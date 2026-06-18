@@ -150,7 +150,7 @@ fn add_shifted(dst: &mut Vec<u64>, src: &[u64], shift: usize) {
     }
 }
 
-pub fn karatsuba(a: &[u64], b: &[u64]) -> Vec<u64> {
+pub(crate) fn karatsuba(a: &[u64], b: &[u64]) -> Vec<u64> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
@@ -195,6 +195,7 @@ pub fn mul(a: &[u64], b: &[u64]) -> Vec<u64> {
 #[cfg(test)]
 mod karatsuba_tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn karatsuba_matches_schoolbook_large() {
@@ -204,5 +205,44 @@ mod karatsuba_tests {
         let mut a = a; trim(&mut a);
         let mut b = b; trim(&mut b);
         assert_eq!(mul_schoolbook(&a, &b), karatsuba(&a, &b));
+    }
+
+    #[test]
+    fn karatsuba_depth_two_recursion() {
+        // ~130 limbs => halves are ~65 > 32 => at least two recursion levels.
+        let a: Vec<u64> = (0..130).map(|i| 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i + 1)).collect();
+        let b: Vec<u64> = (0..130).map(|i| 0xD1B5_4A32_D192_ED03u64.wrapping_mul(i + 7)).collect();
+        let mut a = a; trim(&mut a);
+        let mut b = b; trim(&mut b);
+        assert_eq!(mul_schoolbook(&a, &b), karatsuba(&a, &b));
+    }
+
+    #[test]
+    fn karatsuba_asymmetric_lengths() {
+        // 40 x 33 => one Karatsuba level with unequal halves / short high parts.
+        let a: Vec<u64> = (0..40).map(|i| 0xA5A5_5A5A_0F0F_F0F0u64.wrapping_mul(i + 2)).collect();
+        let b: Vec<u64> = (0..33).map(|i| 0x0123_4567_89AB_CDEFu64.wrapping_mul(i + 5)).collect();
+        let mut a = a; trim(&mut a);
+        let mut b = b; trim(&mut b);
+        assert_eq!(mul_schoolbook(&a, &b), karatsuba(&a, &b));
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(500))]
+
+        // Karatsuba must agree with schoolbook for all operand sizes, including
+        // sizes that drive depth-2+ recursion (>64 limbs), the 32-limb crossover,
+        // asymmetric lengths, and empty operands.
+        #[test]
+        fn karatsuba_matches_schoolbook_random(
+            a in proptest::collection::vec(any::<u64>(), 0..160usize),
+            b in proptest::collection::vec(any::<u64>(), 0..160usize),
+        ) {
+            let mut a = a;
+            let mut b = b;
+            trim(&mut a);
+            trim(&mut b);
+            prop_assert_eq!(mul_schoolbook(&a, &b), karatsuba(&a, &b));
+        }
     }
 }
