@@ -291,6 +291,42 @@ impl Rem for Integer {
     }
 }
 
+impl core::fmt::Display for Integer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        if self.is_zero() {
+            return write!(f, "0");
+        }
+        // Repeatedly divide by 10^18 to build decimal digit chunks, then emit.
+        let base = Integer::from(1_000_000_000_000_000_000i128);
+        let mut n = self.abs();
+        let mut chunks: Vec<u64> = Vec::new();
+        while !n.is_zero() {
+            let (q, r) = n.div_rem(&base);
+            chunks.push(r.to_u64_chunk());
+            n = q;
+        }
+        if self.is_negative() {
+            write!(f, "-")?;
+        }
+        // Most-significant chunk without leading zeros, the rest zero-padded to 18.
+        write!(f, "{}", chunks.last().unwrap())?;
+        for c in chunks.iter().rev().skip(1) {
+            write!(f, "{:018}", c)?;
+        }
+        Ok(())
+    }
+}
+
+impl Integer {
+    /// For a non-negative Integer known to be < 10^18, return its u64 value.
+    pub(crate) fn to_u64_chunk(&self) -> u64 {
+        match &self.0 {
+            Repr::Small(v) => *v as u64,
+            Repr::Big { limbs, .. } => limbs[0], // unreachable for < 10^18, but safe
+        }
+    }
+}
+
 impl Integer {
     /// Greatest common divisor. Result is always non-negative; gcd(0,0)=0.
     pub fn gcd(&self, other: &Integer) -> Integer {
