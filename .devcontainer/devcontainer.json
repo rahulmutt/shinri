@@ -1,6 +1,6 @@
 {
   "name": "shinri",
-  "image": "ghcr.io/rahulmutt/dev:sha-515d7dd",
+  "image": "ghcr.io/rahulmutt/dev:sha-4446684",
   "workspaceFolder": "/workspace",
   "remoteUser": "dev",
   "containerEnv": {
