@@ -1,5 +1,6 @@
 use crate::limbs;
 use core::cmp::Ordering;
+use core::ops::{Add, AddAssign, Neg, Sub, SubAssign};
 
 /// An arbitrary-precision signed integer.
 ///
@@ -166,6 +167,73 @@ impl Ord for Integer {
     }
 }
 
+impl Neg for Integer {
+    type Output = Integer;
+    fn neg(self) -> Integer {
+        match self.0 {
+            Repr::Small(v) => {
+                if v == i128::MIN {
+                    Integer(Repr::Big { negative: false, limbs: vec![0, 1u64 << 63] })
+                } else {
+                    Integer(Repr::Small(-v))
+                }
+            }
+            Repr::Big { negative, limbs } => Integer(Repr::Big { negative: !negative, limbs }),
+        }
+    }
+}
+
+fn add_general(x: &Integer, y: &Integer) -> Integer {
+    let xn = x.is_negative();
+    let yn = y.is_negative();
+    let xm = x.mag_limbs();
+    let ym = y.mag_limbs();
+    if xn == yn {
+        Integer::from_sign_limbs(xn, limbs::add(&xm, &ym))
+    } else {
+        match limbs::cmp(&xm, &ym) {
+            Ordering::Equal => Integer::zero(),
+            Ordering::Greater => Integer::from_sign_limbs(xn, limbs::sub(&xm, &ym)),
+            Ordering::Less => Integer::from_sign_limbs(yn, limbs::sub(&ym, &xm)),
+        }
+    }
+}
+
+impl Add for Integer {
+    type Output = Integer;
+    fn add(self, rhs: Integer) -> Integer {
+        if let (Repr::Small(a), Repr::Small(b)) = (&self.0, &rhs.0) {
+            if let Some(s) = a.checked_add(*b) {
+                return Integer(Repr::Small(s));
+            }
+        }
+        add_general(&self, &rhs)
+    }
+}
+
+impl Sub for Integer {
+    type Output = Integer;
+    fn sub(self, rhs: Integer) -> Integer {
+        if let (Repr::Small(a), Repr::Small(b)) = (&self.0, &rhs.0) {
+            if let Some(s) = a.checked_sub(*b) {
+                return Integer(Repr::Small(s));
+            }
+        }
+        add_general(&self, &(-rhs))
+    }
+}
+
+impl AddAssign for Integer {
+    fn add_assign(&mut self, rhs: Integer) {
+        *self = self.clone() + rhs;
+    }
+}
+impl SubAssign for Integer {
+    fn sub_assign(&mut self, rhs: Integer) {
+        *self = self.clone() - rhs;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -201,5 +269,33 @@ mod tests {
         let b = Integer::from_sign_limbs(true, vec![0, 1u64 << 63]);
         assert!(b.is_negative());
         assert_eq!(b.mag_limbs(), vec![0, 1u64 << 63]);
+    }
+
+    #[test]
+    fn ordering_and_equality() {
+        assert_eq!(Integer::from(5i128), Integer::from(5i128));
+        assert_ne!(Integer::from(5i128), Integer::from(-5i128));
+        assert!(Integer::from(-1i128) < Integer::from(0i128));
+        assert!(Integer::from(0i128) < Integer::from(1i128));
+        // cross representation: i128::MAX < i128::MAX + 2 (Big, strictly > |i128::MIN|)
+        let big = Integer::from(i128::MAX) + Integer::from(2i128);
+        assert!(Integer::from(i128::MAX) < big);
+        assert!(big > Integer::from(0i128));
+        // negative Big < negative Small (neg_big = -(i128::MAX+2) < i128::MIN = -(i128::MAX+1))
+        let neg_big = -big.clone();
+        assert!(neg_big < Integer::from(i128::MIN));
+    }
+
+    #[test]
+    fn add_sub_across_representations() {
+        let max = Integer::from(i128::MAX);
+        let one = Integer::from(1i128);
+        let big = max.clone() + one.clone(); // promotes to Big
+        assert!(big > max);
+        assert_eq!(big.clone() - one.clone(), max); // demotes back to Small
+        // sign handling
+        assert_eq!(Integer::from(5i128) + Integer::from(-8i128), Integer::from(-3i128));
+        assert_eq!(Integer::from(-5i128) - Integer::from(-8i128), Integer::from(3i128));
+        assert_eq!(-(big.clone()) + big.clone(), Integer::zero());
     }
 }
