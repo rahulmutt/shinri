@@ -104,7 +104,7 @@ pub fn divrem(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
 }
 
 /// Schoolbook multiply of two canonical magnitudes.
-pub fn mul(a: &[u64], b: &[u64]) -> Vec<u64> {
+pub fn mul_schoolbook(a: &[u64], b: &[u64]) -> Vec<u64> {
     if a.is_empty() || b.is_empty() {
         return Vec::new();
     }
@@ -121,4 +121,88 @@ pub fn mul(a: &[u64], b: &[u64]) -> Vec<u64> {
     }
     trim(&mut out);
     out
+}
+
+const KARATSUBA_THRESHOLD: usize = 32;
+
+fn add_shifted(dst: &mut Vec<u64>, src: &[u64], shift: usize) {
+    if src.is_empty() {
+        return;
+    }
+    if dst.len() < src.len() + shift {
+        dst.resize(src.len() + shift, 0);
+    }
+    let mut carry: u128 = 0;
+    for i in 0..src.len() {
+        let cur = dst[i + shift] as u128 + src[i] as u128 + carry;
+        dst[i + shift] = cur as u64;
+        carry = cur >> 64;
+    }
+    let mut idx = src.len() + shift;
+    while carry != 0 {
+        if idx >= dst.len() {
+            dst.push(0);
+        }
+        let cur = dst[idx] as u128 + carry;
+        dst[idx] = cur as u64;
+        carry = cur >> 64;
+        idx += 1;
+    }
+}
+
+pub fn karatsuba(a: &[u64], b: &[u64]) -> Vec<u64> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    if a.len() < KARATSUBA_THRESHOLD || b.len() < KARATSUBA_THRESHOLD {
+        return mul_schoolbook(a, b);
+    }
+    let half = a.len().max(b.len()) / 2;
+    let split = |x: &[u64]| -> (Vec<u64>, Vec<u64>) {
+        if x.len() <= half {
+            (x.to_vec(), Vec::new())
+        } else {
+            let mut lo = x[..half].to_vec();
+            let mut hi = x[half..].to_vec();
+            trim(&mut lo);
+            trim(&mut hi);
+            (lo, hi)
+        }
+    };
+    let (a0, a1) = split(a);
+    let (b0, b1) = split(b);
+
+    let z0 = karatsuba(&a0, &b0);
+    let z2 = karatsuba(&a1, &b1);
+    let asum = add(&a0, &a1);
+    let bsum = add(&b0, &b1);
+    let z1full = karatsuba(&asum, &bsum);
+    // z1 = z1full - z2 - z0  (both subtractions are valid: z1full >= z0 + z2)
+    let z1 = sub(&sub(&z1full, &z2), &z0);
+
+    let mut result = z0;
+    add_shifted(&mut result, &z1, half);
+    add_shifted(&mut result, &z2, 2 * half);
+    trim(&mut result);
+    result
+}
+
+/// Public multiply entry point: dispatches schoolbook ↔ Karatsuba by size.
+pub fn mul(a: &[u64], b: &[u64]) -> Vec<u64> {
+    karatsuba(a, b)
+}
+
+#[cfg(test)]
+mod karatsuba_tests {
+    use super::*;
+
+    #[test]
+    fn karatsuba_matches_schoolbook_large() {
+        // Build two ~40-limb magnitudes and check the two algorithms agree.
+        let a: Vec<u64> = (0..40).map(|i| 0x9E37_79B9_7F4A_7C15u64.wrapping_mul(i + 1)).collect();
+        let b: Vec<u64> = (0..40).map(|i| 0xD1B5_4A32_D192_ED03u64.wrapping_mul(i + 3)).collect();
+        let mut a = a; trim(&mut a);
+        let mut b = b; trim(&mut b);
+        assert_eq!(mul_schoolbook(&a, &b), karatsuba(&a, &b));
+    }
 }
