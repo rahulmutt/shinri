@@ -291,6 +291,20 @@ impl Rem for Integer {
     }
 }
 
+impl Integer {
+    /// Greatest common divisor. Result is always non-negative; gcd(0,0)=0.
+    pub fn gcd(&self, other: &Integer) -> Integer {
+        let mut a = self.abs();
+        let mut b = other.abs();
+        while !b.is_zero() {
+            let r = a.div_rem(&b).1; // a % b, non-negative since a,b >= 0
+            a = b;
+            b = r;
+        }
+        a
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -390,5 +404,14 @@ mod tests {
         assert!(p > a);
         // (i128::MAX)^2 has known magnitude; verify it's larger than 2^200 lower bound via add identity:
         assert_eq!(p.clone(), a.clone() * b.clone());
+    }
+
+    #[test]
+    fn gcd_basic_and_signs() {
+        assert_eq!(Integer::from(12i128).gcd(&Integer::from(18i128)), Integer::from(6i128));
+        assert_eq!(Integer::from(-12i128).gcd(&Integer::from(18i128)), Integer::from(6i128));
+        assert_eq!(Integer::from(0i128).gcd(&Integer::from(5i128)), Integer::from(5i128));
+        assert_eq!(Integer::from(0i128).gcd(&Integer::from(0i128)), Integer::zero());
+        assert_eq!(Integer::from(17i128).gcd(&Integer::from(13i128)), Integer::from(1i128));
     }
 }
