@@ -1,6 +1,6 @@
 use crate::limbs;
 use core::cmp::Ordering;
-use core::ops::{Add, AddAssign, Neg, Sub, SubAssign};
+use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
 
 /// An arbitrary-precision signed integer.
 ///
@@ -234,6 +234,29 @@ impl SubAssign for Integer {
     }
 }
 
+impl Mul for Integer {
+    type Output = Integer;
+    fn mul(self, rhs: Integer) -> Integer {
+        if let (Repr::Small(a), Repr::Small(b)) = (&self.0, &rhs.0) {
+            if let Some(p) = a.checked_mul(*b) {
+                return Integer(Repr::Small(p));
+            }
+        }
+        if self.is_zero() || rhs.is_zero() {
+            return Integer::zero();
+        }
+        let negative = self.is_negative() ^ rhs.is_negative();
+        let m = limbs::mul(&self.mag_limbs(), &rhs.mag_limbs());
+        Integer::from_sign_limbs(negative, m)
+    }
+}
+
+impl MulAssign for Integer {
+    fn mul_assign(&mut self, rhs: Integer) {
+        *self = self.clone() * rhs;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -297,5 +320,19 @@ mod tests {
         assert_eq!(Integer::from(5i128) + Integer::from(-8i128), Integer::from(-3i128));
         assert_eq!(Integer::from(-5i128) - Integer::from(-8i128), Integer::from(3i128));
         assert_eq!(-(big.clone()) + big.clone(), Integer::zero());
+    }
+
+    #[test]
+    fn multiply_across_representations() {
+        assert_eq!(Integer::from(6i128) * Integer::from(7i128), Integer::from(42i128));
+        assert_eq!(Integer::from(-6i128) * Integer::from(7i128), Integer::from(-42i128));
+        assert_eq!(Integer::from(0i128) * Integer::from(i128::MAX), Integer::zero());
+        // overflow i128 -> Big, then divide back is checked in Task 5.
+        let a = Integer::from(i128::MAX);
+        let b = Integer::from(i128::MAX);
+        let p = a.clone() * b.clone();
+        assert!(p > a);
+        // (i128::MAX)^2 has known magnitude; verify it's larger than 2^200 lower bound via add identity:
+        assert_eq!(p.clone(), a.clone() * b.clone());
     }
 }

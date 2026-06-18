@@ -60,3 +60,23 @@ pub fn sub(a: &[u64], b: &[u64]) -> Vec<u64> {
     trim(&mut out);
     out
 }
+
+/// Schoolbook multiply of two canonical magnitudes.
+pub fn mul(a: &[u64], b: &[u64]) -> Vec<u64> {
+    if a.is_empty() || b.is_empty() {
+        return Vec::new();
+    }
+    let mut out = vec![0u64; a.len() + b.len()];
+    for i in 0..a.len() {
+        let ai = a[i] as u128;
+        let mut carry: u128 = 0;
+        for j in 0..b.len() {
+            let cur = out[i + j] as u128 + ai * b[j] as u128 + carry;
+            out[i + j] = cur as u64;
+            carry = cur >> 64;
+        }
+        out[i + b.len()] = carry as u64;
+    }
+    trim(&mut out);
+    out
+}
