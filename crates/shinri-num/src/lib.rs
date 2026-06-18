@@ -4,5 +4,7 @@
 
 mod integer;
 mod limbs;
+mod rational;
 
 pub use integer::Integer;
+pub use rational::Rational;
