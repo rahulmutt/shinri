@@ -1,6 +1,6 @@
 use crate::limbs;
 use core::cmp::Ordering;
-use core::ops::{Add, AddAssign, Mul, MulAssign, Neg, Sub, SubAssign};
+use core::ops::{Add, AddAssign, Div, Mul, MulAssign, Neg, Rem, Sub, SubAssign};
 
 /// An arbitrary-precision signed integer.
 ///
@@ -257,6 +257,40 @@ impl MulAssign for Integer {
     }
 }
 
+impl Integer {
+    /// Truncated division: returns (quotient, remainder) with
+    /// `self == quotient * rhs + remainder` and `remainder` taking `self`'s sign.
+    pub fn div_rem(&self, rhs: &Integer) -> (Integer, Integer) {
+        // Fast path: both Small, avoiding the only overflowing case.
+        if let (Repr::Small(a), Repr::Small(b)) = (&self.0, &rhs.0) {
+            if *b != 0 && !(*a == i128::MIN && *b == -1) {
+                return (Integer(Repr::Small(a / b)), Integer(Repr::Small(a % b)));
+            }
+        }
+        assert!(!rhs.is_zero(), "division by zero");
+        let (q, r) = limbs::divrem(&self.mag_limbs(), &rhs.mag_limbs());
+        let q_neg = self.is_negative() ^ rhs.is_negative();
+        let r_neg = self.is_negative();
+        (
+            Integer::from_sign_limbs(q_neg, q),
+            Integer::from_sign_limbs(r_neg, r),
+        )
+    }
+}
+
+impl Div for Integer {
+    type Output = Integer;
+    fn div(self, rhs: Integer) -> Integer {
+        self.div_rem(&rhs).0
+    }
+}
+impl Rem for Integer {
+    type Output = Integer;
+    fn rem(self, rhs: Integer) -> Integer {
+        self.div_rem(&rhs).1
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +354,28 @@ mod tests {
         assert_eq!(Integer::from(5i128) + Integer::from(-8i128), Integer::from(-3i128));
         assert_eq!(Integer::from(-5i128) - Integer::from(-8i128), Integer::from(3i128));
         assert_eq!(-(big.clone()) + big.clone(), Integer::zero());
+    }
+
+    #[test]
+    fn div_rem_matches_truncation() {
+        let (q, r) = Integer::from(17i128).div_rem(&Integer::from(5i128));
+        assert_eq!(q, Integer::from(3i128));
+        assert_eq!(r, Integer::from(2i128));
+        // negative dividend: truncation toward zero, remainder sign = dividend.
+        let (q, r) = Integer::from(-17i128).div_rem(&Integer::from(5i128));
+        assert_eq!(q, Integer::from(-3i128));
+        assert_eq!(r, Integer::from(-2i128));
+        // exact division across representations
+        let big = Integer::from(i128::MAX) * Integer::from(1000i128);
+        let (q, r) = big.div_rem(&Integer::from(1000i128));
+        assert_eq!(q, Integer::from(i128::MAX));
+        assert!(r.is_zero());
+    }
+
+    #[test]
+    #[should_panic(expected = "division by zero")]
+    fn div_by_zero_panics() {
+        let _ = Integer::from(1i128).div_rem(&Integer::zero());
     }
 
     #[test]

@@ -61,6 +61,48 @@ pub fn sub(a: &[u64], b: &[u64]) -> Vec<u64> {
     out
 }
 
+fn shl1(v: &mut Vec<u64>) {
+    let mut carry = 0u64;
+    for x in v.iter_mut() {
+        let new_carry = *x >> 63;
+        *x = (*x << 1) | carry;
+        carry = new_carry;
+    }
+    if carry != 0 {
+        v.push(carry);
+    }
+}
+
+/// Divide canonical magnitude `a` by canonical magnitude `b` (b non-empty),
+/// returning (quotient, remainder), both canonical. Binary long division.
+pub fn divrem(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
+    debug_assert!(!b.is_empty(), "divrem by zero magnitude");
+    if cmp(a, b) == Ordering::Less {
+        return (Vec::new(), a.to_vec());
+    }
+    let bits = a.len() * 64;
+    let mut q = vec![0u64; a.len()];
+    let mut r: Vec<u64> = Vec::new();
+    for i in (0..bits).rev() {
+        shl1(&mut r);
+        let bit = (a[i / 64] >> (i % 64)) & 1;
+        if bit == 1 {
+            if r.is_empty() {
+                r.push(1);
+            } else {
+                r[0] |= 1;
+            }
+        }
+        if cmp(&r, b) != Ordering::Less {
+            r = sub(&r, b);
+            q[i / 64] |= 1u64 << (i % 64);
+        }
+    }
+    trim(&mut q);
+    trim(&mut r);
+    (q, r)
+}
+
 /// Schoolbook multiply of two canonical magnitudes.
 pub fn mul(a: &[u64], b: &[u64]) -> Vec<u64> {
     if a.is_empty() || b.is_empty() {
