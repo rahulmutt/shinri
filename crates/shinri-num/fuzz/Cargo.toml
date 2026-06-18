@@ -1,0 +1,22 @@
+[package]
+name = "shinri-num-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+num-bigint = "0.4"
+shinri-num = { path = ".." }
+
+[[bin]]
+name = "integer_ops"
+path = "fuzz_targets/integer_ops.rs"
+test = false
+doc = false
+
+[workspace]
