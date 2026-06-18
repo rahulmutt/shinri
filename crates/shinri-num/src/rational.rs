@@ -29,13 +29,22 @@ impl Rational {
     }
 
     pub fn from_int(n: Integer) -> Rational {
-        Rational { numer: n, denom: Integer::one() }
+        Rational {
+            numer: n,
+            denom: Integer::one(),
+        }
     }
     pub fn zero() -> Rational {
-        Rational { numer: Integer::zero(), denom: Integer::one() }
+        Rational {
+            numer: Integer::zero(),
+            denom: Integer::one(),
+        }
     }
     pub fn one() -> Rational {
-        Rational { numer: Integer::one(), denom: Integer::one() }
+        Rational {
+            numer: Integer::one(),
+            denom: Integer::one(),
+        }
     }
 
     pub fn numer(&self) -> &Integer {
@@ -112,7 +121,10 @@ impl Div for Rational {
 impl Neg for Rational {
     type Output = Rational;
     fn neg(self) -> Rational {
-        Rational { numer: -self.numer, denom: self.denom }
+        Rational {
+            numer: -self.numer,
+            denom: self.denom,
+        }
     }
 }
 

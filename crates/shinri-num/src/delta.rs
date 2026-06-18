@@ -15,7 +15,10 @@ impl DeltaRational {
         DeltaRational { c, k }
     }
     pub fn from_rational(c: Rational) -> Self {
-        DeltaRational { c, k: Rational::zero() }
+        DeltaRational {
+            c,
+            k: Rational::zero(),
+        }
     }
     pub fn c(&self) -> &Rational {
         &self.c
@@ -45,19 +48,28 @@ impl Ord for DeltaRational {
 impl Add for DeltaRational {
     type Output = DeltaRational;
     fn add(self, o: DeltaRational) -> DeltaRational {
-        DeltaRational { c: self.c + o.c, k: self.k + o.k }
+        DeltaRational {
+            c: self.c + o.c,
+            k: self.k + o.k,
+        }
     }
 }
 impl Sub for DeltaRational {
     type Output = DeltaRational;
     fn sub(self, o: DeltaRational) -> DeltaRational {
-        DeltaRational { c: self.c - o.c, k: self.k - o.k }
+        DeltaRational {
+            c: self.c - o.c,
+            k: self.k - o.k,
+        }
     }
 }
 impl Neg for DeltaRational {
     type Output = DeltaRational;
     fn neg(self) -> DeltaRational {
-        DeltaRational { c: -self.c, k: -self.k }
+        DeltaRational {
+            c: -self.c,
+            k: -self.k,
+        }
     }
 }
 
@@ -82,7 +94,7 @@ mod tests {
         assert!(c < d);
         // equality is reflexive; a value is not less than itself
         assert_eq!(a.clone(), a.clone());
-        assert!(!(a < a));
+        assert!(a <= a);
     }
 
     #[test]

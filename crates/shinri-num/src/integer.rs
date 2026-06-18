@@ -115,7 +115,11 @@ impl Integer {
         }
         if limbs.len() <= 2 {
             let lo = limbs[0] as u128;
-            let hi = if limbs.len() == 2 { limbs[1] as u128 } else { 0 };
+            let hi = if limbs.len() == 2 {
+                limbs[1] as u128
+            } else {
+                0
+            };
             let mag = lo | (hi << 64);
             if !negative {
                 if mag <= i128::MAX as u128 {
@@ -173,12 +177,18 @@ impl Neg for Integer {
         match self.0 {
             Repr::Small(v) => {
                 if v == i128::MIN {
-                    Integer(Repr::Big { negative: false, limbs: vec![0, 1u64 << 63] })
+                    Integer(Repr::Big {
+                        negative: false,
+                        limbs: vec![0, 1u64 << 63],
+                    })
                 } else {
                     Integer(Repr::Small(-v))
                 }
             }
-            Repr::Big { negative, limbs } => Integer(Repr::Big { negative: !negative, limbs }),
+            Repr::Big { negative, limbs } => Integer(Repr::Big {
+                negative: !negative,
+                limbs,
+            }),
         }
     }
 }
@@ -403,9 +413,15 @@ mod tests {
         let big = max.clone() + one.clone(); // promotes to Big
         assert!(big > max);
         assert_eq!(big.clone() - one.clone(), max); // demotes back to Small
-        // sign handling
-        assert_eq!(Integer::from(5i128) + Integer::from(-8i128), Integer::from(-3i128));
-        assert_eq!(Integer::from(-5i128) - Integer::from(-8i128), Integer::from(3i128));
+                                                    // sign handling
+        assert_eq!(
+            Integer::from(5i128) + Integer::from(-8i128),
+            Integer::from(-3i128)
+        );
+        assert_eq!(
+            Integer::from(-5i128) - Integer::from(-8i128),
+            Integer::from(3i128)
+        );
         assert_eq!(-(big.clone()) + big.clone(), Integer::zero());
     }
 
@@ -433,9 +449,18 @@ mod tests {
 
     #[test]
     fn multiply_across_representations() {
-        assert_eq!(Integer::from(6i128) * Integer::from(7i128), Integer::from(42i128));
-        assert_eq!(Integer::from(-6i128) * Integer::from(7i128), Integer::from(-42i128));
-        assert_eq!(Integer::from(0i128) * Integer::from(i128::MAX), Integer::zero());
+        assert_eq!(
+            Integer::from(6i128) * Integer::from(7i128),
+            Integer::from(42i128)
+        );
+        assert_eq!(
+            Integer::from(-6i128) * Integer::from(7i128),
+            Integer::from(-42i128)
+        );
+        assert_eq!(
+            Integer::from(0i128) * Integer::from(i128::MAX),
+            Integer::zero()
+        );
         // overflow i128 -> Big, then divide back is checked in Task 5.
         let a = Integer::from(i128::MAX);
         let b = Integer::from(i128::MAX);
@@ -447,10 +472,25 @@ mod tests {
 
     #[test]
     fn gcd_basic_and_signs() {
-        assert_eq!(Integer::from(12i128).gcd(&Integer::from(18i128)), Integer::from(6i128));
-        assert_eq!(Integer::from(-12i128).gcd(&Integer::from(18i128)), Integer::from(6i128));
-        assert_eq!(Integer::from(0i128).gcd(&Integer::from(5i128)), Integer::from(5i128));
-        assert_eq!(Integer::from(0i128).gcd(&Integer::from(0i128)), Integer::zero());
-        assert_eq!(Integer::from(17i128).gcd(&Integer::from(13i128)), Integer::from(1i128));
+        assert_eq!(
+            Integer::from(12i128).gcd(&Integer::from(18i128)),
+            Integer::from(6i128)
+        );
+        assert_eq!(
+            Integer::from(-12i128).gcd(&Integer::from(18i128)),
+            Integer::from(6i128)
+        );
+        assert_eq!(
+            Integer::from(0i128).gcd(&Integer::from(5i128)),
+            Integer::from(5i128)
+        );
+        assert_eq!(
+            Integer::from(0i128).gcd(&Integer::from(0i128)),
+            Integer::zero()
+        );
+        assert_eq!(
+            Integer::from(17i128).gcd(&Integer::from(13i128)),
+            Integer::from(1i128)
+        );
     }
 }

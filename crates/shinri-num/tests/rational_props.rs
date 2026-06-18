@@ -10,7 +10,7 @@ fn scaled(base: i64, times: u32) -> (shinri_num::Integer, num_bigint::BigInt) {
     let mut b = num_bigint::BigInt::from(base);
     for _ in 0..times {
         s = s.clone() * shinri_num::Integer::from(pow);
-        b = b * num_bigint::BigInt::from(pow);
+        b *= num_bigint::BigInt::from(pow);
     }
     (s, b)
 }

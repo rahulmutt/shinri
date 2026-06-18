@@ -16,13 +16,13 @@ proptest! {
         let mut bi = to_big(a);
         for _ in 0..scale_a {
             si = si.clone() * Integer::from(1i128 << 62);
-            bi = bi * BigInt::from(1i128 << 62);
+            bi *= BigInt::from(1i128 << 62);
         }
         let mut sj = Integer::from(b);
         let mut bj = to_big(b);
         for _ in 0..scale_b {
             sj = sj.clone() * Integer::from(1i128 << 62);
-            bj = bj * BigInt::from(1i128 << 62);
+            bj *= BigInt::from(1i128 << 62);
         }
 
         let sum = si.clone() + sj.clone();
@@ -63,5 +63,9 @@ fn num_integer_gcd(a: BigInt, b: BigInt) -> BigInt {
 }
 
 fn magnitude_abs(x: BigInt) -> BigInt {
-    if x < BigInt::from(0) { -x } else { x }
+    if x < BigInt::from(0) {
+        -x
+    } else {
+        x
+    }
 }
