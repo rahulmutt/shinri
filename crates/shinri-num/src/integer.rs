@@ -130,6 +130,42 @@ impl Integer {
     }
 }
 
+impl PartialEq for Integer {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for Integer {}
+
+impl PartialOrd for Integer {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Integer {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Fast path: both Small.
+        if let (Repr::Small(a), Repr::Small(b)) = (&self.0, &other.0) {
+            return a.cmp(b);
+        }
+        let sa = self.signum();
+        let sb = other.signum();
+        if sa != sb {
+            return sa.cmp(&sb);
+        }
+        if sa == 0 {
+            return Ordering::Equal;
+        }
+        let mag = limbs::cmp(&self.mag_limbs(), &other.mag_limbs());
+        if sa < 0 {
+            mag.reverse()
+        } else {
+            mag
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
