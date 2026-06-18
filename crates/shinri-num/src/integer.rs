@@ -321,7 +321,10 @@ impl Integer {
     /// For a non-negative Integer known to be < 10^18, return its u64 value.
     pub(crate) fn to_u64_chunk(&self) -> u64 {
         match &self.0 {
-            Repr::Small(v) => *v as u64,
+            Repr::Small(v) => {
+                debug_assert!(*v >= 0, "to_u64_chunk called on negative Small");
+                *v as u64
+            }
             Repr::Big { limbs, .. } => limbs[0], // unreachable for < 10^18, but safe
         }
     }

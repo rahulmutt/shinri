@@ -1,13 +1,18 @@
-use num_bigint::BigInt;
 use num_rational::BigRational;
 use proptest::prelude::*;
-use shinri_num::{Integer, Rational};
+use shinri_num::Rational;
 
-fn sr(n: i64, d: i64) -> Rational {
-    Rational::new(Integer::from(n), Integer::from(d))
-}
-fn br(n: i64, d: i64) -> BigRational {
-    BigRational::new(BigInt::from(n), BigInt::from(d))
+/// Build identical shinri / oracle integers, scaled by 2^62 `times` times so
+/// values exceed i128 and exercise the Big path.
+fn scaled(base: i64, times: u32) -> (shinri_num::Integer, num_bigint::BigInt) {
+    let pow = 1i128 << 62;
+    let mut s = shinri_num::Integer::from(base);
+    let mut b = num_bigint::BigInt::from(base);
+    for _ in 0..times {
+        s = s.clone() * shinri_num::Integer::from(pow);
+        b = b * num_bigint::BigInt::from(pow);
+    }
+    (s, b)
 }
 
 proptest! {
@@ -17,11 +22,16 @@ proptest! {
     fn rational_ops_match_bigrational(
         an in any::<i64>(), ad in 1i64..=i64::MAX,
         bn in any::<i64>(), bd in 1i64..=i64::MAX,
+        san in 0u32..3, sad in 0u32..3, sbn in 0u32..3, sbd in 0u32..3,
     ) {
-        let sa = sr(an, ad);
-        let sb = sr(bn, bd);
-        let ba = br(an, ad);
-        let bb = br(bn, bd);
+        let (an_s, an_b) = scaled(an, san);
+        let (ad_s, ad_b) = scaled(ad, sad);
+        let (bn_s, bn_b) = scaled(bn, sbn);
+        let (bd_s, bd_b) = scaled(bd, sbd);
+        let sa = Rational::new(an_s, ad_s);
+        let sb = Rational::new(bn_s, bd_s);
+        let ba = BigRational::new(an_b, ad_b);
+        let bb = BigRational::new(bn_b, bd_b);
 
         prop_assert_eq!(
             rat_str(sa.clone() + sb.clone()),
