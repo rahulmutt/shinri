@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- **Rust edition:** `2021`. Toolchain pinned to `1.83.0` in `mise.toml`.
+- **Rust edition:** `2021`. Toolchain pinned to `1.96.0` in `mise.toml` (the toolchain installed in this environment).
 - **Zero runtime dependencies** for `shinri-num`. The `[dependencies]` table stays empty. `num-bigint`, `num-rational`, `num-traits`, `proptest` appear **only** under `[dev-dependencies]` — they must never reach the shipping build (spec §3.1, §7.4).
 - **Crate license:** `MIT OR Apache-2.0` (permissive — spec §3.1).
 - **No `unsafe`** in this plan's scope. All limb arithmetic uses `u128` widening; checked native ops guard the fast paths. (Audited `unsafe` for `get_unchecked` is a later, separate optimization — not here.)
@@ -54,14 +54,14 @@ members = ["crates/shinri-num"]
 [workspace.package]
 edition = "2021"
 license = "MIT OR Apache-2.0"
-rust-version = "1.83.0"
+rust-version = "1.96.0"
 ```
 
 - [ ] **Step 2: Create `mise.toml`**
 
 ```toml
 [tools]
-rust = "1.83.0"
+rust = "1.96.0"
 "cargo:cargo-nextest" = "latest"
 "cargo:cargo-deny" = "latest"
 "cargo:cargo-fuzz" = "latest"
