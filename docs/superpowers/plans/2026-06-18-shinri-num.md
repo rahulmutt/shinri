@@ -375,8 +375,11 @@ fn ordering_and_equality() {
     assert_ne!(Integer::from(5i128), Integer::from(-5i128));
     assert!(Integer::from(-1i128) < Integer::from(0i128));
     assert!(Integer::from(0i128) < Integer::from(1i128));
-    // cross representation: i128::MAX < i128::MAX + 1 (Big)
-    let big = Integer::from(i128::MAX) + Integer::from(1i128);
+    // cross representation: i128::MAX < i128::MAX + 2 (Big)
+    // NOTE: i128::MAX + 1 == 2^127 == |i128::MIN|, so negating it would EQUAL
+    // i128::MIN, not be less than it. Use +2 so the negative Big magnitude is
+    // strictly greater than i128::MIN's, preserving "negative Big < negative Small".
+    let big = Integer::from(i128::MAX) + Integer::from(2i128);
     assert!(Integer::from(i128::MAX) < big);
     assert!(big > Integer::from(0i128));
     // negative Big < negative Small
