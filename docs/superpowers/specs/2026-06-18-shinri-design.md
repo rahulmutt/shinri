@@ -46,8 +46,10 @@ A Cargo workspace of focused crates with strictly one-directional dependencies.
 ```
 shinri/                         (workspace root: mise.toml, devenv.nix, deny.toml)
 ├── crates/
+│   ├── shinri-num         # from-scratch SMT-tuned bignum + rational: inline small-value
+│   │                      #   storage, schoolbook+Karatsuba mul, binary/Lehmer GCD. No deps.
 │   ├── shinri-core        # term/sort interning DAG, ids, arena, trail/undo-log,
-│   │                      #   Rational abstraction, ProofSink trait. No solving logic.
+│   │                      #   Rational abstraction (over shinri-num), ProofSink trait.
 │   ├── shinri-sat         # CDCL SAT core: incremental + assumptions, watched literals,
 │   │                      #   1-UIP analysis, VMTF/EVSIDS, restarts. Depends on core.
 │   ├── shinri-theory      # Theory trait + DPLL(T) orchestration + Nelson-Oppen combination
@@ -60,15 +62,17 @@ shinri/                         (workspace root: mise.toml, devenv.nix, deny.tom
 └── tests/                 # integration + differential harness, benchmark runner
 ```
 
-**Dependency direction:** `core` ← `sat` ← `theory` ← `{euf, arith}` ← `solver` ← `cli`; `parser` depends on `core` and feeds `solver`. No cycles. `shinri-euf` literally cannot reach into the SAT core internals.
+**Dependency direction:** `num` ← `core` ← `sat` ← `theory` ← `{euf, arith}` ← `solver` ← `cli`; `parser` depends on `core` and feeds `solver`. No cycles. `shinri-num` has zero dependencies; `shinri-euf` literally cannot reach into the SAT core internals.
 
 **Why crates, not modules:** the crate graph mechanically enforces the architectural one-way doors, gives independent compilation/testing, and makes "is this still pure-Rust?" a `cargo tree` query.
 
 ### 3.1 Dependency policy (pure-Rust mandate)
 
-A workspace-level `deny.toml` (cargo-deny) bans native-link crates: `rug`, `gmp-mpfr-sys`, `z3-sys`, `cadical-rs`, `rustsat-{cadical,kissat,glucose,minisat}`. CI runs `cargo deny check`.
+A workspace-level `deny.toml` (cargo-deny) bans native-link crates: `rug`, `gmp-mpfr-sys`, `z3-sys`, `cadical-rs`, `rustsat-{cadical,kissat,glucose,minisat}`. CI runs `cargo deny check`. The shipping dependency surface is deliberately tiny and fully permissive (MIT/Apache): the bignum/rational stack is the in-house `shinri-num`, so there is **no** `malachite` (LGPL) or `num-bigint` in the shipping build.
 
-**Single exception:** `z3.rs` / `easy-smt` are permitted **only** as a `dev-dependency` behind a feature flag, used exclusively as a differential-testing oracle — never in the shipping build.
+**Dev-only oracle exceptions** — permitted **only** as `dev-dependency` behind a feature flag, never in the shipping build:
+- `z3.rs` / `easy-smt` — differential-testing oracle for the solver.
+- `num-bigint` / `num-rational` — differential-testing oracle for `shinri-num`.
 
 ### 3.2 Toolchain
 
@@ -124,7 +128,7 @@ A single trail (`Vec`) with decision-level markers. Each theory registers backtr
 
 ### 4.3 `Rational` abstraction
 
-`Rational` is a trait, not a concrete type, with an **i128 fast-path + overflow→bignum fallback** so the hot arithmetic path stays unboxed until coefficients actually overflow. See §7.
+`Rational` is a trait, not a concrete type, with an **i128 fast-path + overflow→bignum fallback** so the hot arithmetic path stays unboxed until coefficients actually overflow. The bignum/rational fallback is the in-house `shinri-num` crate. See §7.
 
 ### 4.4 `ProofSink` trait
 
@@ -208,14 +212,40 @@ EUF is also the **shared equality hub** for arrays/strings/E-matching in later p
 
 ---
 
-## 7. Exact Arithmetic
+## 7. Exact Arithmetic — `shinri-num` (from scratch)
 
-Float in a theory core is a **soundness bug, full stop.** Everything is exact rationals. The pure-Rust mandate forbids GMP (`rug`), and pure-Rust bignums run 1.5–4× slower — this is the place the mandate costs the most. It cannot be waved away.
+Float in a theory core is a **soundness bug, full stop.** Everything is exact rationals. The pure-Rust mandate forbids GMP (`rug`), and general pure-Rust bignums (`num-bigint`, `malachite`) are either slower, heap-eager, or copyleft. Rather than depend on one, shinri builds **`shinri-num`**: a from-scratch big-integer + rational library tuned for *exactly* the operations this solver performs and nothing else. This is the place the pure-Rust mandate costs the most, so it is the place a focused, workload-specific implementation pays back the most.
 
-**Strategy:**
-- `Rational` behind a trait with an **i128 fast-path + overflow→bignum fallback** — the hot path stays unboxed until coefficients genuinely blow up.
-- **Backend:** start with **`num-rational` / `num-bigint`** (correctness-first); plan a hot-path switch to **`malachite-q`** (fastest pure-Rust). This accepts `malachite`'s **LGPL** license in the shipping build. The trait abstraction keeps the final choice deferrable and benchmark-driven; `dashu` remains a permissive (MIT/Apache) fallback if the LGPL position changes.
-- **Coefficient blowup mitigation:** integer-rows-with-shared-denominator representation in the simplex tableau, not per-cell rationals.
+### 7.1 Why from scratch is justified here
+
+The SMT arithmetic workload has a narrow, exploitable shape that general libraries do not optimize for:
+- **Magnitudes are usually small.** In Dutertre–de Moura simplex, coefficients overwhelmingly fit in 64–128 bits; bignum is the *fallback* for occasional coefficient blowup, rarely astronomically large.
+- **GCD dominates, not multiplication.** Rationals normalize on essentially every operation, so GCD is the hot path. General libraries optimize large-operand multiplication we rarely hit.
+- **The operation set is tiny and closed:** add, sub, mul, compare, `divrem`, GCD, and rational normalize. No need for the hundreds of functions GMP/FLINT ship.
+
+A library that assumes "mostly small, occasionally medium, rarely huge, GCD-heavy, allocation-averse" can beat general-purpose crates *on this workload* while being a fraction of their code — and it makes the entire shipping stack permissive pure-Rust.
+
+### 7.2 Representation
+
+- **`Integer`:** an inline small-value representation — a sign + a small inline limb buffer (e.g. up to 2 limbs / 128 bits stored inline, **no heap allocation**), spilling to a heap `Vec<u64>` of limbs only when the value genuinely exceeds the inline capacity. This is the single biggest win over `num-bigint` (which heap-allocates eagerly). Normalized (no leading zero limbs; canonical zero).
+- **`Rational`:** a `{ numer: Integer, denom: Integer }` kept in canonical form (denominator > 0, `gcd(numer, denom) = 1`). The concrete fallback type behind the `Rational` trait of §4.3; the i128 fast-path in the theory layer means most operations never construct one.
+- **`DeltaRational`:** `(Rational, Rational)` pair `(c, k)` for the simplex `c + k·δ` strict-inequality encoding (§6.5), built on the above.
+
+### 7.3 Algorithms (SMT-tuned scope)
+
+- **Addition/subtraction:** limb-wise with carry/borrow via `u128` widening (or `core::arch` add-carry intrinsics where they win), inline fast path for ≤128-bit operands.
+- **Multiplication:** schoolbook for small operands; **Karatsuba** above a tuned crossover. Toom-Cook and Schönhage-Strassen/FFT are **deliberately deferred** — the SMT workload rarely reaches their crossover; they are added only if profiling proves a need.
+- **Division/remainder:** Knuth Algorithm D (schoolbook long division) with a fast path for single-limb and ≤128-bit divisors. Burnikel-Ziegler divide-and-conquer division deferred (same rationale as Toom-Cook).
+- **GCD (the hot path):** **binary GCD** for small operands and **Lehmer's GCD** for larger ones — chosen because rational normalization makes GCD the most-executed bignum routine. Half-GCD deferred.
+- **Comparison:** branch-light, limb-count then limb-wise.
+
+### 7.4 Correctness regime (a bignum bug is a soundness bug)
+
+`shinri-num` is held to the strictest testing in the project (see §11): exhaustive property tests of algebraic laws, **differential testing of every operation against `num-bigint`/`num-rational` as a dev-only oracle**, fuzzing of the limb-level routines, and `cargo-mutants` on the core algorithms. It is never trusted to decide a `sat`/`unsat` until it provably agrees with the reference across the fuzz/differential corpus.
+
+### 7.5 Coefficient-blowup mitigation in the simplex
+
+Independently of the bignum: the simplex tableau uses an **integer-rows-with-shared-denominator** representation rather than per-cell rationals, which is the primary defense against rational coefficient blowup during pivoting. `shinri-num` makes the per-row integer operations fast; the representation keeps the operands small.
 
 ---
 
@@ -266,17 +296,19 @@ Thin binary over `shinri-solver`: reads SMT-LIB 2 from file or stdin; competitio
 
 The spine is **differential testing against oracle solvers from day one** — the primary mitigation for the from-scratch soundness failure modes (simplex delta-rational off-by-ones, congruence-closure disequality edges, exact-arithmetic bugs).
 
-1. **Unit tests** — per-crate, on tricky invariants: watched-literal maintenance, 1-UIP analysis, congruence-closure merge/explain, simplex pivot correctness, delta-rational strict inequalities, interner dedup.
+1. **Unit tests** — per-crate, on tricky invariants: watched-literal maintenance, 1-UIP analysis, congruence-closure merge/explain, simplex pivot correctness, delta-rational strict inequalities, interner dedup, and `shinri-num` limb-level edge cases (carry/borrow boundaries, inline↔heap spill, Karatsuba crossover, GCD with zero/one operands).
 2. **Property-based tests (`proptest`):**
    - *Term layer:* structural equality ⇔ id equality; sort-checking soundness.
    - *SAT core:* learned clauses are entailed; returned models satisfy all clauses; UNSAT cores are genuinely unsatisfiable.
    - *Theories:* returned models satisfy every asserted literal; every conflict clause is genuinely theory-inconsistent (certificate independently re-checked).
    - *Round-trip:* parse → print → parse is identity on the term DAG.
-3. **Differential / oracle testing** — random well-typed SMT-LIB in Phase 1 logics, shinri vs Z3/cvc5 (`z3.rs`/`easy-smt`, dev-dependency + feature flag only). **Any sat/unsat disagreement is a P0 bug.** `unknown` is never a failure.
-4. **Fuzzing (`cargo-fuzz`):** (a) parser/frontend — never panic on malformed input; (b) structured semantic fuzzing — grammar-driven formulas through the differential harness to hunt soundness bugs.
+3. **Differential / oracle testing** — two layers, both dev-only:
+   - *Solver:* random well-typed SMT-LIB in Phase 1 logics, shinri vs Z3/cvc5 (`z3.rs`/`easy-smt`). **Any sat/unsat disagreement is a P0 bug.** `unknown` is never a failure.
+   - *`shinri-num`:* every arithmetic operation checked against `num-bigint`/`num-rational` on a large random + fuzz corpus. The bignum is not trusted in the solver until it provably agrees with the reference (§7.4).
+4. **Fuzzing (`cargo-fuzz`):** (a) parser/frontend — never panic on malformed input; (b) structured semantic fuzzing — grammar-driven formulas through the solver differential harness to hunt soundness bugs; (c) `shinri-num` limb-level routines — fuzzed operands cross-checked against the `num-bigint` oracle.
 5. **Self-checking:** every `sat` result is internally re-validated (model evaluated against all assertions before output); every `unsat` carries a checkable certificate (Farkas/congruence now; Alethe via Carcara from Phase 2).
 6. **Integration tests** — SMT-LIB regression suite + curated benchmark families (QF_UF, QF_IDL/RDL, QF_LRA, QF_UFLRA) for correctness and tracked performance.
-7. **Mutation testing (`cargo-mutants`)** on core theory code — confirm the suite catches behavioral changes.
+7. **Mutation testing (`cargo-mutants`)** on core theory code **and `shinri-num`** — confirm the suite catches behavioral changes.
 8. **CI gates:** `cargo nextest`, `cargo deny check`, `cargo clippy -D warnings`, `cargo fmt --check`, benchmark-regression job. Differential + fuzz run on a longer scheduled budget.
 
 ---
@@ -284,6 +316,7 @@ The spine is **differential testing against oracle solvers from day one** — th
 ## 12. Phase 1 Deliverable
 
 A sound, complete, single-threaded solver for **QF_UF + QF_IDL/RDL + QF_LRA + QF_UFLRA** with:
+- the in-house `shinri-num` bignum/rational library as the only arithmetic backend (**no `num-bigint`/`malachite` in the shipping build** — Phase 1 gate),
 - a fast SMT-LIB 2.6 frontend,
 - `check-sat`, `check-sat-assuming`, `push`/`pop`,
 - `get-model` / `get-value`, `get-unsat-core`,
@@ -292,12 +325,15 @@ A sound, complete, single-threaded solver for **QF_UF + QF_IDL/RDL + QF_LRA + QF
 - the full testing harness (unit, property, differential, fuzz, mutation, CI).
 
 Implemented incrementally in **QF_UF-first order**, so there is always a sound, runnable solver at each step:
-1. Core (term/sort DAG, trail, Rational, ProofSink) → SAT core (incremental + assumptions).
-2. DPLL(T) glue + Theory trait → EUF (congruence closure + proof forest). **First runnable solver: QF_UF.**
-3. Difference logic. **QF_IDL/RDL.**
-4. Dutertre–de Moura simplex. **QF_LRA.**
-5. Nelson–Oppen model-based combination. **QF_UFLRA.**
-6. SMT-LIB frontend + CLI hardening; model & unsat-core extraction; full test harness.
+1. `shinri-num` (Integer/Rational/DeltaRational) + Core (term/sort DAG, trail, Rational trait, ProofSink). `shinri-num` is differential-tested against `num-bigint` from the start; `num-bigint` may scaffold the `Rational` fallback *during* development but is removed from the shipping path before the gate below.
+2. SAT core (incremental + assumptions).
+3. DPLL(T) glue + Theory trait → EUF (congruence closure + proof forest). **First runnable solver: QF_UF.**
+4. Difference logic. **QF_IDL/RDL.**
+5. Dutertre–de Moura simplex (on `shinri-num`). **QF_LRA.**
+6. Nelson–Oppen model-based combination. **QF_UFLRA.**
+7. SMT-LIB frontend + CLI hardening; model & unsat-core extraction; full test harness.
+
+**Phase 1 gate:** the deliverable is not "done" until `shinri-num` is the sole arithmetic backend in the shipping build and has passed its differential/fuzz/mutation regime; `num-bigint`/`num-rational` survive only as dev-only oracles.
 
 **Competitive measuring sticks (expect competitive + sound, not faster, initially):** Yices2 (QF_UF), OpenSMT (QF_LRA).
 
@@ -319,12 +355,12 @@ Implemented incrementally in **QF_UF-first order**, so there is always a sound, 
 
 1. **Incumbents are decades-tuned.** Beating Yices2 (QF_UF), OpenSMT (QF_LRA), or Bitwuzla (QF_BV) outright is unrealistic for v1. The honest Phase 1 goal is sound, complete, competitive *coverage*.
 2. **Soundness is existential.** One wrong answer sinks a division. Classic from-scratch failure modes: simplex delta-rational handling, congruence-closure disequality edges, exact-arithmetic correctness. Mitigation: differential testing from day one; conservative `unknown`.
-3. **Exact-rational arithmetic is the LRA hot spot.** Pure-Rust bignums are 1.5–4× slower than GMP; per-cell rationals with coefficient blowup kill performance. Mitigation: integer-rows-with-shared-denominator + i128 fast-path.
+3. **Exact-rational arithmetic is the LRA hot spot — and we are building the bignum ourselves (`shinri-num`).** This is a deliberate bet: a workload-tuned library can beat general pure-Rust crates on our shape (small magnitudes, GCD-heavy, allocation-averse), but a bignum bug is a *silent soundness bug*, the worst kind. Mitigations: the i128 fast-path keeps most operations out of the bignum entirely; integer-rows-with-shared-denominator contains coefficient blowup; and `shinri-num` is held to the strictest test regime in the project (differential vs `num-bigint`, property, fuzz, mutation) and is not trusted until it provably agrees with the reference. Residual risk: it is net-new scope that gates Phase 1 and could absorb more time than budgeted — bounded by the SMT-tuned scope (no Toom-Cook/FFT/Burnikel-Ziegler until profiling demands them).
 4. **The SAT core is load-bearing and unforgiving.** Matching Kissat/CaDiCaL raw SAT performance in pure Rust is unrealistic — but for SMT the trail is theory-atom-dominated, so a correct, incremental, well-instrumented MiniSat-class core is the right target.
 5. **Incrementality vs inprocessing tension.** Heavy BVE eliminates exactly the variables theories need; chronological backtracking is a bug magnet. Phase 1 defers both deliberately.
 6. **Architectural one-way doors.** E-matching merge hooks, `ClauseId`/`ProofSink`, the assumption API, and an MCSat-capable trail must be designed in Phase 1 or retrofitting is a rewrite (as cvc5/CVC4 learned with proofs and BV).
 7. **Combination subtleties.** Nelson–Oppen explodes on non-convex theories (LIA, arrays) via arrangement enumeration; model-based combination is a soundness-bug source. Minimal, relevant explanations are where clean implementations quietly win.
-8. **The pure-Rust mandate is a real constraint.** It forbids the fastest bignum and SAT backends. shinri's answer is soundness, memory safety, clean incremental architecture, fast parsing, and being the first credible pure-Rust SMT solver.
+8. **The pure-Rust mandate is a real constraint.** It forbids the fastest bignum (GMP) and SAT backends (Kissat/CaDiCaL via FFI). shinri's answer is not raw-speed parity but soundness, memory safety, a clean incremental architecture, fast parsing, an in-house workload-tuned bignum, a fully permissive (MIT/Apache) shipping stack, and being the first credible pure-Rust SMT solver.
 
 ---
 
@@ -340,3 +376,6 @@ Implemented incrementally in **QF_UF-first order**, so there is always a sound, 
 - Brummayer, Biere. *Lemmas on Demand for the Extensional Theory of Arrays.* JSAT 2009.
 - Niemetz, Preiner. *Bitwuzla.* CAV 2023.
 - Barrett et al. *cvc5: A Versatile and Industrial-Strength SMT Solver.* TACAS 2022.
+- Karatsuba, Ofman. *Multiplication of Many-Digital Numbers by Automatic Computers.* 1962.
+- Knuth. *The Art of Computer Programming, Vol. 2: Seminumerical Algorithms* (Algorithm D division; Lehmer's GCD). 3rd ed.
+- Stein. *Binary GCD algorithm.* 1967.
