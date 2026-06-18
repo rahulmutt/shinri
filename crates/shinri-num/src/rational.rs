@@ -4,6 +4,10 @@ use core::ops::{Add, Div, Mul, Neg, Sub};
 
 /// An exact rational. Invariant: `denom > 0`, `gcd(|numer|, denom) == 1`,
 /// and zero is exactly `0/1`.
+///
+/// Division and reciprocal panic on a zero divisor rather than returning an
+/// error; callers (e.g. the simplex layer) must guarantee non-zero divisors —
+/// this is the soundness boundary.
 #[derive(Clone, Debug)]
 pub struct Rational {
     numer: Integer,
@@ -11,6 +15,9 @@ pub struct Rational {
 }
 
 impl Rational {
+    /// # Panics
+    ///
+    /// Panics if `denom` is zero.
     pub fn new(numer: Integer, denom: Integer) -> Rational {
         assert!(!denom.is_zero(), "zero denominator");
         let mut n = numer;
@@ -63,6 +70,9 @@ impl Rational {
         self.numer.signum()
     }
 
+    /// # Panics
+    ///
+    /// Panics if `self` is zero.
     pub fn recip(&self) -> Rational {
         assert!(!self.is_zero(), "reciprocal of zero");
         Rational::new(self.denom.clone(), self.numer.clone())
@@ -113,6 +123,9 @@ impl Mul for Rational {
 }
 impl Div for Rational {
     type Output = Rational;
+    /// # Panics
+    ///
+    /// Panics if the divisor is zero.
     fn div(self, o: Rational) -> Rational {
         assert!(!o.is_zero(), "division by zero");
         Rational::new(self.numer * o.denom, self.denom * o.numer)
@@ -171,5 +184,17 @@ mod tests {
     #[should_panic(expected = "zero denominator")]
     fn zero_denominator_panics() {
         let _ = Rational::new(Integer::from(1i128), Integer::zero());
+    }
+
+    #[test]
+    #[should_panic(expected = "division by zero")]
+    fn div_by_zero_rational_panics() {
+        let _ = Rational::one() / Rational::zero();
+    }
+
+    #[test]
+    #[should_panic(expected = "reciprocal of zero")]
+    fn recip_of_zero_panics() {
+        let _ = Rational::zero().recip();
     }
 }

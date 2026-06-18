@@ -252,6 +252,7 @@ impl Mul for Integer {
                 return Integer(Repr::Small(p));
             }
         }
+        // Defensive: unreachable in practice (Small(0) hits the fast path; Big is never zero), but cheap.
         if self.is_zero() || rhs.is_zero() {
             return Integer::zero();
         }
@@ -270,6 +271,10 @@ impl MulAssign for Integer {
 impl Integer {
     /// Truncated division: returns (quotient, remainder) with
     /// `self == quotient * rhs + remainder` and `remainder` taking `self`'s sign.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `rhs` is zero.
     pub fn div_rem(&self, rhs: &Integer) -> (Integer, Integer) {
         // Fast path: both Small, avoiding the only overflowing case.
         if let (Repr::Small(a), Repr::Small(b)) = (&self.0, &rhs.0) {
