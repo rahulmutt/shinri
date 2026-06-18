@@ -80,6 +80,9 @@ mod tests {
         let c = DeltaRational::new(rat(1, 1), rat(5, 1));
         let d = DeltaRational::new(rat(2, 1), rat(0, 1));
         assert!(c < d);
+        // equality is reflexive; a value is not less than itself
+        assert_eq!(a.clone(), a.clone());
+        assert!(!(a < a));
     }
 
     #[test]
@@ -92,6 +95,10 @@ mod tests {
         let scaled = a.scale(&rat(2, 1));
         assert_eq!(*scaled.c(), rat(1, 1));
         assert_eq!(*scaled.k(), rat(2, 1));
+        // Sub is componentwise
+        let diff = a.clone() - b.clone();
+        assert_eq!(*diff.c(), rat(1, 6)); // 1/2 - 1/3
+        assert_eq!(*diff.k(), rat(-1, 1)); // 1 - 2
         let n = -b;
         assert_eq!(*n.c(), rat(-1, 3));
         assert_eq!(*n.k(), rat(-2, 1));
