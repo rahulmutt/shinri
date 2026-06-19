@@ -2507,6 +2507,11 @@ impl BranchHeuristic for Vmtf {
         if self.tail == NIL {
             self.tail = i;
         }
+        // The bumped var now holds the max stamp and sits at the head, making it
+        // the best candidate; reset `search` to it so `next` can see it (matches
+        // standard VMTF — the brief's earlier draft omitted this and failed the
+        // move-to-front test).
+        self.search = self.head;
     }
 
     fn decay(&mut self) {
