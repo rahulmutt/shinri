@@ -9,6 +9,7 @@ pub mod assignment;
 pub mod config;
 pub mod types;
 pub mod trail;
+pub mod watch;
 
 #[cfg(any(test, feature = "dimacs"))]
 pub mod dimacs;
