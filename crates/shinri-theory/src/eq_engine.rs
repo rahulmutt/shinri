@@ -141,6 +141,14 @@ impl EqualityEngine {
         pairs: &[(ENodeId, ENodeId)],
     ) -> Result<(), EqConflict> {
         self.cong_undo.record(self.cong_pairs.len());
+        debug_assert!(
+            self.cong_pairs.len() < u32::MAX as usize,
+            "cong_pairs arena overflow"
+        );
+        debug_assert!(
+            pairs.len() <= u32::MAX as usize - self.cong_pairs.len(),
+            "cong_pairs arena overflow"
+        );
         let start = self.cong_pairs.len() as u32;
         self.cong_pairs.extend_from_slice(pairs);
         let cref = crate::types::CongRef {
@@ -286,7 +294,7 @@ impl EqualityEngine {
         });
         let cong_pairs = &mut self.cong_pairs;
         self.cong_undo.pop_to(level, |len_before| {
-            cong_pairs.truncate(len_before);
+            cong_pairs.truncate(len_before); // truncate arena to its pre-insert length
         });
     }
 }
@@ -409,6 +417,32 @@ mod tests {
         eq.explain(fx, fy, &mut out);
         assert!(out.contains(&EqLeaf::Asserted(e1)));
         assert!(out.contains(&EqLeaf::Asserted(e2)));
+    }
+
+    #[test]
+    fn congruence_merge_is_undone_on_pop() {
+        // Verify the arena pop path: after backtracking, the congruence merge is gone.
+        let mut eq = EqualityEngine::default();
+        let x = eq.intern(term(1));
+        let y = eq.intern(term(2));
+        let fx = eq.intern(term(3));
+        let fy = eq.intern(term(4));
+        // Establish x = y at level 0.
+        eq.merge(x, y, asserted(100)).unwrap();
+        let mut events = Vec::new();
+        eq.drain_merges(&mut events);
+        // Push a new level and add a congruence merge f(x) = f(y).
+        eq.push();
+        eq.merge_congruence(fx, fy, &[(x, y)]).unwrap();
+        assert_eq!(eq.find(fx), eq.find(fy), "congruence merge must be visible");
+        eq.drain_merges(&mut events);
+        // Pop back: the congruence merge must be undone.
+        eq.pop(0);
+        assert_ne!(
+            eq.find(fx),
+            eq.find(fy),
+            "congruence merge must be undone after pop"
+        );
     }
 
     #[test]
