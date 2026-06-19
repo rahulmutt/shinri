@@ -24,8 +24,8 @@ fn igcd(a: i128, b: i128) -> i128 {
         a = b;
         b = t;
     }
-    // Safe: the only case where the gcd magnitude reaches 2^127 is gcd(MIN, MIN),
-    // which `small_canon` pre-empts via the `d < 0` checked_neg path.
+    // Safe: every caller passes d > 0 (after sign-normalization), and the gcd
+    // divides d, so gcd <= d <= i128::MAX < 2^127 — the cast never wraps.
     a as i128
 }
 

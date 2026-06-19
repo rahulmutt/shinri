@@ -35,6 +35,7 @@ impl<E> UndoLog<E> {
 
     /// Pop back to `level`, replaying each undone entry through `f` in reverse
     /// (LIFO) order. Panics in debug if `level` exceeds the current level.
+    #[inline]
     pub fn pop_to(&mut self, level: usize, mut f: impl FnMut(E)) {
         debug_assert!(level <= self.level(), "pop_to: target level above current");
         while self.level_starts.len() > level {
