@@ -120,7 +120,7 @@ impl AtomRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shinri_core::{Op, BuiltinOp};
+    use shinri_core::{BuiltinOp, Op};
 
     // Build `(<= x y)` over Real and `(= x y)` etc. via a Context.
     fn real_var(ctx: &mut Context, name: &str) -> TermId {

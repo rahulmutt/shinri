@@ -39,3 +39,7 @@ jobs:
         run: cargo nextest run -p shinri-sat --test oracle
         env:
           PROPTEST_CASES: '4000'
+      - name: shinri-theory extended props (more cases)
+        run: cargo nextest run -p shinri-theory --test props
+        env:
+          PROPTEST_CASES: '4000'

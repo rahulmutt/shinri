@@ -1,0 +1,22 @@
+[package]
+name = "shinri-theory-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+shinri-core = { path = "../../shinri-core" }
+shinri-theory = { path = ".." }
+
+[[bin]]
+name = "classify"
+path = "fuzz_targets/classify.rs"
+test = false
+doc = false
+
+[workspace]

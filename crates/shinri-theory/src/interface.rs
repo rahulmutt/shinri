@@ -104,7 +104,9 @@ fn purify_rec(
         }
     }
     if changed {
-        terms.mk_app(op, &new_children).expect("purify: sort-preserving rebuild")
+        terms
+            .mk_app(op, &new_children)
+            .expect("purify: sort-preserving rebuild")
     } else {
         t
     }
@@ -133,7 +135,7 @@ mod tests {
         let (w, def) = defs[0];
         assert_eq!(def, sum); // w := x + y
         assert_ne!(pure, fsum); // f(w) != f(x+y)
-        // The purified term is f(w).
+                                // The purified term is f(w).
         assert_eq!(pure, ctx.mk_app(Op::Uninterpreted(f), &[w]).unwrap());
     }
 

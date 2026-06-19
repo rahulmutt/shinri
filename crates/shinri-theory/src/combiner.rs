@@ -76,13 +76,16 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                 // Purify first: splits mixed terms, emitting defining equalities
                 // for fresh interface variables (borrow of self.terms is separate
                 // from self.eq / self.iface).
-                let (_pure, defs) = crate::interface::purify(&mut self.terms, &mut self.iface, atom);
+                let (_pure, defs) =
+                    crate::interface::purify(&mut self.terms, &mut self.iface, atom);
                 for (w, def) in defs {
                     let wn = self.eq.intern(w);
                     let dn = self.eq.intern(def);
                     self.iface.mark_shared(wn);
                     // Definitional equality holds unconditionally (level 0).
-                    let _ = self.eq.merge(wn, dn, crate::types::EqJust::Asserted(Lit::from_code(0)));
+                    let _ =
+                        self.eq
+                            .merge(wn, dn, crate::types::EqJust::Asserted(Lit::from_code(0)));
                 }
                 // Re-borrow to notify both theories of the (purified) atom.
                 let mut cx = TheoryCtx {
@@ -404,7 +407,9 @@ mod tests {
         let mut ctx = Context::new();
         let x = real_var(&mut ctx, "x");
         let y = real_var(&mut ctx, "y");
-        let le = ctx.mk_app(Op::Builtin(shinri_core::BuiltinOp::Le), &[x, y]).unwrap();
+        let le = ctx
+            .mk_app(Op::Builtin(shinri_core::BuiltinOp::Le), &[x, y])
+            .unwrap();
         let mut c: Combiner<Spy, Spy> = Combiner::with_context(ctx);
         let v = Var::new(0);
         c.register_atom(v, le).unwrap();
@@ -430,9 +435,19 @@ mod tests {
         let mut ctx = Context::new();
         let x = real_var(&mut ctx, "x");
         let y = real_var(&mut ctx, "y");
-        let xy = ctx.mk_app(shinri_core::Op::Builtin(shinri_core::BuiltinOp::Mul), &[x, y]).unwrap();
+        let xy = ctx
+            .mk_app(
+                shinri_core::Op::Builtin(shinri_core::BuiltinOp::Mul),
+                &[x, y],
+            )
+            .unwrap();
         let z = real_var(&mut ctx, "z");
-        let le = ctx.mk_app(shinri_core::Op::Builtin(shinri_core::BuiltinOp::Le), &[xy, z]).unwrap();
+        let le = ctx
+            .mk_app(
+                shinri_core::Op::Builtin(shinri_core::BuiltinOp::Le),
+                &[xy, z],
+            )
+            .unwrap();
         let mut c: Combiner<Spy, Spy> = Combiner::with_context(ctx);
         assert!(c.register_atom(Var::new(0), le).is_err());
     }
@@ -477,7 +492,13 @@ mod tests {
         c.euf.p = Some(Lit::new(Var::new(7), true));
         let mut out = Vec::new();
         assert!(c.propagate(&mut out).is_none());
-        assert_eq!(out, vec![(Lit::new(Var::new(7), true), TheoryJust { theory: 2, tag: 0 })]);
+        assert_eq!(
+            out,
+            vec![(
+                Lit::new(Var::new(7), true),
+                TheoryJust { theory: 2, tag: 0 }
+            )]
+        );
     }
 
     /// On check(Full), merges e-nodes for term(1) and term(2) once.
@@ -491,7 +512,11 @@ mod tests {
         fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
             None
         }
-        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> {
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _o: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
             None
         }
         fn check(&mut self, cx: &mut TheoryCtx, _e: Effort) -> TCheck {
@@ -499,7 +524,9 @@ mod tests {
                 self.done = true;
                 let a = cx.eq.intern(TermId::new(1).unwrap());
                 let b = cx.eq.intern(TermId::new(2).unwrap());
-                let _ = cx.eq.merge(a, b, EqJust::Interface(TheoryJust { theory: 3, tag: 0 }));
+                let _ = cx
+                    .eq
+                    .merge(a, b, EqJust::Interface(TheoryJust { theory: 3, tag: 0 }));
             }
             TCheck::Sat
         }
@@ -518,7 +545,11 @@ mod tests {
         fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
             None
         }
-        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> {
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _o: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
             None
         }
         fn check(&mut self, cx: &mut TheoryCtx, _e: Effort) -> TCheck {
@@ -564,13 +595,19 @@ mod tests {
         fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
             None
         }
-        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> {
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _o: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
             None
         }
         fn check(&mut self, cx: &mut TheoryCtx, _e: Effort) -> TCheck {
             let a = cx.eq.intern(TermId::new(1).unwrap());
             let b = cx.eq.intern(TermId::new(2).unwrap());
-            let _ = cx.eq.merge(a, b, EqJust::Interface(TheoryJust { theory: 3, tag: 0 }));
+            let _ = cx
+                .eq
+                .merge(a, b, EqJust::Interface(TheoryJust { theory: 3, tag: 0 }));
             TCheck::Sat
         }
         fn explain(&mut self, _cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
@@ -615,7 +652,11 @@ mod tests {
         fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
             None
         }
-        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> {
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _o: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
             None
         }
         fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
@@ -625,7 +666,9 @@ mod tests {
         fn model(&mut self, _cx: &mut TheoryCtx, m: &mut ModelBuilder) {
             m.assign(
                 TermId::new(1).unwrap(),
-                crate::types::ModelVal::Num(shinri_core::Rational::from_int((self.k as i128).into())),
+                crate::types::ModelVal::Num(shinri_core::Rational::from_int(
+                    (self.k as i128).into(),
+                )),
             );
         }
         fn push(&mut self) {}
@@ -639,7 +682,9 @@ mod tests {
         let m = c.build_model();
         assert_eq!(
             m.get(TermId::new(1).unwrap()),
-            Some(&crate::types::ModelVal::Num(shinri_core::Rational::from_int(42i128.into())))
+            Some(&crate::types::ModelVal::Num(
+                shinri_core::Rational::from_int(42i128.into())
+            ))
         );
     }
 
@@ -659,7 +704,10 @@ mod tests {
         c.register_atom(v, le).unwrap();
         c.assert(Lit::new(v, true));
         let mut out = Vec::new();
-        assert!(c.propagate(&mut out).is_some(), "stashed conflict must surface");
+        assert!(
+            c.propagate(&mut out).is_some(),
+            "stashed conflict must surface"
+        );
         let mut out2 = Vec::new();
         assert!(c.propagate(&mut out2).is_none(), "conflict must be drained");
     }

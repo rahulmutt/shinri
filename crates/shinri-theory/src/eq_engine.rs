@@ -48,7 +48,8 @@ impl EqualityEngine {
             size: 1,
         });
         self.fparent.push(id);
-        self.flabel.push(EqJust::Asserted(shinri_core::Lit::from_code(0))); // placeholder for a root
+        self.flabel
+            .push(EqJust::Asserted(shinri_core::Lit::from_code(0))); // placeholder for a root
         self.term_to_node.insert(t, id);
         id
     }
@@ -78,12 +79,7 @@ impl EqualityEngine {
     }
 
     /// Record `a != b`. Conflict if they are already equal.
-    pub fn assert_diseq(
-        &mut self,
-        a: ENodeId,
-        b: ENodeId,
-        j: EqJust,
-    ) -> Result<(), EqConflict> {
+    pub fn assert_diseq(&mut self, a: ENodeId, b: ENodeId, j: EqJust) -> Result<(), EqConflict> {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra == rb {
