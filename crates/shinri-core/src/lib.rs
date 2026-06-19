@@ -5,5 +5,9 @@
 
 pub mod ids;
 pub mod symbol;
+pub mod sort;
+pub mod context;
 
 pub use ids::{ClauseId, Lit, RatId, SortId, SymbolId, TermId, Var};
+pub use context::Context;
+pub use sort::SortNode;
