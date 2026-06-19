@@ -8,5 +8,5 @@
 pub mod types;
 pub mod eq_engine;
 
-pub use types::{ENodeId, EqConflict, EqJust, EqLeaf, Explainer, ModelVal, Owner};
+pub use types::{ENodeId, EqConflict, EqJust, EqLeaf, Explainer, MergeEvent, ModelVal, Owner};
 pub use eq_engine::EqualityEngine;

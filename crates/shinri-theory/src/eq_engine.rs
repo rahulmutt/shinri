@@ -33,6 +33,7 @@ pub struct EqualityEngine {
     fparent: Vec<ENodeId>,
     flabel: Vec<EqJust>,
     forest_undo: UndoLog<ENodeId>, // the node whose forest edge was added
+    merges: Vec<crate::types::MergeEvent>,
 }
 
 impl EqualityEngine {
@@ -124,6 +125,7 @@ impl EqualityEngine {
         });
         self.nodes[child.index()].parent = root;
         self.nodes[root.index()].size += self.nodes[child.index()].size;
+        self.merges.push(crate::types::MergeEvent { a, b });
         Ok(())
     }
 
@@ -230,6 +232,10 @@ impl EqualityEngine {
         }
     }
 
+    pub fn drain_merges(&mut self, out: &mut Vec<crate::types::MergeEvent>) {
+        out.append(&mut self.merges);
+    }
+
     pub fn push(&mut self) {
         self.undo.push_level();
         self.diseq_undo.push_level();
@@ -237,6 +243,7 @@ impl EqualityEngine {
     }
 
     pub fn pop(&mut self, level: usize) {
+        debug_assert!(self.merges.is_empty(), "pop with undrained merge events");
         let nodes = &mut self.nodes;
         self.undo.pop_to(level, |u| {
             nodes[u.child.index()].parent = u.child;
@@ -297,6 +304,8 @@ mod tests {
         eq.push(); // level 1
         eq.merge(a, b, asserted(20)).unwrap();
         assert!(eq.are_equal(a, b));
+        let mut events = Vec::new();
+        eq.drain_merges(&mut events); // drain before pop
         eq.pop(0); // back to level 0
         assert!(!eq.are_equal(a, b));
         assert_ne!(eq.find(a), eq.find(b));
@@ -382,6 +391,35 @@ mod tests {
         let mut out = Vec::new();
         eq.explain(a, b, &mut out);
         assert_eq!(out, vec![EqLeaf::Asserted(ab)]);
+    }
+
+    #[test]
+    fn merges_are_queued_and_drained_once() {
+        let mut eq = EqualityEngine::default();
+        let a = eq.intern(term(1));
+        let b = eq.intern(term(2));
+        let c = eq.intern(term(3));
+        eq.merge(a, b, asserted(80)).unwrap();
+        eq.merge(b, c, asserted(81)).unwrap();
+        let mut events = Vec::new();
+        eq.drain_merges(&mut events);
+        assert_eq!(events.len(), 2);
+        // Draining again yields nothing (queue emptied).
+        let mut again = Vec::new();
+        eq.drain_merges(&mut again);
+        assert!(again.is_empty());
+    }
+
+    #[test]
+    fn redundant_merge_queues_no_event() {
+        let mut eq = EqualityEngine::default();
+        let a = eq.intern(term(1));
+        let b = eq.intern(term(2));
+        eq.merge(a, b, asserted(90)).unwrap();
+        eq.merge(a, b, asserted(91)).unwrap(); // already equal -> no-op
+        let mut events = Vec::new();
+        eq.drain_merges(&mut events);
+        assert_eq!(events.len(), 1);
     }
 }
 

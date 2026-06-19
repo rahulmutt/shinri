@@ -90,6 +90,13 @@ pub enum ModelVal {
     Elem(SortId, u32),
 }
 
+/// A class-union that occurred, surfaced to consumers via `drain_merges`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct MergeEvent {
+    pub a: ENodeId,
+    pub b: ENodeId,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
