@@ -177,6 +177,39 @@ mod tests {
         }
     }
 
+    /// Returns a conflict on its FIRST assert, then never again. Lets us drive
+    /// the assert→propagate `pending_conflict` bridge.
+    #[derive(Default)]
+    struct AssertConflicter {
+        fired: bool,
+    }
+    impl TheorySolver for AssertConflicter {
+        const THEORY_ID: u16 = 7;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> {
+            if !self.fired {
+                self.fired = true;
+                Some(vec![EqLeaf::Asserted(Lit::new(Var::new(99), true))])
+            } else {
+                None
+            }
+        }
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _out: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            TCheck::Sat
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _level: usize) {}
+    }
+
     fn real_var(ctx: &mut Context, name: &str) -> TermId {
         let real = ctx.real_sort();
         let sym = ctx.declare_fun(name, &[], real);
@@ -199,8 +232,7 @@ mod tests {
 
     #[test]
     fn push_pop_track_absolute_levels() {
-        let c: Combiner<Spy, Spy> = Combiner::default();
-        let mut c = c;
+        let mut c: Combiner<Spy, Spy> = Combiner::default();
         c.push();
         c.push();
         assert_eq!(c.level, 2);
@@ -220,5 +252,26 @@ mod tests {
         let le = ctx.mk_app(shinri_core::Op::Builtin(shinri_core::BuiltinOp::Le), &[xy, z]).unwrap();
         let mut c: Combiner<Spy, Spy> = Combiner::with_context(ctx);
         assert!(c.register_atom(Var::new(0), le).is_err());
+    }
+
+    #[test]
+    fn assert_conflict_is_stashed_and_surfaced_by_propagate() {
+        // A `Le` atom routes to `arith`; make arith the conflicter. The
+        // infallible assert stashes the conflict; the next propagate surfaces
+        // and drains it; a following propagate is clean.
+        let mut ctx = Context::new();
+        let x = real_var(&mut ctx, "x");
+        let y = real_var(&mut ctx, "y");
+        let le = ctx
+            .mk_app(Op::Builtin(shinri_core::BuiltinOp::Le), &[x, y])
+            .unwrap();
+        let mut c: Combiner<Spy, AssertConflicter> = Combiner::with_context(ctx);
+        let v = Var::new(0);
+        c.register_atom(v, le).unwrap();
+        c.assert(Lit::new(v, true));
+        let mut out = Vec::new();
+        assert!(c.propagate(&mut out).is_some(), "stashed conflict must surface");
+        let mut out2 = Vec::new();
+        assert!(c.propagate(&mut out2).is_none(), "conflict must be drained");
     }
 }
