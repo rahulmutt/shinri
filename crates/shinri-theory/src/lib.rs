@@ -12,6 +12,7 @@ pub mod model;
 pub mod solver_trait;
 pub mod combiner;
 pub mod interface;
+pub mod proof;
 
 pub use types::{ENodeId, EqConflict, EqJust, EqLeaf, Explainer, MergeEvent, ModelVal, Owner};
 pub use eq_engine::EqualityEngine;
@@ -20,3 +21,4 @@ pub use model::ModelBuilder;
 pub use solver_trait::{TCheck, TheoryCtx, TheorySolver};
 pub use combiner::Combiner;
 pub use interface::InterfaceSet;
+pub use proof::{CertError, CertLog, CertStep};

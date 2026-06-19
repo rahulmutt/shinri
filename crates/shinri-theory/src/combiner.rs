@@ -5,6 +5,7 @@
 use crate::atom::{classify, AtomRegistry, Unsupported};
 use crate::eq_engine::EqualityEngine;
 use crate::interface::InterfaceSet;
+use crate::proof::CertLog;
 use crate::solver_trait::{TCheck, TheoryCtx, TheorySolver};
 use crate::types::{Explainer, MergeEvent, Owner};
 use rustc_hash::FxHashSet;
@@ -23,6 +24,7 @@ pub struct Combiner<E: TheorySolver, A: TheorySolver> {
     /// A conflict detected during `assert` (the SAT seam's `assert` is
     /// infallible); surfaced on the next `propagate` (spec §5.2 bridge).
     pending_conflict: Option<Vec<crate::types::EqLeaf>>,
+    cert: CertLog,
 }
 
 impl<E: TheorySolver, A: TheorySolver> Default for Combiner<E, A> {
@@ -43,6 +45,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
             level: 0,
             merges: Vec::new(),
             pending_conflict: None,
+            cert: CertLog::default(),
         }
     }
 
@@ -245,10 +248,18 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
             exp.push_leaf(leaf);
         }
         self.resolve(&mut exp);
-        let mut clause: Vec<Lit> = exp.take_lits().into_iter().map(|l| l.negate()).collect();
+        let antecedents = exp.take_lits();
+        let mut clause: Vec<Lit> = antecedents.iter().map(|l| l.negate()).collect();
         clause.sort_unstable_by_key(|l| l.code());
         clause.dedup();
+        if !antecedents.is_empty() {
+            self.cert.record(&clause, &antecedents);
+        }
         clause
+    }
+
+    pub fn cert_log(&self) -> &crate::proof::CertLog {
+        &self.cert
     }
 
     /// Drive the Explainer to a fixpoint: expand each pending interface
@@ -551,6 +562,14 @@ mod tests {
             }
             other => panic!("expected conflict, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn emitted_conflict_is_recorded_and_rechecks() {
+        let mut c: Combiner<Explained, Splitter> = Combiner::default();
+        let _ = c.check(Effort::Full);
+        assert_eq!(c.cert_log().steps().len(), 1);
+        assert_eq!(c.cert_log().recheck(), Ok(()));
     }
 
     #[test]
