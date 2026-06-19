@@ -1,7 +1,8 @@
-use crate::ids::{RatId, SortId, TermId};
+use crate::error::SortError;
+use crate::ids::{RatId, SortId, SymbolId, TermId};
 use crate::sort::SortNode;
 use crate::symbol::StringInterner;
-use crate::term::{ChildSlice, ConstVal, TermNode};
+use crate::term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
 use rustc_hash::FxHashMap;
 use shinri_num::Rational;
 
@@ -14,6 +15,7 @@ pub struct Context {
     children: Vec<TermId>,
     nums: Vec<Rational>,
     term_interner: FxHashMap<TermKey, TermId>,
+    fun_sigs: FxHashMap<SymbolId, (Vec<SortId>, SortId)>,
     bool_sort: SortId,
     int_sort: SortId,
     real_sort: SortId,
@@ -35,6 +37,7 @@ impl Context {
             children: Vec::new(),
             nums: Vec::new(),
             term_interner: FxHashMap::default(),
+            fun_sigs: FxHashMap::default(),
             // placeholders; overwritten immediately below
             bool_sort: SortId::from_index(0),
             int_sort: SortId::from_index(0),
@@ -77,6 +80,169 @@ impl Context {
     pub fn sort_node(&self, id: SortId) -> &SortNode {
         &self.sorts[id.index()]
     }
+}
+
+impl Context {
+    pub fn sort_of(&self, t: TermId) -> SortId {
+        match self.term_node(t) {
+            TermNode::App { sort, .. } => *sort,
+            TermNode::Const { sort, .. } => *sort,
+        }
+    }
+
+    pub fn declare_fun(&mut self, name: &str, params: &[SortId], result: SortId) -> SymbolId {
+        let sym = self.symbols.intern(name);
+        self.fun_sigs.insert(sym, (params.to_vec(), result));
+        sym
+    }
+
+    /// Build (and intern) `op` applied to `args`, checking well-sortedness.
+    pub fn mk_app(&mut self, op: Op, args: &[TermId]) -> Result<TermId, SortError> {
+        let result_sort = self.check_app(op, args)?;
+        let slice = self.push_children(args);
+        let key = TermKey::App { op, args: args.to_vec(), sort: result_sort };
+        Ok(self.intern_with_key(
+            key,
+            TermNode::App { op, args: slice, sort: result_sort },
+        ))
+    }
+
+    pub fn mk_eq(&mut self, a: TermId, b: TermId) -> Result<TermId, SortError> {
+        self.mk_app(Op::Builtin(BuiltinOp::Eq), &[a, b])
+    }
+
+    /// Returns the result sort if the application is well-sorted.
+    fn check_app(&self, op: Op, args: &[TermId]) -> Result<SortId, SortError> {
+        let bool_s = self.bool_sort();
+        match op {
+            Op::Uninterpreted(sym) => {
+                let (params, result) = self
+                    .fun_sigs
+                    .get(&sym)
+                    .ok_or(SortError::UndeclaredSymbol)?;
+                if args.len() != params.len() {
+                    return Err(SortError::Arity {
+                        expected: params.len(),
+                        found: args.len(),
+                    });
+                }
+                for (&arg, &expected) in args.iter().zip(params.iter()) {
+                    let found = self.sort_of(arg);
+                    if found != expected {
+                        return Err(SortError::Mismatch { expected, found });
+                    }
+                }
+                Ok(*result)
+            }
+            Op::Builtin(b) => self.check_builtin(b, args, bool_s),
+        }
+    }
+
+    fn check_builtin(
+        &self,
+        b: BuiltinOp,
+        args: &[TermId],
+        bool_s: SortId,
+    ) -> Result<SortId, SortError> {
+        use BuiltinOp::*;
+        let int_s = self.int_sort();
+        let real_s = self.real_sort();
+        let is_arith = |s: SortId| s == int_s || s == real_s;
+        match b {
+            // Boolean connectives: all args Bool -> Bool.
+            Not => {
+                expect_arity(args, 1)?;
+                expect_all(self, args, bool_s)?;
+                Ok(bool_s)
+            }
+            And | Or | Implies | Xor => {
+                if args.len() < 2 {
+                    return Err(SortError::Arity { expected: 2, found: args.len() });
+                }
+                expect_all(self, args, bool_s)?;
+                Ok(bool_s)
+            }
+            Ite => {
+                expect_arity(args, 3)?;
+                if self.sort_of(args[0]) != bool_s {
+                    return Err(SortError::Mismatch {
+                        expected: bool_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                let then_s = self.sort_of(args[1]);
+                let else_s = self.sort_of(args[2]);
+                if then_s != else_s {
+                    return Err(SortError::Mismatch { expected: then_s, found: else_s });
+                }
+                Ok(then_s)
+            }
+            // Equality / distinct: >=2 args of one common sort -> Bool.
+            Eq | Distinct => {
+                if args.len() < 2 {
+                    return Err(SortError::Arity { expected: 2, found: args.len() });
+                }
+                let first = self.sort_of(args[0]);
+                for &a in &args[1..] {
+                    let s = self.sort_of(a);
+                    if s != first {
+                        return Err(SortError::Mismatch { expected: first, found: s });
+                    }
+                }
+                Ok(bool_s)
+            }
+            // Arithmetic: all args one arithmetic sort.
+            Neg => {
+                expect_arity(args, 1)?;
+                let s = self.sort_of(args[0]);
+                if !is_arith(s) {
+                    return Err(SortError::NotApplicable);
+                }
+                Ok(s)
+            }
+            Add | Sub | Mul => {
+                if args.len() < 2 {
+                    return Err(SortError::Arity { expected: 2, found: args.len() });
+                }
+                let s = self.sort_of(args[0]);
+                if !is_arith(s) {
+                    return Err(SortError::NotApplicable);
+                }
+                for &a in &args[1..] {
+                    if self.sort_of(a) != s {
+                        return Err(SortError::NotApplicable);
+                    }
+                }
+                Ok(s)
+            }
+            Le | Lt | Ge | Gt => {
+                expect_arity(args, 2)?;
+                let s = self.sort_of(args[0]);
+                if !is_arith(s) || self.sort_of(args[1]) != s {
+                    return Err(SortError::NotApplicable);
+                }
+                Ok(bool_s)
+            }
+        }
+    }
+}
+
+fn expect_arity(args: &[TermId], n: usize) -> Result<(), SortError> {
+    if args.len() == n {
+        Ok(())
+    } else {
+        Err(SortError::Arity { expected: n, found: args.len() })
+    }
+}
+
+fn expect_all(ctx: &Context, args: &[TermId], expected: SortId) -> Result<(), SortError> {
+    for &a in args {
+        let found = ctx.sort_of(a);
+        if found != expected {
+            return Err(SortError::Mismatch { expected, found });
+        }
+    }
+    Ok(())
 }
 
 /// A fully-resolved structural key for term interning. Distinct from `TermNode`
@@ -146,8 +312,9 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::SortError;
     use crate::sort::SortNode;
-    use crate::term::{ConstVal, TermNode};
+    use crate::term::{BuiltinOp, ConstVal, Op, TermNode};
     use shinri_num::Rational;
 
     #[test]
@@ -196,5 +363,56 @@ mod tests {
         let c = ctx.mk_numeral(Rational::from_int(8i128.into()), int);
         assert_eq!(a, b);
         assert_ne!(a, c);
+    }
+
+    #[test]
+    fn mk_app_checks_arithmetic_sorts() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let two = ctx.mk_numeral(shinri_num::Rational::from_int(2i128.into()), int);
+        let three = ctx.mk_numeral(shinri_num::Rational::from_int(3i128.into()), int);
+        // 2 + 3 : Int
+        let sum = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[two, three]).unwrap();
+        assert_eq!(ctx.sort_of(sum), int);
+        // 2 <= 3 : Bool
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[two, three]).unwrap();
+        assert_eq!(ctx.sort_of(le), ctx.bool_sort());
+    }
+
+    #[test]
+    fn mk_app_rejects_bool_in_arithmetic() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let two = ctx.mk_numeral(shinri_num::Rational::from_int(2i128.into()), int);
+        let t = ctx.mk_const_bool(true);
+        let err = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[two, t]).unwrap_err();
+        assert_eq!(err, SortError::NotApplicable);
+    }
+
+    #[test]
+    fn mk_eq_requires_matching_sorts() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let two = ctx.mk_numeral(shinri_num::Rational::from_int(2i128.into()), int);
+        let t = ctx.mk_const_bool(true);
+        assert!(ctx.mk_eq(two, two).is_ok());
+        assert!(matches!(ctx.mk_eq(two, t), Err(SortError::Mismatch { .. })));
+        let eq_id = ctx.mk_eq(two, two).unwrap();
+        assert_eq!(ctx.sort_of(eq_id), ctx.bool_sort());
+    }
+
+    #[test]
+    fn uninterpreted_application_checks_signature() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let bool_s = ctx.bool_sort();
+        // declare-fun p (Int) Bool
+        let p = ctx.declare_fun("p", &[int], bool_s);
+        let two = ctx.mk_numeral(shinri_num::Rational::from_int(2i128.into()), int);
+        let app = ctx.mk_app(Op::Uninterpreted(p), &[two]).unwrap();
+        assert_eq!(ctx.sort_of(app), bool_s);
+        // wrong arity
+        let err = ctx.mk_app(Op::Uninterpreted(p), &[two, two]).unwrap_err();
+        assert_eq!(err, SortError::Arity { expected: 1, found: 2 });
     }
 }
