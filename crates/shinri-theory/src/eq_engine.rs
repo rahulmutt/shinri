@@ -2,7 +2,7 @@
 //! disequalities, proof forest, and merge events. The single source of
 //! equality truth for all theories (spec §4).
 
-use crate::types::{ENodeId, EqConflict, EqJust};
+use crate::types::{ENodeId, EqConflict, EqJust, EqLeaf};
 use shinri_core::{TermId, UndoLog};
 
 /// One e-node: its union-find parent and class size (for union-by-size).
@@ -28,6 +28,11 @@ pub struct EqualityEngine {
     /// with the justification that asserted them. Backtracked via `diseq_undo`.
     diseqs: rustc_hash::FxHashMap<(ENodeId, ENodeId), EqJust>,
     diseq_undo: UndoLog<(ENodeId, ENodeId)>,
+    /// Proof forest: `fparent[n]` and the label of the edge n→fparent[n].
+    /// `fparent[n] == n` means n is a forest root. Backtracked via `forest_undo`.
+    fparent: Vec<ENodeId>,
+    flabel: Vec<EqJust>,
+    forest_undo: UndoLog<ENodeId>, // the node whose forest edge was added
 }
 
 impl EqualityEngine {
@@ -41,6 +46,8 @@ impl EqualityEngine {
             parent: id,
             size: 1,
         });
+        self.fparent.push(id);
+        self.flabel.push(EqJust::Asserted(shinri_core::Lit::from_code(0))); // placeholder for a root
         self.term_to_node.insert(t, id);
         id
     }
@@ -88,9 +95,8 @@ impl EqualityEngine {
         Ok(())
     }
 
-    /// Union the classes of `a` and `b`. `_j` is recorded by the proof forest
-    /// in Task 4; here it is accepted but unused.
-    pub fn merge(&mut self, a: ENodeId, b: ENodeId, _j: EqJust) -> Result<(), EqConflict> {
+    /// Union the classes of `a` and `b`. `j` is recorded by the proof forest.
+    pub fn merge(&mut self, a: ENodeId, b: ENodeId, j: EqJust) -> Result<(), EqConflict> {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra == rb {
@@ -100,6 +106,11 @@ impl EqualityEngine {
         if let Some(&dj) = self.diseqs.get(&Self::pair(ra, rb)) {
             return Err(EqConflict { a, b, diseq: dj });
         }
+        // Splice the explanation edge a—b labelled j into the proof forest.
+        self.reroot_forest(a);
+        self.fparent[a.index()] = b;
+        self.flabel[a.index()] = j;
+        self.forest_undo.record(a);
         let (root, child) = if self.nodes[ra.index()].size >= self.nodes[rb.index()].size {
             (ra, rb)
         } else {
@@ -116,9 +127,81 @@ impl EqualityEngine {
         Ok(())
     }
 
+    /// Reverse the forest path from `n` up to its root so `n` becomes a root.
+    fn reroot_forest(&mut self, n: ENodeId) {
+        let mut prev = n;
+        let mut prev_label = self.flabel[n.index()];
+        let mut cur = self.fparent[n.index()];
+        self.fparent[n.index()] = n; // n is now a root
+        while cur != prev {
+            let next = self.fparent[cur.index()];
+            let next_label = self.flabel[cur.index()];
+            self.fparent[cur.index()] = prev;
+            self.flabel[cur.index()] = prev_label;
+            prev = cur;
+            prev_label = next_label;
+            if next == cur {
+                break;
+            }
+            cur = next;
+        }
+    }
+
+    /// Forest root of `n` (distinct from the union-find representative).
+    fn forest_root(&self, mut n: ENodeId) -> ENodeId {
+        while self.fparent[n.index()] != n {
+            n = self.fparent[n.index()];
+        }
+        n
+    }
+
+    /// Path from `n` toward the forest root (inclusive of edges, exclusive of
+    /// the root node), pushing each (node) whose edge we cross.
+    fn forest_path(&self, mut n: ENodeId, stop: ENodeId, acc: &mut Vec<ENodeId>) {
+        while n != stop {
+            acc.push(n);
+            let p = self.fparent[n.index()];
+            if p == n {
+                break;
+            }
+            n = p;
+        }
+    }
+
+    /// Collect the explanation leaves entailing `a = b` (spec §4.2).
+    pub fn explain(&self, a: ENodeId, b: ENodeId, out: &mut Vec<EqLeaf>) {
+        if a == b {
+            return;
+        }
+        // Nearest common ancestor in the forest = where the two paths meet.
+        // Both share a forest root once merged; collect each side's edges to it.
+        let root = self.forest_root(a);
+        debug_assert_eq!(root, self.forest_root(b), "explain: a,b not connected");
+        let mut path_a = Vec::new();
+        let mut path_b = Vec::new();
+        self.forest_path(a, root, &mut path_a);
+        self.forest_path(b, root, &mut path_b);
+        for n in path_a.into_iter().chain(path_b) {
+            self.expand_edge(self.flabel[n.index()], out);
+        }
+    }
+
+    /// Turn one edge label into leaves, recursing through congruences.
+    fn expand_edge(&self, label: EqJust, out: &mut Vec<EqLeaf>) {
+        match label {
+            EqJust::Asserted(l) => out.push(EqLeaf::Asserted(l)),
+            EqJust::Interface(j) => out.push(EqLeaf::Interface(j)),
+            EqJust::Congruence(s, t) => {
+                // f(..s..) = f(..t..) because s = t: recurse on the argument pair.
+                self.explain(s, t, out);
+            }
+        }
+    }
+
     pub fn push(&mut self) {
         self.undo.push_level();
         self.diseq_undo.push_level();
+        self.forest_undo.push_level();
     }
 
     pub fn pop(&mut self, level: usize) {
@@ -131,12 +214,17 @@ impl EqualityEngine {
         self.diseq_undo.pop_to(level, |key| {
             diseqs.remove(&key);
         });
+        let fparent = &mut self.fparent;
+        self.forest_undo.pop_to(level, |n| {
+            fparent[n.index()] = n; // detach the spliced edge; n becomes a root again
+        });
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::EqLeaf;
     use shinri_core::{Lit, Var};
 
     fn term(raw: u32) -> TermId {
@@ -212,6 +300,40 @@ mod tests {
         eq.pop(0);
         // After backtrack the disequality is gone, so merge succeeds.
         assert!(eq.merge(a, b, asserted(51)).is_ok());
+    }
+
+    #[test]
+    fn explain_returns_the_asserted_chain() {
+        let mut eq = EqualityEngine::default();
+        let a = eq.intern(term(1));
+        let b = eq.intern(term(2));
+        let c = eq.intern(term(3));
+        let ab = Lit::new(Var::new(60), true);
+        let bc = Lit::new(Var::new(61), true);
+        eq.merge(a, b, EqJust::Asserted(ab)).unwrap();
+        eq.merge(b, c, EqJust::Asserted(bc)).unwrap();
+        let mut out = Vec::new();
+        eq.explain(a, c, &mut out);
+        assert!(out.contains(&EqLeaf::Asserted(ab)));
+        assert!(out.contains(&EqLeaf::Asserted(bc)));
+    }
+
+    #[test]
+    fn explain_expands_congruence_to_its_argument_equalities() {
+        // f(x) and f(y) merged by a Congruence edge whose argument equality is x=y.
+        let mut eq = EqualityEngine::default();
+        let x = eq.intern(term(1));
+        let y = eq.intern(term(2));
+        let fx = eq.intern(term(3));
+        let fy = eq.intern(term(4));
+        let xy = Lit::new(Var::new(70), true);
+        eq.merge(x, y, EqJust::Asserted(xy)).unwrap();
+        // The congruence driver (EUF, later) would call this on discovering f(x)~f(y):
+        eq.merge(fx, fy, EqJust::Congruence(x, y)).unwrap();
+        let mut out = Vec::new();
+        eq.explain(fx, fy, &mut out);
+        // Expands to the underlying asserted x=y, not the synthetic congruence edge.
+        assert_eq!(out, vec![EqLeaf::Asserted(xy)]);
     }
 }
 
