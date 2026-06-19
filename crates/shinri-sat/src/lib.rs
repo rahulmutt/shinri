@@ -12,6 +12,7 @@ pub mod types;
 pub mod trail;
 pub mod watch;
 pub mod solver;
+pub mod reduce;
 
 #[cfg(any(test, feature = "dimacs"))]
 pub mod dimacs;

@@ -13,7 +13,8 @@ impl ClauseRef {
 
 const HEADER_WORDS: usize = 3;
 const LEARNT_BIT: u32 = 1 << 31;
-const LBD_MASK: u32 = 0x7FFF_FFFF;
+const DELETED_BIT: u32 = 1 << 30;
+const LBD_MASK: u32 = 0x3FFF_FFFF;
 
 /// The clause database: one flat `u32` arena. Binary clauses are NOT stored
 /// here — they live implicitly in the watch lists (Task 6).
@@ -88,8 +89,20 @@ impl ClauseDb {
     #[inline]
     pub fn set_lbd(&mut self, r: ClauseRef, lbd: u32) {
         let off = self.off(r);
-        let learnt = self.arena[off + 1] & LEARNT_BIT;
-        self.arena[off + 1] = learnt | (lbd & LBD_MASK);
+        let keep = self.arena[off + 1] & (LEARNT_BIT | DELETED_BIT);
+        self.arena[off + 1] = keep | (lbd & LBD_MASK);
+    }
+
+    #[inline]
+    pub fn is_deleted(&self, r: ClauseRef) -> bool {
+        let off = self.off(r);
+        self.arena[off + 1] & DELETED_BIT != 0
+    }
+
+    #[inline]
+    pub fn mark_deleted(&mut self, r: ClauseRef) {
+        let off = self.off(r);
+        self.arena[off + 1] |= DELETED_BIT;
     }
 
     #[inline]

@@ -19,6 +19,9 @@ pub struct Solver {
     pub(crate) unsat: bool,
     pub(crate) analyzer: Analyzer,
     pub(crate) stats_minimized: u64,
+    pub(crate) learnts: Vec<ClauseRef>,
+    pub(crate) conflicts: u64,
+    pub(crate) stats_deleted: u64,
 }
 
 impl Solver {
@@ -32,6 +35,9 @@ impl Solver {
             unsat: false,
             analyzer: Analyzer::default(),
             stats_minimized: 0,
+            learnts: Vec::new(),
+            conflicts: 0,
+            stats_deleted: 0,
         }
     }
 
@@ -211,9 +217,48 @@ impl Solver {
             _ => {
                 let (_id, r) = self.db.add_clause(learnt, true);
                 self.watches.watch_clause(r, learnt[0], learnt[1]);
+                self.learnts.push(r);
                 Some(r)
             }
         }
+    }
+
+    /// Literal Block Distance: the number of distinct decision levels in `lits`.
+    fn compute_lbd(&self, lits: &[Lit]) -> u32 {
+        let mut levels: Vec<u32> = lits.iter().map(|l| self.assign.level(l.var())).collect();
+        levels.sort_unstable();
+        levels.dedup();
+        levels.len() as u32
+    }
+
+    /// A learnt clause is locked iff it is currently the reason of its asserting
+    /// literal (`lits[0]`), so deleting it would orphan a trail assignment.
+    fn is_locked(&self, r: ClauseRef) -> bool {
+        let l0 = self.db.lit_at(r, 0);
+        self.assign.value(l0.var()) != LBool::Unset
+            && matches!(self.assign.reason(l0.var()), Reason::Clause(rr) if rr == r)
+    }
+
+    /// Delete the high-LBD half of the learnt database (lazy deletion), keeping
+    /// every clause with glue <= threshold and every locked clause.
+    pub(crate) fn reduce(&mut self) {
+        let keep_glue = self.config.lbd_keep_threshold;
+        let mut refs: Vec<ClauseRef> =
+            self.learnts.iter().copied().filter(|&r| !self.db.is_deleted(r)).collect();
+        refs.sort_by_key(|&r| self.db.lbd(r));
+        let n = refs.len();
+        let half = n / 2;
+        let mut survivors = Vec::with_capacity(n);
+        for (i, r) in refs.iter().copied().enumerate() {
+            let in_worst_half = i >= n - half;
+            if in_worst_half && self.db.lbd(r) > keep_glue && !self.is_locked(r) {
+                self.db.mark_deleted(r);
+                self.stats_deleted += 1;
+            } else {
+                survivors.push(r);
+            }
+        }
+        self.learnts = survivors;
     }
 
     /// CDCL search with 1-UIP conflict analysis, clause learning, and
@@ -238,6 +283,14 @@ impl Solver {
                         None => Reason::Unit,
                     };
                     self.enqueue(asserting, reason);
+                    self.conflicts += 1;
+                    let lbd = self.compute_lbd(&learnt);
+                    if let Reason::Clause(r) = reason {
+                        self.db.set_lbd(r, lbd);
+                    }
+                    if self.conflicts % self.config.reduce_interval as u64 == 0 {
+                        self.reduce();
+                    }
                 }
                 None => match self.pick_branch() {
                     Some(l) => {
@@ -349,6 +402,9 @@ impl Solver {
                         }
                     }
                     WatchTarget::Clause(r) => {
+                        if self.db.is_deleted(r) {
+                            continue; // garbage-collect this watch entry
+                        }
                         // Keep watched lits at slots 0,1; put the false lit at 1.
                         if self.db.lit_at(r, 0) == false_lit {
                             self.db.swap_lits(r, 0, 1);
@@ -512,5 +568,21 @@ mod tests {
         // x0,x1 true => ternary forces x2 true; (¬x2) unit forces x2 false => conflict.
         let c = s.propagate();
         assert!(c.is_some(), "expected a conflict");
+    }
+
+    #[test]
+    fn reduce_deletes_high_lbd_unlocked_learnts() {
+        let mut s = mk(6);
+        // Install three "learnt" clauses directly with controlled LBD.
+        let r_lo = s.add_learnt(&[lit(0, true), lit(1, true), lit(2, true)]).unwrap();
+        let r_hi = s.add_learnt(&[lit(3, true), lit(4, true), lit(5, true)]).unwrap();
+        s.learnts.push(r_lo);
+        s.learnts.push(r_hi);
+        s.db.set_lbd(r_lo, 2); // glue, protected (<= threshold 2)
+        s.db.set_lbd(r_hi, 9); // high glue, deletable
+        s.reduce();
+        assert!(!s.db.is_deleted(r_lo), "low-LBD clause kept");
+        assert!(s.db.is_deleted(r_hi), "high-LBD clause deleted");
+        assert!(s.stats_deleted >= 1);
     }
 }
