@@ -88,6 +88,17 @@ impl Lit {
     pub fn negate(self) -> Lit {
         Lit(self.0 ^ 1)
     }
+    /// The raw packed code (`var << 1 | sign`). Lets the SAT layer pack
+    /// literals into the clause arena and index watch lists by `code as usize`.
+    #[inline]
+    pub fn code(self) -> u32 {
+        self.0
+    }
+    /// Reconstruct a literal from its raw packed code.
+    #[inline]
+    pub fn from_code(code: u32) -> Lit {
+        Lit(code)
+    }
 }
 
 #[cfg(test)]
@@ -119,5 +130,14 @@ mod tests {
         assert!(!neg.is_positive());
         assert_eq!(pos.negate(), neg);
         assert_eq!(neg.negate(), pos);
+    }
+
+    #[test]
+    fn lit_code_roundtrips() {
+        let v = Var::new(9);
+        let l = Lit::new(v, false);
+        assert_eq!(Lit::from_code(l.code()), l);
+        assert_eq!(Lit::new(v, true).code() ^ 1, l.code()); // sign bit toggles
+        assert_eq!(Lit::from_code(Lit::new(v, true).code()), Lit::new(v, true));
     }
 }

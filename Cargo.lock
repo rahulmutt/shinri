@@ -296,6 +296,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "shinri-sat"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "shinri-core",
+ "splr",
+]
+
+[[package]]
+name = "splr"
+version = "0.17.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c6c8d72268886573a95520ff76c282876c69d3776e02a0b4ac8eea2b310d69ca"
+dependencies = [
+ "bitflags",
+]
+
+[[package]]
 name = "syn"
 version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -29,6 +29,12 @@ pub trait ProofSink {
 /// The default, zero-cost sink: a ZST whose methods inline to nothing.
 pub struct NoProof;
 
+impl Default for NoProof {
+    fn default() -> Self {
+        NoProof
+    }
+}
+
 impl ProofSink for NoProof {
     #[inline(always)]
     fn input(&mut self, _c: ClauseId, _lits: &[Lit]) {}
