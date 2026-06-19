@@ -307,6 +307,36 @@ impl Context {
         let end = start + slice.len as usize;
         &self.children[start..end]
     }
+
+    /// Rebuild `t`, replacing each occurrence of `params[i]` with `args[i]`.
+    /// Re-interns the result (maximal sharing preserved).
+    pub fn substitute(&mut self, t: TermId, params: &[TermId], args: &[TermId]) -> TermId {
+        debug_assert_eq!(params.len(), args.len(), "substitute: param/arg length mismatch");
+        // Direct replacement at this node?
+        if let Some(pos) = params.iter().position(|&p| p == t) {
+            return args[pos];
+        }
+        match self.term_node(t).clone() {
+            TermNode::Const { .. } => t, // constants contain no params
+            TermNode::App { op, args: slice, .. } => {
+                let child_ids: Vec<TermId> = self.children(slice).to_vec();
+                let mut new_children = Vec::with_capacity(child_ids.len());
+                let mut changed = false;
+                for c in child_ids {
+                    let nc = self.substitute(c, params, args);
+                    changed |= nc != c;
+                    new_children.push(nc);
+                }
+                if !changed {
+                    return t;
+                }
+                // A sort-consistent substitution cannot make a well-sorted term
+                // ill-sorted, so this rebuild always succeeds.
+                self.mk_app(op, &new_children)
+                    .expect("substitute: sort-consistent rebuild cannot fail")
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -414,5 +444,32 @@ mod tests {
         // wrong arity
         let err = ctx.mk_app(Op::Uninterpreted(p), &[two, two]).unwrap_err();
         assert_eq!(err, SortError::Arity { expected: 1, found: 2 });
+    }
+
+    #[test]
+    fn substitute_replaces_leaves_and_reinterns() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        // body: x + 1, with x a placeholder param (an uninterpreted Int constant)
+        let xsym = ctx.declare_fun("x", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xsym), &[]).unwrap();
+        let one = ctx.mk_numeral(shinri_num::Rational::from_int(1i128.into()), int);
+        let body = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, one]).unwrap();
+        // substitute x := 5  =>  5 + 1
+        let five = ctx.mk_numeral(shinri_num::Rational::from_int(5i128.into()), int);
+        let result = ctx.substitute(body, &[x], &[five]);
+        let expected = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[five, one]).unwrap();
+        assert_eq!(result, expected); // re-interned to the same id
+    }
+
+    #[test]
+    fn substitute_is_identity_when_no_param_occurs() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let one = ctx.mk_numeral(shinri_num::Rational::from_int(1i128.into()), int);
+        let two = ctx.mk_numeral(shinri_num::Rational::from_int(2i128.into()), int);
+        let three = ctx.mk_numeral(shinri_num::Rational::from_int(3i128.into()), int);
+        let sum = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[one, two]).unwrap();
+        assert_eq!(ctx.substitute(sum, &[three], &[one]), sum);
     }
 }
