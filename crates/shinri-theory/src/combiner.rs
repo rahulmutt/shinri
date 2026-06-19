@@ -5,6 +5,7 @@
 use crate::atom::{classify, AtomRegistry, Unsupported};
 use crate::eq_engine::EqualityEngine;
 use crate::interface::InterfaceSet;
+use crate::model::ModelBuilder;
 use crate::proof::CertLog;
 use crate::solver_trait::{TCheck, TheoryCtx, TheorySolver};
 use crate::types::{Explainer, MergeEvent, Owner};
@@ -260,6 +261,37 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
 
     pub fn cert_log(&self) -> &crate::proof::CertLog {
         &self.cert
+    }
+
+    /// Assemble the combined model (spec §7.3). Arith assigns rationals first
+    /// (interface variables included); EUF fills uninterpreted classes. The two
+    /// must agree on every shared term — a debug-asserted seam invariant.
+    pub fn build_model(&mut self) -> ModelBuilder {
+        let mut arith_m = ModelBuilder::default();
+        {
+            let mut cx = TheoryCtx {
+                terms: &self.terms,
+                eq: &mut self.eq,
+                atoms: &self.atoms,
+            };
+            self.arith.model(&mut cx, &mut arith_m);
+        }
+        let mut euf_m = ModelBuilder::default();
+        {
+            let mut cx = TheoryCtx {
+                terms: &self.terms,
+                eq: &mut self.eq,
+                atoms: &self.atoms,
+            };
+            self.euf.model(&mut cx, &mut euf_m);
+        }
+        debug_assert!(
+            arith_m.merge_check(&euf_m).is_none(),
+            "model seam disagreement on a shared term"
+        );
+        let mut combined = arith_m;
+        combined.absorb(euf_m);
+        combined
     }
 
     /// Drive the Explainer to a fixpoint: expand each pending interface
@@ -570,6 +602,45 @@ mod tests {
         let _ = c.check(Effort::Full);
         assert_eq!(c.cert_log().steps().len(), 1);
         assert_eq!(c.cert_log().recheck(), Ok(()));
+    }
+
+    /// Assigns ModelVal::Num(k) to term(1).
+    #[derive(Default)]
+    struct ValTheory {
+        k: i64,
+    }
+    impl TheorySolver for ValTheory {
+        const THEORY_ID: u16 = 5;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            TCheck::Sat
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _t: u32, _e: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, m: &mut ModelBuilder) {
+            m.assign(
+                TermId::new(1).unwrap(),
+                crate::types::ModelVal::Num(shinri_core::Rational::from_int((self.k as i128).into())),
+            );
+        }
+        fn push(&mut self) {}
+        fn pop(&mut self, _l: usize) {}
+    }
+
+    #[test]
+    fn build_model_collects_theory_assignments() {
+        let mut c: Combiner<OneShotProp, ValTheory> = Combiner::default();
+        c.arith.k = 42;
+        let m = c.build_model();
+        assert_eq!(
+            m.get(TermId::new(1).unwrap()),
+            Some(&crate::types::ModelVal::Num(shinri_core::Rational::from_int(42i128.into())))
+        );
     }
 
     #[test]

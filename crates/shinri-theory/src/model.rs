@@ -28,4 +28,24 @@ impl ModelBuilder {
     pub fn is_empty(&self) -> bool {
         self.values.is_empty()
     }
+
+    /// First term that `self` and `other` assign different values to, if any.
+    pub fn merge_check(&self, other: &ModelBuilder) -> Option<TermId> {
+        for (t, v) in self.values.iter() {
+            if let Some(ov) = other.values.get(t) {
+                if v != ov {
+                    return Some(*t);
+                }
+            }
+        }
+        None
+    }
+
+    /// Fold another builder's assignments into this one (other wins ties; the
+    /// caller has already verified agreement via `merge_check`).
+    pub fn absorb(&mut self, other: ModelBuilder) {
+        for (t, v) in other.values {
+            self.values.insert(t, v);
+        }
+    }
 }
