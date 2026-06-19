@@ -13,6 +13,7 @@ pub mod trail;
 pub mod watch;
 pub mod solver;
 pub mod reduce;
+pub mod restart;
 
 #[cfg(any(test, feature = "dimacs"))]
 pub mod dimacs;

@@ -2,6 +2,7 @@ use crate::analyze::Analyzer;
 use crate::assignment::Assignment;
 use crate::clause::{ClauseDb, ClauseRef};
 use crate::config::SolverConfig;
+use crate::restart::RestartPolicy;
 use crate::trail::Trail;
 use crate::types::{Conflict, LBool, Reason, SolveResult};
 use crate::watch::{Watch, WatchTarget, Watches};
@@ -22,6 +23,7 @@ pub struct Solver {
     pub(crate) learnts: Vec<ClauseRef>,
     pub(crate) conflicts: u64,
     pub(crate) stats_deleted: u64,
+    pub(crate) restart: RestartPolicy,
 }
 
 impl Solver {
@@ -31,6 +33,7 @@ impl Solver {
             trail: Trail::new(),
             db: ClauseDb::new(),
             watches: Watches::new(),
+            restart: RestartPolicy::new(config.restart, 100),
             config,
             unsat: false,
             analyzer: Analyzer::default(),
@@ -290,6 +293,11 @@ impl Solver {
                     }
                     if self.conflicts % self.config.reduce_interval as u64 == 0 {
                         self.reduce();
+                    }
+                    self.restart.on_conflict(lbd);
+                    if self.restart.should_restart() && self.trail.decision_level() > 0 {
+                        self.restart.on_restart();
+                        self.backtrack_to(0);
                     }
                 }
                 None => match self.pick_branch() {
