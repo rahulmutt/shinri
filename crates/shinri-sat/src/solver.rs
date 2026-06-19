@@ -30,6 +30,7 @@ pub struct Solver<T: Theory, P: ProofSink + Default, H: BranchHeuristic> {
     pub(crate) scopes: Vec<usize>,
     pub(crate) conflicts: u64,
     pub(crate) unsat: bool,
+    pub(crate) theory_silent: bool,
     pub(crate) stats_minimized: u64,
     pub(crate) stats_deleted: u64,
 }
@@ -47,6 +48,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
             theory: T::default(),
             proof: P::default(),
             unsat: false,
+            theory_silent: false,
             analyzer: Analyzer::default(),
             stats_minimized: 0,
             learnts: Vec::new(),
@@ -131,6 +133,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
             self.backtrack_to(0);
         }
         self.scopes.push(self.input_clauses.len());
+        self.theory.push();
     }
 
     pub fn pop(&mut self, n: usize) {
@@ -139,6 +142,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                 self.input_clauses.truncate(mark);
             }
         }
+        self.theory.pop(n);
         self.rebuild();
     }
 
@@ -155,18 +159,20 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         self.learnts.clear();
         self.unsat = false;
         self.heuristic = H::default();
-        self.theory = T::default();
         for i in 0..num_vars {
             self.heuristic.new_var(Var::new(i as u32));
-            self.theory.new_var(Var::new(i as u32));
         }
         self.restart = RestartPolicy::new(self.config.restart, 100);
         self.conflicts = 0;
+        // Re-install survivors WITHOUT re-asserting to the theory: the theory
+        // retained the surviving scopes' facts via its own push/pop (spec §7).
+        self.theory_silent = true;
         let inputs = std::mem::take(&mut self.input_clauses);
         for clause in &inputs {
             self.install_clause(clause);
         }
         self.input_clauses = inputs;
+        self.theory_silent = false;
     }
 
     /// Try to make `l` true. Returns false if `l` is already false (a conflict).
@@ -179,7 +185,9 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                 let level = self.trail.decision_level();
                 self.assign.assign(l, level, reason);
                 self.trail.push(l);
-                self.theory.assert(l);
+                if !self.theory_silent {
+                    self.theory.assert(l);
+                }
                 true
             }
         }
@@ -1051,5 +1059,63 @@ mod tests {
             Solver::with_theory(SolverConfig::default(), NoTheory);
         // Accessors compile and return the injected theory.
         let _t: &NoTheory = s.theory();
+    }
+}
+
+#[cfg(test)]
+mod incremental_tests {
+    use super::*;
+    use crate::heuristic::Vmtf;
+    use crate::theory::Theory;
+    use shinri_core::{Lit, Var};
+    use shinri_core::{NoProof, TheoryJust};
+
+    /// Counts net asserts and tracks its own scope depth, so the test can prove
+    /// rebuild neither resets the instance nor double-asserts surviving units.
+    #[derive(Default)]
+    struct CountTheory {
+        asserts: i64,
+        depth: i64,
+    }
+    impl Theory for CountTheory {
+        fn assert(&mut self, _lit: Lit) {
+            self.asserts += 1;
+        }
+        fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+            None
+        }
+        fn explain(&mut self, _just: TheoryJust, _out: &mut Vec<Lit>) {}
+        fn check(&mut self, _effort: crate::types::Effort) -> crate::types::TheoryResult {
+            crate::types::TheoryResult::Sat
+        }
+        fn push(&mut self) {
+            self.depth += 1;
+        }
+        fn pop(&mut self, n: usize) {
+            self.depth -= n as i64;
+        }
+        fn new_var(&mut self, _v: Var) {}
+    }
+
+    #[test]
+    fn pop_preserves_theory_and_does_not_double_assert() {
+        let mut s: Solver<CountTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let a = s.new_var();
+        // A unit clause asserts `a` at level 0 -> one theory.assert.
+        s.add_clause(&[Lit::new(a, true)]);
+        assert_eq!(s.theory().asserts, 1);
+        s.push(); // opens a user scope -> theory.push
+        assert_eq!(s.theory().depth, 1);
+        let b = s.new_var();
+        s.add_clause(&[Lit::new(b, true)]); // asserts `b` -> two total
+        assert_eq!(s.theory().asserts, 2);
+        s.pop(1); // close the scope: theory.pop(1); silent re-install of survivors
+                  // depth back to 0; the surviving unit `a` is NOT re-asserted (silent).
+        assert_eq!(s.theory().depth, 0);
+        assert_eq!(
+            s.theory().asserts,
+            2,
+            "rebuild must not re-assert survivors"
+        );
     }
 }
