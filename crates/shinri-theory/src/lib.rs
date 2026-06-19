@@ -6,5 +6,7 @@
 //! Depends only on `shinri-core` and `shinri-sat`.
 
 pub mod types;
+pub mod eq_engine;
 
 pub use types::{ENodeId, EqConflict, EqJust, EqLeaf, Explainer, ModelVal, Owner};
+pub use eq_engine::EqualityEngine;
