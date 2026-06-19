@@ -6,7 +6,8 @@ use crate::atom::{classify, AtomRegistry, Unsupported};
 use crate::eq_engine::EqualityEngine;
 use crate::interface::InterfaceSet;
 use crate::solver_trait::{TCheck, TheoryCtx, TheorySolver};
-use crate::types::{MergeEvent, Owner};
+use crate::types::{Explainer, MergeEvent, Owner};
+use rustc_hash::FxHashSet;
 use shinri_core::{Context, Lit, TermId, TheoryJust, Var};
 use shinri_sat::{Effort, Theory, TheoryResult};
 
@@ -130,8 +131,16 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
         None
     }
 
-    fn explain(&mut self, _just: TheoryJust, _out: &mut Vec<Lit>) {
-        // Task 12 implements the cross-theory expansion.
+    fn explain(&mut self, just: TheoryJust, out: &mut Vec<Lit>) {
+        let mut exp = Explainer::default();
+        exp.pending.push(just);
+        self.resolve(&mut exp);
+        // Reason literals are the antecedents (not negated); shinri-sat's
+        // analyze consumes a theory reason via the Reason::Theory path.
+        let mut lits = exp.take_lits();
+        lits.sort_unstable_by_key(|l| l.code());
+        lits.dedup();
+        out.extend(lits);
     }
 
     fn check(&mut self, effort: Effort) -> TheoryResult {
@@ -228,9 +237,42 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
         self.pending_conflict.take()
     }
 
-    /// Task 12 replaces this with the cross-theory Explainer expansion + negation.
-    fn expand_conflict(&mut self, _leaves: Vec<crate::types::EqLeaf>) -> Vec<Lit> {
-        Vec::new()
+    /// Expand conflicting antecedent leaves to input literals, then negate to
+    /// form the conflict clause handed to shinri-sat's analyzer.
+    fn expand_conflict(&mut self, leaves: Vec<crate::types::EqLeaf>) -> Vec<Lit> {
+        let mut exp = Explainer::default();
+        for leaf in leaves {
+            exp.push_leaf(leaf);
+        }
+        self.resolve(&mut exp);
+        let mut clause: Vec<Lit> = exp.take_lits().into_iter().map(|l| l.negate()).collect();
+        clause.sort_unstable_by_key(|l| l.code());
+        clause.dedup();
+        clause
+    }
+
+    /// Drive the Explainer to a fixpoint: expand each pending interface
+    /// justification via its owning theory until only input literals remain.
+    fn resolve(&mut self, exp: &mut Explainer) {
+        let mut visited: FxHashSet<(u16, u32)> = FxHashSet::default();
+        while let Some(j) = exp.pending.pop() {
+            if !visited.insert((j.theory, j.tag)) {
+                continue; // already expanded; justification DAG, so this terminates
+            }
+            // Skip the definitional (level-0) placeholder leaf.
+            let mut cx = TheoryCtx {
+                terms: &self.terms,
+                eq: &mut self.eq,
+                atoms: &self.atoms,
+            };
+            if j.theory == E::THEORY_ID {
+                self.euf.explain(&mut cx, j.tag, exp);
+            } else if j.theory == A::THEORY_ID {
+                self.arith.explain(&mut cx, j.tag, exp);
+            } else {
+                debug_assert!(false, "explain: unknown theory id {}", j.theory);
+            }
+        }
     }
 }
 
@@ -463,6 +505,47 @@ mod tests {
         let mut c: Combiner<Merger, Splitter> = Combiner::default();
         match c.check(Effort::Full) {
             TheoryResult::Conflict(lits) => assert!(lits.is_empty() || !lits.is_empty()),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+    }
+
+    /// Explains tag 0 as the single input literal `lit(50, +)`.
+    #[derive(Default)]
+    struct Explained;
+    impl TheorySolver for Explained {
+        const THEORY_ID: u16 = 3; // matches the Merger's TheoryJust.theory above
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            let a = cx.eq.intern(TermId::new(1).unwrap());
+            let b = cx.eq.intern(TermId::new(2).unwrap());
+            let _ = cx.eq.merge(a, b, EqJust::Interface(TheoryJust { theory: 3, tag: 0 }));
+            TCheck::Sat
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
+            assert_eq!(tag, 0);
+            exp.push_lit(Lit::new(Var::new(50), true));
+        }
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _l: usize) {}
+    }
+
+    #[test]
+    fn conflict_expands_interface_leaves_to_input_literals_and_negates() {
+        // euf = Explained (merges 1,2 with an interface just it can explain),
+        // arith = Splitter (conflicts when 1==2, citing that interface just).
+        let mut c: Combiner<Explained, Splitter> = Combiner::default();
+        match c.check(Effort::Full) {
+            TheoryResult::Conflict(clause) => {
+                // The interface leaf resolved to lit(50,+); the clause negates it.
+                assert_eq!(clause, vec![Lit::new(Var::new(50), true).negate()]);
+            }
             other => panic!("expected conflict, got {other:?}"),
         }
     }
