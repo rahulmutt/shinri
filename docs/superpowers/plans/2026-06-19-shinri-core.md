@@ -18,6 +18,7 @@
 - **Soundness discipline (spec §9):** recoverable construction errors return `Result` (`SortError`), never panic; `debug_assert!` guards hot invariants (interner consistency, `UndoLog` level balance, canonical `FastRat::Small`); panics are reserved for genuine invariant violations.
 - **Zero-cost proof seam:** `ProofSink` methods take borrowed, already-computed data; `NoProof` is a ZST with `#[inline]` empty bodies (spec §8.1).
 - **No `unsafe`** in this plan's scope.
+- **One `shinri-num` change only:** this plan adds a single read-only accessor (`Integer::to_i128`, Task 8) to the already-finished `shinri-num`, to enable `FastRat` demotion (Task 9). No other `shinri-num` modification; the change adds no dependency and is subject to `shinri-num`'s existing test regime.
 
 ---
 
@@ -1399,7 +1400,88 @@ git commit -m "feat(core): generic UndoLog<E> backtracking toolkit + restore-ide
 
 ---
 
-### Task 8: `Rational` trait + `FastRat` + `DeltaRational<R>`
+### Task 8: `shinri-num` — `Integer::to_i128` extraction (enables `FastRat` demotion)
+
+**Files:**
+- Modify: `crates/shinri-num/src/integer.rs` (add `Integer::to_i128`)
+- Test: inline `#[cfg(test)]` module in `integer.rs`
+
+**Interfaces:**
+- Consumes: the existing `shinri-num` `Integer` representation (`Repr::Small(i128) | Repr::Big { .. }`).
+- Produces: `shinri_num::Integer::to_i128(&self) -> Option<i128>` — `Some(v)` iff the value fits in `i128` (i.e. is stored `Small`), else `None`. Relies on the crate's canonical invariant "any value representable in `i128` is `Small`, never `Big`," which makes `None` an exact signal that the magnitude genuinely exceeds `i128`.
+
+Why this lives in `shinri-num`: it is the minimal addition that lets `FastRat` (Task 9) demote a `Big` result back to the unboxed `Small` fast path once a coefficient shrinks back into `i128` range — keeping the hot path hot after a temporary excursion to bignum. It is a pure read-only accessor: no new dependency, no change to existing behavior.
+
+- [ ] **Step 1: Write the failing tests** (add to the existing `#[cfg(test)] mod tests` in `integer.rs`)
+
+```rust
+    #[test]
+    fn to_i128_some_for_inline_values() {
+        for v in [0i128, 1, -1, 42, -42, i128::MAX, i128::MIN] {
+            assert_eq!(Integer::from(v).to_i128(), Some(v));
+        }
+    }
+
+    #[test]
+    fn to_i128_none_for_big_values() {
+        // i128::MAX * 2 exceeds i128 -> stored Big
+        let big = Integer::from(i128::MAX) * Integer::from(2i128);
+        assert_eq!(big.to_i128(), None);
+        // and for a large-magnitude negative
+        let big_neg = Integer::from(i128::MIN) * Integer::from(2i128);
+        assert_eq!(big_neg.to_i128(), None);
+    }
+```
+
+(The module already has `use super::*;`.)
+
+- [ ] **Step 2: Run the tests to verify they fail**
+
+Run: `cargo test -p shinri-num --lib to_i128`
+Expected: FAIL — `to_i128` method not found.
+
+- [ ] **Step 3: Implement `to_i128`**
+
+Add a new `impl Integer` block in `crates/shinri-num/src/integer.rs`:
+
+```rust
+impl Integer {
+    /// The value as `i128` if it fits inline, else `None`. By the canonical
+    /// invariant (any i128-representable value is `Small`), `None` means the
+    /// magnitude genuinely exceeds `i128`.
+    pub fn to_i128(&self) -> Option<i128> {
+        match &self.0 {
+            Repr::Small(v) => Some(*v),
+            Repr::Big { .. } => None,
+        }
+    }
+}
+```
+
+- [ ] **Step 4: Run the tests to verify they pass**
+
+Run: `cargo test -p shinri-num --lib to_i128`
+Expected: PASS (2 tests).
+
+- [ ] **Step 5: Confirm `shinri-num`'s existing regime still holds**
+
+Run:
+```bash
+cargo test -p shinri-num
+cargo clippy -p shinri-num --all-targets -- -D warnings
+```
+Expected: all green (the accessor changes no existing behavior).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add crates/shinri-num/src/integer.rs
+git commit -m "feat(num): Integer::to_i128 accessor for FastRat demotion"
+```
+
+---
+
+### Task 9: `Rational` trait + `FastRat` + `DeltaRational<R>`
 
 **Files:**
 - Create: `crates/shinri-core/src/rational.rs`
@@ -1407,7 +1489,7 @@ git commit -m "feat(core): generic UndoLog<E> backtracking toolkit + restore-ide
 - Test: inline `#[cfg(test)]` module in `rational.rs`, plus a differential proptest in `crates/shinri-core/tests/fastrat_differential.rs`
 
 **Interfaces:**
-- Consumes: `shinri_num::Rational` (overflow fallback).
+- Consumes: `shinri_num::Rational` (overflow fallback) and `shinri_num::Integer::to_i128` (Task 8, for Big→Small demotion).
 - Produces:
   - `shinri_core::rational::Rational` — trait: `Clone + PartialEq + PartialOrd + Add<Output=Self> + Sub<Output=Self> + Mul<Output=Self> + Div<Output=Self> + Neg<Output=Self>`, with `zero()`, `one()`, `from_i64(i64)`, `is_zero(&self) -> bool`, `signum(&self) -> i32`, `recip(&self) -> Self`.
   - `shinri_core::rational::FastRat` — `enum { Small { n: i128, d: i128 }, Big(shinri_num::Rational) }`, implements the trait.
@@ -1470,6 +1552,17 @@ mod tests {
             FastRat::Big(Rational::from_int(Integer::from(i128::MAX)) + Rational::one())
         };
         assert_eq!(sum, expect);
+    }
+
+    #[test]
+    fn big_result_demotes_when_it_fits_again() {
+        // i128::MAX + 1 = 2^127 overflows i128 -> Big
+        let over = FastRat::Small { n: i128::MAX, d: 1 } + FastRat::one();
+        assert!(matches!(over, FastRat::Big(_)));
+        // subtract 1 back: 2^127 - 1 = i128::MAX fits -> demotes to Small
+        let back = over - FastRat::one();
+        assert!(matches!(back, FastRat::Small { .. }));
+        assert_eq!(back, FastRat::Small { n: i128::MAX, d: 1 });
     }
 
     #[test]
@@ -1561,6 +1654,18 @@ impl FastRat {
             FastRat::Big(r) => r.clone(),
         }
     }
+
+    /// Demote a bignum rational to the unboxed `Small` fast path when both its
+    /// (canonical: d > 0, gcd = 1) numerator and denominator fit in i128;
+    /// otherwise keep it `Big`. This is what keeps the hot path hot after a
+    /// coefficient temporarily overflowed and then shrank back into range.
+    fn from_big(r: shinri_num::Rational) -> FastRat {
+        match (r.numer().to_i128(), r.denom().to_i128()) {
+            // r is already canonical, so (n, d) is a canonical Small directly.
+            (Some(n), Some(d)) => FastRat::Small { n, d },
+            _ => FastRat::Big(r),
+        }
+    }
 }
 
 impl Rational for FastRat {
@@ -1590,9 +1695,9 @@ impl Rational for FastRat {
             FastRat::Small { n, d } => {
                 debug_assert!(*n != 0, "recip of zero");
                 FastRat::small_canon(*d, *n)
-                    .unwrap_or_else(|| FastRat::Big(self.to_big().recip()))
+                    .unwrap_or_else(|| FastRat::from_big(self.to_big().recip()))
             }
-            FastRat::Big(r) => FastRat::Big(r.recip()),
+            FastRat::Big(r) => FastRat::from_big(r.recip()),
         }
     }
 }
@@ -1611,7 +1716,7 @@ macro_rules! fastrat_binop {
                         return res;
                     }
                 }
-                FastRat::Big(($big)(self.to_big(), rhs.to_big()))
+                FastRat::from_big(($big)(self.to_big(), rhs.to_big()))
             }
         }
     };
@@ -1657,9 +1762,9 @@ impl Neg for FastRat {
         match self {
             FastRat::Small { n, d } => match n.checked_neg() {
                 Some(nn) => FastRat::Small { n: nn, d },
-                None => FastRat::Big(-self.to_big()),
+                None => FastRat::from_big(-self.to_big()),
             },
-            FastRat::Big(r) => FastRat::Big(-r),
+            FastRat::Big(r) => FastRat::from_big(-r),
         }
     }
 }
@@ -1835,7 +1940,7 @@ git commit -m "feat(core): Rational trait + FastRat i128 fast path + DeltaRation
 
 ---
 
-### Task 9: `ProofSink` trait + `NoProof` + `TheoryJust`
+### Task 10: `ProofSink` trait + `NoProof` + `TheoryJust`
 
 **Files:**
 - Create: `crates/shinri-core/src/proof.rs`
@@ -1995,14 +2100,14 @@ git commit -m "feat(core): ProofSink trait + NoProof zero-cost seam + TheoryJust
 - §4 term/sort representation → Task 3 (sorts), Task 4 (terms, `Op`/`BuiltinOp`/`ConstVal`, interning). §4.1 properties (O(1) eq, sharing, SoA children) → Task 4. §4.2 operator split → Task 4 `Op`. §4.3 reserved-not-built → comments in `sort.rs`/`term.rs`; no Var/Quant/BV/Array variants present.
 - §5 builder + well-sortedness → Task 5. §5.1 `define-fun`/`substitute` → Task 6.
 - §6 `UndoLog<E>` → Task 7. §6.1 decision properties (flat POD, monomorphized, no dyn) → implementation + restore-identity proptest.
-- §7 `Rational` trait + `FastRat` + delta → Task 8, differential-tested.
-- §8 `ProofSink` + `NoProof`, resolution-chain granularity, borrow-don't-build → Task 9. §8.1 `TheoryJust` → Task 9.
+- §7 `Rational` trait + `FastRat` + delta → Task 9, differential-tested. `FastRat`'s Big→Small demotion (an optimization beyond the spec) is enabled by the `shinri-num` `Integer::to_i128` accessor added in Task 8.
+- §8 `ProofSink` + `NoProof`, resolution-chain granularity, borrow-don't-build → Task 10. §8.1 `TheoryJust` → Task 10.
 - §9 error handling → `SortError` (Task 5), `debug_assert!` in `UndoLog`/`FastRat`/`substitute`.
-- §10 testing → property tests (interning Task 4, restore-identity Task 7, FastRat differential Task 8); codegen/ZST check (Task 9 `noproof_is_zero_sized`); CI gates (Task 9 Step 6).
+- §10 testing → property tests (interning Task 4, restore-identity Task 7, FastRat differential Task 9); demotion unit test (Task 9); codegen/ZST check (Task 10 `noproof_is_zero_sized`); CI gates (Task 10 Step 6).
 - §11 deliverable → all tasks; one-way doors designed in (reserved variants, side-table-ready, proof seam, arithmetic abstraction).
 
 **Placeholder scan:** No TBD/TODO/"handle edge cases"/"similar to". Every code step shows complete code. The `Rational` trait method set is concretely pinned (Task 8) with a note that it is additively extensible, resolving the spec's deliberately-open §7.
 
-**Type consistency:** `TermId`/`SortId` use `from_index`/`index`; `Op`/`BuiltinOp`/`ConstVal`/`ChildSlice` names are stable across Tasks 4-6; `mk_app`/`mk_eq`/`sort_of`/`declare_fun`/`substitute` signatures match between their producing task and their use in later tests; `FastRat` variants (`Small { n, d }` / `Big`) and `Rational` trait methods are consistent across Task 8 and its differential test; `ProofSink` method signatures match between trait, `NoProof`, and the Task 9 `Recorder`.
+**Type consistency:** `TermId`/`SortId` use `from_index`/`index`; `Op`/`BuiltinOp`/`ConstVal`/`ChildSlice` names are stable across Tasks 4-6; `mk_app`/`mk_eq`/`sort_of`/`declare_fun`/`substitute` signatures match between their producing task and their use in later tests; `FastRat` variants (`Small { n, d }` / `Big`) and `Rational` trait methods are consistent across Task 9 and its differential test; `from_big` (Task 9) consumes `Integer::to_i128` (Task 8) with matching `Option<i128>` types; `ProofSink` method signatures match between trait, `NoProof`, and the Task 10 `Recorder`.
 
-**One deviation noted for the implementer:** `FastRat` does not demote `Big → Small` (it converts `Small → Big` freely). This is intentional — `shinri-num`'s `Integer` exposes no `i128` extraction, so demotion would require adding one to the already-finished `shinri-num`. Recorded as a future optimization; correctness is unaffected (a `Big` holding a small value still compares/prints equal to the corresponding `Small`).
+**`FastRat` demotion is symmetric (Task 8 + Task 9):** `FastRat` converts `Small → Big` on overflow and demotes `Big → Small` once a value fits `i128` again, via `Integer::to_i128`. Because demotion is canonical (a value fits ⇒ it is `Small`; otherwise `Big`), `PartialEq`/`PartialOrd` remain correct (equal values share the same representation, and the `to_big()` fallback path stays valid regardless). The demotion path is exercised by `big_result_demotes_when_it_fits_again` (Task 9) and validated end-to-end by the overflow-targeted differential test.
