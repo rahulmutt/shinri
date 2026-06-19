@@ -7,6 +7,7 @@
 
 pub mod atom;
 pub mod combiner;
+pub mod empty;
 pub mod eq_engine;
 pub mod interface;
 pub mod model;
@@ -16,9 +17,12 @@ pub mod types;
 
 pub use atom::{classify, AtomRegistry, Unsupported};
 pub use combiner::Combiner;
+pub use empty::EmptyTheory;
 pub use eq_engine::EqualityEngine;
 pub use interface::InterfaceSet;
 pub use model::ModelBuilder;
 pub use proof::{CertError, CertLog, CertStep};
 pub use solver_trait::{TCheck, TheoryCtx, TheorySolver};
-pub use types::{CongRef, ENodeId, EqConflict, EqJust, EqLeaf, Explainer, MergeEvent, ModelVal, Owner};
+pub use types::{
+    CongRef, ENodeId, EqConflict, EqJust, EqLeaf, Explainer, MergeEvent, ModelVal, Owner,
+};
