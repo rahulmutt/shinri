@@ -8,7 +8,11 @@
 pub mod types;
 pub mod eq_engine;
 pub mod atom;
+pub mod model;
+pub mod solver_trait;
 
 pub use types::{ENodeId, EqConflict, EqJust, EqLeaf, Explainer, MergeEvent, ModelVal, Owner};
 pub use eq_engine::EqualityEngine;
 pub use atom::{classify, AtomRegistry, Unsupported};
+pub use model::ModelBuilder;
+pub use solver_trait::{TCheck, TheoryCtx, TheorySolver};
