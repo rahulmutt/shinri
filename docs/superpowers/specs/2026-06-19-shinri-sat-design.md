@@ -41,7 +41,7 @@ These specialize the north-star principles (§2) for the SAT core:
 1. **Soundness is existential.** A wrong `sat`/`unsat` sinks an SMT-COMP division. Every `sat` is internally re-validated against all clauses before it is returned; every `unsat` carries a checkable certificate.
 2. **Index/arena over smart pointers.** Clauses, watches, and the trail are `u32`-indexed flat `Vec`s. No `Rc`/`RefCell` on the hot path.
 3. **The one-way doors are designed in now.** The `Theory` trait and `ProofSink` threading cost nothing when off (`NoTheory`/`NoProof` ZSTs dead-code-eliminate), but enabling them is a type substitution, not a rewrite.
-4. **Monomorphization on the hot path.** Generic over `T: Theory` and `P: ProofSink`; no `dyn` dispatch in `propagate`/`analyze`. The branching choice is dispatched once at construction.
+4. **Monomorphization on the hot path.** Generic over `T: Theory`, `P: ProofSink`, and `H: BranchHeuristic`; no `dyn` dispatch anywhere in the solve loop. The branching heuristic is selected at the type level (construction time), so even `next`/`bump` are monomorphized — chosen over a runtime enum wrapper deliberately for this performance-sensitive core.
 5. **Decomposed, independently-testable units.** State lives in focused structures (`Assignment`, `Trail`, `ClauseDb`, `Watches`, …) with narrow interfaces; the thin `Solver` orchestrator runs the loop without re-implementing them.
 6. **Deterministic and reproducible.** Integer-only VMTF and a fixed seed make runs bit-reproducible, so differential-test failures replay exactly.
 
@@ -54,7 +54,7 @@ crates/shinri-sat/
 ├── Cargo.toml          # deps: shinri-core. dev: proptest, <pure-Rust oracle>
 ├── src/
 │   ├── lib.rs          # crate root, re-exports, top-level docs
-│   ├── solver.rs       # Solver<T, P>: the thin orchestrator + main CDCL(T) loop
+│   ├── solver.rs       # Solver<T, P, H>: the thin orchestrator + main CDCL(T) loop
 │   ├── assignment.rs   # Assignment: per-var value / level / reason / phase
 │   ├── trail.rs        # Trail: assignment stack + decision-level markers
 │   ├── clause.rs       # ClauseDb: packed u32 literal arena + ClauseRef + headers
@@ -77,10 +77,10 @@ crates/shinri-sat/
 
 **Boundary rules that keep the hot loop legible:**
 
-- `Solver<T: Theory, P: ProofSink>` owns the sub-structures and runs the loop; it does *not* re-implement their internals.
+- `Solver<T: Theory, P: ProofSink, H: BranchHeuristic>` owns the sub-structures and runs the loop; it does *not* re-implement their internals.
 - `propagate` is the one place that crosses `Watches` ↔ `ClauseDb` ↔ `Assignment` — the cache-critical crossing is concentrated, not scattered.
 - `dimacs.rs` is test/feature-gated so the shipping library carries no parser weight (parsing belongs to `shinri-parser`).
-- The generic params `T` and `P` are the only seams; everything else is concrete for monomorphization.
+- The generic params `T`, `P`, and `H` are the only seams; everything else is concrete for monomorphization.
 
 ---
 
@@ -217,7 +217,7 @@ trait BranchHeuristic {
 - **VMTF** (Variable Move-To-Front): integer-only, deterministic, no float decay churn — valuable for SMT replay and differential testing.
 - **EVSIDS** (exponential VSIDS): float activities with rescaling; the common industrial default.
 
-Both are implemented from the start and selected at construction via `SolverConfig` (§8.4). **Phase saving** lives alongside the heuristic: `Assignment::phase` records each var's last assigned polarity, and `decide()` re-uses it as the branching sign.
+Both are implemented from the start and selected at the **type level**: the solver is generic over `H: BranchHeuristic`, the concrete heuristic is fixed at construction (§8.4), and so `next`/`bump` are monomorphized with zero dispatch. **Phase saving** lives alongside the heuristic: `Assignment::phase` records each var's last assigned polarity, and `decide()` re-uses it as the branching sign.
 
 ### 6.2 Restarts — `RestartPolicy`, Luby and EMA
 
@@ -249,6 +249,7 @@ Per north-star §8.1, **assumptions are the primary incremental mechanism** (emp
 
 - `push()` / `pop(n)` mark scopes. A scope records the high-water marks of the `new_var` count, the input-clause count, and the heuristic/phase state needed to restore cleanly.
 - `pop` removes clauses added in the popped scope (calling `ProofSink::delete` with their stable `ClauseId`), truncates the var tables, and discards learnt clauses that may depend on popped input clauses. **Phase 1 takes the conservative, obviously-sound route: drop all learnt clauses whose scope tag is ≥ the popped level.** Selective `weaken`/restore is explicitly a Phase 2 item (north-star §13). Correctness over cleverness.
+- **This is a deliberate, non-hot-path choice, not deferred performance.** The optimized incremental mechanism in Phase 1 is *assumptions* (§7.1), which retain *all* learnt clauses across solves and are the mechanism the SMT-COMP incremental track (`check-sat-assuming`) exercises. `weaken`/restore only benefits *nested push/pop*-heavy workloads, where it is a known soundness-bug surface (it interacts with the proof chain) — hence its Phase 2 staging.
 - One `Solver` instance lives across the whole push/pop session.
 
 ### 7.4 Trail interaction
@@ -261,7 +262,7 @@ Assumptions and push/pop both compose with the trail's `level_starts`, and the t
 
 ### 8.1 The `Theory` seam (the T in CDCL(T))
 
-`Solver<T: Theory, P: ProofSink>`. The trait is defined in `shinri-sat` (the SAT crate owns the calling contract); `shinri-theory` implements it. It is the SAT-facing mirror of the richer trait in north-star §6.2.
+`Solver<T: Theory, P: ProofSink, H: BranchHeuristic>`. The `Theory` trait is defined in `shinri-sat` (the SAT crate owns the calling contract); `shinri-theory` implements it. It is the SAT-facing mirror of the richer trait in north-star §6.2.
 
 ```rust
 pub trait Theory {
@@ -280,9 +281,9 @@ pub enum TheoryResult { Sat, Conflict(Conflict), Lemma(/* clause */) }
 
 Key points:
 
-- **Zero-cost when off.** `NoTheory` is a ZST whose every method inlines to nothing; with `Solver<NoTheory, NoProof>` the theory branches in `propagate`/`analyze`/`search` dead-code-eliminate, leaving a pure CDCL SAT solver. Same pattern validated by `NoProof` in core.
+- **Zero-cost when off.** `NoTheory` is a ZST whose every method inlines to nothing; with `Solver<NoTheory, NoProof, _>` the theory branches in `propagate`/`analyze`/`search` dead-code-eliminate, leaving a pure CDCL SAT solver. Same pattern validated by `NoProof` in core.
 - **Caller-owned output buffers** (`&mut Vec<…>`) rather than returned `Vec`s, keeping the hot path allocation-free (the lazy-explanation rationale of §6.2).
-- **`check(Full)`** is invoked at the all-Boolean-assigned point *before* `Sat` is declared: a theory may reject a Boolean-complete model and return a conflict/lemma, which keeps the search going. This is what makes the "first runnable QF_UF solver" (north-star §12 step 3) a drop-in `Solver<EufTheory, _>`.
+- **`check(Full)`** is invoked at the all-Boolean-assigned point *before* `Sat` is declared: a theory may reject a Boolean-complete model and return a conflict/lemma, which keeps the search going. This is what makes the "first runnable QF_UF solver" (north-star §12 step 3) a drop-in `Solver<EufTheory, _, _>`.
 - **Final-check fixpoint.** `Sat` is returned only when Boolean BCP, theory propagation, and `check(Full)` all reach joint fixpoint with no new lemma.
 
 ### 8.2 `ProofSink` threading
@@ -293,20 +294,23 @@ Key points:
 
 Retrofitting a theory-callback interface into a finished CDCL hot loop is the one-way-door rewrite that north-star §14.6 warns about. Threading the (inert) generics through `propagate`/`analyze`/`search` now costs nothing at runtime and avoids that rewrite when `shinri-theory` lands.
 
-### 8.4 Config
+### 8.4 Config & heuristic selection
+
+The branching heuristic is the **generic type parameter** `H: BranchHeuristic`, not a runtime field — it is fixed at construction, so `next`/`bump` are fully monomorphized with **zero dispatch on any path**. Selecting a heuristic from a CLI flag is a single **outer `match`** that constructs the right `Solver<_, _, H>` monomorphization; everything inside is specialized. The differential harness constructs `H = Vmtf` and `H = Evsids` directly.
+
+Remaining runtime knobs live in a plain value struct:
 
 ```rust
 struct SolverConfig {
-    heuristic:           HeuristicKind,   // Vmtf | Evsids
-    restart:             RestartKind,     // Luby | EmaGlucose
+    restart:             RestartKind,   // Luby | EmaGlucose
     reduce_interval:     u32,
-    lbd_keep_threshold:  u32,             // default 2
+    lbd_keep_threshold:  u32,           // default 2
     random_seed:         u64,
     // …additional tuning knobs added as profiling demands
 }
 ```
 
-The branching choice is dispatched **once at construction** into a concrete heuristic held behind an internal `enum` wrapper (`Vmtf | Evsids`), so the public type stays `Solver<T, P>` (no third generic param and no generic blow-up) while the hot loop avoids `dyn` dispatch. *Open trade on record:* an internal `enum` wrapper costs one predictable branch per heuristic call versus a third generic param `H: BranchHeuristic`; we choose the enum for type-surface simplicity and revisit only if profiling shows that branch matters.
+*Trade on record:* the generic `H` adds a third type parameter to `Solver`'s signature (cosmetic verbosity + modestly more monomorphized code/compile time) in exchange for **zero heuristic-dispatch cost on every path**. Chosen deliberately for this performance-sensitive core over a runtime enum wrapper. (`RestartKind` stays a runtime enum: the restart policy is consulted only once per conflict — far colder than branching — so it does not warrant a generic.)
 
 ---
 
@@ -352,12 +356,12 @@ Each step leaves a sound, testable artifact. This feeds the implementation plan 
 2. **Boolean BCP + decisions + backtracking:** a DPLL loop (no learning yet) that is already differential-testable on satisfiable instances.
 3. **Conflict-driven learning:** 1-UIP `analyze`, learnt-clause install, non-chronological backjump → a complete CDCL solver. First differential gate vs the oracle on full SAT/UNSAT.
 4. **Minimization + LBD reduction + restarts + phase saving:** the §5–§6 quality machinery; re-run the differential corpus across configs.
-5. **Branching heuristics behind the trait:** VMTF then EVSIDS, selectable by config.
+5. **Branching heuristics behind the trait:** VMTF then EVSIDS, selected at the type level via the generic `H` (one outer `match` to pick the monomorphization).
 6. **Incrementality:** assumptions + `analyze_final` core; then the scoped push/pop overlay.
-7. **The seams wired through:** `Theory` trait + `NoTheory`, `ProofSink` threading through add/learn/delete. Confirm `Solver<NoTheory, NoProof>` monomorphizes to a pure CDCL solver with the theory/proof branches eliminated.
+7. **The seams wired through:** `Theory` trait + `NoTheory`, `ProofSink` threading through add/learn/delete. Confirm `Solver<NoTheory, NoProof, Vmtf>` monomorphizes to a pure CDCL solver with the theory/proof branches eliminated.
 8. **Hardening:** fuzz targets, mutation testing, CI gates.
 
-**Gate:** `shinri-sat` is "done" for Phase 1 when it passes the differential/fuzz/mutation regime across all configs as a standalone SAT solver, and `Solver<NoTheory, NoProof>` carries provably zero theory/proof overhead — ready for `shinri-theory` (step 3, the first runnable QF_UF solver) to drop in as `T`.
+**Gate:** `shinri-sat` is "done" for Phase 1 when it passes the differential/fuzz/mutation regime across all configs as a standalone SAT solver, and `Solver<NoTheory, NoProof, Vmtf>` carries provably zero theory/proof overhead — ready for `shinri-theory` (step 3, the first runnable QF_UF solver) to drop in as `T`.
 
 ---
 
