@@ -1,0 +1,17 @@
+[package]
+name = "shinri-theory"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shinri-core = { path = "../shinri-core" }
+shinri-sat = { path = "../shinri-sat" }
+
+[dev-dependencies]
+proptest = "1"
+easy-smt = "0.2"
+
+[features]
+# Differential oracle harness (Task 15). Off by default; needs a `z3` binary on PATH.
+oracle = []
