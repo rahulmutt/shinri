@@ -10,6 +10,9 @@ pub mod config;
 pub mod types;
 pub mod trail;
 
+#[cfg(any(test, feature = "dimacs"))]
+pub mod dimacs;
+
 pub use clause::{ClauseDb, ClauseRef};
 pub use config::{RestartKind, SolverConfig};
 pub use types::{Effort, LBool, Reason, SolveResult, TheoryResult};
