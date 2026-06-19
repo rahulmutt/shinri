@@ -28,6 +28,8 @@ pub struct Solver<H: BranchHeuristic> {
     pub(crate) unsat: bool,
     pub(crate) stats_minimized: u64,
     pub(crate) stats_deleted: u64,
+    pub(crate) input_clauses: Vec<Vec<Lit>>,
+    pub(crate) scopes: Vec<usize>,
 }
 
 impl<H: BranchHeuristic> Solver<H> {
@@ -46,6 +48,8 @@ impl<H: BranchHeuristic> Solver<H> {
             learnts: Vec::new(),
             conflicts: 0,
             stats_deleted: 0,
+            input_clauses: Vec::new(),
+            scopes: Vec::new(),
         }
     }
 
@@ -62,12 +66,17 @@ impl<H: BranchHeuristic> Solver<H> {
         self.unsat
     }
 
-    /// Add an input clause at decision level 0. Returns false iff the formula
-    /// is now trivially UNSAT (empty clause or a conflicting unit).
+    /// Add an input clause (records it for push/pop, then installs it).
     pub fn add_clause(&mut self, lits: &[Lit]) -> bool {
         if self.trail.decision_level() != 0 {
             self.backtrack_to(0);
         }
+        self.input_clauses.push(lits.to_vec());
+        self.install_clause(lits)
+    }
+
+    /// Install a clause into the db/watches/trail without recording it.
+    fn install_clause(&mut self, lits: &[Lit]) -> bool {
         match lits.len() {
             0 => {
                 self.unsat = true;
@@ -91,6 +100,44 @@ impl<H: BranchHeuristic> Solver<H> {
                 true
             }
         }
+    }
+
+    pub fn push(&mut self) {
+        if self.trail.decision_level() != 0 {
+            self.backtrack_to(0);
+        }
+        self.scopes.push(self.input_clauses.len());
+    }
+
+    pub fn pop(&mut self, n: usize) {
+        for _ in 0..n {
+            if let Some(mark) = self.scopes.pop() {
+                self.input_clauses.truncate(mark);
+            }
+        }
+        self.rebuild();
+    }
+
+    /// Conservative rebuild: reset all derived state and re-install the
+    /// surviving input clauses. Drops every learnt clause (spec §7.3).
+    fn rebuild(&mut self) {
+        let num_vars = self.assign.num_vars();
+        self.assign.reset();
+        self.trail = Trail::new();
+        self.db = ClauseDb::new();
+        self.watches = Watches::new();
+        self.watches.ensure_vars(num_vars);
+        self.learnts.clear();
+        self.unsat = false;
+        self.heuristic = H::default();
+        for i in 0..num_vars {
+            self.heuristic.new_var(Var::new(i as u32));
+        }
+        let inputs = std::mem::take(&mut self.input_clauses);
+        for clause in &inputs {
+            self.install_clause(clause);
+        }
+        self.input_clauses = inputs;
     }
 
     /// Try to make `l` true. Returns false if `l` is already false (a conflict).
@@ -698,5 +745,16 @@ mod tests {
         let mut s = mk(2);
         s.add_clause(&[lit(0, true), lit(1, true)]);
         assert_eq!(s.solve_under(&[lit(0, true)]), SolveResult::Sat);
+    }
+
+    #[test]
+    fn pop_undoes_scoped_unsat() {
+        let mut s = mk(1);
+        s.push();
+        s.add_clause(&[lit(0, true)]);
+        s.add_clause(&[lit(0, false)]); // conflicting units => UNSAT in scope
+        assert!(matches!(s.solve(), SolveResult::Unsat { .. }));
+        s.pop(1);
+        assert_eq!(s.solve(), SolveResult::Sat); // scope undone => satisfiable
     }
 }
