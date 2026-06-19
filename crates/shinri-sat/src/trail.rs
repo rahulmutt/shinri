@@ -73,6 +73,13 @@ impl Trail {
         }
     }
 
+    /// The trail index where decision `level` (1-based) began. Panics if
+    /// `level == 0` (level 0 has no marker — it starts at index 0).
+    #[inline]
+    pub fn level_start(&self, level: u32) -> usize {
+        self.level_starts[(level - 1) as usize]
+    }
+
     /// Unwind every literal assigned above decision `level`, newest-first,
     /// passing each to `f` (the caller un-assigns it). `qhead` is clamped so
     /// propagation resumes from the truncated end.

@@ -2,7 +2,7 @@ use crate::assignment::Assignment;
 use crate::clause::ClauseDb;
 use crate::config::SolverConfig;
 use crate::trail::Trail;
-use crate::types::{Conflict, LBool, Reason};
+use crate::types::{Conflict, LBool, Reason, SolveResult};
 use crate::watch::{Watch, WatchTarget, Watches};
 use shinri_core::{Lit, Var};
 
@@ -81,6 +81,53 @@ impl Solver {
                 self.assign.assign(l, level, reason);
                 self.trail.push(l);
                 true
+            }
+        }
+    }
+
+    /// Pick an unassigned variable, branching on its saved phase (phase saving).
+    /// Task 13 replaces this body with the `BranchHeuristic`.
+    fn pick_branch(&self) -> Option<Lit> {
+        for i in 0..self.assign.num_vars() {
+            let v = Var::new(i as u32);
+            if self.assign.value(v) == LBool::Unset {
+                return Some(Lit::new(v, self.assign.phase(v)));
+            }
+        }
+        None
+    }
+
+    /// Unwind the trail to `level`, un-assigning every popped literal.
+    pub(crate) fn backtrack_to(&mut self, level: u32) {
+        let assign = &mut self.assign;
+        self.trail.backtrack_to(level, |l| assign.unassign(l.var()));
+    }
+
+    /// Naive DPLL search (no learning). Replaced by CDCL in Task 9.
+    pub fn solve(&mut self) -> SolveResult {
+        if self.unsat {
+            return SolveResult::Unsat { core: vec![] };
+        }
+        loop {
+            match self.propagate() {
+                Some(_conflict) => {
+                    let d = self.trail.decision_level();
+                    if d == 0 {
+                        self.unsat = true;
+                        return SolveResult::Unsat { core: vec![] };
+                    }
+                    // Flip the current level's decision into the parent level.
+                    let dec_lit = self.trail.lit_at(self.trail.level_start(d));
+                    self.backtrack_to(d - 1);
+                    self.enqueue(dec_lit.negate(), Reason::Unit);
+                }
+                None => match self.pick_branch() {
+                    Some(l) => {
+                        self.trail.new_level();
+                        self.enqueue(l, Reason::Decision);
+                    }
+                    None => return SolveResult::Sat,
+                },
             }
         }
     }
@@ -197,6 +244,28 @@ mod tests {
             s.new_var();
         }
         s
+    }
+
+    use crate::types::SolveResult;
+
+    #[test]
+    fn solves_satisfiable_2sat() {
+        // (x0 ∨ x1) ∧ (¬x0 ∨ x1)  =>  SAT (x1 = true works).
+        let mut s = mk(2);
+        s.add_clause(&[lit(0, true), lit(1, true)]);
+        s.add_clause(&[lit(0, false), lit(1, true)]);
+        assert_eq!(s.solve(), SolveResult::Sat);
+    }
+
+    #[test]
+    fn detects_unsatisfiable_2sat() {
+        // All four clauses over {x0,x1} => UNSAT.
+        let mut s = mk(2);
+        s.add_clause(&[lit(0, true), lit(1, true)]);
+        s.add_clause(&[lit(0, true), lit(1, false)]);
+        s.add_clause(&[lit(0, false), lit(1, true)]);
+        s.add_clause(&[lit(0, false), lit(1, false)]);
+        assert_eq!(s.solve(), SolveResult::Unsat { core: vec![] });
     }
 
     #[test]
