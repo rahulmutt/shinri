@@ -75,6 +75,8 @@ impl EGraph {
         if self.app_of.contains_key(&node) {
             return node; // already registered as an app
         }
+        // Note: Const nodes are intentionally not tracked in `app_of` (only App nodes are).
+        // Re-visiting Const nodes is harmless and idempotent—interning dedups them.
         // Copy out op and args slice before releasing the borrow on cx.terms.
         let term_info = match cx.terms.term_node(t) {
             TermNode::App { op, args, .. } => Some((*op, *args)),
@@ -95,7 +97,7 @@ impl EGraph {
                 self.apps.push(AppNode {
                     node,
                     op,
-                    args: arg_nodes.clone(),
+                    args: arg_nodes,
                 });
                 self.is_app[node.index()] = true;
                 self.app_of.insert(node, app_id);
