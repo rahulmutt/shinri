@@ -2,7 +2,7 @@
 
 use rustc_hash::FxHashMap;
 use shinri_core::{Op, TermId, TermNode};
-use shinri_theory::types::ENodeId;
+use shinri_theory::types::{ENodeId, EqConflict, EqJust, EqLeaf};
 use shinri_theory::{EqualityEngine, TheoryCtx};
 
 /// Index into `EGraph.apps`.
@@ -21,7 +21,7 @@ struct AppNode {
 }
 
 /// An undo entry for backtracking the EUF-owned indices.
-#[allow(dead_code)] // variants exercised in Task 7
+#[allow(dead_code)] // fields read in EGraph backtrack logic (Task 8+)
 enum Undo {
     /// `lookup[sig]` was inserted with no prior value; remove it on undo.
     LookupInsert(Signature),
@@ -36,6 +36,13 @@ enum Undo {
     },
 }
 
+/// Internal justification for a single merge step: either an asserted equality
+/// or a congruence discovered by `recanonicalize_use_list`.
+enum MergeJust {
+    Asserted(EqJust),
+    Congruence(Vec<(ENodeId, ENodeId)>),
+}
+
 #[derive(Default)]
 pub struct EGraph {
     apps: Vec<AppNode>,
@@ -44,7 +51,6 @@ pub struct EGraph {
     lookup: FxHashMap<Signature, AppId>,
     /// Congruence work-queue: pairs of app nodes to merge, with arg pairs.
     pending: Vec<PendingEntry>,
-    #[allow(dead_code)] // field exercised in Task 7
     undo: shinri_core::UndoLog<Undo>,
     /// Set when an interned term is a function application (vs a plain leaf).
     is_app: Vec<bool>,
@@ -52,7 +58,7 @@ pub struct EGraph {
 }
 
 impl EGraph {
-    #[allow(dead_code)] // used in tests and will be used in Task 7 debugging
+    #[allow(dead_code)] // used in unit tests; not yet called by solver (Task 8+)
     pub fn app_count(&self) -> usize {
         self.apps.len()
     }
@@ -135,6 +141,150 @@ impl EGraph {
         let node_a = aa.node;
         let node_b = bb.node;
         self.pending.push((node_a, node_b, pairs));
+    }
+
+    /// Merge `a`,`b` (justified by `just`) and close congruence to a fixpoint.
+    /// Returns conflict leaves if a disequality is violated.
+    pub fn merge_eq(
+        &mut self,
+        eq: &mut EqualityEngine,
+        a: ENodeId,
+        b: ENodeId,
+        just: EqJust,
+    ) -> Option<Vec<EqLeaf>> {
+        if let Some(c) = self.do_merge(eq, a, b, MergeJust::Asserted(just)) {
+            return Some(c);
+        }
+        self.drain_pending(eq)
+    }
+
+    /// Assert `a` ≠ `b`; returns conflict leaves if they are already equal.
+    pub fn assert_diseq(
+        &mut self,
+        eq: &mut EqualityEngine,
+        a: ENodeId,
+        b: ENodeId,
+        just: EqJust,
+    ) -> Option<Vec<EqLeaf>> {
+        match eq.assert_diseq(a, b, just) {
+            Ok(()) => None,
+            Err(conflict) => {
+                // a and b are already equal; explain why via the proof forest,
+                // then add the diseq literal.
+                let mut out = Vec::new();
+                eq.explain(conflict.a, conflict.b, &mut out);
+                match conflict.diseq {
+                    EqJust::Asserted(l) => out.push(EqLeaf::Asserted(l)),
+                    EqJust::Interface(j) => out.push(EqLeaf::Interface(j)),
+                    EqJust::Congruence(_) | EqJust::Definitional => {}
+                }
+                Some(out)
+            }
+        }
+    }
+
+    fn drain_pending(&mut self, eq: &mut EqualityEngine) -> Option<Vec<EqLeaf>> {
+        while let Some((na, nb, pairs)) = self.pending.pop() {
+            if eq.find(na) == eq.find(nb) {
+                continue;
+            }
+            if let Some(c) = self.do_merge(eq, na, nb, MergeJust::Congruence(pairs)) {
+                return Some(c);
+            }
+        }
+        None
+    }
+
+    fn do_merge(
+        &mut self,
+        eq: &mut EqualityEngine,
+        a: ENodeId,
+        b: ENodeId,
+        mj: MergeJust,
+    ) -> Option<Vec<EqLeaf>> {
+        let ra = eq.find(a);
+        let rb = eq.find(b);
+        if ra == rb {
+            return None;
+        }
+        let res = match &mj {
+            MergeJust::Asserted(j) => eq.merge(a, b, *j),
+            MergeJust::Congruence(pairs) => eq.merge_congruence(a, b, pairs),
+        };
+        if let Err(conflict) = res {
+            return Some(self.conflict_leaves(eq, &mj, conflict));
+        }
+        // Determine winner/loser by post-merge representative.
+        let nr = eq.find(a);
+        let loser = if nr == ra { rb } else { ra };
+        self.recanonicalize_use_list(eq, nr, loser);
+        None
+    }
+
+    /// Move `loser`'s use-list into `winner`'s, re-canonicalizing each app;
+    /// a signature collision enqueues a congruence.
+    fn recanonicalize_use_list(&mut self, eq: &EqualityEngine, winner: ENodeId, loser: ENodeId) {
+        let moved: Vec<AppId> = std::mem::take(&mut self.use_list[loser.index()]);
+        let count = moved.len();
+        for app in moved.iter().copied() {
+            let sig = self.signature(eq, app);
+            match self.lookup.get(&sig).copied() {
+                Some(other) if other != app => {
+                    self.enqueue_congruence(eq, other, app);
+                    self.undo.record(Undo::LookupOverwrite(sig.clone(), other));
+                    self.lookup.insert(sig, app);
+                }
+                Some(_) => {}
+                None => {
+                    self.undo.record(Undo::LookupInsert(sig.clone()));
+                    self.lookup.insert(sig, app);
+                }
+            }
+        }
+        self.use_list[winner.index()].extend(moved);
+        self.undo.record(Undo::UseSplice {
+            winner: winner.index(),
+            loser: loser.index(),
+            count,
+        });
+    }
+
+    /// Build conflict leaves: the antecedents of why `a = b` was implied,
+    /// plus the disequality that was violated.
+    ///
+    /// When `merge` or `merge_congruence` returns `Err`, the proof forest does
+    /// NOT contain a path between `conflict.a` and `conflict.b` (the merge was
+    /// rejected before any edge was added). We must therefore reconstruct the
+    /// "why equal" argument from the `MergeJust` that triggered this merge:
+    /// - Asserted(j): the literal `j` itself justifies `a = b`.
+    /// - Congruence(pairs): each pair (ai, bi) was already equal; explain each.
+    fn conflict_leaves(
+        &self,
+        eq: &EqualityEngine,
+        mj: &MergeJust,
+        conflict: EqConflict,
+    ) -> Vec<EqLeaf> {
+        let mut out = Vec::new();
+        // Reconstruct why a = b was being merged.
+        match mj {
+            MergeJust::Asserted(j) => match *j {
+                EqJust::Asserted(l) => out.push(EqLeaf::Asserted(l)),
+                EqJust::Interface(j) => out.push(EqLeaf::Interface(j)),
+                EqJust::Congruence(_) | EqJust::Definitional => {}
+            },
+            MergeJust::Congruence(pairs) => {
+                for &(pa, pb) in pairs {
+                    eq.explain(pa, pb, &mut out);
+                }
+            }
+        }
+        // Plus the disequality that was violated.
+        match conflict.diseq {
+            EqJust::Asserted(l) => out.push(EqLeaf::Asserted(l)),
+            EqJust::Interface(j) => out.push(EqLeaf::Interface(j)),
+            EqJust::Congruence(_) | EqJust::Definitional => {}
+        }
+        out
     }
 }
 

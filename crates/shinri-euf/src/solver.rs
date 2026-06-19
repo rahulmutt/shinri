@@ -33,8 +33,46 @@ impl TheorySolver for Euf {
             }
         }
     }
-    fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> {
-        None
+    fn assert(&mut self, cx: &mut TheoryCtx, lit: Lit) -> Option<Vec<EqLeaf>> {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        use shinri_theory::types::EqJust;
+        let atom = cx.atoms.atom(lit.var());
+        let just = EqJust::Asserted(lit);
+        match cx.terms.term_node(atom) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } => {
+                let args_slice = *args;
+                let kids: Vec<shinri_core::TermId> = cx.terms.children(args_slice).to_vec();
+                debug_assert_eq!(kids.len(), 2, "Eq atom must be binary");
+                let a = cx.eq.intern(kids[0]);
+                let b = cx.eq.intern(kids[1]);
+                if lit.is_positive() {
+                    self.inner.merge_eq(cx.eq, a, b, just)
+                } else {
+                    self.inner.assert_diseq(cx.eq, a, b, just)
+                }
+            }
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Distinct),
+                args,
+                ..
+            } => {
+                let args_slice = *args;
+                let kids: Vec<shinri_core::TermId> = cx.terms.children(args_slice).to_vec();
+                debug_assert_eq!(kids.len(), 2, "Distinct lowered to binary (Task 13)");
+                let a = cx.eq.intern(kids[0]);
+                let b = cx.eq.intern(kids[1]);
+                if lit.is_positive() {
+                    self.inner.assert_diseq(cx.eq, a, b, just)
+                } else {
+                    self.inner.merge_eq(cx.eq, a, b, just)
+                }
+            }
+            _ => None,
+        }
     }
     fn propagate(
         &mut self,
