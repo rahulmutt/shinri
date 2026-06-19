@@ -14,7 +14,6 @@ use shinri_core::{Lit, ProofSink, TheoryJust, Var};
 
 /// The CDCL search engine. `T` is the theory, `P` is the proof sink, `H` is
 /// the branching heuristic, all fixed at construction (spec §8.4).
-#[allow(dead_code)] // `proof` field is wired for emit in Task 18
 pub struct Solver<T: Theory, P: ProofSink + Default, H: BranchHeuristic> {
     pub(crate) assign: Assignment,
     pub(crate) trail: Trail,
@@ -25,6 +24,7 @@ pub struct Solver<T: Theory, P: ProofSink + Default, H: BranchHeuristic> {
     pub(crate) config: SolverConfig,
     pub(crate) heuristic: H,
     pub(crate) theory: T,
+    #[allow(dead_code)] // wired for emit in Task 18
     pub(crate) proof: P,
     pub(crate) learnts: Vec<ClauseRef>,
     pub(crate) input_clauses: Vec<Vec<Lit>>,
