@@ -346,6 +346,18 @@ impl Integer {
 }
 
 impl Integer {
+    /// The value as `i128` if it fits inline, else `None`. By the canonical
+    /// invariant (any i128-representable value is `Small`), `None` means the
+    /// magnitude genuinely exceeds `i128`.
+    pub fn to_i128(&self) -> Option<i128> {
+        match &self.0 {
+            Repr::Small(v) => Some(*v),
+            Repr::Big { .. } => None,
+        }
+    }
+}
+
+impl Integer {
     /// Greatest common divisor. Result is always non-negative; gcd(0,0)=0.
     pub fn gcd(&self, other: &Integer) -> Integer {
         let mut a = self.abs();
@@ -497,5 +509,20 @@ mod tests {
             Integer::from(17i128).gcd(&Integer::from(13i128)),
             Integer::from(1i128)
         );
+    }
+
+    #[test]
+    fn to_i128_some_for_inline_values() {
+        for v in [0i128, 1, -1, 42, -42, i128::MAX, i128::MIN] {
+            assert_eq!(Integer::from(v).to_i128(), Some(v));
+        }
+    }
+
+    #[test]
+    fn to_i128_none_for_big_values() {
+        let big = Integer::from(i128::MAX) * Integer::from(2i128);
+        assert_eq!(big.to_i128(), None);
+        let big_neg = Integer::from(i128::MIN) * Integer::from(2i128);
+        assert_eq!(big_neg.to_i128(), None);
     }
 }
