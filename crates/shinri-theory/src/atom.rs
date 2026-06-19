@@ -95,14 +95,18 @@ impl AtomRegistry {
 
     #[inline]
     pub fn owner(&self, v: Var) -> Owner {
-        self.by_var[v.index()]
+        self.by_var
+            .get(v.index())
+            .and_then(|e| *e)
             .expect("owner() on unregistered var")
             .1
     }
 
     #[inline]
     pub fn atom(&self, v: Var) -> TermId {
-        self.by_var[v.index()]
+        self.by_var
+            .get(v.index())
+            .and_then(|e| *e)
             .expect("atom() on unregistered var")
             .0
     }
@@ -116,7 +120,7 @@ impl AtomRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shinri_core::Op;
+    use shinri_core::{Op, BuiltinOp};
 
     // Build `(<= x y)` over Real and `(= x y)` etc. via a Context.
     fn real_var(ctx: &mut Context, name: &str) -> TermId {
@@ -170,5 +174,28 @@ mod tests {
         reg.register(v, atom, Owner::Euf);
         assert_eq!(reg.owner(v), Owner::Euf);
         assert_eq!(reg.atom(v), atom);
+    }
+
+    #[test]
+    fn linear_scaling_is_allowed() {
+        // 2*x is linear (one constant operand) -> the relation classifies as Arith,
+        // NOT refused as nonlinear.
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let x = real_var(&mut ctx, "x");
+        let y = real_var(&mut ctx, "y");
+        let two = ctx.mk_numeral(shinri_core::Rational::from_int(2i128.into()), real);
+        let two_x = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &[two, x]).unwrap();
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[two_x, y]).unwrap();
+        assert_eq!(classify(&ctx, le), Ok(Owner::Arith));
+    }
+
+    #[test]
+    fn const_atom_is_refused() {
+        // A bare constant term is not a theory atom -> Unsupported.
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let k = ctx.mk_numeral(shinri_core::Rational::from_int(3i128.into()), real);
+        assert_eq!(classify(&ctx, k), Err(Unsupported(k)));
     }
 }
