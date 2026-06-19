@@ -21,7 +21,7 @@
 - The foundational **id newtypes** (§3).
 - The hash-consed immutable **term/sort DAG** and its owning `Context`, with a well-sortedness-checking **builder** (§4–§5).
 - The generic **backtracking toolkit** `UndoLog<E>` (§6).
-- The **`Rational` trait + `FastRat`** fast-path type and `DeltaRational` (§7).
+- The **re-export of `shinri_num::{Rational, DeltaRational}`** as the solver-wide rational type, with the i128 fast path folded into `shinri_num::Rational` itself — no trait, no wrapper (§7).
 - The **`ProofSink` trait + `NoProof`** zero-cost default (§8).
 
 ### 1.2 Non-responsibilities (what core does *not* own)
@@ -127,7 +127,7 @@ pub struct Context {
 }
 ```
 
-`Rational` in `Context.nums` is the concrete `shinri_num::Rational` (literal values are stored exactly; the `FastRat` abstraction of §7 is for the theory layer's hot arithmetic, not for term storage).
+`Rational` in `Context.nums` is `shinri_num::Rational` — the single canonical rational type with the folded i128 fast path (§7). Literal values are stored exactly and share the same fast path as the theory layer.
 
 ### 4.1 Properties bought (north-star §4.1)
 
@@ -238,34 +238,30 @@ log.pop_to(target, |e| match e { EufUndo::SetRepr(n, old) => uf[n] = old, /* ...
 
 ---
 
-## 7. Arithmetic Abstraction — `Rational` trait + `FastRat`
+## 7. Arithmetic — the i128 fast path folded into `shinri_num::Rational`
 
-The theory layer's hot arithmetic flows through a `Rational` **trait** (north-star §4.3), with a concrete fast-path type `FastRat` that stays unboxed until coefficients overflow, spilling to `shinri_num::Rational`.
+There is **no `Rational` trait and no `FastRat` wrapper in core**. The unboxed-i128 fast path is folded directly into `shinri_num::Rational`, which becomes the single canonical rational type for the whole solver. `shinri-core` simply re-exports it (and `shinri_num::DeltaRational`); the theory layer, the term-literal store, and the parser all use the one type and all get the fast path.
+
+**This revises the original §4.3 trait decision (and Q1).** The trait's rationale was a one-way door — "let theory code be written against an abstraction so a fast path can be slotted in later." Folding makes the concrete type *already be* the fast path, so the door's purpose is served by the type itself; a second representation to abstract over never materializes (YAGNI). The optimization also belongs in `shinri-num` on the merits: its entire mandate (north-star §7.1) is "mostly small magnitudes, GCD-heavy, allocation-averse," and an unboxed small-rational representation is the most direct expression of it.
+
+### 7.1 Representation
+
+`shinri_num::Rational` carries the Small/Big split at the *rational* level (one level), rather than relying on two enum-tagged `Integer`s (two levels):
 
 ```rust
-pub trait Rational:
-    Clone + PartialEq + PartialOrd + Add + Sub + Mul + Div + Neg + /* AddAssign, ... */
-{
-    fn zero() -> Self;
-    fn one() -> Self;
-    fn from_i64(n: i64) -> Self;
-    fn is_zero(&self) -> bool;
-    fn signum(&self) -> i32;
-    fn recip(&self) -> Self;
-    // ... the closed operation set the simplex/IDL layers require ...
+pub enum Rational {
+    Small { n: i128, d: i128 },             // canonical: d > 0, gcd(|n|, d) = 1; zero = {0, 1}
+    Big { numer: Integer, denom: Integer }, // canonical; magnitude genuinely exceeds the i128 pair
 }
-
-pub enum FastRat {
-    Small { n: i128, d: i128 },          // canonical: d > 0, gcd(|n|, d) = 1
-    Big(shinri_num::Rational),           // overflow fallback
-}
-
-impl Rational for FastRat { /* overflow-checked ops; spill Small -> Big on overflow */ }
 ```
 
-- **`Small` invariant:** kept canonical (positive denominator, reduced) so comparison and equality are branch-light. Arithmetic uses `i128::checked_*`; on overflow the operands promote to `Big` and the operation is redone in `shinri_num::Rational`.
-- **`DeltaRational`** for simplex strict inequalities is provided over the rational representation (the `(c, k)` pair, north-star §6.5). `shinri_num::DeltaRational` already exists for the concrete type; the core layer exposes the delta pairing for the `FastRat` fast path.
-- **Why a trait, not just `shinri_num::Rational`:** the concrete `shinri_num::Rational` is two enum-tagged `Integer`s with per-op match dispatch; `FastRat::Small` is a bare unboxed `i128` pair, materially cheaper on the overwhelmingly-common small-coefficient path (north-star §7.1). The trait is the one-way door that lets the theory layer be written against the abstraction now and benefit from the fast path immediately.
+- **Canonical invariant:** a value is `Small` **iff** both its (reduced) numerator and denominator fit in `i128`; otherwise `Big`. This keeps `PartialEq`/`PartialOrd` correct (equal values share one representation) and makes `Small` comparison/equality branch-light.
+- **Arithmetic:** both-`Small` operands take an `i128::checked_*` fast path → reduce → stay `Small`. On overflow (or any `Big` operand) the op is redone over `Integer`, then **demoted back to `Small` whenever the result fits the i128 pair again** (so the hot path stays unboxed after a temporary excursion to bignum). Demotion uses `Integer::to_i128` (added to `shinri-num`).
+- **`DeltaRational`** (`(c, k)` pair for simplex strict inequalities, north-star §6.5) already lives in `shinri-num` over `Rational` and inherits the fast path automatically — no generic wrapper needed.
+
+### 7.2 API impact
+
+The unboxed `Small` variant has no stored `Integer` to borrow, so `Rational::numer()` / `Rational::denom()` change from returning `&Integer` to returning `Integer` **by value** (cheap: `Integer::from(i128)` for the `Small` case). This is a contained, breaking change to `shinri-num`, re-validated under that crate's existing differential + fuzz + mutation regime.
 
 ---
 
@@ -305,7 +301,7 @@ Consistent with north-star §10:
 
 - **`Result`-based** for recoverable construction errors: `SortError` from the builder (ill-sorted application, sort mismatch) is reported by the parser, never panicked.
 - **Panics reserved for genuine invariant violations** — a broken internal invariant should crash in debug/test, not silently corrupt state.
-- **`debug_assert!`** on hot invariants (interner consistency: structural key ⇔ id; `UndoLog` level balance: `pop_to` never underflows; canonical `FastRat::Small`), compiled out of release, exhaustively checked in test/fuzz.
+- **`debug_assert!`** on hot invariants (interner consistency: structural key ⇔ id; `UndoLog` level balance: `pop_to` never underflows; canonical `Rational::Small`), compiled out of release, exhaustively checked in test/fuzz.
 
 ---
 
@@ -313,13 +309,13 @@ Consistent with north-star §10:
 
 Per-crate slice of north-star §11:
 
-1. **Unit tests** — interner dedup edge cases; builder sort-checking (accept well-sorted, reject ill-sorted); `substitute` correctness; `UndoLog` level push/pop boundaries; `FastRat` overflow-spill boundaries (`i128` edges, denominator normalization, division-by-construction guards).
+1. **Unit tests** — interner dedup edge cases; builder sort-checking (accept well-sorted, reject ill-sorted); `substitute` correctness; `UndoLog` level push/pop boundaries. (`Rational` overflow-spill / demotion boundaries are tested in `shinri-num`, where the fast path now lives.)
 2. **Property tests (`proptest`):**
    - **Structural equality ⇔ id equality** — two structurally identical builds yield the same `TermId`; distinct structures yield distinct ids.
    - **Interner dedup** — building the same subterm twice never grows `nodes`.
    - **Round-trip** — parse → print → parse is identity on the term DAG (shared with the parser crate).
    - **Undo-log restore identity** — snapshot component state → record mutations → `pop_to` → state is bit-identical to the snapshot. The central backtracking-soundness property.
-   - **`FastRat` ⇔ `shinri_num::Rational`** — differential test: every `FastRat` operation agrees with the same operation on `shinri_num::Rational` across a random + overflow-targeted corpus (validates the spill path).
+   - **`shinri_num::Rational` (folded fast path) ⇔ `num-rational` oracle** — differential test (in `shinri-num`): every reworked `Rational` operation agrees with the reference across a random + overflow-targeted corpus, and the Small/Big tag is canonical (a value is `Small` iff it fits the i128 pair). Validates both the spill and demotion paths.
 3. **Codegen check** — a proofless (`NoProof`) build carries no proof bookkeeping (verified via benchmark parity and/or inspection that proof calls are elided).
 4. **CI gates** (workspace-wide, already configured): `cargo nextest`, `cargo deny check`, `cargo clippy -D warnings`, `cargo fmt --check`.
 
@@ -332,7 +328,7 @@ A `shinri-core` crate providing:
 - the id vocabulary (`TermId`/`SortId`/`SymbolId`/`RatId`/`Var`/`Lit`/`ClauseId`),
 - the hash-consed term/sort DAG with a well-sortedness-checking builder and `substitute`,
 - the generic `UndoLog<E>` backtracking toolkit,
-- the `Rational` trait + `FastRat` fast-path type (+ delta-rational pairing),
+- the re-export of `shinri_num::{Rational, DeltaRational}` (the i128 fast path folded into `shinri_num::Rational`; no trait/wrapper),
 - the `ProofSink` trait + `NoProof` zero-cost default with resolution-chain granularity,
 - the full per-crate test suite (unit, property, differential, codegen, CI gates),
 
@@ -346,5 +342,5 @@ with the cross-cutting one-way doors designed in (reserved-but-not-built quantif
 2. **Operator split** — `Op = Builtin(BuiltinOp) | Uninterpreted(SymbolId)`; central op-kind enum for fast type-safe dispatch. (§4.2)
 3. **Reserved-but-not-built** — quantifier/BV/array variants are admitted by architecture (side tables, interned sort algebra, local matches), not by stub variants. (§4.3)
 4. **`UndoLog<E>`** — generic monomorphized typed undo log; flat POD entries, zero normal-access overhead, no cross-layer enum or `dyn`. (§6.1)
-5. **`Rational` trait + `FastRat`** — unboxed `i128` fast path spilling to `shinri_num::Rational`. (§7)
+5. **i128 fast path folded into `shinri_num::Rational`** — no trait, no `FastRat` wrapper; one canonical rational type (`Small{i128,i128} | Big{Integer,Integer}`) with overflow→Big and demote-on-fit. Core re-exports it. Revises the original §4.3/Q1 trait decision. (§7)
 6. **`ProofSink` resolution-chain granularity, borrow-don't-build** — captures what Alethe/LRAT need now; guaranteed zero-cost when off. (§8.1)
