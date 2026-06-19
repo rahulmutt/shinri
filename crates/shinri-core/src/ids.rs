@@ -138,5 +138,6 @@ mod tests {
         let l = Lit::new(v, false);
         assert_eq!(Lit::from_code(l.code()), l);
         assert_eq!(Lit::new(v, true).code() ^ 1, l.code()); // sign bit toggles
+        assert_eq!(Lit::from_code(Lit::new(v, true).code()), Lit::new(v, true));
     }
 }

@@ -60,6 +60,7 @@ mod tests {
     fn lbool_negate_and_from_bool() {
         assert_eq!(LBool::from_bool(true), LBool::True);
         assert_eq!(LBool::True.negate(), LBool::False);
+        assert_eq!(LBool::False.negate(), LBool::True);
         assert_eq!(LBool::Unset.negate(), LBool::Unset);
     }
 }
