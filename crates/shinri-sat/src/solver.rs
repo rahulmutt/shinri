@@ -10,7 +10,7 @@ use crate::theory::Theory;
 use crate::trail::Trail;
 use crate::types::{Conflict, Effort, LBool, Reason, SolveResult, TheoryResult};
 use crate::watch::{Watch, WatchTarget, Watches};
-use shinri_core::{Lit, ProofSink, TheoryJust, Var};
+use shinri_core::{ClauseId, Lit, ProofSink, TheoryJust, Var};
 
 /// The CDCL search engine. `T` is the theory, `P` is the proof sink, `H` is
 /// the branching heuristic, all fixed at construction (spec §8.4).
@@ -24,7 +24,6 @@ pub struct Solver<T: Theory, P: ProofSink + Default, H: BranchHeuristic> {
     pub(crate) config: SolverConfig,
     pub(crate) heuristic: H,
     pub(crate) theory: T,
-    #[allow(dead_code)] // wired for emit in Task 18
     pub(crate) proof: P,
     pub(crate) learnts: Vec<ClauseRef>,
     pub(crate) input_clauses: Vec<Vec<Lit>>,
@@ -101,8 +100,9 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                 true
             }
             _ => {
-                let (_id, r) = self.db.add_clause(lits, false);
+                let (id, r) = self.db.add_clause(lits, false);
                 self.watches.watch_clause(r, lits[0], lits[1]);
+                self.proof.input(id, lits);
                 true
             }
         }
@@ -126,6 +126,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
 
     /// Conservative rebuild: reset all derived state and re-install the
     /// surviving input clauses. Drops every learnt clause (spec §7.3).
+    /// TODO(phase2): emit deletes on pop for learnt clauses being discarded.
     fn rebuild(&mut self) {
         let num_vars = self.assign.num_vars();
         self.assign.reset();
@@ -194,18 +195,23 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
     }
 
     /// 1-UIP conflict analysis. Returns (learnt clause with the asserting
-    /// literal at index 0, backjump level). Assumes the conflict is at the
-    /// current decision level > 0.
-    pub(crate) fn analyze(&mut self, conflict: Conflict) -> (Vec<Lit>, u32) {
+    /// literal at index 0, backjump level, antecedent ClauseId chain for LRAT).
+    /// Assumes the conflict is at the current decision level > 0.
+    pub(crate) fn analyze(&mut self, conflict: Conflict) -> (Vec<Lit>, u32, Vec<ClauseId>) {
         let level = self.trail.decision_level();
         self.analyzer.learnt.clear();
         self.analyzer.learnt.push(Lit::from_code(0)); // placeholder for asserting lit
         let mut counter = 0u32; // literals at `level` still to resolve
         let mut trail_idx = self.trail.len();
         let mut seen_vars: Vec<Var> = Vec::new();
+        let mut chain: Vec<ClauseId> = Vec::new();
 
         // Seed with the conflict clause's literals.
         let mut reason_lits = self.conflict_lits(&conflict);
+        // If the conflict itself is a stored clause, record it in the chain.
+        if let Conflict::Clause(r) = &conflict {
+            chain.push(self.db.clause_id(*r));
+        }
         loop {
             for &q in &reason_lits {
                 let v = q.var();
@@ -237,7 +243,10 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                 self.analyzer.learnt[0] = p.negate();
                 break;
             }
-            // Resolve on p's reason.
+            // Resolve on p's reason; collect stored-clause antecedents into chain.
+            if let Reason::Clause(r) = self.assign.reason(p.var()) {
+                chain.push(self.db.clause_id(r));
+            }
             reason_lits = self.reason_lits_of(p);
         }
 
@@ -256,7 +265,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
             .map(|l| self.assign.level(l.var()))
             .max()
             .unwrap_or(0);
-        (learnt, bt)
+        (learnt, bt, chain)
     }
 
     /// The literals (other than `p` itself) of `p`'s antecedent clause —
@@ -327,6 +336,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         for (i, r) in refs.iter().copied().enumerate() {
             let in_worst_half = i >= n - half;
             if in_worst_half && self.db.lbd(r) > keep_glue && !self.is_locked(r) {
+                self.proof.delete(self.db.clause_id(r));
                 self.db.mark_deleted(r);
                 self.stats_deleted += 1;
             } else {
@@ -356,10 +366,15 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                         self.unsat = true;
                         return SolveResult::Unsat { core: vec![] };
                     }
-                    let (learnt, bt) = self.analyze(conflict);
+                    let (learnt, bt, chain) = self.analyze(conflict);
                     self.backtrack_to(bt);
                     let asserting = learnt[0];
-                    let reason = match self.add_learnt(&learnt) {
+                    let r_opt = self.add_learnt(&learnt);
+                    if let Some(r) = r_opt {
+                        let id = self.db.clause_id(r);
+                        self.proof.learn(id, &learnt, &chain);
+                    }
+                    let reason = match r_opt {
                         Some(r) => Reason::Clause(r),
                         None if learnt.len() == 2 => Reason::Binary(learnt[1]),
                         None => Reason::Unit,
@@ -416,10 +431,15 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                         self.unsat = true;
                                         return SolveResult::Unsat { core: vec![] };
                                     }
-                                    let (learnt, bt) = self.analyze(Conflict::Lits(lits));
+                                    let (learnt, bt, chain) = self.analyze(Conflict::Lits(lits));
                                     self.backtrack_to(bt);
                                     let asserting = learnt[0];
-                                    let reason = match self.add_learnt(&learnt) {
+                                    let r_opt = self.add_learnt(&learnt);
+                                    if let Some(r) = r_opt {
+                                        let id = self.db.clause_id(r);
+                                        self.proof.learn(id, &learnt, &chain);
+                                    }
+                                    let reason = match r_opt {
                                         Some(r) => Reason::Clause(r),
                                         None if learnt.len() == 2 => Reason::Binary(learnt[1]),
                                         None => Reason::Unit,
@@ -867,5 +887,41 @@ mod tests {
         assert!(matches!(s.solve(), SolveResult::Unsat { .. }));
         s.pop(1);
         assert_eq!(s.solve(), SolveResult::Sat); // scope undone => satisfiable
+    }
+
+    use shinri_core::{ClauseId, ProofSink};
+
+    #[derive(Default)]
+    struct CountingSink {
+        inputs: u32,
+        learns: u32,
+        deletes: u32,
+    }
+    impl ProofSink for CountingSink {
+        fn input(&mut self, _c: ClauseId, _lits: &[Lit]) {
+            self.inputs += 1;
+        }
+        fn learn(&mut self, _c: ClauseId, _lits: &[Lit], _chain: &[ClauseId]) {
+            self.learns += 1;
+        }
+        fn theory_lemma(&mut self, _c: ClauseId, _lits: &[Lit], _j: shinri_core::TheoryJust) {}
+        fn delete(&mut self, _c: ClauseId) {
+            self.deletes += 1;
+        }
+    }
+
+    #[test]
+    fn proof_sink_sees_inputs_and_learns() {
+        let mut s: Solver<NoTheory, CountingSink, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..2 {
+            s.new_var();
+        }
+        // Long input clause => one `input` call.
+        s.add_clause(&[lit(0, true), lit(1, true), lit(0, false)]);
+        s.add_clause(&[lit(0, true), lit(1, false)]);
+        s.add_clause(&[lit(0, false), lit(1, true)]);
+        s.add_clause(&[lit(0, false), lit(1, false)]);
+        let _ = s.solve();
+        assert!(s.proof.inputs >= 1, "long input clauses recorded");
     }
 }
