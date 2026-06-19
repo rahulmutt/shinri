@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build `shinri-core`, the shared-vocabulary crate of the shinri SMT solver: the identity types, the hash-consed term/sort DAG with a well-sortedness-checking builder, the generic `UndoLog<E>` backtracking toolkit, the `Rational` trait + `FastRat` fast path over `shinri-num`, and the zero-cost `ProofSink` proof seam.
+**Goal:** Build `shinri-core`, the shared-vocabulary crate of the shinri SMT solver: the identity types, the hash-consed term/sort DAG with a well-sortedness-checking builder, the generic `UndoLog<E>` backtracking toolkit, the re-exported `shinri_num::{Rational, DeltaRational}` (with the i128 fast path folded into `shinri_num::Rational` itself — no trait, no wrapper), and the zero-cost `ProofSink` proof seam.
 
 **Architecture:** A single crate, owning one `Context` that holds index-based arenas (`Vec`s) for terms, sorts, child slices, and literal values, with `FxHashMap` interners giving maximal structural sharing and O(1) structural equality. SAT/theory/proof currency types (`Var`/`Lit`/`ClauseId`) are defined here as inert newtypes because core is the lowest common ancestor of every crate that names them. Operators use a central `Op = Builtin(BuiltinOp) | Uninterpreted(SymbolId)` enum. Backtracking is a generic monomorphized typed undo log. Future quantifier/BV/array variants are admitted by architecture (side tables, interned sort algebra, local matches) but not built.
 
@@ -15,10 +15,10 @@
 - **Runtime dependencies are curated permissive only.** `shinri-core`'s `[dependencies]` may contain `shinri-num` (path) and `rustc-hash` (MIT/Apache). No native-link crate (already enforced by workspace `deny.toml`). `proptest` is `[dev-dependencies]` only.
 - **No floating point anywhere.** Literal values are exact `shinri_num::Rational`. A wrong arithmetic result is a soundness bug (spec §9).
 - **Ids are `Copy`, `#[repr(transparent)]`.** `TermId`/`SortId` wrap `NonZeroU32` (so `Option<Id>` is 4 bytes); `SymbolId`/`RatId`/`Var`/`Lit`/`ClauseId` wrap `u32` (spec §3).
-- **Soundness discipline (spec §9):** recoverable construction errors return `Result` (`SortError`), never panic; `debug_assert!` guards hot invariants (interner consistency, `UndoLog` level balance, canonical `FastRat::Small`); panics are reserved for genuine invariant violations.
+- **Soundness discipline (spec §9):** recoverable construction errors return `Result` (`SortError`), never panic; `debug_assert!` guards hot invariants (interner consistency, `UndoLog` level balance; `Rational` canonicalization in `shinri-num`); panics are reserved for genuine invariant violations.
 - **Zero-cost proof seam:** `ProofSink` methods take borrowed, already-computed data; `NoProof` is a ZST with `#[inline]` empty bodies (spec §8.1).
 - **No `unsafe`** in this plan's scope.
-- **One `shinri-num` change only:** this plan adds a single read-only accessor (`Integer::to_i128`, Task 8) to the already-finished `shinri-num`, to enable `FastRat` demotion (Task 9). No other `shinri-num` modification; the change adds no dependency and is subject to `shinri-num`'s existing test regime.
+- **`shinri-num` is reworked in Task 8 (not just extended).** This plan folds the i128 fast path into `shinri_num::Rational` (`Small{i128,i128} | Big{Integer,Integer}` behind a private `Repr`), adds `Integer::to_i128`, and changes `Rational::numer()`/`denom()` to return `Integer` **by value**. The change adds no dependency and is re-validated under `shinri-num`'s existing differential + property + fuzz + mutation regime. `shinri-core` then re-exports the one canonical type — no `Rational` trait or `FastRat` wrapper anywhere.
 
 ---
 
@@ -1400,19 +1400,25 @@ git commit -m "feat(core): generic UndoLog<E> backtracking toolkit + restore-ide
 
 ---
 
-### Task 8: `shinri-num` — `Integer::to_i128` extraction (enables `FastRat` demotion)
+### Task 8: `shinri-num` — fold the i128 fast path into `Rational`
 
 **Files:**
 - Modify: `crates/shinri-num/src/integer.rs` (add `Integer::to_i128`)
-- Test: inline `#[cfg(test)]` module in `integer.rs`
+- Modify: `crates/shinri-num/src/rational.rs` (rework representation, accessors, and arithmetic)
+- Modify: `crates/shinri-num/src/delta.rs` (only if it fails to compile after the accessor change — see Step 9)
+- Test: inline `#[cfg(test)]` in `integer.rs` and `rational.rs`; new `crates/shinri-num/tests/rational_differential.rs`
 
 **Interfaces:**
-- Consumes: the existing `shinri-num` `Integer` representation (`Repr::Small(i128) | Repr::Big { .. }`).
-- Produces: `shinri_num::Integer::to_i128(&self) -> Option<i128>` — `Some(v)` iff the value fits in `i128` (i.e. is stored `Small`), else `None`. Relies on the crate's canonical invariant "any value representable in `i128` is `Small`, never `Big`," which makes `None` an exact signal that the magnitude genuinely exceeds `i128`.
+- Consumes: the existing `Integer` representation (`Repr::Small(i128) | Repr::Big { .. }`).
+- Produces:
+  - `shinri_num::Integer::to_i128(&self) -> Option<i128>` — `Some(v)` iff stored inline, else `None`.
+  - Reworked `shinri_num::Rational`: `pub struct Rational(Repr)` wrapping a **private** `enum Repr { Small { n: i128, d: i128 }, Big { numer: Integer, denom: Integer } }`. Canonical invariant: a value is `Small` **iff** both reduced components fit `i128`; denominators are positive; fractions are reduced; zero is `Small { n: 0, d: 1 }`.
+  - **API change:** `Rational::numer(&self) -> Integer` and `Rational::denom(&self) -> Integer` now return **by value** (previously `&Integer`).
+  - Unchanged public surface: `new(Integer, Integer)`, `from_int(Integer)`, `zero()`, `one()`, `is_zero`, `is_negative`, `signum`, `recip`, `Add`/`Sub`/`Mul`/`Div`/`Neg`, `PartialEq`/`Eq`/`PartialOrd`/`Ord`.
 
-Why this lives in `shinri-num`: it is the minimal addition that lets `FastRat` (Task 9) demote a `Big` result back to the unboxed `Small` fast path once a coefficient shrinks back into `i128` range — keeping the hot path hot after a temporary excursion to bignum. It is a pure read-only accessor: no new dependency, no change to existing behavior.
+This is a refactor of already-tested code. The discipline: **keep `shinri-num`'s existing tests green while adding new ones**. The `pub struct(Repr)` shape (mirroring `Integer`) keeps the variants private so external code cannot build a non-canonical `Rational`.
 
-- [ ] **Step 1: Write the failing tests** (add to the existing `#[cfg(test)] mod tests` in `integer.rs`)
+- [ ] **Step 1: Write the failing `Integer::to_i128` tests** (add to the `#[cfg(test)] mod tests` in `integer.rs`)
 
 ```rust
     #[test]
@@ -1424,25 +1430,19 @@ Why this lives in `shinri-num`: it is the minimal addition that lets `FastRat` (
 
     #[test]
     fn to_i128_none_for_big_values() {
-        // i128::MAX * 2 exceeds i128 -> stored Big
         let big = Integer::from(i128::MAX) * Integer::from(2i128);
         assert_eq!(big.to_i128(), None);
-        // and for a large-magnitude negative
         let big_neg = Integer::from(i128::MIN) * Integer::from(2i128);
         assert_eq!(big_neg.to_i128(), None);
     }
 ```
 
-(The module already has `use super::*;`.)
-
-- [ ] **Step 2: Run the tests to verify they fail**
+- [ ] **Step 2: Run to verify they fail**
 
 Run: `cargo test -p shinri-num --lib to_i128`
-Expected: FAIL — `to_i128` method not found.
+Expected: FAIL — `to_i128` not found.
 
-- [ ] **Step 3: Implement `to_i128`**
-
-Add a new `impl Integer` block in `crates/shinri-num/src/integer.rs`:
+- [ ] **Step 3: Implement `Integer::to_i128`** (new `impl Integer` block in `integer.rs`)
 
 ```rust
 impl Integer {
@@ -1458,163 +1458,32 @@ impl Integer {
 }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [ ] **Step 4: Run to verify they pass**
 
 Run: `cargo test -p shinri-num --lib to_i128`
 Expected: PASS (2 tests).
 
-- [ ] **Step 5: Confirm `shinri-num`'s existing regime still holds**
+- [ ] **Step 5: Rewrite `rational.rs` — representation, helpers, constructors, accessors**
 
-Run:
-```bash
-cargo test -p shinri-num
-cargo clippy -p shinri-num --all-targets -- -D warnings
-```
-Expected: all green (the accessor changes no existing behavior).
-
-- [ ] **Step 6: Commit**
-
-```bash
-git add crates/shinri-num/src/integer.rs
-git commit -m "feat(num): Integer::to_i128 accessor for FastRat demotion"
-```
-
----
-
-### Task 9: `Rational` trait + `FastRat` + `DeltaRational<R>`
-
-**Files:**
-- Create: `crates/shinri-core/src/rational.rs`
-- Modify: `crates/shinri-core/src/lib.rs`
-- Test: inline `#[cfg(test)]` module in `rational.rs`, plus a differential proptest in `crates/shinri-core/tests/fastrat_differential.rs`
-
-**Interfaces:**
-- Consumes: `shinri_num::Rational` (overflow fallback) and `shinri_num::Integer::to_i128` (Task 8, for Big→Small demotion).
-- Produces:
-  - `shinri_core::rational::Rational` — trait: `Clone + PartialEq + PartialOrd + Add<Output=Self> + Sub<Output=Self> + Mul<Output=Self> + Div<Output=Self> + Neg<Output=Self>`, with `zero()`, `one()`, `from_i64(i64)`, `is_zero(&self) -> bool`, `signum(&self) -> i32`, `recip(&self) -> Self`.
-  - `shinri_core::rational::FastRat` — `enum { Small { n: i128, d: i128 }, Big(shinri_num::Rational) }`, implements the trait.
-  - `shinri_core::rational::DeltaRational<R>` — `struct { c: R, k: R }` generic over `R: Rational`, with `new(c, k)`, `from_rational(c)`, `c()`, `k()`, `Add`/`Sub`/`Neg`, `PartialEq`/`PartialOrd`.
-
-Concrete trait method set: this is the Phase-1 starting set the difference-logic and simplex layers need. It is extensible — adding a method later is additive and breaks no existing impl that supplies it. (Spec §7 deliberately left the exact set bounded-by-consumer; this pins a sensible initial set.)
-
-- [ ] **Step 1: Add the module + exports to `lib.rs`**
+Replace the non-test code in `crates/shinri-num/src/rational.rs` with the following (keep the existing `#[cfg(test)] mod tests`; it is updated in Step 7). Adjust the `use` line to whatever the file already imports for `Integer` plus the ops below.
 
 ```rust
-pub mod rational;
+use crate::integer::Integer;
+use core::cmp::Ordering;
+use core::ops::{Add, Div, Mul, Neg, Sub};
 
-pub use rational::{DeltaRational, FastRat, Rational};
-```
-
-- [ ] **Step 2: Write the failing unit tests**
-
-Create `crates/shinri-core/src/rational.rs`:
-
-```rust
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn small_arithmetic_and_canonicalization() {
-        let half = FastRat::Small { n: 1, d: 2 };
-        let third = FastRat::Small { n: 1, d: 3 };
-        // 1/2 + 1/3 = 5/6
-        assert_eq!(half.clone() + third.clone(), FastRat::Small { n: 5, d: 6 });
-        // 1/2 - 1/2 = 0  (canonical zero)
-        assert!((half.clone() - half.clone()).is_zero());
-        // 1/2 * 1/3 = 1/6
-        assert_eq!(half.clone() * third.clone(), FastRat::Small { n: 1, d: 6 });
-        // (1/2) / (1/3) = 3/2
-        assert_eq!(half.clone() / third.clone(), FastRat::Small { n: 3, d: 2 });
-        // -(1/2) = -1/2 ; sign on numerator, denominator stays positive
-        assert_eq!(-half.clone(), FastRat::Small { n: -1, d: 2 });
-        assert_eq!(half.signum(), 1);
-        assert_eq!((-half.clone()).signum(), -1);
-        assert_eq!(FastRat::zero().signum(), 0);
-    }
-
-    #[test]
-    fn reduces_to_lowest_terms() {
-        // 2/4 -> 1/2
-        let two_fourths = FastRat::Small { n: 2, d: 4 };
-        let half = FastRat::Small { n: 1, d: 2 };
-        assert_eq!(two_fourths, half);
-    }
-
-    #[test]
-    fn overflow_spills_to_big() {
-        let big = FastRat::Small { n: i128::MAX, d: 1 };
-        let sum = big.clone() + FastRat::one();
-        assert!(matches!(sum, FastRat::Big(_)));
-        // value is correct: i128::MAX + 1
-        let expect = {
-            use shinri_num::{Integer, Rational};
-            FastRat::Big(Rational::from_int(Integer::from(i128::MAX)) + Rational::one())
-        };
-        assert_eq!(sum, expect);
-    }
-
-    #[test]
-    fn big_result_demotes_when_it_fits_again() {
-        // i128::MAX + 1 = 2^127 overflows i128 -> Big
-        let over = FastRat::Small { n: i128::MAX, d: 1 } + FastRat::one();
-        assert!(matches!(over, FastRat::Big(_)));
-        // subtract 1 back: 2^127 - 1 = i128::MAX fits -> demotes to Small
-        let back = over - FastRat::one();
-        assert!(matches!(back, FastRat::Small { .. }));
-        assert_eq!(back, FastRat::Small { n: i128::MAX, d: 1 });
-    }
-
-    #[test]
-    fn delta_ordering() {
-        // c + k*delta : (0, 1) means "0 + epsilon" > 0
-        let zero = DeltaRational::<FastRat>::from_rational(FastRat::zero());
-        let eps = DeltaRational::new(FastRat::zero(), FastRat::one());
-        assert!(eps > zero);
-    }
-}
-```
-
-- [ ] **Step 3: Run the tests to verify they fail**
-
-Run: `cargo test -p shinri-core --lib rational`
-Expected: FAIL — trait/types not defined.
-
-- [ ] **Step 4: Implement the trait, `FastRat`, and `DeltaRational`**
-
-Prepend to `crates/shinri-core/src/rational.rs`:
-
-```rust
-use std::cmp::Ordering;
-use std::ops::{Add, Div, Mul, Neg, Sub};
-
-/// The arithmetic currency of the theory layer (spec §7). A trait so the
-/// hot path can stay on the unboxed `FastRat::Small` representation while
-/// falling back to `shinri_num::Rational` on overflow.
-pub trait Rational:
-    Clone
-    + PartialEq
-    + PartialOrd
-    + Add<Output = Self>
-    + Sub<Output = Self>
-    + Mul<Output = Self>
-    + Div<Output = Self>
-    + Neg<Output = Self>
-{
-    fn zero() -> Self;
-    fn one() -> Self;
-    fn from_i64(n: i64) -> Self;
-    fn is_zero(&self) -> bool;
-    fn signum(&self) -> i32;
-    fn recip(&self) -> Self;
-}
-
-/// i128 fast-path rational with bignum fallback (spec §7). `Small` is always
-/// canonical: `d > 0`, `gcd(|n|, d) == 1`, and `0` is `Small { n: 0, d: 1 }`.
+/// Exact rational with an unboxed i128 fast path (spec §7). `pub struct(Repr)`
+/// with a private `Repr` keeps the variants encapsulated, mirroring `Integer`,
+/// so external code cannot construct a non-canonical value.
 #[derive(Clone, Debug)]
-pub enum FastRat {
+pub struct Rational(Repr);
+
+#[derive(Clone, Debug)]
+enum Repr {
+    /// Canonical: `d > 0`, `gcd(|n|, d) == 1`, zero is `{ n: 0, d: 1 }`.
     Small { n: i128, d: i128 },
-    Big(shinri_num::Rational),
+    /// Canonical and genuinely exceeds the i128 pair (`denom > 0`, reduced).
+    Big { numer: Integer, denom: Integer },
 }
 
 fn igcd(a: i128, b: i128) -> i128 {
@@ -1625,318 +1494,454 @@ fn igcd(a: i128, b: i128) -> i128 {
         a = b;
         b = t;
     }
-    a as i128 // gcd <= max operand magnitude; canonical operands keep it in range
+    // Safe: the only case where the gcd magnitude reaches 2^127 is gcd(MIN, MIN),
+    // which `small_canon` pre-empts via the `d < 0` checked_neg path.
+    a as i128
 }
 
-impl FastRat {
-    /// Canonicalize a raw (n, d) into `Small` if it stays in i128, else `None`
-    /// (signalling the caller to use the `Big` path). `d` must be non-zero.
-    fn small_canon(mut n: i128, mut d: i128) -> Option<FastRat> {
+impl Rational {
+    /// Canonicalize a raw i128 pair into `Small`, or `None` if it cannot stay in
+    /// i128 (only the `i128::MIN` denominator-negation case). `d` must be non-zero.
+    fn small_canon(mut n: i128, mut d: i128) -> Option<Rational> {
         debug_assert!(d != 0);
         if n == 0 {
-            return Some(FastRat::Small { n: 0, d: 1 });
+            return Some(Rational(Repr::Small { n: 0, d: 1 }));
         }
         if d < 0 {
-            // negate both; guard against i128::MIN which cannot be negated
             n = n.checked_neg()?;
             d = d.checked_neg()?;
         }
         let g = igcd(n, d);
-        Some(FastRat::Small { n: n / g, d: d / g })
+        Some(Rational(Repr::Small { n: n / g, d: d / g }))
     }
 
-    fn to_big(&self) -> shinri_num::Rational {
-        use shinri_num::{Integer, Rational};
-        match self {
-            FastRat::Small { n, d } => {
-                Rational::new(Integer::from(*n), Integer::from(*d))
+    /// Build from `Integer` components: sign-fix, reduce, then DEMOTE to `Small`
+    /// when both components fit i128 (keeping the hot path unboxed after a
+    /// temporary excursion to bignum), else keep `Big`. `denom` must be non-zero.
+    fn from_components(numer: Integer, denom: Integer) -> Rational {
+        debug_assert!(!denom.is_zero(), "Rational with zero denominator");
+        let (mut numer, mut denom) = if denom.is_negative() {
+            (-numer, -denom)
+        } else {
+            (numer, denom)
+        };
+        let g = numer.gcd(&denom);
+        if !g.is_zero() && g != Integer::one() {
+            let (qn, _) = numer.div_rem(&g);
+            let (qd, _) = denom.div_rem(&g);
+            numer = qn;
+            denom = qd;
+        }
+        match (numer.to_i128(), denom.to_i128()) {
+            (Some(n), Some(d)) => Rational(Repr::Small { n, d }),
+            _ => Rational(Repr::Big { numer, denom }),
+        }
+    }
+
+    pub fn new(numer: Integer, denom: Integer) -> Rational {
+        assert!(!denom.is_zero(), "Rational denominator must be non-zero");
+        if let (Some(n), Some(d)) = (numer.to_i128(), denom.to_i128()) {
+            if let Some(r) = Rational::small_canon(n, d) {
+                return r;
             }
-            FastRat::Big(r) => r.clone(),
+        }
+        Rational::from_components(numer, denom)
+    }
+
+    pub fn from_int(n: Integer) -> Rational {
+        Rational::new(n, Integer::one())
+    }
+
+    pub fn zero() -> Rational {
+        Rational(Repr::Small { n: 0, d: 1 })
+    }
+
+    pub fn one() -> Rational {
+        Rational(Repr::Small { n: 1, d: 1 })
+    }
+
+    /// The numerator, by value (the `Small` variant has no `Integer` to borrow).
+    pub fn numer(&self) -> Integer {
+        match &self.0 {
+            Repr::Small { n, .. } => Integer::from(*n),
+            Repr::Big { numer, .. } => numer.clone(),
         }
     }
 
-    /// Demote a bignum rational to the unboxed `Small` fast path when both its
-    /// (canonical: d > 0, gcd = 1) numerator and denominator fit in i128;
-    /// otherwise keep it `Big`. This is what keeps the hot path hot after a
-    /// coefficient temporarily overflowed and then shrank back into range.
-    fn from_big(r: shinri_num::Rational) -> FastRat {
-        match (r.numer().to_i128(), r.denom().to_i128()) {
-            // r is already canonical, so (n, d) is a canonical Small directly.
-            (Some(n), Some(d)) => FastRat::Small { n, d },
-            _ => FastRat::Big(r),
+    /// The denominator, by value.
+    pub fn denom(&self) -> Integer {
+        match &self.0 {
+            Repr::Small { d, .. } => Integer::from(*d),
+            Repr::Big { denom, .. } => denom.clone(),
         }
+    }
+
+    pub fn is_zero(&self) -> bool {
+        match &self.0 {
+            Repr::Small { n, .. } => *n == 0,
+            Repr::Big { numer, .. } => numer.is_zero(),
+        }
+    }
+
+    pub fn is_negative(&self) -> bool {
+        match &self.0 {
+            Repr::Small { n, .. } => *n < 0,
+            Repr::Big { numer, .. } => numer.is_negative(),
+        }
+    }
+
+    pub fn signum(&self) -> i32 {
+        match &self.0 {
+            Repr::Small { n, .. } => (*n > 0) as i32 - (*n < 0) as i32,
+            Repr::Big { numer, .. } => numer.signum(),
+        }
+    }
+
+    pub fn recip(&self) -> Rational {
+        debug_assert!(!self.is_zero(), "recip of zero");
+        match &self.0 {
+            Repr::Small { n, d } => Rational::small_canon(*d, *n).unwrap_or_else(|| {
+                Rational::from_components(Integer::from(*d), Integer::from(*n))
+            }),
+            Repr::Big { numer, denom } => {
+                Rational::from_components(denom.clone(), numer.clone())
+            }
+        }
+    }
+
+    /// (numerator, denominator) as `Integer`s — used by the bignum fallback paths.
+    fn components(&self) -> (Integer, Integer) {
+        (self.numer(), self.denom())
     }
 }
+```
 
-impl Rational for FastRat {
-    fn zero() -> Self {
-        FastRat::Small { n: 0, d: 1 }
-    }
-    fn one() -> Self {
-        FastRat::Small { n: 1, d: 1 }
-    }
-    fn from_i64(n: i64) -> Self {
-        FastRat::Small { n: n as i128, d: 1 }
-    }
-    fn is_zero(&self) -> bool {
-        match self {
-            FastRat::Small { n, .. } => *n == 0,
-            FastRat::Big(r) => r.is_zero(),
-        }
-    }
-    fn signum(&self) -> i32 {
-        match self {
-            FastRat::Small { n, .. } => (*n > 0) as i32 - (*n < 0) as i32,
-            FastRat::Big(r) => r.signum(),
-        }
-    }
-    fn recip(&self) -> Self {
-        match self {
-            FastRat::Small { n, d } => {
-                debug_assert!(*n != 0, "recip of zero");
-                FastRat::small_canon(*d, *n)
-                    .unwrap_or_else(|| FastRat::from_big(self.to_big().recip()))
-            }
-            FastRat::Big(r) => FastRat::from_big(r.recip()),
-        }
-    }
-}
+- [ ] **Step 6: Add the arithmetic, equality, and ordering impls** (append to `rational.rs`, after the `impl Rational` block)
 
-// --- arithmetic: try the Small fast path; on overflow or any Big operand, go Big ---
-
-macro_rules! fastrat_binop {
+```rust
+macro_rules! rat_binop {
     ($trait:ident, $method:ident, $small:expr, $big:expr) => {
-        impl $trait for FastRat {
-            type Output = FastRat;
-            fn $method(self, rhs: FastRat) -> FastRat {
-                if let (FastRat::Small { n: an, d: ad }, FastRat::Small { n: bn, d: bd }) =
-                    (&self, &rhs)
+        impl $trait for Rational {
+            type Output = Rational;
+            fn $method(self, rhs: Rational) -> Rational {
+                if let (Repr::Small { n: an, d: ad }, Repr::Small { n: bn, d: bd }) =
+                    (&self.0, &rhs.0)
                 {
                     if let Some(res) = ($small)(*an, *ad, *bn, *bd) {
                         return res;
                     }
                 }
-                FastRat::from_big(($big)(self.to_big(), rhs.to_big()))
+                let (an, ad) = self.components();
+                let (bn, bd) = rhs.components();
+                let (num, den) = ($big)(an, ad, bn, bd);
+                Rational::from_components(num, den)
             }
         }
     };
 }
 
-fastrat_binop!(Add, add, |an, ad, bn, bd| {
-    // a/d + b/e = (a*e + b*d) / (d*e)
-    let ae = (an as i128).checked_mul(bd)?;
-    let bdp = (bn as i128).checked_mul(ad)?;
-    let num = ae.checked_add(bdp)?;
-    let den = (ad as i128).checked_mul(bd)?;
-    FastRat::small_canon(num, den)
-}, |a: shinri_num::Rational, b| a + b);
-
-fastrat_binop!(Sub, sub, |an, ad, bn, bd| {
-    let ae = (an as i128).checked_mul(bd)?;
-    let bdp = (bn as i128).checked_mul(ad)?;
-    let num = ae.checked_sub(bdp)?;
-    let den = (ad as i128).checked_mul(bd)?;
-    FastRat::small_canon(num, den)
-}, |a: shinri_num::Rational, b| a - b);
-
-fastrat_binop!(Mul, mul, |an, ad, bn, bd| {
-    let num = (an as i128).checked_mul(bn)?;
-    let den = (ad as i128).checked_mul(bd)?;
-    FastRat::small_canon(num, den)
-}, |a: shinri_num::Rational, b| a * b);
-
-fastrat_binop!(Div, div, |an, ad, bn, bd| {
-    // (a/d) / (b/e) = (a*e) / (d*b)
-    debug_assert!(bn != 0, "division by zero rational");
-    let num = (an as i128).checked_mul(bd)?;
-    let den = (ad as i128).checked_mul(bn)?;
-    if den == 0 {
-        return None;
+rat_binop!(
+    Add,
+    add,
+    |an: i128, ad: i128, bn: i128, bd: i128| -> Option<Rational> {
+        let ae = an.checked_mul(bd)?;
+        let bdp = bn.checked_mul(ad)?;
+        let num = ae.checked_add(bdp)?;
+        let den = ad.checked_mul(bd)?;
+        Rational::small_canon(num, den)
+    },
+    |an: Integer, ad: Integer, bn: Integer, bd: Integer| {
+        (an * bd.clone() + bn * ad.clone(), ad * bd)
     }
-    FastRat::small_canon(num, den)
-}, |a: shinri_num::Rational, b| a / b);
+);
 
-impl Neg for FastRat {
-    type Output = FastRat;
-    fn neg(self) -> FastRat {
-        match self {
-            FastRat::Small { n, d } => match n.checked_neg() {
-                Some(nn) => FastRat::Small { n: nn, d },
-                None => FastRat::from_big(-self.to_big()),
+rat_binop!(
+    Sub,
+    sub,
+    |an: i128, ad: i128, bn: i128, bd: i128| -> Option<Rational> {
+        let ae = an.checked_mul(bd)?;
+        let bdp = bn.checked_mul(ad)?;
+        let num = ae.checked_sub(bdp)?;
+        let den = ad.checked_mul(bd)?;
+        Rational::small_canon(num, den)
+    },
+    |an: Integer, ad: Integer, bn: Integer, bd: Integer| {
+        (an * bd.clone() - bn * ad.clone(), ad * bd)
+    }
+);
+
+rat_binop!(
+    Mul,
+    mul,
+    |an: i128, ad: i128, bn: i128, bd: i128| -> Option<Rational> {
+        let num = an.checked_mul(bn)?;
+        let den = ad.checked_mul(bd)?;
+        Rational::small_canon(num, den)
+    },
+    |an: Integer, ad: Integer, bn: Integer, bd: Integer| { (an * bn, ad * bd) }
+);
+
+rat_binop!(
+    Div,
+    div,
+    |an: i128, ad: i128, bn: i128, bd: i128| -> Option<Rational> {
+        debug_assert!(bn != 0, "division by zero rational");
+        let num = an.checked_mul(bd)?;
+        let den = ad.checked_mul(bn)?;
+        if den == 0 {
+            return None;
+        }
+        Rational::small_canon(num, den)
+    },
+    |an: Integer, ad: Integer, bn: Integer, bd: Integer| {
+        debug_assert!(!bn.is_zero(), "division by zero rational");
+        (an * bd, ad * bn)
+    }
+);
+
+impl Neg for Rational {
+    type Output = Rational;
+    fn neg(self) -> Rational {
+        match self.0 {
+            Repr::Small { n, d } => match n.checked_neg() {
+                Some(nn) => Rational(Repr::Small { n: nn, d }),
+                None => Rational::from_components(-Integer::from(n), Integer::from(d)),
             },
-            FastRat::Big(r) => FastRat::from_big(-r),
+            Repr::Big { numer, denom } => Rational::from_components(-numer, denom),
         }
     }
 }
 
-impl PartialEq for FastRat {
-    fn eq(&self, other: &FastRat) -> bool {
-        match (self, other) {
-            (FastRat::Small { n: an, d: ad }, FastRat::Small { n: bn, d: bd }) => {
-                an == bn && ad == bd // both canonical -> field equality is value equality
-            }
-            _ => self.to_big() == other.to_big(),
+impl PartialEq for Rational {
+    fn eq(&self, other: &Rational) -> bool {
+        match (&self.0, &other.0) {
+            (Repr::Small { n: an, d: ad }, Repr::Small { n: bn, d: bd }) => an == bn && ad == bd,
+            (
+                Repr::Big { numer: an, denom: ad },
+                Repr::Big { numer: bn, denom: bd },
+            ) => an == bn && ad == bd,
+            // Canonical: a value is Small iff it fits, so Small and Big are never equal.
+            _ => false,
         }
     }
 }
 
-impl PartialOrd for FastRat {
-    fn partial_cmp(&self, other: &FastRat) -> Option<Ordering> {
-        if let (FastRat::Small { n: an, d: ad }, FastRat::Small { n: bn, d: bd }) =
-            (self, other)
+impl Eq for Rational {}
+
+impl Ord for Rational {
+    fn cmp(&self, other: &Rational) -> Ordering {
+        if let (Repr::Small { n: an, d: ad }, Repr::Small { n: bn, d: bd }) =
+            (&self.0, &other.0)
         {
-            // a/ad ? b/bd, with ad,bd > 0  =>  a*bd ? b*ad
-            if let (Some(l), Some(r)) =
-                ((*an).checked_mul(*bd), (*bn).checked_mul(*ad))
-            {
-                return Some(l.cmp(&r));
+            if let (Some(l), Some(r)) = (an.checked_mul(*bd), bn.checked_mul(*ad)) {
+                return l.cmp(&r);
             }
         }
-        self.to_big().partial_cmp(&other.to_big())
+        // Cross-multiply over Integer (denominators are positive, so sign is preserved).
+        let (an, ad) = self.components();
+        let (bn, bd) = other.components();
+        (an * bd).cmp(&(bn * ad))
     }
 }
 
-/// `c + k·delta` for strict-inequality encoding (spec §6.5), generic over the
-/// rational abstraction so it works for `FastRat` and any future impl.
-#[derive(Clone, Debug)]
-pub struct DeltaRational<R> {
-    c: R,
-    k: R,
-}
-
-impl<R: Rational> DeltaRational<R> {
-    pub fn new(c: R, k: R) -> Self {
-        DeltaRational { c, k }
-    }
-    pub fn from_rational(c: R) -> Self {
-        DeltaRational { c, k: R::zero() }
-    }
-    pub fn c(&self) -> &R {
-        &self.c
-    }
-    pub fn k(&self) -> &R {
-        &self.k
-    }
-}
-
-impl<R: Rational> Add for DeltaRational<R> {
-    type Output = DeltaRational<R>;
-    fn add(self, rhs: DeltaRational<R>) -> DeltaRational<R> {
-        DeltaRational { c: self.c + rhs.c, k: self.k + rhs.k }
-    }
-}
-
-impl<R: Rational> Sub for DeltaRational<R> {
-    type Output = DeltaRational<R>;
-    fn sub(self, rhs: DeltaRational<R>) -> DeltaRational<R> {
-        DeltaRational { c: self.c - rhs.c, k: self.k - rhs.k }
-    }
-}
-
-impl<R: Rational> Neg for DeltaRational<R> {
-    type Output = DeltaRational<R>;
-    fn neg(self) -> DeltaRational<R> {
-        DeltaRational { c: -self.c, k: -self.k }
-    }
-}
-
-impl<R: Rational> PartialEq for DeltaRational<R> {
-    fn eq(&self, other: &DeltaRational<R>) -> bool {
-        self.c == other.c && self.k == other.k
-    }
-}
-
-impl<R: Rational> PartialOrd for DeltaRational<R> {
-    fn partial_cmp(&self, other: &DeltaRational<R>) -> Option<Ordering> {
-        // lexicographic: compare c first, then the delta coefficient k
-        match self.c.partial_cmp(&other.c)? {
-            Ordering::Equal => self.k.partial_cmp(&other.k),
-            ord => Some(ord),
-        }
+impl PartialOrd for Rational {
+    fn partial_cmp(&self, other: &Rational) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 ```
 
-- [ ] **Step 5: Run the unit tests to verify they pass**
+- [ ] **Step 7: Update the existing inline tests and add new ones** (`#[cfg(test)] mod tests` in `rational.rs`)
 
-Run: `cargo test -p shinri-core --lib rational`
-Expected: PASS (4 tests).
+Two mechanical fixes to existing tests, then new coverage:
 
-- [ ] **Step 6: Write the differential property test vs `shinri_num::Rational`**
+1. Anywhere an existing test dereferenced an accessor (e.g. `*neg.denom()` / `*x.numer()`), drop the `*` — they now return `Integer` by value (e.g. `assert_eq!(neg.denom(), Integer::from(2i128))`).
+2. Keep the existing zero-denominator `#[should_panic]` test (still panics via the `assert!` in `new`).
 
-Create `crates/shinri-core/tests/fastrat_differential.rs`:
+Add these tests:
 
 ```rust
-use proptest::prelude::*;
-use shinri_core::{FastRat, Rational};
-use shinri_num::{Integer, Rational as NumRat};
-
-fn num_of(n: i128, d: i128) -> NumRat {
-    NumRat::new(Integer::from(n), Integer::from(d))
-}
-
-fn fast_of(n: i128, d: i128) -> FastRat {
-    // build n/d as (n/1) / (d/1) to exercise canonicalization
-    let num = FastRat::Small { n, d: 1 };
-    let den = FastRat::Small { n: d, d: 1 };
-    num / den
-}
-
-// Reconstruct any FastRat as a canonical `shinri_num::Rational`, regardless of
-// its Small/Big tag, so it is directly comparable (via `==`) to the oracle.
-// `shinri_num::Rational` has no Display, but it does implement PartialEq, and
-// both Small and Big reduce to the same canonical Rational for the same value.
-fn to_num(f: &FastRat) -> NumRat {
-    match f {
-        FastRat::Small { n, d } => num_of(*n, *d),
-        FastRat::Big(r) => r.clone(),
+    #[test]
+    fn small_tag_and_reduction() {
+        // 2/4 reduces to 1/2 and stays Small
+        let r = Rational::new(Integer::from(2i128), Integer::from(4i128));
+        assert!(matches!(r, Rational(Repr::Small { n: 1, d: 2 })));
+        // negative denominator normalizes onto the numerator
+        let r2 = Rational::new(Integer::from(1i128), Integer::from(-2i128));
+        assert!(matches!(r2, Rational(Repr::Small { n: -1, d: 2 })));
     }
+
+    #[test]
+    fn overflow_promotes_to_big() {
+        let r = Rational::from_int(Integer::from(i128::MAX) * Integer::from(2i128));
+        assert!(matches!(r, Rational(Repr::Big { .. })));
+    }
+
+    #[test]
+    fn demotes_back_to_small_when_it_fits() {
+        // Big value 2*i128::MAX, divided by 2 -> i128::MAX, which fits -> Small
+        let big = Rational::from_int(Integer::from(i128::MAX) * Integer::from(2i128));
+        assert!(matches!(big, Rational(Repr::Big { .. })));
+        let halved = big / Rational::from_int(Integer::from(2i128));
+        assert!(matches!(halved, Rational(Repr::Small { .. })));
+        assert_eq!(halved, Rational::from_int(Integer::from(i128::MAX)));
+    }
+
+    #[test]
+    fn fast_path_arithmetic_and_ordering() {
+        let half = Rational::new(Integer::from(1i128), Integer::from(2i128));
+        let third = Rational::new(Integer::from(1i128), Integer::from(3i128));
+        assert_eq!(
+            half.clone() + third.clone(),
+            Rational::new(Integer::from(5i128), Integer::from(6i128))
+        );
+        assert!((half.clone() - half.clone()).is_zero());
+        assert_eq!(
+            half.clone() * third.clone(),
+            Rational::new(Integer::from(1i128), Integer::from(6i128))
+        );
+        assert_eq!(
+            half.clone() / third.clone(),
+            Rational::new(Integer::from(3i128), Integer::from(2i128))
+        );
+        assert!(third < half);
+        assert_eq!(half.recip(), Rational::from_int(Integer::from(2i128)));
+    }
+```
+
+- [ ] **Step 8: Run the inline tests**
+
+Run: `cargo test -p shinri-num --lib rational`
+Expected: PASS (existing + new).
+
+- [ ] **Step 9: Fix any fallout in `delta.rs` and re-build the crate**
+
+Run: `cargo build -p shinri-num`
+If it fails, the only possible cause is a call site that used `numer()`/`denom()` as `&Integer` (e.g. in `delta.rs` or its tests). Fix mechanically by removing the `&`/`*` (the value is now owned). Re-run until clean.
+Expected: builds clean.
+
+- [ ] **Step 10: Add the differential test vs the `num-rational` oracle**
+
+Create `crates/shinri-num/tests/rational_differential.rs`:
+
+```rust
+use num_bigint::BigInt;
+use num_rational::BigRational;
+use proptest::prelude::*;
+use shinri_num::{Integer, Rational};
+
+fn shinri(n: i128, d: i128) -> Rational {
+    Rational::new(Integer::from(n), Integer::from(d))
+}
+
+fn oracle(n: i128, d: i128) -> BigRational {
+    BigRational::new(BigInt::from(n), BigInt::from(d))
+}
+
+// Both types canonicalize (reduced, positive denominator), so equal values have
+// equal numerator/denominator decimal strings.
+fn agree(s: &Rational, o: &BigRational) -> bool {
+    s.numer().to_string() == o.numer().to_string()
+        && s.denom().to_string() == o.denom().to_string()
 }
 
 proptest! {
-    // FastRat must agree with shinri_num::Rational on every operation, including
-    // when operands overflow i128 and spill to Big (spec §7.4 / §10).
+    // The folded Rational must match the oracle on every op, including when
+    // operands overflow i128 and spill to Big (and demote back). Spec §7 / §10.
     #[test]
-    fn fastrat_matches_numrat(
+    fn rational_matches_oracle(
         an in -1_000_000i128..1_000_000,
         ad in 1i128..1_000_000,
         bn in -1_000_000i128..1_000_000,
         bd in 1i128..1_000_000,
-        // a large multiplier to force overflow on some inputs
         scale in prop::sample::select(vec![1i128, 1_000_000_000_000_000_000]),
     ) {
         let (an, ad) = (an.saturating_mul(scale), ad);
         let (bn, bd) = (bn, bd.saturating_mul(scale));
 
-        let fa = fast_of(an, ad);
-        let fb = fast_of(bn, bd);
-        let na = num_of(an, ad);
-        let nb = num_of(bn, bd);
+        let (sa, sb) = (shinri(an, ad), shinri(bn, bd));
+        let (oa, ob) = (oracle(an, ad), oracle(bn, bd));
 
-        prop_assert_eq!(to_num(&(fa.clone() + fb.clone())), na.clone() + nb.clone());
-        prop_assert_eq!(to_num(&(fa.clone() - fb.clone())), na.clone() - nb.clone());
-        prop_assert_eq!(to_num(&(fa.clone() * fb.clone())), na.clone() * nb.clone());
+        prop_assert!(agree(&(sa.clone() + sb.clone()), &(oa.clone() + ob.clone())));
+        prop_assert!(agree(&(sa.clone() - sb.clone()), &(oa.clone() - ob.clone())));
+        prop_assert!(agree(&(sa.clone() * sb.clone()), &(oa.clone() * ob.clone())));
         if bn != 0 {
-            prop_assert_eq!(to_num(&(fa.clone() / fb.clone())), na.clone() / nb.clone());
+            prop_assert!(agree(&(sa.clone() / sb.clone()), &(oa.clone() / ob.clone())));
         }
-        prop_assert_eq!(fa.partial_cmp(&fb), Some(na.cmp(&nb)));
+        prop_assert_eq!(sa.cmp(&sb), oa.cmp(&ob));
     }
 }
 ```
 
-Note: `to_num` reconstructs the value as a canonical `shinri_num::Rational`, so a `Small` result and a `Big` result representing the same number compare equal via `PartialEq`. This validates the spill path: the same number reached via the i128 fast path and via the bignum fallback must be equal.
+- [ ] **Step 11: Run the full `shinri-num` regime**
 
-- [ ] **Step 7: Run the differential test**
+Run:
+```bash
+cargo test -p shinri-num
+cargo clippy -p shinri-num --all-targets -- -D warnings
+cargo fmt --check
+```
+Expected: all green (existing differential/property tests plus the new rational differential test).
 
-Run: `cargo test -p shinri-core --test fastrat_differential`
-Expected: PASS.
-
-- [ ] **Step 8: Commit**
+- [ ] **Step 12: Commit**
 
 ```bash
-git add crates/shinri-core/src/lib.rs crates/shinri-core/src/rational.rs crates/shinri-core/tests/fastrat_differential.rs
-git commit -m "feat(core): Rational trait + FastRat i128 fast path + DeltaRational, differential-tested"
+git add crates/shinri-num/
+git commit -m "feat(num): fold i128 fast path into Rational (Small|Big), to_i128, by-value numer/denom"
 ```
+
+---
+
+### Task 9: `shinri-core` — re-export the rational types
+
+**Files:**
+- Modify: `crates/shinri-core/src/lib.rs`
+- Test: `crates/shinri-core/tests/rational_reexport.rs`
+
+**Interfaces:**
+- Consumes: `shinri_num::{Rational, DeltaRational}` (Task 8).
+- Produces: `shinri_core::{Rational, DeltaRational}` re-exports — the solver-wide rational vocabulary. No core-defined trait, wrapper, or `rational` module.
+
+- [ ] **Step 1: Add the re-exports to `lib.rs`**
+
+Add to `crates/shinri-core/src/lib.rs` (alongside the other `pub use` lines; core does **not** define its own rational module):
+
+```rust
+pub use shinri_num::{DeltaRational, Rational};
+```
+
+- [ ] **Step 2: Write the smoke test**
+
+Create `crates/shinri-core/tests/rational_reexport.rs`:
+
+```rust
+use shinri_core::Rational;
+use shinri_num::Integer;
+
+#[test]
+fn core_reexports_rational_with_fast_path() {
+    let half = Rational::new(Integer::from(1i128), Integer::from(2i128));
+    let third = Rational::new(Integer::from(1i128), Integer::from(3i128));
+    assert_eq!(
+        half + third,
+        Rational::new(Integer::from(5i128), Integer::from(6i128))
+    );
+}
+```
+
+- [ ] **Step 3: Run the test**
+
+Run: `cargo test -p shinri-core --test rational_reexport`
+Expected: PASS.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/shinri-core/src/lib.rs crates/shinri-core/tests/rational_reexport.rs
+git commit -m "feat(core): re-export shinri_num::{Rational, DeltaRational} (folded fast path)"
+```
+
+(`DeltaRational`'s delta-ordering is tested in `shinri-num`'s `delta.rs`; core only re-exports it.)
 
 ---
 
@@ -2100,14 +2105,14 @@ git commit -m "feat(core): ProofSink trait + NoProof zero-cost seam + TheoryJust
 - §4 term/sort representation → Task 3 (sorts), Task 4 (terms, `Op`/`BuiltinOp`/`ConstVal`, interning). §4.1 properties (O(1) eq, sharing, SoA children) → Task 4. §4.2 operator split → Task 4 `Op`. §4.3 reserved-not-built → comments in `sort.rs`/`term.rs`; no Var/Quant/BV/Array variants present.
 - §5 builder + well-sortedness → Task 5. §5.1 `define-fun`/`substitute` → Task 6.
 - §6 `UndoLog<E>` → Task 7. §6.1 decision properties (flat POD, monomorphized, no dyn) → implementation + restore-identity proptest.
-- §7 `Rational` trait + `FastRat` + delta → Task 9, differential-tested. `FastRat`'s Big→Small demotion (an optimization beyond the spec) is enabled by the `shinri-num` `Integer::to_i128` accessor added in Task 8.
+- §7 arithmetic (folded fast path) → Task 8 (the i128 fast path folded into `shinri_num::Rational` as `Small{i128,i128} | Big{Integer,Integer}` behind a private `Repr`, with `Integer::to_i128`, by-value `numer()`/`denom()`, overflow→Big and demote-on-fit, differential-tested vs `num-rational`). Core re-export → Task 9. The Q1/§4.3 `Rational` trait + `FastRat` wrapper is intentionally **not** built.
 - §8 `ProofSink` + `NoProof`, resolution-chain granularity, borrow-don't-build → Task 10. §8.1 `TheoryJust` → Task 10.
-- §9 error handling → `SortError` (Task 5), `debug_assert!` in `UndoLog`/`FastRat`/`substitute`.
-- §10 testing → property tests (interning Task 4, restore-identity Task 7, FastRat differential Task 9); demotion unit test (Task 9); codegen/ZST check (Task 10 `noproof_is_zero_sized`); CI gates (Task 10 Step 6).
-- §11 deliverable → all tasks; one-way doors designed in (reserved variants, side-table-ready, proof seam, arithmetic abstraction).
+- §9 error handling → `SortError` (Task 5), `debug_assert!` in `UndoLog`/`substitute` (core) and `Rational` canonicalization (Task 8, `shinri-num`).
+- §10 testing → property tests (interning Task 4, restore-identity Task 7); `Rational` differential vs oracle + overflow/demotion unit tests (Task 8, `shinri-num`); codegen/ZST check (Task 10 `noproof_is_zero_sized`); CI gates (Task 8 Step 11 and Task 10 Step 6).
+- §11 deliverable → all tasks; one-way doors designed in (reserved variants, side-table-ready, proof seam) and the rational fast path centralized in `shinri-num`.
 
-**Placeholder scan:** No TBD/TODO/"handle edge cases"/"similar to". Every code step shows complete code. The `Rational` trait method set is concretely pinned (Task 8) with a note that it is additively extensible, resolving the spec's deliberately-open §7.
+**Placeholder scan:** No TBD/TODO/"handle edge cases"/"similar to". Every code step shows complete code.
 
-**Type consistency:** `TermId`/`SortId` use `from_index`/`index`; `Op`/`BuiltinOp`/`ConstVal`/`ChildSlice` names are stable across Tasks 4-6; `mk_app`/`mk_eq`/`sort_of`/`declare_fun`/`substitute` signatures match between their producing task and their use in later tests; `FastRat` variants (`Small { n, d }` / `Big`) and `Rational` trait methods are consistent across Task 9 and its differential test; `from_big` (Task 9) consumes `Integer::to_i128` (Task 8) with matching `Option<i128>` types; `ProofSink` method signatures match between trait, `NoProof`, and the Task 10 `Recorder`.
+**Type consistency:** `TermId`/`SortId` use `from_index`/`index`; `Op`/`BuiltinOp`/`ConstVal`/`ChildSlice` names are stable across Tasks 4-6; `mk_app`/`mk_eq`/`sort_of`/`declare_fun`/`substitute` signatures match between their producing task and later use; `Rational`'s reworked surface (`new`/`from_int`/`zero`/`one`/`numer`/`denom`/`recip`/ops/`Ord`) is consistent between Task 8's implementation, its tests, and the Task 9 re-export smoke test; `from_components`/`small_canon` consume `Integer::to_i128` with matching `Option<i128>` types; `ProofSink` method signatures match between trait, `NoProof`, and the Task 10 `Recorder`.
 
-**`FastRat` demotion is symmetric (Task 8 + Task 9):** `FastRat` converts `Small → Big` on overflow and demotes `Big → Small` once a value fits `i128` again, via `Integer::to_i128`. Because demotion is canonical (a value fits ⇒ it is `Small`; otherwise `Big`), `PartialEq`/`PartialOrd` remain correct (equal values share the same representation, and the `to_big()` fallback path stays valid regardless). The demotion path is exercised by `big_result_demotes_when_it_fits_again` (Task 9) and validated end-to-end by the overflow-targeted differential test.
+**`Rational` fast path is symmetric and encapsulated (Task 8):** `Rational` promotes `Small → Big` on overflow and demotes `Big → Small` once a value fits `i128` again, via `Integer::to_i128`. Because the tag is canonical (a value fits ⇒ `Small`; otherwise `Big`), `PartialEq`/`Eq`/`Ord` are correct: equal values share one representation, so `Small`/`Big` cross-comparison is `false` and ordering cross-multiplies over `Integer`. The private `Repr` (behind `pub struct Rational(Repr)`, mirroring `Integer`) prevents external construction of a non-canonical value. Promotion, demotion, and oracle-agreement are covered by Task 8's unit + differential tests.
