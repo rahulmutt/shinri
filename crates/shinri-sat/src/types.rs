@@ -70,6 +70,14 @@ pub enum Reason {
     Theory(TheoryJust),
 }
 
+/// A detected inconsistency: a stored clause, or a virtual clause (an implicit
+/// binary, or — later — a theory conflict) given by its literal set.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Conflict {
+    Clause(ClauseRef),
+    Lits(Vec<Lit>),
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

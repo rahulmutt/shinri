@@ -10,13 +10,15 @@ pub mod config;
 pub mod types;
 pub mod trail;
 pub mod watch;
+pub mod solver;
 
 #[cfg(any(test, feature = "dimacs"))]
 pub mod dimacs;
 
 pub use clause::{ClauseDb, ClauseRef};
 pub use config::{RestartKind, SolverConfig};
-pub use types::{Effort, LBool, Reason, SolveResult, TheoryResult};
+pub use types::{Conflict, Effort, LBool, Reason, SolveResult, TheoryResult};
+pub use solver::Solver;
 
 // Re-export the core vocabulary so downstream crates and integration tests can
 // name these types via `shinri_sat::` without depending on `shinri-core`

@@ -107,6 +107,18 @@ impl ClauseDb {
     pub fn num_clauses(&self) -> usize {
         self.id_to_ref.len()
     }
+
+    #[inline]
+    pub fn lit_at(&self, r: ClauseRef, i: usize) -> Lit {
+        Lit::from_code(self.arena[self.off(r) + HEADER_WORDS + i])
+    }
+
+    /// Swap two literals within a clause (used to keep watched lits at 0,1).
+    #[inline]
+    pub fn swap_lits(&mut self, r: ClauseRef, i: usize, j: usize) {
+        let base = self.off(r) + HEADER_WORDS;
+        self.arena.swap(base + i, base + j);
+    }
 }
 
 #[cfg(test)]
