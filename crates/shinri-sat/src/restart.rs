@@ -9,8 +9,6 @@ pub fn luby(i: u64) -> u64 {
         size = 2 * size + 1;
         seq += 1;
     }
-    let mut size = size;
-    let mut seq = seq;
     while size != i {
         size = (size - 1) / 2;
         seq -= 1;

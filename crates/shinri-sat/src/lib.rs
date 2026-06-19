@@ -5,29 +5,30 @@
 //! `Theory`/`ProofSink` seams. Depends only on `shinri-core`.
 
 pub mod analyze;
-pub mod clause;
 pub mod assignment;
+pub mod clause;
 pub mod config;
 pub mod heuristic;
-pub mod theory;
-pub mod types;
-pub mod trail;
-pub mod watch;
-pub mod solver;
 pub mod reduce;
 pub mod restart;
+pub mod solver;
+pub mod theory;
+pub mod trail;
+pub mod types;
+pub mod watch;
 
 #[cfg(any(test, feature = "dimacs"))]
 pub mod dimacs;
 
-#[cfg(test)] mod certificate;
+#[cfg(test)]
+mod certificate;
 
 pub use clause::{ClauseDb, ClauseRef};
 pub use config::{RestartKind, SolverConfig};
-pub use types::{Conflict, Effort, LBool, Reason, SolveResult, TheoryResult};
-pub use solver::Solver;
 pub use heuristic::{BranchHeuristic, Evsids, Vmtf};
+pub use solver::Solver;
 pub use theory::{NoTheory, Theory};
+pub use types::{Conflict, Effort, LBool, Reason, SolveResult, TheoryResult};
 
 // Re-export the core vocabulary so downstream crates and integration tests can
 // name these types via `shinri_sat::` without depending on `shinri-core`

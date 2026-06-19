@@ -33,11 +33,17 @@ impl Default for ClauseDb {
 
 impl ClauseDb {
     pub fn new() -> ClauseDb {
-        ClauseDb { arena: Vec::new(), id_to_ref: Vec::new() }
+        ClauseDb {
+            arena: Vec::new(),
+            id_to_ref: Vec::new(),
+        }
     }
 
     pub fn add_clause(&mut self, lits: &[Lit], learnt: bool) -> (ClauseId, ClauseRef) {
-        debug_assert!(self.id_to_ref.len() < u32::MAX as usize, "ClauseId space exhausted");
+        debug_assert!(
+            self.id_to_ref.len() < u32::MAX as usize,
+            "ClauseId space exhausted"
+        );
         let off = self.arena.len() as u32;
         let r = ClauseRef(off);
         let id = ClauseId::new(self.id_to_ref.len() as u32);
@@ -67,7 +73,10 @@ impl ClauseDb {
         let off = self.off(r);
         let len = self.arena[off + 2] as usize;
         let start = off + HEADER_WORDS;
-        debug_assert!(start + len <= self.arena.len(), "clause lits slice out of bounds");
+        debug_assert!(
+            start + len <= self.arena.len(),
+            "clause lits slice out of bounds"
+        );
         let codes = &self.arena[start..start + len];
         // SAFETY: `Lit` is `#[repr(transparent)]` over `u32` (verified in
         // shinri-core), so a slice of literal codes is layout-identical to a
@@ -152,12 +161,12 @@ mod tests {
 
         assert_eq!(db.lits(r0), &ls);
         assert_eq!(db.len_of(r0), 3);
-        assert_eq!(db.is_learnt(r0), false);
-        assert_eq!(db.is_learnt(r1), true);
+        assert!(!db.is_learnt(r0));
+        assert!(db.is_learnt(r1));
 
         db.set_lbd(r1, 2);
         assert_eq!(db.lbd(r1), 2);
-        assert_eq!(db.is_learnt(r1), true); // set_lbd must preserve the LEARNT bit
+        assert!(db.is_learnt(r1)); // set_lbd must preserve the LEARNT bit
 
         // Stable ids map to current refs.
         assert_eq!(db.clause_id(r0), id0);

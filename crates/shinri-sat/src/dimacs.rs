@@ -61,8 +61,14 @@ mod tests {
         let cnf = parse_dimacs(src).unwrap();
         assert_eq!(cnf.num_vars, 3);
         assert_eq!(cnf.clauses.len(), 2);
-        assert_eq!(cnf.clauses[0], vec![Lit::new(Var::new(0), true), Lit::new(Var::new(1), false)]);
-        assert_eq!(cnf.clauses[1], vec![Lit::new(Var::new(1), true), Lit::new(Var::new(2), true)]);
+        assert_eq!(
+            cnf.clauses[0],
+            vec![Lit::new(Var::new(0), true), Lit::new(Var::new(1), false)]
+        );
+        assert_eq!(
+            cnf.clauses[1],
+            vec![Lit::new(Var::new(1), true), Lit::new(Var::new(2), true)]
+        );
     }
 
     #[test]

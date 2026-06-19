@@ -1,6 +1,6 @@
+use crate::clause::ClauseRef;
 use shinri_core::Lit;
 use shinri_core::TheoryJust;
-use crate::clause::ClauseRef;
 
 /// A three-valued Boolean: the value of a variable on the current trail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

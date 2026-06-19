@@ -7,7 +7,10 @@ use shinri_sat::{
 struct Lcg(u64);
 impl Lcg {
     fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         self.0 >> 16
     }
     fn below(&mut self, n: u64) -> u64 {
@@ -50,7 +53,11 @@ fn to_dimacs(clauses: &[Vec<(u32, bool)>]) -> Vec<Vec<i32>> {
             c.iter()
                 .map(|&(v, p)| {
                     let lit = (v + 1) as i32;
-                    if p { lit } else { -lit }
+                    if p {
+                        lit
+                    } else {
+                        -lit
+                    }
                 })
                 .collect()
         })
@@ -95,7 +102,10 @@ fn differential_random_3cnf_across_configs() {
             None => continue, // skip instances the oracle can't classify
         };
         for &(restart, use_evsids) in &configs {
-            let cfg = SolverConfig { restart, ..SolverConfig::default() };
+            let cfg = SolverConfig {
+                restart,
+                ..SolverConfig::default()
+            };
             // run_shinri returns Solver<_, _, H> which differs between Evsids and
             // Vmtf (they are distinct monomorphisations), so we cannot unify them
             // in a single `if/else` binding. Handle each branch separately.

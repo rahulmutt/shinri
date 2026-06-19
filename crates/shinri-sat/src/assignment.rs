@@ -116,17 +116,17 @@ mod tests {
         assert_eq!(a.lit_value(l), LBool::True); // the literal itself is satisfied
         assert_eq!(a.level(v), 3);
         assert_eq!(a.reason(v), Reason::Decision);
-        assert_eq!(a.phase(v), false);
+        assert!(!a.phase(v));
 
         a.unassign(v);
         assert_eq!(a.value(v), LBool::Unset);
-        assert_eq!(a.phase(v), false); // phase is remembered for phase-saving
+        assert!(!a.phase(v)); // phase is remembered for phase-saving
 
         // Phase saving must persist a TRUE phase across unassign (not reset to default).
         let l_pos = Lit::new(v, true);
         a.assign(l_pos, 1, Reason::Unit);
-        assert_eq!(a.phase(v), true);
+        assert!(a.phase(v));
         a.unassign(v);
-        assert_eq!(a.phase(v), true); // saved phase persists across unassign
+        assert!(a.phase(v)); // saved phase persists across unassign
     }
 }

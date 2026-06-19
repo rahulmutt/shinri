@@ -17,7 +17,11 @@ impl Default for Trail {
 
 impl Trail {
     pub fn new() -> Trail {
-        Trail { lits: Vec::new(), level_starts: Vec::new(), qhead: 0 }
+        Trail {
+            lits: Vec::new(),
+            level_starts: Vec::new(),
+            qhead: 0,
+        }
     }
 
     #[inline]
@@ -84,7 +88,10 @@ impl Trail {
     /// passing each to `f` (the caller un-assigns it). `qhead` is clamped so
     /// propagation resumes from the truncated end.
     pub fn backtrack_to(&mut self, level: u32, mut f: impl FnMut(Lit)) {
-        debug_assert!(level <= self.decision_level(), "backtrack above current level");
+        debug_assert!(
+            level <= self.decision_level(),
+            "backtrack above current level"
+        );
         let target_len = if (level as usize) < self.level_starts.len() {
             self.level_starts[level as usize]
         } else {

@@ -71,7 +71,9 @@ mod tests {
     use shinri_core::{Lit, Var};
 
     fn cl(spec: &[(u32, bool)]) -> Vec<Lit> {
-        spec.iter().map(|&(n, p)| Lit::new(Var::new(n), p)).collect()
+        spec.iter()
+            .map(|&(n, p)| Lit::new(Var::new(n), p))
+            .collect()
     }
 
     #[test]

@@ -47,13 +47,25 @@ impl Watches {
     }
 
     pub fn watch_clause(&mut self, r: ClauseRef, w0: Lit, w1: Lit) {
-        self.lists[Self::idx(w0.negate())].push(Watch { target: WatchTarget::Clause(r), blocker: w1 });
-        self.lists[Self::idx(w1.negate())].push(Watch { target: WatchTarget::Clause(r), blocker: w0 });
+        self.lists[Self::idx(w0.negate())].push(Watch {
+            target: WatchTarget::Clause(r),
+            blocker: w1,
+        });
+        self.lists[Self::idx(w1.negate())].push(Watch {
+            target: WatchTarget::Clause(r),
+            blocker: w0,
+        });
     }
 
     pub fn watch_binary(&mut self, a: Lit, b: Lit) {
-        self.lists[Self::idx(a.negate())].push(Watch { target: WatchTarget::Binary, blocker: b });
-        self.lists[Self::idx(b.negate())].push(Watch { target: WatchTarget::Binary, blocker: a });
+        self.lists[Self::idx(a.negate())].push(Watch {
+            target: WatchTarget::Binary,
+            blocker: b,
+        });
+        self.lists[Self::idx(b.negate())].push(Watch {
+            target: WatchTarget::Binary,
+            blocker: a,
+        });
     }
 
     #[inline]

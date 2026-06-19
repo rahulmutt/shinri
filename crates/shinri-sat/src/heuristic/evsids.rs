@@ -9,8 +9,8 @@ use super::BranchHeuristic;
 /// trick that avoids decaying every variable); rescale keeps it finite.
 pub struct Evsids {
     activity: Vec<f64>,
-    heap: Vec<u32>,    // binary max-heap of var indices
-    pos: Vec<i32>,     // pos[v] = index in `heap`, or -1 if absent
+    heap: Vec<u32>, // binary max-heap of var indices
+    pos: Vec<i32>,  // pos[v] = index in `heap`, or -1 if absent
     var_inc: f64,
     var_decay: f64,
 }
@@ -58,7 +58,11 @@ impl Evsids {
                 break;
             }
             let r = l + 1;
-            let child = if r < n && self.higher(self.heap[r], self.heap[l]) { r } else { l };
+            let child = if r < n && self.higher(self.heap[r], self.heap[l]) {
+                r
+            } else {
+                l
+            };
             if self.higher(self.heap[child], x) {
                 self.heap[i] = self.heap[child];
                 self.pos[self.heap[i] as usize] = i as i32;

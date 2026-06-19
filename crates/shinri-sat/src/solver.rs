@@ -293,7 +293,12 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
             Reason::Binary(other) => vec![other],
             Reason::Clause(r) => {
                 // All literals except `p` (which is satisfied by this clause).
-                self.db.lits(r).iter().copied().filter(|&l| l != p).collect()
+                self.db
+                    .lits(r)
+                    .iter()
+                    .copied()
+                    .filter(|&l| l != p)
+                    .collect()
             }
             Reason::Theory(just) => {
                 let mut antecedents = Vec::new();
@@ -343,8 +348,12 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
     /// every clause with glue <= threshold and every locked clause.
     pub(crate) fn reduce(&mut self) {
         let keep_glue = self.config.lbd_keep_threshold;
-        let mut refs: Vec<ClauseRef> =
-            self.learnts.iter().copied().filter(|&r| !self.db.is_deleted(r)).collect();
+        let mut refs: Vec<ClauseRef> = self
+            .learnts
+            .iter()
+            .copied()
+            .filter(|&r| !self.db.is_deleted(r))
+            .collect();
         refs.sort_by_key(|&r| self.db.lbd(r));
         let n = refs.len();
         let half = n / 2;
@@ -403,7 +412,10 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                     if let Reason::Clause(r) = reason {
                         self.db.set_lbd(r, lbd);
                     }
-                    if self.conflicts % self.config.reduce_interval as u64 == 0 {
+                    if self
+                        .conflicts
+                        .is_multiple_of(self.config.reduce_interval as u64)
+                    {
                         self.reduce();
                     }
                     self.restart.on_conflict(lbd);
@@ -443,7 +455,10 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                             }
                             None => match self.theory.check(Effort::Full) {
                                 TheoryResult::Sat => {
-                                    debug_assert!(self.check_model(), "returned SAT but a clause is unsatisfied");
+                                    debug_assert!(
+                                        self.check_model(),
+                                        "returned SAT but a clause is unsatisfied"
+                                    );
                                     return SolveResult::Sat;
                                 }
                                 TheoryResult::Conflict(lits) => {
@@ -557,8 +572,13 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
             Reason::Unit => true,
             Reason::Binary(other) => self.redundant_step(other, newly_seen),
             Reason::Clause(r) => {
-                let lits: Vec<Lit> =
-                    self.db.lits(r).iter().copied().filter(|&x| x != l).collect();
+                let lits: Vec<Lit> = self
+                    .db
+                    .lits(r)
+                    .iter()
+                    .copied()
+                    .filter(|&x| x != l)
+                    .collect();
                 for x in lits {
                     if !self.redundant_step(x, newly_seen) {
                         return false;
@@ -658,7 +678,10 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                         }
                         let other = self.db.lit_at(r, 0);
                         if other != w.blocker && self.assign.lit_value(other) == LBool::True {
-                            keep.push(Watch { target: WatchTarget::Clause(r), blocker: other });
+                            keep.push(Watch {
+                                target: WatchTarget::Clause(r),
+                                blocker: other,
+                            });
                             continue;
                         }
                         // Look for a replacement watch among slots 2..len.
@@ -680,7 +703,10 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                             continue; // clause leaves p's list
                         }
                         // No replacement: clause is unit (or conflicting) on `other`.
-                        keep.push(Watch { target: WatchTarget::Clause(r), blocker: other });
+                        keep.push(Watch {
+                            target: WatchTarget::Clause(r),
+                            blocker: other,
+                        });
                         match self.assign.lit_value(other) {
                             LBool::Unset => {
                                 self.enqueue(other, Reason::Clause(r));
@@ -747,7 +773,10 @@ mod tests {
         fn propagate(&mut self, out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
             if self.saw_x0 && !self.done {
                 self.done = true;
-                out.push((Lit::new(Var::new(1), true), TheoryJust { theory: 0, tag: 0 }));
+                out.push((
+                    Lit::new(Var::new(1), true),
+                    TheoryJust { theory: 0, tag: 0 },
+                ));
             }
             None
         }
@@ -762,8 +791,7 @@ mod tests {
 
     #[test]
     fn theory_propagation_forces_a_literal() {
-        let mut s: Solver<ForceX1, NoProof, Vmtf> =
-            Solver::new(SolverConfig::default());
+        let mut s: Solver<ForceX1, NoProof, Vmtf> = Solver::new(SolverConfig::default());
         for _ in 0..2 {
             s.new_var();
         }
@@ -865,14 +893,21 @@ mod tests {
     fn reduce_deletes_high_lbd_unlocked_learnts() {
         let mut s = mk(6);
         // Install three "learnt" clauses directly with controlled LBD.
-        let r_lo = s.add_learnt(&[lit(0, true), lit(1, true), lit(2, true)]).unwrap();
-        let r_hi = s.add_learnt(&[lit(3, true), lit(4, true), lit(5, true)]).unwrap();
+        let r_lo = s
+            .add_learnt(&[lit(0, true), lit(1, true), lit(2, true)])
+            .unwrap();
+        let r_hi = s
+            .add_learnt(&[lit(3, true), lit(4, true), lit(5, true)])
+            .unwrap();
         s.db.set_lbd(r_lo, 2); // glue, protected (<= threshold 2)
         s.db.set_lbd(r_hi, 9); // high glue, deletable
         s.reduce();
         assert!(!s.db.is_deleted(r_lo), "low-LBD clause kept");
         assert!(s.db.is_deleted(r_hi), "high-LBD clause deleted");
-        assert_eq!(s.stats_deleted, 1, "exactly one high-LBD unlocked clause deleted");
+        assert_eq!(
+            s.stats_deleted, 1,
+            "exactly one high-LBD unlocked clause deleted"
+        );
     }
 
     #[test]
