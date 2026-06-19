@@ -128,7 +128,7 @@ impl Rational {
     }
 
     pub fn recip(&self) -> Rational {
-        debug_assert!(!self.is_zero(), "recip of zero");
+        assert!(!self.is_zero(), "recip of zero");
         match &self.0 {
             Repr::Small { n, d } => Rational::small_canon(*d, *n)
                 .unwrap_or_else(|| Rational::from_components(Integer::from(*d), Integer::from(*n))),
@@ -208,7 +208,7 @@ rat_binop!(
     Div,
     div,
     |an: i128, ad: i128, bn: i128, bd: i128| -> Option<Rational> {
-        debug_assert!(bn != 0, "division by zero rational");
+        assert!(bn != 0, "division by zero rational");
         let num = an.checked_mul(bd)?;
         let den = ad.checked_mul(bn)?;
         if den == 0 {
@@ -217,7 +217,7 @@ rat_binop!(
         Rational::small_canon(num, den)
     },
     |an: Integer, ad: Integer, bn: Integer, bd: Integer| {
-        debug_assert!(!bn.is_zero(), "division by zero rational");
+        assert!(!bn.is_zero(), "division by zero rational");
         (an * bd, ad * bn)
     }
 );
