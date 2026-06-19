@@ -1,4 +1,6 @@
 use shinri_core::Lit;
+use shinri_core::TheoryJust;
+use crate::clause::ClauseRef;
 
 /// A three-valued Boolean: the value of a variable on the current trail.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,6 +52,22 @@ pub enum TheoryResult {
 pub enum SolveResult {
     Sat,
     Unsat { core: Vec<Lit> },
+}
+
+/// The antecedent of a trail assignment: why a variable holds its value.
+/// The resolution backbone for both conflict analysis and the proof chain.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reason {
+    /// A branching decision or an assumption.
+    Decision,
+    /// A top-level unit clause (asserted at level 0).
+    Unit,
+    /// A longer clause became unit under the current trail.
+    Clause(ClauseRef),
+    /// Implied by an implicit binary clause; the literal is the *other* literal.
+    Binary(Lit),
+    /// A theory propagation; the explanation is recomputed lazily (spec §8.1).
+    Theory(TheoryJust),
 }
 
 #[cfg(test)]
