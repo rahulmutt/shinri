@@ -18,6 +18,7 @@ pub struct Solver {
     pub(crate) config: SolverConfig,
     pub(crate) unsat: bool,
     pub(crate) analyzer: Analyzer,
+    pub(crate) stats_minimized: u64,
 }
 
 impl Solver {
@@ -30,6 +31,7 @@ impl Solver {
             config,
             unsat: false,
             analyzer: Analyzer::default(),
+            stats_minimized: 0,
         }
     }
 
@@ -163,6 +165,8 @@ impl Solver {
             reason_lits = self.reason_lits_of(p);
         }
 
+        self.minimize();
+
         // Clear remaining seen marks.
         for v in seen_vars {
             self.analyzer.seen[v.index()] = false;
@@ -243,6 +247,65 @@ impl Solver {
                     None => return SolveResult::Sat,
                 },
             }
+        }
+    }
+
+    /// Drop redundant literals from the learnt clause in place. Runs after the
+    /// UIP loop, while `seen` still marks the clause's non-asserting literals.
+    fn minimize(&mut self) {
+        let mut learnt = std::mem::take(&mut self.analyzer.learnt);
+        let mut newly_seen: Vec<Var> = Vec::new();
+        let mut j = 1;
+        for i in 1..learnt.len() {
+            let l = learnt[i];
+            if !self.lit_redundant(l, &mut newly_seen) {
+                learnt[j] = l;
+                j += 1;
+            }
+        }
+        self.stats_minimized += (learnt.len() - j) as u64;
+        learnt.truncate(j);
+        for v in newly_seen {
+            self.analyzer.seen[v.index()] = false;
+        }
+        self.analyzer.learnt = learnt;
+    }
+
+    /// True if `l` can be removed: every literal of its reason is already in the
+    /// clause (`seen`), at level 0, or itself recursively redundant.
+    fn lit_redundant(&mut self, l: Lit, newly_seen: &mut Vec<Var>) -> bool {
+        match self.assign.reason(l.var()) {
+            Reason::Decision => false,
+            Reason::Unit => true,
+            Reason::Binary(other) => self.redundant_step(other, newly_seen),
+            Reason::Clause(r) => {
+                let lits: Vec<Lit> =
+                    self.db.lits(r).iter().copied().filter(|&x| x != l).collect();
+                for x in lits {
+                    if !self.redundant_step(x, newly_seen) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Reason::Theory(_) => false, // don't minimize across theory reasons (Phase 1)
+        }
+    }
+
+    fn redundant_step(&mut self, x: Lit, newly_seen: &mut Vec<Var>) -> bool {
+        let v = x.var();
+        if self.analyzer.seen[v.index()] || self.assign.level(v) == 0 {
+            return true;
+        }
+        if matches!(self.assign.reason(v), Reason::Decision) {
+            return false;
+        }
+        if self.lit_redundant(x, newly_seen) {
+            self.analyzer.seen[v.index()] = true;
+            newly_seen.push(v);
+            true
+        } else {
+            false
         }
     }
 
@@ -419,6 +482,22 @@ mod tests {
         assert_eq!(s.assign.value(Var::new(0)), LBool::True);
         assert_eq!(s.assign.value(Var::new(1)), LBool::True);
         assert_eq!(s.assign.value(Var::new(2)), LBool::True);
+    }
+
+    #[test]
+    fn minimization_field_tracks_removals_and_result_correct() {
+        // 4-variable UNSAT core; correctness must hold with minimization on.
+        let mut s = mk(4);
+        s.add_clause(&[lit(0, true), lit(1, true)]);
+        s.add_clause(&[lit(0, false), lit(2, true)]);
+        s.add_clause(&[lit(1, false), lit(2, true)]);
+        s.add_clause(&[lit(2, false), lit(3, true)]);
+        s.add_clause(&[lit(2, false), lit(3, false)]);
+        let r = s.solve();
+        // This instance is UNSAT (x2 is forced true, then x3 must be both true
+        // and false); correctness must hold with minimization on.
+        assert_eq!(r, SolveResult::Unsat { core: vec![] });
+        let _ = s.stats_minimized; // field must exist
     }
 
     #[test]

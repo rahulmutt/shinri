@@ -1906,8 +1906,9 @@ Add to `solver.rs` tests:
         s.add_clause(&[lit(2, false), lit(3, true)]);
         s.add_clause(&[lit(2, false), lit(3, false)]);
         let r = s.solve();
-        // Either SAT or UNSAT, but must be deterministic & sound; here it is SAT.
-        assert_eq!(r, SolveResult::Sat);
+        // This instance is UNSAT (x2 is forced true, then x3 must be both true
+        // and false); correctness must hold with minimization on.
+        assert_eq!(r, SolveResult::Unsat { core: vec![] });
         let _ = s.stats_minimized; // field must exist
     }
 ```
