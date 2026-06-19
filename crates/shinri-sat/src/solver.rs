@@ -1,5 +1,6 @@
+use crate::analyze::Analyzer;
 use crate::assignment::Assignment;
-use crate::clause::ClauseDb;
+use crate::clause::{ClauseDb, ClauseRef};
 use crate::config::SolverConfig;
 use crate::trail::Trail;
 use crate::types::{Conflict, LBool, Reason, SolveResult};
@@ -16,6 +17,7 @@ pub struct Solver {
     #[allow(dead_code)]
     pub(crate) config: SolverConfig,
     pub(crate) unsat: bool,
+    pub(crate) analyzer: Analyzer,
 }
 
 impl Solver {
@@ -27,12 +29,14 @@ impl Solver {
             watches: Watches::new(),
             config,
             unsat: false,
+            analyzer: Analyzer::default(),
         }
     }
 
     pub fn new_var(&mut self) -> Var {
         let v = self.assign.new_var();
         self.watches.ensure_vars(self.assign.num_vars());
+        self.analyzer.ensure_vars(self.assign.num_vars());
         v
     }
 
@@ -103,23 +107,133 @@ impl Solver {
         self.trail.backtrack_to(level, |l| assign.unassign(l.var()));
     }
 
-    /// Naive DPLL search (no learning). Replaced by CDCL in Task 9.
+    /// The literal set of a conflict — read from the arena for a stored clause,
+    /// or returned directly for a virtual (binary/theory) conflict.
+    fn conflict_lits(&self, c: &Conflict) -> Vec<Lit> {
+        match c {
+            Conflict::Clause(r) => self.db.lits(*r).to_vec(),
+            Conflict::Lits(ls) => ls.clone(),
+        }
+    }
+
+    /// 1-UIP conflict analysis. Returns (learnt clause with the asserting
+    /// literal at index 0, backjump level). Assumes the conflict is at the
+    /// current decision level > 0.
+    pub(crate) fn analyze(&mut self, conflict: Conflict) -> (Vec<Lit>, u32) {
+        let level = self.trail.decision_level();
+        self.analyzer.learnt.clear();
+        self.analyzer.learnt.push(Lit::from_code(0)); // placeholder for asserting lit
+        let mut counter = 0u32; // literals at `level` still to resolve
+        let mut trail_idx = self.trail.len();
+        let mut seen_vars: Vec<Var> = Vec::new();
+
+        // Seed with the conflict clause's literals.
+        let mut reason_lits = self.conflict_lits(&conflict);
+        loop {
+            for &q in &reason_lits {
+                let v = q.var();
+                if !self.analyzer.seen[v.index()] && self.assign.level(v) > 0 {
+                    self.analyzer.seen[v.index()] = true;
+                    seen_vars.push(v);
+                    if self.assign.level(v) == level {
+                        counter += 1;
+                    } else {
+                        self.analyzer.learnt.push(q);
+                    }
+                }
+            }
+            // Find the next trail literal at `level` that we've marked seen.
+            loop {
+                trail_idx -= 1;
+                let p = self.trail.lit_at(trail_idx);
+                if self.analyzer.seen[p.var().index()] {
+                    break;
+                }
+            }
+            let p = self.trail.lit_at(trail_idx);
+            let pv = p.var();
+            self.analyzer.seen[pv.index()] = false;
+            counter -= 1;
+            if counter == 0 {
+                // `p` is the first UIP; the asserting literal is its negation.
+                self.analyzer.learnt[0] = p.negate();
+                break;
+            }
+            // Resolve on p's reason.
+            reason_lits = self.reason_lits_of(p);
+        }
+
+        // Clear remaining seen marks.
+        for v in seen_vars {
+            self.analyzer.seen[v.index()] = false;
+        }
+
+        // Backjump level = second-highest decision level in the learnt clause.
+        let learnt = std::mem::take(&mut self.analyzer.learnt);
+        let bt = learnt
+            .iter()
+            .skip(1)
+            .map(|l| self.assign.level(l.var()))
+            .max()
+            .unwrap_or(0);
+        (learnt, bt)
+    }
+
+    /// The literals (other than `p` itself) of `p`'s antecedent clause —
+    /// i.e. the literals to resolve against when walking the implication graph.
+    fn reason_lits_of(&self, p: Lit) -> Vec<Lit> {
+        match self.assign.reason(p.var()) {
+            Reason::Decision => Vec::new(), // a decision has no antecedent
+            Reason::Unit => Vec::new(),
+            Reason::Binary(other) => vec![other],
+            Reason::Clause(r) => {
+                // All literals except `p` (which is satisfied by this clause).
+                self.db.lits(r).iter().copied().filter(|&l| l != p).collect()
+            }
+            Reason::Theory(_just) => Vec::new(), // expanded lazily in Task 17
+        }
+    }
+
+    /// Install a learnt clause and return its ref (None if it is a unit, which
+    /// is asserted at level 0). The asserting literal is `learnt[0]`.
+    pub(crate) fn add_learnt(&mut self, learnt: &[Lit]) -> Option<ClauseRef> {
+        match learnt.len() {
+            0 => None, // empty learnt clause => top-level UNSAT (handled by caller)
+            1 => None,
+            2 => {
+                self.watches.watch_binary(learnt[0], learnt[1]);
+                None
+            }
+            _ => {
+                let (_id, r) = self.db.add_clause(learnt, true);
+                self.watches.watch_clause(r, learnt[0], learnt[1]);
+                Some(r)
+            }
+        }
+    }
+
+    /// CDCL search with 1-UIP conflict analysis, clause learning, and
+    /// non-chronological backjumping.
     pub fn solve(&mut self) -> SolveResult {
         if self.unsat {
             return SolveResult::Unsat { core: vec![] };
         }
         loop {
             match self.propagate() {
-                Some(_conflict) => {
-                    let d = self.trail.decision_level();
-                    if d == 0 {
+                Some(conflict) => {
+                    if self.trail.decision_level() == 0 {
                         self.unsat = true;
                         return SolveResult::Unsat { core: vec![] };
                     }
-                    // Flip the current level's decision into the parent level.
-                    let dec_lit = self.trail.lit_at(self.trail.level_start(d));
-                    self.backtrack_to(d - 1);
-                    self.enqueue(dec_lit.negate(), Reason::Unit);
+                    let (learnt, bt) = self.analyze(conflict);
+                    self.backtrack_to(bt);
+                    let asserting = learnt[0];
+                    let reason = match self.add_learnt(&learnt) {
+                        Some(r) => Reason::Clause(r),
+                        None if learnt.len() == 2 => Reason::Binary(learnt[1]),
+                        None => Reason::Unit,
+                    };
+                    self.enqueue(asserting, reason);
                 }
                 None => match self.pick_branch() {
                     Some(l) => {
@@ -247,6 +361,32 @@ mod tests {
     }
 
     use crate::types::SolveResult;
+
+    #[test]
+    fn cdcl_solves_unsat_pigeon_like() {
+        // Same UNSAT 2-SAT as before, now via CDCL: must still be UNSAT.
+        let mut s = mk(2);
+        s.add_clause(&[lit(0, true), lit(1, true)]);
+        s.add_clause(&[lit(0, true), lit(1, false)]);
+        s.add_clause(&[lit(0, false), lit(1, true)]);
+        s.add_clause(&[lit(0, false), lit(1, false)]);
+        assert_eq!(s.solve(), SolveResult::Unsat { core: vec![] });
+    }
+
+    #[test]
+    fn cdcl_solves_sat_and_assignment_satisfies() {
+        // (x0 ∨ x1 ∨ x2) ∧ (¬x0 ∨ ¬x1) ∧ (¬x1 ∨ ¬x2) ∧ (x1) -> forces a chain.
+        let mut s = mk(3);
+        s.add_clause(&[lit(0, true), lit(1, true), lit(2, true)]);
+        s.add_clause(&[lit(0, false), lit(1, false)]);
+        s.add_clause(&[lit(1, false), lit(2, false)]);
+        s.add_clause(&[lit(1, true)]);
+        assert_eq!(s.solve(), SolveResult::Sat);
+        // x1 true => x0 false, x2 false => clause1 needs x0|x1|x2: x1 true ok.
+        assert_eq!(s.assign.value(Var::new(1)), LBool::True);
+        assert_eq!(s.assign.value(Var::new(0)), LBool::False);
+        assert_eq!(s.assign.value(Var::new(2)), LBool::False);
+    }
 
     #[test]
     fn solves_satisfiable_2sat() {

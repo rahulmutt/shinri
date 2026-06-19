@@ -4,6 +4,7 @@
 //! branching, restarts, incremental assumptions, and the zero-cost
 //! `Theory`/`ProofSink` seams. Depends only on `shinri-core`.
 
+pub mod analyze;
 pub mod clause;
 pub mod assignment;
 pub mod config;
