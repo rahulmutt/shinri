@@ -142,6 +142,8 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
             self.heuristic.new_var(Var::new(i as u32));
             self.theory.new_var(Var::new(i as u32));
         }
+        self.restart = RestartPolicy::new(self.config.restart, 100);
+        self.conflicts = 0;
         let inputs = std::mem::take(&mut self.input_clauses);
         for clause in &inputs {
             self.install_clause(clause);
@@ -358,6 +360,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         let n = refs.len();
         let half = n / 2;
         let mut survivors = Vec::with_capacity(n);
+        // refs sorted ascending by LBD; the worst (highest-LBD) half is the tail [n-half, n).
         for (i, r) in refs.iter().copied().enumerate() {
             let in_worst_half = i >= n - half;
             if in_worst_half && self.db.lbd(r) > keep_glue && !self.is_locked(r) {
@@ -395,6 +398,8 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                     self.backtrack_to(bt);
                     let asserting = learnt[0];
                     let r_opt = self.add_learnt(&learnt);
+                    // Phase 1: binary/unit clauses are not stored in ClauseDb, so they carry a sentinel id
+                    // and are proof-invisible by id (the RUP consumer re-derives them from content).
                     let pid = match r_opt {
                         Some(r) => self.db.clause_id(r),
                         None => ClauseId::new(u32::MAX), // sentinel id for unit/binary
@@ -946,6 +951,47 @@ mod tests {
     }
 
     use shinri_core::{ClauseId, ProofSink};
+
+    // RecordingSink for Item 1: proof round-trip test.
+    #[derive(Default)]
+    struct RecordingSink {
+        inputs: Vec<Vec<Lit>>,
+        learns: Vec<Vec<Lit>>,
+    }
+    impl ProofSink for RecordingSink {
+        fn input(&mut self, _c: ClauseId, lits: &[Lit]) {
+            self.inputs.push(lits.to_vec());
+        }
+        fn learn(&mut self, _c: ClauseId, lits: &[Lit], _chain: &[ClauseId]) {
+            self.learns.push(lits.to_vec());
+        }
+        fn theory_lemma(&mut self, _c: ClauseId, _lits: &[Lit], _j: shinri_core::TheoryJust) {}
+        fn delete(&mut self, _c: ClauseId) {}
+    }
+
+    #[test]
+    fn proof_round_trip_drat_validates() {
+        // Definitely-UNSAT 2-SAT: (x0∨x1) ∧ (x0∨¬x1) ∧ (¬x0∨x1) ∧ (¬x0∨¬x1)
+        let mut s: Solver<NoTheory, RecordingSink, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..2 {
+            s.new_var();
+        }
+        let inputs = vec![
+            vec![lit(0, true), lit(1, true)],
+            vec![lit(0, true), lit(1, false)],
+            vec![lit(0, false), lit(1, true)],
+            vec![lit(0, false), lit(1, false)],
+        ];
+        for cl in &inputs {
+            s.add_clause(cl);
+        }
+        assert_eq!(s.solve(), SolveResult::Unsat { core: vec![] });
+        let learnt = s.proof.learns.clone();
+        assert!(
+            crate::certificate::check_drat(2, &inputs, &learnt),
+            "DRAT proof emitted by solver did not validate"
+        );
+    }
 
     #[derive(Default)]
     struct CountingSink {
