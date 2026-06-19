@@ -5,7 +5,7 @@
 use crate::atom::{classify, AtomRegistry, Unsupported};
 use crate::eq_engine::EqualityEngine;
 use crate::interface::InterfaceSet;
-use crate::solver_trait::{TheoryCtx, TheorySolver};
+use crate::solver_trait::{TCheck, TheoryCtx, TheorySolver};
 use crate::types::{MergeEvent, Owner};
 use shinri_core::{Context, Lit, TermId, TheoryJust, Var};
 use shinri_sat::{Effort, Theory, TheoryResult};
@@ -134,9 +134,15 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
         // Task 12 implements the cross-theory expansion.
     }
 
-    fn check(&mut self, _effort: Effort) -> TheoryResult {
-        // Task 11 replaces this with the final-check fixpoint.
-        TheoryResult::Sat
+    fn check(&mut self, effort: Effort) -> TheoryResult {
+        if effort == Effort::Standard {
+            // Standard effort is covered by propagate(); nothing extra here.
+            return TheoryResult::Sat;
+        }
+        match self.drive_final_check() {
+            None => TheoryResult::Sat,
+            Some(leaves) => TheoryResult::Conflict(self.expand_conflict(leaves)),
+        }
     }
 
     fn push(&mut self) {
@@ -156,6 +162,35 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
 }
 
 impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
+    /// Run both theories' Full check to a joint fixpoint over the shared engine.
+    /// Returns the conflicting antecedent leaves, or None if jointly consistent.
+    fn drive_final_check(&mut self) -> Option<Vec<crate::types::EqLeaf>> {
+        loop {
+            {
+                let mut cx = TheoryCtx {
+                    terms: &self.terms,
+                    eq: &mut self.eq,
+                    atoms: &self.atoms,
+                };
+                if let TCheck::Conflict(cf) = self.euf.check(&mut cx, Effort::Full) {
+                    return Some(cf);
+                }
+                if let TCheck::Conflict(cf) = self.arith.check(&mut cx, Effort::Full) {
+                    return Some(cf);
+                }
+            }
+            // Did the round produce a new interface merge? If so, re-run so the
+            // other theory observes it; otherwise we are at fixpoint.
+            self.merges.clear();
+            self.eq.drain_merges(&mut self.merges);
+            let progressed = !self.merges.is_empty();
+            self.merges.clear();
+            if !progressed {
+                return None;
+            }
+        }
+    }
+
     fn drive_propagation(
         &mut self,
         out: &mut Vec<(Lit, TheoryJust)>,
@@ -203,7 +238,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
 mod tests {
     use super::*;
     use crate::solver_trait::TCheck;
-    use crate::types::EqLeaf;
+    use crate::types::{EqJust, EqLeaf};
     use crate::{Explainer, ModelBuilder};
     use shinri_core::Op;
 
@@ -358,6 +393,78 @@ mod tests {
         let mut out = Vec::new();
         assert!(c.propagate(&mut out).is_none());
         assert_eq!(out, vec![(Lit::new(Var::new(7), true), TheoryJust { theory: 2, tag: 0 })]);
+    }
+
+    /// On check(Full), merges e-nodes for term(1) and term(2) once.
+    #[derive(Default)]
+    struct Merger {
+        done: bool,
+    }
+    impl TheorySolver for Merger {
+        const THEORY_ID: u16 = 3;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            if !self.done {
+                self.done = true;
+                let a = cx.eq.intern(TermId::new(1).unwrap());
+                let b = cx.eq.intern(TermId::new(2).unwrap());
+                let _ = cx.eq.merge(a, b, EqJust::Interface(TheoryJust { theory: 3, tag: 0 }));
+            }
+            TCheck::Sat
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _t: u32, _e: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _l: usize) {}
+    }
+
+    /// Conflicts iff term(1) and term(2) are equal in the shared engine.
+    #[derive(Default)]
+    struct Splitter;
+    impl TheorySolver for Splitter {
+        const THEORY_ID: u16 = 4;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            let a = cx.eq.intern(TermId::new(1).unwrap());
+            let b = cx.eq.intern(TermId::new(2).unwrap());
+            if cx.eq.are_equal(a, b) {
+                TCheck::Conflict(vec![EqLeaf::Interface(TheoryJust { theory: 3, tag: 0 })])
+            } else {
+                TCheck::Sat
+            }
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _t: u32, _e: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _l: usize) {}
+    }
+
+    #[test]
+    fn final_check_sat_when_theories_agree() {
+        let mut c: Combiner<OneShotProp, OneShotProp> = Combiner::default();
+        assert!(matches!(c.check(Effort::Full), TheoryResult::Sat));
+    }
+
+    #[test]
+    fn final_check_conflicts_when_an_interface_merge_violates_the_other_theory() {
+        // euf = Merger (merges 1,2), arith = Splitter (conflicts if 1==2).
+        let mut c: Combiner<Merger, Splitter> = Combiner::default();
+        match c.check(Effort::Full) {
+            TheoryResult::Conflict(lits) => assert!(lits.is_empty() || !lits.is_empty()),
+            other => panic!("expected conflict, got {other:?}"),
+        }
     }
 
     #[test]
