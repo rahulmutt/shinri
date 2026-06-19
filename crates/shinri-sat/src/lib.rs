@@ -8,6 +8,7 @@ pub mod clause;
 pub mod assignment;
 pub mod config;
 pub mod types;
+pub mod trail;
 
 pub use config::{RestartKind, SolverConfig};
 pub use types::{Effort, LBool, Reason, SolveResult, TheoryResult};
