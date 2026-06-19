@@ -57,6 +57,24 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         }
     }
 
+    /// Construct around a pre-built theory (e.g. a `Combiner` with its
+    /// `Context` already populated). Identical to `new` but does not default `T`.
+    pub fn with_theory(config: SolverConfig, theory: T) -> Solver<T, P, H> {
+        let mut s = Solver::new(config);
+        s.theory = theory;
+        s
+    }
+
+    /// Borrow the theory (e.g. to read a model after `solve`).
+    pub fn theory(&self) -> &T {
+        &self.theory
+    }
+
+    /// Mutably borrow the theory (e.g. to register atoms before `solve`).
+    pub fn theory_mut(&mut self) -> &mut T {
+        &mut self.theory
+    }
+
     pub fn new_var(&mut self) -> Var {
         let v = self.assign.new_var();
         self.heuristic.new_var(v);
@@ -1025,5 +1043,13 @@ mod tests {
         s.add_clause(&[lit(0, false), lit(1, false)]);
         let _ = s.solve();
         assert!(s.proof.inputs >= 1, "long input clauses recorded");
+    }
+
+    #[test]
+    fn with_theory_injects_and_exposes_the_instance() {
+        let s: Solver<NoTheory, NoProof, Vmtf> =
+            Solver::with_theory(SolverConfig::default(), NoTheory);
+        // Accessors compile and return the injected theory.
+        let _t: &NoTheory = s.theory();
     }
 }
