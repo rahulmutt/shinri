@@ -249,15 +249,30 @@ impl EGraph {
         });
     }
 
-    /// Build conflict leaves: the antecedents of why `a = b` was implied,
-    /// plus the disequality that was violated.
+    /// Build a SOUND, SUFFICIENT conflict clause for a violated disequality.
     ///
     /// When `merge` or `merge_congruence` returns `Err`, the proof forest does
     /// NOT contain a path between `conflict.a` and `conflict.b` (the merge was
-    /// rejected before any edge was added). We must therefore reconstruct the
-    /// "why equal" argument from the `MergeJust` that triggered this merge:
-    /// - Asserted(j): the literal `j` itself justifies `a = b`.
-    /// - Congruence(pairs): each pair (ai, bi) was already equal; explain each.
+    /// rejected before any edge was added). The leaf set has three parts:
+    ///
+    /// 1. The "why a = b is forced" antecedents, reconstructed from `MergeJust`:
+    ///    - Asserted(j): the literal `j` itself justifies `a = b`.
+    ///    - Congruence(pairs): each pair (ai, bi) was already equal; explain each.
+    /// 2. The BRIDGE. The violated diseq `d_lhs ≠ d_rhs` was asserted between
+    ///    nodes that may differ from the merged nodes `a`,`b`, but they share
+    ///    classes: {find(d_lhs), find(d_rhs)} == {find(a), find(b)}. We must add
+    ///    `explain(a, d_lhs)` and `explain(b, d_rhs)` (oriented by representative)
+    ///    so the conjunction actually entails `d_lhs = d_rhs`. Without this
+    ///    bridge the clause is satisfiable and NOT a valid conflict. Both
+    ///    endpoints are in-class with a (resp. b) and are forest-connected at
+    ///    conflict time (a,b not yet unioned), so `explain`'s precondition holds.
+    /// 3. The disequality leaf itself (Asserted→literal, Interface→interface,
+    ///    Congruence/Definitional→none).
+    ///
+    /// The resulting conjunction entails `d_lhs = a = b = d_rhs`, contradicting
+    /// the `d_lhs ≠ d_rhs` disequality — a valid conflict for every case
+    /// (Congruence merge, Asserted merge, and the assert_diseq direct path,
+    /// where the endpoints equal a,b so the bridge is a no-op).
     fn conflict_leaves(
         &self,
         eq: &EqualityEngine,
@@ -265,7 +280,7 @@ impl EGraph {
         conflict: EqConflict,
     ) -> Vec<EqLeaf> {
         let mut out = Vec::new();
-        // Reconstruct why a = b was being merged.
+        // Part 1: reconstruct why a = b was being merged.
         match mj {
             MergeJust::Asserted(j) => match *j {
                 EqJust::Asserted(l) => out.push(EqLeaf::Asserted(l)),
@@ -278,7 +293,18 @@ impl EGraph {
                 }
             }
         }
-        // Plus the disequality that was violated.
+        // Part 2: bridge the merged nodes to the diseq's asserted endpoints.
+        // Orient by representative: pair `a` with whichever endpoint is in a's
+        // class, and `b` with the other.
+        let ra = eq.find(conflict.a);
+        let (a_end, b_end) = if eq.find(conflict.diseq_lhs) == ra {
+            (conflict.diseq_lhs, conflict.diseq_rhs)
+        } else {
+            (conflict.diseq_rhs, conflict.diseq_lhs)
+        };
+        eq.explain(conflict.a, a_end, &mut out);
+        eq.explain(conflict.b, b_end, &mut out);
+        // Part 3: the disequality that was violated.
         match conflict.diseq {
             EqJust::Asserted(l) => out.push(EqLeaf::Asserted(l)),
             EqJust::Interface(j) => out.push(EqLeaf::Interface(j)),

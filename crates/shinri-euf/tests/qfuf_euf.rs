@@ -1,5 +1,6 @@
 use shinri_core::{Context, Lit, Op, TermId, Var};
 use shinri_euf::Euf;
+use shinri_theory::types::EqLeaf;
 use shinri_theory::{AtomRegistry, EqualityEngine, TheoryCtx, TheorySolver};
 
 fn uconst(ctx: &mut Context, name: &str, s: shinri_core::SortId) -> TermId {
@@ -42,6 +43,74 @@ fn congruence_conflict_x_eq_y_implies_fx_eq_fy() {
         let conflict = euf.assert(&mut cx, Lit::new(v_xy, true));
         assert!(conflict.is_some(), "x=y with f(x)!=f(y) must conflict");
     }
+}
+
+/// Regression for the CRITICAL conflict-soundness bug: when the violated
+/// disequality was asserted between class members OTHER than the merged app
+/// nodes, the conflict clause must BRIDGE the merged nodes to the diseq
+/// endpoints. Scenario: f(s)=w, w≠f(t), s=t. Congruence merges f(s),f(t),
+/// violating the diseq stored on (f(s), f(t)) (= (find(w), find(f(t)))). The
+/// sound conflict MUST include the `f(s)=w` equality literal that the old code
+/// dropped; otherwise {s=t, w≠f(t)} is satisfiable and not a valid conflict.
+#[test]
+fn conflict_bridges_to_diseq_endpoints_sufficiency() {
+    let mut ctx = Context::new();
+    let u = ctx.declare_sort("U");
+    let s = uconst(&mut ctx, "s", u);
+    let t = uconst(&mut ctx, "t", u);
+    let w = uconst(&mut ctx, "w", u);
+    let f = ctx.declare_fun("f", &[u], u);
+    let fs = ctx.mk_app(Op::Uninterpreted(f), &[s]).unwrap();
+    let ft = ctx.mk_app(Op::Uninterpreted(f), &[t]).unwrap();
+    let eq_fsw = ctx.mk_eq(fs, w).unwrap(); // f(s) = w
+    let eq_wft = ctx.mk_eq(w, ft).unwrap(); // w = f(t)  (asserted negatively)
+    let eq_st = ctx.mk_eq(s, t).unwrap(); // s = t
+
+    let mut eq = EqualityEngine::default();
+    let mut atoms = AtomRegistry::default();
+    let v_fsw = Var::new(0);
+    let v_wft = Var::new(1);
+    let v_st = Var::new(2);
+    atoms.register(v_fsw, eq_fsw, shinri_theory::types::Owner::Euf);
+    atoms.register(v_wft, eq_wft, shinri_theory::types::Owner::Euf);
+    atoms.register(v_st, eq_st, shinri_theory::types::Owner::Euf);
+
+    let lit_fsw = Lit::new(v_fsw, true); // the literal that MUST appear
+    let lit_wft = Lit::new(v_wft, false); // w ≠ f(t)
+    let lit_st = Lit::new(v_st, true); // s = t
+
+    let mut euf = Euf::default();
+    let mut cx = TheoryCtx {
+        terms: &ctx,
+        eq: &mut eq,
+        atoms: &atoms,
+    };
+    euf.new_var(&mut cx, v_fsw, eq_fsw);
+    euf.new_var(&mut cx, v_wft, eq_wft);
+    euf.new_var(&mut cx, v_st, eq_st);
+
+    assert!(euf.assert(&mut cx, lit_fsw).is_none(), "f(s)=w ok");
+    assert!(euf.assert(&mut cx, lit_wft).is_none(), "w!=f(t) ok");
+    // s=t -> congruence f(s)=f(t) -> conflict with w!=f(t).
+    let conflict = euf
+        .assert(&mut cx, lit_st)
+        .expect("s=t must conflict via congruence + diseq");
+
+    // SUFFICIENCY: the leaf set must contain the bridging equality f(s)=w (the
+    // literal the buggy code omitted), plus s=t and the diseq w!=f(t). Without
+    // f(s)=w the conjunction {s=t, w!=f(t)} is satisfiable — not a conflict.
+    assert!(
+        conflict.contains(&EqLeaf::Asserted(lit_fsw)),
+        "conflict MUST include the bridging equality f(s)=w; got {conflict:?}"
+    );
+    assert!(
+        conflict.contains(&EqLeaf::Asserted(lit_st)),
+        "conflict must include s=t; got {conflict:?}"
+    );
+    assert!(
+        conflict.contains(&EqLeaf::Asserted(lit_wft)),
+        "conflict must include w!=f(t); got {conflict:?}"
+    );
 }
 
 /// a=c ∧ b=d ∧ g(a,b) ≠ g(c,d) is unsat (n-ary congruence).

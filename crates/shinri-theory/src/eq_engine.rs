@@ -19,14 +19,27 @@ struct UfUndo {
     root_size_before: u32,
 }
 
+/// A stored disequality: its justification plus the endpoint nodes exactly as
+/// passed to `assert_diseq` (so a conflict can cite the asserted endpoints, not
+/// the class representatives the diseq is keyed on).
+#[derive(Clone, Copy)]
+struct DiseqRecord {
+    just: EqJust,
+    lhs: ENodeId,
+    rhs: ENodeId,
+}
+
 #[derive(Default)]
 pub struct EqualityEngine {
     nodes: Vec<ENode>,
     term_to_node: shinri_core_map::Map,
     undo: UndoLog<UfUndo>,
     /// Disequal *representative* pairs (canonical order min,max by index), each
-    /// with the justification that asserted them. Backtracked via `diseq_undo`.
-    diseqs: rustc_hash::FxHashMap<(ENodeId, ENodeId), EqJust>,
+    /// with the justification that asserted them AND the two endpoint nodes as
+    /// originally passed to `assert_diseq` (NOT their representatives), so a
+    /// later merge conflict can bridge the merged nodes to the diseq endpoints.
+    /// Backtracked via `diseq_undo`.
+    diseqs: rustc_hash::FxHashMap<(ENodeId, ENodeId), DiseqRecord>,
     diseq_undo: UndoLog<(ENodeId, ENodeId)>,
     /// Proof forest: `fparent[n]` and the label of the edge n→fparent[n].
     /// `fparent[n] == n` means n is a forest root. Backtracked via `forest_undo`.
@@ -90,10 +103,22 @@ impl EqualityEngine {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra == rb {
-            return Err(EqConflict { a, b, diseq: j });
+            // a,b are already equal: they ARE the diseq endpoints here.
+            return Err(EqConflict {
+                a,
+                b,
+                diseq: j,
+                diseq_lhs: a,
+                diseq_rhs: b,
+            });
         }
         let key = Self::pair(ra, rb);
-        if self.diseqs.insert(key, j).is_none() {
+        let record = DiseqRecord {
+            just: j,
+            lhs: a,
+            rhs: b,
+        };
+        if self.diseqs.insert(key, record).is_none() {
             self.diseq_undo.record(key);
         }
         Ok(())
@@ -107,8 +132,14 @@ impl EqualityEngine {
             return Ok(());
         }
         // Guard the single unsoundness vector: uniting a known-disequal pair.
-        if let Some(&dj) = self.diseqs.get(&Self::pair(ra, rb)) {
-            return Err(EqConflict { a, b, diseq: dj });
+        if let Some(&rec) = self.diseqs.get(&Self::pair(ra, rb)) {
+            return Err(EqConflict {
+                a,
+                b,
+                diseq: rec.just,
+                diseq_lhs: rec.lhs,
+                diseq_rhs: rec.rhs,
+            });
         }
         // Splice the explanation edge a—b labelled j into the proof forest.
         self.reroot_forest(a);
@@ -359,6 +390,33 @@ mod tests {
         let err = eq.merge(a, b, asserted(31)).unwrap_err();
         assert_eq!(eq.find(err.a), eq.find(a));
         assert_eq!(eq.find(err.b), eq.find(b));
+    }
+
+    #[test]
+    fn merge_conflict_surfaces_original_diseq_endpoints() {
+        // Diseq asserted between p,q; later a (=p's class) and b (=q's class)
+        // are merged. The conflict must surface the ORIGINAL endpoints p,q,
+        // not the merged nodes a,b.
+        let mut eq = EqualityEngine::default();
+        let p = eq.intern(term(1));
+        let q = eq.intern(term(2));
+        let a = eq.intern(term(3));
+        let b = eq.intern(term(4));
+        // a in p's class, b in q's class.
+        eq.merge(a, p, asserted(1)).unwrap();
+        eq.merge(b, q, asserted(2)).unwrap();
+        // Diseq asserted on p,q (the representatives may be a or b).
+        eq.assert_diseq(p, q, asserted(3)).unwrap();
+        // Merging a,b violates p != q.
+        let err = eq.merge(a, b, asserted(4)).unwrap_err();
+        assert_eq!(err.a, a);
+        assert_eq!(err.b, b);
+        // The conflict carries the asserted endpoints p,q (in some orientation).
+        let set = [err.diseq_lhs, err.diseq_rhs];
+        assert!(set.contains(&p), "diseq endpoint p missing");
+        assert!(set.contains(&q), "diseq endpoint q missing");
+        // And the endpoints differ from the merged nodes here.
+        assert!(err.diseq_lhs != a || err.diseq_rhs != b);
     }
 
     #[test]

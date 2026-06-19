@@ -59,11 +59,24 @@ pub enum EqLeaf {
 
 /// The disequal pair a `merge` would have violated, plus the disequality's
 /// own justification (so the conflict clause can cite it).
+///
+/// `a`/`b` are the nodes passed to the operation that detected the conflict
+/// (the merged app nodes for `merge`/`merge_congruence`; the just-asserted pair
+/// for `assert_diseq`). `diseq_lhs`/`diseq_rhs` are the ORIGINAL endpoint nodes
+/// that were passed to `assert_diseq` when the violated disequality was stored
+/// (NOT their representatives). The two may differ from `a`/`b` when the diseq
+/// was asserted between different class members — callers must bridge
+/// `a`↔`diseq_lhs`/`diseq_rhs` (oriented by representative) to build a sound,
+/// sufficient conflict clause.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EqConflict {
     pub a: ENodeId,
     pub b: ENodeId,
     pub diseq: EqJust,
+    /// The disequality's left endpoint as originally asserted.
+    pub diseq_lhs: ENodeId,
+    /// The disequality's right endpoint as originally asserted.
+    pub diseq_rhs: ENodeId,
 }
 
 /// Accumulates an explanation. `lits` are resolved input literals; `pending`
