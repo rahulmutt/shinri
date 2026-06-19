@@ -10,7 +10,10 @@ pub struct UndoLog<E> {
 
 impl<E> Default for UndoLog<E> {
     fn default() -> Self {
-        UndoLog { entries: Vec::new(), level_starts: Vec::new() }
+        UndoLog {
+            entries: Vec::new(),
+            level_starts: Vec::new(),
+        }
     }
 }
 

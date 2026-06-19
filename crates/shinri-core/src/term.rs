@@ -50,6 +50,13 @@ pub enum ConstVal {
 /// Var/Quant variants are reserved for Phase 4 and added then (spec §4.3).
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub enum TermNode {
-    App { op: Op, args: ChildSlice, sort: SortId },
-    Const { val: ConstVal, sort: SortId },
+    App {
+        op: Op,
+        args: ChildSlice,
+        sort: SortId,
+    },
+    Const {
+        val: ConstVal,
+        sort: SortId,
+    },
 }

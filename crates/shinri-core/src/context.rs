@@ -100,10 +100,18 @@ impl Context {
     pub fn mk_app(&mut self, op: Op, args: &[TermId]) -> Result<TermId, SortError> {
         let result_sort = self.check_app(op, args)?;
         let slice = self.push_children(args);
-        let key = TermKey::App { op, args: args.to_vec(), sort: result_sort };
+        let key = TermKey::App {
+            op,
+            args: args.to_vec(),
+            sort: result_sort,
+        };
         Ok(self.intern_with_key(
             key,
-            TermNode::App { op, args: slice, sort: result_sort },
+            TermNode::App {
+                op,
+                args: slice,
+                sort: result_sort,
+            },
         ))
     }
 
@@ -116,10 +124,8 @@ impl Context {
         let bool_s = self.bool_sort();
         match op {
             Op::Uninterpreted(sym) => {
-                let (params, result) = self
-                    .fun_sigs
-                    .get(&sym)
-                    .ok_or(SortError::UndeclaredSymbol)?;
+                let (params, result) =
+                    self.fun_sigs.get(&sym).ok_or(SortError::UndeclaredSymbol)?;
                 if args.len() != params.len() {
                     return Err(SortError::Arity {
                         expected: params.len(),
@@ -157,7 +163,10 @@ impl Context {
             }
             And | Or | Implies | Xor => {
                 if args.len() < 2 {
-                    return Err(SortError::Arity { expected: 2, found: args.len() });
+                    return Err(SortError::Arity {
+                        expected: 2,
+                        found: args.len(),
+                    });
                 }
                 expect_all(self, args, bool_s)?;
                 Ok(bool_s)
@@ -173,20 +182,29 @@ impl Context {
                 let then_s = self.sort_of(args[1]);
                 let else_s = self.sort_of(args[2]);
                 if then_s != else_s {
-                    return Err(SortError::Mismatch { expected: then_s, found: else_s });
+                    return Err(SortError::Mismatch {
+                        expected: then_s,
+                        found: else_s,
+                    });
                 }
                 Ok(then_s)
             }
             // Equality / distinct: >=2 args of one common sort -> Bool.
             Eq | Distinct => {
                 if args.len() < 2 {
-                    return Err(SortError::Arity { expected: 2, found: args.len() });
+                    return Err(SortError::Arity {
+                        expected: 2,
+                        found: args.len(),
+                    });
                 }
                 let first = self.sort_of(args[0]);
                 for &a in &args[1..] {
                     let s = self.sort_of(a);
                     if s != first {
-                        return Err(SortError::Mismatch { expected: first, found: s });
+                        return Err(SortError::Mismatch {
+                            expected: first,
+                            found: s,
+                        });
                     }
                 }
                 Ok(bool_s)
@@ -202,7 +220,10 @@ impl Context {
             }
             Add | Sub | Mul => {
                 if args.len() < 2 {
-                    return Err(SortError::Arity { expected: 2, found: args.len() });
+                    return Err(SortError::Arity {
+                        expected: 2,
+                        found: args.len(),
+                    });
                 }
                 let s = self.sort_of(args[0]);
                 if !is_arith(s) {
@@ -231,7 +252,10 @@ fn expect_arity(args: &[TermId], n: usize) -> Result<(), SortError> {
     if args.len() == n {
         Ok(())
     } else {
-        Err(SortError::Arity { expected: n, found: args.len() })
+        Err(SortError::Arity {
+            expected: n,
+            found: args.len(),
+        })
     }
 }
 
@@ -251,8 +275,15 @@ fn expect_all(ctx: &Context, args: &[TermId], expected: SortId) -> Result<(), So
 /// slices but must intern to the same id. The key resolves children to their ids.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum TermKey {
-    App { op: crate::term::Op, args: Vec<TermId>, sort: SortId },
-    Const { val: ConstVal, sort: SortId },
+    App {
+        op: crate::term::Op,
+        args: Vec<TermId>,
+        sort: SortId,
+    },
+    Const {
+        val: ConstVal,
+        sort: SortId,
+    },
 }
 
 impl Context {
@@ -269,16 +300,16 @@ impl Context {
     pub(crate) fn push_children(&mut self, args: &[TermId]) -> ChildSlice {
         let off = self.children.len() as u32;
         self.children.extend_from_slice(args);
-        ChildSlice { off, len: args.len() as u32 }
+        ChildSlice {
+            off,
+            len: args.len() as u32,
+        }
     }
 
     pub fn mk_const_bool(&mut self, b: bool) -> TermId {
         let sort = self.bool_sort();
         let val = ConstVal::Bool(b);
-        self.intern_with_key(
-            TermKey::Const { val, sort },
-            TermNode::Const { val, sort },
-        )
+        self.intern_with_key(TermKey::Const { val, sort }, TermNode::Const { val, sort })
     }
 
     pub fn mk_numeral(&mut self, value: Rational, sort: SortId) -> TermId {
@@ -292,10 +323,7 @@ impl Context {
             }
         };
         let val = ConstVal::Num(rat_id);
-        self.intern_with_key(
-            TermKey::Const { val, sort },
-            TermNode::Const { val, sort },
-        )
+        self.intern_with_key(TermKey::Const { val, sort }, TermNode::Const { val, sort })
     }
 
     pub fn term_node(&self, id: TermId) -> &TermNode {
@@ -311,14 +339,20 @@ impl Context {
     /// Rebuild `t`, replacing each occurrence of `params[i]` with `args[i]`.
     /// Re-interns the result (maximal sharing preserved).
     pub fn substitute(&mut self, t: TermId, params: &[TermId], args: &[TermId]) -> TermId {
-        debug_assert_eq!(params.len(), args.len(), "substitute: param/arg length mismatch");
+        debug_assert_eq!(
+            params.len(),
+            args.len(),
+            "substitute: param/arg length mismatch"
+        );
         // Direct replacement at this node?
         if let Some(pos) = params.iter().position(|&p| p == t) {
             return args[pos];
         }
         match self.term_node(t).clone() {
             TermNode::Const { .. } => t, // constants contain no params
-            TermNode::App { op, args: slice, .. } => {
+            TermNode::App {
+                op, args: slice, ..
+            } => {
                 let child_ids: Vec<TermId> = self.children(slice).to_vec();
                 let mut new_children = Vec::with_capacity(child_ids.len());
                 let mut changed = false;
@@ -376,7 +410,10 @@ mod tests {
         assert_eq!(t, t2);
         assert_ne!(t, f);
         match ctx.term_node(t) {
-            TermNode::Const { val: ConstVal::Bool(b), sort } => {
+            TermNode::Const {
+                val: ConstVal::Bool(b),
+                sort,
+            } => {
                 assert!(*b);
                 assert_eq!(*sort, ctx.bool_sort());
             }
@@ -402,10 +439,14 @@ mod tests {
         let two = ctx.mk_numeral(shinri_num::Rational::from_int(2i128.into()), int);
         let three = ctx.mk_numeral(shinri_num::Rational::from_int(3i128.into()), int);
         // 2 + 3 : Int
-        let sum = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[two, three]).unwrap();
+        let sum = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Add), &[two, three])
+            .unwrap();
         assert_eq!(ctx.sort_of(sum), int);
         // 2 <= 3 : Bool
-        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[two, three]).unwrap();
+        let le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[two, three])
+            .unwrap();
         assert_eq!(ctx.sort_of(le), ctx.bool_sort());
     }
 
@@ -415,7 +456,9 @@ mod tests {
         let int = ctx.int_sort();
         let two = ctx.mk_numeral(shinri_num::Rational::from_int(2i128.into()), int);
         let t = ctx.mk_const_bool(true);
-        let err = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[two, t]).unwrap_err();
+        let err = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Add), &[two, t])
+            .unwrap_err();
         assert_eq!(err, SortError::NotApplicable);
     }
 
@@ -443,7 +486,13 @@ mod tests {
         assert_eq!(ctx.sort_of(app), bool_s);
         // wrong arity
         let err = ctx.mk_app(Op::Uninterpreted(p), &[two, two]).unwrap_err();
-        assert_eq!(err, SortError::Arity { expected: 1, found: 2 });
+        assert_eq!(
+            err,
+            SortError::Arity {
+                expected: 1,
+                found: 2
+            }
+        );
     }
 
     #[test]
@@ -458,7 +507,9 @@ mod tests {
         // substitute x := 5  =>  5 + 1
         let five = ctx.mk_numeral(shinri_num::Rational::from_int(5i128.into()), int);
         let result = ctx.substitute(body, &[x], &[five]);
-        let expected = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[five, one]).unwrap();
+        let expected = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Add), &[five, one])
+            .unwrap();
         assert_eq!(result, expected); // re-interned to the same id
     }
 
@@ -469,7 +520,9 @@ mod tests {
         let one = ctx.mk_numeral(shinri_num::Rational::from_int(1i128.into()), int);
         let two = ctx.mk_numeral(shinri_num::Rational::from_int(2i128.into()), int);
         let three = ctx.mk_numeral(shinri_num::Rational::from_int(3i128.into()), int);
-        let sum = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[one, two]).unwrap();
+        let sum = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Add), &[one, two])
+            .unwrap();
         assert_eq!(ctx.substitute(sum, &[three], &[one]), sum);
     }
 }
