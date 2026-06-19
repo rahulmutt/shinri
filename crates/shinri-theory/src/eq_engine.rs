@@ -168,21 +168,53 @@ impl EqualityEngine {
         }
     }
 
-    /// Collect the explanation leaves entailing `a = b` (spec §4.2).
+    /// Collect the explanation leaves entailing `a = b` (spec §4.2). Walks each
+    /// node up to their nearest common ancestor in the proof forest, so the
+    /// returned leaf set is minimal (no edges above the NCA are included).
     pub fn explain(&self, a: ENodeId, b: ENodeId, out: &mut Vec<EqLeaf>) {
         if a == b {
             return;
         }
-        // Nearest common ancestor in the forest = where the two paths meet.
-        // Both share a forest root once merged; collect each side's edges to it.
-        let root = self.forest_root(a);
-        debug_assert_eq!(root, self.forest_root(b), "explain: a,b not connected");
+        debug_assert_eq!(
+            self.forest_root(a),
+            self.forest_root(b),
+            "explain: a,b not connected"
+        );
+        let nca = self.forest_nca(a, b);
         let mut path_a = Vec::new();
         let mut path_b = Vec::new();
-        self.forest_path(a, root, &mut path_a);
-        self.forest_path(b, root, &mut path_b);
+        self.forest_path(a, nca, &mut path_a);
+        self.forest_path(b, nca, &mut path_b);
         for n in path_a.into_iter().chain(path_b) {
             self.expand_edge(self.flabel[n.index()], out);
+        }
+    }
+
+    /// Nearest common ancestor of `a` and `b` in the proof forest. The caller
+    /// guarantees (debug-asserted) that they share a forest root.
+    fn forest_nca(&self, a: ENodeId, b: ENodeId) -> ENodeId {
+        // Mark every ancestor of `a` (inclusive), then walk `b` upward until we
+        // hit a marked node — the deepest shared ancestor.
+        let mut on_path_a: rustc_hash::FxHashSet<ENodeId> = rustc_hash::FxHashSet::default();
+        let mut n = a;
+        loop {
+            on_path_a.insert(n);
+            let p = self.fparent[n.index()];
+            if p == n {
+                break;
+            }
+            n = p;
+        }
+        let mut m = b;
+        loop {
+            if on_path_a.contains(&m) {
+                return m;
+            }
+            let p = self.fparent[m.index()];
+            if p == m {
+                return m; // shared root (always reached for connected a,b)
+            }
+            m = p;
         }
     }
 
@@ -334,6 +366,22 @@ mod tests {
         eq.explain(fx, fy, &mut out);
         // Expands to the underlying asserted x=y, not the synthetic congruence edge.
         assert_eq!(out, vec![EqLeaf::Asserted(xy)]);
+    }
+
+    #[test]
+    fn explain_is_minimal_for_intermediate_equality() {
+        // Chain a—b—c: explaining a=b must NOT drag in the b=c edge.
+        let mut eq = EqualityEngine::default();
+        let a = eq.intern(term(1));
+        let b = eq.intern(term(2));
+        let c = eq.intern(term(3));
+        let ab = Lit::new(Var::new(62), true);
+        let bc = Lit::new(Var::new(63), true);
+        eq.merge(a, b, EqJust::Asserted(ab)).unwrap();
+        eq.merge(b, c, EqJust::Asserted(bc)).unwrap();
+        let mut out = Vec::new();
+        eq.explain(a, b, &mut out);
+        assert_eq!(out, vec![EqLeaf::Asserted(ab)]);
     }
 }
 
