@@ -6,7 +6,6 @@ use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 #[derive(Default)]
 pub struct Euf {
     // Filled in across Tasks 6–11.
-    #[allow(dead_code)]
     inner: crate::egraph::EGraph,
     level: usize,
 }
@@ -14,7 +13,26 @@ pub struct Euf {
 impl TheorySolver for Euf {
     const THEORY_ID: u16 = 1;
 
-    fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+    fn new_var(&mut self, cx: &mut TheoryCtx, _v: Var, atom: TermId) {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        match cx.terms.term_node(atom) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct),
+                args,
+                ..
+            } => {
+                let args_slice = *args;
+                let kids: Vec<shinri_core::TermId> = cx.terms.children(args_slice).to_vec();
+                for k in kids {
+                    self.inner.add_term(cx, k);
+                }
+            }
+            _ => {
+                // Predicate application (or any other EUF atom term).
+                self.inner.add_term(cx, atom);
+            }
+        }
+    }
     fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> {
         None
     }
