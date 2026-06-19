@@ -110,5 +110,12 @@ mod tests {
         a.unassign(v);
         assert_eq!(a.value(v), LBool::Unset);
         assert_eq!(a.phase(v), false); // phase is remembered for phase-saving
+
+        // Phase saving must persist a TRUE phase across unassign (not reset to default).
+        let l_pos = Lit::new(v, true);
+        a.assign(l_pos, 1, Reason::Unit);
+        assert_eq!(a.phase(v), true);
+        a.unassign(v);
+        assert_eq!(a.phase(v), true); // saved phase persists across unassign
     }
 }
