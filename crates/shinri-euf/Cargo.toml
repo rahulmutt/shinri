@@ -1,0 +1,14 @@
+[package]
+name = "shinri-euf"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shinri-core = { path = "../shinri-core" }
+shinri-theory = { path = "../shinri-theory" }
+shinri-sat = { path = "../shinri-sat" }
+rustc-hash = "2"
+
+[dev-dependencies]
+proptest = "1"
