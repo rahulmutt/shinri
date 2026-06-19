@@ -20,8 +20,6 @@ pub struct Combiner<E: TheorySolver, A: TheorySolver> {
     euf: E,
     arith: A,
     level: usize,
-    /// Populated in Task 9 (propagation).
-    #[allow(dead_code)]
     merges: Vec<MergeEvent>,
     /// A conflict detected during `assert` (the SAT seam's `assert` is
     /// infallible); surfaced on the next `propagate` (spec §5.2 bridge).
@@ -98,9 +96,14 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
         // layer's new_var carries no atom, so there is nothing to do here.
     }
 
-    fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
-        // Task 9 replaces this. For now, surface only an assert-time conflict.
-        self.take_pending_conflict()
+    fn propagate(&mut self, out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+        if let Some(leaves) = self.take_pending_conflict_leaves() {
+            return Some(self.expand_conflict(leaves));
+        }
+        if let Some(leaves) = self.drive_propagation(out) {
+            return Some(self.expand_conflict(leaves));
+        }
+        None
     }
 
     fn explain(&mut self, _just: TheoryJust, _out: &mut Vec<Lit>) {
@@ -129,10 +132,46 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
 }
 
 impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
-    /// Drain any conflict stashed during `assert`, mapped to a SAT clause.
-    /// Real expansion lands in Task 12; here it is a no-leaf placeholder.
-    fn take_pending_conflict(&mut self) -> Option<Vec<Lit>> {
-        self.pending_conflict.take().map(|_leaves| Vec::new())
+    fn drive_propagation(
+        &mut self,
+        out: &mut Vec<(Lit, TheoryJust)>,
+    ) -> Option<Vec<crate::types::EqLeaf>> {
+        loop {
+            let before = out.len();
+            // 1. Theory propagation.
+            {
+                let mut cx = TheoryCtx {
+                    terms: &self.terms,
+                    eq: &mut self.eq,
+                    atoms: &self.atoms,
+                };
+                if let Some(cf) = self.euf.propagate(&mut cx, out) {
+                    return Some(cf);
+                }
+                if let Some(cf) = self.arith.propagate(&mut cx, out) {
+                    return Some(cf);
+                }
+            }
+            // 2. Drain congruence/interface merges so each theory can react
+            //    next iteration. EUF's congruence driver consumes them via the
+            //    shared engine; here we only detect whether progress occurred.
+            self.merges.clear();
+            self.eq.drain_merges(&mut self.merges);
+            let progressed = out.len() != before || !self.merges.is_empty();
+            self.merges.clear();
+            if !progressed {
+                return None;
+            }
+        }
+    }
+
+    fn take_pending_conflict_leaves(&mut self) -> Option<Vec<crate::types::EqLeaf>> {
+        self.pending_conflict.take()
+    }
+
+    /// Task 12 replaces this with the cross-theory Explainer expansion + negation.
+    fn expand_conflict(&mut self, _leaves: Vec<crate::types::EqLeaf>) -> Vec<Lit> {
+        Vec::new()
     }
 }
 
@@ -252,6 +291,49 @@ mod tests {
         let le = ctx.mk_app(shinri_core::Op::Builtin(shinri_core::BuiltinOp::Le), &[xy, z]).unwrap();
         let mut c: Combiner<Spy, Spy> = Combiner::with_context(ctx);
         assert!(c.register_atom(Var::new(0), le).is_err());
+    }
+
+    /// Emits one propagation `(p, just)` exactly once, to drive the fixpoint loop.
+    #[derive(Default)]
+    struct OneShotProp {
+        fired: bool,
+        p: Option<Lit>,
+    }
+    impl TheorySolver for OneShotProp {
+        const THEORY_ID: u16 = 2;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            out: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
+            if !self.fired {
+                self.fired = true;
+                if let Some(p) = self.p {
+                    out.push((p, TheoryJust { theory: 2, tag: 0 }));
+                }
+            }
+            None
+        }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            TCheck::Sat
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _level: usize) {}
+    }
+
+    #[test]
+    fn propagate_collects_theory_implications_to_fixpoint() {
+        let mut c: Combiner<OneShotProp, OneShotProp> = Combiner::default();
+        c.euf.p = Some(Lit::new(Var::new(7), true));
+        let mut out = Vec::new();
+        assert!(c.propagate(&mut out).is_none());
+        assert_eq!(out, vec![(Lit::new(Var::new(7), true), TheoryJust { theory: 2, tag: 0 })]);
     }
 
     #[test]
