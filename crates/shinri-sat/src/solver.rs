@@ -185,6 +185,22 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         }
     }
 
+    /// The Boolean value of a variable in the current assignment, if assigned.
+    pub fn value_of(&self, v: Var) -> Option<bool> {
+        match self.assign.value(v) {
+            LBool::True => Some(true),
+            LBool::False => Some(false),
+            LBool::Unset => None,
+        }
+    }
+
+    /// Every recorded input clause is satisfied by the current assignment.
+    pub fn check_model(&self) -> bool {
+        self.input_clauses
+            .iter()
+            .all(|cl| cl.iter().any(|&l| self.assign.lit_value(l) == LBool::True))
+    }
+
     /// The literal set of a conflict — read from the arena for a stored clause,
     /// or returned directly for a virtual (binary/theory) conflict.
     fn conflict_lits(&self, c: &Conflict) -> Vec<Lit> {
@@ -370,10 +386,11 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                     self.backtrack_to(bt);
                     let asserting = learnt[0];
                     let r_opt = self.add_learnt(&learnt);
-                    if let Some(r) = r_opt {
-                        let id = self.db.clause_id(r);
-                        self.proof.learn(id, &learnt, &chain);
-                    }
+                    let pid = match r_opt {
+                        Some(r) => self.db.clause_id(r),
+                        None => ClauseId::new(u32::MAX), // sentinel id for unit/binary
+                    };
+                    self.proof.learn(pid, &learnt, &chain);
                     let reason = match r_opt {
                         Some(r) => Reason::Clause(r),
                         None if learnt.len() == 2 => Reason::Binary(learnt[1]),
@@ -425,7 +442,10 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                 self.enqueue(l, Reason::Decision);
                             }
                             None => match self.theory.check(Effort::Full) {
-                                TheoryResult::Sat => return SolveResult::Sat,
+                                TheoryResult::Sat => {
+                                    debug_assert!(self.check_model(), "returned SAT but a clause is unsatisfied");
+                                    return SolveResult::Sat;
+                                }
                                 TheoryResult::Conflict(lits) => {
                                     if self.trail.decision_level() == 0 {
                                         self.unsat = true;
@@ -435,10 +455,11 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     self.backtrack_to(bt);
                                     let asserting = learnt[0];
                                     let r_opt = self.add_learnt(&learnt);
-                                    if let Some(r) = r_opt {
-                                        let id = self.db.clause_id(r);
-                                        self.proof.learn(id, &learnt, &chain);
-                                    }
+                                    let pid = match r_opt {
+                                        Some(r) => self.db.clause_id(r),
+                                        None => ClauseId::new(u32::MAX), // sentinel id for unit/binary
+                                    };
+                                    self.proof.learn(pid, &learnt, &chain);
                                     let reason = match r_opt {
                                         Some(r) => Reason::Clause(r),
                                         None if learnt.len() == 2 => Reason::Binary(learnt[1]),

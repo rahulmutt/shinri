@@ -20,6 +20,8 @@ pub mod restart;
 #[cfg(any(test, feature = "dimacs"))]
 pub mod dimacs;
 
+#[cfg(test)] mod certificate;
+
 pub use clause::{ClauseDb, ClauseRef};
 pub use config::{RestartKind, SolverConfig};
 pub use types::{Conflict, Effort, LBool, Reason, SolveResult, TheoryResult};
