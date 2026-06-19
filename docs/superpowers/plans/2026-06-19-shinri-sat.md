@@ -2067,14 +2067,12 @@ Add to `Solver`: `pub(crate) learnts: Vec<ClauseRef>,` `pub(crate) conflicts: u6
         // Install three "learnt" clauses directly with controlled LBD.
         let r_lo = s.add_learnt(&[lit(0, true), lit(1, true), lit(2, true)]).unwrap();
         let r_hi = s.add_learnt(&[lit(3, true), lit(4, true), lit(5, true)]).unwrap();
-        s.learnts.push(r_lo);
-        s.learnts.push(r_hi);
         s.db.set_lbd(r_lo, 2); // glue, protected (<= threshold 2)
         s.db.set_lbd(r_hi, 9); // high glue, deletable
         s.reduce();
         assert!(!s.db.is_deleted(r_lo), "low-LBD clause kept");
         assert!(s.db.is_deleted(r_hi), "high-LBD clause deleted");
-        assert!(s.stats_deleted >= 1);
+        assert_eq!(s.stats_deleted, 1, "exactly one high-LBD unlocked clause deleted");
     }
 ```
 
