@@ -42,14 +42,17 @@ impl EqualityEngine {
         if let Some(n) = self.term_to_node.get(t) {
             return n;
         }
+        debug_assert!(
+            self.nodes.len() < u32::MAX as usize,
+            "ENodeId space exhausted"
+        );
         let id = ENodeId::new(self.nodes.len() as u32);
         self.nodes.push(ENode {
             parent: id,
             size: 1,
         });
         self.fparent.push(id);
-        self.flabel
-            .push(EqJust::Asserted(shinri_core::Lit::from_code(0))); // placeholder for a root
+        self.flabel.push(EqJust::Definitional); // placeholder for a root node; never read
         self.term_to_node.insert(t, id);
         id
     }
@@ -225,6 +228,7 @@ impl EqualityEngine {
                 // f(..s..) = f(..t..) because s = t: recurse on the argument pair.
                 self.explain(s, t, out);
             }
+            EqJust::Definitional => {}
         }
     }
 
@@ -416,6 +420,21 @@ mod tests {
         let mut events = Vec::new();
         eq.drain_merges(&mut events);
         assert_eq!(events.len(), 1);
+    }
+
+    #[test]
+    fn definitional_edges_contribute_no_explanation_leaf() {
+        // A definitional equality is unconditionally true: explaining across it
+        // must yield no antecedent leaves (no fake Var(0) literal).
+        let mut eq = EqualityEngine::default();
+        let w = eq.intern(term(1));
+        let d = eq.intern(term(2));
+        eq.merge(w, d, EqJust::Definitional).unwrap();
+        let mut drained = Vec::new();
+        eq.drain_merges(&mut drained); // keep the merge-queue contract clean
+        let mut out = Vec::new();
+        eq.explain(w, d, &mut out);
+        assert!(out.is_empty(), "definitional equality needs no antecedent");
     }
 }
 

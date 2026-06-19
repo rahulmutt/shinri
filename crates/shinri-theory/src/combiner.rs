@@ -83,9 +83,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                     let dn = self.eq.intern(def);
                     self.iface.mark_shared(wn);
                     // Definitional equality holds unconditionally (level 0).
-                    let _ =
-                        self.eq
-                            .merge(wn, dn, crate::types::EqJust::Asserted(Lit::from_code(0)));
+                    let _ = self.eq.merge(wn, dn, crate::types::EqJust::Definitional);
                 }
                 // Re-borrow to notify both theories of the (purified) atom.
                 let mut cx = TheoryCtx {
@@ -247,6 +245,13 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
     /// Expand conflicting antecedent leaves to input literals, then negate to
     /// form the conflict clause handed to shinri-sat's analyzer.
     fn expand_conflict(&mut self, leaves: Vec<crate::types::EqLeaf>) -> Vec<Lit> {
+        // A conflict is about to be handed to the SAT loop, which will backtrack
+        // and pop. Any merge events queued during this round are now stale working
+        // state; drain and discard them so the engine's drain-before-pop contract
+        // (EqualityEngine::pop's debug_assert) holds on the conflict path too.
+        self.merges.clear();
+        self.eq.drain_merges(&mut self.merges);
+        self.merges.clear();
         let mut exp = Explainer::default();
         for leaf in leaves {
             exp.push_leaf(leaf);
@@ -686,6 +691,21 @@ mod tests {
                 shinri_core::Rational::from_int(42i128.into())
             ))
         );
+    }
+
+    #[test]
+    fn merge_then_conflict_then_pop_does_not_panic() {
+        // Merger merges term(1)/term(2) on check(Full) (queuing a MergeEvent);
+        // Splitter then conflicts because they are equal. After the conflict the
+        // SAT loop pops — the engine's merge queue must already be drained, else
+        // EqualityEngine::pop's debug_assert fires.
+        let mut c: Combiner<Merger, Splitter> = Combiner::default();
+        c.push();
+        match c.check(Effort::Full) {
+            TheoryResult::Conflict(_) => {}
+            other => panic!("expected conflict, got {other:?}"),
+        }
+        c.pop(1); // must not panic
     }
 
     #[test]

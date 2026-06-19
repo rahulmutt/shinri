@@ -35,6 +35,10 @@ pub enum EqJust {
     Congruence(ENodeId, ENodeId),
     /// An equality another theory derived; expandable via that theory's `explain`.
     Interface(TheoryJust),
+    /// An unconditional definitional equality (e.g. a purification interface
+    /// variable's defining equation `w := def`). Always true; contributes no
+    /// antecedent to any explanation.
+    Definitional,
 }
 
 /// A leaf produced by walking the proof forest: either an input literal or a

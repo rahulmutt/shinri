@@ -20,7 +20,7 @@ pub enum CertError {
     Empty(usize),
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct CertLog {
     steps: Vec<CertStep>,
 }
