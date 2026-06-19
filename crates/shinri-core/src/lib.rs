@@ -7,7 +7,9 @@ pub mod ids;
 pub mod symbol;
 pub mod sort;
 pub mod context;
+pub mod term;
 
 pub use ids::{ClauseId, Lit, RatId, SortId, SymbolId, TermId, Var};
 pub use context::Context;
 pub use sort::SortNode;
+pub use term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
