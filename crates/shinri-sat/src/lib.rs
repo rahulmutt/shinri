@@ -23,7 +23,7 @@ pub use clause::{ClauseDb, ClauseRef};
 pub use config::{RestartKind, SolverConfig};
 pub use types::{Conflict, Effort, LBool, Reason, SolveResult, TheoryResult};
 pub use solver::Solver;
-pub use heuristic::{BranchHeuristic, Vmtf};
+pub use heuristic::{BranchHeuristic, Evsids, Vmtf};
 
 // Re-export the core vocabulary so downstream crates and integration tests can
 // name these types via `shinri_sat::` without depending on `shinri-core`

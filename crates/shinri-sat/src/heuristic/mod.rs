@@ -1,6 +1,9 @@
 use crate::assignment::Assignment;
 use shinri_core::Var;
 
+pub mod evsids;
+pub use evsids::Evsids;
+
 pub mod vmtf;
 pub use vmtf::Vmtf;
 
