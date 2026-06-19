@@ -1,0 +1,29 @@
+[package]
+name = "shinri-sat-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+shinri-core = { path = "../../shinri-core" }
+shinri-sat = { path = "..", features = ["dimacs"] }
+splr = "0.17"
+
+[[bin]]
+name = "dimacs_parse"
+path = "fuzz_targets/dimacs_parse.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "cnf_vs_oracle"
+path = "fuzz_targets/cnf_vs_oracle.rs"
+test = false
+doc = false
+
+[workspace]

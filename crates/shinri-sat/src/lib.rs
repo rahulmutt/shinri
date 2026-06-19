@@ -3,6 +3,15 @@
 //! Clause database, two-watched-literals propagation, 1-UIP learning,
 //! branching, restarts, incremental assumptions, and the zero-cost
 //! `Theory`/`ProofSink` seams. Depends only on `shinri-core`.
+//!
+//! # Mutation testing
+//!
+//! Confirm the suite kills behavioral mutants in the soundness-critical
+//! routines:
+//!
+//! ```bash
+//! cargo mutants -p shinri-sat --file crates/shinri-sat/src/solver.rs --file crates/shinri-sat/src/analyze.rs
+//! ```
 
 pub mod analyze;
 pub mod assignment;
