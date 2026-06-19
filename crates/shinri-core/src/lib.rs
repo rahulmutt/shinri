@@ -17,3 +17,4 @@ pub use sort::SortNode;
 pub use term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
 pub use error::SortError;
 pub use undo::UndoLog;
+pub use shinri_num::{DeltaRational, Rational};
