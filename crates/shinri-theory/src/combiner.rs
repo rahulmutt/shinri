@@ -14,8 +14,6 @@ pub struct Combiner<E: TheorySolver, A: TheorySolver> {
     terms: Context,
     eq: EqualityEngine,
     atoms: AtomRegistry,
-    /// Placeholder; populated in Task 10.
-    #[allow(dead_code)]
     iface: InterfaceSet,
     euf: E,
     arith: A,
@@ -52,15 +50,41 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
         let owner = classify(&self.terms, atom)?;
         self.atoms.register(v, atom, owner);
         // Split the ctx borrow from the theory fields (the §5.5 pattern).
-        let mut cx = TheoryCtx {
-            terms: &self.terms,
-            eq: &mut self.eq,
-            atoms: &self.atoms,
-        };
         match owner {
-            Owner::Euf => self.euf.new_var(&mut cx, v, atom),
-            Owner::Arith => self.arith.new_var(&mut cx, v, atom),
+            Owner::Euf => {
+                let mut cx = TheoryCtx {
+                    terms: &self.terms,
+                    eq: &mut self.eq,
+                    atoms: &self.atoms,
+                };
+                self.euf.new_var(&mut cx, v, atom);
+            }
+            Owner::Arith => {
+                let mut cx = TheoryCtx {
+                    terms: &self.terms,
+                    eq: &mut self.eq,
+                    atoms: &self.atoms,
+                };
+                self.arith.new_var(&mut cx, v, atom);
+            }
             Owner::Shared => {
+                // Purify first: splits mixed terms, emitting defining equalities
+                // for fresh interface variables (borrow of self.terms is separate
+                // from self.eq / self.iface).
+                let (_pure, defs) = crate::interface::purify(&mut self.terms, &mut self.iface, atom);
+                for (w, def) in defs {
+                    let wn = self.eq.intern(w);
+                    let dn = self.eq.intern(def);
+                    self.iface.mark_shared(wn);
+                    // Definitional equality holds unconditionally (level 0).
+                    let _ = self.eq.merge(wn, dn, crate::types::EqJust::Asserted(Lit::from_code(0)));
+                }
+                // Re-borrow to notify both theories of the (purified) atom.
+                let mut cx = TheoryCtx {
+                    terms: &self.terms,
+                    eq: &mut self.eq,
+                    atoms: &self.atoms,
+                };
                 self.euf.new_var(&mut cx, v, atom);
                 self.arith.new_var(&mut cx, v, atom);
             }
