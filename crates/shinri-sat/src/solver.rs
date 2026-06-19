@@ -8,12 +8,12 @@ use shinri_core::{Lit, Var};
 
 /// The CDCL search engine (concrete for now; generic params for theory, proof,
 /// and heuristic are introduced in Tasks 13/17/18).
-#[allow(dead_code)]
 pub struct Solver {
     pub(crate) assign: Assignment,
     pub(crate) trail: Trail,
     pub(crate) db: ClauseDb,
     pub(crate) watches: Watches,
+    #[allow(dead_code)]
     pub(crate) config: SolverConfig,
     pub(crate) unsat: bool,
 }
