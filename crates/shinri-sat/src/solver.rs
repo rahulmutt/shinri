@@ -2,32 +2,36 @@ use crate::analyze::Analyzer;
 use crate::assignment::Assignment;
 use crate::clause::{ClauseDb, ClauseRef};
 use crate::config::SolverConfig;
+use crate::heuristic::BranchHeuristic;
+#[cfg(test)]
+use crate::heuristic::Vmtf;
 use crate::restart::RestartPolicy;
 use crate::trail::Trail;
 use crate::types::{Conflict, LBool, Reason, SolveResult};
 use crate::watch::{Watch, WatchTarget, Watches};
 use shinri_core::{Lit, Var};
 
-/// The CDCL search engine (concrete for now; generic params for theory, proof,
-/// and heuristic are introduced in Tasks 13/17/18).
-pub struct Solver {
+/// The CDCL search engine. `H` is the branching heuristic, fixed at
+/// construction (spec §8.4); generic params for theory and proof are
+/// introduced in Tasks 17/18.
+pub struct Solver<H: BranchHeuristic> {
     pub(crate) assign: Assignment,
     pub(crate) trail: Trail,
     pub(crate) db: ClauseDb,
     pub(crate) watches: Watches,
-    #[allow(dead_code)]
-    pub(crate) config: SolverConfig,
-    pub(crate) unsat: bool,
     pub(crate) analyzer: Analyzer,
-    pub(crate) stats_minimized: u64,
+    pub(crate) restart: RestartPolicy,
+    pub(crate) config: SolverConfig,
+    pub(crate) heuristic: H,
     pub(crate) learnts: Vec<ClauseRef>,
     pub(crate) conflicts: u64,
+    pub(crate) unsat: bool,
+    pub(crate) stats_minimized: u64,
     pub(crate) stats_deleted: u64,
-    pub(crate) restart: RestartPolicy,
 }
 
-impl Solver {
-    pub fn new(config: SolverConfig) -> Solver {
+impl<H: BranchHeuristic> Solver<H> {
+    pub fn new(config: SolverConfig) -> Solver<H> {
         Solver {
             assign: Assignment::new(),
             trail: Trail::new(),
@@ -35,6 +39,7 @@ impl Solver {
             watches: Watches::new(),
             restart: RestartPolicy::new(config.restart, 100),
             config,
+            heuristic: H::default(),
             unsat: false,
             analyzer: Analyzer::default(),
             stats_minimized: 0,
@@ -46,6 +51,7 @@ impl Solver {
 
     pub fn new_var(&mut self) -> Var {
         let v = self.assign.new_var();
+        self.heuristic.new_var(v);
         self.watches.ensure_vars(self.assign.num_vars());
         self.analyzer.ensure_vars(self.assign.num_vars());
         v
@@ -100,22 +106,20 @@ impl Solver {
         }
     }
 
-    /// Pick an unassigned variable, branching on its saved phase (phase saving).
-    /// Task 13 replaces this body with the `BranchHeuristic`.
-    fn pick_branch(&self) -> Option<Lit> {
-        for i in 0..self.assign.num_vars() {
-            let v = Var::new(i as u32);
-            if self.assign.value(v) == LBool::Unset {
-                return Some(Lit::new(v, self.assign.phase(v)));
-            }
-        }
-        None
+    fn pick_branch(&mut self) -> Option<Lit> {
+        self.heuristic
+            .next(&self.assign)
+            .map(|v| Lit::new(v, self.assign.phase(v)))
     }
 
     /// Unwind the trail to `level`, un-assigning every popped literal.
     pub(crate) fn backtrack_to(&mut self, level: u32) {
         let assign = &mut self.assign;
-        self.trail.backtrack_to(level, |l| assign.unassign(l.var()));
+        let heuristic = &mut self.heuristic;
+        self.trail.backtrack_to(level, |l| {
+            assign.unassign(l.var());
+            heuristic.on_unassign(l.var());
+        });
     }
 
     /// The literal set of a conflict — read from the arena for a stored clause,
@@ -145,6 +149,7 @@ impl Solver {
                 let v = q.var();
                 if !self.analyzer.seen[v.index()] && self.assign.level(v) > 0 {
                     self.analyzer.seen[v.index()] = true;
+                    self.heuristic.bump(v);
                     seen_vars.push(v);
                     if self.assign.level(v) == level {
                         counter += 1;
@@ -287,6 +292,7 @@ impl Solver {
                     };
                     self.enqueue(asserting, reason);
                     self.conflicts += 1;
+                    self.heuristic.decay();
                     let lbd = self.compute_lbd(&learnt);
                     if let Reason::Clause(r) = reason {
                         self.db.set_lbd(r, lbd);
@@ -479,8 +485,8 @@ mod tests {
         Lit::new(Var::new(n), pos)
     }
 
-    fn mk(n_vars: u32) -> Solver {
-        let mut s = Solver::new(SolverConfig::default());
+    fn mk(n_vars: u32) -> Solver<Vmtf> {
+        let mut s = Solver::<Vmtf>::new(SolverConfig::default());
         for _ in 0..n_vars {
             s.new_var();
         }
