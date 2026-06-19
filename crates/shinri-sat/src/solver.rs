@@ -6,15 +6,16 @@ use crate::heuristic::BranchHeuristic;
 #[cfg(test)]
 use crate::heuristic::Vmtf;
 use crate::restart::RestartPolicy;
+use crate::theory::Theory;
 use crate::trail::Trail;
-use crate::types::{Conflict, LBool, Reason, SolveResult};
+use crate::types::{Conflict, Effort, LBool, Reason, SolveResult, TheoryResult};
 use crate::watch::{Watch, WatchTarget, Watches};
-use shinri_core::{Lit, Var};
+use shinri_core::{Lit, ProofSink, TheoryJust, Var};
 
-/// The CDCL search engine. `H` is the branching heuristic, fixed at
-/// construction (spec §8.4); generic params for theory and proof are
-/// introduced in Tasks 17/18.
-pub struct Solver<H: BranchHeuristic> {
+/// The CDCL search engine. `T` is the theory, `P` is the proof sink, `H` is
+/// the branching heuristic, all fixed at construction (spec §8.4).
+#[allow(dead_code)] // `proof` field is wired for emit in Task 18
+pub struct Solver<T: Theory, P: ProofSink + Default, H: BranchHeuristic> {
     pub(crate) assign: Assignment,
     pub(crate) trail: Trail,
     pub(crate) db: ClauseDb,
@@ -23,17 +24,19 @@ pub struct Solver<H: BranchHeuristic> {
     pub(crate) restart: RestartPolicy,
     pub(crate) config: SolverConfig,
     pub(crate) heuristic: H,
+    pub(crate) theory: T,
+    pub(crate) proof: P,
     pub(crate) learnts: Vec<ClauseRef>,
+    pub(crate) input_clauses: Vec<Vec<Lit>>,
+    pub(crate) scopes: Vec<usize>,
     pub(crate) conflicts: u64,
     pub(crate) unsat: bool,
     pub(crate) stats_minimized: u64,
     pub(crate) stats_deleted: u64,
-    pub(crate) input_clauses: Vec<Vec<Lit>>,
-    pub(crate) scopes: Vec<usize>,
 }
 
-impl<H: BranchHeuristic> Solver<H> {
-    pub fn new(config: SolverConfig) -> Solver<H> {
+impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
+    pub fn new(config: SolverConfig) -> Solver<T, P, H> {
         Solver {
             assign: Assignment::new(),
             trail: Trail::new(),
@@ -42,6 +45,8 @@ impl<H: BranchHeuristic> Solver<H> {
             restart: RestartPolicy::new(config.restart, 100),
             config,
             heuristic: H::default(),
+            theory: T::default(),
+            proof: P::default(),
             unsat: false,
             analyzer: Analyzer::default(),
             stats_minimized: 0,
@@ -56,6 +61,7 @@ impl<H: BranchHeuristic> Solver<H> {
     pub fn new_var(&mut self) -> Var {
         let v = self.assign.new_var();
         self.heuristic.new_var(v);
+        self.theory.new_var(v);
         self.watches.ensure_vars(self.assign.num_vars());
         self.analyzer.ensure_vars(self.assign.num_vars());
         v
@@ -130,8 +136,10 @@ impl<H: BranchHeuristic> Solver<H> {
         self.learnts.clear();
         self.unsat = false;
         self.heuristic = H::default();
+        self.theory = T::default();
         for i in 0..num_vars {
             self.heuristic.new_var(Var::new(i as u32));
+            self.theory.new_var(Var::new(i as u32));
         }
         let inputs = std::mem::take(&mut self.input_clauses);
         for clause in &inputs {
@@ -150,6 +158,7 @@ impl<H: BranchHeuristic> Solver<H> {
                 let level = self.trail.decision_level();
                 self.assign.assign(l, level, reason);
                 self.trail.push(l);
+                self.theory.assert(l);
                 true
             }
         }
@@ -163,12 +172,16 @@ impl<H: BranchHeuristic> Solver<H> {
 
     /// Unwind the trail to `level`, un-assigning every popped literal.
     pub(crate) fn backtrack_to(&mut self, level: u32) {
+        let from = self.trail.decision_level();
         let assign = &mut self.assign;
         let heuristic = &mut self.heuristic;
         self.trail.backtrack_to(level, |l| {
             assign.unassign(l.var());
             heuristic.on_unassign(l.var());
         });
+        if from > level {
+            self.theory.pop((from - level) as usize);
+        }
     }
 
     /// The literal set of a conflict — read from the arena for a stored clause,
@@ -248,7 +261,7 @@ impl<H: BranchHeuristic> Solver<H> {
 
     /// The literals (other than `p` itself) of `p`'s antecedent clause —
     /// i.e. the literals to resolve against when walking the implication graph.
-    fn reason_lits_of(&self, p: Lit) -> Vec<Lit> {
+    fn reason_lits_of(&mut self, p: Lit) -> Vec<Lit> {
         match self.assign.reason(p.var()) {
             Reason::Decision => Vec::new(), // a decision has no antecedent
             Reason::Unit => Vec::new(),
@@ -257,7 +270,12 @@ impl<H: BranchHeuristic> Solver<H> {
                 // All literals except `p` (which is satisfied by this clause).
                 self.db.lits(r).iter().copied().filter(|&l| l != p).collect()
             }
-            Reason::Theory(_just) => Vec::new(), // expanded lazily in Task 17
+            Reason::Theory(just) => {
+                let mut antecedents = Vec::new();
+                self.theory.explain(just, &mut antecedents);
+                // The clause is (p ∨ ¬a1 ∨ ...); resolve against the ¬ai (false).
+                antecedents.iter().map(|a| a.negate()).collect()
+            }
         }
     }
 
@@ -371,6 +389,7 @@ impl<H: BranchHeuristic> Solver<H> {
                         match self.assign.lit_value(a) {
                             LBool::True => {
                                 self.trail.new_level(); // align levels; no new assignment
+                                self.theory.push();
                             }
                             LBool::False => {
                                 let mut core = self.analyze_final(a.negate());
@@ -379,6 +398,7 @@ impl<H: BranchHeuristic> Solver<H> {
                             }
                             LBool::Unset => {
                                 self.trail.new_level();
+                                self.theory.push();
                                 self.enqueue(a, Reason::Decision);
                             }
                         }
@@ -386,9 +406,34 @@ impl<H: BranchHeuristic> Solver<H> {
                         match self.pick_branch() {
                             Some(l) => {
                                 self.trail.new_level();
+                                self.theory.push();
                                 self.enqueue(l, Reason::Decision);
                             }
-                            None => return SolveResult::Sat,
+                            None => match self.theory.check(Effort::Full) {
+                                TheoryResult::Sat => return SolveResult::Sat,
+                                TheoryResult::Conflict(lits) => {
+                                    if self.trail.decision_level() == 0 {
+                                        self.unsat = true;
+                                        return SolveResult::Unsat { core: vec![] };
+                                    }
+                                    let (learnt, bt) = self.analyze(Conflict::Lits(lits));
+                                    self.backtrack_to(bt);
+                                    let asserting = learnt[0];
+                                    let reason = match self.add_learnt(&learnt) {
+                                        Some(r) => Reason::Clause(r),
+                                        None if learnt.len() == 2 => Reason::Binary(learnt[1]),
+                                        None => Reason::Unit,
+                                    };
+                                    self.enqueue(asserting, reason);
+                                }
+                                TheoryResult::Lemma(lits) => {
+                                    self.add_learnt(&lits);
+                                    let dl = self.trail.decision_level();
+                                    if dl > 0 {
+                                        self.backtrack_to(dl - 1);
+                                    }
+                                }
+                            },
                         }
                     }
                 }
@@ -501,9 +546,31 @@ impl<H: BranchHeuristic> Solver<H> {
         }
     }
 
+    /// Boolean BCP followed by theory propagation, to joint fixpoint.
+    pub fn propagate(&mut self) -> Option<Conflict> {
+        loop {
+            if let Some(c) = self.propagate_boolean() {
+                return Some(c);
+            }
+            let mut out: Vec<(Lit, TheoryJust)> = Vec::new();
+            match self.theory.propagate(&mut out) {
+                Some(conflict_lits) => return Some(Conflict::Lits(conflict_lits)),
+                None => {
+                    if out.is_empty() {
+                        return None;
+                    }
+                    for (l, just) in out {
+                        self.enqueue(l, Reason::Theory(just));
+                    }
+                    // loop: Boolean-propagate the new theory literals
+                }
+            }
+        }
+    }
+
     /// Boolean constraint propagation to fixpoint. Returns the first conflict,
     /// or `None` if a fixpoint with no conflict is reached.
-    pub fn propagate(&mut self) -> Option<Conflict> {
+    fn propagate_boolean(&mut self) -> Option<Conflict> {
         while self.trail.qhead() < self.trail.len() {
             let p = self.trail.lit_at(self.trail.qhead());
             self.trail.set_qhead(self.trail.qhead() + 1);
@@ -606,12 +673,16 @@ impl<H: BranchHeuristic> Solver<H> {
 mod tests {
     use super::*;
 
+    use crate::theory::{NoTheory, Theory};
+    use crate::types::{Effort, TheoryResult};
+    use shinri_core::{NoProof, TheoryJust};
+
     fn lit(n: u32, pos: bool) -> Lit {
         Lit::new(Var::new(n), pos)
     }
 
-    fn mk(n_vars: u32) -> Solver<Vmtf> {
-        let mut s = Solver::<Vmtf>::new(SolverConfig::default());
+    fn mk(n_vars: u32) -> Solver<NoTheory, NoProof, Vmtf> {
+        let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
         for _ in 0..n_vars {
             s.new_var();
         }
@@ -619,6 +690,46 @@ mod tests {
     }
 
     use crate::types::SolveResult;
+
+    // A toy theory that, once it has seen x0 asserted true, propagates x1 true.
+    #[derive(Default)]
+    struct ForceX1 {
+        saw_x0: bool,
+        done: bool,
+    }
+    impl Theory for ForceX1 {
+        fn assert(&mut self, lit: Lit) {
+            if lit == Lit::new(Var::new(0), true) {
+                self.saw_x0 = true;
+            }
+        }
+        fn propagate(&mut self, out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+            if self.saw_x0 && !self.done {
+                self.done = true;
+                out.push((Lit::new(Var::new(1), true), TheoryJust { theory: 0, tag: 0 }));
+            }
+            None
+        }
+        fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+        fn check(&mut self, _e: Effort) -> TheoryResult {
+            TheoryResult::Sat
+        }
+        fn push(&mut self) {}
+        fn pop(&mut self, _n: usize) {}
+        fn new_var(&mut self, _v: Var) {}
+    }
+
+    #[test]
+    fn theory_propagation_forces_a_literal() {
+        let mut s: Solver<ForceX1, NoProof, Vmtf> =
+            Solver::new(SolverConfig::default());
+        for _ in 0..2 {
+            s.new_var();
+        }
+        s.add_clause(&[lit(0, true)]); // unit forces x0 true
+        assert_eq!(s.solve(), SolveResult::Sat);
+        assert_eq!(s.assign.value(Var::new(1)), LBool::True); // theory-propagated
+    }
 
     #[test]
     fn cdcl_solves_unsat_pigeon_like() {

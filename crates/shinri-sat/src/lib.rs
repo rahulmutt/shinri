@@ -9,6 +9,7 @@ pub mod clause;
 pub mod assignment;
 pub mod config;
 pub mod heuristic;
+pub mod theory;
 pub mod types;
 pub mod trail;
 pub mod watch;
@@ -24,6 +25,7 @@ pub use config::{RestartKind, SolverConfig};
 pub use types::{Conflict, Effort, LBool, Reason, SolveResult, TheoryResult};
 pub use solver::Solver;
 pub use heuristic::{BranchHeuristic, Evsids, Vmtf};
+pub use theory::{NoTheory, Theory};
 
 // Re-export the core vocabulary so downstream crates and integration tests can
 // name these types via `shinri_sat::` without depending on `shinri-core`
