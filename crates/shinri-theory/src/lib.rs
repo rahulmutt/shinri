@@ -21,4 +21,4 @@ pub use interface::InterfaceSet;
 pub use model::ModelBuilder;
 pub use proof::{CertError, CertLog, CertStep};
 pub use solver_trait::{TCheck, TheoryCtx, TheorySolver};
-pub use types::{ENodeId, EqConflict, EqJust, EqLeaf, Explainer, MergeEvent, ModelVal, Owner};
+pub use types::{CongRef, ENodeId, EqConflict, EqJust, EqLeaf, Explainer, MergeEvent, ModelVal, Owner};

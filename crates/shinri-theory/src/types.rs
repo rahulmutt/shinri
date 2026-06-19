@@ -26,13 +26,21 @@ pub enum Owner {
     Shared,
 }
 
+/// A range into `EqualityEngine`'s congruence-pair arena (keeps `EqJust` `Copy`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CongRef {
+    pub start: u32,
+    pub len: u32,
+}
+
 /// The justification on a proof-forest edge (spec §4.2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EqJust {
     /// An input equality literal `a = b` was asserted.
     Asserted(Lit),
-    /// `f(s..) = f(t..)` because each argument pair `(si, ti)` is equal.
-    Congruence(ENodeId, ENodeId),
+    /// `f(s..) = f(t..)` because each argument pair is equal. The pairs live in
+    /// `EqualityEngine.cong_pairs[start .. start+len]`.
+    Congruence(CongRef),
     /// An equality another theory derived; expandable via that theory's `explain`.
     Interface(TheoryJust),
     /// An unconditional definitional equality (e.g. a purification interface

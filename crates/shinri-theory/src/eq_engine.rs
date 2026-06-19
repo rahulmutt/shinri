@@ -34,6 +34,10 @@ pub struct EqualityEngine {
     flabel: Vec<EqJust>,
     forest_undo: UndoLog<ENodeId>, // the node whose forest edge was added
     merges: Vec<crate::types::MergeEvent>,
+    /// Arena of congruence argument pairs; `EqJust::Congruence` indexes into it.
+    cong_pairs: Vec<(ENodeId, ENodeId)>,
+    /// Backtracks `cong_pairs`: each entry is the arena length before a level.
+    cong_undo: UndoLog<usize>,
 }
 
 impl EqualityEngine {
@@ -126,6 +130,24 @@ impl EqualityEngine {
         self.nodes[root.index()].size += self.nodes[child.index()].size;
         self.merges.push(crate::types::MergeEvent { a, b });
         Ok(())
+    }
+
+    /// Like `merge`, but the equality is justified by congruence over the given
+    /// argument pairs (stored in the arena; the edge label references the range).
+    pub fn merge_congruence(
+        &mut self,
+        a: ENodeId,
+        b: ENodeId,
+        pairs: &[(ENodeId, ENodeId)],
+    ) -> Result<(), EqConflict> {
+        self.cong_undo.record(self.cong_pairs.len());
+        let start = self.cong_pairs.len() as u32;
+        self.cong_pairs.extend_from_slice(pairs);
+        let cref = crate::types::CongRef {
+            start,
+            len: pairs.len() as u32,
+        };
+        self.merge(a, b, EqJust::Congruence(cref))
     }
 
     /// Reverse the forest path from `n` up to its root so `n` becomes a root.
@@ -224,9 +246,13 @@ impl EqualityEngine {
         match label {
             EqJust::Asserted(l) => out.push(EqLeaf::Asserted(l)),
             EqJust::Interface(j) => out.push(EqLeaf::Interface(j)),
-            EqJust::Congruence(s, t) => {
-                // f(..s..) = f(..t..) because s = t: recurse on the argument pair.
-                self.explain(s, t, out);
+            EqJust::Congruence(cref) => {
+                let lo = cref.start as usize;
+                let hi = lo + cref.len as usize;
+                for i in lo..hi {
+                    let (s, t) = self.cong_pairs[i];
+                    self.explain(s, t, out);
+                }
             }
             EqJust::Definitional => {}
         }
@@ -240,6 +266,7 @@ impl EqualityEngine {
         self.undo.push_level();
         self.diseq_undo.push_level();
         self.forest_undo.push_level();
+        self.cong_undo.push_level();
     }
 
     pub fn pop(&mut self, level: usize) {
@@ -256,6 +283,10 @@ impl EqualityEngine {
         let fparent = &mut self.fparent;
         self.forest_undo.pop_to(level, |n| {
             fparent[n.index()] = n; // detach the spliced edge; n becomes a root again
+        });
+        let cong_pairs = &mut self.cong_pairs;
+        self.cong_undo.pop_to(level, |len_before| {
+            cong_pairs.truncate(len_before);
         });
     }
 }
@@ -361,20 +392,23 @@ mod tests {
 
     #[test]
     fn explain_expands_congruence_to_its_argument_equalities() {
-        // f(x) and f(y) merged by a Congruence edge whose argument equality is x=y.
+        // f(x1,x2) and f(y1,y2) merged by an n-ary congruence over both arg pairs.
         let mut eq = EqualityEngine::default();
-        let x = eq.intern(term(1));
-        let y = eq.intern(term(2));
-        let fx = eq.intern(term(3));
-        let fy = eq.intern(term(4));
-        let xy = Lit::new(Var::new(70), true);
-        eq.merge(x, y, EqJust::Asserted(xy)).unwrap();
-        // The congruence driver (EUF, later) would call this on discovering f(x)~f(y):
-        eq.merge(fx, fy, EqJust::Congruence(x, y)).unwrap();
+        let x1 = eq.intern(term(1));
+        let y1 = eq.intern(term(2));
+        let x2 = eq.intern(term(3));
+        let y2 = eq.intern(term(4));
+        let fx = eq.intern(term(5));
+        let fy = eq.intern(term(6));
+        let e1 = Lit::new(Var::new(70), true);
+        let e2 = Lit::new(Var::new(71), true);
+        eq.merge(x1, y1, EqJust::Asserted(e1)).unwrap();
+        eq.merge(x2, y2, EqJust::Asserted(e2)).unwrap();
+        eq.merge_congruence(fx, fy, &[(x1, y1), (x2, y2)]).unwrap();
         let mut out = Vec::new();
         eq.explain(fx, fy, &mut out);
-        // Expands to the underlying asserted x=y, not the synthetic congruence edge.
-        assert_eq!(out, vec![EqLeaf::Asserted(xy)]);
+        assert!(out.contains(&EqLeaf::Asserted(e1)));
+        assert!(out.contains(&EqLeaf::Asserted(e2)));
     }
 
     #[test]
