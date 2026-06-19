@@ -9,9 +9,11 @@ pub mod sort;
 pub mod context;
 pub mod term;
 pub mod error;
+pub mod undo;
 
 pub use ids::{ClauseId, Lit, RatId, SortId, SymbolId, TermId, Var};
 pub use context::Context;
 pub use sort::SortNode;
 pub use term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
 pub use error::SortError;
+pub use undo::UndoLog;
