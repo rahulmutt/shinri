@@ -259,7 +259,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
             if !visited.insert((j.theory, j.tag)) {
                 continue; // already expanded; justification DAG, so this terminates
             }
-            // Skip the definitional (level-0) placeholder leaf.
+            // Build context inside the loop so the &mut self.eq borrow is released each iteration.
             let mut cx = TheoryCtx {
                 terms: &self.terms,
                 eq: &mut self.eq,
@@ -504,7 +504,10 @@ mod tests {
         // euf = Merger (merges 1,2), arith = Splitter (conflicts if 1==2).
         let mut c: Combiner<Merger, Splitter> = Combiner::default();
         match c.check(Effort::Full) {
-            TheoryResult::Conflict(lits) => assert!(lits.is_empty() || !lits.is_empty()),
+            TheoryResult::Conflict(lits) => assert!(
+                lits.is_empty(),
+                "Merger.explain is a no-op, so the conflict clause must be empty"
+            ),
             other => panic!("expected conflict, got {other:?}"),
         }
     }
