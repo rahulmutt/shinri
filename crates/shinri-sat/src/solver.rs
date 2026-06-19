@@ -65,7 +65,9 @@ impl<H: BranchHeuristic> Solver<H> {
     /// Add an input clause at decision level 0. Returns false iff the formula
     /// is now trivially UNSAT (empty clause or a conflicting unit).
     pub fn add_clause(&mut self, lits: &[Lit]) -> bool {
-        debug_assert_eq!(self.trail.decision_level(), 0, "add_clause only at level 0");
+        if self.trail.decision_level() != 0 {
+            self.backtrack_to(0);
+        }
         match lits.len() {
             0 => {
                 self.unsat = true;
@@ -272,9 +274,16 @@ impl<H: BranchHeuristic> Solver<H> {
     /// CDCL search with 1-UIP conflict analysis, clause learning, and
     /// non-chronological backjumping.
     pub fn solve(&mut self) -> SolveResult {
+        self.solve_under(&[])
+    }
+
+    /// Solve under the given assumption literals (placed as the first
+    /// decisions). On UNSAT, `core` is the failed-assumption subset.
+    pub fn solve_under(&mut self, assumptions: &[Lit]) -> SolveResult {
         if self.unsat {
             return SolveResult::Unsat { core: vec![] };
         }
+        self.backtrack_to(0);
         loop {
             match self.propagate() {
                 Some(conflict) => {
@@ -301,20 +310,89 @@ impl<H: BranchHeuristic> Solver<H> {
                         self.reduce();
                     }
                     self.restart.on_conflict(lbd);
-                    if self.restart.should_restart() && self.trail.decision_level() > 0 {
+                    if self.restart.should_restart()
+                        && self.trail.decision_level() as usize > assumptions.len()
+                    {
                         self.restart.on_restart();
-                        self.backtrack_to(0);
+                        self.backtrack_to(assumptions.len() as u32);
                     }
                 }
-                None => match self.pick_branch() {
-                    Some(l) => {
-                        self.trail.new_level();
-                        self.enqueue(l, Reason::Decision);
+                None => {
+                    let dl = self.trail.decision_level() as usize;
+                    if dl < assumptions.len() {
+                        let a = assumptions[dl];
+                        match self.assign.lit_value(a) {
+                            LBool::True => {
+                                self.trail.new_level(); // align levels; no new assignment
+                            }
+                            LBool::False => {
+                                let mut core = self.analyze_final(a.negate());
+                                core.push(a);
+                                return SolveResult::Unsat { core };
+                            }
+                            LBool::Unset => {
+                                self.trail.new_level();
+                                self.enqueue(a, Reason::Decision);
+                            }
+                        }
+                    } else {
+                        match self.pick_branch() {
+                            Some(l) => {
+                                self.trail.new_level();
+                                self.enqueue(l, Reason::Decision);
+                            }
+                            None => return SolveResult::Sat,
+                        }
                     }
-                    None => return SolveResult::Sat,
-                },
+                }
             }
         }
+    }
+
+    /// Collect the assumption/decision literals that entail `p` (which is true
+    /// on the trail). The basis of `get-unsat-core` under assumptions.
+    fn analyze_final(&mut self, p: Lit) -> Vec<Lit> {
+        self.analyzer.ensure_vars(self.assign.num_vars());
+        let mut core: Vec<Lit> = Vec::new();
+        let mut seen_vars: Vec<Var> = Vec::new();
+        self.analyzer.seen[p.var().index()] = true;
+        seen_vars.push(p.var());
+
+        let mut i = self.trail.len();
+        while i > 0 {
+            i -= 1;
+            let q = self.trail.lit_at(i);
+            let v = q.var();
+            if !self.analyzer.seen[v.index()] {
+                continue;
+            }
+            match self.assign.reason(v) {
+                Reason::Decision => core.push(q),
+                Reason::Unit => {}
+                Reason::Binary(other) => {
+                    let ov = other.var();
+                    if !self.analyzer.seen[ov.index()] && self.assign.level(ov) > 0 {
+                        self.analyzer.seen[ov.index()] = true;
+                        seen_vars.push(ov);
+                    }
+                }
+                Reason::Clause(r) => {
+                    let lits: Vec<Lit> = self.db.lits(r).to_vec();
+                    for x in lits {
+                        let xv = x.var();
+                        if xv != v && !self.analyzer.seen[xv.index()] && self.assign.level(xv) > 0 {
+                            self.analyzer.seen[xv.index()] = true;
+                            seen_vars.push(xv);
+                        }
+                    }
+                }
+                Reason::Theory(_) => {}
+            }
+        }
+        for v in seen_vars {
+            self.analyzer.seen[v.index()] = false;
+        }
+        core
     }
 
     /// Drop redundant literals from the learnt clause in place. Runs after the
@@ -596,5 +674,29 @@ mod tests {
         assert!(!s.db.is_deleted(r_lo), "low-LBD clause kept");
         assert!(s.db.is_deleted(r_hi), "high-LBD clause deleted");
         assert_eq!(s.stats_deleted, 1, "exactly one high-LBD unlocked clause deleted");
+    }
+
+    #[test]
+    fn failed_assumptions_yield_core() {
+        use std::collections::HashSet;
+        // Clause (x0 ∨ x1). Assume ¬x0 and ¬x1 => UNSAT, core = {¬x0, ¬x1}.
+        let mut s = mk(2);
+        s.add_clause(&[lit(0, true), lit(1, true)]);
+        let r = s.solve_under(&[lit(0, false), lit(1, false)]);
+        match r {
+            SolveResult::Unsat { core } => {
+                let set: HashSet<Lit> = core.into_iter().collect();
+                assert!(set.contains(&lit(0, false)));
+                assert!(set.contains(&lit(1, false)));
+            }
+            _ => panic!("expected UNSAT under assumptions"),
+        }
+    }
+
+    #[test]
+    fn satisfiable_under_assumptions() {
+        let mut s = mk(2);
+        s.add_clause(&[lit(0, true), lit(1, true)]);
+        assert_eq!(s.solve_under(&[lit(0, true)]), SolveResult::Sat);
     }
 }
