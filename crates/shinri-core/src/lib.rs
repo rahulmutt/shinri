@@ -4,5 +4,6 @@
 //! and the proof seam. No theory, SAT, or parsing logic lives here.
 
 pub mod ids;
+pub mod symbol;
 
 pub use ids::{ClauseId, Lit, RatId, SortId, SymbolId, TermId, Var};
