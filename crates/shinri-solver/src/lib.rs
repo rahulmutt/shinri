@@ -12,6 +12,7 @@ use shinri_core::{Context, Op, SortId, SymbolId, TermId};
 pub struct Solver {
     ctx: Context,
     assertions: Vec<TermId>,
+    scopes: Vec<usize>,
     // Canonical Bool constants; used by the Tseitin encoder to handle ⊤/⊥
     // terms. Stored here so check_sat() can pass them to the Encoder
     // without re-building them.
@@ -34,6 +35,7 @@ impl Solver {
         Solver {
             ctx,
             assertions: Vec::new(),
+            scopes: Vec::new(),
             t_true,
             t_false,
             last_model: None,
@@ -57,6 +59,19 @@ impl Solver {
     }
     pub fn assert(&mut self, formula: TermId) {
         self.assertions.push(formula);
+    }
+
+    pub fn push(&mut self) {
+        self.scopes.push(self.assertions.len());
+    }
+
+    pub fn pop(&mut self, n: usize) {
+        for _ in 0..n {
+            if let Some(mark) = self.scopes.pop() {
+                self.assertions.truncate(mark);
+            }
+        }
+        self.last_model = None;
     }
 
     pub fn check_sat(&mut self) -> SolveOutcome {
