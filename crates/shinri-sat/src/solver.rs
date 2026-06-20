@@ -274,10 +274,14 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                 }
             }
             // Find the next trail literal at `level` that we've marked seen.
+            // IMPORTANT: only match literals at the CURRENT decision level.
+            // Literals at intermediate levels are marked `seen` (to avoid
+            // double-processing) but are already in the learnt clause; the
+            // scan must skip them or `counter` underflows on decrement.
             loop {
                 trail_idx -= 1;
                 let p = self.trail.lit_at(trail_idx);
-                if self.analyzer.seen[p.var().index()] {
+                if self.analyzer.seen[p.var().index()] && self.assign.level(p.var()) == level {
                     break;
                 }
             }
@@ -423,6 +427,66 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                         self.unsat = true;
                         return SolveResult::Unsat { core: vec![] };
                     }
+                    // Theory conflicts (from pending_conflict) can contain only
+                    // literals at levels strictly below the current level when
+                    // the conflict was triggered by an earlier decision but
+                    // surfaced after more decisions were made. In that case, the
+                    // conflict clause spans only lower levels; we cannot pivot on
+                    // a current-level literal during 1-UIP analysis.
+                    // Instead: treat the conflict clause itself as a learnt nogood,
+                    // backjump to the second-highest level, and unit-propagate the
+                    // highest-level literal (which becomes unassigned after backtrack).
+                    let cur = self.trail.decision_level();
+                    let conflict_lits = self.conflict_lits(&conflict);
+                    let has_cur_level = conflict_lits
+                        .iter()
+                        .any(|l| self.assign.level(l.var()) == cur);
+                    if !has_cur_level {
+                        // Compute max_level and the asserting literal BEFORE backtracking.
+                        let max_level = conflict_lits
+                            .iter()
+                            .map(|l| self.assign.level(l.var()))
+                            .max()
+                            .unwrap_or(0);
+                        if max_level == 0 {
+                            self.unsat = true;
+                            return SolveResult::Unsat { core: vec![] };
+                        }
+                        // Asserting literal = the one at max_level (it becomes
+                        // unassigned after backtracking, and the clause is unit then).
+                        let asserting = conflict_lits
+                            .iter()
+                            .copied()
+                            .find(|l| self.assign.level(l.var()) == max_level)
+                            .unwrap(); // max_level > 0 so this always exists
+                                       // Backjump level = second-highest distinct level in the clause.
+                        let bt = conflict_lits
+                            .iter()
+                            .map(|l| self.assign.level(l.var()))
+                            .filter(|&lv| lv < max_level)
+                            .max()
+                            .unwrap_or(0);
+                        self.backtrack_to(bt);
+                        // Put asserting literal first (standard CDCL convention).
+                        let mut learnt_clause: Vec<Lit> = vec![asserting];
+                        learnt_clause
+                            .extend(conflict_lits.iter().copied().filter(|&l| l != asserting));
+                        let r_opt = self.add_learnt(&learnt_clause);
+                        let pid = match r_opt {
+                            Some(r) => self.db.clause_id(r),
+                            None => ClauseId::new(u32::MAX),
+                        };
+                        self.proof.learn(pid, &learnt_clause, &[]);
+                        let reason = match r_opt {
+                            Some(r) => Reason::Clause(r),
+                            None if learnt_clause.len() == 2 => Reason::Binary(learnt_clause[1]),
+                            None => Reason::Unit,
+                        };
+                        self.enqueue(asserting, reason);
+                        self.conflicts += 1;
+                        self.heuristic.decay();
+                        continue;
+                    }
                     let (learnt, bt, chain) = self.analyze(conflict);
                     self.backtrack_to(bt);
                     let asserting = learnt[0];
@@ -499,6 +563,57 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     if self.trail.decision_level() == 0 {
                                         self.unsat = true;
                                         return SolveResult::Unsat { core: vec![] };
+                                    }
+                                    // If the theory conflict involves only literals at levels
+                                    // strictly below the current decision level, 1-UIP analysis
+                                    // would have no current-level literal to pivot on.
+                                    // Same treatment as the propagate() path above.
+                                    let cur = self.trail.decision_level();
+                                    let has_cur_level =
+                                        lits.iter().any(|l| self.assign.level(l.var()) == cur);
+                                    if !has_cur_level {
+                                        let max_level = lits
+                                            .iter()
+                                            .map(|l| self.assign.level(l.var()))
+                                            .max()
+                                            .unwrap_or(0);
+                                        if max_level == 0 {
+                                            self.unsat = true;
+                                            return SolveResult::Unsat { core: vec![] };
+                                        }
+                                        let asserting = lits
+                                            .iter()
+                                            .copied()
+                                            .find(|l| self.assign.level(l.var()) == max_level)
+                                            .unwrap();
+                                        let bt = lits
+                                            .iter()
+                                            .map(|l| self.assign.level(l.var()))
+                                            .filter(|&lv| lv < max_level)
+                                            .max()
+                                            .unwrap_or(0);
+                                        self.backtrack_to(bt);
+                                        let mut learnt_clause: Vec<Lit> = vec![asserting];
+                                        learnt_clause.extend(
+                                            lits.iter().copied().filter(|&l| l != asserting),
+                                        );
+                                        let r_opt = self.add_learnt(&learnt_clause);
+                                        let pid = match r_opt {
+                                            Some(r) => self.db.clause_id(r),
+                                            None => ClauseId::new(u32::MAX),
+                                        };
+                                        self.proof.learn(pid, &learnt_clause, &[]);
+                                        let reason = match r_opt {
+                                            Some(r) => Reason::Clause(r),
+                                            None if learnt_clause.len() == 2 => {
+                                                Reason::Binary(learnt_clause[1])
+                                            }
+                                            None => Reason::Unit,
+                                        };
+                                        self.enqueue(asserting, reason);
+                                        self.conflicts += 1;
+                                        self.heuristic.decay();
+                                        continue;
                                     }
                                     let (learnt, bt, chain) = self.analyze(Conflict::Lits(lits));
                                     self.backtrack_to(bt);
