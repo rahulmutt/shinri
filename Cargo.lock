@@ -417,6 +417,7 @@ dependencies = [
  "shinri-euf",
  "shinri-frontend",
  "shinri-num",
+ "shinri-parser",
  "shinri-sat",
  "shinri-theory",
 ]

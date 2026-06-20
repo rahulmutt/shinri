@@ -153,6 +153,8 @@ impl TheorySolver for Euf {
             self.inner.registered_terms().to_vec();
         let mut elem_of: FxHashMap<(shinri_core::SortId, shinri_theory::types::ENodeId), u32> =
             FxHashMap::default();
+        let real_s = cx.terms.real_sort();
+        let int_s = cx.terms.int_sort();
         for (term, _node) in registered {
             let node = cx.eq.intern(term);
             let rep = cx.eq.find(node);
@@ -167,6 +169,12 @@ impl TheorySolver for Euf {
                 }
             }
             let sort = cx.terms.sort_of(term);
+            // Skip Real/Int-sorted terms: the Arith theory assigns their numeric
+            // values. EUF assigning Elem(...) for them would conflict with Arith's
+            // Num(...) assignments and trigger the model seam debug_assert.
+            if sort == real_s || sort == int_s {
+                continue;
+            }
             let next = elem_of.len() as u32;
             let id = *elem_of.entry((sort, rep)).or_insert(next);
             m.assign(term, ModelVal::Elem(sort, id));

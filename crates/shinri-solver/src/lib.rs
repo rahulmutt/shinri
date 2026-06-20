@@ -229,7 +229,19 @@ impl Solver {
             }
             atom_vars = enc.atom_vars.clone();
             refused = enc.refused;
-            mixed = enc.saw_shared || (enc.saw_euf && enc.saw_arith);
+            // saw_shared: an atom mixes arith and non-arith sorts in one equality
+            // (requires purification not yet implemented) → Unknown.
+            //
+            // saw_euf_nonreal && saw_arith: there are EUF atoms on a purely
+            // uninterpreted sort (e.g. sort U) AND arith atoms on Real/Int.
+            // Without N-O equality propagation from arith to EUF, combining these
+            // two theories unsoundly. Fence to Unknown.
+            //
+            // NOTE: EUF atoms on Real/Int sorts (e.g. (= x:Real y:Real)) are NOT
+            // fenced — they're paired with companion Le/Ge arith atoms emitted by
+            // lower(), giving both theories the constraint. This is QF_UFLRA: EUF
+            // handles congruence (f(x)=f(y) when x=y), Arith handles linear bounds.
+            mixed = enc.saw_shared || (enc.saw_euf_nonreal && enc.saw_arith);
         }
 
         if refused || mixed {
@@ -274,10 +286,39 @@ impl Solver {
     ///   `(distinct a..n)`  →  `(and (lower(distinct ai aj)) ...)` for all pairs
     ///
     /// EUF/Bool `=` and binary EUF `distinct` pass through unchanged.
+    /// Returns true if `t` is a "pure arith" term — a linear combination of
+    /// nullary uninterpreted constants and numerals. Non-nullary uninterpreted
+    /// applications (function calls like `f(x)`) are EUF-structure, not pure arith.
+    fn is_pure_arith(ctx: &shinri_core::Context, t: TermId) -> bool {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        match ctx.term_node(t) {
+            TermNode::Const { .. } => true, // numeral constant
+            TermNode::App { op, args, .. } => {
+                let children = ctx.children(*args);
+                match op {
+                    // Nullary uninterpreted symbol = a plain variable.
+                    Op::Uninterpreted(_) if children.is_empty() => true,
+                    // Non-nullary uninterpreted = function application (EUF).
+                    Op::Uninterpreted(_) => false,
+                    // Linear arithmetic ops: all children must be pure arith too.
+                    Op::Builtin(
+                        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Neg,
+                    ) => children.iter().all(|&c| Self::is_pure_arith(ctx, c)),
+                    _ => false,
+                }
+            }
+        }
+    }
+
     fn lower(&mut self, t: TermId) -> TermId {
         use shinri_core::{BuiltinOp, Op, TermNode};
         match self.ctx.term_node(t).clone() {
-            // ── Real equality: (= a b) → (and (Le a b) (Ge a b)) ─────────────
+            // ── Real equality: (= a b) → (and (= a b) (Le a b) (Ge a b)) ─────
+            //
+            // We keep the original Eq atom so EUF can see x=y for congruence
+            // (needed for QF_UFLRA: x=y must reach EUF so congruence can derive
+            // f(x)=f(y)). The Le/Ge atoms are also added so arith can reason
+            // about the bound constraint. Both are semantically equivalent to (= a b).
             TermNode::App {
                 op: Op::Builtin(BuiltinOp::Eq),
                 args,
@@ -288,10 +329,16 @@ impl Solver {
                 // EUF/Bool equalities for the theory encoder.
                 if kids.len() >= 2 && self.ctx.sort_of(kids[0]) == self.ctx.real_sort() {
                     // Real-sorted (= a b c ...) : a == b == c == ...
-                    // Chain adjacent pairs: (Le a b)∧(Ge a b) ∧ (Le b c)∧(Ge b c) ∧ ...
-                    // Transitivity makes this equivalent to all-equal.
-                    let mut conj: Vec<TermId> = Vec::with_capacity((kids.len() - 1) * 2);
+                    // Chain adjacent pairs:
+                    //   (= a b)∧(Le a b)∧(Ge a b) ∧ (= b c)∧(Le b c)∧(Ge b c) ∧ ...
+                    // The Eq atoms go to EUF for congruence; the Le/Ge go to Arith.
+                    let mut conj: Vec<TermId> = Vec::with_capacity((kids.len() - 1) * 3);
                     for w in kids.windows(2) {
+                        // Keep the original binary Eq for EUF.
+                        let eq = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Eq), &[w[0], w[1]])
+                            .expect("Eq well-sorted");
                         let le = self
                             .ctx
                             .mk_app(Op::Builtin(BuiltinOp::Le), &[w[0], w[1]])
@@ -300,6 +347,7 @@ impl Solver {
                             .ctx
                             .mk_app(Op::Builtin(BuiltinOp::Ge), &[w[0], w[1]])
                             .expect("Ge well-sorted");
+                        conj.push(eq);
                         conj.push(le);
                         conj.push(ge);
                     }
@@ -318,26 +366,39 @@ impl Solver {
             } => {
                 let kids: Vec<TermId> = self.ctx.children(args).to_vec();
                 if kids.len() <= 2 {
-                    // Binary distinct: rewrite to (or (Lt a b) (Gt a b)) if Real.
+                    // Binary distinct over Real sort.
                     if self.ctx.sort_of(kids[0]) == self.ctx.real_sort() {
-                        let lt = self
-                            .ctx
-                            .mk_app(Op::Builtin(BuiltinOp::Lt), &[kids[0], kids[1]])
-                            .expect("Lt well-sorted");
-                        let gt = self
-                            .ctx
-                            .mk_app(Op::Builtin(BuiltinOp::Gt), &[kids[0], kids[1]])
-                            .expect("Gt well-sorted");
-                        self.ctx
-                            .mk_app(Op::Builtin(BuiltinOp::Or), &[lt, gt])
-                            .expect("or well-sorted")
+                        // If both args are pure arithmetic terms (nullary vars /
+                        // numerals / linear combinations), lower to (or Lt Gt) so
+                        // the Arith theory can reason about the disequality.
+                        // If either arg contains a function application (EUF), keep
+                        // it as a Distinct atom for EUF — congruence closure handles
+                        // it (e.g. distinct(f x)(f y) when x=y → conflict via EUF).
+                        if Self::is_pure_arith(&self.ctx, kids[0])
+                            && Self::is_pure_arith(&self.ctx, kids[1])
+                        {
+                            let lt = self
+                                .ctx
+                                .mk_app(Op::Builtin(BuiltinOp::Lt), &[kids[0], kids[1]])
+                                .expect("Lt well-sorted");
+                            let gt = self
+                                .ctx
+                                .mk_app(Op::Builtin(BuiltinOp::Gt), &[kids[0], kids[1]])
+                                .expect("Gt well-sorted");
+                            self.ctx
+                                .mk_app(Op::Builtin(BuiltinOp::Or), &[lt, gt])
+                                .expect("or well-sorted")
+                        } else {
+                            // EUF function args: keep as Distinct atom for EUF.
+                            t
+                        }
                     } else {
-                        // EUF binary distinct: pass through unchanged.
+                        // Non-Real (EUF) binary distinct: pass through unchanged.
                         t
                     }
                 } else {
                     // N-ary distinct: split into pairwise binary distincts, each
-                    // recursively lowered (so Real pairs → Lt/Gt, EUF pairs stay).
+                    // recursively lowered (so pure-Real pairs → Lt/Gt, EUF pairs stay).
                     let mut pairs = Vec::new();
                     for i in 0..kids.len() {
                         for j in (i + 1)..kids.len() {
@@ -345,7 +406,7 @@ impl Solver {
                                 .ctx
                                 .mk_app(Op::Builtin(BuiltinOp::Distinct), &[kids[i], kids[j]])
                                 .expect("binary distinct well-sorted");
-                            // Recurse so Real pairs become (or Lt Gt).
+                            // Recurse so pure-Real pairs become (or Lt Gt).
                             let lowered_d = self.lower(d);
                             pairs.push(lowered_d);
                         }
