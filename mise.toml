@@ -1,6 +1,7 @@
 [tools]
 rust = "1.96.0"
-"cargo:cargo-nextest" = "latest"
-"cargo:cargo-deny" = "latest"
-"cargo:cargo-fuzz" = "latest"
-"cargo:cargo-mutants" = "latest"
+"cargo:cargo-nextest" = "0.9.137"
+"cargo:cargo-deny" = "0.19.9"
+"cargo:cargo-fuzz" = "0.13.2"
+"cargo:cargo-mutants" = "27.1.0"
+"github:Z3Prover/z3" = { version = "z3-4.16.0", exe = "z3", matching = "x64-glibc" }
