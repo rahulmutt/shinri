@@ -1,6 +1,7 @@
 use crate::env::Env;
 use crate::lexer::{Lexer, Span, Token};
 use shinri_core::{Context, Rational, SortId, TermId};
+use shinri_frontend::Command;
 use shinri_num::Integer;
 
 /// A recoverable parse / well-sortedness error (design §8). Never panicked.
@@ -29,6 +30,9 @@ pub struct Parser<'a> {
     env: Env,
     #[allow(dead_code)]
     eof: usize,
+    /// Set to `true` after `(exit)` is processed; subsequent `next_command`
+    /// calls return `None` immediately.
+    stopped: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -38,6 +42,7 @@ impl<'a> Parser<'a> {
             peeked: None,
             env: Env::new(),
             eof: src.len(),
+            stopped: false,
         }
     }
 
@@ -443,6 +448,269 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse the next top-level command, interning into `ctx`. Returns `None`
+    /// at EOF or after `(exit)`. On error, skips to the end of the current
+    /// command so the next call resumes cleanly (design §8 recovery).
+    pub fn next_command(&mut self, ctx: &mut Context) -> Option<Result<Command, Diagnostic>> {
+        if self.stopped {
+            return None;
+        }
+        // Skip to the next '(' (tolerate stray tokens); None at EOF.
+        loop {
+            match self.peek() {
+                None => return None,
+                Some((Ok(Token::LParen), _)) => {
+                    self.bump();
+                    break;
+                }
+                Some((_, _)) => {
+                    self.bump(); // stray token before a command
+                }
+            }
+        }
+        let result = self.parse_command_body(ctx);
+        if result.is_err() {
+            self.recover_to_command_end();
+        }
+        if let Ok(Command::Exit) = &result {
+            self.stopped = true;
+        }
+        Some(result)
+    }
+
+    /// After the opening '(' is consumed, parse the command head + body,
+    /// including the closing ')'.
+    fn parse_command_body(&mut self, ctx: &mut Context) -> Result<Command, Diagnostic> {
+        let (head, hsp) = self.expect_symbol()?;
+        let cmd = match head.as_str() {
+            "set-logic" => {
+                let (l, _) = self.expect_symbol()?;
+                Command::SetLogic(l)
+            }
+            "declare-sort" => {
+                let (name, _) = self.expect_symbol()?;
+                let arity = self.expect_numeral_u32()?;
+                if arity != 0 {
+                    return Err(Diagnostic::new(hsp, "declare-sort arity > 0 unsupported"));
+                }
+                let s = ctx.declare_sort(&name);
+                self.env.add_sort(&name, s);
+                Command::DeclareSort { name, arity }
+            }
+            "declare-const" => {
+                let (name, _) = self.expect_symbol()?;
+                let result = self.parse_sort(ctx)?;
+                let sym = ctx.declare_fun(&name, &[], result);
+                self.env.add_fun(&name, sym);
+                Command::DeclareFun {
+                    name,
+                    sym,
+                    params: Vec::new(),
+                    result,
+                }
+            }
+            "declare-fun" => {
+                let (name, _) = self.expect_symbol()?;
+                self.expect_token(&Token::LParen)?;
+                let mut params = Vec::new();
+                while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+                    params.push(self.parse_sort(ctx)?);
+                }
+                self.bump(); // ')'
+                let result = self.parse_sort(ctx)?;
+                let sym = ctx.declare_fun(&name, &params, result);
+                self.env.add_fun(&name, sym);
+                Command::DeclareFun {
+                    name,
+                    sym,
+                    params,
+                    result,
+                }
+            }
+            "define-fun" => {
+                self.parse_define_fun(ctx)?;
+                // No command emitted; tail-call to fetch the next real command.
+                return self.parse_after_define(ctx);
+            }
+            "assert" => {
+                let t = self.parse_term(ctx)?;
+                Command::Assert(t)
+            }
+            "check-sat" => Command::CheckSat,
+            "check-sat-assuming" => {
+                self.expect_token(&Token::LParen)?;
+                let mut lits = Vec::new();
+                while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+                    lits.push(self.parse_term(ctx)?);
+                }
+                self.bump();
+                Command::CheckSatAssuming(lits)
+            }
+            "push" => Command::Push(self.opt_numeral_u32(1)?),
+            "pop" => Command::Pop(self.opt_numeral_u32(1)?),
+            "get-model" => Command::GetModel,
+            "get-value" => {
+                self.expect_token(&Token::LParen)?;
+                let mut ts = Vec::new();
+                while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+                    ts.push(self.parse_term(ctx)?);
+                }
+                self.bump();
+                Command::GetValue(ts)
+            }
+            "get-unsat-core" => Command::GetUnsatCore,
+            "set-option" => {
+                let (k, v) = self.parse_attr()?;
+                Command::SetOption {
+                    keyword: k,
+                    value: v,
+                }
+            }
+            "set-info" => {
+                let (k, v) = self.parse_attr()?;
+                Command::SetInfo {
+                    keyword: k,
+                    value: v,
+                }
+            }
+            "get-info" => {
+                let (k, _) = self.expect_keyword()?;
+                Command::GetInfo(k)
+            }
+            "echo" => match self.bump() {
+                Some((Ok(Token::Str(s)), _)) => Command::Echo(s),
+                Some((_, sp)) => return Err(Diagnostic::new(sp, "echo expects a string")),
+                None => return Err(Diagnostic::new(self.eof..self.eof, "echo expects a string")),
+            },
+            "reset" => Command::Reset,
+            "exit" => Command::Exit,
+            other => {
+                return Err(Diagnostic::new(
+                    hsp,
+                    format!("unsupported command: {other}"),
+                ))
+            }
+        };
+        self.expect_token(&Token::RParen)?; // close the command
+        Ok(cmd)
+    }
+
+    /// `(define-fun f ((x S)…) R body)` — intern body against fresh formal
+    /// placeholder consts and store as a macro; emits no command.
+    fn parse_define_fun(&mut self, ctx: &mut Context) -> Result<(), Diagnostic> {
+        let (name, _) = self.expect_symbol()?;
+        self.expect_token(&Token::LParen)?;
+        let mut formal_names = Vec::new();
+        let mut formals = Vec::new();
+        while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+            self.expect_token(&Token::LParen)?;
+            let (pname, _) = self.expect_symbol()?;
+            let psort = self.parse_sort(ctx)?;
+            // Fresh placeholder const, unique per definition to avoid clashes.
+            let fresh = ctx.declare_fun(&format!("@{name}!{pname}"), &[], psort);
+            let fresh_t = ctx
+                .mk_app(shinri_core::Op::Uninterpreted(fresh), &[])
+                .map_err(|e| Diagnostic::new(0..0, format!("{e:?}")))?;
+            formal_names.push(pname);
+            formals.push(fresh_t);
+            self.expect_token(&Token::RParen)?;
+        }
+        self.bump(); // consume ')'
+        let _result_sort = self.parse_sort(ctx)?;
+        // Bind formals as let-style names while parsing the body.
+        self.env.push_let(
+            formal_names
+                .into_iter()
+                .zip(formals.iter().copied())
+                .collect(),
+        );
+        let body = self.parse_term(ctx);
+        self.env.pop_let();
+        let body = body?;
+        self.expect_token(&Token::RParen)?; // close (define-fun …)
+        self.env.add_macro(&name, formals, body);
+        Ok(())
+    }
+
+    /// After a `define-fun` (which emits nothing), fetch the next real command.
+    fn parse_after_define(&mut self, ctx: &mut Context) -> Result<Command, Diagnostic> {
+        match self.next_command(ctx) {
+            Some(r) => r,
+            None => Err(Diagnostic::new(
+                self.eof..self.eof,
+                "end of input after define-fun",
+            )),
+        }
+    }
+
+    /// Skip to the end of the current command. Called after a parse error to
+    /// re-synchronise at the next command boundary. Depth starts at 1 because
+    /// the command's opening '(' was already consumed.
+    fn recover_to_command_end(&mut self) {
+        let mut depth: i32 = 1;
+        while depth > 0 {
+            match self.bump() {
+                None => break,
+                Some((Ok(Token::LParen), _)) => depth += 1,
+                Some((Ok(Token::RParen), _)) => depth -= 1,
+                _ => {}
+            }
+        }
+    }
+
+    fn expect_numeral_u32(&mut self) -> Result<u32, Diagnostic> {
+        match self.bump() {
+            Some((Ok(Token::Numeral(s)), sp)) => {
+                s.parse().map_err(|_| Diagnostic::new(sp, "expected u32"))
+            }
+            Some((_, sp)) => Err(Diagnostic::new(sp, "expected numeral")),
+            None => Err(Diagnostic::new(
+                self.eof..self.eof,
+                "expected numeral, found EOF",
+            )),
+        }
+    }
+
+    /// Optional trailing numeral (for `push`/`pop`); returns `default` when absent.
+    fn opt_numeral_u32(&mut self, default: u32) -> Result<u32, Diagnostic> {
+        if let Some((Ok(Token::Numeral(_)), _)) = self.peek() {
+            if let Some((Ok(Token::Numeral(s)), sp)) = self.bump() {
+                return s.parse().map_err(|_| Diagnostic::new(sp, "expected u32"));
+            }
+        }
+        Ok(default)
+    }
+
+    fn expect_keyword(&mut self) -> Result<(String, Span), Diagnostic> {
+        match self.bump() {
+            Some((Ok(Token::Keyword(k)), sp)) => Ok((k, sp)),
+            Some((_, sp)) => Err(Diagnostic::new(sp, "expected :keyword")),
+            None => Err(Diagnostic::new(
+                self.eof..self.eof,
+                "expected :keyword, found EOF",
+            )),
+        }
+    }
+
+    /// `:keyword [value-token]` — capture the value as raw text (Phase 1).
+    fn parse_attr(&mut self) -> Result<(String, shinri_frontend::AttrValue), Diagnostic> {
+        use shinri_frontend::AttrValue;
+        let (k, _) = self.expect_keyword()?;
+        // A value is present unless the next token closes the command.
+        let val = match self.peek() {
+            Some((Ok(Token::RParen), _)) | None => AttrValue::Token(None),
+            Some((Ok(tok), _)) => {
+                let text = format!("{tok:?}");
+                self.bump();
+                AttrValue::Token(Some(text))
+            }
+            Some((Err(()), sp)) => {
+                return Err(Diagnostic::new(sp.clone(), "invalid attribute value"))
+            }
+        };
+        Ok((k, val))
+    }
+
     /// Build a numeral term from literal text. `is_decimal` selects Real;
     /// integer literals default to Int (caller may re-coerce to Real later).
     #[allow(dead_code)]
@@ -650,5 +918,71 @@ mod tests {
         let mut ctx = Context::new();
         let mut p = Parser::new("(forall ((x Int)) true)");
         assert!(p.parse_term(&mut ctx).is_err());
+    }
+
+    // ── Command-loop + error-recovery tests ────────────────────────────────
+
+    use shinri_frontend::Command;
+
+    fn commands(src: &str) -> Vec<Result<Command, Diagnostic>> {
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        let mut out = Vec::new();
+        while let Some(c) = p.next_command(&mut ctx) {
+            out.push(c);
+        }
+        out
+    }
+
+    /// Resolution: `(exit)` DOES emit `Command::Exit` before stopping the
+    /// stream, so the script has 5 commands, not 4.
+    #[test]
+    fn parses_a_small_script() {
+        let cs = commands(
+            "(set-logic QF_LRA)\n(declare-fun x () Real)\n(assert (< x 1.0))\n(check-sat)\n(exit)",
+        );
+        assert!(matches!(cs[0], Ok(Command::SetLogic(_))));
+        assert!(matches!(cs[1], Ok(Command::DeclareFun { .. })));
+        assert!(matches!(cs[2], Ok(Command::Assert(_))));
+        assert!(matches!(cs[3], Ok(Command::CheckSat)));
+        assert!(matches!(cs[4], Ok(Command::Exit)));
+        assert_eq!(cs.len(), 5);
+    }
+
+    #[test]
+    fn exit_emits_then_stops() {
+        let cs = commands("(check-sat)\n(exit)\n(check-sat)");
+        assert!(matches!(cs[0], Ok(Command::CheckSat)));
+        assert!(matches!(cs[1], Ok(Command::Exit)));
+        assert_eq!(cs.len(), 2); // nothing after (exit)
+    }
+
+    #[test]
+    fn error_recovers_to_next_command() {
+        // Second command has a sort error; the third must still parse.
+        let cs = commands("(declare-fun x () Real)\n(assert (and x x))\n(check-sat)");
+        assert!(matches!(cs[0], Ok(Command::DeclareFun { .. })));
+        assert!(cs[1].is_err()); // (and x x): x is Real, not Bool
+        assert!(matches!(cs[2], Ok(Command::CheckSat)));
+    }
+
+    #[test]
+    fn define_fun_expands_and_emits_no_command() {
+        let cs = commands(
+            "(define-fun dbl ((a Real)) Real (+ a a))\n(declare-fun y () Real)\n(assert (= (dbl y) 0.0))\n(check-sat)",
+        );
+        // define-fun emits nothing; declare/assert/check-sat remain.
+        assert!(matches!(cs[0], Ok(Command::DeclareFun { .. })));
+        assert!(matches!(cs[1], Ok(Command::Assert(_))));
+        assert!(matches!(cs[2], Ok(Command::CheckSat)));
+        assert_eq!(cs.len(), 3);
+    }
+
+    #[test]
+    fn error_recovers_and_continues() {
+        // Unknown command; following check-sat must still parse.
+        let cs = commands("(bad-command foo bar)\n(check-sat)");
+        assert!(cs[0].is_err());
+        assert!(matches!(cs[1], Ok(Command::CheckSat)));
     }
 }
