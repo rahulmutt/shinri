@@ -394,6 +394,7 @@ dependencies = [
  "rustc-hash",
  "shinri-core",
  "shinri-frontend",
+ "shinri-num",
 ]
 
 [[package]]

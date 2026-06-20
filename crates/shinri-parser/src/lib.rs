@@ -2,6 +2,8 @@
 
 mod env;
 mod lexer;
+mod parser;
 
 pub use env::{Env, Macro};
 pub use lexer::{Lexer, Span, Token};
+pub use parser::{Diagnostic, Parser};

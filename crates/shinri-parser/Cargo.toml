@@ -8,6 +8,7 @@ rust-version.workspace = true
 [dependencies]
 shinri-core = { path = "../shinri-core" }
 shinri-frontend = { path = "../shinri-frontend" }
+shinri-num = { path = "../shinri-num" }
 logos = "0.14"
 rustc-hash = "2"
 
