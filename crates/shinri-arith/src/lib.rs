@@ -211,8 +211,11 @@ impl Arith {
         TCheck::Sat
     }
 
-    fn farkas_conflict(&mut self, _b: ArithVar, _d: crate::simplex::Below) -> Vec<EqLeaf> {
-        Vec::new()
+    fn farkas_conflict(&mut self, basic: ArithVar, dir: crate::simplex::Below) -> Vec<EqLeaf> {
+        crate::farkas::conflict_lits(&self.tableau, &self.bounds, basic, dir)
+            .into_iter()
+            .map(EqLeaf::Asserted)
+            .collect()
     }
 
     fn tableau_well_formed(&self) -> bool {
@@ -443,6 +446,46 @@ mod check_tests {
     #[test]
     fn infeasible_system_is_unsat() {
         assert!(!setup(true));
+    }
+
+    #[test]
+    fn unsat_conflict_cites_participating_literals() {
+        // Reuse the infeasible setup but capture the conflict leaves.
+        use shinri_core::{BuiltinOp, Context, Op, Var};
+        use shinri_theory::types::EqLeaf;
+        use shinri_theory::{AtomRegistry, EqualityEngine, TheoryCtx, TheorySolver};
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let xs = ctx.declare_fun("x", &[], real);
+        let ys = ctx.declare_fun("y", &[], real);
+        let x = ctx.mk_app(Op::Uninterpreted(xs), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(ys), &[]).unwrap();
+        let xy = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let one = ctx.mk_numeral(Rational::one(), real);
+        let three = ctx.mk_numeral(Rational::from_int(3i128.into()), real);
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xy, one]).unwrap();
+        let ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[xy, three])
+            .unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), le);
+        arith.new_var(&mut cx, Var::new(1), ge);
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        match arith.check(&mut cx, Effort::Full) {
+            TCheck::Conflict(leaves) => {
+                assert!(leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(0), true))));
+                assert!(leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(1), true))));
+            }
+            TCheck::Sat => panic!("expected conflict"),
+        }
     }
 
     #[test]
