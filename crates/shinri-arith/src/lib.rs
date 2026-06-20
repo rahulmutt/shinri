@@ -169,7 +169,54 @@ impl Arith {
     // -----------------------------------------------------------------------
 
     fn check_full(&mut self) -> TCheck {
+        use crate::simplex::{entering_for, first_violated_basic, Below};
+        loop {
+            let Some((basic, dir)) = first_violated_basic(&self.tableau, &self.bounds, &self.value)
+            else {
+                // Bounds feasible. Disequality repair (Task 12) runs here.
+                return self.repair_diseqs();
+            };
+            let increase = dir == Below::Lower;
+            match entering_for(&self.tableau, &self.bounds, &self.value, basic, increase) {
+                Some(entering) => {
+                    // Target = the violated bound of `basic`.
+                    let target = match dir {
+                        Below::Lower => self.bounds.lower(basic).unwrap().0.clone(),
+                        Below::Upper => self.bounds.upper(basic).unwrap().0.clone(),
+                    };
+                    self.pivot_and_update(basic, entering, target);
+                }
+                None => {
+                    // No candidate: Farkas conflict (Task 11).
+                    return TCheck::Conflict(self.farkas_conflict(basic, dir));
+                }
+            }
+        }
+    }
+
+    /// Move `entering` so that `basic` reaches `target`, then pivot the basis.
+    fn pivot_and_update(&mut self, basic: ArithVar, entering: ArithVar, target: DeltaRational) {
+        let a = self.tableau.row(basic).coeff(entering); // basic = ... + a*entering
+        debug_assert!(!a.is_zero());
+        // theta = (target - value[basic]) / a, applied to `entering`.
+        let diff = target - self.value[basic.index()].clone();
+        let theta = diff.scale(&a.recip());
+        let new_entering = self.value[entering.index()].clone() + theta;
+        self.update(entering, new_entering);
+        self.tableau.pivot(basic, entering);
+        debug_assert!(self.tableau_well_formed());
+    }
+
+    fn repair_diseqs(&mut self) -> TCheck {
         TCheck::Sat
+    }
+
+    fn farkas_conflict(&mut self, _b: ArithVar, _d: crate::simplex::Below) -> Vec<EqLeaf> {
+        Vec::new()
+    }
+
+    fn tableau_well_formed(&self) -> bool {
+        true
     }
 
     fn build_model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
@@ -332,6 +379,70 @@ mod backtrack_tests {
         let _ = arith.assert(&mut cx, Lit::new(Var::new(1), true));
         arith.pop(0);
         assert!(matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat));
+    }
+}
+
+#[cfg(test)]
+mod check_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_num::Rational;
+    use shinri_theory::{AtomRegistry, EqualityEngine, TheoryCtx, TheorySolver};
+
+    fn real_var(ctx: &mut Context, name: &str) -> TermId {
+        let real = ctx.real_sort();
+        let s = ctx.declare_fun(name, &[], real);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+    fn num(ctx: &mut Context, n: i128) -> TermId {
+        ctx.mk_numeral(Rational::from_int(n.into()), ctx.real_sort())
+    }
+
+    // Build: x + y <= 1 ; x >= 0 ; y >= 0  -> SAT
+    //        plus  x + y >= 3              -> UNSAT
+    fn setup(unsat: bool) -> bool {
+        let mut ctx = Context::new();
+        let x = real_var(&mut ctx, "x");
+        let y = real_var(&mut ctx, "y");
+        let xy = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let one = num(&mut ctx, 1);
+        let zero = num(&mut ctx, 0);
+        let three = num(&mut ctx, 3);
+        let a = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xy, one]).unwrap(); // x+y<=1
+        let b = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, zero]).unwrap(); // x>=0
+        let c = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[y, zero]).unwrap(); // y>=0
+        let d = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[xy, three])
+            .unwrap(); // x+y>=3
+
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        for (i, atom) in [a, b, c, d].iter().enumerate() {
+            arith.new_var(&mut cx, Var::new(i as u32), *atom);
+        }
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        arith.assert(&mut cx, Lit::new(Var::new(2), true));
+        if unsat {
+            arith.assert(&mut cx, Lit::new(Var::new(3), true));
+        }
+        matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat)
+    }
+
+    #[test]
+    fn feasible_system_is_sat() {
+        assert!(setup(false));
+    }
+
+    #[test]
+    fn infeasible_system_is_unsat() {
+        assert!(!setup(true));
     }
 }
 
