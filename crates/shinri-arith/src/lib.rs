@@ -23,11 +23,6 @@ use shinri_num::{DeltaRational, Rational};
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Effort, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
-fn midpoint(a: &DeltaRational, b: &DeltaRational) -> DeltaRational {
-    let half = Rational::new(1i128.into(), 2i128.into());
-    a.clone() + (b.clone() - a.clone()).scale(&half)
-}
-
 #[derive(Default)]
 pub struct Arith {
     vars: VarStore,
@@ -213,9 +208,9 @@ impl Arith {
     }
 
     fn repair_diseqs(&mut self) -> TCheck {
-        const MAX_ROUNDS: usize = 64;
-        for _ in 0..MAX_ROUNDS {
-            // Find a violated diseq: value[var] == rhs.
+        let max_rounds = self.diseqs.iter().count() + 1;
+        for round in 0..max_rounds {
+            let _ = round;
             let mut hit: Option<(ArithVar, DeltaRational, Lit)> = None;
             for (v, rhs, lit) in self.diseqs.iter() {
                 if &self.value[v.index()] == rhs {
@@ -224,29 +219,46 @@ impl Arith {
                 }
             }
             let Some((var, rhs, dlit)) = hit else {
-                return TCheck::Sat; // no diseq violated
+                return TCheck::Sat;
             };
-            if self.try_separate(var, &rhs) {
-                continue; // re-scan after the shift
+            let diseqs_snap: Vec<(ArithVar, DeltaRational, Lit)> = self
+                .diseqs
+                .iter()
+                .map(|(v, r, l)| (*v, r.clone(), *l))
+                .collect();
+            match self.try_separate(var, &rhs, &diseqs_snap) {
+                None => continue,
+                Some(pins) => {
+                    let mut lits = vec![dlit];
+                    lits.extend(pins);
+                    lits.sort_unstable_by_key(|l| l.code());
+                    lits.dedup();
+                    return TCheck::Conflict(lits.into_iter().map(EqLeaf::Asserted).collect());
+                }
             }
-            // var is fixed at rhs -> conflict.
-            let mut lits = vec![dlit];
-            lits.extend(self.pinning_lits(var));
-            lits.sort_unstable_by_key(|l| l.code());
-            lits.dedup();
-            return TCheck::Conflict(lits.into_iter().map(EqLeaf::Asserted).collect());
         }
-        // Hit the round cap: re-scan; if still violated, report conflict for the
-        // first one (sound: we never claim Sat with a violated diseq).
+        // Should be unreachable by construction (each round separates one diseq without
+        // re-violating others, or returns a conflict). Stay sound: re-scan and conflict.
+        debug_assert!(
+            false,
+            "repair_diseqs exceeded round cap — should be unreachable"
+        );
         for (v, rhs, dlit) in self.diseqs.iter() {
             if &self.value[v.index()] == rhs {
                 let mut lits = vec![*dlit];
-                // Conservative: cite the var's own bounds if present.
-                if let Some((_, l)) = self.bounds.lower(*v) {
-                    lits.push(*l);
+                let (r_lo, b_lo) = self.feasible_step(*v, false);
+                let (r_hi, b_hi) = self.feasible_step(*v, true);
+                if matches!(&r_lo, Some(r) if *r == DeltaRational::from_rational(Rational::zero()))
+                {
+                    if let Some(l) = b_lo {
+                        lits.push(l);
+                    }
                 }
-                if let Some((_, l)) = self.bounds.upper(*v) {
-                    lits.push(*l);
+                if matches!(&r_hi, Some(r) if *r == DeltaRational::from_rational(Rational::zero()))
+                {
+                    if let Some(l) = b_hi {
+                        lits.push(l);
+                    }
                 }
                 lits.sort_unstable_by_key(|l| l.code());
                 lits.dedup();
@@ -256,133 +268,217 @@ impl Arith {
         TCheck::Sat
     }
 
-    /// Try to move `var` off `rhs` while staying feasible. Returns true on success.
-    fn try_separate(&mut self, var: ArithVar, rhs: &DeltaRational) -> bool {
-        use crate::simplex::Below;
-        if !self.tableau.is_basic(var) {
-            // Nudge nonbasic toward whichever bound has slack.
-            if self.can_move(var, true) {
-                let target = self.slack_target(var, true, rhs);
-                self.update(var, target);
-                return self.value[var.index()] != *rhs;
+    /// Max feasible non-negative step magnitude for nonbasic `j` in direction `rise`,
+    /// bounded by j's own bounds AND by every basic's bounds via the ratio test.
+    /// Returns (room, binder): room=None → unbounded; room=Some(0) → blocked.
+    fn feasible_step(&self, j: ArithVar, rise: bool) -> (Option<DeltaRational>, Option<Lit>) {
+        let zero_dr = DeltaRational::from_rational(Rational::zero());
+        let mut room: Option<DeltaRational> = None;
+        let mut binder: Option<Lit> = None;
+
+        let cur = self.value[j.index()].clone();
+
+        // j's own bound in the direction of movement.
+        if rise {
+            if let Some((hi, l)) = self.bounds.upper(j) {
+                let candidate = hi.clone() - cur.clone();
+                let tighter = match &room {
+                    None => true,
+                    Some(r) => candidate < *r,
+                };
+                if tighter {
+                    room = Some(candidate);
+                    binder = Some(*l);
+                }
             }
-            if self.can_move(var, false) {
-                let target = self.slack_target(var, false, rhs);
-                self.update(var, target);
-                return self.value[var.index()] != *rhs;
+        } else if let Some((lo, l)) = self.bounds.lower(j) {
+            let candidate = cur.clone() - lo.clone();
+            let tighter = match &room {
+                None => true,
+                Some(r) => candidate < *r,
+            };
+            if tighter {
+                room = Some(candidate);
+                binder = Some(*l);
             }
-            return false;
         }
-        // Basic: find a movable nonbasic in its row and pivot var off rhs.
+
+        // Ratio test: for each basic b whose row has nonzero coefficient on j.
+        let basics: Vec<ArithVar> = self.tableau.basic.iter().copied().collect();
+        for b in basics {
+            let a = self.tableau.row(b).coeff(j);
+            if a.is_zero() {
+                continue;
+            }
+            // b moves up when (rise && a > 0) || (!rise && a < 0).
+            let b_rises = (rise && !a.is_negative()) || (!rise && a.is_negative());
+            let abs_a = if a.is_negative() {
+                -a.clone()
+            } else {
+                a.clone()
+            };
+            let inv_abs_a = abs_a.recip();
+            let cur_b = self.value[b.index()].clone();
+            let candidate = if b_rises {
+                match self.bounds.upper(b) {
+                    Some((hi_b, l)) => {
+                        let c = (hi_b.clone() - cur_b).scale(&inv_abs_a);
+                        Some((c, *l))
+                    }
+                    None => None,
+                }
+            } else {
+                match self.bounds.lower(b) {
+                    Some((lo_b, l)) => {
+                        let c = (cur_b - lo_b.clone()).scale(&inv_abs_a);
+                        Some((c, *l))
+                    }
+                    None => None,
+                }
+            };
+            if let Some((c, l)) = candidate {
+                let tighter = match &room {
+                    None => true,
+                    Some(r) => c < *r,
+                };
+                if tighter {
+                    room = Some(c);
+                    binder = Some(l);
+                }
+            }
+        }
+
+        // Ensure room is never a negative value (can happen if already OOB, which
+        // simplex should have ruled out, but guard defensively).
+        if let Some(ref r) = room {
+            if *r < zero_dr {
+                room = Some(zero_dr);
+            }
+        }
+
+        (room, binder)
+    }
+
+    /// Try to separate nonbasic/basic `var` off `rhs` with a ratio-test-bounded move
+    /// that avoids every disequality hyperplane.
+    /// Returns None on success (move applied), Some(pins) if forced (conflict evidence).
+    fn try_separate(
+        &mut self,
+        var: ArithVar,
+        _rhs: &DeltaRational,
+        diseqs_snap: &[(ArithVar, DeltaRational, Lit)],
+    ) -> Option<Vec<Lit>> {
+        let zero_dr = DeltaRational::from_rational(Rational::zero());
+
+        if !self.tableau.is_basic(var) {
+            let mut pins: Vec<Lit> = vec![];
+            for rise in [true, false] {
+                let (room, binder) = self.feasible_step(var, rise);
+                // Blocked if room == Some(0).
+                if matches!(&room, Some(r) if *r == zero_dr) {
+                    if let Some(b) = binder {
+                        pins.push(b);
+                    }
+                    continue;
+                }
+                // room is None (∞) or Some(positive): we can move.
+                let cap = room.unwrap_or_else(|| DeltaRational::from_rational(Rational::one()));
+                let sigma = if rise {
+                    Rational::one()
+                } else {
+                    -Rational::one()
+                };
+
+                // Compute forbidden Δ values (each diseq hyperplane that a move would land on).
+                let mut forbidden: Vec<DeltaRational> = vec![];
+                for (w, c_w, _) in diseqs_snap {
+                    let dwdv = if *w == var {
+                        Rational::one()
+                    } else if self.tableau.is_basic(*w) {
+                        self.tableau.row(*w).coeff(var)
+                    } else {
+                        Rational::zero()
+                    };
+                    if dwdv.is_zero() {
+                        continue;
+                    }
+                    let denom = dwdv * sigma.clone();
+                    let diff = c_w.clone() - self.value[w.index()].clone();
+                    let cand = diff.scale(&denom.recip());
+                    if cand > zero_dr && cand <= cap {
+                        forbidden.push(cand);
+                    }
+                }
+                forbidden.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let delta = match forbidden.first() {
+                    None => cap,
+                    Some(min_f) => min_f.scale(&Rational::new(1i128.into(), 2i128.into())),
+                };
+                let new_val = self.value[var.index()].clone() + delta.scale(&sigma);
+                self.update(var, new_val);
+                return None;
+            }
+            return Some(pins);
+        }
+
+        // Basic var: try pivoting via each nonbasic j in its row.
         let row_vars: Vec<ArithVar> = {
             let mut vs: Vec<ArithVar> = self.tableau.row(var).vars().collect();
             vs.sort();
             vs
         };
+        let mut pins: Vec<Lit> = vec![];
         for j in row_vars {
-            let a = self.tableau.row(var).coeff(j);
-            if a.is_zero() {
+            let a_vj = self.tableau.row(var).coeff(j);
+            if a_vj.is_zero() {
                 continue;
             }
-            if self.can_move(j, true) || self.can_move(j, false) {
-                // Move var to a feasible point strictly off rhs: aim at its own
-                // bound if finite-and-different, else a unit step in a free dir.
-                let dir = if self.bound_above(var, rhs) {
-                    Below::Lower
+            for rise in [true, false] {
+                let (room, binder) = self.feasible_step(j, rise);
+                if matches!(&room, Some(r) if *r == zero_dr) {
+                    if let Some(b) = binder {
+                        pins.push(b);
+                    }
+                    continue;
+                }
+                let cap = room.unwrap_or_else(|| DeltaRational::from_rational(Rational::one()));
+                let sigma = if rise {
+                    Rational::one()
                 } else {
-                    Below::Upper
+                    -Rational::one()
                 };
-                let target = self.separation_target(var, rhs, dir);
-                self.pivot_and_update(var, j, target);
-                return self.value[var.index()] != *rhs;
-            }
-        }
-        false
-    }
 
-    fn can_move(&self, v: ArithVar, rise: bool) -> bool {
-        if rise {
-            match self.bounds.upper(v) {
-                Some((hi, _)) => &self.value[v.index()] < hi,
-                None => true,
-            }
-        } else {
-            match self.bounds.lower(v) {
-                Some((lo, _)) => &self.value[v.index()] > lo,
-                None => true,
-            }
-        }
-    }
-
-    /// A feasible target for nonbasic `var` strictly away from `rhs`: step halfway
-    /// to the bounding side, or a unit step if that side is unbounded.
-    fn slack_target(&self, var: ArithVar, rise: bool, _rhs: &DeltaRational) -> DeltaRational {
-        let cur = self.value[var.index()].clone();
-        let unit = DeltaRational::from_rational(Rational::one());
-        if rise {
-            match self.bounds.upper(var) {
-                Some((hi, _)) => midpoint(&cur, hi),
-                None => cur + unit,
-            }
-        } else {
-            match self.bounds.lower(var) {
-                Some((lo, _)) => midpoint(&cur, lo),
-                None => cur - unit,
-            }
-        }
-    }
-
-    fn bound_above(&self, var: ArithVar, _rhs: &DeltaRational) -> bool {
-        // Prefer to push basic var DOWN toward its lower bound if it has one.
-        self.bounds.lower(var).is_some()
-    }
-
-    fn separation_target(
-        &self,
-        var: ArithVar,
-        rhs: &DeltaRational,
-        dir: crate::simplex::Below,
-    ) -> DeltaRational {
-        let cur = self.value[var.index()].clone();
-        let unit = DeltaRational::from_rational(Rational::one());
-        match dir {
-            crate::simplex::Below::Lower => match self.bounds.lower(var) {
-                Some((lo, _)) if lo != rhs => midpoint(lo, &cur),
-                _ => cur - unit,
-            },
-            crate::simplex::Below::Upper => match self.bounds.upper(var) {
-                Some((hi, _)) if hi != rhs => midpoint(&cur, hi),
-                _ => cur + unit,
-            },
-        }
-    }
-
-    /// The literals pinning `var` to a fixed value: its own coincident bounds, or
-    /// if basic, the pinning bounds of every nonbasic in its row (both sides,
-    /// since an equality pins both directions).
-    fn pinning_lits(&self, var: ArithVar) -> Vec<Lit> {
-        let mut out = Vec::new();
-        if !self.tableau.is_basic(var) {
-            if let Some((_, l)) = self.bounds.lower(var) {
-                out.push(*l);
-            }
-            if let Some((_, l)) = self.bounds.upper(var) {
-                out.push(*l);
-            }
-            return out;
-        }
-        for j in self.tableau.row(var).vars() {
-            if self.tableau.row(var).coeff(j).is_zero() {
-                continue;
-            }
-            if let Some((_, l)) = self.bounds.lower(j) {
-                out.push(*l);
-            }
-            if let Some((_, l)) = self.bounds.upper(j) {
-                out.push(*l);
+                // Forbidden Δ values: each diseq hyperplane relative to j's move.
+                let mut forbidden: Vec<DeltaRational> = vec![];
+                for (w, c_w, _) in diseqs_snap {
+                    let dwdj = if *w == j {
+                        Rational::one()
+                    } else if self.tableau.is_basic(*w) {
+                        self.tableau.row(*w).coeff(j)
+                    } else {
+                        Rational::zero()
+                    };
+                    if dwdj.is_zero() {
+                        continue;
+                    }
+                    let denom = dwdj * sigma.clone();
+                    let diff = c_w.clone() - self.value[w.index()].clone();
+                    let cand = diff.scale(&denom.recip());
+                    if cand > zero_dr && cand <= cap {
+                        forbidden.push(cand);
+                    }
+                }
+                forbidden.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let delta = match forbidden.first() {
+                    None => cap,
+                    Some(min_f) => min_f.scale(&Rational::new(1i128.into(), 2i128.into())),
+                };
+                let new_j_val = self.value[j.index()].clone() + delta.scale(&sigma);
+                self.update(j, new_j_val);
+                return None;
             }
         }
-        out
+        Some(pins)
     }
 
     fn farkas_conflict(&mut self, basic: ArithVar, dir: crate::simplex::Below) -> Vec<EqLeaf> {
@@ -748,6 +844,79 @@ mod diseq_tests {
         arith.new_var(&mut cx, Var::new(1), eq);
         arith.assert(&mut cx, Lit::new(Var::new(0), true));
         arith.assert(&mut cx, Lit::new(Var::new(1), false));
+        assert!(matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat));
+    }
+
+    // Regression: s=x+y basic with s∈[0,0], y∈[0,0], x≠0 → UNSAT (x is forced to 0).
+    // The unsound old code steps x to 1, breaking s's bounds, and returns Sat (false Sat).
+    #[test]
+    fn diseq_through_bounded_slack_is_unsat() {
+        let mut ctx = Context::new();
+        let x = rv(&mut ctx, "x");
+        let y = rv(&mut ctx, "y");
+        let real = ctx.real_sort();
+        let z0 = ctx.mk_numeral(Rational::zero(), real);
+        let xy = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        // s = x+y; s <= 0 (var 0), s >= 0 (var 1), y <= 0 (var 2), y >= 0 (var 3), x = 0 (var 4)
+        let sle = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xy, z0]).unwrap();
+        let sge = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[xy, z0]).unwrap();
+        let yle = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[y, z0]).unwrap();
+        let yge = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[y, z0]).unwrap();
+        let xeq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, z0]).unwrap();
+        let mut arith = Arith::default();
+        let mut e = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut e,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), sle);
+        arith.new_var(&mut cx, Var::new(1), sge);
+        arith.new_var(&mut cx, Var::new(2), yle);
+        arith.new_var(&mut cx, Var::new(3), yge);
+        arith.new_var(&mut cx, Var::new(4), xeq);
+        arith.assert(&mut cx, Lit::new(Var::new(0), true)); // x+y <= 0
+        arith.assert(&mut cx, Lit::new(Var::new(1), true)); // x+y >= 0
+        arith.assert(&mut cx, Lit::new(Var::new(2), true)); // y <= 0
+        arith.assert(&mut cx, Lit::new(Var::new(3), true)); // y >= 0
+        arith.assert(&mut cx, Lit::new(Var::new(4), false)); // x != 0
+        assert!(
+            matches!(arith.check(&mut cx, Effort::Full), TCheck::Conflict(_)),
+            "expected Conflict (x is forced to 0 by s∈[0,0] and y∈[0,0]) but got Sat"
+        );
+    }
+
+    // x∈[0,5], x≠0, x≠1 → SAT (step x to e.g. 1/2, avoiding both 0 and 1).
+    #[test]
+    fn multiple_diseqs_on_one_var_is_sat() {
+        let mut ctx = Context::new();
+        let x = rv(&mut ctx, "x");
+        let real = ctx.real_sort();
+        let z0 = ctx.mk_numeral(Rational::zero(), real);
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), real);
+        let one = ctx.mk_numeral(Rational::one(), real);
+        // var 0: x >= 0, var 1: x <= 5, var 2: x = 0, var 3: x = 1
+        let xge0 = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, z0]).unwrap();
+        let xle5 = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, five]).unwrap();
+        let xeq0 = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, z0]).unwrap();
+        let xeq1 = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, one]).unwrap();
+        let mut arith = Arith::default();
+        let mut e = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut e,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), xge0);
+        arith.new_var(&mut cx, Var::new(1), xle5);
+        arith.new_var(&mut cx, Var::new(2), xeq0);
+        arith.new_var(&mut cx, Var::new(3), xeq1);
+        arith.assert(&mut cx, Lit::new(Var::new(0), true)); // x >= 0
+        arith.assert(&mut cx, Lit::new(Var::new(1), true)); // x <= 5
+        arith.assert(&mut cx, Lit::new(Var::new(2), false)); // x != 0
+        arith.assert(&mut cx, Lit::new(Var::new(3), false)); // x != 1
         assert!(matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat));
     }
 }
