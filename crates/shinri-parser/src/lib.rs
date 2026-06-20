@@ -4,6 +4,7 @@ mod env;
 mod lexer;
 mod parser;
 mod print;
+mod stream;
 
 pub use env::{Env, Macro};
 pub use lexer::{Lexer, Span, Token};
