@@ -152,6 +152,73 @@ fn predicate_congruence_conflict() {
     assert!(conflict.is_some(), "p(a) ∧ ¬p(b) ∧ a=b must conflict");
 }
 
+/// I1 regression: predicate conflict detection must survive a push/pop.
+///
+/// The ⊤≠⊥ Definitional disequality must be installed at decision level 0 (when
+/// predicate atoms are REGISTERED via `new_var`), not lazily on the first
+/// predicate `assert`. If it were asserted lazily at level ≥1, a pop below that
+/// level would drop it, and the un-backtracked `EGraph.truth` cache would make
+/// `truth_nodes` early-return without re-asserting → ⊤=⊥ could later merge with
+/// no conflict (unsound). Here we assert the predicate atoms at level 1, pop back
+/// to level 0, then drive p(a) ∧ ¬p(b) ∧ a=b — the conflict must still fire.
+#[test]
+fn predicate_conflict_survives_push_pop() {
+    let mut ctx = Context::new();
+    let u = ctx.declare_sort("U");
+    let boolsort = ctx.bool_sort();
+    let a = uconst(&mut ctx, "a", u);
+    let b = uconst(&mut ctx, "b", u);
+    let p = ctx.declare_fun("p", &[u], boolsort);
+    let pa = ctx.mk_app(Op::Uninterpreted(p), &[a]).unwrap();
+    let pb = ctx.mk_app(Op::Uninterpreted(p), &[b]).unwrap();
+    let eq_ab = ctx.mk_eq(a, b).unwrap();
+
+    let t_true = ctx.mk_const_bool(true);
+    let t_false = ctx.mk_const_bool(false);
+
+    let mut eq = EqualityEngine::default();
+    let mut atoms = AtomRegistry::default();
+    let (vpa, vpb, vab) = (Var::new(0), Var::new(1), Var::new(2));
+    atoms.register(vpa, pa, shinri_theory::types::Owner::Euf);
+    atoms.register(vpb, pb, shinri_theory::types::Owner::Euf);
+    atoms.register(vab, eq_ab, shinri_theory::types::Owner::Euf);
+
+    let mut euf = Euf::default();
+    euf.set_truth_terms(t_true, t_false);
+    let mut cx = TheoryCtx {
+        terms: &ctx,
+        eq: &mut eq,
+        atoms: &atoms,
+    };
+    // Registration happens at level 0 — this installs ⊤≠⊥ at level 0 (the fix).
+    euf.new_var(&mut cx, vpa, pa);
+    euf.new_var(&mut cx, vpb, pb);
+    euf.new_var(&mut cx, vab, eq_ab);
+
+    // Decision level 1: assert the predicate atoms HERE. Pre-fix this is where
+    // ⊤≠⊥ would have been lazily installed, so the following pop would drop it.
+    euf.push();
+    cx.eq.push();
+    assert!(euf.assert(&mut cx, Lit::new(vpa, true)).is_none());
+    assert!(euf.assert(&mut cx, Lit::new(vpb, false)).is_none());
+
+    // Backtrack to level 0 (honor the drain-merges-before-pop contract).
+    let mut events = Vec::new();
+    cx.eq.drain_merges(&mut events);
+    euf.pop(0);
+    cx.eq.pop(0);
+
+    // Now drive the full conflict at level 0. With ⊤≠⊥ installed at level 0 it is
+    // still live; the congruence p(a)=p(b) then collides ⊤=⊥ → conflict.
+    assert!(euf.assert(&mut cx, Lit::new(vpa, true)).is_none());
+    assert!(euf.assert(&mut cx, Lit::new(vpb, false)).is_none());
+    let conflict = euf.assert(&mut cx, Lit::new(vab, true));
+    assert!(
+        conflict.is_some(),
+        "p(a) ∧ ¬p(b) ∧ a=b must still conflict after a push/pop (I1)"
+    );
+}
+
 /// a=c ∧ b=d ∧ g(a,b) ≠ g(c,d) is unsat (n-ary congruence).
 #[test]
 fn nary_congruence_conflict() {

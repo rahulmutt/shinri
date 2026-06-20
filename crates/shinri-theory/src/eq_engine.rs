@@ -33,12 +33,24 @@ struct DiseqRecord {
 enum DiseqUndo {
     /// A fresh key was inserted; remove it on undo.
     Insert((ENodeId, ENodeId)),
-    /// A key was re-keyed (from `old` to `new`) during a merge; restore `old`
-    /// (with the same record) and remove `new` on undo.
+    /// A key was re-keyed (from `old` to `new`) during a merge and `new` did
+    /// NOT previously exist; restore `old` (with the moved record) and remove
+    /// `new` on undo.
     Rekey {
         old: (ENodeId, ENodeId),
         new: (ENodeId, ENodeId),
         rec: DiseqRecord,
+    },
+    /// A key was re-keyed (from `old` to `new`) during a merge and `new` ALREADY
+    /// held a (distinct) live disequality that the re-key overwrote. To restore
+    /// the EXACT pre-merge map on undo we must re-insert BOTH the moved record at
+    /// `old` AND the displaced record at `new` (the latter would otherwise be
+    /// permanently lost — the C1 soundness bug).
+    RekeyOverwrite {
+        old: (ENodeId, ENodeId),
+        new: (ENodeId, ENodeId),
+        moved_rec: DiseqRecord,
+        displaced_rec: DiseqRecord,
     },
 }
 
@@ -186,13 +198,35 @@ impl EqualityEngine {
             let (ka, kb) = old_key;
             let new_a = if ka == child { root } else { ka };
             let new_b = if kb == child { root } else { kb };
+            // A self-key pair(root, root) would mean `child ≠ root` was stored
+            // (the other endpoint canonicalizes to `root`), i.e. we are uniting a
+            // known-disequal pair. That case is `pair(child, root) == pair(ra, rb)`
+            // and is already rejected by the early conflict check above before any
+            // re-keying happens, so it can never reach this loop.
+            debug_assert_ne!(
+                new_a, new_b,
+                "re-key to self-diseq must have been caught as a conflict"
+            );
             let new_key = Self::pair(new_a, new_b);
-            self.diseqs.insert(new_key, rec);
-            self.diseq_undo.record(DiseqUndo::Rekey {
-                old: old_key,
-                new: new_key,
-                rec,
-            });
+            match self.diseqs.insert(new_key, rec) {
+                // `new_key` was free: plain re-key, undo restores `old` and drops `new`.
+                None => self.diseq_undo.record(DiseqUndo::Rekey {
+                    old: old_key,
+                    new: new_key,
+                    rec,
+                }),
+                // `new_key` already held a DISTINCT live diseq (root's class was
+                // independently disequal from `new_key`'s other class). The two
+                // classes are still distinct (no self-key, asserted above), so this
+                // is a duplicate-but-distinct collision: keep BOTH records
+                // recoverable so undo restores the exact pre-merge map (C1 fix).
+                Some(displaced_rec) => self.diseq_undo.record(DiseqUndo::RekeyOverwrite {
+                    old: old_key,
+                    new: new_key,
+                    moved_rec: rec,
+                    displaced_rec,
+                }),
+            }
         }
         Ok(())
     }
@@ -358,6 +392,17 @@ impl EqualityEngine {
                 diseqs.remove(&new);
                 diseqs.insert(old, rec);
             }
+            DiseqUndo::RekeyOverwrite {
+                old,
+                new,
+                moved_rec,
+                displaced_rec,
+            } => {
+                // Restore the EXACT pre-merge map: the moved record returns to
+                // `old`, and the displaced (pre-existing) record returns to `new`.
+                diseqs.insert(old, moved_rec);
+                diseqs.insert(new, displaced_rec);
+            }
         });
         let fparent = &mut self.fparent;
         self.forest_undo.pop_to(level, |n| {
@@ -478,6 +523,65 @@ mod tests {
         eq.pop(0);
         // After backtrack the disequality is gone, so merge succeeds.
         assert!(eq.merge(a, b, asserted(51)).is_ok());
+    }
+
+    #[test]
+    fn rekey_collision_preserves_preexisting_diseq_across_backtrack() {
+        // C1 regression: a re-key key-collision must not permanently drop a
+        // pre-existing disequality on backtrack.
+        //
+        // Setup: a≠m and b≠m. push. merge a=b where a is the union child so its
+        // representative changes; this re-keys pair(a,m) -> pair(b,m), colliding
+        // with the pre-existing pair(b,m). pop. Then merging a's class with m must
+        // STILL conflict (the old code lost the b≠m record and wrongly returned Ok).
+        let mut eq = EqualityEngine::default();
+        let a = eq.intern(term(1));
+        let b = eq.intern(term(2));
+        let m = eq.intern(term(3));
+        // Pad b's class so that on merge(a,b) the larger class (b's) wins and `a`
+        // becomes the union child whose representative changes.
+        let b2 = eq.intern(term(4));
+        eq.merge(b, b2, asserted(1)).unwrap();
+        let mut drained = Vec::new();
+        eq.drain_merges(&mut drained);
+
+        eq.assert_diseq(a, m, asserted(2)).unwrap();
+        eq.assert_diseq(b, m, asserted(3)).unwrap();
+
+        eq.push(); // level 1
+                   // merge a=b: a's class (size 1) loses to b's class (size 2), so a is the
+                   // child and find(a) flips to b's representative, re-keying pair(a,m).
+        eq.merge(a, b, asserted(4)).unwrap();
+        assert_eq!(eq.find(a), eq.find(b));
+        let mut drained2 = Vec::new();
+        eq.drain_merges(&mut drained2); // honor drain-before-pop contract
+        eq.pop(0); // back to level 0: a and b distinct again
+
+        assert_ne!(eq.find(a), eq.find(b), "merge must be undone");
+        // The pre-existing b≠m must still be live: merging b's class with m conflicts.
+        assert!(
+            eq.merge(b, m, asserted(5)).is_err(),
+            "b≠m must survive the collision+backtrack (C1)"
+        );
+        // And a≠m must also still be live.
+        let mut eq2 = EqualityEngine::default();
+        let a = eq2.intern(term(1));
+        let b = eq2.intern(term(2));
+        let m = eq2.intern(term(3));
+        let b2 = eq2.intern(term(4));
+        eq2.merge(b, b2, asserted(1)).unwrap();
+        let mut d = Vec::new();
+        eq2.drain_merges(&mut d);
+        eq2.assert_diseq(a, m, asserted(2)).unwrap();
+        eq2.assert_diseq(b, m, asserted(3)).unwrap();
+        eq2.push();
+        eq2.merge(a, b, asserted(4)).unwrap();
+        eq2.drain_merges(&mut d);
+        eq2.pop(0);
+        assert!(
+            eq2.merge(a, m, asserted(6)).is_err(),
+            "a≠m must survive the collision+backtrack (C1)"
+        );
     }
 
     #[test]

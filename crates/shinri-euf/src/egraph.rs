@@ -201,7 +201,16 @@ impl EGraph {
         // Ensure the EGraph's use_list and is_app arrays cover these nodes.
         self.ensure_node(tn);
         self.ensure_node(fln);
-        let _ = cx.eq.assert_diseq(tn, fln, EqJust::Definitional);
+        // Fresh, distinct sentinels can never already be equal, so this cannot
+        // conflict — but don't silently drop the Result: if it ever did conflict,
+        // that signals a real soundness problem. (Always perform the assert, even
+        // in release builds; only the success check is debug-gated.)
+        let diseq_res = cx.eq.assert_diseq(tn, fln, EqJust::Definitional);
+        debug_assert!(
+            diseq_res.is_ok(),
+            "fresh ⊤/⊥ sentinels must not already be equal"
+        );
+        let _ = diseq_res;
         self.truth = Some((tn, fln));
         (tn, fln)
     }

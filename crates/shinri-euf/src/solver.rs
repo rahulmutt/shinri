@@ -40,6 +40,17 @@ impl TheorySolver for Euf {
             _ => {
                 // Predicate application (or any other EUF atom term).
                 self.inner.add_term(cx, atom);
+                // Register the ⊤/⊥ sentinels and the Definitional ⊤≠⊥ diseq NOW,
+                // at level 0 (registration always happens before solving). This
+                // guarantees ⊤≠⊥ is installed exactly once at decision level 0 and
+                // survives all backtracking — asserting it lazily inside `assert`
+                // would record its undo at whatever level the first predicate atom
+                // appears, letting a pop drop it (the I1 soundness bug). Only do so
+                // when the truth terms are available (standalone EUF sets them via
+                // `set_truth_terms`; the combiner registers atoms at level 0).
+                if let Some((t_true, t_false)) = self.truth_terms {
+                    self.inner.truth_nodes(cx, t_true, t_false);
+                }
             }
         }
     }
