@@ -174,7 +174,42 @@ impl Arith {
 
     fn build_model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
 
-    fn recompute_basic_values(&mut self) {}
+    fn recompute_basic_values(&mut self) {
+        // 1. Clamp nonbasic vars into restored bounds.
+        let n = self.vars.len();
+        for i in 0..n {
+            let v = ArithVar(i as u32);
+            if self.tableau.is_basic(v) {
+                continue;
+            }
+            if let Some((lo, _)) = self.bounds.lower(v).cloned() {
+                if self.value[i] < lo {
+                    self.value[i] = lo;
+                    continue;
+                }
+            }
+            if let Some((hi, _)) = self.bounds.upper(v).cloned() {
+                if self.value[i] > hi {
+                    self.value[i] = hi;
+                }
+            }
+        }
+        // 2. Recompute every basic var from its row.
+        // Collect (basic, [(j, coeff)]) pairs first to avoid holding a borrow on
+        // self.tableau while we also need to read/write self.value.
+        let basics: Vec<ArithVar> = self.tableau.basic.iter().copied().collect();
+        for b in basics {
+            let pairs: Vec<(ArithVar, Rational)> = {
+                let row = self.tableau.row(b);
+                row.vars().map(|j| (j, row.coeff(j))).collect()
+            };
+            let mut acc = DeltaRational::from_rational(Rational::zero());
+            for (j, a) in pairs {
+                acc = acc + self.value[j.index()].clone().scale(&a);
+            }
+            self.value[b.index()] = acc;
+        }
+    }
 }
 
 impl TheorySolver for Arith {
@@ -256,6 +291,47 @@ impl TheorySolver for Arith {
         self.diseqs.undo_to(level);
         self.recompute_basic_values();
         self.level = level;
+    }
+}
+
+#[cfg(test)]
+mod backtrack_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_num::Rational;
+    use shinri_theory::{AtomRegistry, EqualityEngine, TheoryCtx, TheorySolver};
+
+    fn real_var(ctx: &mut Context, name: &str) -> TermId {
+        let real = ctx.real_sort();
+        let s = ctx.declare_fun(name, &[], real);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    #[test]
+    fn assert_then_pop_is_consistent_again() {
+        // x <= 1 ; push ; x >= 2 (conflict at check) ; pop ; check sat
+        let mut ctx = Context::new();
+        let x = real_var(&mut ctx, "x");
+        let one = ctx.mk_numeral(Rational::one(), ctx.real_sort());
+        let two = ctx.mk_numeral(Rational::from_int(2i128.into()), ctx.real_sort());
+        let le1 = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, one]).unwrap();
+        let ge2 = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, two]).unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), le1);
+        arith.new_var(&mut cx, Var::new(1), ge2);
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.push();
+        // the >= 2 conflicts directly at assert here (single var), so just exercise pop:
+        let _ = arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        arith.pop(0);
+        assert!(matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat));
     }
 }
 
