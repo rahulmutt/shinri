@@ -1,7 +1,7 @@
-//! Differential QF_UFLRA harness vs an external z3 (spec §10). Inert until
-//! shinri-euf/shinri-arith provide concrete theories for `Combiner<Euf, Arith>`;
-//! until then there is no end-to-end solve to diff. Gated behind `--features
-//! oracle` and `#[ignore]` so CI does not require a z3 binary yet.
+//! The end-to-end differential oracle lives in `shinri-solver` (it needs the
+//! concrete `Euf` theory, which `shinri-theory` cannot depend on without
+//! inverting the crate graph). See `crates/shinri-solver/tests/oracle.rs`,
+//! run with `--features oracle` and a `z3` binary on PATH.
 
 #![cfg(feature = "oracle")]
 
