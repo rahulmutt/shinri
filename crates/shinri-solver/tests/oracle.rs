@@ -692,3 +692,223 @@ fn differential_qf_uflra() {
          (fence firing). This is worth investigating even though it is sound."
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// QF_LRA from-text differential oracle — closes the loop on the SMT-LIB
+// frontend by driving Parser + execute instead of hand-built API calls.
+//
+// The generator mirrors `differential_qf_lra_small` exactly (same structure,
+// different Lcg seed). Each iteration renders the instance to SMT-LIB 2 text,
+// runs it through `shinri_parser::Parser` + `solver.execute`, and compares the
+// verdict to z3 (fed the same constraints via easy-smt). Any sat/unsat
+// disagreement PANICs with the full text for reproduction.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Render an integer as an SMT-LIB 2 Real literal (decimal notation).
+/// Decimal literals have sort Real in SMT-LIB 2.6, avoiding sort-coercion
+/// issues when mixing with Real-sorted variables.
+fn smt2_real(n: i32) -> String {
+    if n >= 0 {
+        format!("{n}.0")
+    } else {
+        // SMT-LIB 2 negation of a decimal literal
+        format!("(- {}.0)", -n)
+    }
+}
+
+/// Render `coeff * var_name` as an SMT-LIB 2 Real term, or `None` if coeff == 0.
+/// Uses decimal coefficient literals so everything stays in the Real sort.
+/// Negative coefficients are rendered as `(- (* |c|.0 var))` rather than
+/// `(* (- |c|.0) var)` so the `Mul` node has only one non-constant child
+/// (the variable), which is correctly identified as linear by the solver's
+/// nonlinear-multiplication guard.
+fn smt2_real_coeff_times_var(coeff: i32, var: &str) -> Option<String> {
+    match coeff {
+        0 => None,
+        1 => Some(var.to_string()),
+        -1 => Some(format!("(- {var})")),
+        c if c > 0 => Some(format!("(* {c}.0 {var})")),
+        c => Some(format!("(- (* {}.0 {var}))", -c)),
+    }
+}
+
+/// Drive `Parser::new(src)` + `solver.execute` for each command.
+/// Returns `Some(true)` = sat, `Some(false)` = unsat, `None` = unknown / error.
+fn solve_text_qf_lra(src: &str) -> Option<bool> {
+    use shinri_parser::Parser;
+    use shinri_solver::{CommandResponse, Solver};
+
+    let mut solver = Solver::new();
+    let mut parser = Parser::new(src);
+    let mut verdict = None;
+    while let Some(Ok(cmd)) = parser.next_command(solver.ctx_mut()) {
+        match solver.execute(cmd) {
+            CommandResponse::Sat => verdict = Some(true),
+            CommandResponse::Unsat => verdict = Some(false),
+            CommandResponse::Unknown => return None,
+            _ => {}
+        }
+    }
+    verdict
+}
+
+#[test]
+fn differential_qf_lra_from_text() {
+    // Different seed from differential_qf_lra_small to keep corpora independent.
+    let mut rng = Lcg(0xF0_0D_CA_FE);
+
+    const N_VARS: usize = 3;
+    const N_ITERS: usize = 200;
+    let mut unknowns = 0usize;
+    let mut agreements = 0usize;
+
+    for iter in 0..N_ITERS {
+        // ── z3 setup (easy-smt) — builds the same constraints in lock-step ──
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .unwrap();
+        ctx.set_logic("QF_LRA").unwrap();
+        let z_real = ctx.atom("Real");
+        let z_vars: Vec<easy_smt::SExpr> = (0..N_VARS)
+            .map(|i| ctx.declare_const(format!("x{i}"), z_real).unwrap())
+            .collect();
+
+        // ── SMT-LIB 2 text builder (same instance, rendered as text) ────────
+        let mut text = String::new();
+        text.push_str("(set-logic QF_LRA)\n");
+        for i in 0..N_VARS {
+            text.push_str(&format!("(declare-fun x{i} () Real)\n"));
+        }
+
+        // Number of constraints — same formula as differential_qf_lra_small.
+        let n_constraints = 4 + rng.below(4) as usize; // 4..=7
+
+        for _c in 0..n_constraints {
+            // Pick relation.
+            let rel = match rng.below(6) {
+                0 => Rel::Le,
+                1 => Rel::Lt,
+                2 => Rel::Ge,
+                3 => Rel::Gt,
+                4 => Rel::Eq,
+                _ => Rel::Ne,
+            };
+
+            // Generate coefficients for each variable in -2..=2.
+            // If all are zero, force x0 to have coeff=1.
+            let mut coeffs: Vec<i32> = (0..N_VARS).map(|_| (rng.below(5) as i32) - 2).collect();
+            if coeffs.iter().all(|&c| c == 0) {
+                coeffs[0] = 1;
+            }
+
+            // RHS in -3..=3.
+            let rhs_val: i32 = (rng.below(7) as i32) - 3;
+
+            // ── Render LHS as SMT-LIB 2 text ─────────────────────────────────
+            let lhs_terms: Vec<String> = (0..N_VARS)
+                .filter_map(|i| smt2_real_coeff_times_var(coeffs[i], &format!("x{i}")))
+                .collect();
+            let lhs_text = if lhs_terms.len() == 1 {
+                lhs_terms[0].clone()
+            } else {
+                // left-fold: (+ (+ a b) c)
+                lhs_terms
+                    .into_iter()
+                    .reduce(|acc, t| format!("(+ {acc} {t})"))
+                    .unwrap()
+            };
+            let rhs_text = smt2_real(rhs_val);
+
+            let (rel_sym, is_ne) = match rel {
+                Rel::Le => ("<=", false),
+                Rel::Lt => ("<", false),
+                Rel::Ge => (">=", false),
+                Rel::Gt => (">", false),
+                Rel::Eq => ("=", false),
+                Rel::Ne => ("=", true), // rendered as (not (= ...))
+            };
+
+            let atom_text = if is_ne {
+                format!("(not ({rel_sym} {lhs_text} {rhs_text}))")
+            } else {
+                format!("({rel_sym} {lhs_text} {rhs_text})")
+            };
+            text.push_str(&format!("(assert {atom_text})\n"));
+
+            // ── z3: build same constraint in lock-step ────────────────────────
+            let z_terms: Vec<easy_smt::SExpr> = (0..N_VARS)
+                .filter_map(|i| z_coeff_times_var(&ctx, coeffs[i], z_vars[i]))
+                .collect();
+            let z_lhs = if z_terms.len() == 1 {
+                z_terms[0]
+            } else {
+                z_terms
+                    .into_iter()
+                    .reduce(|acc, t| ctx.plus(acc, t))
+                    .unwrap()
+            };
+            let z_rhs = z_int(&ctx, rhs_val);
+            let z_atom = match rel {
+                Rel::Le => ctx.lte(z_lhs, z_rhs),
+                Rel::Lt => ctx.lt(z_lhs, z_rhs),
+                Rel::Ge => ctx.gte(z_lhs, z_rhs),
+                Rel::Gt => ctx.gt(z_lhs, z_rhs),
+                Rel::Eq => ctx.eq(z_lhs, z_rhs),
+                Rel::Ne => {
+                    let eq = ctx.eq(z_lhs, z_rhs);
+                    ctx.not(eq)
+                }
+            };
+            ctx.assert(z_atom).unwrap();
+        }
+
+        text.push_str("(check-sat)\n");
+
+        // ── Run our parser+solver on the text ───────────────────────────────
+        let ours = solve_text_qf_lra(&text);
+
+        // ── Run z3 on the same constraints ──────────────────────────────────
+        let z3_resp = ctx.check().unwrap();
+        let theirs = match z3_resp {
+            easy_smt::Response::Sat => Some(true),
+            easy_smt::Response::Unsat => Some(false),
+            easy_smt::Response::Unknown => None,
+        };
+
+        match (ours, theirs) {
+            (None, _) => {
+                unknowns += 1; // Our Unknown is never a failure — skip
+            }
+            (Some(o), Some(t)) if o == t => {
+                agreements += 1;
+            }
+            (Some(o), Some(t)) => {
+                panic!(
+                    "FROM-TEXT SOUNDNESS DISAGREEMENT (iter {iter}): \
+                     shinri={o} z3={t}\nReproduce with this instance:\n{text}"
+                );
+            }
+            (Some(o), None) => {
+                // z3 said Unknown — we can't verify; count as unknown/skip
+                let _ = o;
+                unknowns += 1;
+            }
+        }
+    }
+
+    println!(
+        "differential_qf_lra_from_text: {N_ITERS} instances, \
+         {agreements} agreements, {unknowns} skipped (Unknown), 0 disagreements"
+    );
+
+    assert!(
+        agreements > 0,
+        "No agreements reached — either z3 is absent or the generator is broken"
+    );
+    assert_eq!(
+        unknowns, 0,
+        "Got {unknowns} Unknown results in QF_LRA from-text oracle — \
+         this indicates a parser translation bug or a spurious fence"
+    );
+}
