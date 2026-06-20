@@ -1,0 +1,19 @@
+[package]
+name = "shinri-solver"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+shinri-core = { path = "../shinri-core" }
+shinri-sat = { path = "../shinri-sat" }
+shinri-theory = { path = "../shinri-theory" }
+shinri-euf = { path = "../shinri-euf" }
+rustc-hash = "2"
+
+[dev-dependencies]
+easy-smt = "0.2"
+
+[features]
+# Differential oracle harness (Task 17); off by default; needs `z3` on PATH.
+oracle = []
