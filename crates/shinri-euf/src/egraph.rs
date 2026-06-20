@@ -53,7 +53,6 @@ pub struct EGraph {
     undo: shinri_core::UndoLog<Undo>,
     /// Set when an interned term is a function application (vs a plain leaf).
     is_app: Vec<bool>,
-    app_of: FxHashMap<ENodeId, AppId>,
     /// Cached ⊤/⊥ sentinel e-nodes (interned once, distinct by Definitional diseq).
     truth: Option<(ENodeId, ENodeId)>,
     /// Every registered term in insertion order (one entry per distinct TermId).
@@ -158,7 +157,6 @@ impl EGraph {
                     args: arg_nodes,
                 });
                 self.is_app[node.index()] = true;
-                self.app_of.insert(node, app_id);
                 // Initial signature; a collision means an existing congruent app.
                 let sig = self.signature(cx.eq, app_id);
                 if let Some(&other) = self.lookup.get(&sig) {

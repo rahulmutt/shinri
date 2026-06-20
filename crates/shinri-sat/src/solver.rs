@@ -136,6 +136,9 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         self.theory.push();
     }
 
+    /// Closes `n` incremental scopes. Assumes the solver is at decision level 0
+    /// (unlike `push`, this does not call `backtrack_to(0)`; callers must ensure
+    /// solves have completed and the trail is already unwound to level 0).
     pub fn pop(&mut self, n: usize) {
         for _ in 0..n {
             if let Some(mark) = self.scopes.pop() {

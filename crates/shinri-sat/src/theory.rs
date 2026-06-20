@@ -16,7 +16,9 @@ pub trait Theory: Default {
     fn check(&mut self, effort: Effort) -> TheoryResult;
     /// Open a backtracking scope (one per SAT decision level).
     fn push(&mut self);
-    /// Close `n` scopes (on backtrack).
+    /// Close `n` scopes (on backtrack). Note: variable registrations made via
+    /// `new_var` are permanent and are NOT undone by `pop` — theory-preserving
+    /// rebuild relies on this invariant.
     fn pop(&mut self, n: usize);
     /// A new variable was allocated.
     fn new_var(&mut self, v: Var);
