@@ -303,7 +303,7 @@ dependencies = [
 
 [[package]]
 name = "shinri-euf"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "proptest",
  "rustc-hash",
@@ -329,6 +329,18 @@ dependencies = [
  "proptest",
  "shinri-core",
  "splr",
+]
+
+[[package]]
+name = "shinri-solver"
+version = "0.1.0"
+dependencies = [
+ "easy-smt",
+ "rustc-hash",
+ "shinri-core",
+ "shinri-euf",
+ "shinri-sat",
+ "shinri-theory",
 ]
 
 [[package]]
