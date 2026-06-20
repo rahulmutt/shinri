@@ -57,7 +57,8 @@ stdin/file/flag plumbing to a separate small effort.
 
 ## 3. Crate Layout & Dependency Graph
 
-One new neutral crate and one new parser crate; one existing crate edited.
+One new neutral crate and one new parser crate; two existing crates edited
+(`shinri-solver` for the driver glue, `shinri-num` for a decimal constructor).
 
 ```
 shinri-core ← shinri-frontend ← shinri-parser
@@ -97,15 +98,39 @@ src/print.rs    # minimal term/command printer (for the round-trip property test
   Produced here, consumed by the driver/CLI. **Not** in the neutral crate (the
   solver never names it).
 
-### 3.3 `shinri-solver` (edited — the only change outside the new crates)
+### 3.3 `shinri-solver` (edited — driver glue)
 
 - Add `ctx_mut(&mut self) -> &mut Context`.
-- Add `execute(&mut self, cmd: Command) -> Option<CommandResponse>` that matches
-  on the IR and calls existing methods (`assert`, `check_sat`, `push`, `pop`,
-  `get_model`, `get_value`, …). `CommandResponse` (or direct stdout writing) is
-  solver-side; `SolveOutcome` / `Model` stay in `shinri-solver` (the parser
-  never names them).
+- Add `execute(&mut self, cmd: Command) -> CommandResponse` that matches on the
+  IR and calls existing methods (`assert`, `check_sat`, `push`, `pop`,
+  `get_model`, `get_value`, …) and **returns a response value** — the driver
+  formats it to stdout (resolved decision §11.4: response-values, not direct
+  stdout, for testability and CLI-controlled output). `CommandResponse` is a
+  solver-side enum:
+
+  ```rust
+  enum CommandResponse {
+      None,                         // declarations, set-option, push/pop, …
+      Sat, Unsat, Unknown,          // check-sat / check-sat-assuming
+      Model(Model),                 // get-model
+      Values(Vec<(TermId, ModelVal)>), // get-value
+      Error(String),                // unsupported / runtime (e.g. get-unsat-core)
+  }
+  ```
+
+  `SolveOutcome` / `Model` stay in `shinri-solver` (the parser never names them).
+  Formatting `Model` / `ModelVal` as SMT-LIB s-expressions
+  (`((define-fun …))`, `((t v))`) is new solver-side output code.
 - Add a `shinri-frontend` dependency.
+
+### 3.4 `shinri-num` (edited — decimal constructor)
+
+Add `Integer::from_str_radix(s: &str, radix: u32) -> Result<Integer, _>` (Horner:
+`acc = acc * radix + digit`) so the parser can build arbitrary-magnitude integer
+literals, not just those fitting `i128`. Covered by the existing `num-bigint`
+differential oracle (design §7.4). This is the resolved home for numeric
+string→`Integer` conversion (it belongs in the bignum crate, where it is
+oracle-tested, rather than in the parser).
 
 ---
 
@@ -127,7 +152,7 @@ to parser-internal handling.
 | `push n` / `pop n` | `Push(u32)` / `Pop(u32)` (default n = 1) |
 | `get-model` | `GetModel` |
 | `get-value (t…)` | `GetValue(Vec<TermId>)` |
-| `get-unsat-core` | `GetUnsatCore` |
+| `get-unsat-core` | `GetUnsatCore` — **deferred this milestone**: `execute` returns `Error("unsupported")` (the solver has no core extraction yet); becomes its own focused effort |
 | `set-option` / `set-info` | `SetOption{ kw, val }` / parser-internal record; unknown keys accepted silently per SMT-LIB |
 | `get-info` / `echo` / `reset` / `exit` | `GetInfo{kw}` / `Echo(String)` / `Reset` / `Exit` |
 
@@ -220,9 +245,10 @@ fun → built-in op. At a leaf: let-bound → declared const → numeral/decimal
 `mk_app` performs the sort check and returns `Result<TermId, SortError>`; the
 parser converts a `SortError` into a `Diagnostic`.
 
-- **Numerals / decimals:** `42` → `Integer::from_str_radix(s, 10)`
-  *(integration point: confirm the exact `shinri-num` constructor while
-  implementing)* → `Rational::from_int`. `1.5` → `3/2`. Both → `mk_numeral`.
+- **Numerals / decimals:** `42` → `Integer::from_str_radix(s, 10)` (new
+  constructor, §3.4) → `Rational::from_int`. `1.5` → numer/denom from the
+  fractional digits → `Rational::new(15, 10)` (normalizes to `3/2`). Both →
+  `mk_numeral`. Magnitude is unbounded (not capped at `i128`).
 - **Int/Real coercion:** SMT-LIB requires literal-context typing. Phase-1 rule:
   an integer literal adopts `Real` when the surrounding operator or declared
   sort demands it, else `Int`. A genuine mismatch that cannot coerce →
@@ -301,16 +327,23 @@ benchmark text, and leaves a clean seam for the follow-on `shinri-cli` binary
 
 ---
 
-## Appendix — Open Integration Points (resolve while implementing)
+## Appendix — Integration Points (resolved)
 
-1. **`shinri-num` numeral constructor:** exact API to build an `Integer` from a
-   decimal string (`from_str_radix` vs limb construction) and a `Rational` from
-   a decimal — confirm against the real crate.
-2. **`Rational` operator ergonomics:** `recip`, `&a * &b` vs `a * b` for the
-   `/`-folding and linear-division rewrites.
-3. **`Solver` capability wiring:** whether `get-unsat-core` is available yet; if
-   not, `execute` returns `(error "unsupported")` rather than blocking the
-   milestone.
-4. **`CommandResponse` vs direct stdout:** whether `execute` returns a response
-   value the driver prints, or writes competition output itself. Pick one while
-   implementing the solver edit; the parser is unaffected either way.
+All four points raised during brainstorming are resolved; recorded here so the
+plan inherits a decision-complete spec.
+
+1. **Numeral construction → add `Integer::from_str_radix` to `shinri-num`**
+   (§3.4). `Integer` currently has only `From<i128>` + arithmetic; a decimal
+   constructor is the clean, oracle-tested home for unbounded literals. Decimals
+   build via `Rational::new(numer, 10^k)` (auto-normalized).
+2. **`Rational` ergonomics — resolved, no change needed.** `recip()`
+   (rational.rs:130) and by-value `Add/Sub/Mul/Neg` exist; the `/`-fold is
+   `c1 * c2.recip()` and linear division is `mk_app(Mul, [numeral(c.recip()),
+   x])`. Clone operands as the by-value ops require.
+3. **`get-unsat-core` — deferred this milestone.** The solver has no core
+   extraction (`check_sat`/`get_model`/`get_value` exist and work; `get_model`/
+   `get_value` are wired). `execute(GetUnsatCore)` → `Error("unsupported")`.
+   Core extraction is its own follow-on effort.
+4. **`execute` returns `CommandResponse` values** (§3.3), driver formats to
+   stdout — chosen over direct stdout writing for testability and
+   CLI-controlled output.
