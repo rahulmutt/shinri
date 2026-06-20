@@ -444,6 +444,29 @@ mod check_tests {
     fn infeasible_system_is_unsat() {
         assert!(!setup(true));
     }
+
+    #[test]
+    fn sat_requiring_a_pivot() {
+        // x + y >= 2, no upper bounds: infeasible at the all-zero start (slack s=0 < 2),
+        // so check_full MUST pivot to reach a feasible assignment (e.g. x=2, y=0).
+        let mut ctx = Context::new();
+        let x = real_var(&mut ctx, "x");
+        let y = real_var(&mut ctx, "y");
+        let xy = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let two = num(&mut ctx, 2);
+        let ge = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[xy, two]).unwrap(); // x+y >= 2
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), ge);
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        assert!(matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat));
+    }
 }
 
 #[cfg(test)]
