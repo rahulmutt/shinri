@@ -232,16 +232,21 @@ impl Solver {
             // saw_shared: an atom mixes arith and non-arith sorts in one equality
             // (requires purification not yet implemented) → Unknown.
             //
-            // saw_euf_nonreal && saw_arith: there are EUF atoms on a purely
-            // uninterpreted sort (e.g. sort U) AND arith atoms on Real/Int.
-            // Without N-O equality propagation from arith to EUF, combining these
-            // two theories unsoundly. Fence to Unknown.
-            //
-            // NOTE: EUF atoms on Real/Int sorts (e.g. (= x:Real y:Real)) are NOT
-            // fenced — they're paired with companion Le/Ge arith atoms emitted by
-            // lower(), giving both theories the constraint. This is QF_UFLRA: EUF
-            // handles congruence (f(x)=f(y) when x=y), Arith handles linear bounds.
-            mixed = enc.saw_shared || (enc.saw_euf_nonreal && enc.saw_arith);
+            // The former `saw_euf_nonreal && saw_arith` fence (EUF atoms on a
+            // purely uninterpreted sort AND arith atoms on Real/Int) is REMOVED
+            // (Task 12b): bidirectional Nelson-Oppen equality propagation now
+            // exchanges entailed equalities between Arith and EUF over shared
+            // Real terms (Combiner::drive_final_check). The two soundness cases:
+            //   * variable-disjoint EUF(sort U) + Arith (e.g. `(= p:U q:U) ∧
+            //     (> x 0)`) is trivially combinable → handled directly;
+            //   * shared-Real cases (`x≥5 ∧ x≤5 ∧ distinct(f x)(f 5)`) are caught
+            //     by N-O (LRA + EUF are convex ⇒ entailed-equality exchange is
+            //     sound AND complete for QF_UFLRA).
+            // Genuinely unsupported constructs (nonlinear, Int arith, quantifiers,
+            // mixed-sort equalities) remain fenced via classify→Unsupported and
+            // `saw_shared`. (`saw_arith`/`saw_euf`/`saw_euf_nonreal` are retained
+            // as classification signals but no longer gate the result.)
+            mixed = enc.saw_shared;
         }
 
         if refused || mixed {

@@ -303,11 +303,23 @@ impl Arith {
     /// Mint a fresh synthetic sentinel literal for an entailment probe. Lives in
     /// the reserved top-half var space so it can never equal an input lit (R2).
     fn fresh_sentinel(&mut self) -> Lit {
+        // The sentinel region [SENTINEL_VAR_BASE, u32::MAX] must not be exhausted
+        // (would collide with another sentinel or wrap into real-var space).
+        debug_assert!(
+            self.next_sentinel < u32::MAX - SENTINEL_VAR_BASE,
+            "N-O sentinel var region exhausted"
+        );
         let raw = SENTINEL_VAR_BASE + self.next_sentinel;
         self.next_sentinel += 1;
         Lit::new(Var::new(raw), true)
     }
 
+    /// Whether `lit` is a synthetic N-O probe/interface sentinel (vs a real
+    /// input literal). INVARIANT (12a finding): real SAT vars are dense from 0
+    /// and the SAT solver never mints one in the reserved top-half region, so
+    /// real vars stay strictly `< SENTINEL_VAR_BASE` (= 1<<30) and only
+    /// synthetic sentinels live at/above it. `fresh_sentinel` debug-asserts it
+    /// never wraps out of that region.
     #[inline]
     fn is_sentinel(lit: Lit) -> bool {
         lit.var().index() as u32 >= SENTINEL_VAR_BASE
@@ -637,6 +649,30 @@ impl TheorySolver for Arith {
 
     fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
         self.build_model(cx, m) // Task 13
+    }
+
+    // ----- Nelson-Oppen seam (Task 12b): delegate to the inherent core ------
+
+    fn ensure_shared_var(&mut self, cx: &mut TheoryCtx, t: TermId) {
+        Arith::ensure_shared_var(self, cx.terms, t);
+    }
+
+    fn entailed_equalities(
+        &mut self,
+        cx: &mut TheoryCtx,
+        shared: &[TermId],
+    ) -> Vec<(TermId, TermId, u32)> {
+        Arith::entailed_equalities(self, cx.terms, shared)
+    }
+
+    fn consume_interface_equality(
+        &mut self,
+        cx: &mut TheoryCtx,
+        a: TermId,
+        b: TermId,
+        just: TheoryJust,
+    ) -> Option<Vec<EqLeaf>> {
+        Arith::assert_interface_equality(self, cx.terms, a, b, just)
     }
 
     fn push(&mut self) {

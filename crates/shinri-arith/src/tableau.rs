@@ -132,6 +132,13 @@ impl Tableau {
         let mut acc: FxHashMap<ArithVar, Rational> = FxHashMap::default();
         for (v, c) in &comb.0 {
             if self.basic.contains(v) {
+                // A var in `basic` MUST have a row (the two sets are maintained
+                // in lockstep); guard the index so a desync surfaces loudly in
+                // debug builds rather than panicking opaquely (12a finding).
+                debug_assert!(
+                    self.rows.contains_key(v),
+                    "basic comb var lacks a tableau row (basic/rows desync)"
+                );
                 let row = &self.rows[v];
                 for j in row.vars() {
                     let add = c.clone() * row.coeff(j);

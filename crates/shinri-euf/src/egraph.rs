@@ -355,6 +355,19 @@ impl EGraph {
         self.prop_records[tag as usize]
     }
 
+    /// Mint an explanation tag for an arbitrary currently-equal pair `(a, b)`
+    /// (used for EUF→arith interface equalities). The tag resolves through the
+    /// SAME `prop_record`/`explain` path as a forced propagation: `explain(tag)`
+    /// will call `eq.explain(a, b, …)`, expanding `a = b` to its input-literal
+    /// antecedents over the live proof forest. SOUND because, at the time a
+    /// conflict citing this tag is resolved, the proof forest still connects
+    /// `a` and `b` (the equality holds at the conflict's decision level).
+    pub fn record_interface_pair(&mut self, a: ENodeId, b: ENodeId) -> u32 {
+        let tag = self.prop_records.len() as u32;
+        self.prop_records.push((a, b));
+        tag
+    }
+
     /// Build a SOUND, SUFFICIENT conflict clause for a violated disequality.
     ///
     /// When `merge` or `merge_congruence` returns `Err`, the proof forest does

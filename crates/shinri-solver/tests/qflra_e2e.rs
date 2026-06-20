@@ -141,9 +141,15 @@ fn nary_real_equality_is_transitive() {
     assert_eq!(s.check_sat(), SolveOutcome::Unsat);
 }
 
-/// 7. Mixed UF + LRA → Unknown (fence)
+/// 7. Variable-disjoint UF + LRA → Sat (fence removed in Task 12b).
+///
+/// `(= p:U q:U) ∧ (> x:Real 0)` shares NO terms between EUF (sort U) and Arith
+/// (Real). Both halves are independently satisfiable (p=q in EUF, x>0 in arith)
+/// and disjoint ⇒ the combination is Sat. The former `saw_euf_nonreal &&
+/// saw_arith` fence over-approximated this to Unknown; bidirectional N-O makes
+/// the combination sound, so it now returns Sat. (Was `mixed_uf_lra_is_unknown`.)
 #[test]
-fn mixed_uf_lra_is_unknown() {
+fn disjoint_uf_lra_is_sat() {
     let mut s = Solver::new();
     // Uninterpreted sort U with consts p, q
     let u = s.declare_sort("U");
@@ -157,5 +163,5 @@ fn mixed_uf_lra_is_unknown() {
     let gt0 = s.app(Op::Builtin(BuiltinOp::Gt), &[x, zero]);
     s.assert(pq);
     s.assert(gt0);
-    assert_eq!(s.check_sat(), SolveOutcome::Unknown);
+    assert_eq!(s.check_sat(), SolveOutcome::Sat);
 }

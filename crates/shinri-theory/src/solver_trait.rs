@@ -41,6 +41,56 @@ pub trait TheorySolver: Default {
     fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder);
     fn push(&mut self);
     fn pop(&mut self, level: usize);
+
+    // ----- Nelson-Oppen equality-exchange seam (Task 12b) -------------------
+    // Default no-op implementations so a theory that does not participate in a
+    // given direction (or the unit-test stubs) need not implement them.
+
+    /// The set of shared Real-sorted TermIds this theory reasons about. EUF
+    /// returns its registered Real terms; arith returns none (the combiner
+    /// drives the set FROM the EUF side). Used to compute the N-O shared set S.
+    fn shared_real_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
+        Vec::new()
+    }
+
+    /// Ensure this theory has a variable for the shared Real term `t` (arith
+    /// interns a problem var; numerals get an unconditional fixed bound). Called
+    /// for every term in S BEFORE the arith check that reads entailed equalities.
+    fn ensure_shared_var(&mut self, _cx: &mut TheoryCtx, _t: TermId) {}
+
+    /// Right after a Sat Full check: the equalities this theory ENTAILS among
+    /// `shared`, each with an explanation tag resolvable via `explain`. Leaves
+    /// this theory's state UNPERTURBED. (Arith implements; EUF returns none.)
+    fn entailed_equalities(
+        &mut self,
+        _cx: &mut TheoryCtx,
+        _shared: &[TermId],
+    ) -> Vec<(TermId, TermId, u32)> {
+        Vec::new()
+    }
+
+    /// Install `a = b` (derived by ANOTHER theory) into this theory and close
+    /// its own reasoning. EUF merges the e-nodes and closes congruence; arith
+    /// installs fixed bounds. Returns conflict leaves if it makes this theory
+    /// infeasible. `just` lets a resulting conflict be explained back.
+    fn consume_interface_equality(
+        &mut self,
+        _cx: &mut TheoryCtx,
+        _a: TermId,
+        _b: TermId,
+        _just: TheoryJust,
+    ) -> Option<Vec<EqLeaf>> {
+        None
+    }
+
+    /// Mint an explanation tag (resolvable via THIS theory's `explain`) for a
+    /// pair `(a, b)` this theory has made equal — so when the OTHER theory cites
+    /// the resulting interface equality in a conflict, it resolves back to this
+    /// theory's input-literal antecedents. EUF mints from its proof forest;
+    /// arith does not export EUF-derived equalities so the default is unused.
+    fn mint_eq_tag(&mut self, _cx: &mut TheoryCtx, _a: TermId, _b: TermId) -> u32 {
+        0
+    }
 }
 
 #[cfg(test)]
