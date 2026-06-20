@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/shinri-num", "crates/shinri-core", "crates/shinri-sat", "crates/shinri-theory", "crates/shinri-euf", "crates/shinri-solver", "crates/shinri-arith"]
+members = ["crates/shinri-num", "crates/shinri-core", "crates/shinri-frontend", "crates/shinri-sat", "crates/shinri-theory", "crates/shinri-euf", "crates/shinri-solver", "crates/shinri-arith"]
 
 [workspace.package]
 edition = "2021"
