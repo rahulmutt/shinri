@@ -43,9 +43,11 @@ pub struct Arith {
     enc: Vec<Option<AtomEncoding>>,
     level: usize,
     /// Antecedents of entailed-equality tags produced by `entailed_equalities`
-    /// (the stripped union of the two probes' Farkas cores). Looked up by
-    /// `explain`. Tags are cleared on `pop` (see `tag_trail`).
-    eq_antecedents: FxHashMap<u32, Vec<Lit>>,
+    /// (the resolved union of the two probes' Farkas cores). Each leaf is either
+    /// an input bound literal (`EqLeaf::Asserted`) or an interface dependency
+    /// (`EqLeaf::Interface`) that the Combiner expands recursively via the owning
+    /// theory's `explain` (CRITICAL-1). Looked up by `explain`; cleared on `pop`.
+    eq_antecedents: FxHashMap<u32, Vec<EqLeaf>>,
     /// (decision level, tag) so `pop(level)` can drop tags created at higher
     /// levels (R5 backtrack safety).
     tag_trail: Vec<(usize, u32)>,
@@ -436,10 +438,14 @@ impl Arith {
             self.bounds.mark();
 
             // Both directions infeasible ⇒ u = v entailed (R3 sufficient).
-            let mut antecedent = core_pos;
-            antecedent.extend(core_neg);
-            antecedent.sort_unstable_by_key(|l| l.code());
-            antecedent.dedup();
+            // Antecedent = union of the two probes' resolved cores (input bound
+            // lits + interface deps). Dedup preserving order; cores are tiny.
+            let mut antecedent: Vec<EqLeaf> = Vec::new();
+            for leaf in core_pos.into_iter().chain(core_neg) {
+                if !antecedent.contains(&leaf) {
+                    antecedent.push(leaf);
+                }
+            }
             let tag = self.next_tag;
             self.next_tag += 1;
             self.eq_antecedents.insert(tag, antecedent);
@@ -459,12 +465,21 @@ impl Arith {
     }
 
     /// Run ONE entailment probe: inject the synthetic strict bound on slack `s`
-    /// under a sentinel lit, run `check_full`, and return the conflict core with
-    /// the sentinel(s) STRIPPED (R2) — or `None` if the probe is feasible (so
-    /// the pair is not entailed). Handles BOTH the immediate-crossing
-    /// (`tighten` Conflict) path and the Farkas (`check_full` Conflict) path.
+    /// under a fresh probe sentinel lit, run `check_full`, and return the
+    /// conflict core as `EqLeaf`s — or `None` if the probe is feasible (so the
+    /// pair is not entailed). Handles BOTH the immediate-crossing (`tighten`
+    /// Conflict) path and the Farkas (`check_full` Conflict) path.
+    ///
+    /// CRITICAL-1: the probe's OWN injected strict bound rides under a fresh
+    /// sentinel which we STRIP (R2 — it is not an input literal). But an EUF→arith
+    /// interface bound (installed by `assert_interface_equality`) also rides under
+    /// a sentinel pseudo-lit that is NOT an input literal yet IS a real dependency:
+    /// it must be RESOLVED to `EqLeaf::Interface(just)`, not silently dropped.
+    /// `resolve_iface_leaves` does exactly this split: interface pseudo-lits (in
+    /// `iface_lit`) → `Interface`; every other sentinel (incl. this probe's own
+    /// and a numeral-pin Definitional sentinel) → dropped; input lits → `Asserted`.
     /// Does NOT restore state; the caller restores afterward.
-    fn probe(&mut self, s: ArithVar, kind: BoundKind, val: DeltaRational) -> Option<Vec<Lit>> {
+    fn probe(&mut self, s: ArithVar, kind: BoundKind, val: DeltaRational) -> Option<Vec<EqLeaf>> {
         let sentinel = self.fresh_sentinel();
         match self.bounds.tighten(s, kind, val, sentinel) {
             TightenResult::Redundant => {
@@ -473,25 +488,13 @@ impl Arith {
                 None
             }
             TightenResult::Conflict { other } => {
-                // Immediate crossing: antecedent = {sentinel, other} \ sentinels.
-                let core: Vec<Lit> = [sentinel, other]
-                    .into_iter()
-                    .filter(|l| !Self::is_sentinel(*l))
-                    .collect();
-                Some(core)
+                // Immediate crossing: antecedent = resolve({sentinel, other}).
+                let leaves = vec![EqLeaf::Asserted(sentinel), EqLeaf::Asserted(other)];
+                Some(self.resolve_iface_leaves(leaves))
             }
             TightenResult::Tightened => match self.check_full() {
                 TCheck::Sat => None,
-                TCheck::Conflict(leaves) => {
-                    let core: Vec<Lit> = leaves
-                        .into_iter()
-                        .filter_map(|leaf| match leaf {
-                            EqLeaf::Asserted(l) if !Self::is_sentinel(l) => Some(l),
-                            _ => None,
-                        })
-                        .collect();
-                    Some(core)
-                }
+                TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
             },
         }
     }
@@ -626,16 +629,18 @@ impl TheorySolver for Arith {
 
     fn explain(&mut self, _cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
         // A tag produced by `entailed_equalities`: push its stored antecedent
-        // input lits (the stripped union of the two probes' Farkas cores) as
-        // `EqLeaf::Asserted`. Sentinel/Definitional bounds were already stripped
-        // when the antecedent was built, so none can appear here (R2).
-        if let Some(lits) = self.eq_antecedents.get(&tag) {
-            for &l in lits {
+        // leaves (the resolved union of the two probes' Farkas cores). Each is
+        // either an input bound literal (`Asserted`) or an interface dependency
+        // (`Interface`) the Combiner expands recursively via the owning theory's
+        // `explain` (CRITICAL-1). Probe sentinels and numeral-pin Definitional
+        // bounds were already stripped/resolved when the antecedent was built.
+        if let Some(leaves) = self.eq_antecedents.get(&tag) {
+            for &leaf in leaves {
                 debug_assert!(
-                    !Self::is_sentinel(l),
+                    !matches!(leaf, EqLeaf::Asserted(l) if Self::is_sentinel(l)),
                     "entailed-equality antecedent must not cite a synthetic sentinel lit"
                 );
-                exp.push_leaf(EqLeaf::Asserted(l));
+                exp.push_leaf(leaf);
             }
             return;
         }
@@ -1246,6 +1251,96 @@ mod nelson_oppen_tests {
         );
         // And its tag bookkeeping was cleared.
         assert!(h.arith.iface_justs.is_empty());
+    }
+
+    // ----- Test 10 (CRITICAL-1 regression): an entailed-equality antecedent
+    // that rests on an EUF→arith interface bound MUST retain the interface dep
+    // (as EqLeaf::Interface) AND cite the real input bound lits — not strip the
+    // interface (under-cite → unsound nogood) nor cite a non-input companion.
+    #[test]
+    fn entailed_eq_antecedent_retains_interface_dependency() {
+        // fa - w >= 0  (L0) ;  w - fb >= 0  (L1) ;  interface fa = fb.
+        // Then w = fa is entailed: w <= fa (from L0) and w >= fb = fa (L1 + iface).
+        // The antecedent for w=fa MUST include Interface(fa=fb) and the input
+        // lits L0, L1.
+        let mut h = Harness::new();
+        let fa = real_var(&mut h.ctx, "fa");
+        let fb = real_var(&mut h.ctx, "fb");
+        let w = real_var(&mut h.ctx, "w");
+        let zero = num(&mut h.ctx, 0);
+        // fa - w >= 0
+        let faw = h.ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[fa, w]).unwrap();
+        let ge0 = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[faw, zero])
+            .unwrap();
+        // w - fb >= 0
+        let wfb = h.ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[w, fb]).unwrap();
+        let ge1 = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[wfb, zero])
+            .unwrap();
+        h.assert_atom(0, ge0); // L0
+        h.assert_atom(1, ge1); // L1
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        for v in [fa, fb, w] {
+            h.arith.ensure_shared_var(&ctx, v);
+        }
+        // Install the EUF→arith interface equality fa = fb.
+        let iface = TheoryJust { theory: 1, tag: 99 };
+        assert!(
+            h.arith
+                .assert_interface_equality(&ctx, fa, fb, iface)
+                .is_none(),
+            "fa=fb is consistent with fa-w>=0 ∧ w-fb>=0"
+        );
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+        // Now w = fa must be entailed.
+        let pairs = h.arith.entailed_equalities(&ctx, &[fa, fb, w]);
+        let wfa = pairs
+            .iter()
+            .find(|(a, b, _)| {
+                let (lo, hi) = (a.index().min(b.index()), a.index().max(b.index()));
+                (lo, hi) == (w.index().min(fa.index()), w.index().max(fa.index()))
+            })
+            .expect("w = fa must be entailed");
+        let tag = wfa.2;
+        // Drive explain: the antecedent must contain Interface(fa=fb) AND the
+        // input lits L0,L1 (resolution of Interface happens in the Combiner).
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        let mut exp = Explainer::default();
+        h.arith.explain(&mut cx, tag, &mut exp);
+        assert!(
+            exp.pending.contains(&iface),
+            "antecedent MUST retain the interface dependency fa=fb, got pending={:?} lits={:?}",
+            exp.pending,
+            exp.lits
+        );
+        let lits: std::collections::BTreeSet<u32> = exp.lits.iter().map(|l| l.code()).collect();
+        assert!(
+            lits.contains(&Lit::new(Var::new(0), true).code()),
+            "must cite L0 (fa-w>=0), got {:?}",
+            exp.lits
+        );
+        assert!(
+            lits.contains(&Lit::new(Var::new(1), true).code()),
+            "must cite L1 (w-fb>=0), got {:?}",
+            exp.lits
+        );
+        for l in &exp.lits {
+            assert!(
+                (l.var().index() as u32) < SENTINEL_VAR_BASE,
+                "must NOT cite a synthetic sentinel lit, got {:?}",
+                l
+            );
+        }
     }
 
     // sanity: numeral fixed bound itself doesn't break feasibility check.

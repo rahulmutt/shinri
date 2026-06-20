@@ -91,6 +91,15 @@ pub trait TheorySolver: Default {
     fn mint_eq_tag(&mut self, _cx: &mut TheoryCtx, _a: TermId, _b: TermId) -> u32 {
         0
     }
+
+    /// Intern every Real-sorted UF-application subterm of an ARITH atom `atom`
+    /// into THIS theory so congruence applies and they join the shared set S
+    /// (CRITICAL-2). A UF-app used directly inside a linear arith term (e.g.
+    /// `(- (f x0) (f x1))`) is otherwise opaque to EUF, so the EUF-derived
+    /// equality between the f-apps never reaches arith (and dually). Recursive
+    /// over nesting so `f(g(x))` interns `g(x)` and `f(g(x))` both. EUF
+    /// implements; arith (and stubs) default to a no-op.
+    fn register_arith_uf_terms(&mut self, _cx: &mut TheoryCtx, _atom: TermId) {}
 }
 
 #[cfg(test)]

@@ -76,6 +76,10 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                     atoms: &self.atoms,
                 };
                 self.arith.new_var(&mut cx, v, atom);
+                // CRITICAL-2: a UF-application used directly as an operand of a
+                // linear arith atom (e.g. `(- (f x0) (f x1))`) must be interned
+                // into EUF so congruence applies and it joins the shared set S.
+                self.euf.register_arith_uf_terms(&mut cx, atom);
             }
             Owner::Shared => {
                 // Purify first: splits mixed terms, emitting defining equalities
@@ -98,6 +102,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                 };
                 self.euf.new_var(&mut cx, v, atom);
                 self.arith.new_var(&mut cx, v, atom);
+                self.euf.register_arith_uf_terms(&mut cx, atom);
             }
         }
         Ok(())
