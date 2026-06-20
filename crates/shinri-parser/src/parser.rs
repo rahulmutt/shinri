@@ -63,6 +63,24 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Build a parser over `src` seeded with an existing resolution `env`.
+    /// Used by `StreamingParser` to parse one command slice at a time while
+    /// keeping declarations alive across commands.
+    pub(crate) fn with_env(src: &'a str, env: Env) -> Self {
+        Parser {
+            lx: Lexer::new(src),
+            peeked: None,
+            env,
+            eof: src.len(),
+            stopped: false,
+        }
+    }
+
+    /// Recover the resolution environment after parsing a command slice.
+    pub(crate) fn into_env(self) -> Env {
+        self.env
+    }
+
     #[allow(dead_code)]
     fn peek(&mut self) -> Option<&(Result<Token, ()>, Span)> {
         if self.peeked.is_none() {
