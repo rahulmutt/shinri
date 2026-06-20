@@ -23,11 +23,22 @@ impl Euf {
 impl TheorySolver for Euf {
     const THEORY_ID: u16 = 1;
 
-    fn new_var(&mut self, cx: &mut TheoryCtx, _v: Var, atom: TermId) {
+    fn new_var(&mut self, cx: &mut TheoryCtx, v: Var, atom: TermId) {
         use shinri_core::{BuiltinOp, Op, TermNode};
         match cx.terms.term_node(atom) {
             TermNode::App {
-                op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct),
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } => {
+                let args_slice = *args;
+                let kids: Vec<shinri_core::TermId> = cx.terms.children(args_slice).to_vec();
+                let a = self.inner.add_term(cx, kids[0]);
+                let b = self.inner.add_term(cx, kids[1]);
+                self.inner.register_eq_atom(v.index() as u32, a, b);
+            }
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Distinct),
                 args,
                 ..
             } => {
@@ -106,15 +117,33 @@ impl TheorySolver for Euf {
     }
     fn propagate(
         &mut self,
-        _cx: &mut TheoryCtx,
-        _out: &mut Vec<(Lit, TheoryJust)>,
+        cx: &mut TheoryCtx,
+        out: &mut Vec<(Lit, TheoryJust)>,
     ) -> Option<Vec<EqLeaf>> {
+        let props = self.inner.collect_eq_propagations(cx.eq);
+        for (vi, tag) in props {
+            let lit = Lit::new(Var::new(vi), true);
+            out.push((
+                lit,
+                TheoryJust {
+                    theory: Self::THEORY_ID,
+                    tag,
+                },
+            ));
+        }
         None
     }
     fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
         TCheck::Sat
     }
-    fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {}
+    fn explain(&mut self, cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
+        let (a, b) = self.inner.prop_record(tag);
+        let mut leaves = Vec::new();
+        cx.eq.explain(a, b, &mut leaves);
+        for leaf in leaves {
+            exp.push_leaf(leaf);
+        }
+    }
     fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
         use rustc_hash::FxHashMap;
         use shinri_theory::types::ModelVal;

@@ -60,6 +60,12 @@ pub struct EGraph {
     terms: Vec<(TermId, ENodeId)>,
     /// Guard to ensure each TermId is recorded in `terms` exactly once.
     seen_terms: FxHashSet<TermId>,
+    /// Registered equality atoms: (var index, a_node, b_node).
+    eq_atoms: Vec<(u32, ENodeId, ENodeId)>,
+    /// Propagation explanation records: tag -> (a_node, b_node).
+    prop_records: Vec<(ENodeId, ENodeId)>,
+    /// Vars already propagated (avoid re-emitting), append-only within a solve.
+    propagated: rustc_hash::FxHashSet<u32>,
 }
 
 impl EGraph {
@@ -323,6 +329,32 @@ impl EGraph {
             loser: loser.index(),
             count,
         });
+    }
+
+    /// Register an equality atom for propagation scanning.
+    pub fn register_eq_atom(&mut self, var_index: u32, a: ENodeId, b: ENodeId) {
+        self.eq_atoms.push((var_index, a, b));
+    }
+
+    /// Emit forced-equality propagations. Returns the (lit-var, tag) pairs.
+    pub fn collect_eq_propagations(&mut self, eq: &EqualityEngine) -> Vec<(u32, u32)> {
+        let mut out = Vec::new();
+        for &(vi, a, b) in &self.eq_atoms {
+            if self.propagated.contains(&vi) {
+                continue;
+            }
+            if eq.are_equal(a, b) {
+                let tag = self.prop_records.len() as u32;
+                self.prop_records.push((a, b));
+                self.propagated.insert(vi);
+                out.push((vi, tag));
+            }
+        }
+        out
+    }
+
+    pub fn prop_record(&self, tag: u32) -> (ENodeId, ENodeId) {
+        self.prop_records[tag as usize]
     }
 
     /// Build a SOUND, SUFFICIENT conflict clause for a violated disequality.

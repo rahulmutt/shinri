@@ -295,6 +295,47 @@ fn model_assigns_equal_terms_the_same_element() {
     assert!(matches!(m.get(a), Some(ModelVal::Elem(_, _))));
 }
 
+/// With x=y asserted and a registered atom (x = y'), where y' is merged to y,
+/// EUF propagates that atom true with an explainable justification.
+#[test]
+fn propagates_forced_equality_with_explanation() {
+    use shinri_core::TheoryJust;
+    let mut ctx = Context::new();
+    let u = ctx.declare_sort("U");
+    let x = uconst(&mut ctx, "x", u);
+    let y = uconst(&mut ctx, "y", u);
+    let eq_xy = ctx.mk_eq(x, y).unwrap();
+    let eq_xy2 = ctx.mk_eq(y, x).unwrap(); // a second, distinct atom over the same pair
+
+    let mut eq = EqualityEngine::default();
+    let mut atoms = AtomRegistry::default();
+    let (v0, v1) = (Var::new(0), Var::new(1));
+    atoms.register(v0, eq_xy, shinri_theory::types::Owner::Euf);
+    atoms.register(v1, eq_xy2, shinri_theory::types::Owner::Euf);
+
+    let mut euf = Euf::default();
+    let mut cx = TheoryCtx {
+        terms: &ctx,
+        eq: &mut eq,
+        atoms: &atoms,
+    };
+    euf.new_var(&mut cx, v0, eq_xy);
+    euf.new_var(&mut cx, v1, eq_xy2);
+    assert!(euf.assert(&mut cx, Lit::new(v0, true)).is_none());
+
+    let mut out: Vec<(Lit, TheoryJust)> = Vec::new();
+    assert!(euf.propagate(&mut cx, &mut out).is_none());
+    assert!(
+        out.iter().any(|(l, _)| l.var() == v1 && l.is_positive()),
+        "x=y entails the (y=x) atom"
+    );
+    // The justification is explainable to the original asserted literal.
+    let (_, just) = *out.iter().find(|(l, _)| l.var() == v1).unwrap();
+    let mut exp = shinri_theory::Explainer::default();
+    euf.explain(&mut cx, just.tag, &mut exp);
+    assert!(exp.lits.contains(&Lit::new(v0, true)));
+}
+
 /// a=c ∧ b=d ∧ g(a,b) ≠ g(c,d) is unsat (n-ary congruence).
 #[test]
 fn nary_congruence_conflict() {
