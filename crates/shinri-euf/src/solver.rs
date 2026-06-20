@@ -118,8 +118,10 @@ impl TheorySolver for Euf {
     fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
     fn push(&mut self) {
         self.level += 1;
+        self.inner.push();
     }
     fn pop(&mut self, level: usize) {
+        self.inner.pop(level);
         self.level = level;
     }
 }

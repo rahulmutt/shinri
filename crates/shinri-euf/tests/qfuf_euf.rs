@@ -219,6 +219,52 @@ fn predicate_conflict_survives_push_pop() {
     );
 }
 
+/// After asserting x=y (forcing f(x)=f(y)) then popping, f(x) and f(y) are
+/// independent again: asserting f(x)≠f(y) no longer conflicts.
+#[test]
+fn pop_undoes_congruence_merge() {
+    let mut ctx = Context::new();
+    let u = ctx.declare_sort("U");
+    let x = uconst(&mut ctx, "x", u);
+    let y = uconst(&mut ctx, "y", u);
+    let f = ctx.declare_fun("f", &[u], u);
+    let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+    let fy = ctx.mk_app(Op::Uninterpreted(f), &[y]).unwrap();
+    let eq_xy = ctx.mk_eq(x, y).unwrap();
+    let eq_ff = ctx.mk_eq(fx, fy).unwrap();
+
+    let mut eq = EqualityEngine::default();
+    let mut atoms = AtomRegistry::default();
+    let (vxy, vff) = (Var::new(0), Var::new(1));
+    atoms.register(vxy, eq_xy, shinri_theory::types::Owner::Euf);
+    atoms.register(vff, eq_ff, shinri_theory::types::Owner::Euf);
+
+    let mut euf = Euf::default();
+    let mut cx = TheoryCtx {
+        terms: &ctx,
+        eq: &mut eq,
+        atoms: &atoms,
+    };
+    euf.new_var(&mut cx, vxy, eq_xy);
+    euf.new_var(&mut cx, vff, eq_ff);
+
+    // level 1: assert x=y
+    cx.eq.push();
+    euf.push();
+    assert!(euf.assert(&mut cx, Lit::new(vxy, true)).is_none());
+    let mut events = Vec::new();
+    cx.eq.drain_merges(&mut events); // honor the engine's drain-before-pop contract
+                                     // pop back to level 0
+    cx.eq.pop(0);
+    euf.pop(0);
+
+    // Now f(x) and f(y) must be independent again.
+    assert!(euf.assert(&mut cx, Lit::new(vff, false)).is_none());
+    let conflict = euf.assert(&mut cx, Lit::new(vxy, true));
+    // x=y again forces f(x)=f(y), contradicting the fresh f(x)≠f(y): conflict.
+    assert!(conflict.is_some());
+}
+
 /// a=c ∧ b=d ∧ g(a,b) ≠ g(c,d) is unsat (n-ary congruence).
 #[test]
 fn nary_congruence_conflict() {

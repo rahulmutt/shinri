@@ -21,7 +21,6 @@ struct AppNode {
 }
 
 /// An undo entry for backtracking the EUF-owned indices.
-#[allow(dead_code)] // fields read in EGraph backtrack logic (Task 8+)
 enum Undo {
     /// `lookup[sig]` was inserted with no prior value; remove it on undo.
     LookupInsert(Signature),
@@ -63,6 +62,37 @@ impl EGraph {
     #[allow(dead_code)] // used in unit tests; not yet called by solver (Task 8+)
     pub fn app_count(&self) -> usize {
         self.apps.len()
+    }
+
+    pub fn push(&mut self) {
+        self.undo.push_level();
+    }
+
+    pub fn pop(&mut self, level: usize) {
+        let lookup = &mut self.lookup;
+        let use_list = &mut self.use_list;
+        self.undo.pop_to(level, |u| match u {
+            Undo::LookupInsert(sig) => {
+                lookup.remove(&sig);
+            }
+            Undo::LookupOverwrite(sig, prev) => {
+                lookup.insert(sig, prev);
+            }
+            Undo::UseSplice {
+                winner,
+                loser,
+                count,
+            } => {
+                debug_assert!(use_list[winner].len() >= count, "use-splice underflow");
+                let total = use_list[winner].len();
+                let moved = use_list[winner].split_off(total - count);
+                debug_assert!(
+                    use_list[loser].is_empty(),
+                    "loser use-list not empty on undo"
+                );
+                use_list[loser] = moved;
+            }
+        });
     }
 
     fn ensure_node(&mut self, n: ENodeId) {
