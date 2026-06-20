@@ -23,6 +23,11 @@ use shinri_num::{DeltaRational, Rational};
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Effort, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
+fn midpoint(a: &DeltaRational, b: &DeltaRational) -> DeltaRational {
+    let half = Rational::new(1i128.into(), 2i128.into());
+    a.clone() + (b.clone() - a.clone()).scale(&half)
+}
+
 #[derive(Default)]
 pub struct Arith {
     vars: VarStore,
@@ -208,7 +213,176 @@ impl Arith {
     }
 
     fn repair_diseqs(&mut self) -> TCheck {
+        const MAX_ROUNDS: usize = 64;
+        for _ in 0..MAX_ROUNDS {
+            // Find a violated diseq: value[var] == rhs.
+            let mut hit: Option<(ArithVar, DeltaRational, Lit)> = None;
+            for (v, rhs, lit) in self.diseqs.iter() {
+                if &self.value[v.index()] == rhs {
+                    hit = Some((*v, rhs.clone(), *lit));
+                    break;
+                }
+            }
+            let Some((var, rhs, dlit)) = hit else {
+                return TCheck::Sat; // no diseq violated
+            };
+            if self.try_separate(var, &rhs) {
+                continue; // re-scan after the shift
+            }
+            // var is fixed at rhs -> conflict.
+            let mut lits = vec![dlit];
+            lits.extend(self.pinning_lits(var));
+            lits.sort_unstable_by_key(|l| l.code());
+            lits.dedup();
+            return TCheck::Conflict(lits.into_iter().map(EqLeaf::Asserted).collect());
+        }
+        // Hit the round cap: re-scan; if still violated, report conflict for the
+        // first one (sound: we never claim Sat with a violated diseq).
+        for (v, rhs, dlit) in self.diseqs.iter() {
+            if &self.value[v.index()] == rhs {
+                let mut lits = vec![*dlit];
+                // Conservative: cite the var's own bounds if present.
+                if let Some((_, l)) = self.bounds.lower(*v) {
+                    lits.push(*l);
+                }
+                if let Some((_, l)) = self.bounds.upper(*v) {
+                    lits.push(*l);
+                }
+                lits.sort_unstable_by_key(|l| l.code());
+                lits.dedup();
+                return TCheck::Conflict(lits.into_iter().map(EqLeaf::Asserted).collect());
+            }
+        }
         TCheck::Sat
+    }
+
+    /// Try to move `var` off `rhs` while staying feasible. Returns true on success.
+    fn try_separate(&mut self, var: ArithVar, rhs: &DeltaRational) -> bool {
+        use crate::simplex::Below;
+        if !self.tableau.is_basic(var) {
+            // Nudge nonbasic toward whichever bound has slack.
+            if self.can_move(var, true) {
+                let target = self.slack_target(var, true, rhs);
+                self.update(var, target);
+                return self.value[var.index()] != *rhs;
+            }
+            if self.can_move(var, false) {
+                let target = self.slack_target(var, false, rhs);
+                self.update(var, target);
+                return self.value[var.index()] != *rhs;
+            }
+            return false;
+        }
+        // Basic: find a movable nonbasic in its row and pivot var off rhs.
+        let row_vars: Vec<ArithVar> = {
+            let mut vs: Vec<ArithVar> = self.tableau.row(var).vars().collect();
+            vs.sort();
+            vs
+        };
+        for j in row_vars {
+            let a = self.tableau.row(var).coeff(j);
+            if a.is_zero() {
+                continue;
+            }
+            if self.can_move(j, true) || self.can_move(j, false) {
+                // Move var to a feasible point strictly off rhs: aim at its own
+                // bound if finite-and-different, else a unit step in a free dir.
+                let dir = if self.bound_above(var, rhs) {
+                    Below::Lower
+                } else {
+                    Below::Upper
+                };
+                let target = self.separation_target(var, rhs, dir);
+                self.pivot_and_update(var, j, target);
+                return self.value[var.index()] != *rhs;
+            }
+        }
+        false
+    }
+
+    fn can_move(&self, v: ArithVar, rise: bool) -> bool {
+        if rise {
+            match self.bounds.upper(v) {
+                Some((hi, _)) => &self.value[v.index()] < hi,
+                None => true,
+            }
+        } else {
+            match self.bounds.lower(v) {
+                Some((lo, _)) => &self.value[v.index()] > lo,
+                None => true,
+            }
+        }
+    }
+
+    /// A feasible target for nonbasic `var` strictly away from `rhs`: step halfway
+    /// to the bounding side, or a unit step if that side is unbounded.
+    fn slack_target(&self, var: ArithVar, rise: bool, _rhs: &DeltaRational) -> DeltaRational {
+        let cur = self.value[var.index()].clone();
+        let unit = DeltaRational::from_rational(Rational::one());
+        if rise {
+            match self.bounds.upper(var) {
+                Some((hi, _)) => midpoint(&cur, hi),
+                None => cur + unit,
+            }
+        } else {
+            match self.bounds.lower(var) {
+                Some((lo, _)) => midpoint(&cur, lo),
+                None => cur - unit,
+            }
+        }
+    }
+
+    fn bound_above(&self, var: ArithVar, _rhs: &DeltaRational) -> bool {
+        // Prefer to push basic var DOWN toward its lower bound if it has one.
+        self.bounds.lower(var).is_some()
+    }
+
+    fn separation_target(
+        &self,
+        var: ArithVar,
+        rhs: &DeltaRational,
+        dir: crate::simplex::Below,
+    ) -> DeltaRational {
+        let cur = self.value[var.index()].clone();
+        let unit = DeltaRational::from_rational(Rational::one());
+        match dir {
+            crate::simplex::Below::Lower => match self.bounds.lower(var) {
+                Some((lo, _)) if lo != rhs => midpoint(lo, &cur),
+                _ => cur - unit,
+            },
+            crate::simplex::Below::Upper => match self.bounds.upper(var) {
+                Some((hi, _)) if hi != rhs => midpoint(&cur, hi),
+                _ => cur + unit,
+            },
+        }
+    }
+
+    /// The literals pinning `var` to a fixed value: its own coincident bounds, or
+    /// if basic, the pinning bounds of every nonbasic in its row (both sides,
+    /// since an equality pins both directions).
+    fn pinning_lits(&self, var: ArithVar) -> Vec<Lit> {
+        let mut out = Vec::new();
+        if !self.tableau.is_basic(var) {
+            if let Some((_, l)) = self.bounds.lower(var) {
+                out.push(*l);
+            }
+            if let Some((_, l)) = self.bounds.upper(var) {
+                out.push(*l);
+            }
+            return out;
+        }
+        for j in self.tableau.row(var).vars() {
+            if self.tableau.row(var).coeff(j).is_zero() {
+                continue;
+            }
+            if let Some((_, l)) = self.bounds.lower(j) {
+                out.push(*l);
+            }
+            if let Some((_, l)) = self.bounds.upper(j) {
+                out.push(*l);
+            }
+        }
+        out
     }
 
     fn farkas_conflict(&mut self, basic: ArithVar, dir: crate::simplex::Below) -> Vec<EqLeaf> {
@@ -508,6 +682,72 @@ mod check_tests {
         };
         arith.new_var(&mut cx, Var::new(0), ge);
         arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        assert!(matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat));
+    }
+}
+
+#[cfg(test)]
+mod diseq_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_num::Rational;
+    use shinri_theory::{AtomRegistry, EqualityEngine, TheoryCtx, TheorySolver};
+
+    fn rv(ctx: &mut Context, n: &str) -> TermId {
+        let real = ctx.real_sort();
+        let s = ctx.declare_fun(n, &[], real);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    // x = 0 forced by 0<=x<=0, plus x != 0  -> UNSAT
+    #[test]
+    fn forced_equality_violating_diseq_is_unsat() {
+        let mut ctx = Context::new();
+        let x = rv(&mut ctx, "x");
+        let z = ctx.mk_numeral(Rational::zero(), ctx.real_sort());
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, z]).unwrap(); // x<=0
+        let ge = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, z]).unwrap(); // x>=0
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, z]).unwrap(); // x=0
+        let mut arith = Arith::default();
+        let mut e = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut e,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), le);
+        arith.new_var(&mut cx, Var::new(1), ge);
+        arith.new_var(&mut cx, Var::new(2), eq);
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        arith.assert(&mut cx, Lit::new(Var::new(2), false)); // x != 0
+        assert!(matches!(
+            arith.check(&mut cx, Effort::Full),
+            TCheck::Conflict(_)
+        ));
+    }
+
+    // x>=0, x!=0 is SAT (x can be > 0).
+    #[test]
+    fn separable_diseq_is_sat() {
+        let mut ctx = Context::new();
+        let x = rv(&mut ctx, "x");
+        let z = ctx.mk_numeral(Rational::zero(), ctx.real_sort());
+        let ge = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, z]).unwrap();
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, z]).unwrap();
+        let mut arith = Arith::default();
+        let mut e = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut e,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), ge);
+        arith.new_var(&mut cx, Var::new(1), eq);
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), false));
         assert!(matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat));
     }
 }
