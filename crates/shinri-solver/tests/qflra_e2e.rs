@@ -118,6 +118,29 @@ fn distinct_reals_unsat() {
     assert_eq!(s.check_sat(), SolveOutcome::Unsat);
 }
 
+/// 8. N-ary real equality soundness: (= x y z) AND (not (= x z)) → Unsat
+///
+/// Pre-fix: the rewrite truncated (= x y z) to (and (Le x y)(Ge x y)),
+/// dropping z entirely, leaving z free → wrongly returned Sat.
+/// Post-fix: all adjacent pairs are chained, so x==y and y==z are both
+/// asserted, forcing x==z, which contradicts (not (= x z)) → Unsat.
+#[test]
+fn nary_real_equality_is_transitive() {
+    let mut s = Solver::new();
+    let r = s.real_sort();
+    let x = s.declare_const("x", r);
+    let y = s.declare_const("y", r);
+    let z = s.declare_const("z", r);
+    // (= x y z)  — n-ary equality; the bug dropped z
+    let eq3 = s.app(Op::Builtin(BuiltinOp::Eq), &[x, y, z]);
+    // (not (= x z))
+    let xz = s.eq(x, z);
+    let nxz = s.app(Op::Builtin(BuiltinOp::Not), &[xz]);
+    s.assert(eq3);
+    s.assert(nxz);
+    assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+}
+
 /// 7. Mixed UF + LRA → Unknown (fence)
 #[test]
 fn mixed_uf_lra_is_unknown() {

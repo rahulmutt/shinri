@@ -188,16 +188,24 @@ impl Solver {
                 // Only rewrite arithmetic (Real-sorted) equalities; leave
                 // EUF/Bool equalities for the theory encoder.
                 if kids.len() >= 2 && self.ctx.sort_of(kids[0]) == self.ctx.real_sort() {
-                    let le = self
-                        .ctx
-                        .mk_app(Op::Builtin(BuiltinOp::Le), &[kids[0], kids[1]])
-                        .expect("Le well-sorted");
-                    let ge = self
-                        .ctx
-                        .mk_app(Op::Builtin(BuiltinOp::Ge), &[kids[0], kids[1]])
-                        .expect("Ge well-sorted");
+                    // Real-sorted (= a b c ...) : a == b == c == ...
+                    // Chain adjacent pairs: (Le a b)∧(Ge a b) ∧ (Le b c)∧(Ge b c) ∧ ...
+                    // Transitivity makes this equivalent to all-equal.
+                    let mut conj: Vec<TermId> = Vec::with_capacity((kids.len() - 1) * 2);
+                    for w in kids.windows(2) {
+                        let le = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Le), &[w[0], w[1]])
+                            .expect("Le well-sorted");
+                        let ge = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Ge), &[w[0], w[1]])
+                            .expect("Ge well-sorted");
+                        conj.push(le);
+                        conj.push(ge);
+                    }
                     self.ctx
-                        .mk_app(Op::Builtin(BuiltinOp::And), &[le, ge])
+                        .mk_app(Op::Builtin(BuiltinOp::And), &conj)
                         .expect("and well-sorted")
                 } else {
                     t
