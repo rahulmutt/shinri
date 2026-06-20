@@ -165,4 +165,35 @@ mod tests {
         b.undo_to(0);
         assert_eq!(b.upper(av(0)).unwrap().0, dr(10));
     }
+
+    #[test]
+    fn undo_removes_a_freshly_installed_bound() {
+        let mut b = Bounds::default();
+        b.ensure(1);
+        // No prior bound on av(0).
+        b.mark();
+        assert_eq!(
+            b.tighten(av(0), BoundKind::Lower, dr(7), lit(1)),
+            TightenResult::Tightened
+        );
+        assert!(b.lower(av(0)).is_some());
+        b.undo_to(0);
+        // The bound was installed with prev=None, so undo must restore it to None.
+        assert!(b.lower(av(0)).is_none());
+    }
+
+    #[test]
+    fn tighten_detects_crossing_conflict_other_direction() {
+        let mut b = Bounds::default();
+        b.ensure(1);
+        assert_eq!(
+            b.tighten(av(0), BoundKind::Upper, dr(3), lit(1)),
+            TightenResult::Tightened
+        );
+        // lower 5 > upper 3 -> conflict citing the upper's lit.
+        assert_eq!(
+            b.tighten(av(0), BoundKind::Lower, dr(5), lit(2)),
+            TightenResult::Conflict { other: lit(1) }
+        );
+    }
 }
