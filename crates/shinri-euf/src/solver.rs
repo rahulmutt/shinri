@@ -8,6 +8,16 @@ pub struct Euf {
     // Filled in across Tasks 6–11.
     inner: crate::egraph::EGraph,
     level: usize,
+    /// Canonical ⊤/⊥ Bool constant TermIds; set by the owner of the mutable Context.
+    truth_terms: Option<(TermId, TermId)>,
+}
+
+impl Euf {
+    /// Provide the canonical Bool ⊤/⊥ terms (created by the owner of the
+    /// mutable `Context`). Must be called before asserting predicate atoms.
+    pub fn set_truth_terms(&mut self, t_true: TermId, t_false: TermId) {
+        self.truth_terms = Some((t_true, t_false));
+    }
 }
 
 impl TheorySolver for Euf {
@@ -71,7 +81,16 @@ impl TheorySolver for Euf {
                     self.inner.merge_eq(cx.eq, a, b, just)
                 }
             }
-            _ => None,
+            _ => {
+                // Uninterpreted predicate application: p(args) merged with ⊤/⊥.
+                let (t_true, t_false) = self
+                    .truth_terms
+                    .expect("set_truth_terms must precede predicate asserts");
+                let (tn, fln) = self.inner.truth_nodes(cx, t_true, t_false);
+                let pnode = self.inner.add_term(cx, atom);
+                let target = if lit.is_positive() { tn } else { fln };
+                self.inner.merge_eq(cx.eq, pnode, target, just)
+            }
         }
     }
     fn propagate(

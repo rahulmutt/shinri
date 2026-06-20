@@ -113,6 +113,45 @@ fn conflict_bridges_to_diseq_endpoints_sufficiency() {
     );
 }
 
+/// p(a) ∧ ¬p(b) ∧ a=b  is unsat (predicate congruence).
+#[test]
+fn predicate_congruence_conflict() {
+    let mut ctx = Context::new();
+    let u = ctx.declare_sort("U");
+    let boolsort = ctx.bool_sort();
+    let a = uconst(&mut ctx, "a", u);
+    let b = uconst(&mut ctx, "b", u);
+    let p = ctx.declare_fun("p", &[u], boolsort);
+    let pa = ctx.mk_app(Op::Uninterpreted(p), &[a]).unwrap();
+    let pb = ctx.mk_app(Op::Uninterpreted(p), &[b]).unwrap();
+    let eq_ab = ctx.mk_eq(a, b).unwrap();
+
+    let t_true = ctx.mk_const_bool(true);
+    let t_false = ctx.mk_const_bool(false);
+
+    let mut eq = EqualityEngine::default();
+    let mut atoms = AtomRegistry::default();
+    let (vpa, vpb, vab) = (Var::new(0), Var::new(1), Var::new(2));
+    atoms.register(vpa, pa, shinri_theory::types::Owner::Euf);
+    atoms.register(vpb, pb, shinri_theory::types::Owner::Euf);
+    atoms.register(vab, eq_ab, shinri_theory::types::Owner::Euf);
+
+    let mut euf = Euf::default();
+    euf.set_truth_terms(t_true, t_false);
+    let mut cx = TheoryCtx {
+        terms: &ctx,
+        eq: &mut eq,
+        atoms: &atoms,
+    };
+    euf.new_var(&mut cx, vpa, pa);
+    euf.new_var(&mut cx, vpb, pb);
+    euf.new_var(&mut cx, vab, eq_ab);
+    assert!(euf.assert(&mut cx, Lit::new(vpa, true)).is_none());
+    assert!(euf.assert(&mut cx, Lit::new(vpb, false)).is_none());
+    let conflict = euf.assert(&mut cx, Lit::new(vab, true));
+    assert!(conflict.is_some(), "p(a) ∧ ¬p(b) ∧ a=b must conflict");
+}
+
 /// a=c ∧ b=d ∧ g(a,b) ≠ g(c,d) is unsat (n-ary congruence).
 #[test]
 fn nary_congruence_conflict() {

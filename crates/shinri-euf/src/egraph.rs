@@ -55,6 +55,8 @@ pub struct EGraph {
     /// Set when an interned term is a function application (vs a plain leaf).
     is_app: Vec<bool>,
     app_of: FxHashMap<ENodeId, AppId>,
+    /// Cached ⊤/⊥ sentinel e-nodes (interned once, distinct by Definitional diseq).
+    truth: Option<(ENodeId, ENodeId)>,
 }
 
 impl EGraph {
@@ -181,6 +183,27 @@ impl EGraph {
                 Some(out)
             }
         }
+    }
+
+    /// Intern the ⊤/⊥ sentinels once and assert them distinct (level 0, Definitional).
+    /// Idempotent: subsequent calls return the cached pair.
+    pub fn truth_nodes(
+        &mut self,
+        cx: &mut TheoryCtx,
+        t_true: TermId,
+        t_false: TermId,
+    ) -> (ENodeId, ENodeId) {
+        if let Some(tf) = self.truth {
+            return tf;
+        }
+        let tn = cx.eq.intern(t_true);
+        let fln = cx.eq.intern(t_false);
+        // Ensure the EGraph's use_list and is_app arrays cover these nodes.
+        self.ensure_node(tn);
+        self.ensure_node(fln);
+        let _ = cx.eq.assert_diseq(tn, fln, EqJust::Definitional);
+        self.truth = Some((tn, fln));
+        (tn, fln)
     }
 
     fn drain_pending(&mut self, eq: &mut EqualityEngine) -> Option<Vec<EqLeaf>> {

@@ -29,6 +29,19 @@ struct DiseqRecord {
     rhs: ENodeId,
 }
 
+/// Undo entry for the diseq map.
+enum DiseqUndo {
+    /// A fresh key was inserted; remove it on undo.
+    Insert((ENodeId, ENodeId)),
+    /// A key was re-keyed (from `old` to `new`) during a merge; restore `old`
+    /// (with the same record) and remove `new` on undo.
+    Rekey {
+        old: (ENodeId, ENodeId),
+        new: (ENodeId, ENodeId),
+        rec: DiseqRecord,
+    },
+}
+
 #[derive(Default)]
 pub struct EqualityEngine {
     nodes: Vec<ENode>,
@@ -40,7 +53,7 @@ pub struct EqualityEngine {
     /// later merge conflict can bridge the merged nodes to the diseq endpoints.
     /// Backtracked via `diseq_undo`.
     diseqs: rustc_hash::FxHashMap<(ENodeId, ENodeId), DiseqRecord>,
-    diseq_undo: UndoLog<(ENodeId, ENodeId)>,
+    diseq_undo: UndoLog<DiseqUndo>,
     /// Proof forest: `fparent[n]` and the label of the edge n→fparent[n].
     /// `fparent[n] == n` means n is a forest root. Backtracked via `forest_undo`.
     fparent: Vec<ENodeId>,
@@ -119,7 +132,7 @@ impl EqualityEngine {
             rhs: b,
         };
         if self.diseqs.insert(key, record).is_none() {
-            self.diseq_undo.record(key);
+            self.diseq_undo.record(DiseqUndo::Insert(key));
         }
         Ok(())
     }
@@ -160,6 +173,27 @@ impl EqualityEngine {
         self.nodes[child.index()].parent = root;
         self.nodes[root.index()].size += self.nodes[child.index()].size;
         self.merges.push(crate::types::MergeEvent { a, b });
+        // Re-key any disequalities involving `child` to use `root` instead,
+        // so the representative-keyed lookup stays valid after the union.
+        let stale_keys: Vec<(ENodeId, ENodeId)> = self
+            .diseqs
+            .keys()
+            .filter(|&&(ka, kb)| ka == child || kb == child)
+            .copied()
+            .collect();
+        for old_key in stale_keys {
+            let rec = self.diseqs.remove(&old_key).expect("key present by filter");
+            let (ka, kb) = old_key;
+            let new_a = if ka == child { root } else { ka };
+            let new_b = if kb == child { root } else { kb };
+            let new_key = Self::pair(new_a, new_b);
+            self.diseqs.insert(new_key, rec);
+            self.diseq_undo.record(DiseqUndo::Rekey {
+                old: old_key,
+                new: new_key,
+                rec,
+            });
+        }
         Ok(())
     }
 
@@ -316,8 +350,14 @@ impl EqualityEngine {
             nodes[u.root.index()].size = u.root_size_before;
         });
         let diseqs = &mut self.diseqs;
-        self.diseq_undo.pop_to(level, |key| {
-            diseqs.remove(&key);
+        self.diseq_undo.pop_to(level, |entry| match entry {
+            DiseqUndo::Insert(key) => {
+                diseqs.remove(&key);
+            }
+            DiseqUndo::Rekey { old, new, rec } => {
+                diseqs.remove(&new);
+                diseqs.insert(old, rec);
+            }
         });
         let fparent = &mut self.fparent;
         self.forest_undo.pop_to(level, |n| {
