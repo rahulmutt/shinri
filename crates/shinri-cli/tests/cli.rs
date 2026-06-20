@@ -67,7 +67,7 @@ fn print_success_emits_success_lines() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.first(), Some(&"success")); // set-logic
     assert_eq!(lines.last(), Some(&"sat"));
-    assert!(lines.iter().filter(|l| **l == "success").count() >= 3);
+    assert_eq!(lines.iter().filter(|l| **l == "success").count(), 3);
 }
 
 #[test]

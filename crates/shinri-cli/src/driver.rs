@@ -105,8 +105,9 @@ impl Driver {
 
     /// Flush at input EOF: report a trailing partial command, if any.
     pub fn finish(&mut self) -> io::Result<()> {
-        if let StreamItem::Command(Err(d)) = self.parser.finish(self.solver.ctx_mut()) {
-            self.error(&d.message)?;
+        match self.parser.finish(self.solver.ctx_mut()) {
+            StreamItem::Command(Err(d)) => self.error(&d.message)?,
+            StreamItem::Command(Ok(_)) | StreamItem::NeedMore | StreamItem::Done => {}
         }
         Ok(())
     }
