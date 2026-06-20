@@ -265,6 +265,36 @@ fn pop_undoes_congruence_merge() {
     assert!(conflict.is_some());
 }
 
+/// A satisfiable EUF instance yields a model where equal terms share a value.
+#[test]
+fn model_assigns_equal_terms_the_same_element() {
+    use shinri_theory::types::ModelVal;
+    use shinri_theory::ModelBuilder;
+    let mut ctx = Context::new();
+    let u = ctx.declare_sort("U");
+    let a = uconst(&mut ctx, "a", u);
+    let b = uconst(&mut ctx, "b", u);
+    let eq_ab = ctx.mk_eq(a, b).unwrap();
+
+    let mut eq = EqualityEngine::default();
+    let mut atoms = AtomRegistry::default();
+    let v = Var::new(0);
+    atoms.register(v, eq_ab, shinri_theory::types::Owner::Euf);
+
+    let mut euf = Euf::default();
+    let mut m = ModelBuilder::default();
+    let mut cx = TheoryCtx {
+        terms: &ctx,
+        eq: &mut eq,
+        atoms: &atoms,
+    };
+    euf.new_var(&mut cx, v, eq_ab);
+    assert!(euf.assert(&mut cx, Lit::new(v, true)).is_none());
+    euf.model(&mut cx, &mut m);
+    assert_eq!(m.get(a), m.get(b), "a=b ⇒ same model element");
+    assert!(matches!(m.get(a), Some(ModelVal::Elem(_, _))));
+}
+
 /// a=c ∧ b=d ∧ g(a,b) ≠ g(c,d) is unsat (n-ary congruence).
 #[test]
 fn nary_congruence_conflict() {

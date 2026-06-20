@@ -1,6 +1,6 @@
 //! The congruence-closure machinery layered over `EqualityEngine`.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{Op, TermId, TermNode};
 use shinri_theory::types::{ENodeId, EqConflict, EqJust, EqLeaf};
 use shinri_theory::{EqualityEngine, TheoryCtx};
@@ -56,12 +56,26 @@ pub struct EGraph {
     app_of: FxHashMap<ENodeId, AppId>,
     /// Cached ⊤/⊥ sentinel e-nodes (interned once, distinct by Definitional diseq).
     truth: Option<(ENodeId, ENodeId)>,
+    /// Every registered term in insertion order (one entry per distinct TermId).
+    terms: Vec<(TermId, ENodeId)>,
+    /// Guard to ensure each TermId is recorded in `terms` exactly once.
+    seen_terms: FxHashSet<TermId>,
 }
 
 impl EGraph {
     #[allow(dead_code)] // used in unit tests; not yet called by solver (Task 8+)
     pub fn app_count(&self) -> usize {
         self.apps.len()
+    }
+
+    /// All terms registered via `add_term`, in insertion order (one per distinct TermId).
+    pub fn registered_terms(&self) -> &[(TermId, ENodeId)] {
+        &self.terms
+    }
+
+    /// Cached ⊤/⊥ e-node pair, if sentinels have been interned.
+    pub fn truth(&self) -> Option<(ENodeId, ENodeId)> {
+        self.truth
     }
 
     pub fn push(&mut self) {
@@ -108,13 +122,13 @@ impl EGraph {
     /// Recursively intern `t` and all subterms, recording app structure.
     /// Returns the e-node of `t`. Idempotent (interning dedups).
     pub fn add_term(&mut self, cx: &mut TheoryCtx, t: TermId) -> ENodeId {
-        let node = cx.eq.intern(t);
-        self.ensure_node(node);
-        if self.app_of.contains_key(&node) {
-            return node; // already registered as an app
+        // Guard: process each distinct TermId exactly once.
+        if !self.seen_terms.insert(t) {
+            return cx.eq.intern(t);
         }
-        // Note: Const nodes are intentionally not tracked in `app_of` (only App nodes are).
-        // Re-visiting Const nodes is harmless and idempotent—interning dedups them.
+        let node = cx.eq.intern(t);
+        self.terms.push((t, node));
+        self.ensure_node(node);
         // Copy out op and args slice before releasing the borrow on cx.terms.
         let term_info = match cx.terms.term_node(t) {
             TermNode::App { op, args, .. } => Some((*op, *args)),

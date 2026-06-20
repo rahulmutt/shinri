@@ -115,7 +115,34 @@ impl TheorySolver for Euf {
         TCheck::Sat
     }
     fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {}
-    fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+    fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
+        use rustc_hash::FxHashMap;
+        use shinri_theory::types::ModelVal;
+        let truth = self.inner.truth();
+        // Collect registered terms into a local Vec to avoid borrow conflicts.
+        let registered: Vec<(shinri_core::TermId, shinri_theory::types::ENodeId)> =
+            self.inner.registered_terms().to_vec();
+        let mut elem_of: FxHashMap<(shinri_core::SortId, shinri_theory::types::ENodeId), u32> =
+            FxHashMap::default();
+        for (term, _node) in registered {
+            let node = cx.eq.intern(term);
+            let rep = cx.eq.find(node);
+            if let Some((tn, fln)) = truth {
+                if cx.eq.find(tn) == rep {
+                    m.assign(term, ModelVal::Bool(true));
+                    continue;
+                }
+                if cx.eq.find(fln) == rep {
+                    m.assign(term, ModelVal::Bool(false));
+                    continue;
+                }
+            }
+            let sort = cx.terms.sort_of(term);
+            let next = elem_of.len() as u32;
+            let id = *elem_of.entry((sort, rep)).or_insert(next);
+            m.assign(term, ModelVal::Elem(sort, id));
+        }
+    }
     fn push(&mut self) {
         self.level += 1;
         self.inner.push();
