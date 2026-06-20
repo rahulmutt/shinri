@@ -35,6 +35,23 @@ pub struct Parser<'a> {
     stopped: bool,
 }
 
+/// The semantic text of an attribute-value token: the inner string for
+/// symbols/numerals/decimals/keywords/hex/bin, and the quote-stripped,
+/// `""`-unescaped contents for string literals.
+fn token_value_text(tok: &Token) -> String {
+    match tok {
+        Token::Symbol(s)
+        | Token::Numeral(s)
+        | Token::Decimal(s)
+        | Token::Keyword(s)
+        | Token::Hex(s)
+        | Token::Bin(s) => s.clone(),
+        Token::Str(s) => s[1..s.len() - 1].replace("\"\"", "\""),
+        Token::LParen => "(".to_string(),
+        Token::RParen => ")".to_string(),
+    }
+}
+
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str) -> Self {
         Parser {
@@ -709,13 +726,14 @@ impl<'a> Parser<'a> {
         // A value is present unless the next token closes the command.
         let val = match self.peek() {
             Some((Ok(Token::RParen), _)) | None => AttrValue::Token(None),
-            Some((Ok(tok), _)) => {
-                let text = format!("{tok:?}");
-                self.bump();
-                AttrValue::Token(Some(text))
-            }
             Some((Err(()), sp)) => {
                 return Err(Diagnostic::new(sp.clone(), "invalid attribute value"))
+            }
+            Some((Ok(_), _)) => {
+                // A value token is present; consume it and capture its text.
+                let (tok, _) = self.bump().expect("peek saw a token");
+                let tok = tok.expect("peek saw Ok(token)");
+                AttrValue::Token(Some(token_value_text(&tok)))
             }
         };
         Ok((k, val))
@@ -1008,6 +1026,55 @@ mod tests {
             matches!(cs[1], Ok(Command::CheckSat)),
             "check-sat should be the second result, got {:?}",
             cs[1]
+        );
+    }
+}
+
+#[cfg(test)]
+mod attr_tests {
+    use super::Parser;
+    use shinri_core::Context;
+    use shinri_frontend::{AttrValue, Command};
+
+    #[test]
+    fn set_option_bool_value_is_semantic_text() {
+        let mut ctx = Context::new();
+        let mut p = Parser::new("(set-option :print-success false)");
+        let cmd = p.next_command(&mut ctx).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetOption {
+                keyword: ":print-success".into(),
+                value: AttrValue::Token(Some("false".into())),
+            }
+        );
+    }
+
+    #[test]
+    fn set_option_string_value_strips_quotes() {
+        let mut ctx = Context::new();
+        let mut p = Parser::new("(set-option :regular-output-channel \"out.txt\")");
+        let cmd = p.next_command(&mut ctx).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetOption {
+                keyword: ":regular-output-channel".into(),
+                value: AttrValue::Token(Some("out.txt".into())),
+            }
+        );
+    }
+
+    #[test]
+    fn set_option_bare_keyword_has_no_value() {
+        let mut ctx = Context::new();
+        let mut p = Parser::new("(set-info :some-flag)");
+        let cmd = p.next_command(&mut ctx).unwrap().unwrap();
+        assert_eq!(
+            cmd,
+            Command::SetInfo {
+                keyword: ":some-flag".into(),
+                value: AttrValue::Token(None),
+            }
         );
     }
 }
