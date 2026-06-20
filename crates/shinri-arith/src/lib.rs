@@ -104,7 +104,6 @@ impl Arith {
                     // dividing by a negative coefficient flips ≤ into ≥: swap
                     // the kinds and negate the infinitesimals accordingly.
                     std::mem::swap(&mut pk, &mut nk);
-                    std::mem::swap(&mut pkk, &mut nkk);
                     pkk = -pkk;
                     nkk = -nkk;
                 }
@@ -183,7 +182,6 @@ impl TheorySolver for Arith {
 
     fn new_var(&mut self, cx: &mut TheoryCtx, v: Var, atom: TermId) {
         let n = normalize_atom(cx.terms, &mut self.vars, atom);
-        self.grow_value();
         let enc = self.build_encoding(&n);
         let idx = v.index();
         if idx >= self.enc.len() {
@@ -273,6 +271,38 @@ mod assert_tests {
         let real = ctx.real_sort();
         let s = ctx.declare_fun(name, &[], real);
         ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    #[test]
+    fn flipped_strict_lower_conflicts_with_upper_at_boundary() {
+        // (> x 2)  must install a STRICT lower bound x>2 (Lower(2,+1)).
+        // (<= x 2) installs Upper(2,0). Together UNSAT -> crossing conflict at assert.
+        // With the encoding bug, (> x 2) installs x>=2 (Lower(2,0)) and there is NO conflict.
+        let mut ctx = Context::new();
+        let x = real_var(&mut ctx, "x");
+        let real = ctx.real_sort();
+        let two = ctx.mk_numeral(Rational::from_int(2i128.into()), real);
+        let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[x, two]).unwrap(); // x > 2
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, two]).unwrap(); // x <= 2
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let va = Var::new(0);
+        let vb = Var::new(1);
+        {
+            let mut cx = TheoryCtx {
+                terms: &ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            arith.new_var(&mut cx, va, gt);
+            arith.new_var(&mut cx, vb, le);
+            assert!(arith.assert(&mut cx, Lit::new(va, true)).is_none()); // x>2 alone: ok
+            let cf = arith.assert(&mut cx, Lit::new(vb, true)); // x<=2: crosses x>2
+            let leaves = cf.expect("x>2 and x<=2 must conflict at the boundary");
+            assert!(leaves.contains(&EqLeaf::Asserted(Lit::new(va, true))));
+            assert!(leaves.contains(&EqLeaf::Asserted(Lit::new(vb, true))));
+        }
     }
 
     #[test]
