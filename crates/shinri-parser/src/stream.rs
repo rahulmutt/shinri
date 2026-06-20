@@ -178,10 +178,16 @@ mod streaming_tests {
         let mut ctx = Context::new();
         let mut sp = StreamingParser::new();
         sp.push_str("(declare-fun a () Bool)");
-        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(c, Command::DeclareFun { .. })));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::DeclareFun { .. }
+        )));
         // `a` resolves only if the env from the first command persisted.
         sp.push_str("(assert a)");
-        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(c, Command::Assert(_))));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::Assert(_)
+        )));
     }
 
     #[test]

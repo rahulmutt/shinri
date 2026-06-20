@@ -162,7 +162,9 @@ impl Driver {
     }
 
     fn error(&mut self, msg: &str) -> io::Result<()> {
-        self.pres.regular.write_line(&format!("(error \"{}\")", escape(msg)))
+        self.pres
+            .regular
+            .write_line(&format!("(error \"{}\")", escape(msg)))
     }
 
     /// `Some(result)` if `keyword` is a presentation option handled here;
@@ -211,8 +213,14 @@ mod channel_tests {
 
     #[test]
     fn open_maps_standard_streams() {
-        assert!(matches!(OutChannel::open("stdout").unwrap(), OutChannel::Stdout));
-        assert!(matches!(OutChannel::open("stderr").unwrap(), OutChannel::Stderr));
+        assert!(matches!(
+            OutChannel::open("stdout").unwrap(),
+            OutChannel::Stdout
+        ));
+        assert!(matches!(
+            OutChannel::open("stderr").unwrap(),
+            OutChannel::Stderr
+        ));
     }
 
     #[test]

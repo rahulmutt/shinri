@@ -61,9 +61,8 @@ fn stdin_qf_uf_unsat_quiet() {
 #[test]
 fn print_success_emits_success_lines() {
     // No `:print-success false`: declarations and asserts each print `success`.
-    let (stdout, _) = run_stdin(
-        "(set-logic QF_LRA)(declare-fun x () Real)(assert (> x 0.0))(check-sat)",
-    );
+    let (stdout, _) =
+        run_stdin("(set-logic QF_LRA)(declare-fun x () Real)(assert (> x 0.0))(check-sat)");
     let lines: Vec<&str> = stdout.lines().collect();
     assert_eq!(lines.first(), Some(&"success")); // set-logic
     assert_eq!(lines.last(), Some(&"sat"));
@@ -76,8 +75,14 @@ fn parse_error_does_not_stop_the_stream() {
         "(set-option :print-success false)(this-is-not-a-command)\
 (set-logic QF_LRA)(declare-fun x () Real)(assert (> x 0.0))(check-sat)",
     );
-    assert!(stdout.contains("(error"), "expected an error line, got: {stdout:?}");
-    assert!(stdout.trim_end().ends_with("sat"), "stream should continue: {stdout:?}");
+    assert!(
+        stdout.contains("(error"),
+        "expected an error line, got: {stdout:?}"
+    );
+    assert!(
+        stdout.trim_end().ends_with("sat"),
+        "stream should continue: {stdout:?}"
+    );
     assert_eq!(code, Some(0)); // in-band error, not a process failure
 }
 
@@ -100,7 +105,10 @@ fn regular_output_channel_redirects_to_file() {
 (set-option :regular-output-channel \"{p}\")(echo \"hi\")"
     );
     let (stdout, _) = run_stdin(&script);
-    assert_eq!(stdout, "", "output should have gone to the file, not stdout");
+    assert_eq!(
+        stdout, "",
+        "output should have gone to the file, not stdout"
+    );
     let body = std::fs::read_to_string(&path).unwrap();
     assert!(body.contains("hi"), "redirected file got: {body:?}");
     let _ = std::fs::remove_file(&path);
@@ -117,11 +125,17 @@ fn streaming_agrees_with_known_oracle_scripts() {
     // Mirrors crates/shinri-solver/tests/script_e2e.rs expectations, but driven
     // through the streaming CLI (whole-script fed via stdin).
     let cases = [
-        ("(set-option :print-success false)(set-logic QF_UFLRA)\
+        (
+            "(set-option :print-success false)(set-logic QF_UFLRA)\
 (declare-fun x () Real)(declare-fun y () Real)(declare-fun f (Real) Real)\
-(assert (= x y))(assert (distinct (f x) (f y)))(check-sat)", "unsat\n"),
-        ("(set-option :print-success false)(set-logic QF_LRA)\
-(declare-fun x () Real)(assert (< x 1.0))(assert (> x 0.0))(check-sat)", "sat\n"),
+(assert (= x y))(assert (distinct (f x) (f y)))(check-sat)",
+            "unsat\n",
+        ),
+        (
+            "(set-option :print-success false)(set-logic QF_LRA)\
+(declare-fun x () Real)(assert (< x 1.0))(assert (> x 0.0))(check-sat)",
+            "sat\n",
+        ),
     ];
     for (script, expected) in cases {
         let (stdout, code) = run_stdin(script);

@@ -62,14 +62,21 @@ mod tests {
 
     #[test]
     fn no_args_reads_stdin() {
-        assert_eq!(parse(&[]), Ok(Invocation::Run { input: Input::Stdin }));
+        assert_eq!(
+            parse(&[]),
+            Ok(Invocation::Run {
+                input: Input::Stdin
+            })
+        );
     }
 
     #[test]
     fn file_arg_is_file_input() {
         assert_eq!(
             parse(&["foo.smt2"]),
-            Ok(Invocation::Run { input: Input::File("foo.smt2".into()) })
+            Ok(Invocation::Run {
+                input: Input::File("foo.smt2".into())
+            })
         );
     }
 
