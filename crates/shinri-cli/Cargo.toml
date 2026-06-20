@@ -1,0 +1,15 @@
+[package]
+name = "shinri-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "shinri"
+path = "src/main.rs"
+
+[dependencies]
+shinri-solver = { path = "../shinri-solver" }
+shinri-parser = { path = "../shinri-parser" }
+shinri-frontend = { path = "../shinri-frontend" }
