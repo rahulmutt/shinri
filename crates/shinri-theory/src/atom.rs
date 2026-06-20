@@ -17,6 +17,12 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
     if contains_nonlinear_mul(terms, atom) {
         return Err(Unsupported(atom));
     }
+    // QF_LIA is out of scope this milestone: an LRA simplex solves only the real
+    // relaxation, which is unsound for integers. Fence Int-sorted arithmetic to
+    // `unknown` (spec §1.1). Real-sorted arithmetic is unaffected.
+    if contains_int_arith(terms, atom) {
+        return Err(Unsupported(atom));
+    }
     match terms.term_node(atom) {
         TermNode::App { op, args, .. } => {
             let children = terms.children(*args);
@@ -75,6 +81,25 @@ fn contains_nonlinear_mul(terms: &Context, t: TermId) -> bool {
             children.iter().any(|&c| contains_nonlinear_mul(terms, c))
         }
     }
+}
+
+/// True if `atom` is an arithmetic relation/equality with an Int-sorted operand.
+fn contains_int_arith(terms: &Context, atom: TermId) -> bool {
+    let int_s = terms.int_sort();
+    if let TermNode::App { op, args, .. } = terms.term_node(atom) {
+        let children = terms.children(*args);
+        let touches_int = children.iter().any(|&c| terms.sort_of(c) == int_s);
+        match op {
+            Op::Builtin(BuiltinOp::Le | BuiltinOp::Lt | BuiltinOp::Ge | BuiltinOp::Gt) => {
+                return touches_int;
+            }
+            Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct) => {
+                return touches_int;
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// `Var`-indexed routing table. Append-only across a solve (atoms are never
@@ -197,5 +222,25 @@ mod tests {
         let real = ctx.real_sort();
         let k = ctx.mk_numeral(shinri_core::Rational::from_int(3i128.into()), real);
         assert_eq!(classify(&ctx, k), Err(Unsupported(k)));
+    }
+
+    #[test]
+    fn int_sorted_arith_is_fenced_to_unsupported() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let xi = ctx.declare_fun("xi", &[], int);
+        let yi = ctx.declare_fun("yi", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xi), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(yi), &[]).unwrap();
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, y]).unwrap();
+        assert_eq!(classify(&ctx, le), Err(Unsupported(le)));
+        // Real-sorted still arith.
+        let real = ctx.real_sort();
+        let xr = ctx.declare_fun("xr", &[], real);
+        let yr = ctx.declare_fun("yr", &[], real);
+        let xrt = ctx.mk_app(Op::Uninterpreted(xr), &[]).unwrap();
+        let yrt = ctx.mk_app(Op::Uninterpreted(yr), &[]).unwrap();
+        let ler = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xrt, yrt]).unwrap();
+        assert_eq!(classify(&ctx, ler), Ok(Owner::Arith));
     }
 }
