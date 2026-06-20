@@ -268,4 +268,60 @@ mod tests {
         let m = s.get_model();
         assert_eq!(m.get(a), m.get(b));
     }
+
+    // Helpers: three uninterpreted constants of a fresh sort.
+    fn three_consts(s: &mut Solver) -> (TermId, TermId, TermId) {
+        let u = s.declare_sort("U");
+        let af = s.declare_fun("a", &[], u);
+        let a = s.app(Op::Uninterpreted(af), &[]);
+        let bf = s.declare_fun("b", &[], u);
+        let b = s.app(Op::Uninterpreted(bf), &[]);
+        let cf = s.declare_fun("c", &[], u);
+        let c = s.app(Op::Uninterpreted(cf), &[]);
+        (a, b, c)
+    }
+
+    /// REGRESSION (aux-var panic): a top-level `(and (= a b) (= b c))` mints an
+    /// auxiliary Tseitin var for the `And`; the SAT layer asserts it during
+    /// solve(), which pre-fix paniced in `Combiner::assert` (owner() on an
+    /// unregistered aux var). Must now solve to Sat.
+    #[test]
+    fn and_of_equalities_solves_sat() {
+        use shinri_core::{BuiltinOp, Op};
+        let mut s = Solver::new();
+        let (a, b, c) = three_consts(&mut s);
+        let ab = s.eq(a, b);
+        let bc = s.eq(b, c);
+        let conj = s.app(Op::Builtin(BuiltinOp::And), &[ab, bc]);
+        s.assert(conj);
+        assert_eq!(s.check_sat(), SolveOutcome::Sat);
+    }
+
+    /// REGRESSION (n-ary distinct path): `(distinct a b c)` is lowered to an
+    /// `And` of binary distincts, which mints an aux var. Pre-fix this paniced;
+    /// now it solves to Sat (three distinct elements are satisfiable).
+    #[test]
+    fn nary_distinct_solves_sat() {
+        use shinri_core::{BuiltinOp, Op};
+        let mut s = Solver::new();
+        let (a, b, c) = three_consts(&mut s);
+        let distinct = s.app(Op::Builtin(BuiltinOp::Distinct), &[a, b, c]);
+        s.assert(distinct);
+        assert_eq!(s.check_sat(), SolveOutcome::Sat);
+    }
+
+    /// REGRESSION + soundness: `(distinct a b c) ∧ (= a b)` exercises the aux-var
+    /// path (the distinct lowering produces an And) AND verifies distinct
+    /// soundness end-to-end: a≠b is required, but a=b is asserted → Unsat.
+    #[test]
+    fn nary_distinct_with_conflicting_eq_is_unsat() {
+        use shinri_core::{BuiltinOp, Op};
+        let mut s = Solver::new();
+        let (a, b, c) = three_consts(&mut s);
+        let distinct = s.app(Op::Builtin(BuiltinOp::Distinct), &[a, b, c]);
+        let ab = s.eq(a, b);
+        s.assert(distinct);
+        s.assert(ab);
+        assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    }
 }

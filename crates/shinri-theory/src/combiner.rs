@@ -106,6 +106,15 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
 
 impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
     fn assert(&mut self, lit: Lit) {
+        // The SAT layer asserts EVERY trail literal, including auxiliary Tseitin
+        // variables minted for Boolean connectives (And/Or/Implies/Xor/Ite/...).
+        // Those carry no theory meaning — their Boolean semantics are fully
+        // handled by the SAT layer via the Tseitin defining clauses — and are
+        // never registered as theory atoms. Ignore them; only registered atoms
+        // route to a theory. (Without this, owner() below panics on aux vars.)
+        if !self.atoms.is_registered(lit.var()) {
+            return;
+        }
         let owner = self.atoms.owner(lit.var());
         let mut cx = TheoryCtx {
             terms: &self.terms,
