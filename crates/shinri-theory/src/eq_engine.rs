@@ -19,21 +19,63 @@ struct UfUndo {
     root_size_before: u32,
 }
 
+/// A stored disequality: its justification plus the endpoint nodes exactly as
+/// passed to `assert_diseq` (so a conflict can cite the asserted endpoints, not
+/// the class representatives the diseq is keyed on).
+#[derive(Clone, Copy)]
+struct DiseqRecord {
+    just: EqJust,
+    lhs: ENodeId,
+    rhs: ENodeId,
+}
+
+/// Undo entry for the diseq map.
+enum DiseqUndo {
+    /// A fresh key was inserted; remove it on undo.
+    Insert((ENodeId, ENodeId)),
+    /// A key was re-keyed (from `old` to `new`) during a merge and `new` did
+    /// NOT previously exist; restore `old` (with the moved record) and remove
+    /// `new` on undo.
+    Rekey {
+        old: (ENodeId, ENodeId),
+        new: (ENodeId, ENodeId),
+        rec: DiseqRecord,
+    },
+    /// A key was re-keyed (from `old` to `new`) during a merge and `new` ALREADY
+    /// held a (distinct) live disequality that the re-key overwrote. To restore
+    /// the EXACT pre-merge map on undo we must re-insert BOTH the moved record at
+    /// `old` AND the displaced record at `new` (the latter would otherwise be
+    /// permanently lost — the C1 soundness bug).
+    RekeyOverwrite {
+        old: (ENodeId, ENodeId),
+        new: (ENodeId, ENodeId),
+        moved_rec: DiseqRecord,
+        displaced_rec: DiseqRecord,
+    },
+}
+
 #[derive(Default)]
 pub struct EqualityEngine {
     nodes: Vec<ENode>,
     term_to_node: shinri_core_map::Map,
     undo: UndoLog<UfUndo>,
     /// Disequal *representative* pairs (canonical order min,max by index), each
-    /// with the justification that asserted them. Backtracked via `diseq_undo`.
-    diseqs: rustc_hash::FxHashMap<(ENodeId, ENodeId), EqJust>,
-    diseq_undo: UndoLog<(ENodeId, ENodeId)>,
+    /// with the justification that asserted them AND the two endpoint nodes as
+    /// originally passed to `assert_diseq` (NOT their representatives), so a
+    /// later merge conflict can bridge the merged nodes to the diseq endpoints.
+    /// Backtracked via `diseq_undo`.
+    diseqs: rustc_hash::FxHashMap<(ENodeId, ENodeId), DiseqRecord>,
+    diseq_undo: UndoLog<DiseqUndo>,
     /// Proof forest: `fparent[n]` and the label of the edge n→fparent[n].
     /// `fparent[n] == n` means n is a forest root. Backtracked via `forest_undo`.
     fparent: Vec<ENodeId>,
     flabel: Vec<EqJust>,
     forest_undo: UndoLog<ENodeId>, // the node whose forest edge was added
     merges: Vec<crate::types::MergeEvent>,
+    /// Arena of congruence argument pairs; `EqJust::Congruence` indexes into it.
+    cong_pairs: Vec<(ENodeId, ENodeId)>,
+    /// Backtracks `cong_pairs`: each entry is the arena length before a level.
+    cong_undo: UndoLog<usize>,
 }
 
 impl EqualityEngine {
@@ -86,11 +128,23 @@ impl EqualityEngine {
         let ra = self.find(a);
         let rb = self.find(b);
         if ra == rb {
-            return Err(EqConflict { a, b, diseq: j });
+            // a,b are already equal: they ARE the diseq endpoints here.
+            return Err(EqConflict {
+                a,
+                b,
+                diseq: j,
+                diseq_lhs: a,
+                diseq_rhs: b,
+            });
         }
         let key = Self::pair(ra, rb);
-        if self.diseqs.insert(key, j).is_none() {
-            self.diseq_undo.record(key);
+        let record = DiseqRecord {
+            just: j,
+            lhs: a,
+            rhs: b,
+        };
+        if self.diseqs.insert(key, record).is_none() {
+            self.diseq_undo.record(DiseqUndo::Insert(key));
         }
         Ok(())
     }
@@ -103,8 +157,14 @@ impl EqualityEngine {
             return Ok(());
         }
         // Guard the single unsoundness vector: uniting a known-disequal pair.
-        if let Some(&dj) = self.diseqs.get(&Self::pair(ra, rb)) {
-            return Err(EqConflict { a, b, diseq: dj });
+        if let Some(&rec) = self.diseqs.get(&Self::pair(ra, rb)) {
+            return Err(EqConflict {
+                a,
+                b,
+                diseq: rec.just,
+                diseq_lhs: rec.lhs,
+                diseq_rhs: rec.rhs,
+            });
         }
         // Splice the explanation edge a—b labelled j into the proof forest.
         self.reroot_forest(a);
@@ -125,7 +185,76 @@ impl EqualityEngine {
         self.nodes[child.index()].parent = root;
         self.nodes[root.index()].size += self.nodes[child.index()].size;
         self.merges.push(crate::types::MergeEvent { a, b });
+        // Re-key any disequalities involving `child` to use `root` instead,
+        // so the representative-keyed lookup stays valid after the union.
+        let stale_keys: Vec<(ENodeId, ENodeId)> = self
+            .diseqs
+            .keys()
+            .filter(|&&(ka, kb)| ka == child || kb == child)
+            .copied()
+            .collect();
+        for old_key in stale_keys {
+            let rec = self.diseqs.remove(&old_key).expect("key present by filter");
+            let (ka, kb) = old_key;
+            let new_a = if ka == child { root } else { ka };
+            let new_b = if kb == child { root } else { kb };
+            // A self-key pair(root, root) would mean `child ≠ root` was stored
+            // (the other endpoint canonicalizes to `root`), i.e. we are uniting a
+            // known-disequal pair. That case is `pair(child, root) == pair(ra, rb)`
+            // and is already rejected by the early conflict check above before any
+            // re-keying happens, so it can never reach this loop.
+            debug_assert_ne!(
+                new_a, new_b,
+                "re-key to self-diseq must have been caught as a conflict"
+            );
+            let new_key = Self::pair(new_a, new_b);
+            match self.diseqs.insert(new_key, rec) {
+                // `new_key` was free: plain re-key, undo restores `old` and drops `new`.
+                None => self.diseq_undo.record(DiseqUndo::Rekey {
+                    old: old_key,
+                    new: new_key,
+                    rec,
+                }),
+                // `new_key` already held a DISTINCT live diseq (root's class was
+                // independently disequal from `new_key`'s other class). The two
+                // classes are still distinct (no self-key, asserted above), so this
+                // is a duplicate-but-distinct collision: keep BOTH records
+                // recoverable so undo restores the exact pre-merge map (C1 fix).
+                Some(displaced_rec) => self.diseq_undo.record(DiseqUndo::RekeyOverwrite {
+                    old: old_key,
+                    new: new_key,
+                    moved_rec: rec,
+                    displaced_rec,
+                }),
+            }
+        }
         Ok(())
+    }
+
+    /// Like `merge`, but the equality is justified by congruence over the given
+    /// argument pairs (stored in the arena; the edge label references the range).
+    pub fn merge_congruence(
+        &mut self,
+        a: ENodeId,
+        b: ENodeId,
+        pairs: &[(ENodeId, ENodeId)],
+    ) -> Result<(), EqConflict> {
+        self.cong_undo.record(self.cong_pairs.len());
+        debug_assert!(
+            self.cong_pairs.len() < u32::MAX as usize,
+            "cong_pairs arena overflow"
+        );
+        debug_assert!(
+            pairs.len() <= u32::MAX as usize - self.cong_pairs.len(),
+            "cong_pairs arena overflow"
+        );
+        let start = self.cong_pairs.len() as u32;
+        self.cong_pairs.extend_from_slice(pairs);
+        let cref = crate::types::CongRef {
+            start,
+            len: pairs.len() as u32,
+        };
+        self.merge(a, b, EqJust::Congruence(cref))
     }
 
     /// Reverse the forest path from `n` up to its root so `n` becomes a root.
@@ -224,9 +353,13 @@ impl EqualityEngine {
         match label {
             EqJust::Asserted(l) => out.push(EqLeaf::Asserted(l)),
             EqJust::Interface(j) => out.push(EqLeaf::Interface(j)),
-            EqJust::Congruence(s, t) => {
-                // f(..s..) = f(..t..) because s = t: recurse on the argument pair.
-                self.explain(s, t, out);
+            EqJust::Congruence(cref) => {
+                let lo = cref.start as usize;
+                let hi = lo + cref.len as usize;
+                for i in lo..hi {
+                    let (s, t) = self.cong_pairs[i];
+                    self.explain(s, t, out);
+                }
             }
             EqJust::Definitional => {}
         }
@@ -240,6 +373,7 @@ impl EqualityEngine {
         self.undo.push_level();
         self.diseq_undo.push_level();
         self.forest_undo.push_level();
+        self.cong_undo.push_level();
     }
 
     pub fn pop(&mut self, level: usize) {
@@ -250,12 +384,33 @@ impl EqualityEngine {
             nodes[u.root.index()].size = u.root_size_before;
         });
         let diseqs = &mut self.diseqs;
-        self.diseq_undo.pop_to(level, |key| {
-            diseqs.remove(&key);
+        self.diseq_undo.pop_to(level, |entry| match entry {
+            DiseqUndo::Insert(key) => {
+                diseqs.remove(&key);
+            }
+            DiseqUndo::Rekey { old, new, rec } => {
+                diseqs.remove(&new);
+                diseqs.insert(old, rec);
+            }
+            DiseqUndo::RekeyOverwrite {
+                old,
+                new,
+                moved_rec,
+                displaced_rec,
+            } => {
+                // Restore the EXACT pre-merge map: the moved record returns to
+                // `old`, and the displaced (pre-existing) record returns to `new`.
+                diseqs.insert(old, moved_rec);
+                diseqs.insert(new, displaced_rec);
+            }
         });
         let fparent = &mut self.fparent;
         self.forest_undo.pop_to(level, |n| {
             fparent[n.index()] = n; // detach the spliced edge; n becomes a root again
+        });
+        let cong_pairs = &mut self.cong_pairs;
+        self.cong_undo.pop_to(level, |len_before| {
+            cong_pairs.truncate(len_before); // truncate arena to its pre-insert length
         });
     }
 }
@@ -323,6 +478,33 @@ mod tests {
     }
 
     #[test]
+    fn merge_conflict_surfaces_original_diseq_endpoints() {
+        // Diseq asserted between p,q; later a (=p's class) and b (=q's class)
+        // are merged. The conflict must surface the ORIGINAL endpoints p,q,
+        // not the merged nodes a,b.
+        let mut eq = EqualityEngine::default();
+        let p = eq.intern(term(1));
+        let q = eq.intern(term(2));
+        let a = eq.intern(term(3));
+        let b = eq.intern(term(4));
+        // a in p's class, b in q's class.
+        eq.merge(a, p, asserted(1)).unwrap();
+        eq.merge(b, q, asserted(2)).unwrap();
+        // Diseq asserted on p,q (the representatives may be a or b).
+        eq.assert_diseq(p, q, asserted(3)).unwrap();
+        // Merging a,b violates p != q.
+        let err = eq.merge(a, b, asserted(4)).unwrap_err();
+        assert_eq!(err.a, a);
+        assert_eq!(err.b, b);
+        // The conflict carries the asserted endpoints p,q (in some orientation).
+        let set = [err.diseq_lhs, err.diseq_rhs];
+        assert!(set.contains(&p), "diseq endpoint p missing");
+        assert!(set.contains(&q), "diseq endpoint q missing");
+        // And the endpoints differ from the merged nodes here.
+        assert!(err.diseq_lhs != a || err.diseq_rhs != b);
+    }
+
+    #[test]
     fn asserting_diseq_on_equal_conflicts() {
         let mut eq = EqualityEngine::default();
         let a = eq.intern(term(1));
@@ -344,6 +526,65 @@ mod tests {
     }
 
     #[test]
+    fn rekey_collision_preserves_preexisting_diseq_across_backtrack() {
+        // C1 regression: a re-key key-collision must not permanently drop a
+        // pre-existing disequality on backtrack.
+        //
+        // Setup: a≠m and b≠m. push. merge a=b where a is the union child so its
+        // representative changes; this re-keys pair(a,m) -> pair(b,m), colliding
+        // with the pre-existing pair(b,m). pop. Then merging a's class with m must
+        // STILL conflict (the old code lost the b≠m record and wrongly returned Ok).
+        let mut eq = EqualityEngine::default();
+        let a = eq.intern(term(1));
+        let b = eq.intern(term(2));
+        let m = eq.intern(term(3));
+        // Pad b's class so that on merge(a,b) the larger class (b's) wins and `a`
+        // becomes the union child whose representative changes.
+        let b2 = eq.intern(term(4));
+        eq.merge(b, b2, asserted(1)).unwrap();
+        let mut drained = Vec::new();
+        eq.drain_merges(&mut drained);
+
+        eq.assert_diseq(a, m, asserted(2)).unwrap();
+        eq.assert_diseq(b, m, asserted(3)).unwrap();
+
+        eq.push(); // level 1
+                   // merge a=b: a's class (size 1) loses to b's class (size 2), so a is the
+                   // child and find(a) flips to b's representative, re-keying pair(a,m).
+        eq.merge(a, b, asserted(4)).unwrap();
+        assert_eq!(eq.find(a), eq.find(b));
+        let mut drained2 = Vec::new();
+        eq.drain_merges(&mut drained2); // honor drain-before-pop contract
+        eq.pop(0); // back to level 0: a and b distinct again
+
+        assert_ne!(eq.find(a), eq.find(b), "merge must be undone");
+        // The pre-existing b≠m must still be live: merging b's class with m conflicts.
+        assert!(
+            eq.merge(b, m, asserted(5)).is_err(),
+            "b≠m must survive the collision+backtrack (C1)"
+        );
+        // And a≠m must also still be live.
+        let mut eq2 = EqualityEngine::default();
+        let a = eq2.intern(term(1));
+        let b = eq2.intern(term(2));
+        let m = eq2.intern(term(3));
+        let b2 = eq2.intern(term(4));
+        eq2.merge(b, b2, asserted(1)).unwrap();
+        let mut d = Vec::new();
+        eq2.drain_merges(&mut d);
+        eq2.assert_diseq(a, m, asserted(2)).unwrap();
+        eq2.assert_diseq(b, m, asserted(3)).unwrap();
+        eq2.push();
+        eq2.merge(a, b, asserted(4)).unwrap();
+        eq2.drain_merges(&mut d);
+        eq2.pop(0);
+        assert!(
+            eq2.merge(a, m, asserted(6)).is_err(),
+            "a≠m must survive the collision+backtrack (C1)"
+        );
+    }
+
+    #[test]
     fn explain_returns_the_asserted_chain() {
         let mut eq = EqualityEngine::default();
         let a = eq.intern(term(1));
@@ -361,20 +602,49 @@ mod tests {
 
     #[test]
     fn explain_expands_congruence_to_its_argument_equalities() {
-        // f(x) and f(y) merged by a Congruence edge whose argument equality is x=y.
+        // f(x1,x2) and f(y1,y2) merged by an n-ary congruence over both arg pairs.
+        let mut eq = EqualityEngine::default();
+        let x1 = eq.intern(term(1));
+        let y1 = eq.intern(term(2));
+        let x2 = eq.intern(term(3));
+        let y2 = eq.intern(term(4));
+        let fx = eq.intern(term(5));
+        let fy = eq.intern(term(6));
+        let e1 = Lit::new(Var::new(70), true);
+        let e2 = Lit::new(Var::new(71), true);
+        eq.merge(x1, y1, EqJust::Asserted(e1)).unwrap();
+        eq.merge(x2, y2, EqJust::Asserted(e2)).unwrap();
+        eq.merge_congruence(fx, fy, &[(x1, y1), (x2, y2)]).unwrap();
+        let mut out = Vec::new();
+        eq.explain(fx, fy, &mut out);
+        assert!(out.contains(&EqLeaf::Asserted(e1)));
+        assert!(out.contains(&EqLeaf::Asserted(e2)));
+    }
+
+    #[test]
+    fn congruence_merge_is_undone_on_pop() {
+        // Verify the arena pop path: after backtracking, the congruence merge is gone.
         let mut eq = EqualityEngine::default();
         let x = eq.intern(term(1));
         let y = eq.intern(term(2));
         let fx = eq.intern(term(3));
         let fy = eq.intern(term(4));
-        let xy = Lit::new(Var::new(70), true);
-        eq.merge(x, y, EqJust::Asserted(xy)).unwrap();
-        // The congruence driver (EUF, later) would call this on discovering f(x)~f(y):
-        eq.merge(fx, fy, EqJust::Congruence(x, y)).unwrap();
-        let mut out = Vec::new();
-        eq.explain(fx, fy, &mut out);
-        // Expands to the underlying asserted x=y, not the synthetic congruence edge.
-        assert_eq!(out, vec![EqLeaf::Asserted(xy)]);
+        // Establish x = y at level 0.
+        eq.merge(x, y, asserted(100)).unwrap();
+        let mut events = Vec::new();
+        eq.drain_merges(&mut events);
+        // Push a new level and add a congruence merge f(x) = f(y).
+        eq.push();
+        eq.merge_congruence(fx, fy, &[(x, y)]).unwrap();
+        assert_eq!(eq.find(fx), eq.find(fy), "congruence merge must be visible");
+        eq.drain_merges(&mut events);
+        // Pop back: the congruence merge must be undone.
+        eq.pop(0);
+        assert_ne!(
+            eq.find(fx),
+            eq.find(fy),
+            "congruence merge must be undone after pop"
+        );
     }
 
     #[test]

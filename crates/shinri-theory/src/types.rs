@@ -26,13 +26,21 @@ pub enum Owner {
     Shared,
 }
 
+/// A range into `EqualityEngine`'s congruence-pair arena (keeps `EqJust` `Copy`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct CongRef {
+    pub start: u32,
+    pub len: u32,
+}
+
 /// The justification on a proof-forest edge (spec §4.2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum EqJust {
     /// An input equality literal `a = b` was asserted.
     Asserted(Lit),
-    /// `f(s..) = f(t..)` because each argument pair `(si, ti)` is equal.
-    Congruence(ENodeId, ENodeId),
+    /// `f(s..) = f(t..)` because each argument pair is equal. The pairs live in
+    /// `EqualityEngine.cong_pairs[start .. start+len]`.
+    Congruence(CongRef),
     /// An equality another theory derived; expandable via that theory's `explain`.
     Interface(TheoryJust),
     /// An unconditional definitional equality (e.g. a purification interface
@@ -51,11 +59,24 @@ pub enum EqLeaf {
 
 /// The disequal pair a `merge` would have violated, plus the disequality's
 /// own justification (so the conflict clause can cite it).
+///
+/// `a`/`b` are the nodes passed to the operation that detected the conflict
+/// (the merged app nodes for `merge`/`merge_congruence`; the just-asserted pair
+/// for `assert_diseq`). `diseq_lhs`/`diseq_rhs` are the ORIGINAL endpoint nodes
+/// that were passed to `assert_diseq` when the violated disequality was stored
+/// (NOT their representatives). The two may differ from `a`/`b` when the diseq
+/// was asserted between different class members — callers must bridge
+/// `a`↔`diseq_lhs`/`diseq_rhs` (oriented by representative) to build a sound,
+/// sufficient conflict clause.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct EqConflict {
     pub a: ENodeId,
     pub b: ENodeId,
     pub diseq: EqJust,
+    /// The disequality's left endpoint as originally asserted.
+    pub diseq_lhs: ENodeId,
+    /// The disequality's right endpoint as originally asserted.
+    pub diseq_rhs: ENodeId,
 }
 
 /// Accumulates an explanation. `lits` are resolved input literals; `pending`

@@ -76,7 +76,7 @@ mod tests {
 
     #[test]
     fn null_theory_checks_sat() {
-        let mut t = NullTheory::default();
+        let mut t = NullTheory;
         let terms = Context::new();
         let mut eq = EqualityEngine::default();
         let atoms = AtomRegistry::default();

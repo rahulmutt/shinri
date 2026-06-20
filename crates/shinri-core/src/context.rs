@@ -7,6 +7,7 @@ use rustc_hash::FxHashMap;
 use shinri_num::Rational;
 
 /// The single owning arena for all interned sorts (and, after Task 4, terms).
+#[derive(Clone)]
 pub struct Context {
     sorts: Vec<SortNode>,
     sort_interner: FxHashMap<SortNode, SortId>,
