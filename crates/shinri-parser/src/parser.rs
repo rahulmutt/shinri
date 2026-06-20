@@ -168,6 +168,11 @@ impl<'a> Parser<'a> {
             .map_err(|e| Diagnostic::new(sp.clone(), format!("sort error: {e:?}")))
     }
 
+    /// Public single-term entry point (used by the round-trip test).
+    pub fn parse_term_pub(&mut self, ctx: &mut Context) -> Result<TermId, Diagnostic> {
+        self.parse_term(ctx)
+    }
+
     /// Parse one s-expression term, interning bottom-up.
     pub fn parse_term(&mut self, ctx: &mut Context) -> Result<TermId, Diagnostic> {
         let (tok, sp) = self
