@@ -4,6 +4,10 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 
+use shinri_frontend::{AttrValue, Command};
+use shinri_parser::{StreamItem, StreamingParser};
+use shinri_solver::{CommandResponse, Solver};
+
 /// An SMT-LIB output channel: a standard stream or a file.
 pub enum OutChannel {
     Stdout,
@@ -62,6 +66,140 @@ impl Default for Presentation {
         Presentation {
             print_success: true,
             regular: OutChannel::Stdout,
+        }
+    }
+}
+
+/// Escape a string for inclusion inside an SMT-LIB `"..."` literal.
+fn escape(s: &str) -> String {
+    s.replace('"', "\"\"")
+}
+
+pub struct Driver {
+    solver: Solver,
+    parser: StreamingParser,
+    pres: Presentation,
+}
+
+impl Default for Driver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Driver {
+    pub fn new() -> Driver {
+        Driver {
+            solver: Solver::new(),
+            parser: StreamingParser::new(),
+            pres: Presentation::default(),
+        }
+    }
+
+    /// Feed a chunk and execute every complete command it completes.
+    /// Returns `Ok(true)` once `(exit)`/end-of-stream is reached.
+    pub fn feed(&mut self, chunk: &str) -> io::Result<bool> {
+        self.parser.push_str(chunk);
+        self.drain()
+    }
+
+    /// Flush at input EOF: report a trailing partial command, if any.
+    pub fn finish(&mut self) -> io::Result<()> {
+        if let StreamItem::Command(Err(d)) = self.parser.finish(self.solver.ctx_mut()) {
+            self.error(&d.message)?;
+        }
+        Ok(())
+    }
+
+    fn drain(&mut self) -> io::Result<bool> {
+        loop {
+            match self.parser.next_command(self.solver.ctx_mut()) {
+                StreamItem::NeedMore => return Ok(false),
+                StreamItem::Done => return Ok(true),
+                StreamItem::Command(Err(d)) => self.error(&d.message)?,
+                StreamItem::Command(Ok(cmd)) => {
+                    if self.handle(cmd)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Execute one command. Returns `Ok(true)` if it was `(exit)`.
+    fn handle(&mut self, cmd: Command) -> io::Result<bool> {
+        // Presentation-affecting options are handled here, not by the solver.
+        if let Command::SetOption { keyword, value } = &cmd {
+            if let Some(result) = self.try_presentation_option(keyword, value) {
+                match result {
+                    Ok(()) => self.success()?,
+                    Err(msg) => self.error(&msg)?,
+                }
+                return Ok(false);
+            }
+        }
+
+        let exiting = matches!(cmd, Command::Exit);
+        match self.solver.execute(cmd) {
+            CommandResponse::None => self.success()?,
+            CommandResponse::Sat => self.pres.regular.write_line("sat")?,
+            CommandResponse::Unsat => self.pres.regular.write_line("unsat")?,
+            CommandResponse::Unknown => self.pres.regular.write_line("unknown")?,
+            CommandResponse::Model(s) | CommandResponse::Values(s) => {
+                self.pres.regular.write_line(&s)?
+            }
+            CommandResponse::Error(e) => self.error(&e)?,
+        }
+        Ok(exiting)
+    }
+
+    fn success(&mut self) -> io::Result<()> {
+        if self.pres.print_success {
+            self.pres.regular.write_line("success")?;
+        }
+        Ok(())
+    }
+
+    fn error(&mut self, msg: &str) -> io::Result<()> {
+        self.pres.regular.write_line(&format!("(error \"{}\")", escape(msg)))
+    }
+
+    /// `Some(result)` if `keyword` is a presentation option handled here;
+    /// `None` if it should fall through to the solver.
+    fn try_presentation_option(
+        &mut self,
+        keyword: &str,
+        value: &AttrValue,
+    ) -> Option<Result<(), String>> {
+        let AttrValue::Token(v) = value;
+        match keyword {
+            ":print-success" => Some(match v.as_deref() {
+                Some("true") => {
+                    self.pres.print_success = true;
+                    Ok(())
+                }
+                Some("false") => {
+                    self.pres.print_success = false;
+                    Ok(())
+                }
+                _ => Err(":print-success expects true or false".to_string()),
+            }),
+            ":regular-output-channel" => Some(self.set_regular_channel(v.as_deref())),
+            // `:diagnostic-output-channel` falls through (returns None) to the
+            // solver no-op: accepted and `success`-acked, but not applied —
+            // Phase 1 emits no diagnostic output to route. See Presentation.
+            _ => None,
+        }
+    }
+
+    fn set_regular_channel(&mut self, name: Option<&str>) -> Result<(), String> {
+        let name = name.ok_or_else(|| "output-channel expects a string".to_string())?;
+        match OutChannel::open(name) {
+            Ok(ch) => {
+                self.pres.regular = ch;
+                Ok(())
+            }
+            Err(e) => Err(format!("cannot open channel {name}: {e}")),
         }
     }
 }
