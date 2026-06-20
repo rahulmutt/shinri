@@ -50,6 +50,11 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
         }
     }
 
+    /// Expose the EUF theory field for EUF-specific setup (e.g. set_truth_terms).
+    pub fn euf_mut(&mut self) -> &mut E {
+        &mut self.euf
+    }
+
     /// Classify and register an atom, refusing unsupported constructs (spec §9).
     pub fn register_atom(&mut self, v: Var, atom: TermId) -> Result<(), Unsupported> {
         let owner = classify(&self.terms, atom)?;

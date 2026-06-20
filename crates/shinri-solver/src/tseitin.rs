@@ -16,6 +16,7 @@ pub struct Encoder<'a> {
     sat: &'a mut Sat,
     cache: FxHashMap<TermId, Lit>,
     pub atom_vars: Vec<(Var, TermId)>,
+    pub refused: bool,
     t_true: TermId,
     t_false: TermId,
 }
@@ -27,9 +28,15 @@ impl<'a> Encoder<'a> {
             sat,
             cache: FxHashMap::default(),
             atom_vars: Vec::new(),
+            refused: false,
             t_true,
             t_false,
         }
+    }
+
+    /// Force the encoded top-level formula literal to be true.
+    pub fn assert_top(&mut self, lit: Lit) {
+        self.sat.add_clause(&[lit]);
     }
 
     /// Encode `t` (a Bool-sorted term); return a literal true iff `t` holds.
@@ -132,9 +139,11 @@ impl<'a> Encoder<'a> {
     fn atom(&mut self, t: TermId) -> Lit {
         let v = self.sat.new_var();
         // Refusal (unsupported atom) surfaces as Unknown at the solver layer;
-        // register_atom returns Err for those. We record the (var, term) either
-        // way; check_sat consults registration success.
-        let _ = self.sat.theory_mut().register_atom(v, t);
+        // register_atom returns Err for those. Set refused=true so check_sat
+        // can return Unknown without calling solve().
+        if self.sat.theory_mut().register_atom(v, t).is_err() {
+            self.refused = true;
+        }
         self.atom_vars.push((v, t));
         Lit::new(v, true)
     }

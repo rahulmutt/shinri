@@ -48,4 +48,9 @@ impl ModelBuilder {
             self.values.insert(t, v);
         }
     }
+
+    /// Iterate all assigned `(TermId, ModelVal)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (shinri_core::TermId, crate::types::ModelVal)> + '_ {
+        self.values.iter().map(|(t, v)| (*t, v.clone()))
+    }
 }
