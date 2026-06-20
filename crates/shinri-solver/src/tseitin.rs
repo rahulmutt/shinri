@@ -251,6 +251,18 @@ impl<'a> Encoder<'a> {
     }
 }
 
+/// Minimal term display for model/value output (name for nullary consts, else `t<id>`).
+pub(crate) fn display_term(ctx: &shinri_core::Context, t: shinri_core::TermId) -> String {
+    match ctx.term_node(t) {
+        TermNode::App {
+            op: Op::Uninterpreted(sym),
+            args,
+            ..
+        } if args.len == 0 => ctx.symbol_name(*sym).to_string(),
+        _ => format!("t{}", t.index()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use shinri_core::Op;

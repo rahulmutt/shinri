@@ -7,7 +7,21 @@ mod tseitin;
 
 pub use model::{Model, SolveOutcome};
 
+/// The result of executing one SMT-LIB command. Model/value payloads are
+/// pre-formatted as SMT-LIB text so the driver loop just writes them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandResponse {
+    None,
+    Sat,
+    Unsat,
+    Unknown,
+    Model(String),
+    Values(String),
+    Error(String),
+}
+
 use shinri_core::{Context, Op, SortId, SymbolId, TermId};
+use shinri_frontend::Command;
 use shinri_num::Rational;
 
 pub struct Solver {
@@ -83,6 +97,91 @@ impl Solver {
             }
         }
         self.last_model = None;
+    }
+
+    /// Mutable access to the shared term DAG, so the parser can intern terms
+    /// into the same `Context` the solver uses.
+    pub fn ctx_mut(&mut self) -> &mut Context {
+        &mut self.ctx
+    }
+
+    /// Execute one IR command and return the response.
+    pub fn execute(&mut self, cmd: Command) -> CommandResponse {
+        match cmd {
+            Command::Assert(t) => {
+                self.assert(t);
+                CommandResponse::None
+            }
+            Command::CheckSat => match self.check_sat() {
+                SolveOutcome::Sat => CommandResponse::Sat,
+                SolveOutcome::Unsat => CommandResponse::Unsat,
+                SolveOutcome::Unknown => CommandResponse::Unknown,
+            },
+            Command::CheckSatAssuming(_) => CommandResponse::Unknown,
+            Command::Push(n) => {
+                for _ in 0..n {
+                    self.push();
+                }
+                CommandResponse::None
+            }
+            Command::Pop(n) => {
+                self.pop(n as usize);
+                CommandResponse::None
+            }
+            Command::GetModel => CommandResponse::Model(self.format_model()),
+            Command::GetValue(ts) => {
+                let mut out = String::from("(");
+                for (i, t) in ts.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    let name = crate::tseitin::display_term(&self.ctx, *t);
+                    let v = self.format_value(*t).unwrap_or_else(|| "?".to_string());
+                    out.push_str(&format!("({name} {v})"));
+                }
+                out.push(')');
+                CommandResponse::Values(out)
+            }
+            Command::GetUnsatCore => CommandResponse::Error("unsupported".into()),
+            Command::Reset => {
+                self.assertions.clear();
+                self.scopes.clear();
+                self.last_model = None;
+                CommandResponse::None
+            }
+            Command::SetLogic(_)
+            | Command::DeclareSort { .. }
+            | Command::DeclareFun { .. }
+            | Command::SetOption { .. }
+            | Command::SetInfo { .. }
+            | Command::Exit => CommandResponse::None,
+            Command::GetInfo(_) => CommandResponse::None,
+            Command::Echo(s) => CommandResponse::Values(s),
+            _ => CommandResponse::None,
+        }
+    }
+
+    fn format_value(&self, t: TermId) -> Option<String> {
+        self.last_model
+            .as_ref()?
+            .get(t)
+            .map(crate::model::format_modelval)
+    }
+
+    fn format_model(&self) -> String {
+        match &self.last_model {
+            None => "()".into(),
+            Some(m) => {
+                let mut out = String::from("(");
+                for (t, v) in m.values.iter() {
+                    let name = crate::tseitin::display_term(&self.ctx, *t);
+                    let val = crate::model::format_modelval(v);
+                    out.push_str(&format!("({name} {val})"));
+                }
+                out.push(')');
+                out
+            }
+        }
     }
 
     pub fn check_sat(&mut self) -> SolveOutcome {
@@ -303,6 +402,51 @@ impl Solver {
         let mut enc = Encoder::new(&self.ctx, &mut sat, self.t_true, self.t_false);
         let lit = enc.encode(formula);
         (lit, enc.atom_vars.clone())
+    }
+}
+
+#[cfg(test)]
+mod execute_tests {
+    use super::*;
+    use shinri_frontend::Command;
+
+    #[test]
+    fn execute_runs_check_sat_unsat() {
+        // x < 0 and x > 0 over Real -> unsat. Build via ctx_mut to mirror the parser.
+        let mut s = Solver::new();
+        let r = s.real_sort();
+        let x = s.declare_const("x", r);
+        let zero = s.numeral(shinri_num::Rational::zero(), r);
+        let lt = s.app(Op::Builtin(shinri_core::BuiltinOp::Lt), &[x, zero]);
+        let gt = s.app(Op::Builtin(shinri_core::BuiltinOp::Gt), &[x, zero]);
+        assert!(matches!(
+            s.execute(Command::Assert(lt)),
+            CommandResponse::None
+        ));
+        assert!(matches!(
+            s.execute(Command::Assert(gt)),
+            CommandResponse::None
+        ));
+        assert!(matches!(
+            s.execute(Command::CheckSat),
+            CommandResponse::Unsat
+        ));
+    }
+
+    #[test]
+    fn get_unsat_core_is_unsupported() {
+        let mut s = Solver::new();
+        assert!(matches!(
+            s.execute(Command::GetUnsatCore),
+            CommandResponse::Error(_)
+        ));
+    }
+
+    #[test]
+    fn push_pop_are_noops_response() {
+        let mut s = Solver::new();
+        assert!(matches!(s.execute(Command::Push(2)), CommandResponse::None));
+        assert!(matches!(s.execute(Command::Pop(1)), CommandResponse::None));
     }
 }
 
