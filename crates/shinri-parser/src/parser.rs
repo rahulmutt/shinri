@@ -517,11 +517,18 @@ mod tests {
 
     #[test]
     fn folds_constant_division() {
+        use shinri_core::TermNode;
         let (ctx, t) = parse_one("(/ 1 3)", |_, _| {});
         assert_eq!(ctx.sort_of(t), ctx.real_sort());
         assert_eq!(
             ctx.numeral_value(t).unwrap().clone(),
             Rational::new(Integer::from(1i128), Integer::from(3i128))
+        );
+        // Must be a single Const node — not a deferred Mul App.
+        assert!(
+            matches!(ctx.term_node(t), TermNode::Const { .. }),
+            "expected Const (constant-folded), got {:?}",
+            ctx.term_node(t)
         );
     }
 
@@ -547,30 +554,94 @@ mod tests {
     #[test]
     fn coerces_int_literal_to_real_in_real_context() {
         // (+ x 1) where x : Real  ->  literal 1 coerced to Real, app is Real.
+        use shinri_core::{BuiltinOp, Op, TermNode};
         let (ctx, t) = parse_one("(+ x 1)", |ctx, p| {
             let r = ctx.real_sort();
             let sym = ctx.declare_fun("x", &[], r);
             p.bind_fun("x", sym);
         });
         assert_eq!(ctx.sort_of(t), ctx.real_sort());
+        // Both children of the Add must be Real-sorted (integer literal was re-minted).
+        let kids = match ctx.term_node(t).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Add),
+                args,
+                ..
+            } => ctx.children(args).to_vec(),
+            other => panic!("expected Add App, got {other:?}"),
+        };
+        for kid in &kids {
+            assert_eq!(
+                ctx.sort_of(*kid),
+                ctx.real_sort(),
+                "child {kid:?} should be Real-sorted after coercion"
+            );
+        }
     }
 
     #[test]
     fn let_binding_resolves() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
         let (ctx, t) = parse_one("(let ((y 1.0)) (+ y y))", |_, _| {});
         assert_eq!(ctx.sort_of(t), ctx.real_sort());
+        // Body must be an Add with exactly 2 children, both the SAME term id
+        // (let substituted the same binding for both uses of y).
+        let kids = match ctx.term_node(t).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Add),
+                args,
+                ..
+            } => ctx.children(args).to_vec(),
+            other => panic!("expected Add App, got {other:?}"),
+        };
+        assert_eq!(kids.len(), 2, "Add should have exactly 2 children");
+        assert_eq!(
+            kids[0], kids[1],
+            "both children should be the same TermId (same y binding)"
+        );
+        // Each child must be the numeral 1.0 (Rational 1/1).
+        let expected = Rational::from_int(Integer::from(1i128));
+        for kid in &kids {
+            assert_eq!(
+                ctx.numeral_value(*kid).cloned(),
+                Some(expected.clone()),
+                "child {kid:?} should have value 1.0"
+            );
+        }
     }
 
     #[test]
     fn chained_relation_desugars_to_and() {
         use shinri_core::{BuiltinOp, Op, TermNode};
         let (ctx, t) = parse_one("(< 1.0 2.0 3.0)", |_, _| {});
-        match ctx.term_node(t) {
+        // Top level must be And.
+        let and_args = match ctx.term_node(t).clone() {
             TermNode::App {
                 op: Op::Builtin(BuiltinOp::And),
+                args,
                 ..
-            } => {}
+            } => ctx.children(args).to_vec(),
             other => panic!("expected And, got {other:?}"),
+        };
+        // Must have exactly 2 conjuncts.
+        assert_eq!(
+            and_args.len(),
+            2,
+            "And should have exactly 2 children for (< a b c)"
+        );
+        // Each conjunct must be a Lt App.
+        for child in &and_args {
+            assert!(
+                matches!(
+                    ctx.term_node(*child),
+                    TermNode::App {
+                        op: Op::Builtin(BuiltinOp::Lt),
+                        ..
+                    }
+                ),
+                "each conjunct should be Lt, got {:?}",
+                ctx.term_node(*child)
+            );
         }
     }
 
