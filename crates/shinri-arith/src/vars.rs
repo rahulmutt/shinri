@@ -16,7 +16,7 @@ impl ArithVar {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct VarStore {
     by_term: FxHashMap<TermId, ArithVar>,
     by_comb: FxHashMap<LinComb, ArithVar>,

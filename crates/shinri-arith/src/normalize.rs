@@ -55,16 +55,30 @@ fn hash_integer<H: std::hash::Hasher>(n: Integer, state: &mut H) {
     use std::hash::Hash;
     Hash::hash(&n.is_negative(), state);
     let mut remaining = n.abs();
-    let chunk = Integer::from(u64::MAX as i128) + Integer::one();
+    // Fix 2: assert the invariant that abs() is non-negative so a future edit
+    // removing `.abs()` can't silently produce a negative remainder.
+    debug_assert!(!remaining.is_negative());
+    // Fix 3: 2^64 = 18446744073709551616 fits in i128 (max ~1.7e38); avoids runtime add.
+    // Fix 1: collect chunks into a Vec first so we can hash their count as a
+    // length prefix, making each integer's encoding self-delimiting and keeping
+    // the numer/denom boundary unambiguous for multi-limb Big integers.
+    let chunk = Integer::from((u64::MAX as i128) + 1); // 2^64
+    let mut chunks: Vec<u64> = Vec::new();
     loop {
         let (q, r) = remaining.div_rem(&chunk);
         // r is always in [0, 2^64) because chunk = 2^64
         let digit = r.to_i128().expect("remainder < 2^64 always fits i128") as u64;
-        Hash::hash(&digit, state);
+        chunks.push(digit);
         if q.is_zero() {
             break;
         }
         remaining = q;
+    }
+    // Hash the length prefix before the digits so each integer's encoding is
+    // self-delimiting (prefix-free).
+    Hash::hash(&chunks.len(), state);
+    for digit in &chunks {
+        Hash::hash(digit, state);
     }
 }
 
