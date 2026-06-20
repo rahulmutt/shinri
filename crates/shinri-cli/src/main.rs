@@ -1,4 +1,5 @@
 mod args;
+mod driver;
 
 use std::process::ExitCode;
 
