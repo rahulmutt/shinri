@@ -111,3 +111,21 @@ fn unreadable_file_exits_two() {
     let out = bin().arg("/no/such/shinri/file.smt2").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+#[test]
+fn streaming_agrees_with_known_oracle_scripts() {
+    // Mirrors crates/shinri-solver/tests/script_e2e.rs expectations, but driven
+    // through the streaming CLI (whole-script fed via stdin).
+    let cases = [
+        ("(set-option :print-success false)(set-logic QF_UFLRA)\
+(declare-fun x () Real)(declare-fun y () Real)(declare-fun f (Real) Real)\
+(assert (= x y))(assert (distinct (f x) (f y)))(check-sat)", "unsat\n"),
+        ("(set-option :print-success false)(set-logic QF_LRA)\
+(declare-fun x () Real)(assert (< x 1.0))(assert (> x 0.0))(check-sat)", "sat\n"),
+    ];
+    for (script, expected) in cases {
+        let (stdout, code) = run_stdin(script);
+        assert_eq!(stdout, expected, "script: {script}");
+        assert_eq!(code, Some(0));
+    }
+}
