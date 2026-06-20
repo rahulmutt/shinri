@@ -216,8 +216,8 @@ pub fn normalize_atom(terms: &Context, vars: &mut VarStore, atom: TermId) -> Nor
     let (rv, rc) = linearize(terms, vars, kids[1]);
     let mut both = lv;
     both.extend(rv.into_iter().map(|(x, q)| (x, -q)));
-    let comb_const = lc - rc; // (lhs - rhs) = comb_vars + comb_const
-                              // comb_vars (rel) -comb_const
+    // (lhs - rhs) = comb_vars + comb_const  =>  comb_vars (rel) -comb_const
+    let comb_const = lc - rc;
     let comb = canonicalize(both);
     let rhs = -comb_const;
     match op {
@@ -304,6 +304,44 @@ mod tests {
         assert_eq!(n.rel, Rel::Le);
         assert_eq!(n.comb.0, vec![(xv, -Rational::one())]);
         assert_eq!(n.rhs, Rational::from_int((-5i128).into()));
+    }
+
+    #[test]
+    fn sub_negates_second_term() {
+        // (<= (- x y) 1)  ==>  comb {x:1, y:-1}, Le, rhs 1
+        let mut ctx = Context::new();
+        let x = real_var(&mut ctx, "x");
+        let y = real_var(&mut ctx, "y");
+        let one = num(&mut ctx, 1);
+        let sub = ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[x, y]).unwrap();
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[sub, one]).unwrap();
+        let mut vs = VarStore::default();
+        let n = normalize_atom(&ctx, &mut vs, le);
+        let xv = vs.problem_var(x);
+        let yv = vs.problem_var(y);
+        assert_eq!(n.rel, Rel::Le);
+        let mut got = n.comb.0.clone();
+        got.sort_by_key(|p| p.0);
+        assert_eq!(got, vec![(xv, Rational::one()), (yv, -Rational::one())]);
+        assert_eq!(n.rhs, Rational::one());
+    }
+
+    #[test]
+    fn neg_inverts_coefficients() {
+        // (<= (- x) 0)  i.e. Neg(x)  ==>  comb {x:-1}, Le, rhs 0
+        let mut ctx = Context::new();
+        let x = real_var(&mut ctx, "x");
+        let zero = num(&mut ctx, 0);
+        let negx = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[x]).unwrap();
+        let le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[negx, zero])
+            .unwrap();
+        let mut vs = VarStore::default();
+        let n = normalize_atom(&ctx, &mut vs, le);
+        let xv = vs.problem_var(x);
+        assert_eq!(n.comb.0, vec![(xv, -Rational::one())]);
+        assert_eq!(n.rel, Rel::Le);
+        assert_eq!(n.rhs, Rational::zero());
     }
 
     #[test]
