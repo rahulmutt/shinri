@@ -69,3 +69,14 @@ fn magnitude_abs(x: BigInt) -> BigInt {
         x
     }
 }
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2000))]
+
+    #[test]
+    fn from_str_radix_matches_bigint(digits in "[0-9]{1,40}") {
+        let ours = shinri_num::Integer::from_str_radix(&digits, 10).unwrap();
+        let theirs: BigInt = digits.parse().unwrap();
+        prop_assert_eq!(ours.to_string(), theirs.to_string());
+    }
+}

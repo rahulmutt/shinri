@@ -51,6 +51,11 @@ impl Bounds {
         self.marks.push(self.trail.len());
     }
 
+    /// Number of live marks (so a caller can `undo_to` this exact depth later).
+    pub fn marks_len(&self) -> usize {
+        self.marks.len()
+    }
+
     /// Undo down to `checkpoints` remaining marks (absolute count of marks kept).
     pub fn undo_to(&mut self, checkpoints: usize) {
         while self.marks.len() > checkpoints {

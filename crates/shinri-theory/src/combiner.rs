@@ -9,7 +9,7 @@ use crate::model::ModelBuilder;
 use crate::proof::CertLog;
 use crate::solver_trait::{TCheck, TheoryCtx, TheorySolver};
 use crate::types::{Explainer, MergeEvent, Owner};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{Context, Lit, TermId, TheoryJust, Var};
 use shinri_sat::{Effort, Theory, TheoryResult};
 
@@ -76,6 +76,10 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                     atoms: &self.atoms,
                 };
                 self.arith.new_var(&mut cx, v, atom);
+                // CRITICAL-2: a UF-application used directly as an operand of a
+                // linear arith atom (e.g. `(- (f x0) (f x1))`) must be interned
+                // into EUF so congruence applies and it joins the shared set S.
+                self.euf.register_arith_uf_terms(&mut cx, atom);
             }
             Owner::Shared => {
                 // Purify first: splits mixed terms, emitting defining equalities
@@ -98,6 +102,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                 };
                 self.euf.new_var(&mut cx, v, atom);
                 self.arith.new_var(&mut cx, v, atom);
+                self.euf.register_arith_uf_terms(&mut cx, atom);
             }
         }
         Ok(())
@@ -190,9 +195,41 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
 }
 
 impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
-    /// Run both theories' Full check to a joint fixpoint over the shared engine.
+    /// Run both theories' Full check to a joint fixpoint over the shared engine,
+    /// with BIDIRECTIONAL Nelson-Oppen equality propagation (Task 12b).
     /// Returns the conflicting antecedent leaves, or None if jointly consistent.
+    ///
+    /// Each round:
+    ///   euf.check → arith.check → drain pending merges
+    ///   → arith→EUF: merge arith-entailed shared equalities into EUF (closes
+    ///     congruence; a violated diseq is a conflict)
+    ///   → EUF→arith: feed EUF congruence classes' Real members into arith as
+    ///     interface equalities (so arith can detect bound infeasibility)
+    /// Re-loops while either direction makes progress; terminates at fixpoint.
+    ///
+    /// TERMINATION (R5): the shared term set S is finite; arith→EUF skips pairs
+    /// already equal in `cx.eq` (merges are monotone — classes only ever shrink
+    /// in number), and EUF→arith skips pairs already asserted this round. So the
+    /// number of new merges/assertions is bounded and the loop converges.
     fn drive_final_check(&mut self) -> Option<Vec<crate::types::EqLeaf>> {
+        // Compute the shared Real-term set S once and ensure arith has a var
+        // (incl. numeral pins) for every member BEFORE any arith check that
+        // reads entailed equalities (R4: pins must be active during solving).
+        let shared: Vec<TermId> = {
+            let mut cx = TheoryCtx {
+                terms: &self.terms,
+                eq: &mut self.eq,
+                atoms: &self.atoms,
+            };
+            let s = self.euf.shared_real_terms(&mut cx);
+            for &t in &s {
+                self.arith.ensure_shared_var(&mut cx, t);
+            }
+            s
+        };
+        // Pairs already asserted EUF→arith this check (R5 termination guard).
+        let mut iface_asserted: FxHashSet<(TermId, TermId)> = FxHashSet::default();
+
         loop {
             {
                 let mut cx = TheoryCtx {
@@ -207,12 +244,110 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                     return Some(cf);
                 }
             }
-            // Did the round produce a new interface merge? If so, re-run so the
-            // other theory observes it; otherwise we are at fixpoint.
+            // Did the existing round produce a new interface/congruence merge?
             self.merges.clear();
             self.eq.drain_merges(&mut self.merges);
-            let progressed = !self.merges.is_empty();
+            let mut progressed = !self.merges.is_empty();
             self.merges.clear();
+
+            // ── arith → EUF: arith.check just returned Sat above, so read its
+            //    entailed shared equalities and merge them into EUF. ──────────
+            if !shared.is_empty() {
+                let entailed: Vec<(TermId, TermId, u32)> = {
+                    let mut cx = TheoryCtx {
+                        terms: &self.terms,
+                        eq: &mut self.eq,
+                        atoms: &self.atoms,
+                    };
+                    self.arith.entailed_equalities(&mut cx, &shared)
+                };
+                for (a, b, tag) in entailed {
+                    let mut cx = TheoryCtx {
+                        terms: &self.terms,
+                        eq: &mut self.eq,
+                        atoms: &self.atoms,
+                    };
+                    let an = cx.eq.intern(a);
+                    let bn = cx.eq.intern(b);
+                    if cx.eq.are_equal(an, bn) {
+                        continue; // R5: already merged — don't re-emit (no progress)
+                    }
+                    let just = TheoryJust {
+                        theory: A::THEORY_ID,
+                        tag,
+                    };
+                    if let Some(cf) = self.euf.consume_interface_equality(&mut cx, a, b, just) {
+                        return Some(cf);
+                    }
+                    progressed = true;
+                }
+            }
+
+            // ── EUF → arith: feed each EUF congruence class's Real members to
+            //    arith as interface equalities (needed for congruence-derived
+            //    equalities, e.g. a=b ⟹ g(a)=g(b) feeding arith). ────────────
+            if !shared.is_empty() {
+                // Group shared terms by current congruence class representative.
+                let mut classes: FxHashMap<crate::types::ENodeId, Vec<TermId>> =
+                    FxHashMap::default();
+                {
+                    let cx = TheoryCtx {
+                        terms: &self.terms,
+                        eq: &mut self.eq,
+                        atoms: &self.atoms,
+                    };
+                    for &t in &shared {
+                        let n = cx.eq.intern(t);
+                        let rep = cx.eq.find(n);
+                        classes.entry(rep).or_default().push(t);
+                    }
+                }
+                for members in classes.values() {
+                    if members.len() < 2 {
+                        continue;
+                    }
+                    // Assert each non-representative member equal to the first.
+                    let rep = members[0];
+                    for &m in &members[1..] {
+                        let key = if rep.index() <= m.index() {
+                            (rep, m)
+                        } else {
+                            (m, rep)
+                        };
+                        if !iface_asserted.insert(key) {
+                            continue; // R5: already asserted this round
+                        }
+                        let mut cx = TheoryCtx {
+                            terms: &self.terms,
+                            eq: &mut self.eq,
+                            atoms: &self.atoms,
+                        };
+                        // Approach (a): mint an EUF-explainable tag for rep=m so
+                        // a later arith conflict citing it resolves to EUF's
+                        // input-literal proof via euf.explain → cx.eq.explain.
+                        let tag = self.euf.mint_eq_tag(&mut cx, rep, m);
+                        let just = TheoryJust {
+                            theory: E::THEORY_ID,
+                            tag,
+                        };
+                        if let Some(cf) =
+                            self.arith.consume_interface_equality(&mut cx, rep, m, just)
+                        {
+                            return Some(cf);
+                        }
+                        progressed = true;
+                    }
+                }
+            }
+
+            // Drain any merges produced by the arith→EUF step before deciding.
+            self.merges.clear();
+            self.eq.drain_merges(&mut self.merges);
+            if !self.merges.is_empty() {
+                progressed = true;
+            }
+            self.merges.clear();
+
             if !progressed {
                 return None;
             }

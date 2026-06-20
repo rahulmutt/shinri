@@ -7,7 +7,21 @@ mod tseitin;
 
 pub use model::{Model, SolveOutcome};
 
+/// The result of executing one SMT-LIB command. Model/value payloads are
+/// pre-formatted as SMT-LIB text so the driver loop just writes them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CommandResponse {
+    None,
+    Sat,
+    Unsat,
+    Unknown,
+    Model(String),
+    Values(String),
+    Error(String),
+}
+
 use shinri_core::{Context, Op, SortId, SymbolId, TermId};
+use shinri_frontend::Command;
 use shinri_num::Rational;
 
 pub struct Solver {
@@ -85,6 +99,91 @@ impl Solver {
         self.last_model = None;
     }
 
+    /// Mutable access to the shared term DAG, so the parser can intern terms
+    /// into the same `Context` the solver uses.
+    pub fn ctx_mut(&mut self) -> &mut Context {
+        &mut self.ctx
+    }
+
+    /// Execute one IR command and return the response.
+    pub fn execute(&mut self, cmd: Command) -> CommandResponse {
+        match cmd {
+            Command::Assert(t) => {
+                self.assert(t);
+                CommandResponse::None
+            }
+            Command::CheckSat => match self.check_sat() {
+                SolveOutcome::Sat => CommandResponse::Sat,
+                SolveOutcome::Unsat => CommandResponse::Unsat,
+                SolveOutcome::Unknown => CommandResponse::Unknown,
+            },
+            Command::CheckSatAssuming(_) => CommandResponse::Unknown,
+            Command::Push(n) => {
+                for _ in 0..n {
+                    self.push();
+                }
+                CommandResponse::None
+            }
+            Command::Pop(n) => {
+                self.pop(n as usize);
+                CommandResponse::None
+            }
+            Command::GetModel => CommandResponse::Model(self.format_model()),
+            Command::GetValue(ts) => {
+                let mut out = String::from("(");
+                for (i, t) in ts.iter().enumerate() {
+                    if i > 0 {
+                        out.push(' ');
+                    }
+                    let name = crate::tseitin::display_term(&self.ctx, *t);
+                    let v = self.format_value(*t).unwrap_or_else(|| "?".to_string());
+                    out.push_str(&format!("({name} {v})"));
+                }
+                out.push(')');
+                CommandResponse::Values(out)
+            }
+            Command::GetUnsatCore => CommandResponse::Error("unsupported".into()),
+            Command::Reset => {
+                self.assertions.clear();
+                self.scopes.clear();
+                self.last_model = None;
+                CommandResponse::None
+            }
+            Command::SetLogic(_)
+            | Command::DeclareSort { .. }
+            | Command::DeclareFun { .. }
+            | Command::SetOption { .. }
+            | Command::SetInfo { .. }
+            | Command::Exit => CommandResponse::None,
+            Command::GetInfo(_) => CommandResponse::None,
+            Command::Echo(s) => CommandResponse::Values(s),
+            _ => CommandResponse::None,
+        }
+    }
+
+    fn format_value(&self, t: TermId) -> Option<String> {
+        self.last_model
+            .as_ref()?
+            .get(t)
+            .map(crate::model::format_modelval)
+    }
+
+    fn format_model(&self) -> String {
+        match &self.last_model {
+            None => "()".into(),
+            Some(m) => {
+                let mut out = String::from("(");
+                for (t, v) in m.values.iter() {
+                    let name = crate::tseitin::display_term(&self.ctx, *t);
+                    let val = crate::model::format_modelval(v);
+                    out.push_str(&format!("({name} {val})"));
+                }
+                out.push(')');
+                out
+            }
+        }
+    }
+
     pub fn check_sat(&mut self) -> SolveOutcome {
         use crate::tseitin::Encoder;
         use shinri_core::NoProof;
@@ -130,7 +229,24 @@ impl Solver {
             }
             atom_vars = enc.atom_vars.clone();
             refused = enc.refused;
-            mixed = enc.saw_shared || (enc.saw_euf && enc.saw_arith);
+            // saw_shared: an atom mixes arith and non-arith sorts in one equality
+            // (requires purification not yet implemented) → Unknown.
+            //
+            // The former `saw_euf_nonreal && saw_arith` fence (EUF atoms on a
+            // purely uninterpreted sort AND arith atoms on Real/Int) is REMOVED
+            // (Task 12b): bidirectional Nelson-Oppen equality propagation now
+            // exchanges entailed equalities between Arith and EUF over shared
+            // Real terms (Combiner::drive_final_check). The two soundness cases:
+            //   * variable-disjoint EUF(sort U) + Arith (e.g. `(= p:U q:U) ∧
+            //     (> x 0)`) is trivially combinable → handled directly;
+            //   * shared-Real cases (`x≥5 ∧ x≤5 ∧ distinct(f x)(f 5)`) are caught
+            //     by N-O (LRA + EUF are convex ⇒ entailed-equality exchange is
+            //     sound AND complete for QF_UFLRA).
+            // Genuinely unsupported constructs (nonlinear, Int arith, quantifiers,
+            // mixed-sort equalities) remain fenced via classify→Unsupported and
+            // `saw_shared`. (`saw_arith`/`saw_euf`/`saw_euf_nonreal` are retained
+            // as classification signals but no longer gate the result.)
+            mixed = enc.saw_shared;
         }
 
         if refused || mixed {
@@ -175,10 +291,39 @@ impl Solver {
     ///   `(distinct a..n)`  →  `(and (lower(distinct ai aj)) ...)` for all pairs
     ///
     /// EUF/Bool `=` and binary EUF `distinct` pass through unchanged.
+    /// Returns true if `t` is a "pure arith" term — a linear combination of
+    /// nullary uninterpreted constants and numerals. Non-nullary uninterpreted
+    /// applications (function calls like `f(x)`) are EUF-structure, not pure arith.
+    fn is_pure_arith(ctx: &shinri_core::Context, t: TermId) -> bool {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        match ctx.term_node(t) {
+            TermNode::Const { .. } => true, // numeral constant
+            TermNode::App { op, args, .. } => {
+                let children = ctx.children(*args);
+                match op {
+                    // Nullary uninterpreted symbol = a plain variable.
+                    Op::Uninterpreted(_) if children.is_empty() => true,
+                    // Non-nullary uninterpreted = function application (EUF).
+                    Op::Uninterpreted(_) => false,
+                    // Linear arithmetic ops: all children must be pure arith too.
+                    Op::Builtin(
+                        BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Neg,
+                    ) => children.iter().all(|&c| Self::is_pure_arith(ctx, c)),
+                    _ => false,
+                }
+            }
+        }
+    }
+
     fn lower(&mut self, t: TermId) -> TermId {
         use shinri_core::{BuiltinOp, Op, TermNode};
         match self.ctx.term_node(t).clone() {
-            // ── Real equality: (= a b) → (and (Le a b) (Ge a b)) ─────────────
+            // ── Real equality: (= a b) → (and (= a b) (Le a b) (Ge a b)) ─────
+            //
+            // We keep the original Eq atom so EUF can see x=y for congruence
+            // (needed for QF_UFLRA: x=y must reach EUF so congruence can derive
+            // f(x)=f(y)). The Le/Ge atoms are also added so arith can reason
+            // about the bound constraint. Both are semantically equivalent to (= a b).
             TermNode::App {
                 op: Op::Builtin(BuiltinOp::Eq),
                 args,
@@ -189,10 +334,16 @@ impl Solver {
                 // EUF/Bool equalities for the theory encoder.
                 if kids.len() >= 2 && self.ctx.sort_of(kids[0]) == self.ctx.real_sort() {
                     // Real-sorted (= a b c ...) : a == b == c == ...
-                    // Chain adjacent pairs: (Le a b)∧(Ge a b) ∧ (Le b c)∧(Ge b c) ∧ ...
-                    // Transitivity makes this equivalent to all-equal.
-                    let mut conj: Vec<TermId> = Vec::with_capacity((kids.len() - 1) * 2);
+                    // Chain adjacent pairs:
+                    //   (= a b)∧(Le a b)∧(Ge a b) ∧ (= b c)∧(Le b c)∧(Ge b c) ∧ ...
+                    // The Eq atoms go to EUF for congruence; the Le/Ge go to Arith.
+                    let mut conj: Vec<TermId> = Vec::with_capacity((kids.len() - 1) * 3);
                     for w in kids.windows(2) {
+                        // Keep the original binary Eq for EUF.
+                        let eq = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Eq), &[w[0], w[1]])
+                            .expect("Eq well-sorted");
                         let le = self
                             .ctx
                             .mk_app(Op::Builtin(BuiltinOp::Le), &[w[0], w[1]])
@@ -201,6 +352,7 @@ impl Solver {
                             .ctx
                             .mk_app(Op::Builtin(BuiltinOp::Ge), &[w[0], w[1]])
                             .expect("Ge well-sorted");
+                        conj.push(eq);
                         conj.push(le);
                         conj.push(ge);
                     }
@@ -219,26 +371,39 @@ impl Solver {
             } => {
                 let kids: Vec<TermId> = self.ctx.children(args).to_vec();
                 if kids.len() <= 2 {
-                    // Binary distinct: rewrite to (or (Lt a b) (Gt a b)) if Real.
+                    // Binary distinct over Real sort.
                     if self.ctx.sort_of(kids[0]) == self.ctx.real_sort() {
-                        let lt = self
-                            .ctx
-                            .mk_app(Op::Builtin(BuiltinOp::Lt), &[kids[0], kids[1]])
-                            .expect("Lt well-sorted");
-                        let gt = self
-                            .ctx
-                            .mk_app(Op::Builtin(BuiltinOp::Gt), &[kids[0], kids[1]])
-                            .expect("Gt well-sorted");
-                        self.ctx
-                            .mk_app(Op::Builtin(BuiltinOp::Or), &[lt, gt])
-                            .expect("or well-sorted")
+                        // If both args are pure arithmetic terms (nullary vars /
+                        // numerals / linear combinations), lower to (or Lt Gt) so
+                        // the Arith theory can reason about the disequality.
+                        // If either arg contains a function application (EUF), keep
+                        // it as a Distinct atom for EUF — congruence closure handles
+                        // it (e.g. distinct(f x)(f y) when x=y → conflict via EUF).
+                        if Self::is_pure_arith(&self.ctx, kids[0])
+                            && Self::is_pure_arith(&self.ctx, kids[1])
+                        {
+                            let lt = self
+                                .ctx
+                                .mk_app(Op::Builtin(BuiltinOp::Lt), &[kids[0], kids[1]])
+                                .expect("Lt well-sorted");
+                            let gt = self
+                                .ctx
+                                .mk_app(Op::Builtin(BuiltinOp::Gt), &[kids[0], kids[1]])
+                                .expect("Gt well-sorted");
+                            self.ctx
+                                .mk_app(Op::Builtin(BuiltinOp::Or), &[lt, gt])
+                                .expect("or well-sorted")
+                        } else {
+                            // EUF function args: keep as Distinct atom for EUF.
+                            t
+                        }
                     } else {
-                        // EUF binary distinct: pass through unchanged.
+                        // Non-Real (EUF) binary distinct: pass through unchanged.
                         t
                     }
                 } else {
                     // N-ary distinct: split into pairwise binary distincts, each
-                    // recursively lowered (so Real pairs → Lt/Gt, EUF pairs stay).
+                    // recursively lowered (so pure-Real pairs → Lt/Gt, EUF pairs stay).
                     let mut pairs = Vec::new();
                     for i in 0..kids.len() {
                         for j in (i + 1)..kids.len() {
@@ -246,7 +411,7 @@ impl Solver {
                                 .ctx
                                 .mk_app(Op::Builtin(BuiltinOp::Distinct), &[kids[i], kids[j]])
                                 .expect("binary distinct well-sorted");
-                            // Recurse so Real pairs become (or Lt Gt).
+                            // Recurse so pure-Real pairs become (or Lt Gt).
                             let lowered_d = self.lower(d);
                             pairs.push(lowered_d);
                         }
@@ -303,6 +468,51 @@ impl Solver {
         let mut enc = Encoder::new(&self.ctx, &mut sat, self.t_true, self.t_false);
         let lit = enc.encode(formula);
         (lit, enc.atom_vars.clone())
+    }
+}
+
+#[cfg(test)]
+mod execute_tests {
+    use super::*;
+    use shinri_frontend::Command;
+
+    #[test]
+    fn execute_runs_check_sat_unsat() {
+        // x < 0 and x > 0 over Real -> unsat. Build via ctx_mut to mirror the parser.
+        let mut s = Solver::new();
+        let r = s.real_sort();
+        let x = s.declare_const("x", r);
+        let zero = s.numeral(shinri_num::Rational::zero(), r);
+        let lt = s.app(Op::Builtin(shinri_core::BuiltinOp::Lt), &[x, zero]);
+        let gt = s.app(Op::Builtin(shinri_core::BuiltinOp::Gt), &[x, zero]);
+        assert!(matches!(
+            s.execute(Command::Assert(lt)),
+            CommandResponse::None
+        ));
+        assert!(matches!(
+            s.execute(Command::Assert(gt)),
+            CommandResponse::None
+        ));
+        assert!(matches!(
+            s.execute(Command::CheckSat),
+            CommandResponse::Unsat
+        ));
+    }
+
+    #[test]
+    fn get_unsat_core_is_unsupported() {
+        let mut s = Solver::new();
+        assert!(matches!(
+            s.execute(Command::GetUnsatCore),
+            CommandResponse::Error(_)
+        ));
+    }
+
+    #[test]
+    fn push_pop_are_noops_response() {
+        let mut s = Solver::new();
+        assert!(matches!(s.execute(Command::Push(2)), CommandResponse::None));
+        assert!(matches!(s.execute(Command::Pop(1)), CommandResponse::None));
     }
 }
 

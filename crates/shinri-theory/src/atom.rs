@@ -43,8 +43,22 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
     }
 }
 
-/// Equality routing: by the argument sort. Uninterpreted sort → EUF; arithmetic
-/// sort → Arith; a mix (after purification both sides are pure) → Shared.
+/// Equality routing: by the argument sort.
+///
+/// Equalities (`Eq`) are always routed to EUF so the congruence closure can
+/// observe them for congruence propagation (x=y → f(x)=f(y)). The solver's
+/// `lower()` pass ALSO emits `Le`/`Ge` atoms for Real-sorted equalities so the
+/// Arith theory can reason about the bound constraint; those atoms route to
+/// `Owner::Arith` separately. This dual-route approach enables QF_UFLRA:
+///   EUF handles congruence, Arith handles linear arithmetic, they share terms.
+///
+/// Disequalities (`Distinct`) whose arguments are of a non-arithmetic sort route
+/// to EUF. Real-sorted `Distinct` atoms only reach classify if `lower()` kept
+/// them as-is (i.e., an arg contains a function application like f(x)); in that
+/// case EUF handles it via diseq assertion. Pure-arith `Distinct` is lowered to
+/// `(or Lt Gt)` before reaching here.
+///
+/// A mix of arith and non-arith argument sorts (rare after purification) → Shared.
 fn classify_equality(terms: &Context, args: &[TermId]) -> Owner {
     let int_s = terms.int_sort();
     let real_s = terms.real_sort();
@@ -52,14 +66,15 @@ fn classify_equality(terms: &Context, args: &[TermId]) -> Owner {
         let s = terms.sort_of(t);
         s == int_s || s == real_s
     };
-    let all_arith = args.iter().all(|&a| is_arith(a));
     let none_arith = args.iter().all(|&a| !is_arith(a));
-    if all_arith {
-        Owner::Arith
-    } else if none_arith {
+    if none_arith {
         Owner::Euf
     } else {
-        Owner::Shared
+        // All-arith or mixed: route to EUF. For Eq atoms, lower() will have
+        // emitted companion Le/Ge atoms that go to Arith separately, so both
+        // theories see the constraint. For Distinct atoms that reached here,
+        // lower() decided they need EUF (function-application args).
+        Owner::Euf
     }
 }
 

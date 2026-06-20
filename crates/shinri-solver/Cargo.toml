@@ -12,10 +12,13 @@ shinri-theory = { path = "../shinri-theory" }
 shinri-euf = { path = "../shinri-euf" }
 shinri-arith = { path = "../shinri-arith" }
 shinri-num = { path = "../shinri-num" }
+shinri-frontend = { path = "../shinri-frontend" }
 rustc-hash = "2"
 
 [dev-dependencies]
 easy-smt = "0.2"
+shinri-parser = { path = "../shinri-parser" }
+shinri-frontend = { path = "../shinri-frontend" }
 
 [features]
 # Differential oracle harness (Task 17); off by default; needs `z3` on PATH.

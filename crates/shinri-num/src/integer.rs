@@ -371,6 +371,33 @@ impl Integer {
     }
 }
 
+/// Failure parsing a decimal/radix string into an `Integer`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ParseIntegerError;
+
+impl core::fmt::Display for ParseIntegerError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "invalid integer literal")
+    }
+}
+
+impl Integer {
+    /// Parse an unsigned digit string in `radix` (2..=16) via Horner's method.
+    /// No sign, no whitespace, no prefix; empty or non-digit input is an error.
+    pub fn from_str_radix(s: &str, radix: u32) -> Result<Integer, ParseIntegerError> {
+        if s.is_empty() {
+            return Err(ParseIntegerError);
+        }
+        let base = Integer::from(radix as i128);
+        let mut acc = Integer::zero();
+        for ch in s.chars() {
+            let d = ch.to_digit(radix).ok_or(ParseIntegerError)?;
+            acc = acc * base.clone() + Integer::from(d as i128);
+        }
+        Ok(acc)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -524,5 +551,25 @@ mod tests {
         assert_eq!(big.to_i128(), None);
         let big_neg = Integer::from(i128::MIN) * Integer::from(2i128);
         assert_eq!(big_neg.to_i128(), None);
+    }
+
+    #[test]
+    fn from_str_radix_small_and_big() {
+        assert_eq!(
+            Integer::from_str_radix("0", 10).unwrap(),
+            Integer::from(0i128)
+        );
+        assert_eq!(
+            Integer::from_str_radix("42", 10).unwrap(),
+            Integer::from(42i128)
+        );
+        // 2^128 — genuinely exceeds i128, exercises the Big path.
+        let two_128 = Integer::from(1i128 << 100) * Integer::from(1i128 << 28);
+        assert_eq!(
+            Integer::from_str_radix("340282366920938463463374607431768211456", 10).unwrap(),
+            two_128
+        );
+        assert!(Integer::from_str_radix("", 10).is_err());
+        assert!(Integer::from_str_radix("12a", 10).is_err());
     }
 }

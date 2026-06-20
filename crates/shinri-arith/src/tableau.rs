@@ -104,7 +104,7 @@ fn lcm(a: &Integer, b: &Integer) -> Integer {
 use crate::normalize::LinComb;
 use rustc_hash::FxHashSet;
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Tableau {
     pub rows: FxHashMap<ArithVar, Row>,
     pub basic: FxHashSet<ArithVar>,
@@ -125,7 +125,33 @@ impl Tableau {
         if self.basic.contains(&slack) {
             return;
         }
-        let row = Row::from_rationals(&comb.0);
+        // The new row `slack = Σ c_j x_j` must be expressed over NONBASIC vars to
+        // preserve the tableau invariant. If any `x_j` is currently basic (which
+        // happens when a slack is defined mid-solve after pivots — e.g. the N-O
+        // entailment `u-v` slacks), substitute it by its own row.
+        let mut acc: FxHashMap<ArithVar, Rational> = FxHashMap::default();
+        for (v, c) in &comb.0 {
+            if self.basic.contains(v) {
+                // A var in `basic` MUST have a row (the two sets are maintained
+                // in lockstep); guard the index so a desync surfaces loudly in
+                // debug builds rather than panicking opaquely (12a finding).
+                debug_assert!(
+                    self.rows.contains_key(v),
+                    "basic comb var lacks a tableau row (basic/rows desync)"
+                );
+                let row = &self.rows[v];
+                for j in row.vars() {
+                    let add = c.clone() * row.coeff(j);
+                    let e = acc.entry(j).or_insert_with(Rational::zero);
+                    *e = e.clone() + add;
+                }
+            } else {
+                let e = acc.entry(*v).or_insert_with(Rational::zero);
+                *e = e.clone() + c.clone();
+            }
+        }
+        let pairs: Vec<(ArithVar, Rational)> = acc.into_iter().collect();
+        let row = Row::from_rationals(&pairs);
         self.rows.insert(slack, row);
         self.basic.insert(slack);
     }

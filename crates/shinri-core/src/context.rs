@@ -81,6 +81,10 @@ impl Context {
     pub fn sort_node(&self, id: SortId) -> &SortNode {
         &self.sorts[id.index()]
     }
+
+    pub fn symbol_name(&self, sym: SymbolId) -> &str {
+        self.symbols.resolve(sym)
+    }
 }
 
 impl Context {

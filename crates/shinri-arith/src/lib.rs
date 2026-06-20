@@ -19,10 +19,18 @@ use crate::encode::AtomEncoding;
 use crate::normalize::{normalize_atom, LinComb, Rel};
 use crate::tableau::Tableau;
 use crate::vars::VarStore;
-use shinri_core::{Lit, TermId, TheoryJust, Var};
+use rustc_hash::FxHashMap;
+use shinri_core::{Context, Lit, TermId, TheoryJust, Var};
 use shinri_num::{DeltaRational, Rational};
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Effort, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
+
+/// SAT variables are dense from 0; the SAT solver never mints variables in the
+/// top half of the `u32` space. We reserve that region for the synthetic
+/// "sentinel" literals injected by Nelson-Oppen entailment probes so they can
+/// never collide with an input literal and are trivially stripped from a
+/// conflict's antecedent (R2).
+const SENTINEL_VAR_BASE: u32 = 1 << 30;
 
 #[derive(Default)]
 pub struct Arith {
@@ -34,6 +42,25 @@ pub struct Arith {
     /// Per SAT-var encoding (indexed by Var::index()).
     enc: Vec<Option<AtomEncoding>>,
     level: usize,
+    /// Antecedents of entailed-equality tags produced by `entailed_equalities`
+    /// (the resolved union of the two probes' Farkas cores). Each leaf is either
+    /// an input bound literal (`EqLeaf::Asserted`) or an interface dependency
+    /// (`EqLeaf::Interface`) that the Combiner expands recursively via the owning
+    /// theory's `explain` (CRITICAL-1). Looked up by `explain`; cleared on `pop`.
+    eq_antecedents: FxHashMap<u32, Vec<EqLeaf>>,
+    /// (decision level, tag) so `pop(level)` can drop tags created at higher
+    /// levels (R5 backtrack safety).
+    tag_trail: Vec<(usize, u32)>,
+    /// Monotonic counter handing out fresh `entailed_equalities` tags.
+    next_tag: u32,
+    /// Counter handing out fresh synthetic sentinel literals for probes.
+    next_sentinel: u32,
+    /// Interface justifications (EUF→arith) stored under a tag, keyed by the tag.
+    /// Cleared on `pop` via `tag_trail`.
+    iface_justs: FxHashMap<u32, TheoryJust>,
+    /// Maps an interface pseudo-lit's code back to its `iface_justs` tag, so a
+    /// Farkas conflict that cites the pseudo-lit resolves to `Interface(just)`.
+    iface_lit: FxHashMap<u32, u32>,
 }
 
 impl Arith {
@@ -267,6 +294,289 @@ impl Arith {
             self.value[b.index()] = acc;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Nelson-Oppen interface (Task 12a): shared-var interning, entailed-equality
+    // detection (state-safe probes), explanation, EUF→arith equality intake.
+    // These are arith-local: they take `&Context` (term info) only so they are
+    // unit-testable without the Combiner's TheoryCtx. 12b wires them up.
+    // -----------------------------------------------------------------------
+
+    /// Mint a fresh synthetic sentinel literal for an entailment probe. Lives in
+    /// the reserved top-half var space so it can never equal an input lit (R2).
+    fn fresh_sentinel(&mut self) -> Lit {
+        // The sentinel region [SENTINEL_VAR_BASE, u32::MAX] must not be exhausted
+        // (would collide with another sentinel or wrap into real-var space).
+        debug_assert!(
+            self.next_sentinel < u32::MAX - SENTINEL_VAR_BASE,
+            "N-O sentinel var region exhausted"
+        );
+        let raw = SENTINEL_VAR_BASE + self.next_sentinel;
+        self.next_sentinel += 1;
+        Lit::new(Var::new(raw), true)
+    }
+
+    /// Whether `lit` is a synthetic N-O probe/interface sentinel (vs a real
+    /// input literal). INVARIANT (12a finding): real SAT vars are dense from 0
+    /// and the SAT solver never mints one in the reserved top-half region, so
+    /// real vars stay strictly `< SENTINEL_VAR_BASE` (= 1<<30) and only
+    /// synthetic sentinels live at/above it. `fresh_sentinel` debug-asserts it
+    /// never wraps out of that region.
+    #[inline]
+    fn is_sentinel(lit: Lit) -> bool {
+        lit.var().index() as u32 >= SENTINEL_VAR_BASE
+    }
+
+    /// Intern a problem var for the Real-sorted shared term `t`. If `t` is a
+    /// numeral, ALSO pin it with an unconditional fixed bound lower=upper=value,
+    /// marked Definitional (NO input Lit — uses a sentinel that `explain`
+    /// contributes nothing for). Plain vars / UF-application terms just get a
+    /// free problem var. (R4)
+    pub fn ensure_shared_var(&mut self, ctx: &Context, t: TermId) {
+        let v = self.vars.problem_var(t);
+        self.grow_value();
+        if let Some(r) = ctx.numeral_value(t) {
+            let dr = DeltaRational::from_rational(r.clone());
+            // Skip if already pinned to this value (idempotent).
+            let already = matches!(self.bounds.lower(v), Some((lo, _)) if *lo == dr)
+                && matches!(self.bounds.upper(v), Some((hi, _)) if *hi == dr);
+            if !already {
+                // Definitional/unconditional: a sentinel lit that explain drops.
+                let def = self.fresh_sentinel();
+                let _ = self.bounds.tighten(v, BoundKind::Lower, dr.clone(), def);
+                let _ = self.bounds.tighten(v, BoundKind::Upper, dr.clone(), def);
+                // Keep β consistent for a nonbasic numeral var.
+                if !self.tableau.is_basic(v) {
+                    self.value[v.index()] = dr;
+                }
+            }
+        }
+    }
+
+    /// Build the canonical `u - v` linear combination over problem vars.
+    fn diff_comb(uv: ArithVar, vv: ArithVar) -> LinComb {
+        let mut raw = vec![(uv, Rational::one()), (vv, -Rational::one())];
+        raw.sort_by_key(|p| p.0);
+        // u and v are distinct problem vars, so no cancellation.
+        LinComb(raw)
+    }
+
+    /// PRECONDITION: call only right after a Sat `check_full`. Returns the
+    /// entailed-equal pairs among `shared` (already interned as problem
+    /// vars/numerals via `ensure_shared_var`), each with a fresh arith
+    /// explanation tag. State-safe: arith is left in EXACTLY the entry state
+    /// (R1) — a subsequent `check_full` returns Sat with the identical β/basis.
+    pub fn entailed_equalities(
+        &mut self,
+        ctx: &Context,
+        shared: &[TermId],
+    ) -> Vec<(TermId, TermId, u32)> {
+        let _ = ctx;
+        // Resolve shared terms to interned problem vars (dedup, keep order).
+        let mut items: Vec<(TermId, ArithVar)> = Vec::new();
+        for &t in shared {
+            let v = self.vars.problem_var(t);
+            if !items.iter().any(|(_, w)| *w == v) {
+                items.push((t, v));
+            }
+        }
+        // Pre-filter (R3 necessary condition): only same-β pairs can be entailed.
+        // Group by current β (DeltaRational equality).
+        let mut candidates: Vec<(usize, usize)> = Vec::new();
+        for i in 0..items.len() {
+            for j in (i + 1)..items.len() {
+                if self.value[items[i].1.index()] == self.value[items[j].1.index()] {
+                    candidates.push((i, j));
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+
+        // R1 step 1+2: ensure every candidate's u-v slack exists, then make β
+        // consistent for the new slacks before snapshotting.
+        for &(i, j) in &candidates {
+            let comb = Self::diff_comb(items[i].1, items[j].1);
+            let s = self.vars.slack_var(&comb);
+            self.tableau.define_slack(s, &comb);
+        }
+        self.grow_value();
+        self.recompute_basic_values();
+
+        // R1 step 3: SNAPSHOT the live state. Every probe restores to this.
+        let snap_tableau = self.tableau.clone();
+        let snap_value = self.value.clone();
+        let snap_mark = self.bounds_marks();
+        self.bounds.mark();
+
+        let mut out: Vec<(TermId, TermId, u32)> = Vec::new();
+        for &(i, j) in &candidates {
+            let (ut, uv) = items[i];
+            let (vt, vv) = items[j];
+            let comb = Self::diff_comb(uv, vv);
+            let s = self.vars.slack_var(&comb);
+
+            // Probe ">": inject strict s > 0  (lower = {0, +1}).
+            let pos_strict = DeltaRational::new(Rational::zero(), Rational::one());
+            let Some(core_pos) = self.probe(s, BoundKind::Lower, pos_strict) else {
+                self.restore(&snap_tableau, &snap_value, snap_mark);
+                self.bounds.mark();
+                continue; // feasible ⇒ u>v possible ⇒ not entailed
+            };
+            self.restore(&snap_tableau, &snap_value, snap_mark);
+            self.bounds.mark();
+
+            // Probe "<": inject strict s < 0  (upper = {0, -1}).
+            let neg_strict = DeltaRational::new(Rational::zero(), -Rational::one());
+            let Some(core_neg) = self.probe(s, BoundKind::Upper, neg_strict) else {
+                self.restore(&snap_tableau, &snap_value, snap_mark);
+                self.bounds.mark();
+                continue;
+            };
+            self.restore(&snap_tableau, &snap_value, snap_mark);
+            self.bounds.mark();
+
+            // Both directions infeasible ⇒ u = v entailed (R3 sufficient).
+            // Antecedent = union of the two probes' resolved cores (input bound
+            // lits + interface deps). Dedup preserving order; cores are tiny.
+            let mut antecedent: Vec<EqLeaf> = Vec::new();
+            for leaf in core_pos.into_iter().chain(core_neg) {
+                if !antecedent.contains(&leaf) {
+                    antecedent.push(leaf);
+                }
+            }
+            let tag = self.next_tag;
+            self.next_tag += 1;
+            self.eq_antecedents.insert(tag, antecedent);
+            self.tag_trail.push((self.level, tag));
+            out.push((ut, vt, tag));
+        }
+
+        // Drop the probe mark; restore to the snapshot one final time so the
+        // live state is byte-for-byte the entry state.
+        self.restore(&snap_tableau, &snap_value, snap_mark);
+        out
+    }
+
+    /// Current number of bounds-trail marks (so a probe can `undo_to` it).
+    fn bounds_marks(&self) -> usize {
+        self.bounds.marks_len()
+    }
+
+    /// Run ONE entailment probe: inject the synthetic strict bound on slack `s`
+    /// under a fresh probe sentinel lit, run `check_full`, and return the
+    /// conflict core as `EqLeaf`s — or `None` if the probe is feasible (so the
+    /// pair is not entailed). Handles BOTH the immediate-crossing (`tighten`
+    /// Conflict) path and the Farkas (`check_full` Conflict) path.
+    ///
+    /// CRITICAL-1: the probe's OWN injected strict bound rides under a fresh
+    /// sentinel which we STRIP (R2 — it is not an input literal). But an EUF→arith
+    /// interface bound (installed by `assert_interface_equality`) also rides under
+    /// a sentinel pseudo-lit that is NOT an input literal yet IS a real dependency:
+    /// it must be RESOLVED to `EqLeaf::Interface(just)`, not silently dropped.
+    /// `resolve_iface_leaves` does exactly this split: interface pseudo-lits (in
+    /// `iface_lit`) → `Interface`; every other sentinel (incl. this probe's own
+    /// and a numeral-pin Definitional sentinel) → dropped; input lits → `Asserted`.
+    /// Does NOT restore state; the caller restores afterward.
+    fn probe(&mut self, s: ArithVar, kind: BoundKind, val: DeltaRational) -> Option<Vec<EqLeaf>> {
+        let sentinel = self.fresh_sentinel();
+        match self.bounds.tighten(s, kind, val, sentinel) {
+            TightenResult::Redundant => {
+                // The slack is already forced strictly past 0 in this direction
+                // ⇒ a model with u≠v exists ⇒ not entailed.
+                None
+            }
+            TightenResult::Conflict { other } => {
+                // Immediate crossing: antecedent = resolve({sentinel, other}).
+                let leaves = vec![EqLeaf::Asserted(sentinel), EqLeaf::Asserted(other)];
+                Some(self.resolve_iface_leaves(leaves))
+            }
+            TightenResult::Tightened => match self.check_full() {
+                TCheck::Sat => None,
+                TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
+            },
+        }
+    }
+
+    /// Overwrite the live tableau+value from the snapshot and undo every bound
+    /// installed since the snapshot mark. After this the state is identical to
+    /// the snapshot (R1).
+    fn restore(&mut self, tableau: &Tableau, value: &[DeltaRational], mark: usize) {
+        self.bounds.undo_to(mark);
+        self.tableau = tableau.clone();
+        self.value = value.to_vec();
+    }
+
+    /// EUF → arith (R5): install `a = b` as bounds on the slack `a - b` (fixed to
+    /// 0) with the interface justification `just` as antecedent, under the LIVE
+    /// backtrack mark (current level — NOT level 0). Returns conflict leaves if
+    /// it makes arith infeasible (mirrors `assert`), else `None`.
+    pub fn assert_interface_equality(
+        &mut self,
+        ctx: &Context,
+        a: TermId,
+        b: TermId,
+        just: TheoryJust,
+    ) -> Option<Vec<EqLeaf>> {
+        self.ensure_shared_var(ctx, a);
+        self.ensure_shared_var(ctx, b);
+        let av = self.vars.problem_var(a);
+        let bv = self.vars.problem_var(b);
+        if av == bv {
+            return None;
+        }
+        let comb = Self::diff_comb(av, bv);
+        let s = self.vars.slack_var(&comb);
+        self.tableau.define_slack(s, &comb);
+        self.grow_value();
+        self.recompute_basic_values();
+        // Encode the interface equality as a fixed bound s = 0; the justification
+        // rides as the antecedent lit. We can't pack a TheoryJust into a Lit, so
+        // we store the just under a fresh tag and reference it via a sentinel lit
+        // that `explain` resolves to EqLeaf::Interface(just).
+        let tag = self.next_tag;
+        self.next_tag += 1;
+        self.iface_justs.insert(tag, just);
+        self.tag_trail.push((self.level, tag));
+        let pseudo = self.fresh_sentinel();
+        self.iface_lit.insert(pseudo.code(), tag);
+        let zero = DeltaRational::from_rational(Rational::zero());
+        // Install lower then upper; either may immediately conflict.
+        if let Some(c) = self.apply_bound(s, BoundKind::Lower, zero.clone(), pseudo) {
+            return Some(self.resolve_iface_leaves(c));
+        }
+        if let Some(c) = self.apply_bound(s, BoundKind::Upper, zero, pseudo) {
+            return Some(self.resolve_iface_leaves(c));
+        }
+        // Surface any infeasibility the fixed bound introduces.
+        match self.check_full() {
+            TCheck::Sat => None,
+            TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
+        }
+    }
+
+    /// Map a conflict's leaves back to real antecedents: an interface pseudo-lit
+    /// becomes `EqLeaf::Interface(just)`; an entailment sentinel is dropped; any
+    /// other lit stays as `EqLeaf::Asserted`.
+    fn resolve_iface_leaves(&self, leaves: Vec<EqLeaf>) -> Vec<EqLeaf> {
+        let mut out = Vec::new();
+        for leaf in leaves {
+            match leaf {
+                EqLeaf::Asserted(l) => {
+                    if let Some(&tag) = self.iface_lit.get(&l.code()) {
+                        if let Some(j) = self.iface_justs.get(&tag) {
+                            out.push(EqLeaf::Interface(*j));
+                        }
+                    } else if !Self::is_sentinel(l) {
+                        out.push(EqLeaf::Asserted(l));
+                    }
+                }
+                other => out.push(other),
+            }
+        }
+        out
+    }
 }
 
 impl TheorySolver for Arith {
@@ -317,12 +627,57 @@ impl TheorySolver for Arith {
         self.check_full() // Task 10
     }
 
-    fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {
-        unreachable!("arith emits conflicts directly as EqLeaf::Asserted; no lazy tags (spec §7)")
+    fn explain(&mut self, _cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
+        // A tag produced by `entailed_equalities`: push its stored antecedent
+        // leaves (the resolved union of the two probes' Farkas cores). Each is
+        // either an input bound literal (`Asserted`) or an interface dependency
+        // (`Interface`) the Combiner expands recursively via the owning theory's
+        // `explain` (CRITICAL-1). Probe sentinels and numeral-pin Definitional
+        // bounds were already stripped/resolved when the antecedent was built.
+        if let Some(leaves) = self.eq_antecedents.get(&tag) {
+            for &leaf in leaves {
+                debug_assert!(
+                    !matches!(leaf, EqLeaf::Asserted(l) if Self::is_sentinel(l)),
+                    "entailed-equality antecedent must not cite a synthetic sentinel lit"
+                );
+                exp.push_leaf(leaf);
+            }
+            return;
+        }
+        // An interface-equality tag (EUF→arith): contributes its interface just.
+        if let Some(j) = self.iface_justs.get(&tag) {
+            exp.push_leaf(EqLeaf::Interface(*j));
+            return;
+        }
+        unreachable!("arith::explain called with an unknown tag {tag}")
     }
 
     fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
         self.build_model(cx, m) // Task 13
+    }
+
+    // ----- Nelson-Oppen seam (Task 12b): delegate to the inherent core ------
+
+    fn ensure_shared_var(&mut self, cx: &mut TheoryCtx, t: TermId) {
+        Arith::ensure_shared_var(self, cx.terms, t);
+    }
+
+    fn entailed_equalities(
+        &mut self,
+        cx: &mut TheoryCtx,
+        shared: &[TermId],
+    ) -> Vec<(TermId, TermId, u32)> {
+        Arith::entailed_equalities(self, cx.terms, shared)
+    }
+
+    fn consume_interface_equality(
+        &mut self,
+        cx: &mut TheoryCtx,
+        a: TermId,
+        b: TermId,
+        just: TheoryJust,
+    ) -> Option<Vec<EqLeaf>> {
+        Arith::assert_interface_equality(self, cx.terms, a, b, just)
     }
 
     fn push(&mut self) {
@@ -334,6 +689,19 @@ impl TheorySolver for Arith {
         // absolute target level; restore bounds and recompute the assignment.
         self.bounds.undo_to(level);
         self.recompute_basic_values();
+        // Drop any N-O tags / interface justifications created above `level`
+        // (R5 backtrack safety): their antecedents are no longer valid.
+        while let Some(&(lvl, tag)) = self.tag_trail.last() {
+            if lvl <= level {
+                break;
+            }
+            self.tag_trail.pop();
+            self.eq_antecedents.remove(&tag);
+            self.iface_justs.remove(&tag);
+        }
+        // Drop interface pseudo-lit mappings whose tag is gone.
+        self.iface_lit
+            .retain(|_, tag| self.iface_justs.contains_key(tag));
         self.level = level;
     }
 }
@@ -540,6 +908,451 @@ mod check_tests {
         arith.new_var(&mut cx, Var::new(0), ge);
         arith.assert(&mut cx, Lit::new(Var::new(0), true));
         assert!(matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat));
+    }
+}
+
+#[cfg(test)]
+mod nelson_oppen_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_num::Rational;
+    use shinri_theory::types::EqLeaf;
+    use shinri_theory::{AtomRegistry, EqualityEngine, TheoryCtx, TheorySolver};
+
+    fn real_var(ctx: &mut Context, name: &str) -> TermId {
+        let real = ctx.real_sort();
+        let s = ctx.declare_fun(name, &[], real);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+    fn num(ctx: &mut Context, n: i128) -> TermId {
+        ctx.mk_numeral(Rational::from_int(n.into()), ctx.real_sort())
+    }
+    fn dr(n: i128) -> DeltaRational {
+        DeltaRational::from_rational(Rational::from_int(n.into()))
+    }
+
+    /// Helper: build a `TheoryCtx`-free harness. Returns ctx so the caller keeps
+    /// term identities; arith methods take `&Context` directly.
+    struct Harness {
+        ctx: Context,
+        arith: Arith,
+    }
+    impl Harness {
+        fn new() -> Self {
+            Harness {
+                ctx: Context::new(),
+                arith: Arith::default(),
+            }
+        }
+        /// Declare an atom as SAT var `i` and assert it (positive).
+        fn assert_atom(&mut self, i: u32, atom: TermId) {
+            let mut eq = EqualityEngine::default();
+            let atoms = AtomRegistry::default();
+            let mut cx = TheoryCtx {
+                terms: &self.ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            self.arith.new_var(&mut cx, Var::new(i), atom);
+            self.arith.assert(&mut cx, Lit::new(Var::new(i), true));
+        }
+        fn check(&mut self) -> TCheck {
+            self.arith.check_full()
+        }
+    }
+
+    // ----- Test 1: probe_does_not_perturb_state (R1 regression guard) -----
+    #[test]
+    fn probe_does_not_perturb_state() {
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        // x+y <= 5 ; x >= 0 ; y >= 0  (feasible, not entailed-equal)
+        let xy = h.ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let five = num(&mut h.ctx, 5);
+        let zero = num(&mut h.ctx, 0);
+        let a = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[xy, five])
+            .unwrap();
+        let b = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[x, zero])
+            .unwrap();
+        let c = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[y, zero])
+            .unwrap();
+        h.assert_atom(0, a);
+        h.assert_atom(1, b);
+        h.assert_atom(2, c);
+        assert!(matches!(h.check(), TCheck::Sat));
+
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+
+        // Run entailed_equalities ONCE to mint the candidate slacks, then snapshot
+        // the post-slack state; a SECOND run must leave that state byte-identical
+        // (the probes must not perturb anything). This is the R1 guard: the slack
+        // rows are part of the protocol's entry state, the probes are not.
+        let _ = h.arith.entailed_equalities(&ctx, &[x, y]);
+        let value_before = h.arith.value.clone();
+        let basis_before: std::collections::BTreeSet<u32> =
+            h.arith.tableau.basic.iter().map(|v| v.0).collect();
+
+        let _ = h.arith.entailed_equalities(&ctx, &[x, y]);
+
+        assert_eq!(h.arith.value, value_before, "β must be byte-identical");
+        let basis_after: std::collections::BTreeSet<u32> =
+            h.arith.tableau.basic.iter().map(|v| v.0).collect();
+        assert_eq!(basis_before, basis_after, "basis must be identical");
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+    }
+
+    // ----- Test 2: order_independence (R1) -----
+    #[test]
+    fn order_independence() {
+        // Three vars all forced equal: x=y=z all fixed to 3. Every pair entailed
+        // regardless of probe order; probing one must not drop another.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let z = real_var(&mut h.ctx, "z");
+        let three = num(&mut h.ctx, 3);
+        for (i, v) in [x, y, z].iter().enumerate() {
+            let le = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[*v, three])
+                .unwrap();
+            let ge = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[*v, three])
+                .unwrap();
+            h.assert_atom(2 * i as u32, le);
+            h.assert_atom(2 * i as u32 + 1, ge);
+        }
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        for v in [x, y, z] {
+            h.arith.ensure_shared_var(&ctx, v);
+        }
+        let fwd = pairset(&h.arith.entailed_equalities(&ctx, &[x, y, z]));
+        let rev = pairset(&h.arith.entailed_equalities(&ctx, &[z, y, x]));
+        assert_eq!(fwd, rev, "entailed set must be order-independent");
+        assert_eq!(fwd.len(), 3, "all three pairs must be entailed");
+    }
+
+    fn pairset(pairs: &[(TermId, TermId, u32)]) -> std::collections::BTreeSet<(usize, usize)> {
+        pairs
+            .iter()
+            .map(|(a, b, _)| {
+                let (lo, hi) = (a.index().min(b.index()), a.index().max(b.index()));
+                (lo, hi)
+            })
+            .collect()
+    }
+
+    // ----- Test 3: fixed_vars_entailed_equal -----
+    #[test]
+    fn fixed_vars_entailed_equal() {
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let z = real_var(&mut h.ctx, "z");
+        let five = num(&mut h.ctx, 5);
+        let seven = num(&mut h.ctx, 7);
+        let mut i = 0u32;
+        for (v, n) in [(x, five), (y, five), (z, seven)] {
+            let le = h.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[v, n]).unwrap();
+            let ge = h.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[v, n]).unwrap();
+            h.assert_atom(i, le);
+            h.assert_atom(i + 1, ge);
+            i += 2;
+        }
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        for v in [x, y, z] {
+            h.arith.ensure_shared_var(&ctx, v);
+        }
+        let got = pairset(&h.arith.entailed_equalities(&ctx, &[x, y, z]));
+        assert!(got.contains(&(x.index().min(y.index()), x.index().max(y.index()))));
+        // z (fixed 7) must NOT be paired with x (fixed 5).
+        assert!(!got.contains(&(x.index().min(z.index()), x.index().max(z.index()))));
+        assert!(!got.contains(&(y.index().min(z.index()), y.index().max(z.index()))));
+    }
+
+    // ----- Test 4: numeral_pinning (R4) -----
+    #[test]
+    fn numeral_pinning() {
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let five = num(&mut h.ctx, 5);
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[x, five])
+            .unwrap();
+        let ge = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[x, five])
+            .unwrap();
+        h.assert_atom(0, le);
+        h.assert_atom(1, ge);
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, five); // pin numeral 5
+        let got = pairset(&h.arith.entailed_equalities(&ctx, &[x, five]));
+        assert!(
+            got.contains(&(x.index().min(five.index()), x.index().max(five.index()))),
+            "x fixed to 5 must be entailed-equal to numeral 5"
+        );
+    }
+
+    // ----- Test 5: nonfixed_entailed -----
+    #[test]
+    fn nonfixed_entailed() {
+        // x <= y AND y <= x : neither individually fixed, but x = y entailed.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let le1 = h.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, y]).unwrap();
+        let le2 = h.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[y, x]).unwrap();
+        h.assert_atom(0, le1);
+        h.assert_atom(1, le2);
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+        let got = pairset(&h.arith.entailed_equalities(&ctx, &[x, y]));
+        assert!(
+            got.contains(&(x.index().min(y.index()), x.index().max(y.index()))),
+            "x<=y AND y<=x must entail x=y"
+        );
+    }
+
+    // ----- Test 6: not_entailed_when_separable -----
+    #[test]
+    fn not_entailed_when_separable() {
+        // x <= y only: a model with x < y exists, so NOT entailed.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let le1 = h.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, y]).unwrap();
+        h.assert_atom(0, le1);
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+        let got = h.arith.entailed_equalities(&ctx, &[x, y]);
+        assert!(got.is_empty(), "x<=y alone must not entail x=y");
+    }
+
+    // ----- Test 7: explain_cites_only_input_lits (R2) -----
+    #[test]
+    fn explain_cites_only_input_lits() {
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        // x<=y (var 0) AND y<=x (var 1) entail x=y.
+        let le1 = h.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, y]).unwrap();
+        let le2 = h.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[y, x]).unwrap();
+        h.assert_atom(0, le1);
+        h.assert_atom(1, le2);
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+        let pairs = h.arith.entailed_equalities(&ctx, &[x, y]);
+        assert_eq!(pairs.len(), 1);
+        let tag = pairs[0].2;
+        // Drive explain via the trait method.
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        let mut exp = Explainer::default();
+        h.arith.explain(&mut cx, tag, &mut exp);
+        // Must cite exactly the two asserting bound lits, no sentinels.
+        let lits: std::collections::BTreeSet<u32> = exp.lits.iter().map(|l| l.code()).collect();
+        assert!(exp.pending.is_empty());
+        assert!(
+            lits.contains(&Lit::new(Var::new(0), true).code()),
+            "must cite x<=y lit"
+        );
+        assert!(
+            lits.contains(&Lit::new(Var::new(1), true).code()),
+            "must cite y<=x lit"
+        );
+        for l in &exp.lits {
+            assert!(
+                (l.var().index() as u32) < SENTINEL_VAR_BASE,
+                "must NOT cite a synthetic sentinel lit"
+            );
+        }
+    }
+
+    // ----- Test 8: interface_equality_conflict -----
+    #[test]
+    fn interface_equality_conflict() {
+        // a - b >= 1, then assert interface a = b  -> conflict citing the just.
+        let mut h = Harness::new();
+        let a = real_var(&mut h.ctx, "a");
+        let b = real_var(&mut h.ctx, "b");
+        let ab = h.ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[a, b]).unwrap();
+        let one = num(&mut h.ctx, 1);
+        let ge = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[ab, one])
+            .unwrap();
+        h.assert_atom(0, ge); // a - b >= 1
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 1, tag: 42 };
+        let conflict = h.arith.assert_interface_equality(&ctx, a, b, just);
+        let leaves = conflict.expect("a=b with a-b>=1 must conflict");
+        assert!(
+            leaves.contains(&EqLeaf::Interface(just)),
+            "conflict must cite the interface justification, got {:?}",
+            leaves
+        );
+        assert!(
+            leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(0), true))),
+            "conflict must cite the a-b>=1 lit"
+        );
+    }
+
+    // ----- Test 9: interface bound undone on pop -----
+    #[test]
+    fn interface_equality_undone_on_pop() {
+        let mut h = Harness::new();
+        let a = real_var(&mut h.ctx, "a");
+        let b = real_var(&mut h.ctx, "b");
+        let ab = h.ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[a, b]).unwrap();
+        let one = num(&mut h.ctx, 1);
+        let ge = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[ab, one])
+            .unwrap();
+        h.assert_atom(0, ge); // a - b >= 1
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.push(); // level 1
+        let just = TheoryJust { theory: 1, tag: 7 };
+        let conflict = h.arith.assert_interface_equality(&ctx, a, b, just);
+        assert!(conflict.is_some(), "a=b must conflict at level 1");
+        h.arith.pop(0); // undo the interface equality
+        assert!(
+            matches!(h.arith.check_full(), TCheck::Sat),
+            "after pop the interface bound must be gone -> feasible again"
+        );
+        // And its tag bookkeeping was cleared.
+        assert!(h.arith.iface_justs.is_empty());
+    }
+
+    // ----- Test 10 (CRITICAL-1 regression): an entailed-equality antecedent
+    // that rests on an EUF→arith interface bound MUST retain the interface dep
+    // (as EqLeaf::Interface) AND cite the real input bound lits — not strip the
+    // interface (under-cite → unsound nogood) nor cite a non-input companion.
+    #[test]
+    fn entailed_eq_antecedent_retains_interface_dependency() {
+        // fa - w >= 0  (L0) ;  w - fb >= 0  (L1) ;  interface fa = fb.
+        // Then w = fa is entailed: w <= fa (from L0) and w >= fb = fa (L1 + iface).
+        // The antecedent for w=fa MUST include Interface(fa=fb) and the input
+        // lits L0, L1.
+        let mut h = Harness::new();
+        let fa = real_var(&mut h.ctx, "fa");
+        let fb = real_var(&mut h.ctx, "fb");
+        let w = real_var(&mut h.ctx, "w");
+        let zero = num(&mut h.ctx, 0);
+        // fa - w >= 0
+        let faw = h.ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[fa, w]).unwrap();
+        let ge0 = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[faw, zero])
+            .unwrap();
+        // w - fb >= 0
+        let wfb = h.ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[w, fb]).unwrap();
+        let ge1 = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[wfb, zero])
+            .unwrap();
+        h.assert_atom(0, ge0); // L0
+        h.assert_atom(1, ge1); // L1
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        for v in [fa, fb, w] {
+            h.arith.ensure_shared_var(&ctx, v);
+        }
+        // Install the EUF→arith interface equality fa = fb.
+        let iface = TheoryJust { theory: 1, tag: 99 };
+        assert!(
+            h.arith
+                .assert_interface_equality(&ctx, fa, fb, iface)
+                .is_none(),
+            "fa=fb is consistent with fa-w>=0 ∧ w-fb>=0"
+        );
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+        // Now w = fa must be entailed.
+        let pairs = h.arith.entailed_equalities(&ctx, &[fa, fb, w]);
+        let wfa = pairs
+            .iter()
+            .find(|(a, b, _)| {
+                let (lo, hi) = (a.index().min(b.index()), a.index().max(b.index()));
+                (lo, hi) == (w.index().min(fa.index()), w.index().max(fa.index()))
+            })
+            .expect("w = fa must be entailed");
+        let tag = wfa.2;
+        // Drive explain: the antecedent must contain Interface(fa=fb) AND the
+        // input lits L0,L1 (resolution of Interface happens in the Combiner).
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        let mut exp = Explainer::default();
+        h.arith.explain(&mut cx, tag, &mut exp);
+        assert!(
+            exp.pending.contains(&iface),
+            "antecedent MUST retain the interface dependency fa=fb, got pending={:?} lits={:?}",
+            exp.pending,
+            exp.lits
+        );
+        let lits: std::collections::BTreeSet<u32> = exp.lits.iter().map(|l| l.code()).collect();
+        assert!(
+            lits.contains(&Lit::new(Var::new(0), true).code()),
+            "must cite L0 (fa-w>=0), got {:?}",
+            exp.lits
+        );
+        assert!(
+            lits.contains(&Lit::new(Var::new(1), true).code()),
+            "must cite L1 (w-fb>=0), got {:?}",
+            exp.lits
+        );
+        for l in &exp.lits {
+            assert!(
+                (l.var().index() as u32) < SENTINEL_VAR_BASE,
+                "must NOT cite a synthetic sentinel lit, got {:?}",
+                l
+            );
+        }
+    }
+
+    // sanity: numeral fixed bound itself doesn't break feasibility check.
+    #[test]
+    fn numeral_pin_keeps_value() {
+        let mut h = Harness::new();
+        let five = num(&mut h.ctx, 5);
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, five);
+        let v = h.arith.vars.problem_var(five);
+        assert_eq!(h.arith.value[v.index()], dr(5));
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
     }
 }
 

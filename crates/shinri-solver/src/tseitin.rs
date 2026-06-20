@@ -21,6 +21,12 @@ pub struct Encoder<'a> {
     pub saw_euf: bool,
     pub saw_arith: bool,
     pub saw_shared: bool,
+    /// True if at least one EUF atom's top-level terms are of a *non-arithmetic*
+    /// (uninterpreted) sort, e.g. `(= p q)` where p,q are of sort U.
+    /// Used to gate the "pure EUF + arith" mixed fence: we want to fence
+    /// `(= p:U q:U) ∧ (> x:Real 0)` (no N-O propagation), but NOT
+    /// `(= x:Real y:Real) ∧ (Le x y)` (valid QF_UFLRA with companion Le/Ge).
+    pub saw_euf_nonreal: bool,
     t_true: TermId,
     t_false: TermId,
 }
@@ -36,6 +42,7 @@ impl<'a> Encoder<'a> {
             saw_euf: false,
             saw_arith: false,
             saw_shared: false,
+            saw_euf_nonreal: false,
             t_true,
             t_false,
         }
@@ -142,6 +149,40 @@ impl<'a> Encoder<'a> {
         self.ctx.sort_of(t) == self.ctx.bool_sort()
     }
 
+    /// True if the atom's top-level argument terms are of a non-arithmetic sort
+    /// (i.e., not Real or Int). Used to identify "purely uninterpreted" EUF atoms
+    /// like `(= p:U q:U)` which cannot be combined with arith without N-O propagation,
+    /// vs `(= x:Real y:Real)` which has companion Le/Ge atoms in the arith theory.
+    fn euf_atom_has_nonreal_args(&self, t: TermId) -> bool {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let real = self.ctx.real_sort();
+        let int = self.ctx.int_sort();
+        let bool_s = self.ctx.bool_sort();
+        let is_arith_or_bool = |s| s == real || s == int || s == bool_s;
+        match self.ctx.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                let children = self.ctx.children(*args);
+                match op {
+                    Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct) => {
+                        // Check argument sorts: if any arg is of a non-arith sort, it's
+                        // a "pure EUF" atom (uninterpreted sort like U).
+                        children
+                            .iter()
+                            .any(|&c| !is_arith_or_bool(self.ctx.sort_of(c)))
+                    }
+                    Op::Uninterpreted(_) => {
+                        // Predicate application: check if the sort of the atom (Bool)
+                        // indicates an uninterpreted predicate over non-arith sorts.
+                        // For now, treat any uninterpreted predicate as non-real EUF.
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
     /// A theory atom leaf: one SAT var, registered with the Combiner.
     fn atom(&mut self, t: TermId) -> Lit {
         let v = self.sat.new_var();
@@ -152,7 +193,17 @@ impl<'a> Encoder<'a> {
             self.refused = true;
         } else {
             match shinri_theory::atom::classify(self.ctx, t) {
-                Ok(shinri_theory::types::Owner::Euf) => self.saw_euf = true,
+                Ok(shinri_theory::types::Owner::Euf) => {
+                    self.saw_euf = true;
+                    // Track whether this EUF atom's top-level terms are of a
+                    // non-arithmetic sort (e.g. sort U vs Real). Used to gate the
+                    // mixed-theory fence: `(= p:U q:U) ∧ (> x:Real 0)` is fenced
+                    // to Unknown (no N-O propagation), but `(= x:Real y:Real)` with
+                    // companion Le/Ge atoms is valid QF_UFLRA and must NOT be fenced.
+                    if self.euf_atom_has_nonreal_args(t) {
+                        self.saw_euf_nonreal = true;
+                    }
+                }
                 Ok(shinri_theory::types::Owner::Arith) => self.saw_arith = true,
                 Ok(shinri_theory::types::Owner::Shared) => self.saw_shared = true,
                 Err(_) => {}
@@ -248,6 +299,18 @@ impl<'a> Encoder<'a> {
         self.sat.add_clause(&[c, out.negate(), el]);
         self.sat.add_clause(&[c, out, el.negate()]);
         out
+    }
+}
+
+/// Minimal term display for model/value output (name for nullary consts, else `t<id>`).
+pub(crate) fn display_term(ctx: &shinri_core::Context, t: shinri_core::TermId) -> String {
+    match ctx.term_node(t) {
+        TermNode::App {
+            op: Op::Uninterpreted(sym),
+            args,
+            ..
+        } if args.len == 0 => ctx.symbol_name(*sym).to_string(),
+        _ => format!("t{}", t.index()),
     }
 }
 

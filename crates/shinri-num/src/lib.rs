@@ -8,5 +8,5 @@ mod limbs;
 mod rational;
 
 pub use delta::DeltaRational;
-pub use integer::Integer;
+pub use integer::{Integer, ParseIntegerError};
 pub use rational::Rational;
