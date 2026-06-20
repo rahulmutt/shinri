@@ -232,6 +232,52 @@ mod tableau_tests {
             Rational::new((-3i128).into(), 2i128.into())
         );
     }
+
+    #[test]
+    fn pivot_sums_shared_variable_across_rows() {
+        // Two basic rows sharing nonbasic y:
+        //   s1 = 2x + 3y   (av 3)
+        //   s2 =  x + 4y   (av 4)
+        // pivot(s1, x):  x = (1/2)s1 - (3/2)y, then substitute x out of s2:
+        //   s2 = (s2 without x) + c_e * entering_row
+        //      = 4y + 1*((1/2)s1 - (3/2)y) = (1/2)s1 + (5/2)y
+        // y appears in BOTH old-s2 (4y) and entering_row (-3/2 y) -> coefficients SUM to 5/2.
+        let mut t = Tableau::default();
+        let comb1 = LinComb(vec![
+            (av(1), Rational::from_int(2i128.into())),
+            (av(2), Rational::from_int(3i128.into())),
+        ]);
+        let comb2 = LinComb(vec![
+            (av(1), Rational::one()),
+            (av(2), Rational::from_int(4i128.into())),
+        ]);
+        t.define_slack(av(3), &comb1); // s1
+        t.define_slack(av(4), &comb2); // s2
+        t.pivot(av(3), av(1)); // pivot x(av1) in, s1(av3) out
+        assert!(t.is_basic(av(1))); // x now basic
+        assert!(!t.is_basic(av(3))); // s1 now nonbasic
+        assert!(t.is_basic(av(4))); // s2 still basic
+                                    // x's row: x = (1/2)s1 - (3/2)y
+        assert_eq!(
+            t.row(av(1)).coeff(av(3)),
+            Rational::new(1i128.into(), 2i128.into())
+        );
+        assert_eq!(
+            t.row(av(1)).coeff(av(2)),
+            Rational::new((-3i128).into(), 2i128.into())
+        );
+        // s2's REWRITTEN row: s2 = (1/2)s1 + (5/2)y  <-- the shared-y summation
+        assert_eq!(
+            t.row(av(4)).coeff(av(3)),
+            Rational::new(1i128.into(), 2i128.into())
+        );
+        assert_eq!(
+            t.row(av(4)).coeff(av(2)),
+            Rational::new(5i128.into(), 2i128.into())
+        );
+        // s2 no longer references x directly.
+        assert_eq!(t.row(av(4)).coeff(av(1)), Rational::zero());
+    }
 }
 
 #[cfg(test)]
