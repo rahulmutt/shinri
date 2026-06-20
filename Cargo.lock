@@ -349,6 +349,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "shinri-cli"
+version = "0.1.0"
+dependencies = [
+ "shinri-frontend",
+ "shinri-parser",
+ "shinri-solver",
+]
+
+[[package]]
 name = "shinri-core"
 version = "0.1.0"
 dependencies = [
