@@ -164,7 +164,7 @@ impl Arith {
     }
 
     // -----------------------------------------------------------------------
-    // Stubs for Tasks 9–13 (replaced later)
+    // Solver internals (Tasks 9–13, all implemented)
     // -----------------------------------------------------------------------
 
     fn check_full(&mut self) -> TCheck {
@@ -217,7 +217,19 @@ impl Arith {
         true
     }
 
-    fn build_model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+    fn build_model(&mut self, _cx: &mut TheoryCtx, m: &mut ModelBuilder) {
+        use shinri_theory::types::ModelVal;
+        let n = self.vars.len();
+        let delta = crate::model::choose_delta(&self.value, &self.bounds, n);
+        for i in 0..n {
+            let v = ArithVar(i as u32);
+            if let Some(term) = self.vars.term_of(v) {
+                let dv = &self.value[i];
+                let concrete = dv.c().clone() + dv.k().clone() * delta.clone();
+                m.assign(term, ModelVal::Num(concrete));
+            }
+        }
+    }
 
     fn recompute_basic_values(&mut self) {
         // 1. Clamp nonbasic vars into restored bounds.
@@ -323,6 +335,43 @@ impl TheorySolver for Arith {
         self.bounds.undo_to(level);
         self.recompute_basic_values();
         self.level = level;
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_num::Rational;
+    use shinri_theory::types::ModelVal;
+    use shinri_theory::{AtomRegistry, EqualityEngine, ModelBuilder, TheoryCtx, TheorySolver};
+
+    #[test]
+    fn model_picks_concrete_value_for_strict_bound() {
+        // x > 0  -> model must give x = c + k*delta with a concrete positive rational.
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let xs = ctx.declare_fun("x", &[], real);
+        let x = ctx.mk_app(Op::Uninterpreted(xs), &[]).unwrap();
+        let z = ctx.mk_numeral(Rational::zero(), real);
+        let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[x, z]).unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), gt);
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        assert!(matches!(arith.check(&mut cx, Effort::Full), TCheck::Sat));
+        let mut mb = ModelBuilder::default();
+        arith.model(&mut cx, &mut mb);
+        match mb.get(x) {
+            Some(ModelVal::Num(r)) => assert!(*r > Rational::zero(), "x must be > 0, got {:?}", r),
+            other => panic!("expected Num, got {:?}", other),
+        }
     }
 }
 
