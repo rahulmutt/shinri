@@ -33,6 +33,10 @@ pub(crate) fn scan_command_end(s: &str) -> Scan {
             }
             Ok(Token::RParen) => {
                 depth -= 1;
+                // `<= 0` (not `== 0`) deliberately treats a leading orphan `)`
+                // (depth goes negative) as a 1-token boundary: the slice is
+                // handed to the parser, which skips the stray token. Narrowing
+                // this to `== 0` would loop forever on an orphan `)`.
                 if depth <= 0 {
                     return Scan::Complete(span.end);
                 }
@@ -102,11 +106,17 @@ impl StreamingParser {
             let base = self.consumed;
             let rel_end = match scan_command_end(&self.buf[base..]) {
                 Scan::Complete(end) => end,
+                // Both mean "not a complete command yet": `Empty` (only
+                // whitespace/comments so far) and `NeedMore` (an open form).
+                // The caller distinguishes terminal EOF by calling `finish`.
                 Scan::NeedMore | Scan::Empty => return StreamItem::NeedMore,
             };
 
             // Parse exactly this command's slice with a transient parser that
-            // borrows the persistent env, then take the env back.
+            // borrows the persistent env, then take the env back. The slice is
+            // copied to an owned `String` so its borrow doesn't conflict with
+            // the `&mut self.env` swap below (the transient parser borrows the
+            // text for its whole lifetime).
             let cmd_text = self.buf[base..base + rel_end].to_string();
             let env = std::mem::replace(&mut self.env, Env::new());
             let mut p = Parser::with_env(&cmd_text, env);
