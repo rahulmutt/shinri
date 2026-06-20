@@ -101,6 +101,139 @@ fn lcm(a: &Integer, b: &Integer) -> Integer {
     (q * b.clone()).abs()
 }
 
+use crate::normalize::LinComb;
+use rustc_hash::FxHashSet;
+
+#[derive(Default)]
+pub struct Tableau {
+    pub rows: FxHashMap<ArithVar, Row>,
+    pub basic: FxHashSet<ArithVar>,
+}
+
+impl Tableau {
+    #[inline]
+    pub fn is_basic(&self, v: ArithVar) -> bool {
+        self.basic.contains(&v)
+    }
+
+    #[inline]
+    pub fn row(&self, basic: ArithVar) -> &Row {
+        &self.rows[&basic]
+    }
+
+    pub fn define_slack(&mut self, slack: ArithVar, comb: &LinComb) {
+        if self.basic.contains(&slack) {
+            return;
+        }
+        let row = Row::from_rationals(&comb.0);
+        self.rows.insert(slack, row);
+        self.basic.insert(slack);
+    }
+
+    /// Swap `entering` (nonbasic) into the basis; `basic` leaves. Gauss-Jordan
+    /// over the rational coefficients, each row re-reduced to shared-denominator
+    /// integer form afterward (spec §7.5).
+    pub fn pivot(&mut self, basic: ArithVar, entering: ArithVar) {
+        // Solve rows[basic]:  basic = Σ a_j x_j , with a_e = coeff(entering) ≠ 0.
+        // => entering = (1/a_e) basic - Σ_{j≠e} (a_j/a_e) x_j
+        let old = self.rows.remove(&basic).expect("pivot on non-basic row");
+        let a_e = old.coeff(entering);
+        debug_assert!(!a_e.is_zero(), "pivot on zero coefficient");
+        let inv = a_e.recip();
+
+        // Build entering_row: (basic, 1/a_e) and (j, -(a_j/a_e)) for each j≠entering.
+        let mut solved: Vec<(ArithVar, Rational)> = Vec::new();
+        solved.push((basic, inv.clone()));
+        for v in old.vars() {
+            if v == entering {
+                continue;
+            }
+            let a_j = old.coeff(v);
+            solved.push((v, -(a_j * inv.clone())));
+        }
+        let entering_row = Row::from_rationals(&solved);
+
+        // Substitute `entering` out of every other row:
+        //   row b: b = Σ c_k x_k + c_e * entering
+        //   ->  b = Σ c_k x_k + c_e * entering_row   (drop the c_e·entering term)
+        // new_b[v] = old_b.coeff(v) (for v≠entering) + c_e * entering_row.coeff(v)
+        let other_basics: Vec<ArithVar> = self.rows.keys().copied().collect();
+        for b in other_basics {
+            let c_e = self.rows[&b].coeff(entering);
+            if c_e.is_zero() {
+                continue;
+            }
+            // Collect all vars from old row b (excluding entering) and entering_row.
+            let mut merged: FxHashMap<ArithVar, Rational> = FxHashMap::default();
+            // Contribution from old row b (without the entering term).
+            for v in self.rows[&b].vars() {
+                if v == entering {
+                    continue;
+                }
+                let coeff = self.rows[&b].coeff(v);
+                *merged.entry(v).or_insert_with(Rational::zero) =
+                    merged.get(&v).cloned().unwrap_or_else(Rational::zero) + coeff;
+            }
+            // Contribution from c_e * entering_row.
+            for v in entering_row.vars() {
+                let add = c_e.clone() * entering_row.coeff(v);
+                let e = merged.entry(v).or_insert_with(Rational::zero);
+                *e = e.clone() + add;
+            }
+            let pairs: Vec<(ArithVar, Rational)> = merged.into_iter().collect();
+            self.rows.insert(b, Row::from_rationals(&pairs));
+        }
+
+        self.rows.insert(entering, entering_row);
+        self.basic.remove(&basic);
+        self.basic.insert(entering);
+    }
+}
+
+#[cfg(test)]
+mod tableau_tests {
+    use super::*;
+    fn av(n: u32) -> ArithVar {
+        ArithVar(n)
+    }
+
+    #[test]
+    fn define_slack_creates_a_basic_row() {
+        // s = 2x + 3y
+        let mut t = Tableau::default();
+        let comb = LinComb(vec![
+            (av(1), Rational::from_int(2i128.into())),
+            (av(2), Rational::from_int(3i128.into())),
+        ]);
+        t.define_slack(av(0), &comb);
+        assert!(t.is_basic(av(0)));
+        assert_eq!(t.row(av(0)).coeff(av(1)), Rational::from_int(2i128.into()));
+        assert_eq!(t.row(av(0)).coeff(av(2)), Rational::from_int(3i128.into()));
+    }
+
+    #[test]
+    fn pivot_swaps_basis_and_rewrites() {
+        // s = 2x + 3y ; pivot x in, s out  =>  x = (1/2) s - (3/2) y
+        let mut t = Tableau::default();
+        let comb = LinComb(vec![
+            (av(1), Rational::from_int(2i128.into())),
+            (av(2), Rational::from_int(3i128.into())),
+        ]);
+        t.define_slack(av(0), &comb);
+        t.pivot(av(0), av(1));
+        assert!(t.is_basic(av(1)));
+        assert!(!t.is_basic(av(0)));
+        assert_eq!(
+            t.row(av(1)).coeff(av(0)),
+            Rational::new(1i128.into(), 2i128.into())
+        );
+        assert_eq!(
+            t.row(av(1)).coeff(av(2)),
+            Rational::new((-3i128).into(), 2i128.into())
+        );
+    }
+}
+
 #[cfg(test)]
 mod row_tests {
     use super::*;
