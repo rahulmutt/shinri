@@ -331,6 +331,17 @@ impl Context {
         &self.nodes[id.index()]
     }
 
+    /// The exact `Rational` of a numeral term, or `None` if `t` is not a numeral.
+    pub fn numeral_value(&self, t: TermId) -> Option<&Rational> {
+        match self.term_node(t) {
+            TermNode::Const {
+                val: ConstVal::Num(id),
+                ..
+            } => Some(&self.nums[id.index()]),
+            _ => None,
+        }
+    }
+
     pub fn children(&self, slice: ChildSlice) -> &[TermId] {
         let start = slice.off as usize;
         let end = start + slice.len as usize;
@@ -512,6 +523,19 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::Add), &[five, one])
             .unwrap();
         assert_eq!(result, expected); // re-interned to the same id
+    }
+
+    #[test]
+    fn numeral_value_reads_back_the_rational() {
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let r = shinri_num::Rational::new(3i128.into(), 4i128.into()); // 3/4
+        let t = ctx.mk_numeral(r.clone(), real);
+        assert_eq!(ctx.numeral_value(t), Some(&r));
+        // A non-numeral term returns None.
+        let x = ctx.declare_fun("x", &[], real);
+        let xt = ctx.mk_app(crate::term::Op::Uninterpreted(x), &[]).unwrap();
+        assert_eq!(ctx.numeral_value(xt), None);
     }
 
     #[test]
