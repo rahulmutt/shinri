@@ -10,6 +10,8 @@ shinri-core = { path = "../shinri-core" }
 shinri-sat = { path = "../shinri-sat" }
 shinri-theory = { path = "../shinri-theory" }
 shinri-euf = { path = "../shinri-euf" }
+shinri-arith = { path = "../shinri-arith" }
+shinri-num = { path = "../shinri-num" }
 rustc-hash = "2"
 
 [dev-dependencies]

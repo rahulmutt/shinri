@@ -216,6 +216,34 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         }
     }
 
+    /// If `conflict_lits` contains no literal at the current decision level,
+    /// backtrack to the conflict's max level so that 1-UIP has a pivot literal.
+    /// Returns `Err(())` when max_level == 0, signalling top-level UNSAT.
+    /// `backtrack_to(max_level)` keeps levels ≤ max_level assigned (so the
+    /// conflict clause stays all-false for `analyze`) and sets the decision
+    /// level to max_level, giving 1-UIP a current-level literal to resolve on.
+    fn reduce_to_conflict_level(&mut self, conflict_lits: &[Lit]) -> Result<(), ()> {
+        let cur = self.trail.decision_level();
+        if conflict_lits
+            .iter()
+            .any(|l| self.assign.level(l.var()) == cur)
+        {
+            return Ok(());
+        }
+        let max_level = conflict_lits
+            .iter()
+            .map(|l| self.assign.level(l.var()))
+            .max()
+            .unwrap_or(0);
+        if max_level == 0 {
+            return Err(());
+        }
+        // Keep max_level assignments intact so analyze() can resolve them;
+        // only unassign levels strictly above max_level.
+        self.backtrack_to(max_level);
+        Ok(())
+    }
+
     /// The Boolean value of a variable in the current assignment, if assigned.
     pub fn value_of(&self, v: Var) -> Option<bool> {
         match self.assign.value(v) {
@@ -274,10 +302,14 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                 }
             }
             // Find the next trail literal at `level` that we've marked seen.
+            // IMPORTANT: only match literals at the CURRENT decision level.
+            // Literals at intermediate levels are marked `seen` (to avoid
+            // double-processing) but are already in the learnt clause; the
+            // scan must skip them or `counter` underflows on decrement.
             loop {
                 trail_idx -= 1;
                 let p = self.trail.lit_at(trail_idx);
-                if self.analyzer.seen[p.var().index()] {
+                if self.analyzer.seen[p.var().index()] && self.assign.level(p.var()) == level {
                     break;
                 }
             }
@@ -423,6 +455,18 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                         self.unsat = true;
                         return SolveResult::Unsat { core: vec![] };
                     }
+                    // Theory conflicts can span only levels below the current one
+                    // (the conflict was implied by earlier decisions but surfaced
+                    // after more were made). 1-UIP needs a current-level literal
+                    // to pivot on. Reduce the decision level to the conflict's max
+                    // level so its top literals become current-level, then run the
+                    // normal analysis (which resolves multiple top-level lits to
+                    // one UIP).
+                    let conflict_lits = self.conflict_lits(&conflict);
+                    if let Err(()) = self.reduce_to_conflict_level(&conflict_lits) {
+                        self.unsat = true;
+                        return SolveResult::Unsat { core: vec![] };
+                    }
                     let (learnt, bt, chain) = self.analyze(conflict);
                     self.backtrack_to(bt);
                     let asserting = learnt[0];
@@ -500,7 +544,17 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                         self.unsat = true;
                                         return SolveResult::Unsat { core: vec![] };
                                     }
-                                    let (learnt, bt, chain) = self.analyze(Conflict::Lits(lits));
+                                    // Same treatment as the propagate() path: if the
+                                    // conflict spans only levels below the current one,
+                                    // reduce the decision level to the conflict's max
+                                    // level so 1-UIP has a current-level pivot.
+                                    let conflict = Conflict::Lits(lits);
+                                    let conflict_lits = self.conflict_lits(&conflict);
+                                    if let Err(()) = self.reduce_to_conflict_level(&conflict_lits) {
+                                        self.unsat = true;
+                                        return SolveResult::Unsat { core: vec![] };
+                                    }
+                                    let (learnt, bt, chain) = self.analyze(conflict);
                                     self.backtrack_to(bt);
                                     let asserting = learnt[0];
                                     let r_opt = self.add_learnt(&learnt);

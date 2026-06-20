@@ -8,6 +8,7 @@ mod tseitin;
 pub use model::{Model, SolveOutcome};
 
 use shinri_core::{Context, Op, SortId, SymbolId, TermId};
+use shinri_num::Rational;
 
 pub struct Solver {
     ctx: Context,
@@ -51,6 +52,16 @@ impl Solver {
     pub fn bool_sort(&self) -> SortId {
         self.ctx.bool_sort()
     }
+    pub fn real_sort(&self) -> SortId {
+        self.ctx.real_sort()
+    }
+    pub fn numeral(&mut self, value: Rational, sort: SortId) -> TermId {
+        self.ctx.mk_numeral(value, sort)
+    }
+    pub fn declare_const(&mut self, name: &str, sort: SortId) -> TermId {
+        let f = self.ctx.declare_fun(name, &[], sort);
+        self.ctx.mk_app(Op::Uninterpreted(f), &[]).expect("const")
+    }
     pub fn app(&mut self, op: Op, args: &[TermId]) -> TermId {
         self.ctx.mk_app(op, args).expect("well-sorted application")
     }
@@ -79,9 +90,9 @@ impl Solver {
         use shinri_core::NoProof;
         use shinri_euf::Euf;
         use shinri_sat::{SolveResult, SolverConfig, Vmtf};
-        use shinri_theory::{Combiner, EmptyTheory};
+        use shinri_theory::Combiner;
 
-        type Sat = shinri_sat::Solver<Combiner<Euf, EmptyTheory>, NoProof, Vmtf>;
+        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith>, NoProof, Vmtf>;
 
         // Lower n-ary distinct to pairwise binary up front (needs &mut ctx).
         let lowered: Vec<TermId> = self
@@ -104,6 +115,7 @@ impl Solver {
 
         let atom_vars: Vec<(shinri_core::Var, TermId)>;
         let refused: bool;
+        let mixed: bool;
         {
             let mut enc = Encoder::new(&self.ctx, &mut sat, self.t_true, self.t_false);
             // Phase 1: encode all formulas, registering all theory atoms with the
@@ -118,9 +130,10 @@ impl Solver {
             }
             atom_vars = enc.atom_vars.clone();
             refused = enc.refused;
+            mixed = enc.saw_shared || (enc.saw_euf && enc.saw_arith);
         }
 
-        if refused {
+        if refused || mixed {
             return SolveOutcome::Unknown;
         }
 
@@ -152,12 +165,53 @@ impl Solver {
         self.last_model.as_ref().and_then(|m| m.get(t).cloned())
     }
 
-    /// Rewrite n-ary `(distinct t1..tn)` into `(and (distinct ti tj) ...)`.
-    /// Recurses through Boolean connectives. Binary distinct passes through
-    /// unchanged (handled as a theory atom by the encoder).
+    /// Preprocessing pass: lowers arithmetic equalities/disequalities to
+    /// inequalities, and n-ary distinct to pairwise binary. Recurses through
+    /// Boolean connectives. Must run before the Tseitin encoder.
+    ///
+    /// Rules (Real-sorted operands only):
+    ///   `(= a b)`          →  `(and (Le a b) (Ge a b))`
+    ///   `(distinct a b)`   →  `(or  (Lt a b) (Gt a b))`
+    ///   `(distinct a..n)`  →  `(and (lower(distinct ai aj)) ...)` for all pairs
+    ///
+    /// EUF/Bool `=` and binary EUF `distinct` pass through unchanged.
     fn lower(&mut self, t: TermId) -> TermId {
         use shinri_core::{BuiltinOp, Op, TermNode};
         match self.ctx.term_node(t).clone() {
+            // ── Real equality: (= a b) → (and (Le a b) (Ge a b)) ─────────────
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } => {
+                let kids: Vec<TermId> = self.ctx.children(args).to_vec();
+                // Only rewrite arithmetic (Real-sorted) equalities; leave
+                // EUF/Bool equalities for the theory encoder.
+                if kids.len() >= 2 && self.ctx.sort_of(kids[0]) == self.ctx.real_sort() {
+                    // Real-sorted (= a b c ...) : a == b == c == ...
+                    // Chain adjacent pairs: (Le a b)∧(Ge a b) ∧ (Le b c)∧(Ge b c) ∧ ...
+                    // Transitivity makes this equivalent to all-equal.
+                    let mut conj: Vec<TermId> = Vec::with_capacity((kids.len() - 1) * 2);
+                    for w in kids.windows(2) {
+                        let le = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Le), &[w[0], w[1]])
+                            .expect("Le well-sorted");
+                        let ge = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Ge), &[w[0], w[1]])
+                            .expect("Ge well-sorted");
+                        conj.push(le);
+                        conj.push(ge);
+                    }
+                    self.ctx
+                        .mk_app(Op::Builtin(BuiltinOp::And), &conj)
+                        .expect("and well-sorted")
+                } else {
+                    t
+                }
+            }
+            // ── Distinct ──────────────────────────────────────────────────────
             TermNode::App {
                 op: Op::Builtin(BuiltinOp::Distinct),
                 args,
@@ -165,22 +219,44 @@ impl Solver {
             } => {
                 let kids: Vec<TermId> = self.ctx.children(args).to_vec();
                 if kids.len() <= 2 {
-                    return t;
-                }
-                let mut pairs = Vec::new();
-                for i in 0..kids.len() {
-                    for j in (i + 1)..kids.len() {
-                        let d = self
+                    // Binary distinct: rewrite to (or (Lt a b) (Gt a b)) if Real.
+                    if self.ctx.sort_of(kids[0]) == self.ctx.real_sort() {
+                        let lt = self
                             .ctx
-                            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[kids[i], kids[j]])
-                            .expect("binary distinct well-sorted");
-                        pairs.push(d);
+                            .mk_app(Op::Builtin(BuiltinOp::Lt), &[kids[0], kids[1]])
+                            .expect("Lt well-sorted");
+                        let gt = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Gt), &[kids[0], kids[1]])
+                            .expect("Gt well-sorted");
+                        self.ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Or), &[lt, gt])
+                            .expect("or well-sorted")
+                    } else {
+                        // EUF binary distinct: pass through unchanged.
+                        t
                     }
+                } else {
+                    // N-ary distinct: split into pairwise binary distincts, each
+                    // recursively lowered (so Real pairs → Lt/Gt, EUF pairs stay).
+                    let mut pairs = Vec::new();
+                    for i in 0..kids.len() {
+                        for j in (i + 1)..kids.len() {
+                            let d = self
+                                .ctx
+                                .mk_app(Op::Builtin(BuiltinOp::Distinct), &[kids[i], kids[j]])
+                                .expect("binary distinct well-sorted");
+                            // Recurse so Real pairs become (or Lt Gt).
+                            let lowered_d = self.lower(d);
+                            pairs.push(lowered_d);
+                        }
+                    }
+                    self.ctx
+                        .mk_app(Op::Builtin(BuiltinOp::And), &pairs)
+                        .expect("and well-sorted")
                 }
-                self.ctx
-                    .mk_app(Op::Builtin(BuiltinOp::And), &pairs)
-                    .expect("and well-sorted")
             }
+            // ── Boolean connectives: recurse ──────────────────────────────────
             TermNode::App {
                 op: Op::Builtin(b),
                 args,
@@ -216,9 +292,9 @@ impl Solver {
         use shinri_core::NoProof;
         use shinri_euf::Euf;
         use shinri_sat::{SolverConfig, Vmtf};
-        use shinri_theory::{Combiner, EmptyTheory};
+        use shinri_theory::Combiner;
 
-        type Sat = shinri_sat::Solver<Combiner<Euf, EmptyTheory>, NoProof, Vmtf>;
+        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith>, NoProof, Vmtf>;
 
         let mut sat: Sat = shinri_sat::Solver::with_theory(
             SolverConfig::default(),

@@ -1,0 +1,15 @@
+[package]
+name = "shinri-arith"
+version = "0.0.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+shinri-core = { path = "../shinri-core" }
+shinri-theory = { path = "../shinri-theory" }
+shinri-num = { path = "../shinri-num" }
+rustc-hash = "2"
+
+[dev-dependencies]
+proptest = "1"

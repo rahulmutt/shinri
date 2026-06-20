@@ -22,6 +22,7 @@ pub use eq_engine::EqualityEngine;
 pub use interface::InterfaceSet;
 pub use model::ModelBuilder;
 pub use proof::{CertError, CertLog, CertStep};
+pub use shinri_sat::Effort;
 pub use solver_trait::{TCheck, TheoryCtx, TheorySolver};
 pub use types::{
     CongRef, ENodeId, EqConflict, EqJust, EqLeaf, Explainer, MergeEvent, ModelVal, Owner,

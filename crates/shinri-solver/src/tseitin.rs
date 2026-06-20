@@ -7,9 +7,10 @@
 use rustc_hash::FxHashMap;
 use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode, Var};
 use shinri_euf::Euf;
-use shinri_theory::{Combiner, EmptyTheory};
+use shinri_theory::Combiner;
 
-type Sat = shinri_sat::Solver<Combiner<Euf, EmptyTheory>, shinri_core::NoProof, shinri_sat::Vmtf>;
+type Sat =
+    shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith>, shinri_core::NoProof, shinri_sat::Vmtf>;
 
 pub struct Encoder<'a> {
     ctx: &'a Context,
@@ -17,6 +18,9 @@ pub struct Encoder<'a> {
     cache: FxHashMap<TermId, Lit>,
     pub atom_vars: Vec<(Var, TermId)>,
     pub refused: bool,
+    pub saw_euf: bool,
+    pub saw_arith: bool,
+    pub saw_shared: bool,
     t_true: TermId,
     t_false: TermId,
 }
@@ -29,6 +33,9 @@ impl<'a> Encoder<'a> {
             cache: FxHashMap::default(),
             atom_vars: Vec::new(),
             refused: false,
+            saw_euf: false,
+            saw_arith: false,
+            saw_shared: false,
             t_true,
             t_false,
         }
@@ -143,6 +150,13 @@ impl<'a> Encoder<'a> {
         // can return Unknown without calling solve().
         if self.sat.theory_mut().register_atom(v, t).is_err() {
             self.refused = true;
+        } else {
+            match shinri_theory::atom::classify(self.ctx, t) {
+                Ok(shinri_theory::types::Owner::Euf) => self.saw_euf = true,
+                Ok(shinri_theory::types::Owner::Arith) => self.saw_arith = true,
+                Ok(shinri_theory::types::Owner::Shared) => self.saw_shared = true,
+                Err(_) => {}
+            }
         }
         self.atom_vars.push((v, t));
         Lit::new(v, true)
