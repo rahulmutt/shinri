@@ -12,6 +12,13 @@ use shinri_core::{Context, Op, SortId, SymbolId, TermId};
 pub struct Solver {
     ctx: Context,
     assertions: Vec<TermId>,
+    // Canonical Bool constants; used by the Tseitin encoder to handle ⊤/⊥
+    // terms. Stored here so Task 14's check_sat() can pass them to the Encoder
+    // without re-building them.
+    #[allow(dead_code)]
+    t_true: TermId,
+    #[allow(dead_code)]
+    t_false: TermId,
 }
 
 impl Default for Solver {
@@ -22,9 +29,14 @@ impl Default for Solver {
 
 impl Solver {
     pub fn new() -> Solver {
+        let mut ctx = Context::new();
+        let t_true = ctx.mk_const_bool(true);
+        let t_false = ctx.mk_const_bool(false);
         Solver {
-            ctx: Context::new(),
+            ctx,
             assertions: Vec::new(),
+            t_true,
+            t_false,
         }
     }
 
@@ -50,6 +62,30 @@ impl Solver {
     pub fn check_sat(&mut self) -> SolveOutcome {
         // Implemented in Task 14.
         SolveOutcome::Unknown
+    }
+}
+
+#[cfg(test)]
+impl Solver {
+    pub(crate) fn encode_for_test(
+        &mut self,
+        formula: TermId,
+    ) -> (shinri_core::Lit, Vec<(shinri_core::Var, TermId)>) {
+        use crate::tseitin::Encoder;
+        use shinri_core::NoProof;
+        use shinri_euf::Euf;
+        use shinri_sat::{SolverConfig, Vmtf};
+        use shinri_theory::{Combiner, EmptyTheory};
+
+        type Sat = shinri_sat::Solver<Combiner<Euf, EmptyTheory>, NoProof, Vmtf>;
+
+        let mut sat: Sat = shinri_sat::Solver::with_theory(
+            SolverConfig::default(),
+            Combiner::with_context(self.ctx.clone()),
+        );
+        let mut enc = Encoder::new(&self.ctx, &mut sat, self.t_true, self.t_false);
+        let lit = enc.encode(formula);
+        (lit, enc.atom_vars.clone())
     }
 }
 

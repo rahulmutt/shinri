@@ -3,7 +3,7 @@ use rustc_hash::FxHashMap;
 
 /// Interns symbol text to a `SymbolId` and back. Equal text always yields the
 /// same id (maximal sharing); SipHash is never used (uses `FxHashMap`).
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct StringInterner {
     map: FxHashMap<Box<str>, SymbolId>,
     texts: Vec<Box<str>>,
