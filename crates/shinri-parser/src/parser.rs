@@ -451,36 +451,52 @@ impl<'a> Parser<'a> {
     /// Parse the next top-level command, interning into `ctx`. Returns `None`
     /// at EOF or after `(exit)`. On error, skips to the end of the current
     /// command so the next call resumes cleanly (design §8 recovery).
+    ///
+    /// Recovery runs exactly once per command: `parse_command_body` returns
+    /// `Ok(None)` for `define-fun` (no IR command emitted), and this loop
+    /// simply continues — no recursion, no double-recovery.
     pub fn next_command(&mut self, ctx: &mut Context) -> Option<Result<Command, Diagnostic>> {
-        if self.stopped {
-            return None;
-        }
-        // Skip to the next '(' (tolerate stray tokens); None at EOF.
         loop {
-            match self.peek() {
-                None => return None,
-                Some((Ok(Token::LParen), _)) => {
-                    self.bump();
-                    break;
+            if self.stopped {
+                return None;
+            }
+            // Skip to the next '(' (tolerate stray tokens); None at EOF.
+            loop {
+                match self.peek() {
+                    None => return None,
+                    Some((Ok(Token::LParen), _)) => {
+                        self.bump();
+                        break;
+                    }
+                    Some(_) => {
+                        self.bump(); // stray token before a command
+                    }
                 }
-                Some((_, _)) => {
-                    self.bump(); // stray token before a command
+            }
+            match self.parse_command_body(ctx) {
+                Ok(None) => continue, // define-fun: no IR command, fetch next
+                Ok(Some(cmd)) => {
+                    if matches!(cmd, Command::Exit) {
+                        self.stopped = true;
+                    }
+                    return Some(Ok(cmd));
+                }
+                Err(d) => {
+                    self.recover_to_command_end();
+                    return Some(Err(d));
                 }
             }
         }
-        let result = self.parse_command_body(ctx);
-        if result.is_err() {
-            self.recover_to_command_end();
-        }
-        if let Ok(Command::Exit) = &result {
-            self.stopped = true;
-        }
-        Some(result)
     }
 
     /// After the opening '(' is consumed, parse the command head + body,
     /// including the closing ')'.
-    fn parse_command_body(&mut self, ctx: &mut Context) -> Result<Command, Diagnostic> {
+    ///
+    /// Returns `Ok(None)` for `define-fun` (no IR command emitted); the caller
+    /// loops to fetch the next real command. Returns `Ok(Some(cmd))` for every
+    /// other command. Returns `Err` on parse/sort errors — the caller is
+    /// responsible for calling `recover_to_command_end` exactly once.
+    fn parse_command_body(&mut self, ctx: &mut Context) -> Result<Option<Command>, Diagnostic> {
         let (head, hsp) = self.expect_symbol()?;
         let cmd = match head.as_str() {
             "set-logic" => {
@@ -528,9 +544,9 @@ impl<'a> Parser<'a> {
                 }
             }
             "define-fun" => {
+                // parse_define_fun already consumes the define-fun's own closing ')'.
                 self.parse_define_fun(ctx)?;
-                // No command emitted; tail-call to fetch the next real command.
-                return self.parse_after_define(ctx);
+                return Ok(None); // no IR command emitted; caller loops
             }
             "assert" => {
                 let t = self.parse_term(ctx)?;
@@ -592,7 +608,7 @@ impl<'a> Parser<'a> {
             }
         };
         self.expect_token(&Token::RParen)?; // close the command
-        Ok(cmd)
+        Ok(Some(cmd))
     }
 
     /// `(define-fun f ((x S)…) R body)` — intern body against fresh formal
@@ -630,17 +646,6 @@ impl<'a> Parser<'a> {
         self.expect_token(&Token::RParen)?; // close (define-fun …)
         self.env.add_macro(&name, formals, body);
         Ok(())
-    }
-
-    /// After a `define-fun` (which emits nothing), fetch the next real command.
-    fn parse_after_define(&mut self, ctx: &mut Context) -> Result<Command, Diagnostic> {
-        match self.next_command(ctx) {
-            Some(r) => r,
-            None => Err(Diagnostic::new(
-                self.eof..self.eof,
-                "end of input after define-fun",
-            )),
-        }
     }
 
     /// Skip to the end of the current command. Called after a parse error to
@@ -984,5 +989,20 @@ mod tests {
         let cs = commands("(bad-command foo bar)\n(check-sat)");
         assert!(cs[0].is_err());
         assert!(matches!(cs[1], Ok(Command::CheckSat)));
+    }
+
+    /// Regression: define-fun followed by a bad command must NOT drop the
+    /// command after the bad one. Before the fix, double error-recovery caused
+    /// `(check-sat)` to be silently consumed.
+    #[test]
+    fn error_after_define_fun_recovers_to_next_command() {
+        let cs = commands("(define-fun f () Bool true)\n(bad-cmd arg)\n(check-sat)");
+        assert_eq!(cs.len(), 2, "expected exactly 2 results (err + check-sat)");
+        assert!(cs[0].is_err(), "bad-cmd should produce an error");
+        assert!(
+            matches!(cs[1], Ok(Command::CheckSat)),
+            "check-sat should be the second result, got {:?}",
+            cs[1]
+        );
     }
 }
