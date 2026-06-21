@@ -4,6 +4,7 @@
 //! eliminated at the CNF encoder level (rewritten to `(a<=b) AND (a>=b)`).
 
 pub mod bounds;
+pub mod branch;
 pub mod encode;
 pub mod farkas;
 pub mod model;
@@ -20,7 +21,7 @@ use crate::normalize::{normalize_atom, LinComb, Rel};
 use crate::tableau::Tableau;
 use crate::vars::VarStore;
 use rustc_hash::{FxHashMap, FxHashSet};
-use shinri_core::{Context, Lit, TermId, TheoryJust, Var};
+use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TheoryJust, Var};
 use shinri_num::{DeltaRational, Integer, Rational};
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Effort, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
@@ -612,6 +613,56 @@ impl Arith {
     }
 
     // -----------------------------------------------------------------------
+    // Integer branch-and-bound layer (Task 5).
+    // -----------------------------------------------------------------------
+
+    /// After the real relaxation is feasible (`check_full` Sat), scan Int problem
+    /// vars for a non-integral value. All integral ⇒ Sat. Otherwise pick the
+    /// most-fractional var (ties by smallest ArithVar index = Bland order) and
+    /// return `Split` on `(x ≤ ⌊v⌋) ∨ (x ≥ ⌈v⌉)`, building the atoms via cx.terms.
+    fn integer_check(&mut self, cx: &mut TheoryCtx) -> TCheck {
+        let mut best: Option<(ArithVar, Rational)> = None; // (var, fractional distance)
+        for i in 0..self.vars.len() {
+            let v = ArithVar(i as u32);
+            if self.vars.is_slack(v) || !self.vars.is_int(v) {
+                continue;
+            }
+            let val = &self.value[v.index()];
+            let integral = val.k().is_zero() && val.c().denom() == shinri_num::Integer::one();
+            if integral {
+                continue;
+            }
+            // Fractional distance to the floor, as a tie-break key (most fractional).
+            let (f, _c) = crate::branch::floor_ceil(val);
+            let dist = val.c().clone() - Rational::from_int(f);
+            match &best {
+                Some((_, bd)) if &dist <= bd => {}
+                _ => best = Some((v, dist)),
+            }
+        }
+        let Some((bv, _)) = best else {
+            return TCheck::Sat; // all Int problem vars integral
+        };
+        let (floor, ceil) = crate::branch::floor_ceil(&self.value[bv.index()]);
+        let term = self
+            .vars
+            .term_of(bv)
+            .expect("branch var is a problem var with a term");
+        let int_s = cx.terms.int_sort();
+        let floor_num = cx.terms.mk_numeral(Rational::from_int(floor), int_s);
+        let ceil_num = cx.terms.mk_numeral(Rational::from_int(ceil), int_s);
+        let le = cx
+            .terms
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[term, floor_num])
+            .expect("(x <= floor) well-sorted");
+        let ge = cx
+            .terms
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[term, ceil_num])
+            .expect("(x >= ceil) well-sorted");
+        TCheck::Split(vec![le, ge])
+    }
+
+    // -----------------------------------------------------------------------
     // A-priori finite box (Task 4): termination backstop for QF_LIA.
     // -----------------------------------------------------------------------
 
@@ -755,16 +806,17 @@ impl TheorySolver for Arith {
         None // spec §1 decision 3: check-only; propagate is a no-op.
     }
 
-    fn check(&mut self, _cx: &mut TheoryCtx, effort: Effort) -> TCheck {
+    fn check(&mut self, cx: &mut TheoryCtx, effort: Effort) -> TCheck {
         if effort != Effort::Full {
             return TCheck::Sat;
         }
         self.seed_apriori_if_needed();
         match self.check_full() {
-            TCheck::Conflict(leaves) => TCheck::Conflict(self.strip_apriori(leaves)),
+            TCheck::Conflict(leaves) => return TCheck::Conflict(self.strip_apriori(leaves)),
             TCheck::Split(_) => unreachable!("check_full never emits Split"),
-            TCheck::Sat => TCheck::Sat,
+            TCheck::Sat => {}
         }
+        self.integer_check(cx)
     }
 
     fn explain(&mut self, _cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
@@ -1777,5 +1829,49 @@ mod apriori_tests {
             arith.bounds.upper(xv).is_some(),
             "upper box bound must survive push to level 1"
         );
+    }
+}
+
+#[cfg(test)]
+mod integer_branch_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_num::Rational;
+    use shinri_theory::{AtomRegistry, Effort, EqualityEngine, TheoryCtx, TheorySolver};
+
+    #[test]
+    fn fractional_int_var_triggers_split() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let xi = ctx.declare_fun("xi", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xi), &[]).unwrap();
+        let two = ctx.mk_numeral(Rational::from_int(2i128.into()), int);
+        let one = ctx.mk_numeral(Rational::one(), int);
+        let twox = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &[two, x]).unwrap();
+        let ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[twox, one])
+            .unwrap();
+        let le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[twox, one])
+            .unwrap();
+
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), ge);
+        arith.new_var(&mut cx, Var::new(1), le);
+        // Assert both so the relaxation pins x = 1/2.
+        let _ = arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        let _ = arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        match arith.check(&mut cx, Effort::Full) {
+            TCheck::Split(atoms) => assert_eq!(atoms.len(), 2),
+            TCheck::Sat => panic!("expected Split on fractional x, got Sat"),
+            TCheck::Conflict(_) => panic!("expected Split on fractional x, got Conflict"),
+        }
     }
 }
