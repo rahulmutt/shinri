@@ -19,9 +19,9 @@ use crate::encode::AtomEncoding;
 use crate::normalize::{normalize_atom, LinComb, Rel};
 use crate::tableau::Tableau;
 use crate::vars::VarStore;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{Context, Lit, TermId, TheoryJust, Var};
-use shinri_num::{DeltaRational, Rational};
+use shinri_num::{DeltaRational, Integer, Rational};
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Effort, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
@@ -32,7 +32,6 @@ use shinri_theory::{Effort, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySo
 /// conflict's antecedent (R2).
 const SENTINEL_VAR_BASE: u32 = 1 << 30;
 
-#[derive(Default)]
 pub struct Arith {
     vars: VarStore,
     tableau: Tableau,
@@ -61,6 +60,38 @@ pub struct Arith {
     /// Maps an interface pseudo-lit's code back to its `iface_justs` tag, so a
     /// Farkas conflict that cites the pseudo-lit resolves to `Interface(just)`.
     iface_lit: FxHashMap<u32, u32>,
+    /// Max |coefficient| and |constant| over all registered atoms — the input
+    /// magnitude `a` feeding the a-priori bound `M`. Updated in `new_var`.
+    apriori_coeff_max: Integer,
+    /// Count of registered arith atoms — the constraint count `m` feeding `M`.
+    apriori_atom_count: usize,
+    /// One-shot guard: the a-priori box is seeded at the first level-0 Full check.
+    apriori_seeded: bool,
+    /// Sentinel lit codes used for a-priori box bounds, stripped from conflicts.
+    apriori_lits: FxHashSet<u32>,
+}
+
+impl Default for Arith {
+    fn default() -> Self {
+        Arith {
+            vars: VarStore::default(),
+            tableau: Tableau::default(),
+            bounds: Bounds::default(),
+            value: Vec::default(),
+            enc: Vec::default(),
+            level: 0,
+            eq_antecedents: FxHashMap::default(),
+            tag_trail: Vec::default(),
+            next_tag: 0,
+            next_sentinel: 0,
+            iface_justs: FxHashMap::default(),
+            iface_lit: FxHashMap::default(),
+            apriori_coeff_max: Integer::zero(),
+            apriori_atom_count: 0,
+            apriori_seeded: false,
+            apriori_lits: FxHashSet::default(),
+        }
+    }
 }
 
 impl Arith {
@@ -579,6 +610,75 @@ impl Arith {
         }
         out
     }
+
+    // -----------------------------------------------------------------------
+    // A-priori finite box (Task 4): termination backstop for QF_LIA.
+    // -----------------------------------------------------------------------
+
+    /// A dominating small-model bound (Papadimitriou 1981). Generously
+    /// over-approximated: `M = (n+1) * ((m+1)*(a+1))^(2*(m+1))` where n = #Int
+    /// problem vars, m = #atoms, a = max |coeff/const|. Larger is always sound
+    /// (only slower); only a too-small M could be unsound, so we over-shoot.
+    fn apriori_bound(&self) -> Integer {
+        let n_int = (0..self.vars.len())
+            .filter(|&i| {
+                let v = ArithVar(i as u32);
+                !self.vars.is_slack(v) && self.vars.is_int(v)
+            })
+            .count();
+        let n = Integer::from(n_int as i128);
+        let m = Integer::from(self.apriori_atom_count as i128);
+        let a = self.apriori_coeff_max.clone();
+        let one = Integer::one();
+        let base = (m.clone() + one.clone()) * (a + one.clone()); // (m+1)*(a+1)
+                                                                  // exponent = 2*(m+1)
+        let exp_int = (self.apriori_atom_count + 1) * 2;
+        let mut pow = Integer::one();
+        for _ in 0..exp_int {
+            pow = pow * base.clone();
+        }
+        (n + one) * pow
+    }
+
+    /// Seed `−M ≤ x ≤ M` on every Int problem var, once, at level 0. Bounds ride
+    /// under fresh sentinel lits (stripped from conflicts by `strip_apriori`).
+    /// No-op if there are no Int problem vars (pure-Real path unchanged).
+    fn seed_apriori_if_needed(&mut self) {
+        if self.apriori_seeded {
+            return;
+        }
+        // Only seed at level 0. At higher levels, skip — this can happen for
+        // pure-Real queries where the CDCL calls check at level > 0.
+        if self.level != 0 {
+            return;
+        }
+        self.apriori_seeded = true;
+        let m = self.apriori_bound();
+        let hi = DeltaRational::from_rational(Rational::from_int(m.clone()));
+        let lo = DeltaRational::from_rational(Rational::from_int(-m));
+        for i in 0..self.vars.len() {
+            let v = ArithVar(i as u32);
+            if self.vars.is_slack(v) || !self.vars.is_int(v) {
+                continue;
+            }
+            let lo_lit = self.fresh_sentinel();
+            let hi_lit = self.fresh_sentinel();
+            self.apriori_lits.insert(lo_lit.code());
+            self.apriori_lits.insert(hi_lit.code());
+            let _ = self.apply_bound(v, BoundKind::Lower, lo.clone(), lo_lit);
+            let _ = self.apply_bound(v, BoundKind::Upper, hi.clone(), hi_lit);
+        }
+    }
+
+    /// Drop a-priori box sentinel lits from a conflict core (see Soundness note).
+    fn strip_apriori(&self, leaves: Vec<EqLeaf>) -> Vec<EqLeaf> {
+        leaves
+            .into_iter()
+            .filter(|leaf| {
+                !matches!(leaf, EqLeaf::Asserted(l) if self.apriori_lits.contains(&l.code()))
+            })
+            .collect()
+    }
 }
 
 impl TheorySolver for Arith {
@@ -596,6 +696,22 @@ impl TheorySolver for Arith {
                     self.vars.mark_int(*av);
                 }
             }
+        }
+        // Track max |coeff| and |constant| across all atoms (for a-priori bound).
+        self.apriori_atom_count += 1;
+        for (_, coeff) in &n.comb.0 {
+            let mag = coeff.numer().abs();
+            if mag > self.apriori_coeff_max {
+                self.apriori_coeff_max = mag;
+            }
+            let dmag = coeff.denom().abs();
+            if dmag > self.apriori_coeff_max {
+                self.apriori_coeff_max = dmag;
+            }
+        }
+        let rmag = n.rhs.numer().abs();
+        if rmag > self.apriori_coeff_max {
+            self.apriori_coeff_max = rmag;
         }
         let enc = self.build_encoding(&n);
         let idx = v.index();
@@ -637,7 +753,12 @@ impl TheorySolver for Arith {
         if effort != Effort::Full {
             return TCheck::Sat;
         }
-        self.check_full() // Task 10
+        self.seed_apriori_if_needed();
+        match self.check_full() {
+            TCheck::Conflict(leaves) => TCheck::Conflict(self.strip_apriori(leaves)),
+            TCheck::Split(_) => unreachable!("check_full never emits Split"),
+            TCheck::Sat => TCheck::Sat,
+        }
     }
 
     fn explain(&mut self, _cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
@@ -1446,6 +1567,122 @@ mod assert_tests {
             let leaves = cf.expect("expected conflict");
             assert!(leaves.contains(&EqLeaf::Asserted(Lit::new(vb, true))));
             assert!(leaves.contains(&EqLeaf::Asserted(Lit::new(va, true))));
+        }
+    }
+}
+
+#[cfg(test)]
+mod apriori_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_num::Rational;
+    use shinri_theory::{AtomRegistry, Effort, EqualityEngine, TheoryCtx, TheorySolver};
+
+    #[test]
+    fn apriori_box_seeded_on_int_vars_at_level_zero() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let xi = ctx.declare_fun("xi", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xi), &[]).unwrap();
+        let three = ctx.mk_numeral(Rational::from_int(3i128.into()), int);
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, three]).unwrap();
+
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            arith.new_var(&mut cx, v, le);
+            // First Full check at level 0 seeds the box.
+            let _ = arith.check(&mut cx, Effort::Full);
+        }
+        let xv = arith.vars.problem_var(x); // already interned by new_var
+        let m = arith.apriori_bound();
+        let lo = arith
+            .bounds
+            .lower(xv)
+            .expect("lower box seeded")
+            .0
+            .c()
+            .clone();
+        let hi = arith
+            .bounds
+            .upper(xv)
+            .expect("upper box seeded")
+            .0
+            .c()
+            .clone();
+        assert_eq!(hi, Rational::from_int(m.clone()));
+        assert_eq!(lo, Rational::from_int(-m));
+    }
+
+    #[test]
+    fn apriori_not_seeded_on_real_vars() {
+        // A pure-Real atom must NOT cause the box to be seeded.
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let xr = ctx.declare_fun("xr", &[], real);
+        let x = ctx.mk_app(Op::Uninterpreted(xr), &[]).unwrap();
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), real);
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, five]).unwrap();
+
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            arith.new_var(&mut cx, Var::new(0), le);
+            let _ = arith.check(&mut cx, Effort::Full);
+        }
+        let xv = arith.vars.problem_var(x);
+        // No box bounds should be installed on a Real var.
+        assert!(
+            arith.bounds.upper(xv).is_none(),
+            "Real var must not get a box upper bound"
+        );
+        assert!(
+            arith.bounds.lower(xv).is_none(),
+            "Real var must not get a box lower bound"
+        );
+    }
+
+    #[test]
+    fn apriori_seeded_only_once() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let xi = ctx.declare_fun("yi", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xi), &[]).unwrap();
+        let two = ctx.mk_numeral(Rational::from_int(2i128.into()), int);
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, two]).unwrap();
+
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            arith.new_var(&mut cx, Var::new(0), le);
+            let _ = arith.check(&mut cx, Effort::Full);
+            let sentinel_count_after_first = arith.apriori_lits.len();
+            let _ = arith.check(&mut cx, Effort::Full);
+            // Second check must not add more sentinel lits.
+            assert_eq!(
+                arith.apriori_lits.len(),
+                sentinel_count_after_first,
+                "box must be seeded exactly once"
+            );
         }
     }
 }
