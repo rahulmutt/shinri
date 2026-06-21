@@ -647,9 +647,10 @@ impl Arith {
         if self.apriori_seeded {
             return;
         }
-        // Only seed at level 0. At higher levels, skip — this can happen for
-        // pure-Real queries where the CDCL calls check at level > 0.
-        if self.level != 0 {
+        // Only seed before the first checkpoint: bounds installed before the
+        // first bounds.mark() are permanent (level-0) and survive every backtrack.
+        // marks_len()==0 means no decision has been pushed yet.
+        if self.bounds.marks_len() != 0 {
             return;
         }
         self.apriori_seeded = true;
@@ -746,6 +747,11 @@ impl TheorySolver for Arith {
         _cx: &mut TheoryCtx,
         _out: &mut Vec<(Lit, TheoryJust)>,
     ) -> Option<Vec<EqLeaf>> {
+        // Seed the a-priori box here: `propagate` is called by the SAT solver's
+        // main loop BEFORE any theory.push / bounds.mark(), guaranteeing level-0
+        // permanence for bounds installed now (they survive every backtrack).
+        // The call in `check` remains as an idempotent fallback (no-op once seeded).
+        self.seed_apriori_if_needed();
         None // spec §1 decision 3: check-only; propagate is a no-op.
     }
 
@@ -1684,5 +1690,92 @@ mod apriori_tests {
                 "box must be seeded exactly once"
             );
         }
+    }
+
+    /// Regression test for the level-0 seeding bug: the a-priori box must be
+    /// seeded via `Arith::propagate` BEFORE any decision (push/mark), NOT only
+    /// via a level-0 Full `check`.
+    ///
+    /// Under the OLD guard (`self.level != 0 { return; }`), this test FAILS:
+    ///   - `propagate` is called first (no push yet, so level==0 there too)...
+    ///   - BUT the OLD guard was in a code path only triggered by `check`, not
+    ///     `propagate`. The real solver calls `theory.check(Effort::Full)` only
+    ///     when `pick_branch()==None` (complete propositional assignment), which
+    ///     arrives at decision level >= 1 for any branching query. At that point
+    ///     `self.level != 0` is true, so seeding is skipped forever.
+    ///   - This test exercises the `propagate`-first path explicitly: it calls
+    ///     `arith.propagate` at level 0 (no push), then pushes (simulating a
+    ///     decision), then calls `check(Full)`. Under the old guard, propagate
+    ///     would NOT trigger seeding (it never called `seed_apriori_if_needed`),
+    ///     and the subsequent check at level 1 would also skip seeding due to
+    ///     `self.level != 0`. Result: bounds remain None → test FAILS.
+    ///   - Under the NEW guard (`marks_len() != 0`), `propagate` seeds before
+    ///     the first mark, so the box is present and permanent.
+    #[test]
+    fn apriori_box_seeded_via_propagate_before_decision() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let xi = ctx.declare_fun("zi", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xi), &[]).unwrap();
+        let four = ctx.mk_numeral(Rational::from_int(4i128.into()), int);
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, four]).unwrap();
+
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            arith.new_var(&mut cx, v, le);
+
+            // Simulate the real solver: call propagate at level 0 (no push yet).
+            // This is the path that fires before any decision in solve_under.
+            let mut out: Vec<(Lit, TheoryJust)> = Vec::new();
+            let _ = arith.propagate(&mut cx, &mut out);
+        }
+
+        // After propagate (level 0, no marks yet), box must be seeded.
+        let xv = arith.vars.problem_var(x);
+        let m = arith.apriori_bound();
+        let lo = arith
+            .bounds
+            .lower(xv)
+            .expect("lower box bound must be seeded by propagate at level 0")
+            .0
+            .c()
+            .clone();
+        let hi = arith
+            .bounds
+            .upper(xv)
+            .expect("upper box bound must be seeded by propagate at level 0")
+            .0
+            .c()
+            .clone();
+        assert_eq!(hi, Rational::from_int(m.clone()), "upper box = +M");
+        assert_eq!(lo, Rational::from_int(-m), "lower box = -M");
+
+        // Also verify permanence: after a push (decision level 1) and Full check,
+        // the box bounds installed at level 0 are still present.
+        arith.push(); // simulates the SAT solver making a decision
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            let _ = arith.check(&mut cx, Effort::Full);
+        }
+        assert!(
+            arith.bounds.lower(xv).is_some(),
+            "lower box bound must survive push to level 1"
+        );
+        assert!(
+            arith.bounds.upper(xv).is_some(),
+            "upper box bound must survive push to level 1"
+        );
     }
 }
