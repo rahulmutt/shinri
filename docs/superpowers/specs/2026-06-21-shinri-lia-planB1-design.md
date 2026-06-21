@@ -25,7 +25,7 @@ Plan A delivered the cross-crate *mechanism* (the splitting seam) validated by s
 2. Narrowing the Int-sort fence to admit **pure-Int** atoms while still fencing **mixed** Int/Real (master spec §3.1).
 3. A-priori finite bound `M` seeded as ordinary axiomatic bounds (master spec §3.2).
 4. Fractional scan + branch `Split` in `check(Full)` (master spec §4).
-5. Integer disequalities + strict inequalities via eager `lower()` rewrite + Int strict-bound tightening (master spec §5, corrected to the actual codebase — see §3.5).
+5. Integer disequalities via eager `lower()` rewrite to `(or Lt Gt)`; integer strictness handled by reusing the existing δ encoding (master spec §5, corrected to the actual codebase — see §3.5; tightening deferred to B2).
 6. Integer model emission (master spec §7).
 7. Two-stage-ready differential oracle against **z3 + cvc5** + the unit/property soundness spine (master spec §9).
 
@@ -100,12 +100,18 @@ The Combiner lifts to `SplitAtoms`; the solver mints a `Var` per atom, `bind_fre
 
 > **Correction vs master spec §5.** The master spec describes integer `a ≠ b` as emitted through `TCheck::Split` and references a QF_LRA `diseq.rs` feasibility-shift path. **Neither matches the codebase.** There is no `diseq.rs`; instead the `lower()` pass in `crates/shinri-solver/src/lib.rs` *eagerly* rewrites Real `(distinct a b)` → `(or (Lt a b) (Gt a b))` (and Real `(= a b)` → `Eq` for EUF + `Le`/`Ge` for arith), but both rewrites are **gated to `real_sort()`**. So disequalities are resolved by an **eager Boolean split at encoding time** — the SAT solver case-splits the `(or Lt Gt)` clause — *not* by splitting-on-demand. `TCheck::Split` is reserved for branch-and-bound on fractional vars (§3.4), which genuinely arise mid-search and cannot be eagerly enumerated.
 
-B1 therefore handles integer disequalities by **extending `lower()`** rather than adding a `TCheck::Split` diseq path:
+B1 handles integer disequalities by **extending `lower()`** rather than adding a `TCheck::Split` diseq path:
 
 - **Drop the `real_sort()`-only gate** on the Eq and Distinct rewrites so Int-sorted operands lower the same way: Int `(distinct a b)` → `(or (Lt a b) (Gt a b))`; Int `(= a b)` keeps `Eq` (for EUF) and emits `Le`/`Ge` companions for arith. The pairwise `(distinct a … n)` expansion is already sort-agnostic.
-- **Tighten Int strict inequalities to non-strict integer bounds** when decoding/asserting a bound (`normalize.rs` / `assert`): for an Int var, `x < c` ⟹ `x ≤ c − 1` and `x > c` ⟹ `x ≥ c + 1` (and the floor/ceil of a non-integer constant for `≤`/`≥`). This is the standard integer-strictness rule and gives integer `a ≠ b` exactly the `(a ≤ b−1) ∨ (a ≥ b+1)` shape the master spec intended, while also covering strict inequalities that appear directly in the input.
 
-**Rejected alternative — reuse δ:** lower Int `Distinct` to `(or Lt Gt)` and rely on the LRA δ-infinitesimal strict bound (`x < c` ⟺ `x ≤ c − δ`) plus the fractional scan (treating δ-coeff ≠ 0 as non-integral, §3.4) and a branch round to resolve. Provably correct, but leans on δ — an LRA device — for integer reasoning and spends a branch round per disequality. Tightening is cleaner and standard. **Real-sorted** disequalities/strict inequalities are unchanged (they keep δ).
+> **Reversal vs the original §3.5 (decided 2026-06-21, after API-fact extraction).** The original §3.5 chose to **tighten** Int strict inequalities to non-strict integer bounds (`x < c` ⟹ `x ≤ c − 1`) at encoding time, listing "reuse δ" as the rejected alternative. The extracted facts inverted that tradeoff, so **B1 now reuses δ and defers tightening to B2.** The decisive findings:
+>
+> - **Branch-and-bound needs floor/ceil and branching regardless** — the simplex relaxation can return `x = 5/2` for an Int var no matter how strictness is encoded, and that fractional value *must* be branched on (`branch.rs`, §3.4). Tightening is therefore **not an alternative to branching**; it is an *add-on* that only pre-empts the one extra branch a strict bound's δ would cause. So "tighten" = "reuse δ" **plus** extra code, not instead of it.
+> - `Rational` exposes **no `floor`/`ceil`** (must be hand-rolled via `Integer::div_rem`); δ-reuse needs that helper in exactly one place (`branch.rs`), tightening needs it in two and additionally must thread an `is_int_query` flag and tighten in `build_encoding`/`normalize`.
+> - `normalize.rs` and `build_encoding` are **already sort-blind and correct on Int atoms as rationals** — under δ-reuse they need **zero** changes; the existing `Rel::Lt` → `(rhs, −δ)` encoding already produces the strict bound.
+> - **The two are byte-identical in sat/unsat verdicts** — the differential oracle cannot distinguish them. Tightening is a pure *performance* optimization (saves ~1 branch round per strict bound / disequality), which is exactly B2's remit, where it gets the same free differential validation against this A baseline.
+>
+> **Mechanism (δ-reuse):** keep the existing LRA δ-infinitesimal strict bound (`x < c` ⟺ `x ≤ c − δ`); the fractional scan (§3.4) treats a nonzero δ-component as non-integral and branches; the conflicting half of the branch dies, leaving the correct integer bound. Real-sorted disequalities/strict inequalities are unchanged (they keep δ). **Deferred to B2:** integer strict-bound tightening as a preprocessing optimization, differentially validated against B1.
 
 ### 3.6 Integer model emission (`crates/shinri-arith/src/model.rs`)
 
@@ -123,7 +129,7 @@ When `check` reports integer-feasible, the assignment is already **integral**, s
    - Add a random **QF_LIA** generator (Int sort; `set-logic QF_LIA`) alongside the existing QF_UF / QF_LRA generators.
    - Wire **cvc5** as a second `easy-smt` backend next to z3; compare our sat/unsat against **both**. Any disagreement panics with the full instance dumped; our `Unknown` is never a disagreement, but assert pure-QF_LIA instances do not go `Unknown` past the fence.
    - Cuts are off throughout B1, so this corpus *is* the Stage-A baseline that B2 must reproduce identically.
-2. **Unit:** a-priori `M` computation; branch-atom freshness + mid-search registration (atom → `Owner::Arith`); Int strict-bound tightening (`x<c` ⟹ `x≤c−1`) and Int `(distinct a b)` lowering to `(or Lt Gt)`; the classic *non-terminating-without-a-bound* instance must **terminate**; most-fractional + Bland-tiebreak branch-selection determinism; pure-Int admitted / mixed Int-Real fenced to `unknown`.
+2. **Unit:** a-priori `M` computation; branch-atom freshness + mid-search registration (atom → `Owner::Arith`); Int `(distinct a b)` lowering to `(or Lt Gt)`; a strict integer bound (`x < 5`) resolves to the correct integer bound via the δ-branch path; the classic *non-terminating-without-a-bound* instance must **terminate**; most-fractional + Bland-tiebreak branch-selection determinism; pure-Int admitted / mixed Int-Real fenced to `unknown`.
 3. **Self-check:** every `sat` integral model re-evaluated against all assertions (already wired in `shinri-solver`); every `unsat` carries a Farkas conflict over the (possibly branch) bound literals.
 4. **Property:** assert-then-`pop` observationally equivalent to never-asserted, **including branch bounds**; random feasible/infeasible QF_LIA systems checked against self-evaluation.
 
@@ -137,7 +143,7 @@ When `check` reports integer-feasible, the assignment is already **integral**, s
 
 | Module | Change |
 |---|---|
-| `normalize.rs` | Accept Int-sorted atoms (reuse `LinAtom`/tableau verbatim); tighten Int strict bounds (`<`→`≤ −1`, `>`→`≥ +1`, floor/ceil non-integer constants) |
+| `normalize.rs` / `build_encoding` | **No change** — already sort-blind; Int atoms normalize as rationals and the existing `Rel::Lt` → `(rhs, −δ)` encoding handles strictness (see §3.5 reversal) |
 | `vars.rs` | Record Int-sortedness per `ArithVar` |
 | `bounds.rs` | Compute + seed a-priori `−M ≤ x ≤ M` (bigint `M`, lazy one-shot at first level-0 `check(Full)`) |
 | `lib.rs` (`check_full`) | Non-integral-scan + branch-decision step after the simplex feasibility loop |
@@ -150,7 +156,8 @@ When `check` reports integer-feasible, the assignment is already **integral**, s
 |---|---|
 | `shinri-theory` | `TheoryCtx.terms: &mut Context`; update `combiner.rs` construction sites |
 | `shinri-theory` (`atom.rs`) | Narrow the Int fence: mixed-only, admit pure-Int |
-| `shinri-solver` (`lib.rs`) | Query-level pure-Int gate (mixed Int/Real → `unknown`); extend `lower()` to also rewrite Int Eq/Distinct (drop the `real_sort()`-only gate) |
+| `shinri-solver` (`lib.rs`) | Query-level pure-Int gate (mixed Int/Real → `unknown`); extend `lower()` to also rewrite Int Eq/Distinct (drop the `real_sort()`-only gate); add public `Solver::int_sort()` (currently only `real_sort()` is exposed) |
+| `shinri-solver` (`tseitin.rs`) | Encoder tracks `saw_int_arith` / `saw_real_arith` so the query-level LIRA gate can fire |
 | `shinri-solver` (`tests/oracle.rs`) | QF_LIA generator + cvc5 second backend |
 
 No GMI cut module in B1.
