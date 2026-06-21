@@ -577,6 +577,10 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                         self.backtrack_to(dl - 1);
                                     }
                                 }
+                                TheoryResult::SplitAtoms(_) => {
+                                    // TODO: Task 3 — implement splitting-on-demand logic
+                                    unimplemented!("SplitAtoms handler not yet implemented")
+                                }
                             },
                         }
                     }
