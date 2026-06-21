@@ -577,9 +577,25 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                         self.backtrack_to(dl - 1);
                                     }
                                 }
-                                TheoryResult::SplitAtoms(_) => {
-                                    // TODO: Task 3 — implement splitting-on-demand logic
-                                    unimplemented!("SplitAtoms handler not yet implemented")
+                                TheoryResult::SplitAtoms(atoms) => {
+                                    // Two-phase fresh-atom protocol (QF_LIA Plan A). Phase 1:
+                                    // allocate a fresh var per split atom and let the theory
+                                    // bind+encode it BEFORE the clause exists. new_var() updates
+                                    // assignment/heuristic/watches/analyzer, so the fresh vars
+                                    // are immediately usable in a learnt clause.
+                                    let mut lits: Vec<Lit> = Vec::with_capacity(atoms.len());
+                                    for atom in atoms {
+                                        let v = self.new_var();
+                                        self.theory.bind_fresh(v, atom);
+                                        lits.push(Lit::new(v, true));
+                                    }
+                                    // Phase 2: learn the split clause and backtrack one level so
+                                    // the solver must case-split on it (mirrors the Lemma path).
+                                    self.add_learnt(&lits);
+                                    let dl = self.trail.decision_level();
+                                    if dl > 0 {
+                                        self.backtrack_to(dl - 1);
+                                    }
                                 }
                             },
                         }
@@ -1120,6 +1136,56 @@ mod tests {
             Solver::with_theory(SolverConfig::default(), NoTheory);
         // Accessors compile and return the injected theory.
         let _t: &NoTheory = s.theory();
+    }
+
+    #[test]
+    fn solver_materializes_split_atoms_then_converges() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct Splitter {
+            fired: bool,
+            bound_vars: Rc<RefCell<Vec<Var>>>,
+        }
+        impl Theory for Splitter {
+            fn new_var(&mut self, _v: Var) {}
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    // Two split atoms named by sentinel TermIds; solver mints vars.
+                    TheoryResult::SplitAtoms(vec![
+                        TermId::new(100).unwrap(),
+                        TermId::new(101).unwrap(),
+                    ])
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn bind_fresh(&mut self, v: Var, _atom: TermId) {
+                self.bound_vars.borrow_mut().push(v);
+            }
+        }
+
+        // A trivially-SAT formula with one real var so search reaches the Full check.
+        let mut s: Solver<Splitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let a = s.new_var();
+        s.add_clause(&[Lit::new(a, true)]); // forces a then a Full check
+
+        let res = s.solve();
+        assert!(matches!(res, SolveResult::Sat));
+        // The two split atoms were bound to two freshly-minted vars (indices above `a`).
+        let bound = s.theory().bound_vars.borrow().clone();
+        assert_eq!(bound.len(), 2);
+        assert!(bound.iter().all(|v| v.index() > a.index()));
     }
 }
 
