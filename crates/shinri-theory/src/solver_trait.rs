@@ -18,10 +18,13 @@ pub struct TheoryCtx<'a> {
 }
 
 /// A sub-theory consistency verdict. Convex Phase-1 theories produce conflicts,
-/// never free-standing lemmas (combination lemmas are the Combiner's job).
+/// never free-standing lemmas. `Split` is the SINGLE sanctioned exception (QF_LIA
+/// Plan A): a clause of theory-valid positive atoms (`TermId`s) the Combiner
+/// lifts to `TheoryResult::SplitAtoms`. Only arithmetic emits it; EUF/Empty never do.
 pub enum TCheck {
     Sat,
     Conflict(Vec<EqLeaf>),
+    Split(Vec<TermId>),
 }
 
 /// `pop(level)` uses ABSOLUTE target levels (matching `EqualityEngine`/`UndoLog`).
@@ -145,5 +148,15 @@ mod tests {
             atoms: &atoms,
         };
         assert!(matches!(t.check(&mut cx, Effort::Full), TCheck::Sat));
+    }
+
+    #[test]
+    fn tcheck_split_carries_atoms() {
+        let t = shinri_core::TermId::new(5).unwrap();
+        let c = TCheck::Split(vec![t]);
+        match c {
+            TCheck::Split(atoms) => assert_eq!(atoms, vec![t]),
+            _ => panic!("expected Split"),
+        }
     }
 }
