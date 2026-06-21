@@ -6,3 +6,11 @@ rust = "1.96.0"
 "cargo:cargo-mutants" = "27.1.0"
 "github:Z3Prover/z3" = { version = "z3-4.16.0", exe = "z3", matching = "x64-glibc" }
 "github:cvc5/cvc5" = { version = "cvc5-1.3.4", exe = "cvc5", matching = "x86_64-static.zip" }
+
+[tasks.test]
+description = "Fast test suite — skips #[ignore]d slow tests"
+run = "cargo test --workspace"
+
+[tasks.test-full]
+description = "Full test suite — includes #[ignore]d slow tests (e.g. baseline-B&B diophantine termination)"
+run = "cargo test --workspace -- --include-ignored"

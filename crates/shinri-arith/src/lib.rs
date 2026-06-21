@@ -666,13 +666,34 @@ impl Arith {
     // A-priori finite box (Task 4): termination backstop for QF_LIA.
     // -----------------------------------------------------------------------
 
-    /// A dominating small-model bound (Papadimitriou 1981). Generously
-    /// A dominating small-model bound (Papadimitriou 1981, Borosh–Treybig 1976).
-    /// `M = (n * a + 1)^n` where n = #Int problem vars, a = max |coeff/const|.
-    /// This is the standard Papadimitriou small-model bound: if an ILP with n
-    /// integer variables and max coefficient magnitude a has an integer solution,
-    /// it has one with |x_i| ≤ M. Using variable count n in the exponent (not
-    /// atom count m) keeps M practical. Larger is always sound (only slower).
+    /// A dominating small-model bound for QF_LIA termination.
+    ///
+    /// `M = (n + 1) * ((n + m) * a + 1)^(n + m)`
+    ///
+    /// where:
+    /// - `n` = number of Int *problem* variables (non-slack Int vars),
+    /// - `m` = number of registered arithmetic atoms / constraints
+    ///   (`self.apriori_atom_count`),
+    /// - `a` = `self.apriori_coeff_max` (maximum |coefficient| or |constant|
+    ///   seen across all atoms).
+    ///
+    /// **Soundness.** After introducing one slack variable per inequality the
+    /// system has `n + m` integer variables and coefficient magnitude ≤ `a`.
+    /// Any integer solution to this slacked system — if one exists — has a
+    /// solution with each variable bounded by the Borosh–Treybig / Cramer
+    /// determinant bound, which is dominated by `((n+m)·a + 1)^(n+m)`.  The
+    /// leading `(n + 1)` factor is the standard Papadimitriou / Seshia–Bryant
+    /// (LICS'04) multiplier that accounts for the inequality-to-equality slack
+    /// dimension.  Therefore this bound is an *over-approximation* of every
+    /// feasible integer point: using it as the box radius is always sound
+    /// (a too-small M can cut off the only feasible point; a too-large M is
+    /// slower but never unsound).
+    ///
+    /// **Why m matters.** The Papadimitriou and Seshia–Bryant bounds are both
+    /// m-dependent.  A bound that drops `m` (e.g., `(n·a+1)^n`) under-counts
+    /// the slack dimension and can be strictly smaller than the actual feasible
+    /// region when `m ≫ n`, causing wrong UNSAT.  This bound restores the
+    /// missing `m` term, making it correct for arbitrary QF_LIA instances.
     fn apriori_bound(&self) -> Integer {
         let n_int = (0..self.vars.len())
             .filter(|&i| {
@@ -685,13 +706,15 @@ impl Arith {
         }
         let a = self.apriori_coeff_max.clone();
         let n = Integer::from(n_int as i128);
-        // M = (n * a + 1)^n
-        let base = n.clone() * a + Integer::one();
+        let m = Integer::from(self.apriori_atom_count as i128);
+        // M = (n + 1) * ((n + m) * a + 1)^(n + m)
+        let exp = n_int + self.apriori_atom_count; // n + m as usize for loop
+        let base = (n.clone() + m) * a + Integer::one();
         let mut pow = Integer::one();
-        for _ in 0..n_int {
-            pow = pow * base.clone();
+        for _ in 0..exp {
+            pow *= base.clone();
         }
-        pow
+        (n + Integer::one()) * pow
     }
 
     /// Seed `−M ≤ x ≤ M` on every Int problem var, once, at level 0. Bounds ride
