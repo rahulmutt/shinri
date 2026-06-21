@@ -5,3 +5,4 @@ rust = "1.96.0"
 "cargo:cargo-fuzz" = "0.13.2"
 "cargo:cargo-mutants" = "27.1.0"
 "github:Z3Prover/z3" = { version = "z3-4.16.0", exe = "z3", matching = "x64-glibc" }
+"github:cvc5/cvc5" = { version = "cvc5-1.3.4", exe = "cvc5", matching = "x86_64-static.zip" }
