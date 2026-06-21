@@ -495,6 +495,7 @@ impl Arith {
             TightenResult::Tightened => match self.check_full() {
                 TCheck::Sat => None,
                 TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
+                TCheck::Split(_) => unreachable!("arith check_full never emits Split"),
             },
         }
     }
@@ -553,6 +554,7 @@ impl Arith {
         match self.check_full() {
             TCheck::Sat => None,
             TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
+            TCheck::Split(_) => unreachable!("arith check_full never emits Split"),
         }
     }
 
@@ -884,6 +886,7 @@ mod check_tests {
                 assert!(leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(1), true))));
             }
             TCheck::Sat => panic!("expected conflict"),
+            TCheck::Split(_) => unreachable!("Arith check never emits Split in its own tests"),
         }
     }
 
