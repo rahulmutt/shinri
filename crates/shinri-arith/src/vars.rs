@@ -22,13 +22,15 @@ pub struct VarStore {
     by_comb: FxHashMap<LinComb, ArithVar>,
     term_of: Vec<Option<TermId>>,
     is_slack: Vec<bool>,
+    is_int: Vec<bool>,
 }
 
 impl VarStore {
-    fn fresh(&mut self, term: Option<TermId>, slack: bool) -> ArithVar {
+    fn fresh(&mut self, term: Option<TermId>, slack: bool, is_int: bool) -> ArithVar {
         let v = ArithVar(self.term_of.len() as u32);
         self.term_of.push(term);
         self.is_slack.push(slack);
+        self.is_int.push(is_int);
         v
     }
 
@@ -36,7 +38,16 @@ impl VarStore {
         if let Some(&v) = self.by_term.get(&t) {
             return v;
         }
-        let v = self.fresh(Some(t), false);
+        let v = self.fresh(Some(t), false, false);
+        self.by_term.insert(t, v);
+        v
+    }
+
+    pub fn problem_var_sorted(&mut self, t: TermId, is_int: bool) -> ArithVar {
+        if let Some(&v) = self.by_term.get(&t) {
+            return v;
+        }
+        let v = self.fresh(Some(t), false, is_int);
         self.by_term.insert(t, v);
         v
     }
@@ -45,7 +56,7 @@ impl VarStore {
         if let Some(&v) = self.by_comb.get(comb) {
             return v;
         }
-        let v = self.fresh(None, true);
+        let v = self.fresh(None, true, false);
         self.by_comb.insert(comb.clone(), v);
         v
     }
@@ -66,6 +77,15 @@ impl VarStore {
     }
 
     #[inline]
+    pub fn is_int(&self, v: ArithVar) -> bool {
+        self.is_int[v.index()]
+    }
+
+    pub fn mark_int(&mut self, v: ArithVar) {
+        self.is_int[v.index()] = true;
+    }
+
+    #[inline]
     pub fn term_of(&self, v: ArithVar) -> Option<TermId> {
         self.term_of[v.index()]
     }
@@ -76,6 +96,24 @@ mod tests {
     use super::*;
     use crate::normalize::LinComb;
     use shinri_num::Rational;
+
+    #[test]
+    fn problem_var_records_int_sortedness() {
+        let mut s = VarStore::default();
+        let ti = TermId::new(1).unwrap();
+        let tr = TermId::new(2).unwrap();
+        let xi = s.problem_var_sorted(ti, true);
+        let xr = s.problem_var_sorted(tr, false);
+        assert!(s.is_int(xi));
+        assert!(!s.is_int(xr));
+        // Re-interning the same term returns the same var, keeps its flag.
+        assert_eq!(s.problem_var_sorted(ti, true), xi);
+        assert!(s.is_int(xi));
+        // Slacks are never int.
+        let comb = LinComb(vec![(xi, Rational::one()), (xr, Rational::one())]);
+        let sl = s.slack_var(&comb);
+        assert!(!s.is_int(sl));
+    }
 
     #[test]
     fn problem_and_slack_vars_intern_by_identity() {

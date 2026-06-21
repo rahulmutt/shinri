@@ -586,6 +586,17 @@ impl TheorySolver for Arith {
 
     fn new_var(&mut self, cx: &mut TheoryCtx, v: Var, atom: TermId) {
         let n = normalize_atom(cx.terms, &mut self.vars, atom);
+        // Stamp Int-sortedness on each problem var this atom interned, so the
+        // integer layer (Task 5) and the a-priori box (Task 4) know which vars
+        // must be integral. normalize.rs is sort-blind; we read the sort here.
+        let int_s = cx.terms.int_sort();
+        for (av, _) in &n.comb.0 {
+            if let Some(t) = self.vars.term_of(*av) {
+                if cx.terms.sort_of(t) == int_s {
+                    self.vars.mark_int(*av);
+                }
+            }
+        }
         let enc = self.build_encoding(&n);
         let idx = v.index();
         if idx >= self.enc.len() {
