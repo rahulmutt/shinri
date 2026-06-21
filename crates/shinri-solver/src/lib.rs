@@ -69,6 +69,9 @@ impl Solver {
     pub fn real_sort(&self) -> SortId {
         self.ctx.real_sort()
     }
+    pub fn int_sort(&self) -> SortId {
+        self.ctx.int_sort()
+    }
     pub fn numeral(&mut self, value: Rational, sort: SortId) -> TermId {
         self.ctx.mk_numeral(value, sort)
     }
@@ -519,6 +522,12 @@ mod execute_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn int_sort_is_exposed_and_distinct_from_real() {
+        let s = Solver::new();
+        assert_ne!(s.int_sort(), s.real_sort());
+    }
 
     #[test]
     fn solver_builds_terms() {
