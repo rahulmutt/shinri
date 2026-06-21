@@ -27,6 +27,10 @@ pub struct Encoder<'a> {
     /// `(= p:U q:U) ∧ (> x:Real 0)` (no N-O propagation), but NOT
     /// `(= x:Real y:Real) ∧ (Le x y)` (valid QF_UFLRA with companion Le/Ge).
     pub saw_euf_nonreal: bool,
+    /// True if any arith atom's operands are Int-sorted.
+    pub saw_int_arith: bool,
+    /// True if any arith atom's operands are Real-sorted.
+    pub saw_real_arith: bool,
     t_true: TermId,
     t_false: TermId,
 }
@@ -43,6 +47,8 @@ impl<'a> Encoder<'a> {
             saw_arith: false,
             saw_shared: false,
             saw_euf_nonreal: false,
+            saw_int_arith: false,
+            saw_real_arith: false,
             t_true,
             t_false,
         }
@@ -204,13 +210,33 @@ impl<'a> Encoder<'a> {
                         self.saw_euf_nonreal = true;
                     }
                 }
-                Ok(shinri_theory::types::Owner::Arith) => self.saw_arith = true,
+                Ok(shinri_theory::types::Owner::Arith) => {
+                    self.saw_arith = true;
+                    if self.arith_atom_is_int(t) {
+                        self.saw_int_arith = true;
+                    } else {
+                        self.saw_real_arith = true;
+                    }
+                }
                 Ok(shinri_theory::types::Owner::Shared) => self.saw_shared = true,
                 Err(_) => {}
             }
         }
         self.atom_vars.push((v, t));
         Lit::new(v, true)
+    }
+
+    /// True iff this arith relation atom's operands are Int-sorted. `mk_app`
+    /// forbids mixed Int/Real arithmetic, so checking the first child suffices.
+    fn arith_atom_is_int(&self, t: TermId) -> bool {
+        use shinri_core::TermNode;
+        if let TermNode::App { args, .. } = self.ctx.term_node(t) {
+            let kids = self.ctx.children(*args);
+            if let Some(&c0) = kids.first() {
+                return self.ctx.sort_of(c0) == self.ctx.int_sort();
+            }
+        }
+        false
     }
 
     /// Distinct over a non-Bool sort.

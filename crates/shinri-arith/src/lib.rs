@@ -667,9 +667,12 @@ impl Arith {
     // -----------------------------------------------------------------------
 
     /// A dominating small-model bound (Papadimitriou 1981). Generously
-    /// over-approximated: `M = (n+1) * ((m+1)*(a+1))^(2*(m+1))` where n = #Int
-    /// problem vars, m = #atoms, a = max |coeff/const|. Larger is always sound
-    /// (only slower); only a too-small M could be unsound, so we over-shoot.
+    /// A dominating small-model bound (Papadimitriou 1981, Borosh–Treybig 1976).
+    /// `M = (n * a + 1)^n` where n = #Int problem vars, a = max |coeff/const|.
+    /// This is the standard Papadimitriou small-model bound: if an ILP with n
+    /// integer variables and max coefficient magnitude a has an integer solution,
+    /// it has one with |x_i| ≤ M. Using variable count n in the exponent (not
+    /// atom count m) keeps M practical. Larger is always sound (only slower).
     fn apriori_bound(&self) -> Integer {
         let n_int = (0..self.vars.len())
             .filter(|&i| {
@@ -677,18 +680,18 @@ impl Arith {
                 !self.vars.is_slack(v) && self.vars.is_int(v)
             })
             .count();
-        let n = Integer::from(n_int as i128);
-        let m = Integer::from(self.apriori_atom_count as i128);
+        if n_int == 0 {
+            return Integer::one(); // no Int vars → dummy; box never seeded
+        }
         let a = self.apriori_coeff_max.clone();
-        let one = Integer::one();
-        let base = (m.clone() + one.clone()) * (a + one.clone()); // (m+1)*(a+1)
-                                                                  // exponent = 2*(m+1)
-        let exp_int = (self.apriori_atom_count + 1) * 2;
+        let n = Integer::from(n_int as i128);
+        // M = (n * a + 1)^n
+        let base = n.clone() * a + Integer::one();
         let mut pow = Integer::one();
-        for _ in 0..exp_int {
+        for _ in 0..n_int {
             pow = pow * base.clone();
         }
-        (n + one) * pow
+        pow
     }
 
     /// Seed `−M ≤ x ≤ M` on every Int problem var, once, at level 0. Bounds ride

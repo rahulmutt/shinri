@@ -11,16 +11,10 @@ use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode, Var};
 pub struct Unsupported(pub TermId);
 
 /// Classify a Boolean atom by its top operator and argument sorts. Returns the
-/// owning theory, or `Unsupported` for constructs outside QF_UFLRA.
+/// owning theory, or `Unsupported` for constructs outside QF_UFLRA/QF_LIA.
 pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
     // Reject any nonlinear product anywhere in the atom first (spec §9).
     if contains_nonlinear_mul(terms, atom) {
-        return Err(Unsupported(atom));
-    }
-    // QF_LIA is out of scope this milestone: an LRA simplex solves only the real
-    // relaxation, which is unsound for integers. Fence Int-sorted arithmetic to
-    // `unknown` (spec §1.1). Real-sorted arithmetic is unaffected.
-    if contains_int_arith(terms, atom) {
         return Err(Unsupported(atom));
     }
     match terms.term_node(atom) {
@@ -96,25 +90,6 @@ fn contains_nonlinear_mul(terms: &Context, t: TermId) -> bool {
             children.iter().any(|&c| contains_nonlinear_mul(terms, c))
         }
     }
-}
-
-/// True if `atom` is an arithmetic relation/equality with an Int-sorted operand.
-fn contains_int_arith(terms: &Context, atom: TermId) -> bool {
-    let int_s = terms.int_sort();
-    if let TermNode::App { op, args, .. } = terms.term_node(atom) {
-        let children = terms.children(*args);
-        let touches_int = children.iter().any(|&c| terms.sort_of(c) == int_s);
-        match op {
-            Op::Builtin(BuiltinOp::Le | BuiltinOp::Lt | BuiltinOp::Ge | BuiltinOp::Gt) => {
-                return touches_int;
-            }
-            Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct) => {
-                return touches_int;
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 /// `Var`-indexed routing table. Append-only across a solve (atoms are never
@@ -240,7 +215,7 @@ mod tests {
     }
 
     #[test]
-    fn int_sorted_arith_is_fenced_to_unsupported() {
+    fn pure_int_arith_is_admitted_to_owner_arith() {
         let mut ctx = Context::new();
         let int = ctx.int_sort();
         let xi = ctx.declare_fun("xi", &[], int);
@@ -248,8 +223,8 @@ mod tests {
         let x = ctx.mk_app(Op::Uninterpreted(xi), &[]).unwrap();
         let y = ctx.mk_app(Op::Uninterpreted(yi), &[]).unwrap();
         let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, y]).unwrap();
-        assert_eq!(classify(&ctx, le), Err(Unsupported(le)));
-        // Real-sorted still arith.
+        assert_eq!(classify(&ctx, le), Ok(Owner::Arith));
+        // Real still arith.
         let real = ctx.real_sort();
         let xr = ctx.declare_fun("xr", &[], real);
         let yr = ctx.declare_fun("yr", &[], real);

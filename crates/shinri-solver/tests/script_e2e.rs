@@ -88,8 +88,12 @@ fn error_recovers_and_continues() {
 }
 
 #[test]
-fn int_arithmetic_is_unknown_not_wrong() {
-    // QF_LIA fragment is fenced downstream to unknown (never a wrong answer).
-    let out = run_script("(declare-fun n () Int)(assert (> n 0))(assert (< n 1))(check-sat)");
-    assert_eq!(out, vec!["unknown"]);
+fn int_arithmetic_is_now_decided() {
+    // Pure QF_LIA is now decided end-to-end (Task 7 flip).
+    // n > 0 ∧ n < 1 has no integer solution → unsat.
+    let unsat = run_script("(declare-fun n () Int)(assert (> n 0))(assert (< n 1))(check-sat)");
+    assert_eq!(unsat, vec!["unsat"]);
+    // n > 0 is satisfiable over Int (e.g. n=1) → sat.
+    let sat = run_script("(declare-fun n () Int)(assert (> n 0))(check-sat)");
+    assert_eq!(sat, vec!["sat"]);
 }

@@ -218,6 +218,7 @@ impl Solver {
         let atom_vars: Vec<(shinri_core::Var, TermId)>;
         let refused: bool;
         let mixed: bool;
+        let lira: bool;
         {
             let mut enc = Encoder::new(&self.ctx, &mut sat, self.t_true, self.t_false);
             // Phase 1: encode all formulas, registering all theory atoms with the
@@ -245,14 +246,18 @@ impl Solver {
             //   * shared-Real cases (`x≥5 ∧ x≤5 ∧ distinct(f x)(f 5)`) are caught
             //     by N-O (LRA + EUF are convex ⇒ entailed-equality exchange is
             //     sound AND complete for QF_UFLRA).
-            // Genuinely unsupported constructs (nonlinear, Int arith, quantifiers,
-            // mixed-sort equalities) remain fenced via classify→Unsupported and
-            // `saw_shared`. (`saw_arith`/`saw_euf`/`saw_euf_nonreal` are retained
-            // as classification signals but no longer gate the result.)
+            // Genuinely unsupported constructs (nonlinear, quantifiers,
+            // mixed-sort equalities, mixed Int+Real arith) remain fenced via
+            // classify→Unsupported, `saw_shared`, or the `lira` gate below.
+            // (`saw_arith`/`saw_euf`/`saw_euf_nonreal` are retained as
+            // classification signals but no longer gate the result.)
             mixed = enc.saw_shared;
+            // QF_LIRA (Int and Real arith vars in one query) is out of scope —
+            // the simplex cannot share a tableau across sorts soundly here. Fence.
+            lira = enc.saw_int_arith && enc.saw_real_arith;
         }
 
-        if refused || mixed {
+        if refused || mixed || lira {
             return SolveOutcome::Unknown;
         }
 
@@ -338,10 +343,10 @@ impl Solver {
                 ..
             } => {
                 let kids: Vec<TermId> = self.ctx.children(args).to_vec();
-                // Only rewrite arithmetic (Real-sorted) equalities; leave
+                // Only rewrite arithmetic-sorted equalities; leave
                 // EUF/Bool equalities for the theory encoder.
                 if kids.len() >= 2 && self.is_arith_sorted(kids[0]) {
-                    // Real-sorted (= a b c ...) : a == b == c == ...
+                    // Arith-sorted (= a b c ...) : a == b == c == ...
                     // Chain adjacent pairs:
                     //   (= a b)∧(Le a b)∧(Ge a b) ∧ (= b c)∧(Le b c)∧(Ge b c) ∧ ...
                     // The Eq atoms go to EUF for congruence; the Le/Ge go to Arith.
@@ -406,12 +411,12 @@ impl Solver {
                             t
                         }
                     } else {
-                        // Non-Real (EUF) binary distinct: pass through unchanged.
+                        // Non-arithmetic (EUF) binary distinct: pass through unchanged.
                         t
                     }
                 } else {
                     // N-ary distinct: split into pairwise binary distincts, each
-                    // recursively lowered (so pure-Real pairs → Lt/Gt, EUF pairs stay).
+                    // recursively lowered (so pure-arith pairs → Lt/Gt, EUF pairs stay).
                     let mut pairs = Vec::new();
                     for i in 0..kids.len() {
                         for j in (i + 1)..kids.len() {
@@ -419,7 +424,7 @@ impl Solver {
                                 .ctx
                                 .mk_app(Op::Builtin(BuiltinOp::Distinct), &[kids[i], kids[j]])
                                 .expect("binary distinct well-sorted");
-                            // Recurse so pure-Real pairs become (or Lt Gt).
+                            // Recurse so pure-arith pairs become (or Lt Gt).
                             let lowered_d = self.lower(d);
                             pairs.push(lowered_d);
                         }
