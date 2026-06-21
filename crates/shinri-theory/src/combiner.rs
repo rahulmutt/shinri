@@ -13,6 +13,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{Context, Lit, TermId, TheoryJust, Var};
 use shinri_sat::{Effort, Theory, TheoryResult};
 
+/// Private tri-state result for `drive_final_check`, carrying the Split variant
+/// through to `Theory::check` so it can be lifted to `TheoryResult::SplitAtoms`.
+enum FinalCheck {
+    Sat,
+    Conflict(Vec<crate::types::EqLeaf>),
+    Split(Vec<TermId>),
+}
+
 pub struct Combiner<E: TheorySolver, A: TheorySolver> {
     terms: Context,
     eq: EqualityEngine,
@@ -173,9 +181,21 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
             return TheoryResult::Sat;
         }
         match self.drive_final_check() {
-            None => TheoryResult::Sat,
-            Some(leaves) => TheoryResult::Conflict(self.expand_conflict(leaves)),
+            FinalCheck::Sat => TheoryResult::Sat,
+            FinalCheck::Conflict(leaves) => TheoryResult::Conflict(self.expand_conflict(leaves)),
+            FinalCheck::Split(atoms) => TheoryResult::SplitAtoms(atoms),
         }
+    }
+
+    fn bind_fresh(&mut self, v: Var, atom: TermId) {
+        self.atoms.register(v, atom, Owner::Arith);
+        // Borrow-split: build the ctx from the non-arith fields, then call arith.
+        let mut cx = TheoryCtx {
+            terms: &self.terms,
+            eq: &mut self.eq,
+            atoms: &self.atoms,
+        };
+        self.arith.new_var(&mut cx, v, atom);
     }
 
     fn push(&mut self) {
@@ -211,7 +231,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
     /// already equal in `cx.eq` (merges are monotone — classes only ever shrink
     /// in number), and EUF→arith skips pairs already asserted this round. So the
     /// number of new merges/assertions is bounded and the loop converges.
-    fn drive_final_check(&mut self) -> Option<Vec<crate::types::EqLeaf>> {
+    fn drive_final_check(&mut self) -> FinalCheck {
         // Compute the shared Real-term set S once and ensure arith has a var
         // (incl. numeral pins) for every member BEFORE any arith check that
         // reads entailed equalities (R4: pins must be active during solving).
@@ -237,11 +257,15 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                     eq: &mut self.eq,
                     atoms: &self.atoms,
                 };
-                if let TCheck::Conflict(cf) = self.euf.check(&mut cx, Effort::Full) {
-                    return Some(cf);
+                match self.euf.check(&mut cx, Effort::Full) {
+                    TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
+                    TCheck::Split(_) => unreachable!("EUF never splits"),
+                    TCheck::Sat => {}
                 }
-                if let TCheck::Conflict(cf) = self.arith.check(&mut cx, Effort::Full) {
-                    return Some(cf);
+                match self.arith.check(&mut cx, Effort::Full) {
+                    TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
+                    TCheck::Split(atoms) => return FinalCheck::Split(atoms),
+                    TCheck::Sat => {}
                 }
             }
             // Did the existing round produce a new interface/congruence merge?
@@ -277,7 +301,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                         tag,
                     };
                     if let Some(cf) = self.euf.consume_interface_equality(&mut cx, a, b, just) {
-                        return Some(cf);
+                        return FinalCheck::Conflict(cf);
                     }
                     progressed = true;
                 }
@@ -333,7 +357,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                         if let Some(cf) =
                             self.arith.consume_interface_equality(&mut cx, rep, m, just)
                         {
-                            return Some(cf);
+                            return FinalCheck::Conflict(cf);
                         }
                         progressed = true;
                     }
@@ -349,7 +373,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
             self.merges.clear();
 
             if !progressed {
-                return None;
+                return FinalCheck::Sat;
             }
         }
     }
@@ -418,6 +442,16 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
 
     pub fn cert_log(&self) -> &crate::proof::CertLog {
         &self.cert
+    }
+
+    #[cfg(test)]
+    pub(crate) fn atoms_ref(&self) -> &AtomRegistry {
+        &self.atoms
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arith_ref(&self) -> &A {
+        &self.arith
     }
 
     /// Assemble the combined model (spec §7.3). Arith assigns rationals first
@@ -879,5 +913,88 @@ mod tests {
         );
         let mut out2 = Vec::new();
         assert!(c.propagate(&mut out2).is_none(), "conflict must be drained");
+    }
+
+    // ── Task 5: Combiner lifts TCheck::Split → SplitAtoms + bind_fresh ──────
+
+    /// Do-nothing EUF slot: always Sat, never splits.
+    #[derive(Default)]
+    struct NullTheory;
+    impl TheorySolver for NullTheory {
+        const THEORY_ID: u16 = 99;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _out: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            TCheck::Sat
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _level: usize) {}
+    }
+
+    /// Arith-slot stub: returns Split(one atom) on first Full check, then Sat.
+    /// Records (v, atom) pairs from `new_var` for bind_fresh verification.
+    #[derive(Default)]
+    struct ArithSplitter {
+        fired: bool,
+        pub bound: Vec<(Var, TermId)>,
+    }
+    impl TheorySolver for ArithSplitter {
+        const THEORY_ID: u16 = 7;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, v: Var, atom: TermId) {
+            self.bound.push((v, atom));
+        }
+        fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _o: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            if !self.fired {
+                self.fired = true;
+                TCheck::Split(vec![TermId::new(42).unwrap()])
+            } else {
+                TCheck::Sat
+            }
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _t: u32, _e: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _l: usize) {}
+    }
+
+    #[test]
+    fn combiner_lifts_split_and_binds_fresh() {
+        use crate::types::Owner;
+
+        let mut comb: Combiner<NullTheory, ArithSplitter> = Combiner::default();
+        // First Full check lifts the arith Split into SplitAtoms.
+        match Theory::check(&mut comb, Effort::Full) {
+            TheoryResult::SplitAtoms(atoms) => {
+                assert_eq!(atoms, vec![TermId::new(42).unwrap()])
+            }
+            other => panic!("expected SplitAtoms, got {other:?}"),
+        }
+        // Solver would now allocate a var and call back bind_fresh; simulate it.
+        let v = Var::new(0);
+        Theory::bind_fresh(&mut comb, v, TermId::new(42).unwrap());
+        // The fresh atom is registered to the Arith owner and encoded by the arith slot.
+        assert_eq!(comb.atoms_ref().owner(v), Owner::Arith);
+        assert_eq!(comb.arith_ref().bound, vec![(v, TermId::new(42).unwrap())]);
     }
 }

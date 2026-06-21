@@ -1,5 +1,6 @@
 use crate::clause::ClauseRef;
 use shinri_core::Lit;
+use shinri_core::TermId;
 use shinri_core::TheoryJust;
 
 /// A three-valued Boolean: the value of a variable on the current trail.
@@ -38,12 +39,16 @@ pub enum Effort {
 }
 
 /// The result of a theory consistency `check` (spec §8.1). `Conflict`/`Lemma`
-/// carry literal sets the solver folds into conflict analysis.
+/// carry literal sets the solver folds into conflict analysis. `SplitAtoms`
+/// carries a clause of *positive atoms* (as `TermId`s) the solver must mint
+/// fresh vars for, bind into the theory, then learn + case-split (splitting on
+/// demand — QF_LIA Plan A).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TheoryResult {
     Sat,
     Conflict(Vec<Lit>),
     Lemma(Vec<Lit>),
+    SplitAtoms(Vec<TermId>),
 }
 
 /// The outcome of a solve. `Unsat.core` is the failed-assumption set
@@ -88,5 +93,15 @@ mod tests {
         assert_eq!(LBool::True.negate(), LBool::False);
         assert_eq!(LBool::False.negate(), LBool::True);
         assert_eq!(LBool::Unset.negate(), LBool::Unset);
+    }
+
+    #[test]
+    fn split_atoms_holds_term_ids() {
+        let t = shinri_core::TermId::new(7).unwrap();
+        let r = TheoryResult::SplitAtoms(vec![t]);
+        match r {
+            TheoryResult::SplitAtoms(atoms) => assert_eq!(atoms, vec![t]),
+            _ => panic!("expected SplitAtoms"),
+        }
     }
 }

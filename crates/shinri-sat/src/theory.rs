@@ -1,5 +1,5 @@
 use crate::types::{Effort, TheoryResult};
-use shinri_core::{Lit, TheoryJust, Var};
+use shinri_core::{Lit, TermId, TheoryJust, Var};
 
 /// The theory-integration seam (spec §8.1). Implemented by `shinri-theory`.
 /// `NoTheory` makes every method inline to nothing, leaving a pure CDCL solver.
@@ -22,6 +22,12 @@ pub trait Theory: Default {
     fn pop(&mut self, n: usize);
     /// A new variable was allocated.
     fn new_var(&mut self, v: Var);
+    /// Bind a freshly-minted split atom to the var the solver just allocated
+    /// for it (splitting on demand, QF_LIA Plan A). Called once per atom in a
+    /// `TheoryResult::SplitAtoms` clause, BEFORE the clause is learnt, so the
+    /// theory can register `v -> atom` and build its encoding. Default no-op:
+    /// theories that never emit `SplitAtoms` need not implement it.
+    fn bind_fresh(&mut self, _v: Var, _atom: TermId) {}
 }
 
 /// The zero-cost default theory: a ZST whose methods compile to nothing.
@@ -47,4 +53,38 @@ impl Theory for NoTheory {
     fn pop(&mut self, _n: usize) {}
     #[inline(always)]
     fn new_var(&mut self, _v: Var) {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_fresh_default_is_noop_and_overridable() {
+        #[derive(Default)]
+        struct Recorder {
+            bound: Vec<(Var, TermId)>,
+        }
+        impl Theory for Recorder {
+            fn new_var(&mut self, _v: Var) {}
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                TheoryResult::Sat
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn bind_fresh(&mut self, v: Var, atom: TermId) {
+                self.bound.push((v, atom));
+            }
+        }
+        let mut r = Recorder::default();
+        let v = Var::new(3);
+        let t = TermId::new(9).unwrap();
+        r.bind_fresh(v, t);
+        assert_eq!(r.bound, vec![(v, t)]);
+    }
 }
