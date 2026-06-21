@@ -36,7 +36,7 @@ proptest! {
         atoms.register(vd, diseq, shinri_theory::types::Owner::Euf);
 
         let mut euf = Euf::default();
-        let mut cx = TheoryCtx { terms: &ctx, eq: &mut eq, atoms: &atoms };
+        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &atoms };
         for (i, &atom) in eqs.iter().enumerate() {
             euf.new_var(&mut cx, Var::new(i as u32), atom);
         }

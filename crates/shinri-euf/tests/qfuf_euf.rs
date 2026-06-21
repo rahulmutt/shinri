@@ -31,7 +31,7 @@ fn congruence_conflict_x_eq_y_implies_fx_eq_fy() {
     let mut euf = Euf::default();
     {
         let mut cx = TheoryCtx {
-            terms: &ctx,
+            terms: &mut ctx,
             eq: &mut eq,
             atoms: &atoms,
         };
@@ -81,7 +81,7 @@ fn conflict_bridges_to_diseq_endpoints_sufficiency() {
 
     let mut euf = Euf::default();
     let mut cx = TheoryCtx {
-        terms: &ctx,
+        terms: &mut ctx,
         eq: &mut eq,
         atoms: &atoms,
     };
@@ -139,7 +139,7 @@ fn predicate_congruence_conflict() {
     let mut euf = Euf::default();
     euf.set_truth_terms(t_true, t_false);
     let mut cx = TheoryCtx {
-        terms: &ctx,
+        terms: &mut ctx,
         eq: &mut eq,
         atoms: &atoms,
     };
@@ -186,7 +186,7 @@ fn predicate_conflict_survives_push_pop() {
     let mut euf = Euf::default();
     euf.set_truth_terms(t_true, t_false);
     let mut cx = TheoryCtx {
-        terms: &ctx,
+        terms: &mut ctx,
         eq: &mut eq,
         atoms: &atoms,
     };
@@ -241,7 +241,7 @@ fn pop_undoes_congruence_merge() {
 
     let mut euf = Euf::default();
     let mut cx = TheoryCtx {
-        terms: &ctx,
+        terms: &mut ctx,
         eq: &mut eq,
         atoms: &atoms,
     };
@@ -284,7 +284,7 @@ fn model_assigns_equal_terms_the_same_element() {
     let mut euf = Euf::default();
     let mut m = ModelBuilder::default();
     let mut cx = TheoryCtx {
-        terms: &ctx,
+        terms: &mut ctx,
         eq: &mut eq,
         atoms: &atoms,
     };
@@ -315,7 +315,7 @@ fn propagates_forced_equality_with_explanation() {
 
     let mut euf = Euf::default();
     let mut cx = TheoryCtx {
-        terms: &ctx,
+        terms: &mut ctx,
         eq: &mut eq,
         atoms: &atoms,
     };
@@ -361,7 +361,7 @@ fn nary_congruence_conflict() {
 
     let mut euf = Euf::default();
     let mut cx = TheoryCtx {
-        terms: &ctx,
+        terms: &mut ctx,
         eq: &mut eq,
         atoms: &atoms,
     };

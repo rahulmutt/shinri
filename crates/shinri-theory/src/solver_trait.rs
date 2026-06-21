@@ -12,7 +12,7 @@ use shinri_sat::Effort;
 
 /// The borrowed context threaded into every `TheorySolver` call (spec §5.1).
 pub struct TheoryCtx<'a> {
-    pub terms: &'a Context,
+    pub terms: &'a mut Context,
     pub eq: &'a mut EqualityEngine,
     pub atoms: &'a AtomRegistry,
 }
@@ -139,11 +139,11 @@ mod tests {
     #[test]
     fn null_theory_checks_sat() {
         let mut t = NullTheory;
-        let terms = Context::new();
+        let mut terms = Context::new();
         let mut eq = EqualityEngine::default();
         let atoms = AtomRegistry::default();
         let mut cx = TheoryCtx {
-            terms: &terms,
+            terms: &mut terms,
             eq: &mut eq,
             atoms: &atoms,
         };

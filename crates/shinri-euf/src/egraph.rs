@@ -459,7 +459,7 @@ mod tests {
         let mut g = EGraph::default();
         {
             let mut cx = TheoryCtx {
-                terms: &ctx,
+                terms: &mut ctx,
                 eq: &mut eq,
                 atoms: &atoms,
             };

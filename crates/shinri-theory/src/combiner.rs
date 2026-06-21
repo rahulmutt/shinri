@@ -71,7 +71,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
         match owner {
             Owner::Euf => {
                 let mut cx = TheoryCtx {
-                    terms: &self.terms,
+                    terms: &mut self.terms,
                     eq: &mut self.eq,
                     atoms: &self.atoms,
                 };
@@ -79,7 +79,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
             }
             Owner::Arith => {
                 let mut cx = TheoryCtx {
-                    terms: &self.terms,
+                    terms: &mut self.terms,
                     eq: &mut self.eq,
                     atoms: &self.atoms,
                 };
@@ -104,7 +104,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                 }
                 // Re-borrow to notify both theories of the (purified) atom.
                 let mut cx = TheoryCtx {
-                    terms: &self.terms,
+                    terms: &mut self.terms,
                     eq: &mut self.eq,
                     atoms: &self.atoms,
                 };
@@ -130,7 +130,7 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
         }
         let owner = self.atoms.owner(lit.var());
         let mut cx = TheoryCtx {
-            terms: &self.terms,
+            terms: &mut self.terms,
             eq: &mut self.eq,
             atoms: &self.atoms,
         };
@@ -191,7 +191,7 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
         self.atoms.register(v, atom, Owner::Arith);
         // Borrow-split: build the ctx from the non-arith fields, then call arith.
         let mut cx = TheoryCtx {
-            terms: &self.terms,
+            terms: &mut self.terms,
             eq: &mut self.eq,
             atoms: &self.atoms,
         };
@@ -237,7 +237,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
         // reads entailed equalities (R4: pins must be active during solving).
         let shared: Vec<TermId> = {
             let mut cx = TheoryCtx {
-                terms: &self.terms,
+                terms: &mut self.terms,
                 eq: &mut self.eq,
                 atoms: &self.atoms,
             };
@@ -253,7 +253,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
         loop {
             {
                 let mut cx = TheoryCtx {
-                    terms: &self.terms,
+                    terms: &mut self.terms,
                     eq: &mut self.eq,
                     atoms: &self.atoms,
                 };
@@ -279,7 +279,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
             if !shared.is_empty() {
                 let entailed: Vec<(TermId, TermId, u32)> = {
                     let mut cx = TheoryCtx {
-                        terms: &self.terms,
+                        terms: &mut self.terms,
                         eq: &mut self.eq,
                         atoms: &self.atoms,
                     };
@@ -287,7 +287,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                 };
                 for (a, b, tag) in entailed {
                     let mut cx = TheoryCtx {
-                        terms: &self.terms,
+                        terms: &mut self.terms,
                         eq: &mut self.eq,
                         atoms: &self.atoms,
                     };
@@ -316,7 +316,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                     FxHashMap::default();
                 {
                     let cx = TheoryCtx {
-                        terms: &self.terms,
+                        terms: &mut self.terms,
                         eq: &mut self.eq,
                         atoms: &self.atoms,
                     };
@@ -342,7 +342,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                             continue; // R5: already asserted this round
                         }
                         let mut cx = TheoryCtx {
-                            terms: &self.terms,
+                            terms: &mut self.terms,
                             eq: &mut self.eq,
                             atoms: &self.atoms,
                         };
@@ -387,7 +387,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
             // 1. Theory propagation.
             {
                 let mut cx = TheoryCtx {
-                    terms: &self.terms,
+                    terms: &mut self.terms,
                     eq: &mut self.eq,
                     atoms: &self.atoms,
                 };
@@ -461,7 +461,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
         let mut arith_m = ModelBuilder::default();
         {
             let mut cx = TheoryCtx {
-                terms: &self.terms,
+                terms: &mut self.terms,
                 eq: &mut self.eq,
                 atoms: &self.atoms,
             };
@@ -470,7 +470,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
         let mut euf_m = ModelBuilder::default();
         {
             let mut cx = TheoryCtx {
-                terms: &self.terms,
+                terms: &mut self.terms,
                 eq: &mut self.eq,
                 atoms: &self.atoms,
             };
@@ -495,7 +495,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
             }
             // Build context inside the loop so the &mut self.eq borrow is released each iteration.
             let mut cx = TheoryCtx {
-                terms: &self.terms,
+                terms: &mut self.terms,
                 eq: &mut self.eq,
                 atoms: &self.atoms,
             };

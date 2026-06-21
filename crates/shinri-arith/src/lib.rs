@@ -729,7 +729,7 @@ mod model_tests {
         let mut eq = EqualityEngine::default();
         let atoms = AtomRegistry::default();
         let mut cx = TheoryCtx {
-            terms: &ctx,
+            terms: &mut ctx,
             eq: &mut eq,
             atoms: &atoms,
         };
@@ -771,7 +771,7 @@ mod backtrack_tests {
         let mut eq = EqualityEngine::default();
         let atoms = AtomRegistry::default();
         let mut cx = TheoryCtx {
-            terms: &ctx,
+            terms: &mut ctx,
             eq: &mut eq,
             atoms: &atoms,
         };
@@ -823,7 +823,7 @@ mod check_tests {
         let mut eq = EqualityEngine::default();
         let atoms = AtomRegistry::default();
         let mut cx = TheoryCtx {
-            terms: &ctx,
+            terms: &mut ctx,
             eq: &mut eq,
             atoms: &atoms,
         };
@@ -872,7 +872,7 @@ mod check_tests {
         let mut eq = EqualityEngine::default();
         let atoms = AtomRegistry::default();
         let mut cx = TheoryCtx {
-            terms: &ctx,
+            terms: &mut ctx,
             eq: &mut eq,
             atoms: &atoms,
         };
@@ -904,7 +904,7 @@ mod check_tests {
         let mut eq = EqualityEngine::default();
         let atoms = AtomRegistry::default();
         let mut cx = TheoryCtx {
-            terms: &ctx,
+            terms: &mut ctx,
             eq: &mut eq,
             atoms: &atoms,
         };
@@ -952,7 +952,7 @@ mod nelson_oppen_tests {
             let mut eq = EqualityEngine::default();
             let atoms = AtomRegistry::default();
             let mut cx = TheoryCtx {
-                terms: &self.ctx,
+                terms: &mut self.ctx,
                 eq: &mut eq,
                 atoms: &atoms,
             };
@@ -1163,7 +1163,7 @@ mod nelson_oppen_tests {
         h.assert_atom(0, le1);
         h.assert_atom(1, le2);
         assert!(matches!(h.check(), TCheck::Sat));
-        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let mut ctx = std::mem::replace(&mut h.ctx, Context::new());
         h.arith.ensure_shared_var(&ctx, x);
         h.arith.ensure_shared_var(&ctx, y);
         let pairs = h.arith.entailed_equalities(&ctx, &[x, y]);
@@ -1173,7 +1173,7 @@ mod nelson_oppen_tests {
         let mut eq = EqualityEngine::default();
         let atoms = AtomRegistry::default();
         let mut cx = TheoryCtx {
-            terms: &ctx,
+            terms: &mut ctx,
             eq: &mut eq,
             atoms: &atoms,
         };
@@ -1286,7 +1286,7 @@ mod nelson_oppen_tests {
         h.assert_atom(0, ge0); // L0
         h.assert_atom(1, ge1); // L1
         assert!(matches!(h.check(), TCheck::Sat));
-        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let mut ctx = std::mem::replace(&mut h.ctx, Context::new());
         for v in [fa, fb, w] {
             h.arith.ensure_shared_var(&ctx, v);
         }
@@ -1314,7 +1314,7 @@ mod nelson_oppen_tests {
         let mut eq = EqualityEngine::default();
         let atoms = AtomRegistry::default();
         let mut cx = TheoryCtx {
-            terms: &ctx,
+            terms: &mut ctx,
             eq: &mut eq,
             atoms: &atoms,
         };
@@ -1391,7 +1391,7 @@ mod assert_tests {
         let vb = Var::new(1);
         {
             let mut cx = TheoryCtx {
-                terms: &ctx,
+                terms: &mut ctx,
                 eq: &mut eq,
                 atoms: &atoms,
             };
@@ -1422,7 +1422,7 @@ mod assert_tests {
         let vb = Var::new(1);
         {
             let mut cx = TheoryCtx {
-                terms: &ctx,
+                terms: &mut ctx,
                 eq: &mut eq,
                 atoms: &atoms,
             };
