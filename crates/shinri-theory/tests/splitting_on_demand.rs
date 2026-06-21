@@ -15,7 +15,7 @@ use shinri_theory::{Combiner, Effort, ModelBuilder, TCheck, TheoryCtx, TheorySol
 // outside the Combiner (the `#[cfg(test)] pub(crate)` accessors are invisible
 // to integration tests, which link the non-test lib build).
 thread_local! {
-    static BOUND: RefCell<Vec<(Var, TermId)>> = RefCell::new(Vec::new());
+    static BOUND: RefCell<Vec<(Var, TermId)>> = const { RefCell::new(Vec::new()) };
 }
 
 // ── NullTheory ────────────────────────────────────────────────────────────────
