@@ -578,6 +578,10 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     }
                                 }
                                 TheoryResult::SplitAtoms(atoms) => {
+                                    debug_assert!(
+                                        !atoms.is_empty(),
+                                        "a theory must not emit an empty SplitAtoms clause (would livelock)"
+                                    );
                                     // Two-phase fresh-atom protocol (QF_LIA Plan A). Phase 1:
                                     // allocate a fresh var per split atom and let the theory
                                     // bind+encode it BEFORE the clause exists. new_var() updates
@@ -591,6 +595,9 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     }
                                     // Phase 2: learn the split clause and backtrack one level so
                                     // the solver must case-split on it (mirrors the Lemma path).
+                                    // NOTE: like the Lemma arm, the split clause is not recorded to self.proof —
+                                    // it is a tautology over fresh atoms. TODO(planB): when arith emits real
+                                    // branch/cut Split clauses, decide whether they need certificate emission.
                                     self.add_learnt(&lits);
                                     let dl = self.trail.decision_level();
                                     if dl > 0 {
