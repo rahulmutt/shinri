@@ -318,6 +318,11 @@ impl Solver {
         }
     }
 
+    fn is_arith_sorted(&self, t: TermId) -> bool {
+        let s = self.ctx.sort_of(t);
+        s == self.ctx.real_sort() || s == self.ctx.int_sort()
+    }
+
     fn lower(&mut self, t: TermId) -> TermId {
         use shinri_core::{BuiltinOp, Op, TermNode};
         match self.ctx.term_node(t).clone() {
@@ -335,7 +340,7 @@ impl Solver {
                 let kids: Vec<TermId> = self.ctx.children(args).to_vec();
                 // Only rewrite arithmetic (Real-sorted) equalities; leave
                 // EUF/Bool equalities for the theory encoder.
-                if kids.len() >= 2 && self.ctx.sort_of(kids[0]) == self.ctx.real_sort() {
+                if kids.len() >= 2 && self.is_arith_sorted(kids[0]) {
                     // Real-sorted (= a b c ...) : a == b == c == ...
                     // Chain adjacent pairs:
                     //   (= a b)∧(Le a b)∧(Ge a b) ∧ (= b c)∧(Le b c)∧(Ge b c) ∧ ...
@@ -374,8 +379,8 @@ impl Solver {
             } => {
                 let kids: Vec<TermId> = self.ctx.children(args).to_vec();
                 if kids.len() <= 2 {
-                    // Binary distinct over Real sort.
-                    if self.ctx.sort_of(kids[0]) == self.ctx.real_sort() {
+                    // Binary distinct over arithmetic (Real or Int) sort.
+                    if self.is_arith_sorted(kids[0]) {
                         // If both args are pure arithmetic terms (nullary vars /
                         // numerals / linear combinations), lower to (or Lt Gt) so
                         // the Arith theory can reason about the disequality.
@@ -452,6 +457,10 @@ impl Solver {
 
 #[cfg(test)]
 impl Solver {
+    pub(crate) fn ctx(&self) -> &shinri_core::Context {
+        &self.ctx
+    }
+
     pub(crate) fn encode_for_test(
         &mut self,
         formula: TermId,
@@ -633,5 +642,25 @@ mod tests {
         s.assert(distinct);
         s.assert(ab);
         assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    }
+
+    /// lower() must rewrite Int-sorted (distinct a b) → (or (Lt a b) (Gt a b)),
+    /// matching the Real path (is_arith_sorted covers both).
+    #[test]
+    fn lower_rewrites_int_distinct_to_or_lt_gt() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let mut s = Solver::new();
+        let int = s.int_sort();
+        let a = s.declare_const("a", int);
+        let b = s.declare_const("b", int);
+        let d = s.app(Op::Builtin(BuiltinOp::Distinct), &[a, b]);
+        let lowered = s.lower(d);
+        match s.ctx().term_node(lowered) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Or),
+                ..
+            } => {}
+            other => panic!("expected (or ..), got {other:?}"),
+        }
     }
 }
