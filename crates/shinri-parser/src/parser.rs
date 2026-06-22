@@ -485,6 +485,8 @@ impl<'a> Parser<'a> {
                 Self::mk(ctx, Op::Builtin(BuiltinOp::Ite), &args, &sp)
             }
             BuiltinOp::Neg => unreachable!("Neg is produced only via unary '-'"),
+            BuiltinOp::Select => Err(Diagnostic::new(sp, "select is not supported in input")),
+            BuiltinOp::Store => Err(Diagnostic::new(sp, "store is not supported in input")),
         }
     }
 

@@ -72,5 +72,7 @@ fn builtin_name(b: BuiltinOp) -> &'static str {
         Lt => "<",
         Ge => ">=",
         Gt => ">",
+        Select => "select",
+        Store => "store",
     }
 }
