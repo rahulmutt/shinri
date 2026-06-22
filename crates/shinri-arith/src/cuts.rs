@@ -66,17 +66,22 @@ pub fn derive_gmi(
         // Determine orientation and active bound.
         // at lower ⟹ y_j = x_j − lo (sign convention: x_j = y_j + lo)
         // at upper ⟹ y_j = hi − x_j (x_j = hi − y_j)
-        // δ-drop deliberate: cut is over rational/integer feasibility; δ is only a
-        // strict-bound lexicographic tie-break and does not affect which bound is active.
-        let at_lower = bounds
-            .lower(j)
-            .map(|(d, _)| d.c() == value[j.index()].c())
-            .unwrap_or(false);
+        //
+        // CRITICAL: compare full DeltaRational (c AND k) to identify which bound
+        // the nonbasic sits at. Comparing only .c() is wrong when δ distinguishes
+        // the bounds (e.g. a strict lower at `2−δ` vs an upper at `2`): the rational
+        // parts are equal but the var is NOT at the lower bound. Wrong orientation
+        // ⟹ y_j ≠ 0 at the current vertex ⟹ the cut doesn't separate it → panic.
+        let val_j = &value[j.index()];
+        let at_lower = bounds.lower(j).map(|(d, _)| d == val_j).unwrap_or(false);
+        let at_upper = !at_lower && bounds.upper(j).map(|(d, _)| d == val_j).unwrap_or(false);
         let (at_upper_bound, bound_val) = if at_lower {
             (false, bounds.lower(j).unwrap().0.c().clone())
-        } else if let Some((d, _)) = bounds.upper(j) {
-            (true, d.c().clone())
+        } else if at_upper {
+            (true, bounds.upper(j).unwrap().0.c().clone())
         } else if let Some((d, _)) = bounds.lower(j) {
+            // Defensive: value matches neither bound (shouldn't happen for a true
+            // nonbasic in a feasible LP state). Fall back to treating as lower.
             (false, d.c().clone())
         } else {
             // Free nonbasic with nonzero coeff: cannot orient ⟹ no cut.
@@ -163,7 +168,14 @@ pub fn derive_gmi(
     if lhs.is_empty() {
         return None;
     }
-    Some(GmiCut { lhs, rhs: rhs_le })
+    let cut = GmiCut { lhs, rhs: rhs_le };
+    // Safety net: a non-separating cut is useless; returning None lets the caller
+    // fall back to branching (always sound). This guarantees debug_validate's
+    // separation assertion can never fire even under edge-case orientation issues.
+    if !separates(&cut, value) {
+        return None;
+    }
+    Some(cut)
 }
 
 /// True iff the current assignment violates the `≤` cut (strict separation).
