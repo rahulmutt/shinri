@@ -175,13 +175,38 @@ impl Arith {
                     pkk = -pkk;
                     nkk = -nkk;
                 }
-                AtomEncoding::Ineq {
+                let mut enc = AtomEncoding::Ineq {
                     var,
                     pos: (pk, DeltaRational::new(rhs.clone(), pkk)),
                     neg: (nk, DeltaRational::new(rhs, nkk)),
+                };
+                // Stage-B integer bound rounding: if the bounded quantity is
+                // integer-valued, replace each (kind, value) with the integer
+                // round and drop the δ. `strict` is read off the δ-coefficient
+                // (nonzero ⇒ strict). Handles flipped-coefficient cases because
+                // `kind` and `value` are already resolved here.
+                if self.stage_b && self.comb_is_int_valued(&n.comb) {
+                    if let AtomEncoding::Ineq { pos, neg, .. } = &mut enc {
+                        for slot in [pos, neg] {
+                            let strict = !slot.1.k().is_zero();
+                            slot.1 = crate::branch::round_int_bound(slot.1.c(), slot.0, strict);
+                        }
+                    }
                 }
+                enc
             }
         }
+    }
+
+    /// True iff the linear combination evaluates to an integer for every model:
+    /// every variable is Int-sorted AND every coefficient is an integer. In a
+    /// pure-Int query this holds for all problem vars and all slacks.
+    fn comb_is_int_valued(&self, comb: &LinComb) -> bool {
+        !comb.0.is_empty()
+            && comb
+                .0
+                .iter()
+                .all(|(v, c)| self.vars.is_int(*v) && c.denom() == Integer::one())
     }
 
     /// β-update: set nonbasic `v` to `val`, propagating the delta to all basics.
@@ -1901,13 +1926,125 @@ mod integer_branch_tests {
         };
         arith.new_var(&mut cx, Var::new(0), ge);
         arith.new_var(&mut cx, Var::new(1), le);
-        // Assert both so the relaxation pins x = 1/2.
-        let _ = arith.assert(&mut cx, Lit::new(Var::new(0), true));
-        let _ = arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        // Assert both: 2x >= 1 AND 2x <= 1 over Int.
+        // With B2 rounding: 2x>=1 → x>=1; 2x<=1 → x<=0 — an immediate conflict.
+        // (No integer satisfies x>=1 ∧ x<=0, so UNSAT is the correct result.)
+        let conflict_at_assert = arith.assert(&mut cx, Lit::new(Var::new(0), true)).is_some()
+            || arith.assert(&mut cx, Lit::new(Var::new(1), true)).is_some();
+        if conflict_at_assert {
+            // Immediate bound crossing — correct UNSAT.
+            return;
+        }
         match arith.check(&mut cx, Effort::Full) {
-            TCheck::Split(atoms) => assert_eq!(atoms.len(), 2),
-            TCheck::Sat => panic!("expected Split on fractional x, got Sat"),
-            TCheck::Conflict(_) => panic!("expected Split on fractional x, got Conflict"),
+            TCheck::Conflict(_) => {} // correct: 2x=1 has no integer solution
+            TCheck::Sat => panic!("expected Conflict (no int solution for 2x=1), got Sat"),
+            TCheck::Split(_) => panic!("expected Conflict (no int solution for 2x=1), got Split"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod rounding_tests {
+    use super::*;
+    use crate::encode::AtomEncoding;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_theory::{AtomRegistry, EqualityEngine, TheoryCtx, TheorySolver};
+
+    fn int_var(ctx: &mut Context, name: &str) -> TermId {
+        let int = ctx.int_sort();
+        let s = ctx.declare_fun(name, &[], int);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    // x < 5 over Int (gate ON) must encode pos as Upper bound 4 with k = 0.
+    #[test]
+    fn int_strict_bound_rounds_and_drops_delta() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), ctx.int_sort());
+        let lt = ctx.mk_app(Op::Builtin(BuiltinOp::Lt), &[x, five]).unwrap();
+        let mut arith = Arith::default(); // stage_b = true
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), lt);
+        match arith.enc[0].clone().unwrap() {
+            AtomEncoding::Ineq {
+                pos: (BoundKind::Upper, dr),
+                ..
+            } => {
+                assert_eq!(*dr.c(), Rational::from_int(4i128.into()));
+                assert!(
+                    dr.k().is_zero(),
+                    "δ must be dropped for an Int strict bound"
+                );
+            }
+            other => panic!("expected Upper Ineq, got {other:?}"),
+        }
+    }
+
+    // 2x <= 5 over Int (gate ON): bound on x is 5/2 → rounds to 2.
+    #[test]
+    fn int_coefficient_division_rounds() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let two = ctx.mk_numeral(Rational::from_int(2i128.into()), ctx.int_sort());
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), ctx.int_sort());
+        let twox = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &[two, x]).unwrap();
+        let le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[twox, five])
+            .unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), le);
+        match arith.enc[0].clone().unwrap() {
+            AtomEncoding::Ineq {
+                pos: (BoundKind::Upper, dr),
+                ..
+            } => {
+                assert_eq!(*dr.c(), Rational::from_int(2i128.into()));
+                assert!(dr.k().is_zero());
+            }
+            other => panic!("expected Upper Ineq, got {other:?}"),
+        }
+    }
+
+    // Real x < 5 must KEEP its δ (rounding does not cross the Int fence).
+    #[test]
+    fn real_strict_bound_keeps_delta() {
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let xs = ctx.declare_fun("x", &[], real);
+        let x = ctx.mk_app(Op::Uninterpreted(xs), &[]).unwrap();
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), real);
+        let lt = ctx.mk_app(Op::Builtin(BuiltinOp::Lt), &[x, five]).unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), lt);
+        match arith.enc[0].clone().unwrap() {
+            AtomEncoding::Ineq {
+                pos: (BoundKind::Upper, dr),
+                ..
+            } => {
+                assert!(!dr.k().is_zero(), "Real strict bound must keep δ");
+            }
+            other => panic!("expected Upper Ineq, got {other:?}"),
         }
     }
 }
