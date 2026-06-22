@@ -1386,9 +1386,16 @@ fn differential_qf_lia_two_stage() {
         if oracle == Some(true) {
             let data = instance.clone();
             let (tx, rx) = mpsc::channel();
-            std::thread::spawn(move || {
-                let _ = tx.send(shinri_check_lia_gated(&data, N_VARS, false));
-            });
+            // SMT solver search uses a bounded-but-moderate stack that can exceed the
+            // default 2 MB spawned-thread stack on some QF_LIA instances.  64 MB makes
+            // the test self-contained (no RUST_MIN_STACK env-var needed).  The
+            // controller verified there is no unbounded recursion.
+            std::thread::Builder::new()
+                .stack_size(64 * 1024 * 1024)
+                .spawn(move || {
+                    let _ = tx.send(shinri_check_lia_gated(&data, N_VARS, false));
+                })
+                .unwrap();
             if let Ok(b1) = rx.recv_timeout(TIMEOUT) {
                 assert!(
                     matches!(b1, SolveOutcome::Sat),
@@ -1400,9 +1407,12 @@ fn differential_qf_lia_two_stage() {
         // Stage-B (gate ON): must match the oracle on BOTH directions, in budget.
         let data = instance.clone();
         let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(shinri_check_lia_gated(&data, N_VARS, true));
-        });
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let _ = tx.send(shinri_check_lia_gated(&data, N_VARS, true));
+            })
+            .unwrap();
         match rx.recv_timeout(TIMEOUT) {
             Ok(SolveOutcome::Sat) => {
                 assert_eq!(
