@@ -411,7 +411,10 @@ impl Arith {
     /// contributes nothing for). Plain vars / UF-application terms just get a
     /// free problem var. (R4)
     pub fn ensure_shared_var(&mut self, ctx: &Context, t: TermId) {
-        let v = self.vars.problem_var(t);
+        // Stamp Int-sortedness so shared Int terms (f-apps, numerals, vars) are
+        // integral in the simplex / integer layer — required for QF_UFLIA.
+        let is_int = ctx.sort_of(t) == ctx.int_sort();
+        let v = self.vars.problem_var_sorted(t, is_int);
         self.grow_value();
         if let Some(r) = ctx.numeral_value(t) {
             let dr = DeltaRational::from_rational(r.clone());
@@ -534,6 +537,29 @@ impl Arith {
         // Drop the probe mark; restore to the snapshot one final time so the
         // live state is byte-for-byte the entry state.
         self.restore(&snap_tableau, &snap_value, snap_mark);
+        out
+    }
+
+    /// Shared INT-sorted pairs equal under the current model `β` (MBTC candidate
+    /// pairs). Read-only / state-safe. Int-only via `is_int`, reliable because
+    /// `ensure_shared_var` stamps Int-sortedness. Excludes Real pairs (convex
+    /// exchange handles those; splitting them would regress QF_UFLRA).
+    pub fn model_equal_shared_pairs(&mut self, shared: &[TermId]) -> Vec<(TermId, TermId)> {
+        let mut items: Vec<(TermId, ArithVar)> = Vec::new();
+        for &t in shared {
+            let v = self.vars.problem_var(t);
+            if self.vars.is_int(v) && !items.iter().any(|(_, w)| *w == v) {
+                items.push((t, v));
+            }
+        }
+        let mut out = Vec::new();
+        for i in 0..items.len() {
+            for j in (i + 1)..items.len() {
+                if self.value[items[i].1.index()] == self.value[items[j].1.index()] {
+                    out.push((items[i].0, items[j].0));
+                }
+            }
+        }
         out
     }
 
@@ -1041,6 +1067,14 @@ impl TheorySolver for Arith {
         Arith::assert_interface_equality(self, cx.terms, a, b, just)
     }
 
+    fn model_equal_shared_pairs(
+        &mut self,
+        _cx: &mut TheoryCtx,
+        shared: &[TermId],
+    ) -> Vec<(TermId, TermId)> {
+        Arith::model_equal_shared_pairs(self, shared)
+    }
+
     fn push(&mut self) {
         self.level += 1;
         self.bounds.mark();
@@ -1102,6 +1136,63 @@ mod model_tests {
             Some(ModelVal::Num(r)) => assert!(*r > Rational::zero(), "x must be > 0, got {:?}", r),
             other => panic!("expected Num, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn model_equal_shared_pairs_reports_beta_equal_int_pair() {
+        // Two Int consts both pinned to 5: β(x)=β(y)=5 ⇒ reported as a pair.
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let xs = ctx.declare_fun("x", &[], int);
+        let ys = ctx.declare_fun("y", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xs), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(ys), &[]).unwrap();
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), int);
+        let mk = |ctx: &mut Context, op, a, b| ctx.mk_app(Op::Builtin(op), &[a, b]).unwrap();
+        let atom_terms = [
+            mk(&mut ctx, BuiltinOp::Ge, x, five),
+            mk(&mut ctx, BuiltinOp::Le, x, five),
+            mk(&mut ctx, BuiltinOp::Ge, y, five),
+            mk(&mut ctx, BuiltinOp::Le, y, five),
+        ];
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        for (i, &atom) in atom_terms.iter().enumerate() {
+            let v = Var::new(i as u32);
+            let mut cx = TheoryCtx {
+                terms: &mut ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            <Arith as TheorySolver>::new_var(&mut arith, &mut cx, v, atom);
+        }
+        for i in 0..atom_terms.len() {
+            let v = Var::new(i as u32);
+            let mut cx = TheoryCtx {
+                terms: &mut ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            assert!(
+                <Arith as TheorySolver>::assert(&mut arith, &mut cx, Lit::new(v, true)).is_none(),
+                "asserting [5,5] bounds must not conflict"
+            );
+        }
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut ctx,
+                eq: &mut eq,
+                atoms: &atoms,
+            };
+            arith.ensure_shared_var(cx.terms, x);
+            arith.ensure_shared_var(cx.terms, y);
+            assert!(matches!(
+                <Arith as TheorySolver>::check(&mut arith, &mut cx, Effort::Full),
+                TCheck::Sat
+            ));
+        }
+        assert_eq!(arith.model_equal_shared_pairs(&[x, y]), vec![(x, y)]);
     }
 }
 

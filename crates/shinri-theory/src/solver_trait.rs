@@ -103,6 +103,19 @@ pub trait TheorySolver: Default {
     /// over nesting so `f(g(x))` interns `g(x)` and `f(g(x))` both. EUF
     /// implements; arith (and stubs) default to a no-op.
     fn register_arith_uf_terms(&mut self, _cx: &mut TheoryCtx, _atom: TermId) {}
+
+    /// The shared INT-sorted pairs equal under this theory's current model `β`
+    /// (whether or not entailed). The combiner resolves any such pair not merged
+    /// in the shared engine with an integer trichotomy split (MBTC). State-safe
+    /// (read-only). Real pairs are excluded — convex exchange handles them, so
+    /// they need no split. Arith implements; EUF / stubs default to none.
+    fn model_equal_shared_pairs(
+        &mut self,
+        _cx: &mut TheoryCtx,
+        _shared: &[TermId],
+    ) -> Vec<(TermId, TermId)> {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]
