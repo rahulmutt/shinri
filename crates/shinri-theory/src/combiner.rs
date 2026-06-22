@@ -63,6 +63,12 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
         &mut self.euf
     }
 
+    /// Mutable access to the arith theory slot (mirrors `euf_mut`). Used by the
+    /// solver to set the Plan B2 Stage-B gate before solving.
+    pub fn arith_mut(&mut self) -> &mut A {
+        &mut self.arith
+    }
+
     /// Classify and register an atom, refusing unsupported constructs (spec §9).
     pub fn register_atom(&mut self, v: Var, atom: TermId) -> Result<(), Unsupported> {
         let owner = classify(&self.terms, atom)?;

@@ -70,6 +70,10 @@ pub struct Arith {
     apriori_seeded: bool,
     /// Sentinel lit codes used for a-priori box bounds, stripped from conflicts.
     apriori_lits: FxHashSet<u32>,
+    /// Master gate for all Plan B2 optimizations (integer bound rounding, FBBT,
+    /// GMI cuts). Default ON; the differential harness builds an OFF solver to
+    /// reproduce the byte-identical B1 baseline.
+    stage_b: bool,
 }
 
 impl Default for Arith {
@@ -91,6 +95,7 @@ impl Default for Arith {
             apriori_atom_count: 0,
             apriori_seeded: false,
             apriori_lits: FxHashSet::default(),
+            stage_b: true,
         }
     }
 }
@@ -102,6 +107,11 @@ impl Arith {
                 .push(DeltaRational::from_rational(Rational::zero()));
         }
         self.bounds.ensure(self.vars.len());
+    }
+
+    /// Toggle the Plan B2 optimization gate (default ON). OFF = B1 baseline.
+    pub fn set_stage_b(&mut self, on: bool) {
+        self.stage_b = on;
     }
 
     /// Reduce a normalized atom to a *bound on one variable*. For a single-term

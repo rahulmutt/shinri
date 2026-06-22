@@ -34,6 +34,8 @@ pub struct Solver {
     t_true: TermId,
     t_false: TermId,
     last_model: Option<Model>,
+    /// Plan B2 Stage-B optimization gate, forwarded to Arith in check_sat.
+    stage_b: bool,
 }
 
 impl Default for Solver {
@@ -54,6 +56,7 @@ impl Solver {
             t_true,
             t_false,
             last_model: None,
+            stage_b: true,
         }
     }
 
@@ -106,6 +109,12 @@ impl Solver {
     /// into the same `Context` the solver uses.
     pub fn ctx_mut(&mut self) -> &mut Context {
         &mut self.ctx
+    }
+
+    /// Toggle the Plan B2 Stage-B gate (default ON). Used by the differential
+    /// oracle to compare the cuts-on solver against the B1 baseline.
+    pub fn set_stage_b(&mut self, on: bool) {
+        self.stage_b = on;
     }
 
     /// Execute one IR command and return the response.
@@ -214,6 +223,7 @@ impl Solver {
         sat.theory_mut()
             .euf_mut()
             .set_truth_terms(self.t_true, self.t_false);
+        sat.theory_mut().arith_mut().set_stage_b(self.stage_b);
 
         let atom_vars: Vec<(shinri_core::Var, TermId)>;
         let refused: bool;
@@ -667,5 +677,36 @@ mod tests {
             } => {}
             other => panic!("expected (or ..), got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod stage_b_gate_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Op};
+
+    fn build(stage_b: bool) -> SolveOutcome {
+        // x >= 0 ; x <= 2 ; 2x = 3  (UNSAT over Int: no integer x with 2x=3)
+        let mut s = Solver::new();
+        s.set_stage_b(stage_b);
+        let int = s.int_sort();
+        let x = s.declare_const("x", int);
+        let zero = s.numeral(Rational::zero(), int);
+        let two = s.numeral(Rational::from_int(2i128.into()), int);
+        let three = s.numeral(Rational::from_int(3i128.into()), int);
+        let ge0 = s.app(Op::Builtin(BuiltinOp::Ge), &[x, zero]);
+        let le2 = s.app(Op::Builtin(BuiltinOp::Le), &[x, two]);
+        let twox = s.app(Op::Builtin(BuiltinOp::Mul), &[two, x]);
+        let eq3 = s.eq(twox, three);
+        s.assert(ge0);
+        s.assert(le2);
+        s.assert(eq3);
+        s.check_sat()
+    }
+
+    #[test]
+    fn gate_toggles_without_changing_verdict() {
+        assert!(matches!(build(true), SolveOutcome::Unsat));
+        assert!(matches!(build(false), SolveOutcome::Unsat));
     }
 }
