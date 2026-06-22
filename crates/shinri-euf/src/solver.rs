@@ -19,30 +19,36 @@ impl Euf {
         self.truth_terms = Some((t_true, t_false));
     }
 
-    /// Recursively descend `t`; for every Real-sorted `Op::Uninterpreted`
-    /// application with at least one argument (a UF-app, NOT a nullary var),
-    /// intern it (and, via `add_term`'s recursion, its argument subterms) into
-    /// the EGraph. Non-UF nodes (arith builtins, numerals, nullary vars) are
-    /// only descended through, never interned here — arith owns those, and EUF
-    /// only needs the function applications for congruence. (CRITICAL-2)
-    fn walk_real_uf_apps(&mut self, cx: &mut TheoryCtx, t: TermId) {
+    /// Recursively descend `t`; for every arith-sorted (Real or Int)
+    /// `Op::Uninterpreted` application with at least one argument (a UF-app,
+    /// NOT a nullary var), intern it (and, via `add_term`'s recursion, its
+    /// argument subterms) into the EGraph. Non-UF nodes (arith builtins,
+    /// numerals, nullary vars) are only descended through, never interned here
+    /// — arith owns those, and EUF only needs the function applications for
+    /// congruence. (CRITICAL-2)
+    fn walk_arith_uf_apps(&mut self, cx: &mut TheoryCtx, t: TermId) {
         use shinri_core::{Op, TermNode};
         let real_s = cx.terms.real_sort();
+        let int_s = cx.terms.int_sort();
         // Snapshot op + child terms before borrowing the EGraph mutably.
         let info = match cx.terms.term_node(t) {
             TermNode::App { op, args, .. } => Some((*op, cx.terms.children(*args).to_vec())),
             TermNode::Const { .. } => None,
         };
         let Some((op, kids)) = info else { return };
-        // A Real-sorted UF-application (with args) is a shared f-app: intern it.
-        if matches!(op, Op::Uninterpreted(_)) && !kids.is_empty() && cx.terms.sort_of(t) == real_s {
+        // An arith-sorted (Real or Int) UF-application (with args) is a shared f-app: intern it.
+        let sort = cx.terms.sort_of(t);
+        if matches!(op, Op::Uninterpreted(_))
+            && !kids.is_empty()
+            && (sort == real_s || sort == int_s)
+        {
             self.inner.add_term(cx, t);
             // add_term already interned the argument subterms; still descend so
             // a nested UF-app sitting under a non-UF arg (none here, but for
             // robustness) is not missed.
         }
         for k in kids {
-            self.walk_real_uf_apps(cx, k);
+            self.walk_arith_uf_apps(cx, k);
         }
     }
 }
@@ -218,16 +224,20 @@ impl TheorySolver for Euf {
 
     // ----- Nelson-Oppen seam (Task 12b) -------------------------------------
 
-    /// The shared Real-sorted terms EUF reasons about: every registered term of
-    /// Real sort. These are handed to arith (which interns vars / pins numerals)
-    /// and used as the N-O candidate set for entailed-equality exchange.
-    fn shared_real_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
+    /// The shared arith-sorted terms EUF reasons about: every registered term of
+    /// Real OR Int sort. Handed to arith (interns vars / pins numerals) and used
+    /// as the N-O candidate set for entailed-equality exchange and MBTC splits.
+    fn shared_arith_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
         let real_s = cx.terms.real_sort();
+        let int_s = cx.terms.int_sort();
         self.inner
             .registered_terms()
             .iter()
             .map(|(t, _)| *t)
-            .filter(|&t| cx.terms.sort_of(t) == real_s)
+            .filter(|&t| {
+                let s = cx.terms.sort_of(t);
+                s == real_s || s == int_s
+            })
             .collect()
     }
 
@@ -248,12 +258,13 @@ impl TheorySolver for Euf {
         self.inner.merge_eq(cx.eq, an, bn, EqJust::Interface(just))
     }
 
-    /// CRITICAL-2: intern every Real-sorted UF-application subterm of an arith
-    /// atom into EUF so congruence applies to those f-apps and they join the
-    /// shared set S. `add_term` is recursive + idempotent, so interning a
-    /// Real-sorted UF-app pulls in its (possibly nested) argument subterms too.
+    /// CRITICAL-2: intern every arith-sorted (Real or Int) UF-application
+    /// subterm of an arith atom into EUF so congruence applies to those f-apps
+    /// and they join the shared set S. `add_term` is recursive + idempotent,
+    /// so interning an arith-sorted UF-app pulls in its (possibly nested)
+    /// argument subterms too.
     fn register_arith_uf_terms(&mut self, cx: &mut TheoryCtx, atom: TermId) {
-        self.walk_real_uf_apps(cx, atom);
+        self.walk_arith_uf_apps(cx, atom);
     }
 
     /// EUF→arith: mint an explanation tag for a currently-equal pair `(a, b)`.
@@ -279,5 +290,38 @@ mod tests {
     fn euf_constructs_and_has_theory_id_one() {
         let _e = Euf::default();
         assert_eq!(Euf::THEORY_ID, 1);
+    }
+
+    #[test]
+    fn shared_arith_terms_includes_int_uf_apps() {
+        use shinri_core::{BuiltinOp, Context, Op};
+        use shinri_theory::{AtomRegistry, EqualityEngine};
+
+        // f : Int -> Int ; register arith atom `(>= (f x) 0)` so EUF interns the
+        // Int-sorted f-app via register_arith_uf_terms (CRITICAL-2 path).
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let xs = ctx.declare_fun("x", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xs), &[]).unwrap();
+        let f = ctx.declare_fun("f", &[int], int);
+        let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+        let zero = ctx.mk_numeral(shinri_core::Rational::zero(), int);
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[fx, zero]).unwrap();
+
+        let mut euf = Euf::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        euf.register_arith_uf_terms(&mut cx, atom);
+
+        let shared = euf.shared_arith_terms(&mut cx);
+        assert!(
+            shared.contains(&fx),
+            "Int-sorted f-app must join the shared set"
+        );
     }
 }

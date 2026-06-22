@@ -262,7 +262,7 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                 eq: &mut self.eq,
                 atoms: &self.atoms,
             };
-            let s = self.euf.shared_real_terms(&mut cx);
+            let s = self.euf.shared_arith_terms(&mut cx);
             for &t in &s {
                 self.arith.ensure_shared_var(&mut cx, t);
             }
@@ -1122,7 +1122,7 @@ mod tests {
         fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
         fn push(&mut self) {}
         fn pop(&mut self, _l: usize) {}
-        fn shared_real_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
+        fn shared_arith_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
             vec![self.t1.unwrap(), self.t2.unwrap()]
         }
     }

@@ -49,10 +49,10 @@ pub trait TheorySolver: Default {
     // Default no-op implementations so a theory that does not participate in a
     // given direction (or the unit-test stubs) need not implement them.
 
-    /// The set of shared Real-sorted TermIds this theory reasons about. EUF
-    /// returns its registered Real terms; arith returns none (the combiner
-    /// drives the set FROM the EUF side). Used to compute the N-O shared set S.
-    fn shared_real_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
+    /// The set of shared arith-sorted (Real OR Int) TermIds this theory reasons
+    /// about. EUF returns its registered Real/Int terms; arith returns none (the
+    /// combiner drives the set FROM the EUF side). Used to compute the N-O set S.
+    fn shared_arith_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
         Vec::new()
     }
 
