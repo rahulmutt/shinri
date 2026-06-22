@@ -595,9 +595,13 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     }
                                     // Phase 2: learn the split clause and backtrack one level so
                                     // the solver must case-split on it (mirrors the Lemma path).
-                                    // NOTE: like the Lemma arm, the split clause is not recorded to self.proof —
-                                    // it is a tautology over fresh atoms. TODO(planB): when arith emits real
-                                    // branch/cut Split clauses, decide whether they need certificate emission.
+                                    // NOTE: like the Lemma arm, the split clause is not recorded to
+                                    // self.proof. Plan B2 decision: branch and GMI-cut lemmas are NOT
+                                    // proof-certified — proof emission beyond Farkas conflicts is out of
+                                    // scope for the QF_LIA milestone. A branch clause is valid over the
+                                    // integers and a unit cut clause is theory-valid by exact rational
+                                    // derivation; their soundness net is the debug re-derivation check
+                                    // (shinri-arith/src/cuts.rs) plus the two-stage differential oracle.
                                     self.add_learnt(&lits);
                                     let dl = self.trail.decision_level();
                                     if dl > 0 {
