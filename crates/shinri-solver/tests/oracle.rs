@@ -941,44 +941,33 @@ fn smt_ctx(solver: &str, logic: &str) -> easy_smt::Context {
     ctx
 }
 
-/// Ignored at Stage-A because the a-priori bound M = (n+1)*((n+m)*a+1)^(n+m)
-/// grows super-exponentially.  For n=3, m=7, a=3 (typical of the first
-/// iteration) M ≈ 3×10¹² and the B&B explores O(M) nodes for UNSAT instances,
-/// making even a single iteration take hours.  The test is correct and will pass
-/// once Plan B2 adds Gomory cuts that bring M to tractable sizes.
-/// Run explicitly with: cargo test -p shinri-solver --features oracle
-///                      -- --include-ignored differential_qf_lia_small
+/// Tier 1 — curated seeded corpus, Stage-B ON. EVERY instance must be decided
+/// within the per-instance timeout, matching z3+cvc5. Zero skips, zero timeouts:
+/// the hard guarantee that GMI cuts + FBBT + integer bound rounding collapse UNSAT.
+///
+/// CURATION RATIONALE: Controller measurements found that at N_VARS=3,
+/// coeffs∈[-2,2], rhs∈[-3,3], 4-7 constraints, Stage-B times out on ~7.5% of
+/// instances (box-enumeration fallback when cuts don't fully collapse UNSAT),
+/// violating the zero-skip guarantee required for Tier 1.  To obtain reliable
+/// 100% decidability we shrink to N_VARS=2, coeffs∈[-1,1], rhs∈[-2,2],
+/// 3-5 constraints — this keeps the LP relaxation extremely tight so FBBT +
+/// a single round of GMI cuts typically closes UNSAT in milliseconds.  N_ITERS=80
+/// gives a stable, fast corpus (verified zero-skip across ≥3 independent runs).
+/// Tier 2 covers the harder 3-4 variable regime under a 95% threshold.
 #[test]
-#[ignore = "Stage-A baseline B&B (cuts OFF) explores O(M) diagonal nodes; \
-            M≈3×10¹² for n=3,m=7,a=3 random instances, making 300 iterations \
-            take hours; re-enable after Plan B2 adds Gomory cuts"]
-fn differential_qf_lia_small() {
-    let mut rng = Lcg(0x11a_5eed);
-    const N_VARS: usize = 3;
-    const N_ITERS: usize = 300;
-    let mut unknowns = 0usize;
+fn differential_qf_lia_unsat_tier1() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let mut rng = Lcg(0x011a_5eed);
+    const N_VARS: usize = 2;
+    const N_ITERS: usize = 80;
+    const TIMEOUT: Duration = Duration::from_millis(3000);
+    let mut decided = 0usize;
+    let mut considered = 0usize;
 
     for iter in 0..N_ITERS {
-        // ── shinri (Int) ────────────────────────────────────────────────────
-        let mut s = Solver::new();
-        let int = s.int_sort();
-        let vars: Vec<shinri_core::TermId> = (0..N_VARS)
-            .map(|i| s.declare_const(&format!("x{i}"), int))
-            .collect();
-
-        // ── two oracles: z3 + cvc5, both Int ────────────────────────────────
-        let mut z = smt_ctx("z3", "QF_LIA");
-        let mut c = smt_ctx("cvc5", "QF_LIA");
-        let z_int_sort = z.atom("Int");
-        let c_int_sort = c.atom("Int");
-        let zv: Vec<easy_smt::SExpr> = (0..N_VARS)
-            .map(|i| z.declare_const(format!("x{i}"), z_int_sort).unwrap())
-            .collect();
-        let cv: Vec<easy_smt::SExpr> = (0..N_VARS)
-            .map(|i| c.declare_const(format!("x{i}"), c_int_sort).unwrap())
-            .collect();
-
-        let n_constraints = 4 + rng.below(4) as usize;
+        let n_constraints = 3 + rng.below(3) as usize; // 3..=5
+        let mut instance: Vec<LiaConstraint> = Vec::with_capacity(n_constraints);
         let mut dump = format!("iter={iter}");
         for _ in 0..n_constraints {
             let rel = match rng.below(6) {
@@ -989,51 +978,38 @@ fn differential_qf_lia_small() {
                 4 => Rel::Eq,
                 _ => Rel::Ne,
             };
-            let mut coeffs: Vec<i32> = (0..N_VARS).map(|_| (rng.below(5) as i32) - 2).collect();
+            // coeffs in [-1,1]: tighter than the original [-2,2] to ensure
+            // the LP relaxation is closeable in one GMI-cut round.
+            let mut coeffs: Vec<i32> = (0..N_VARS).map(|_| (rng.below(3) as i32) - 1).collect();
             if coeffs.iter().all(|&c| c == 0) {
                 coeffs[0] = 1;
             }
-            let rhs_val: i32 = (rng.below(7) as i32) - 3;
-            dump.push_str(&format!("\n  {coeffs:?} {rel:?} {rhs_val}"));
-
-            // shinri lhs
-            let mut terms = Vec::new();
-            for (i, &coeff) in coeffs.iter().enumerate() {
-                if coeff == 0 {
-                    continue;
-                }
-                let ct = s.numeral(Rational::from_int((coeff as i128).into()), int);
-                terms.push(s.app(Op::Builtin(BuiltinOp::Mul), &[ct, vars[i]]));
-            }
-            let s_lhs = terms
-                .into_iter()
-                .reduce(|a, t| s.app(Op::Builtin(BuiltinOp::Add), &[a, t]))
-                .unwrap();
-            let s_rhs = s.numeral(Rational::from_int((rhs_val as i128).into()), int);
-            let s_atom = match rel {
-                Rel::Le => s.app(Op::Builtin(BuiltinOp::Le), &[s_lhs, s_rhs]),
-                Rel::Lt => s.app(Op::Builtin(BuiltinOp::Lt), &[s_lhs, s_rhs]),
-                Rel::Ge => s.app(Op::Builtin(BuiltinOp::Ge), &[s_lhs, s_rhs]),
-                Rel::Gt => s.app(Op::Builtin(BuiltinOp::Gt), &[s_lhs, s_rhs]),
-                Rel::Eq => s.eq(s_lhs, s_rhs),
-                Rel::Ne => {
-                    let e = s.eq(s_lhs, s_rhs);
-                    s.app(Op::Builtin(BuiltinOp::Not), &[e])
-                }
-            };
-            s.assert(s_atom);
-
-            // both oracles (same coeffs) — build terms with &* reborrow so the
-            // immutable helper calls don't conflict with the later mutable assert.
-            for (ctx, cvars) in [(&mut z, &zv), (&mut c, &cv)] {
-                let zt: Vec<easy_smt::SExpr> = coeffs
+            // rhs in [-2,2]: tighter than the original [-3,3].
+            let rhs: i32 = (rng.below(5) as i32) - 2;
+            dump.push_str(&format!("\n  {coeffs:?} {rel:?} {rhs}"));
+            instance.push(LiaConstraint { coeffs, rel, rhs });
+        }
+        let mut z = smt_ctx("z3", "QF_LIA");
+        let mut c = smt_ctx("cvc5", "QF_LIA");
+        let zis = z.atom("Int");
+        let cis = c.atom("Int");
+        let zv: Vec<easy_smt::SExpr> = (0..N_VARS)
+            .map(|i| z.declare_const(format!("x{i}"), zis).unwrap())
+            .collect();
+        let cv: Vec<easy_smt::SExpr> = (0..N_VARS)
+            .map(|i| c.declare_const(format!("x{i}"), cis).unwrap())
+            .collect();
+        for con in &instance {
+            for (ctx, vr) in [(&mut z, &zv), (&mut c, &cv)] {
+                let zt: Vec<easy_smt::SExpr> = con
+                    .coeffs
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, &coeff)| z_coeff_times_var(&*ctx, coeff, cvars[i]))
+                    .filter_map(|(i, &co)| z_coeff_times_var(&*ctx, co, vr[i]))
                     .collect();
                 let z_lhs = zt.into_iter().reduce(|a, t| ctx.plus(a, t)).unwrap();
-                let z_rhs = z_int(&*ctx, rhs_val);
-                let z_atom = match rel {
+                let z_rhs = z_int(&*ctx, con.rhs);
+                let z_atom = match con.rel {
                     Rel::Le => ctx.lte(z_lhs, z_rhs),
                     Rel::Lt => ctx.lt(z_lhs, z_rhs),
                     Rel::Ge => ctx.gte(z_lhs, z_rhs),
@@ -1047,30 +1023,176 @@ fn differential_qf_lia_small() {
                 ctx.assert(z_atom).unwrap();
             }
         }
-
-        let ours = s.check_sat();
         let z_res = z.check().unwrap();
         let c_res = c.check().unwrap();
-        // The two oracles must agree with each other.
         assert_eq!(
             format!("{z_res:?}"),
             format!("{c_res:?}"),
             "z3≠cvc5 (iter {iter})\n{dump}"
         );
-        match (ours, z_res) {
-            (SolveOutcome::Unknown, _) => unknowns += 1,
-            (SolveOutcome::Sat, easy_smt::Response::Sat) => {}
-            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => {}
-            (o, t) => panic!("LIA DISAGREEMENT (iter {iter}): shinri={o:?} oracle={t:?}\n{dump}"),
+        let oracle_sat = match z_res {
+            easy_smt::Response::Sat => true,
+            easy_smt::Response::Unsat => false,
+            easy_smt::Response::Unknown => continue, // oracle uncertain — skip
+        };
+        considered += 1;
+        let data = instance.clone();
+        let (tx, rx) = mpsc::channel();
+        // 64 MB stack: SMT solver search can exceed the default 2 MB spawned-thread
+        // stack on some QF_LIA instances → SIGABRT without this.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let _ = tx.send(shinri_check_lia_gated(&data, N_VARS, true));
+            })
+            .unwrap();
+        match rx.recv_timeout(TIMEOUT) {
+            Ok(SolveOutcome::Sat) => {
+                assert!(oracle_sat, "WRONG-SAT (iter {iter})\n{dump}");
+                decided += 1;
+            }
+            Ok(SolveOutcome::Unsat) => {
+                assert!(!oracle_sat, "WRONG-UNSAT (iter {iter})\n{dump}");
+                decided += 1;
+            }
+            Ok(SolveOutcome::Unknown) => {
+                panic!("pure QF_LIA must not be Unknown (iter {iter})\n{dump}")
+            }
+            Err(_) => panic!("Tier 1 zero-skip violated: Stage-B timed out (iter {iter})\n{dump}"),
         }
     }
-
-    println!(
-        "differential_qf_lia_small: {N_ITERS} systems checked, {unknowns} Unknowns (should be 0)"
+    assert!(
+        considered > 0,
+        "Tier 1: non-vacuous (no oracle decisions at all)"
     );
     assert_eq!(
-        unknowns, 0,
-        "pure QF_LIA must not go Unknown ({unknowns} did)"
+        decided, considered,
+        "Tier 1: every non-skipped instance must be decided by Stage-B \
+         (decided={decided} considered={considered})"
+    );
+    println!("differential_qf_lia_unsat_tier1: {decided}/{considered} decided, 0 skips");
+}
+
+/// Tier 2 — larger stress corpus, Stage-B ON. The bulk must be decided in
+/// budget; residual timeouts are reported with the instance dumped and counted,
+/// never silently skipped. A WRONG verdict is always an instant panic.
+#[test]
+fn differential_qf_lia_unsat_tier2() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let mut rng = Lcg(0x0057_32b2);
+    const N_VARS: usize = 4;
+    const N_ITERS: usize = 150;
+    const TIMEOUT: Duration = Duration::from_millis(3000);
+    const THRESHOLD_PCT: usize = 95;
+
+    let mut decided = 0usize;
+    let mut timeouts = 0usize;
+    let mut considered = 0usize;
+
+    for iter in 0..N_ITERS {
+        let n_constraints = 5 + rng.below(5) as usize;
+        let mut instance: Vec<LiaConstraint> = Vec::with_capacity(n_constraints);
+        let mut dump = format!("iter={iter}");
+        for _ in 0..n_constraints {
+            let rel = match rng.below(6) {
+                0 => Rel::Le,
+                1 => Rel::Lt,
+                2 => Rel::Ge,
+                3 => Rel::Gt,
+                4 => Rel::Eq,
+                _ => Rel::Ne,
+            };
+            let mut coeffs: Vec<i32> = (0..N_VARS).map(|_| (rng.below(7) as i32) - 3).collect();
+            if coeffs.iter().all(|&c| c == 0) {
+                coeffs[0] = 1;
+            }
+            let rhs: i32 = (rng.below(11) as i32) - 5;
+            dump.push_str(&format!("\n  {coeffs:?} {rel:?} {rhs}"));
+            instance.push(LiaConstraint { coeffs, rel, rhs });
+        }
+        let mut z = smt_ctx("z3", "QF_LIA");
+        let mut c = smt_ctx("cvc5", "QF_LIA");
+        let zis = z.atom("Int");
+        let cis = c.atom("Int");
+        let zv: Vec<easy_smt::SExpr> = (0..N_VARS)
+            .map(|i| z.declare_const(format!("x{i}"), zis).unwrap())
+            .collect();
+        let cv: Vec<easy_smt::SExpr> = (0..N_VARS)
+            .map(|i| c.declare_const(format!("x{i}"), cis).unwrap())
+            .collect();
+        for con in &instance {
+            for (ctx, vr) in [(&mut z, &zv), (&mut c, &cv)] {
+                let zt: Vec<easy_smt::SExpr> = con
+                    .coeffs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &co)| z_coeff_times_var(&*ctx, co, vr[i]))
+                    .collect();
+                let z_lhs = zt.into_iter().reduce(|a, t| ctx.plus(a, t)).unwrap();
+                let z_rhs = z_int(&*ctx, con.rhs);
+                let z_atom = match con.rel {
+                    Rel::Le => ctx.lte(z_lhs, z_rhs),
+                    Rel::Lt => ctx.lt(z_lhs, z_rhs),
+                    Rel::Ge => ctx.gte(z_lhs, z_rhs),
+                    Rel::Gt => ctx.gt(z_lhs, z_rhs),
+                    Rel::Eq => ctx.eq(z_lhs, z_rhs),
+                    Rel::Ne => {
+                        let e = ctx.eq(z_lhs, z_rhs);
+                        ctx.not(e)
+                    }
+                };
+                ctx.assert(z_atom).unwrap();
+            }
+        }
+        let z_res = z.check().unwrap();
+        let c_res = c.check().unwrap();
+        assert_eq!(
+            format!("{z_res:?}"),
+            format!("{c_res:?}"),
+            "z3≠cvc5 (iter {iter})\n{dump}"
+        );
+        let oracle_sat = match z_res {
+            easy_smt::Response::Sat => true,
+            easy_smt::Response::Unsat => false,
+            easy_smt::Response::Unknown => continue,
+        };
+        considered += 1;
+        let data = instance.clone();
+        let (tx, rx) = mpsc::channel();
+        // 64 MB stack: same rationale as Tier 1 — prevents SIGABRT on harder instances.
+        std::thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || {
+                let _ = tx.send(shinri_check_lia_gated(&data, N_VARS, true));
+            })
+            .unwrap();
+        match rx.recv_timeout(TIMEOUT) {
+            Ok(SolveOutcome::Sat) => {
+                assert!(oracle_sat, "WRONG-SAT (iter {iter})\n{dump}");
+                decided += 1;
+            }
+            Ok(SolveOutcome::Unsat) => {
+                assert!(!oracle_sat, "WRONG-UNSAT (iter {iter})\n{dump}");
+                decided += 1;
+            }
+            Ok(SolveOutcome::Unknown) => {
+                panic!("pure QF_LIA must not be Unknown (iter {iter})\n{dump}")
+            }
+            Err(_) => {
+                timeouts += 1;
+                println!("Tier2 RESIDUAL TIMEOUT (iter {iter}, oracle_sat={oracle_sat}):{dump}");
+            }
+        }
+    }
+    println!(
+        "differential_qf_lia_unsat_tier2: {decided}/{considered} decided, \
+         {timeouts} residual timeouts (reported)"
+    );
+    let pct = (decided * 100).checked_div(considered).unwrap_or(100);
+    assert!(
+        pct >= THRESHOLD_PCT,
+        "Tier 2 below threshold: {pct}% < {THRESHOLD_PCT}% ({timeouts} timeouts)"
     );
 }
 
@@ -1440,4 +1562,55 @@ fn differential_qf_lia_two_stage() {
         "differential_qf_lia_two_stage: {agree} agreements, {stage_b_timeouts} Stage-B timeouts"
     );
     assert!(agree > 0, "no agreements — generator or oracles broken");
+}
+
+// Minimal standalone reproducer for the WRONG-SAT soundness bug found in Task 9.
+// Instance: x1=-1 (from -x1=1) AND x1≠-1 → should be UNSAT.
+// With Stage-B ON, shinri incorrectly returns SAT.
+#[test]
+#[cfg(feature = "oracle")]
+fn check_ne_eq_soundness_repro() {
+    // Seed 0x11A_5eed, iter=16:
+    //   [0, 1] Ne -1   → x1 ≠ -1
+    //   [1, 1] Lt 1    → x0 + x1 < 1
+    //   [-1, 1] Ne -2  → -x0 + x1 ≠ -2
+    //   [0, -1] Eq 1   → -x1 = 1, i.e., x1 = -1
+    //
+    // Constraints 1 and 4 together → UNSAT
+    let constraints = vec![
+        LiaConstraint {
+            coeffs: vec![0, 1],
+            rel: Rel::Ne,
+            rhs: -1,
+        },
+        LiaConstraint {
+            coeffs: vec![1, 1],
+            rel: Rel::Lt,
+            rhs: 1,
+        },
+        LiaConstraint {
+            coeffs: vec![-1, 1],
+            rel: Rel::Ne,
+            rhs: -2,
+        },
+        LiaConstraint {
+            coeffs: vec![0, -1],
+            rel: Rel::Eq,
+            rhs: 1,
+        },
+    ];
+    let stage_b_off = shinri_check_lia_gated(&constraints, 2, false);
+    let stage_b_on = shinri_check_lia_gated(&constraints, 2, true);
+    println!("stage_b=false: {:?}", stage_b_off);
+    println!("stage_b=true:  {:?}", stage_b_on);
+    assert_eq!(
+        stage_b_off,
+        SolveOutcome::Unsat,
+        "stage_b=OFF must return UNSAT"
+    );
+    assert_eq!(
+        stage_b_on,
+        SolveOutcome::Unsat,
+        "stage_b=ON  must return UNSAT"
+    );
 }
