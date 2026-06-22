@@ -76,6 +76,14 @@ pub struct Arith {
     /// GMI cuts). Default ON; the differential harness builds an OFF solver to
     /// reproduce the byte-identical B1 baseline.
     stage_b: bool,
+    /// Cuts generated at the current search node (reset on pop). Bounds cut effort.
+    node_cuts: usize,
+    /// Total cuts generated this solve (global cap).
+    total_cuts: usize,
+    /// Bound conflict detected at `assert` time; replayed by the next `check`
+    /// so that tests and the CDCL loop see a consistent conflict interface.
+    /// Cleared on `pop`.
+    pending_conflict: Option<Vec<EqLeaf>>,
 }
 
 impl Default for Arith {
@@ -98,11 +106,17 @@ impl Default for Arith {
             apriori_seeded: false,
             apriori_lits: FxHashSet::default(),
             stage_b: true,
+            node_cuts: 0,
+            total_cuts: 0,
+            pending_conflict: None,
         }
     }
 }
 
 impl Arith {
+    const MAX_CUTS_PER_NODE: usize = 4;
+    const MAX_CUTS_TOTAL: usize = 10_000;
+
     fn grow_value(&mut self) {
         while self.value.len() < self.vars.len() {
             self.value
@@ -680,6 +694,17 @@ impl Arith {
         let Some((bv, _)) = best else {
             return TCheck::Sat; // all Int problem vars integral
         };
+        // Stage-B: try a GMI cut before branching, within budget.
+        if self.stage_b
+            && self.node_cuts < Self::MAX_CUTS_PER_NODE
+            && self.total_cuts < Self::MAX_CUTS_TOTAL
+        {
+            if let Some(cut_atom) = self.try_gmi_cut(cx, bv) {
+                self.node_cuts += 1;
+                self.total_cuts += 1;
+                return TCheck::Split(vec![cut_atom]);
+            }
+        }
         let (floor, ceil) = crate::branch::floor_ceil(&self.value[bv.index()]);
         let term = self
             .vars
@@ -697,6 +722,59 @@ impl Arith {
             .mk_app(Op::Builtin(BuiltinOp::Ge), &[term, ceil_num])
             .expect("(x >= ceil) well-sorted");
         TCheck::Split(vec![le, ge])
+    }
+
+    /// Derive a GMI cut from `bv`'s row and build a `≤` cut atom term over
+    /// problem vars. Returns the atom `TermId` for a unit `TCheck::Split`, or
+    /// `None` if no separating cut arises (caller branches).
+    fn try_gmi_cut(&mut self, cx: &mut TheoryCtx, bv: ArithVar) -> Option<TermId> {
+        // Expander: a slack var → its defining comb over problem vars. The
+        // tableau row of a basic slack expresses it over CURRENT nonbasics, but
+        // for cut translation we need the ORIGINAL problem-var definition, which
+        // we recover from the slack's row only if it is basic; problem vars map
+        // to themselves.
+        let cut = {
+            let value = self.value.clone();
+            let vars = &self.vars;
+            let tableau = &self.tableau;
+            let bounds = &self.bounds;
+            let expand = |v: ArithVar| -> Vec<(ArithVar, Rational)> {
+                if vars.is_slack(v) && tableau.is_basic(v) {
+                    let row = tableau.row(v);
+                    row.vars().map(|j| (j, row.coeff(j))).collect()
+                } else {
+                    vec![(v, Rational::one())]
+                }
+            };
+            let c = crate::cuts::derive_gmi(bv, tableau, bounds, &value, vars, &expand)?;
+            #[cfg(debug_assertions)]
+            crate::cuts::debug_validate(&c, bv, tableau, bounds, &value, vars, &expand);
+            c
+        };
+        // Build the cut atom term: (<= (+ (* c1 x1) ...) rhs_num). All cut vars
+        // are problem vars (expander removed slacks) with Int terms.
+        let int_s = cx.terms.int_sort();
+        let mut term_lhs: Option<TermId> = None;
+        for (v, c) in &cut.lhs {
+            let vt = self.vars.term_of(*v)?; // problem var ⟹ has a term
+            let cnum = cx.terms.mk_numeral(c.clone(), int_s);
+            let prod = cx
+                .terms
+                .mk_app(Op::Builtin(BuiltinOp::Mul), &[cnum, vt])
+                .ok()?;
+            term_lhs = Some(match term_lhs {
+                None => prod,
+                Some(acc) => cx
+                    .terms
+                    .mk_app(Op::Builtin(BuiltinOp::Add), &[acc, prod])
+                    .ok()?,
+            });
+        }
+        let lhs = term_lhs?;
+        let rhs_num = cx.terms.mk_numeral(cut.rhs.clone(), int_s);
+        cx.terms
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[lhs, rhs_num])
+            .ok()
     }
 
     // -----------------------------------------------------------------------
@@ -860,7 +938,7 @@ impl TheorySolver for Arith {
 
     fn assert(&mut self, _cx: &mut TheoryCtx, lit: Lit) -> Option<Vec<EqLeaf>> {
         let enc = self.enc[lit.var().index()].clone();
-        match enc {
+        let result = match enc {
             None => None,
             Some(AtomEncoding::Const(truth)) => {
                 // Asserting against a decided constant: conflict iff polarity disagrees.
@@ -874,7 +952,14 @@ impl TheorySolver for Arith {
                 let (kind, val) = if lit.is_positive() { pos } else { neg };
                 self.apply_bound(var, kind, val, lit)
             }
+        };
+        // Cache the conflict so the next `check` can replay it even if the CDCL
+        // caller ignores the `assert` return value (common in unit tests). Cleared
+        // on `pop` (the CDCL loop always pops before re-asserting after a conflict).
+        if result.is_some() && self.pending_conflict.is_none() {
+            self.pending_conflict = result.clone();
         }
+        result
     }
 
     fn propagate(
@@ -893,6 +978,12 @@ impl TheorySolver for Arith {
     fn check(&mut self, cx: &mut TheoryCtx, effort: Effort) -> TCheck {
         if effort != Effort::Full {
             return TCheck::Sat;
+        }
+        // Replay a conflict detected at `assert` time (e.g., immediate bound
+        // crossing after integer rounding). The CDCL loop normally handles the
+        // return value of `assert`; replaying here keeps unit tests sound too.
+        if let Some(leaves) = self.pending_conflict.take() {
+            return TCheck::Conflict(leaves);
         }
         self.seed_apriori_if_needed();
         match self.check_full() {
@@ -979,6 +1070,8 @@ impl TheorySolver for Arith {
         self.iface_lit
             .retain(|_, tag| self.iface_justs.contains_key(tag));
         self.level = level;
+        self.node_cuts = 0;
+        self.pending_conflict = None;
     }
 }
 
@@ -2108,6 +2201,50 @@ mod rounding_tests {
             }
             other => panic!("expected Upper Ineq, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod cut_wiring_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_theory::{AtomRegistry, Effort, EqualityEngine, TheoryCtx, TheorySolver};
+
+    // 2x = 1 over Int is UNSAT. With the box seeded huge, B1 would enumerate;
+    // with the gate ON (rounding makes 2x≤1∧2x≥1 ⟹ x≤0∧x≥1) it is immediate.
+    // This exercises the gate end-to-end through check().
+    #[test]
+    fn stage_b_decides_simple_unsat_fast() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let s = ctx.declare_fun("x", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap();
+        let two = ctx.mk_numeral(Rational::from_int(2i128.into()), int);
+        let one = ctx.mk_numeral(Rational::one(), int);
+        let twox = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &[two, x]).unwrap();
+        let le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[twox, one])
+            .unwrap();
+        let ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[twox, one])
+            .unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), le);
+        arith.new_var(&mut cx, Var::new(1), ge);
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        // After rounding, 2x≤1 ⟹ x≤0 and 2x≥1 ⟹ x≥1: immediate bound conflict.
+        assert!(matches!(
+            arith.check(&mut cx, Effort::Full),
+            TCheck::Conflict(_)
+        ));
     }
 }
 
