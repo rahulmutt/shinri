@@ -953,7 +953,7 @@ fn smt_ctx(solver: &str, logic: &str) -> easy_smt::Context {
             M≈3×10¹² for n=3,m=7,a=3 random instances, making 300 iterations \
             take hours; re-enable after Plan B2 adds Gomory cuts"]
 fn differential_qf_lia_small() {
-    let mut rng = Lcg(0x11A_5eed);
+    let mut rng = Lcg(0x11a_5eed);
     const N_VARS: usize = 3;
     const N_ITERS: usize = 300;
     let mut unknowns = 0usize;
@@ -1103,12 +1103,21 @@ struct LiaConstraint {
 /// Build a shinri QF_LIA instance from plain constraint data and run check_sat.
 /// Intended to be called inside a spawned thread.
 fn shinri_check_lia(constraints: &[LiaConstraint], n_vars: usize) -> SolveOutcome {
+    shinri_check_lia_gated(constraints, n_vars, false)
+}
+
+/// Like `shinri_check_lia`, but with an explicit Stage-B gate (false = B1).
+fn shinri_check_lia_gated(
+    constraints: &[LiaConstraint],
+    n_vars: usize,
+    stage_b: bool,
+) -> SolveOutcome {
     let mut s = Solver::new();
+    s.set_stage_b(stage_b);
     let int = s.int_sort();
     let vars: Vec<shinri_core::TermId> = (0..n_vars)
         .map(|i| s.declare_const(&format!("x{i}"), int))
         .collect();
-
     for con in constraints {
         let mut terms = Vec::new();
         for (i, &coeff) in con.coeffs.iter().enumerate() {
@@ -1285,4 +1294,140 @@ fn differential_qf_lia_sat_direction() {
          loosen generator or raise N_ITERS \
          (oracle_unsat_skipped={oracle_unsat_skipped} shinri_timeout_skipped={shinri_timeout_skipped})"
     );
+}
+
+// ─── QF_LIA two-stage differential: B1 (gate OFF) vs Stage-B (gate ON) vs z3+cvc5.
+// Every instance must agree across all four. Stage-B makes UNSAT tractable, so
+// (unlike the SAT-only baseline test) UNSAT instances are checked under a timeout.
+#[test]
+fn differential_qf_lia_two_stage() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+    let mut rng = Lcg(0xb2_5eed);
+    const N_VARS: usize = 3;
+    const N_ITERS: usize = 200;
+    const TIMEOUT: Duration = Duration::from_millis(2000);
+
+    let mut agree = 0usize;
+    let mut stage_b_timeouts = 0usize;
+
+    for iter in 0..N_ITERS {
+        let n_constraints = 4 + rng.below(4) as usize;
+        let mut instance: Vec<LiaConstraint> = Vec::with_capacity(n_constraints);
+        let mut dump = format!("iter={iter}");
+        for _ in 0..n_constraints {
+            let rel = match rng.below(6) {
+                0 => Rel::Le,
+                1 => Rel::Lt,
+                2 => Rel::Ge,
+                3 => Rel::Gt,
+                4 => Rel::Eq,
+                _ => Rel::Ne,
+            };
+            let mut coeffs: Vec<i32> = (0..N_VARS).map(|_| (rng.below(5) as i32) - 2).collect();
+            if coeffs.iter().all(|&c| c == 0) {
+                coeffs[0] = 1;
+            }
+            let rhs: i32 = (rng.below(7) as i32) - 3;
+            dump.push_str(&format!("\n  {coeffs:?} {rel:?} {rhs}"));
+            instance.push(LiaConstraint { coeffs, rel, rhs });
+        }
+
+        // Oracle verdict (z3 == cvc5).
+        let mut z = smt_ctx("z3", "QF_LIA");
+        let mut c = smt_ctx("cvc5", "QF_LIA");
+        let z_int_sort = z.atom("Int");
+        let c_int_sort = c.atom("Int");
+        let zv: Vec<easy_smt::SExpr> = (0..N_VARS)
+            .map(|i| z.declare_const(format!("x{i}"), z_int_sort).unwrap())
+            .collect();
+        let cv: Vec<easy_smt::SExpr> = (0..N_VARS)
+            .map(|i| c.declare_const(format!("x{i}"), c_int_sort).unwrap())
+            .collect();
+        for con in &instance {
+            for (ctx, vr) in [(&mut z, &zv), (&mut c, &cv)] {
+                let zt: Vec<easy_smt::SExpr> = con
+                    .coeffs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &co)| z_coeff_times_var(&*ctx, co, vr[i]))
+                    .collect();
+                let z_lhs = zt.into_iter().reduce(|a, t| ctx.plus(a, t)).unwrap();
+                let z_rhs = z_int(&*ctx, con.rhs);
+                let z_atom = match con.rel {
+                    Rel::Le => ctx.lte(z_lhs, z_rhs),
+                    Rel::Lt => ctx.lt(z_lhs, z_rhs),
+                    Rel::Ge => ctx.gte(z_lhs, z_rhs),
+                    Rel::Gt => ctx.gt(z_lhs, z_rhs),
+                    Rel::Eq => ctx.eq(z_lhs, z_rhs),
+                    Rel::Ne => {
+                        let e = ctx.eq(z_lhs, z_rhs);
+                        ctx.not(e)
+                    }
+                };
+                ctx.assert(z_atom).unwrap();
+            }
+        }
+        let z_res = z.check().unwrap();
+        let c_res = c.check().unwrap();
+        assert_eq!(
+            format!("{z_res:?}"),
+            format!("{c_res:?}"),
+            "z3≠cvc5 (iter {iter})\n{dump}"
+        );
+        let oracle = match z_res {
+            easy_smt::Response::Sat => Some(true),
+            easy_smt::Response::Unsat => Some(false),
+            easy_smt::Response::Unknown => continue, // oracle uncertain → skip
+        };
+
+        // Baseline (gate OFF): only run on instances the oracle says SAT (B1
+        // cannot decide UNSAT in budget). On SAT it must agree.
+        if oracle == Some(true) {
+            let data = instance.clone();
+            let (tx, rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(shinri_check_lia_gated(&data, N_VARS, false));
+            });
+            if let Ok(b1) = rx.recv_timeout(TIMEOUT) {
+                assert!(
+                    matches!(b1, SolveOutcome::Sat),
+                    "B1 baseline disagreed on SAT (iter {iter})\n{dump}"
+                );
+            }
+        }
+
+        // Stage-B (gate ON): must match the oracle on BOTH directions, in budget.
+        let data = instance.clone();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(shinri_check_lia_gated(&data, N_VARS, true));
+        });
+        match rx.recv_timeout(TIMEOUT) {
+            Ok(SolveOutcome::Sat) => {
+                assert_eq!(
+                    oracle,
+                    Some(true),
+                    "Stage-B WRONG-SAT (iter {iter})\n{dump}"
+                );
+                agree += 1;
+            }
+            Ok(SolveOutcome::Unsat) => {
+                assert_eq!(
+                    oracle,
+                    Some(false),
+                    "Stage-B WRONG-UNSAT soundness bug (iter {iter})\n{dump}"
+                );
+                agree += 1;
+            }
+            Ok(SolveOutcome::Unknown) => {
+                panic!("pure QF_LIA must not be Unknown (iter {iter})\n{dump}")
+            }
+            Err(_) => stage_b_timeouts += 1,
+        }
+    }
+    println!(
+        "differential_qf_lia_two_stage: {agree} agreements, {stage_b_timeouts} Stage-B timeouts"
+    );
+    assert!(agree > 0, "no agreements — generator or oracles broken");
 }
