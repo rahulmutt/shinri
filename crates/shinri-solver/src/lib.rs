@@ -203,7 +203,7 @@ impl Solver {
         use shinri_sat::{SolveResult, SolverConfig, Vmtf};
         use shinri_theory::Combiner;
 
-        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith>, NoProof, Vmtf>;
+        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_theory::EmptyTheory>, NoProof, Vmtf>;
 
         // Lower n-ary distinct to pairwise binary up front (needs &mut ctx).
         let lowered: Vec<TermId> = self
@@ -550,7 +550,7 @@ impl Solver {
         use shinri_sat::{SolverConfig, Vmtf};
         use shinri_theory::Combiner;
 
-        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith>, NoProof, Vmtf>;
+        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_theory::EmptyTheory>, NoProof, Vmtf>;
 
         let mut sat: Sat = shinri_sat::Solver::with_theory(
             SolverConfig::default(),
