@@ -34,6 +34,8 @@ pub struct Solver {
     t_true: TermId,
     t_false: TermId,
     last_model: Option<Model>,
+    /// Plan B2 Stage-B optimization gate, forwarded to Arith in check_sat.
+    stage_b: bool,
 }
 
 impl Default for Solver {
@@ -54,6 +56,7 @@ impl Solver {
             t_true,
             t_false,
             last_model: None,
+            stage_b: true,
         }
     }
 
@@ -106,6 +109,12 @@ impl Solver {
     /// into the same `Context` the solver uses.
     pub fn ctx_mut(&mut self) -> &mut Context {
         &mut self.ctx
+    }
+
+    /// Toggle the Plan B2 Stage-B gate (default ON). Used by the differential
+    /// oracle to compare the cuts-on solver against the B1 baseline.
+    pub fn set_stage_b(&mut self, on: bool) {
+        self.stage_b = on;
     }
 
     /// Execute one IR command and return the response.
@@ -214,6 +223,7 @@ impl Solver {
         sat.theory_mut()
             .euf_mut()
             .set_truth_terms(self.t_true, self.t_false);
+        sat.theory_mut().arith_mut().set_stage_b(self.stage_b);
 
         let atom_vars: Vec<(shinri_core::Var, TermId)>;
         let refused: bool;
@@ -434,6 +444,71 @@ impl Solver {
                         .expect("and well-sorted")
                 }
             }
+            // ── Not(Eq): pure-arith binary disequality ────────────────────────
+            //
+            // `(not (= a b))` where both args are pure-arith (Int or Real) is
+            // lowered directly to `(or (Lt a b) (Gt a b))` so the Arith theory
+            // enforces the disequality. Without this, the generic Not path would
+            // produce `(not (and (= a b) (Le a b) (Ge a b)))` = a disjunction
+            // where the SAT solver can choose `¬Eq_euf` independently of Arith,
+            // allowing a contradicting arith assignment (WRONG-SAT / soundness bug).
+            //
+            // Only the BINARY case is handled here: n-ary `(not (= a b c ...))` is
+            // NOT equivalent to Distinct; keep generic recursion for n-ary.
+            // Non-pure-arith args (function applications) stay on the generic path
+            // so EUF/QF_UFLRA congruence handles them correctly.
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Not),
+                args: not_args,
+                ..
+            } => {
+                let not_kids: Vec<TermId> = self.ctx.children(not_args).to_vec();
+                // `not` is always unary; inspect the single child.
+                let child = not_kids[0];
+                let handled = match self.ctx.term_node(child).clone() {
+                    TermNode::App {
+                        op: Op::Builtin(BuiltinOp::Eq),
+                        args: eq_args,
+                        ..
+                    } => {
+                        let eq_kids: Vec<TermId> = self.ctx.children(eq_args).to_vec();
+                        // Binary Eq over pure-arith terms → (or (Lt a b) (Gt a b)).
+                        if eq_kids.len() == 2
+                            && self.is_arith_sorted(eq_kids[0])
+                            && Self::is_pure_arith(&self.ctx, eq_kids[0])
+                            && Self::is_pure_arith(&self.ctx, eq_kids[1])
+                        {
+                            let a = eq_kids[0];
+                            let b = eq_kids[1];
+                            let lt = self
+                                .ctx
+                                .mk_app(Op::Builtin(BuiltinOp::Lt), &[a, b])
+                                .expect("Lt well-sorted");
+                            let gt = self
+                                .ctx
+                                .mk_app(Op::Builtin(BuiltinOp::Gt), &[a, b])
+                                .expect("Gt well-sorted");
+                            Some(
+                                self.ctx
+                                    .mk_app(Op::Builtin(BuiltinOp::Or), &[lt, gt])
+                                    .expect("or well-sorted"),
+                            )
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                };
+                if let Some(lowered_diseq) = handled {
+                    lowered_diseq
+                } else {
+                    // Generic Not: recurse into child.
+                    let lowered_child = self.lower(child);
+                    self.ctx
+                        .mk_app(Op::Builtin(BuiltinOp::Not), &[lowered_child])
+                        .expect("not well-sorted")
+                }
+            }
             // ── Boolean connectives: recurse ──────────────────────────────────
             TermNode::App {
                 op: Op::Builtin(b),
@@ -441,8 +516,7 @@ impl Solver {
                 ..
             } if matches!(
                 b,
-                BuiltinOp::Not
-                    | BuiltinOp::And
+                BuiltinOp::And
                     | BuiltinOp::Or
                     | BuiltinOp::Implies
                     | BuiltinOp::Xor
@@ -667,5 +741,87 @@ mod tests {
             } => {}
             other => panic!("expected (or ..), got {other:?}"),
         }
+    }
+
+    /// SOUNDNESS REGRESSION: `(1*x ≠ -1) ∧ (-1*x = 1)` over Int must be Unsat.
+    ///
+    /// This was the controller-confirmed WRONG-SAT bug: `not (= (1*x) (-1))` used
+    /// a DIFFERENT Eq atom than `(= (-1*x) 1)`.  Without the pure-arith `Not(Eq)`
+    /// fix, the SAT solver satisfied `¬Eq_euf` (independent of arith) while arith
+    /// assigned x=-1 satisfying both linear constraints, yielding bogus Sat.
+    /// After the fix, `(not (= (1*x) (-1)))` lowers to `(or (Lt …) (Gt …))` and
+    /// Arith correctly detects UNSAT (1*(-1) = -1 contradicts ≠ -1).
+    #[test]
+    fn not_eq_different_terms_int_is_unsat() {
+        use shinri_core::{BuiltinOp, Op};
+        let mut s = Solver::new();
+        let int = s.int_sort();
+        let x = s.declare_const("x", int);
+        let one = s.numeral(Rational::from_int(1i128.into()), int);
+        let neg_one = s.numeral(Rational::from_int((-1i128).into()), int);
+        // 1*x
+        let one_x = s.app(Op::Builtin(BuiltinOp::Mul), &[one, x]);
+        // -1*x
+        let neg_one_x = s.app(Op::Builtin(BuiltinOp::Mul), &[neg_one, x]);
+        // (1*x ≠ -1): not (= (1*x) (-1))
+        let eq1 = s.eq(one_x, neg_one);
+        let neq = s.app(Op::Builtin(BuiltinOp::Not), &[eq1]);
+        // (-1*x = 1): (= (-1*x) 1)
+        let eq2 = s.eq(neg_one_x, one);
+        s.assert(neq);
+        s.assert(eq2);
+        // x = -1 satisfies -1*x=1, but also 1*x=-1, violating 1*x≠-1 → Unsat.
+        assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    }
+
+    /// SOUNDNESS REGRESSION (same-term case): `x = -1 ∧ x ≠ -1` → Unsat.
+    ///
+    /// This was already correct before the fix (EUF self-contradiction), but we
+    /// guard against any future regression.
+    #[test]
+    fn not_eq_same_term_int_is_unsat() {
+        use shinri_core::{BuiltinOp, Op};
+        let mut s = Solver::new();
+        let int = s.int_sort();
+        let x = s.declare_const("x", int);
+        let neg_one = s.numeral(Rational::from_int((-1i128).into()), int);
+        // x = -1
+        let eq = s.eq(x, neg_one);
+        // x ≠ -1: not (= x (-1))
+        let neq = s.app(Op::Builtin(BuiltinOp::Not), &[eq]);
+        s.assert(eq);
+        s.assert(neq);
+        assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    }
+}
+
+#[cfg(test)]
+mod stage_b_gate_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Op};
+
+    fn build(stage_b: bool) -> SolveOutcome {
+        // x >= 0 ; x <= 2 ; 2x = 3  (UNSAT over Int: no integer x with 2x=3)
+        let mut s = Solver::new();
+        s.set_stage_b(stage_b);
+        let int = s.int_sort();
+        let x = s.declare_const("x", int);
+        let zero = s.numeral(Rational::zero(), int);
+        let two = s.numeral(Rational::from_int(2i128.into()), int);
+        let three = s.numeral(Rational::from_int(3i128.into()), int);
+        let ge0 = s.app(Op::Builtin(BuiltinOp::Ge), &[x, zero]);
+        let le2 = s.app(Op::Builtin(BuiltinOp::Le), &[x, two]);
+        let twox = s.app(Op::Builtin(BuiltinOp::Mul), &[two, x]);
+        let eq3 = s.eq(twox, three);
+        s.assert(ge0);
+        s.assert(le2);
+        s.assert(eq3);
+        s.check_sat()
+    }
+
+    #[test]
+    fn gate_toggles_without_changing_verdict() {
+        assert!(matches!(build(true), SolveOutcome::Unsat));
+        assert!(matches!(build(false), SolveOutcome::Unsat));
     }
 }

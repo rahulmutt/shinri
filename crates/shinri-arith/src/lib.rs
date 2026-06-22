@@ -5,10 +5,12 @@
 
 pub mod bounds;
 pub mod branch;
+pub mod cuts;
 pub mod encode;
 pub mod farkas;
 pub mod model;
 pub mod normalize;
+pub mod propagate;
 pub mod simplex;
 pub mod tableau;
 pub mod vars;
@@ -70,6 +72,14 @@ pub struct Arith {
     apriori_seeded: bool,
     /// Sentinel lit codes used for a-priori box bounds, stripped from conflicts.
     apriori_lits: FxHashSet<u32>,
+    /// Master gate for all Plan B2 optimizations (integer bound rounding, FBBT,
+    /// GMI cuts). Default ON; the differential harness builds an OFF solver to
+    /// reproduce the byte-identical B1 baseline.
+    stage_b: bool,
+    /// Cuts generated at the current search node (reset on pop). Bounds cut effort.
+    node_cuts: usize,
+    /// Total cuts generated this solve (global cap).
+    total_cuts: usize,
 }
 
 impl Default for Arith {
@@ -91,17 +101,28 @@ impl Default for Arith {
             apriori_atom_count: 0,
             apriori_seeded: false,
             apriori_lits: FxHashSet::default(),
+            stage_b: true,
+            node_cuts: 0,
+            total_cuts: 0,
         }
     }
 }
 
 impl Arith {
+    const MAX_CUTS_PER_NODE: usize = 4;
+    const MAX_CUTS_TOTAL: usize = 10_000;
+
     fn grow_value(&mut self) {
         while self.value.len() < self.vars.len() {
             self.value
                 .push(DeltaRational::from_rational(Rational::zero()));
         }
         self.bounds.ensure(self.vars.len());
+    }
+
+    /// Toggle the Plan B2 optimization gate (default ON). OFF = B1 baseline.
+    pub fn set_stage_b(&mut self, on: bool) {
+        self.stage_b = on;
     }
 
     /// Reduce a normalized atom to a *bound on one variable*. For a single-term
@@ -165,13 +186,38 @@ impl Arith {
                     pkk = -pkk;
                     nkk = -nkk;
                 }
-                AtomEncoding::Ineq {
+                let mut enc = AtomEncoding::Ineq {
                     var,
                     pos: (pk, DeltaRational::new(rhs.clone(), pkk)),
                     neg: (nk, DeltaRational::new(rhs, nkk)),
+                };
+                // Stage-B integer bound rounding: if the bounded quantity is
+                // integer-valued, replace each (kind, value) with the integer
+                // round and drop the δ. `strict` is read off the δ-coefficient
+                // (nonzero ⇒ strict). Handles flipped-coefficient cases because
+                // `kind` and `value` are already resolved here.
+                if self.stage_b && self.comb_is_int_valued(&n.comb) {
+                    if let AtomEncoding::Ineq { pos, neg, .. } = &mut enc {
+                        for slot in [pos, neg] {
+                            let strict = !slot.1.k().is_zero();
+                            slot.1 = crate::branch::round_int_bound(slot.1.c(), slot.0, strict);
+                        }
+                    }
                 }
+                enc
             }
         }
+    }
+
+    /// True iff the linear combination evaluates to an integer for every model:
+    /// every variable is Int-sorted AND every coefficient is an integer. In a
+    /// pure-Int query this holds for all problem vars and all slacks.
+    fn comb_is_int_valued(&self, comb: &LinComb) -> bool {
+        !comb.0.is_empty()
+            && comb
+                .0
+                .iter()
+                .all(|(v, c)| self.vars.is_int(*v) && c.denom() == Integer::one())
     }
 
     /// β-update: set nonbasic `v` to `val`, propagating the delta to all basics.
@@ -643,6 +689,17 @@ impl Arith {
         let Some((bv, _)) = best else {
             return TCheck::Sat; // all Int problem vars integral
         };
+        // Stage-B: try a GMI cut before branching, within budget.
+        if self.stage_b
+            && self.node_cuts < Self::MAX_CUTS_PER_NODE
+            && self.total_cuts < Self::MAX_CUTS_TOTAL
+        {
+            if let Some(cut_atom) = self.try_gmi_cut(cx, bv) {
+                self.node_cuts += 1;
+                self.total_cuts += 1;
+                return TCheck::Split(vec![cut_atom]);
+            }
+        }
         let (floor, ceil) = crate::branch::floor_ceil(&self.value[bv.index()]);
         let term = self
             .vars
@@ -660,6 +717,59 @@ impl Arith {
             .mk_app(Op::Builtin(BuiltinOp::Ge), &[term, ceil_num])
             .expect("(x >= ceil) well-sorted");
         TCheck::Split(vec![le, ge])
+    }
+
+    /// Derive a GMI cut from `bv`'s row and build a `≤` cut atom term over
+    /// problem vars. Returns the atom `TermId` for a unit `TCheck::Split`, or
+    /// `None` if no separating cut arises (caller branches).
+    fn try_gmi_cut(&mut self, cx: &mut TheoryCtx, bv: ArithVar) -> Option<TermId> {
+        // Expander: a slack var → its defining comb over problem vars. The
+        // tableau row of a basic slack expresses it over CURRENT nonbasics, but
+        // for cut translation we need the ORIGINAL problem-var definition, which
+        // we recover from the slack's row only if it is basic; problem vars map
+        // to themselves.
+        let cut = {
+            let value = self.value.clone();
+            let vars = &self.vars;
+            let tableau = &self.tableau;
+            let bounds = &self.bounds;
+            let expand = |v: ArithVar| -> Vec<(ArithVar, Rational)> {
+                if vars.is_slack(v) && tableau.is_basic(v) {
+                    let row = tableau.row(v);
+                    row.vars().map(|j| (j, row.coeff(j))).collect()
+                } else {
+                    vec![(v, Rational::one())]
+                }
+            };
+            let c = crate::cuts::derive_gmi(bv, tableau, bounds, &value, vars, &expand)?;
+            #[cfg(debug_assertions)]
+            crate::cuts::debug_validate(&c, bv, tableau, bounds, &value, vars, &expand);
+            c
+        };
+        // Build the cut atom term: (<= (+ (* c1 x1) ...) rhs_num). All cut vars
+        // are problem vars (expander removed slacks) with Int terms.
+        let int_s = cx.terms.int_sort();
+        let mut term_lhs: Option<TermId> = None;
+        for (v, c) in &cut.lhs {
+            let vt = self.vars.term_of(*v)?; // problem var ⟹ has a term
+            let cnum = cx.terms.mk_numeral(c.clone(), int_s);
+            let prod = cx
+                .terms
+                .mk_app(Op::Builtin(BuiltinOp::Mul), &[cnum, vt])
+                .ok()?;
+            term_lhs = Some(match term_lhs {
+                None => prod,
+                Some(acc) => cx
+                    .terms
+                    .mk_app(Op::Builtin(BuiltinOp::Add), &[acc, prod])
+                    .ok()?,
+            });
+        }
+        let lhs = term_lhs?;
+        let rhs_num = cx.terms.mk_numeral(cut.rhs.clone(), int_s);
+        cx.terms
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[lhs, rhs_num])
+            .ok()
     }
 
     // -----------------------------------------------------------------------
@@ -746,6 +856,27 @@ impl Arith {
             let _ = self.apply_bound(v, BoundKind::Lower, lo.clone(), lo_lit);
             let _ = self.apply_bound(v, BoundKind::Upper, hi.clone(), hi_lit);
         }
+        if self.stage_b {
+            self.run_fbbt();
+        }
+    }
+
+    /// One-shot level-0 FBBT pass: derive tighter integer bounds from the
+    /// tableau rows and install them as level-0 axiomatic bounds under stripped
+    /// sentinels (like the a-priori box). Stage-B only.
+    fn run_fbbt(&mut self) {
+        const MAX_ROUNDS: usize = 16;
+        let tightenings = crate::propagate::tighten_to_fixpoint(
+            &self.tableau,
+            &self.bounds,
+            &self.vars,
+            MAX_ROUNDS,
+        );
+        for (v, kind, val) in tightenings {
+            let lit = self.fresh_sentinel();
+            self.apriori_lits.insert(lit.code());
+            let _ = self.apply_bound(v, kind, val, lit);
+        }
     }
 
     /// Drop a-priori box sentinel lits from a conflict core (see Soundness note).
@@ -802,7 +933,7 @@ impl TheorySolver for Arith {
 
     fn assert(&mut self, _cx: &mut TheoryCtx, lit: Lit) -> Option<Vec<EqLeaf>> {
         let enc = self.enc[lit.var().index()].clone();
-        match enc {
+        let conflict = match enc {
             None => None,
             Some(AtomEncoding::Const(truth)) => {
                 // Asserting against a decided constant: conflict iff polarity disagrees.
@@ -816,7 +947,19 @@ impl TheorySolver for Arith {
                 let (kind, val) = if lit.is_positive() { pos } else { neg };
                 self.apply_bound(var, kind, val, lit)
             }
-        }
+        };
+        // Strip a-priori-box / FBBT sentinels from an assert-time conflict, the
+        // same way the `check` path strips `check_full`'s conflict (~972). When
+        // `apply_bound` reports a crossing against a sentinel bound (`other`), the
+        // sentinel lit's var index lives in the reserved region (≥ 1<<30); left in
+        // the core it leaks into SAT `analyze`, which indexes `seen[var.index()]`
+        // sized to the real-var count → out-of-bounds panic. FBBT (Task 4) installs
+        // TIGHT level-0 sentinel bounds that asserted bounds routinely cross, which
+        // is what exposed this (B1's huge box was never crossed at assert time).
+        // Soundness: sentinel bounds are level-0–entailed facts, so dropping them
+        // yields a still-valid core of real asserted lits (the a-priori stripping
+        // argument; the differential oracle is the empirical net).
+        conflict.map(|leaves| self.strip_apriori(leaves))
     }
 
     fn propagate(
@@ -921,6 +1064,7 @@ impl TheorySolver for Arith {
         self.iface_lit
             .retain(|_, tag| self.iface_justs.contains_key(tag));
         self.level = level;
+        self.node_cuts = 0;
     }
 }
 
@@ -1856,6 +2000,77 @@ mod apriori_tests {
             "upper box bound must survive push to level 1"
         );
     }
+
+    /// Regression test for Bug 1 (sentinel leak into SAT analyze).
+    ///
+    /// When an asserted bound crosses an FBBT-derived sentinel bound, `apply_bound`
+    /// returns a conflict that contains the sentinel lit. Before the fix, `assert`
+    /// returned that conflict un-stripped, so the sentinel lit (var index ≥ 1<<30)
+    /// would reach the SAT solver's `analyze`, which indexes `seen[var.index()]`
+    /// sized to the real-var count → out-of-bounds panic.
+    ///
+    /// The fix captures the conflict from `apply_bound` and pipes it through
+    /// `strip_apriori` before returning. This test:
+    ///   1. Sets up a system so FBBT will tighten an Int var's upper bound tightly.
+    ///   2. Asserts a bound that crosses the FBBT-derived sentinel bound.
+    ///   3. Captures the conflict returned by `assert`.
+    ///   4. Asserts that NO leaf in the conflict cites a sentinel lit
+    ///      (var index ≥ SENTINEL_VAR_BASE = 1<<30).
+    #[test]
+    fn assert_conflict_against_sentinel_no_sentinel_in_core() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        // x + y <= 1, x >= 0, y >= 0 → FBBT tightens x ≤ 1 (and y ≤ 1) at level 0.
+        let xi = ctx.declare_fun("px", &[], int);
+        let yi = ctx.declare_fun("py", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xi), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(yi), &[]).unwrap();
+        let xy = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let zero = ctx.mk_numeral(Rational::zero(), int);
+        let one = ctx.mk_numeral(Rational::one(), int);
+        let two = ctx.mk_numeral(Rational::from_int(2i128.into()), int);
+        let gx = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, zero]).unwrap();
+        let gy = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[y, zero]).unwrap();
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xy, one]).unwrap();
+        // x >= 2 will cross the FBBT-tightened upper bound x ≤ 1 at assert time.
+        let ge2 = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, two]).unwrap();
+
+        let mut arith = Arith::default(); // stage_b = true → FBBT enabled
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        for (i, a) in [gx, gy, le, ge2].iter().enumerate() {
+            arith.new_var(&mut cx, Var::new(i as u32), *a);
+        }
+        // Assert x >= 0, y >= 0, x + y <= 1 — causes FBBT to install tight bounds.
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        arith.assert(&mut cx, Lit::new(Var::new(2), true));
+        let _ = arith.check(&mut cx, Effort::Full); // seeds apriori + FBBT
+
+        // Now assert x >= 2: this MUST conflict against the FBBT sentinel bound x ≤ 1.
+        let conflict = arith.assert(&mut cx, Lit::new(Var::new(3), true));
+        let leaves = conflict.expect("x>=2 must conflict against FBBT-tightened x<=1");
+
+        // The conflict must NOT contain any sentinel lit (var index ≥ 1<<30).
+        for leaf in &leaves {
+            if let shinri_theory::types::EqLeaf::Asserted(l) = leaf {
+                assert!(
+                    (l.var().index() as u32) < SENTINEL_VAR_BASE,
+                    "conflict must NOT cite sentinel lit (var index {}, SENTINEL_VAR_BASE={}): \
+                     sentinel leak would cause OOB panic in SAT analyze. leaves={leaves:?}",
+                    l.var().index(),
+                    SENTINEL_VAR_BASE,
+                );
+            }
+        }
+        // The conflict must be non-empty (we need at least the asserted lit x>=2).
+        assert!(!leaves.is_empty(), "conflict must be non-empty: {leaves:?}");
+    }
 }
 
 #[cfg(test)]
@@ -1891,13 +2106,311 @@ mod integer_branch_tests {
         };
         arith.new_var(&mut cx, Var::new(0), ge);
         arith.new_var(&mut cx, Var::new(1), le);
-        // Assert both so the relaxation pins x = 1/2.
-        let _ = arith.assert(&mut cx, Lit::new(Var::new(0), true));
-        let _ = arith.assert(&mut cx, Lit::new(Var::new(1), true));
-        match arith.check(&mut cx, Effort::Full) {
-            TCheck::Split(atoms) => assert_eq!(atoms.len(), 2),
-            TCheck::Sat => panic!("expected Split on fractional x, got Sat"),
-            TCheck::Conflict(_) => panic!("expected Split on fractional x, got Conflict"),
+        // Assert both: 2x >= 1 AND 2x <= 1 over Int.
+        // With B2 rounding: 2x>=1 → x>=1; 2x<=1 → x<=0 — an immediate conflict
+        // at assert time (Lower=1 > Upper=0). This system MUST be detected UNSAT
+        // and MUST NOT produce Sat or Split.
+        let conflict_at_assert = arith.assert(&mut cx, Lit::new(Var::new(0), true)).is_some()
+            || arith.assert(&mut cx, Lit::new(Var::new(1), true)).is_some();
+        assert!(
+            conflict_at_assert,
+            "2x=1 over Int must be UNSAT (immediate bound conflict after rounding: \
+             2x>=1 → x>=1, 2x<=1 → x<=0)"
+        );
+        // Confirm the solver is also in a definitive state (not Split).
+        let result = arith.check(&mut cx, Effort::Full);
+        assert!(
+            !matches!(result, TCheck::Split(_)),
+            "after a bound conflict at assert, check must not return Split"
+        );
+    }
+}
+
+#[cfg(test)]
+mod rounding_tests {
+    use super::*;
+    use crate::encode::AtomEncoding;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_theory::{AtomRegistry, EqualityEngine, TheoryCtx, TheorySolver};
+
+    fn int_var(ctx: &mut Context, name: &str) -> TermId {
+        let int = ctx.int_sort();
+        let s = ctx.declare_fun(name, &[], int);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    // x < 5 over Int (gate ON) must encode pos as Upper bound 4 with k = 0.
+    #[test]
+    fn int_strict_bound_rounds_and_drops_delta() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), ctx.int_sort());
+        let lt = ctx.mk_app(Op::Builtin(BuiltinOp::Lt), &[x, five]).unwrap();
+        let mut arith = Arith::default(); // stage_b = true
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), lt);
+        match arith.enc[0].clone().unwrap() {
+            AtomEncoding::Ineq {
+                pos: (BoundKind::Upper, dr),
+                ..
+            } => {
+                assert_eq!(*dr.c(), Rational::from_int(4i128.into()));
+                assert!(
+                    dr.k().is_zero(),
+                    "δ must be dropped for an Int strict bound"
+                );
+            }
+            other => panic!("expected Upper Ineq, got {other:?}"),
         }
+    }
+
+    // 2x <= 5 over Int (gate ON): bound on x is 5/2 → rounds to 2.
+    #[test]
+    fn int_coefficient_division_rounds() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let two = ctx.mk_numeral(Rational::from_int(2i128.into()), ctx.int_sort());
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), ctx.int_sort());
+        let twox = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &[two, x]).unwrap();
+        let le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[twox, five])
+            .unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), le);
+        match arith.enc[0].clone().unwrap() {
+            AtomEncoding::Ineq {
+                pos: (BoundKind::Upper, dr),
+                ..
+            } => {
+                assert_eq!(*dr.c(), Rational::from_int(2i128.into()));
+                assert!(dr.k().is_zero());
+            }
+            other => panic!("expected Upper Ineq, got {other:?}"),
+        }
+    }
+
+    // gate OFF: Int x < 5 with stage_b=false must keep its δ (B1 byte-identical baseline).
+    #[test]
+    fn stage_b_off_preserves_delta_for_int_strict() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), ctx.int_sort());
+        let lt = ctx.mk_app(Op::Builtin(BuiltinOp::Lt), &[x, five]).unwrap();
+        let mut arith = Arith::default();
+        arith.set_stage_b(false); // gate OFF → B1 baseline
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), lt);
+        match arith.enc[0].clone().unwrap() {
+            AtomEncoding::Ineq {
+                pos: (BoundKind::Upper, dr),
+                ..
+            } => {
+                assert_eq!(
+                    *dr.c(),
+                    Rational::from_int(5i128.into()),
+                    "with stage_b OFF the rhs must not be rounded"
+                );
+                assert!(
+                    !dr.k().is_zero(),
+                    "with stage_b OFF the δ must be preserved (strict bound keeps −δ)"
+                );
+            }
+            other => panic!("expected Upper Ineq, got {other:?}"),
+        }
+    }
+
+    // Real x < 5 must KEEP its δ (rounding does not cross the Int fence).
+    #[test]
+    fn real_strict_bound_keeps_delta() {
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let xs = ctx.declare_fun("x", &[], real);
+        let x = ctx.mk_app(Op::Uninterpreted(xs), &[]).unwrap();
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), real);
+        let lt = ctx.mk_app(Op::Builtin(BuiltinOp::Lt), &[x, five]).unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), lt);
+        match arith.enc[0].clone().unwrap() {
+            AtomEncoding::Ineq {
+                pos: (BoundKind::Upper, dr),
+                ..
+            } => {
+                assert!(!dr.k().is_zero(), "Real strict bound must keep δ");
+            }
+            other => panic!("expected Upper Ineq, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod cut_wiring_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_theory::{AtomRegistry, Effort, EqualityEngine, TheoryCtx, TheorySolver};
+
+    // 2x = 1 over Int is UNSAT. With the box seeded huge, B1 would enumerate;
+    // with the gate ON (rounding makes 2x≤1∧2x≥1 ⟹ x≤0∧x≥1) it is immediate.
+    // This exercises the gate end-to-end through check().
+    #[test]
+    fn stage_b_decides_simple_unsat_fast() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let s = ctx.declare_fun("x", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap();
+        let two = ctx.mk_numeral(Rational::from_int(2i128.into()), int);
+        let one = ctx.mk_numeral(Rational::one(), int);
+        let twox = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &[two, x]).unwrap();
+        let le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[twox, one])
+            .unwrap();
+        let ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[twox, one])
+            .unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), le);
+        arith.new_var(&mut cx, Var::new(1), ge);
+        // After rounding: 2x≤1 ⟹ x≤0 (Upper), 2x≥1 ⟹ x≥1 (Lower).
+        // The conflict fires at assert time when the second bound crosses the first.
+        let c1 = arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        let c2 = arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        let conflict_at_assert = c1.is_some() || c2.is_some();
+        assert!(
+            conflict_at_assert,
+            "2x=1 over Int must be UNSAT via immediate bound conflict at assert time \
+             (rounding: 2x≤1 ⟹ x≤0, 2x≥1 ⟹ x≥1 — Lower 1 > Upper 0)"
+        );
+        // Confirm check does not claim Sat or Split (state is already conflicting).
+        let result = arith.check(&mut cx, Effort::Full);
+        assert!(
+            !matches!(result, TCheck::Split(_)),
+            "after assert-time conflict, check must not return Split"
+        );
+    }
+}
+
+#[cfg(test)]
+mod fbbt_wiring_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_theory::{AtomRegistry, Effort, EqualityEngine, TheoryCtx, TheorySolver};
+
+    fn int_var(ctx: &mut Context, name: &str) -> TermId {
+        let int = ctx.int_sort();
+        let s = ctx.declare_fun(name, &[], int);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    // x, y >= 0 and x + y <= 1 ⟹ FBBT must tighten x's upper bound far below M.
+    #[test]
+    fn fbbt_shrinks_box_at_level_zero() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let y = int_var(&mut ctx, "y");
+        let xy = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let zero = ctx.mk_numeral(Rational::zero(), ctx.int_sort());
+        let one = ctx.mk_numeral(Rational::one(), ctx.int_sort());
+        let gx = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, zero]).unwrap();
+        let gy = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[y, zero]).unwrap();
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xy, one]).unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        for (i, a) in [gx, gy, le].iter().enumerate() {
+            arith.new_var(&mut cx, Var::new(i as u32), *a);
+        }
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        arith.assert(&mut cx, Lit::new(Var::new(2), true));
+        let _ = arith.check(&mut cx, Effort::Full);
+        // x is problem var 0. Its FBBT upper bound must be ≤ 1 (≪ M).
+        let xv = arith.vars.problem_var(x);
+        let ub = arith
+            .bounds
+            .upper(xv)
+            .expect("x has an upper bound")
+            .0
+            .c()
+            .clone();
+        assert!(ub <= Rational::one(), "FBBT should bound x ≤ 1, got {ub:?}");
+    }
+
+    // With the gate OFF, FBBT must NOT run: x keeps the (huge) a-priori bound.
+    #[test]
+    fn fbbt_disabled_when_stage_b_off() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let y = int_var(&mut ctx, "y");
+        let xy = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let zero = ctx.mk_numeral(Rational::zero(), ctx.int_sort());
+        let one = ctx.mk_numeral(Rational::one(), ctx.int_sort());
+        let gx = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, zero]).unwrap();
+        let gy = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[y, zero]).unwrap();
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xy, one]).unwrap();
+        let mut arith = Arith::default();
+        arith.set_stage_b(false);
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        for (i, a) in [gx, gy, le].iter().enumerate() {
+            arith.new_var(&mut cx, Var::new(i as u32), *a);
+        }
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        arith.assert(&mut cx, Lit::new(Var::new(2), true));
+        let _ = arith.check(&mut cx, Effort::Full);
+        let xv = arith.vars.problem_var(x);
+        let ub = arith
+            .bounds
+            .upper(xv)
+            .expect("x has an upper bound")
+            .0
+            .c()
+            .clone();
+        assert!(
+            ub > Rational::one(),
+            "gate OFF: x must keep the large a-priori bound, got {ub:?}"
+        );
     }
 }

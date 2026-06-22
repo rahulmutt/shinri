@@ -1,6 +1,7 @@
 //! Branch-and-bound support: integer floor/ceil of a δ-value, used to build the
 //! split clause `(x ≤ ⌊v⌋) ∨ (x ≥ ⌈v⌉)` for a fractional Int problem var.
 
+use crate::bounds::BoundKind;
 use shinri_num::{DeltaRational, Integer, Rational};
 
 /// Integer floor/ceil of `c + k·δ`. δ is a positive infinitesimal, so when `c`
@@ -27,9 +28,32 @@ pub fn floor_ceil(value: &DeltaRational) -> (Integer, Integer) {
     }
 }
 
+/// Round a bound on an integer-valued variable to an integer `DeltaRational`
+/// (k = 0), absorbing strictness:
+///   Upper, non-strict  `x ≤ rhs`  ⟹ `x ≤ ⌊rhs⌋`
+///   Upper, strict      `x < rhs`  ⟹ `x ≤ ⌈rhs⌉ − 1`
+///   Lower, non-strict  `x ≥ rhs`  ⟹ `x ≥ ⌈rhs⌉`
+///   Lower, strict      `x > rhs`  ⟹ `x ≥ ⌊rhs⌋ + 1`
+pub(crate) fn round_int_bound(rhs: &Rational, kind: BoundKind, strict: bool) -> DeltaRational {
+    let floor = floor_rational(rhs);
+    let is_int = &Rational::from_int(floor.clone()) == rhs;
+    let ceil = if is_int {
+        floor.clone()
+    } else {
+        floor.clone() + Integer::one()
+    };
+    let bound = match (kind, strict) {
+        (BoundKind::Upper, false) => floor,
+        (BoundKind::Upper, true) => ceil - Integer::one(),
+        (BoundKind::Lower, false) => ceil,
+        (BoundKind::Lower, true) => floor + Integer::one(),
+    };
+    DeltaRational::from_rational(Rational::from_int(bound))
+}
+
 /// `⌊n/d⌋` for a Rational `n/d` (d > 0 in canonical form). Uses truncating
 /// `div_rem` and corrects toward −∞ for negative non-exact values.
-fn floor_rational(r: &Rational) -> Integer {
+pub(crate) fn floor_rational(r: &Rational) -> Integer {
     let n = r.numer();
     let d = r.denom();
     let (q, rem) = n.div_rem(&d);
@@ -43,11 +67,40 @@ fn floor_rational(r: &Rational) -> Integer {
 
 #[cfg(test)]
 mod tests {
-    use super::floor_ceil;
+    use super::{floor_ceil, round_int_bound};
+    use crate::bounds::BoundKind;
     use shinri_num::{DeltaRational, Integer, Rational};
 
     fn r(n: i128, d: i128) -> Rational {
         Rational::new(Integer::from(n), Integer::from(d))
+    }
+
+    fn dri(n: i128) -> DeltaRational {
+        DeltaRational::from_rational(Rational::from_int(Integer::from(n)))
+    }
+
+    #[test]
+    fn round_int_bound_handles_all_cases() {
+        // Upper, non-strict: x <= 5/2  ⟹  x <= 2
+        assert_eq!(round_int_bound(&r(5, 2), BoundKind::Upper, false), dri(2));
+        // Upper, strict: x < 5 (int rhs)  ⟹  x <= 4
+        assert_eq!(
+            round_int_bound(&Rational::from_int(5i128.into()), BoundKind::Upper, true),
+            dri(4)
+        );
+        // Upper, strict: x < 5/2  ⟹  x <= 2  (ceil(5/2)-1 = 3-1 = 2)
+        assert_eq!(round_int_bound(&r(5, 2), BoundKind::Upper, true), dri(2));
+        // Lower, non-strict: x >= 5/2  ⟹  x >= 3
+        assert_eq!(round_int_bound(&r(5, 2), BoundKind::Lower, false), dri(3));
+        // Lower, strict: x > 5 (int rhs)  ⟹  x >= 6
+        assert_eq!(
+            round_int_bound(&Rational::from_int(5i128.into()), BoundKind::Lower, true),
+            dri(6)
+        );
+        // Negative: x <= -5/2  ⟹  x <= -3
+        assert_eq!(round_int_bound(&r(-5, 2), BoundKind::Upper, false), dri(-3));
+        // Negative Lower strict: x > -5/2 over Int  ⟹  x >= -2  (floor(-5/2)+1 = -3+1 = -2)
+        assert_eq!(round_int_bound(&r(-5, 2), BoundKind::Lower, true), dri(-2));
     }
 
     #[test]

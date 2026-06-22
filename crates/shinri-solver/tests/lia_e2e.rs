@@ -80,6 +80,73 @@ fn unbounded_infeasible_terminates() {
     assert_eq!(s.check_sat(), SolveOutcome::Unsat);
 }
 
+/// Regression test for Bug 2 (GMI orientation via full DeltaRational match).
+///
+/// iter=22 repro from the Task-8 differential oracle: constraints over x0,x1,x2 ∈ ℤ:
+///   -x2 ≠ -3  (x2 ≠ 3)
+///   -2x0 -2x1 -2x2 ≠ 3
+///   -x0 ≠ -2  (x0 ≠ 2)
+///   x0 - 2x2 < 0
+///
+/// Before the fix, `derive_gmi` picked the wrong bound orientation for a nonbasic
+/// whose value matched the bound only on .c() but NOT on the δ component; this
+/// produced a non-separating cut → `debug_validate` SIGABRT (in debug mode).
+/// After the fix the solver must return Sat or Unsat (no panic).
+#[test]
+fn gmi_orientation_bug_repro_iter22() {
+    let mut s = Solver::new();
+    s.set_stage_b(true);
+    let int = s.int_sort();
+    let x0 = s.declare_const("x0", int);
+    let x1 = s.declare_const("x1", int);
+    let x2 = s.declare_const("x2", int);
+
+    let n = |s: &mut Solver, v: i64| s.numeral(Rational::from_int((v as i128).into()), int);
+    let mul = |s: &mut Solver, c: i64, v: _| {
+        let cn = n(s, c);
+        s.app(Op::Builtin(BuiltinOp::Mul), &[cn, v])
+    };
+    let ne = |s: &mut Solver, lhs: _, rhs: _| {
+        let eq = s.eq(lhs, rhs);
+        s.app(Op::Builtin(BuiltinOp::Not), &[eq])
+    };
+
+    // -x2 ≠ -3
+    let neg_x2 = mul(&mut s, -1, x2);
+    let neg3 = n(&mut s, -3);
+    let c0 = ne(&mut s, neg_x2, neg3);
+    // -2x0 - 2x1 - 2x2 ≠ 3
+    let t0 = mul(&mut s, -2, x0);
+    let t1 = mul(&mut s, -2, x1);
+    let t2 = mul(&mut s, -2, x2);
+    let sum01 = s.app(Op::Builtin(BuiltinOp::Add), &[t0, t1]);
+    let sum012 = s.app(Op::Builtin(BuiltinOp::Add), &[sum01, t2]);
+    let three = n(&mut s, 3);
+    let c1 = ne(&mut s, sum012, three);
+    // -x0 ≠ -2
+    let neg_x0 = mul(&mut s, -1, x0);
+    let neg2 = n(&mut s, -2);
+    let c2 = ne(&mut s, neg_x0, neg2);
+    // x0 - 2x2 < 0
+    let pos_x0 = mul(&mut s, 1, x0);
+    let neg2x2 = mul(&mut s, -2, x2);
+    let lhs4 = s.app(Op::Builtin(BuiltinOp::Add), &[pos_x0, neg2x2]);
+    let zero = n(&mut s, 0);
+    let c3 = s.app(Op::Builtin(BuiltinOp::Lt), &[lhs4, zero]);
+
+    s.assert(c0);
+    s.assert(c1);
+    s.assert(c2);
+    s.assert(c3);
+    // Must not panic (SIGABRT from debug_validate or OOB from sentinel leak).
+    // The exact outcome (Sat/Unsat) is whatever is correct; we just guard no crash.
+    let outcome = s.check_sat();
+    assert!(
+        matches!(outcome, SolveOutcome::Sat | SolveOutcome::Unsat),
+        "expected Sat or Unsat, got {outcome:?}"
+    );
+}
+
 #[test]
 fn mixed_int_real_query_is_unknown() {
     // An Int atom and a Real atom in one query → fenced to Unknown (QF_LIRA).
