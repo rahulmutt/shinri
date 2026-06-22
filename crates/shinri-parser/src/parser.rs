@@ -129,10 +129,39 @@ impl<'a> Parser<'a> {
         }
     }
 
-    /// Parse a sort: `Bool`/`Int`/`Real`/user-declared. Indexed/parameterized
-    /// sorts (`(_ BitVec n)`, `(Array …)`) are out of scope → diagnostic.
+    /// Consume a `(` if present; returns `true` if consumed, `false` otherwise.
+    fn eat_lparen(&mut self) -> bool {
+        if matches!(self.peek(), Some((Ok(Token::LParen), _))) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Parse a sort: `Bool`/`Int`/`Real`/user-declared, or the compound
+    /// `(Array <index> <element>)` sort.
     #[allow(dead_code)]
     fn parse_sort(&mut self, ctx: &mut Context) -> Result<SortId, Diagnostic> {
+        // Compound sort: (Array <index> <element>)
+        if self.eat_lparen() {
+            let (head, sp) = self.expect_symbol()?;
+            let s = match head.as_str() {
+                "Array" => {
+                    let index = self.parse_sort(ctx)?;
+                    let elem = self.parse_sort(ctx)?;
+                    ctx.array_sort(index, elem)
+                }
+                other => {
+                    return Err(Diagnostic::new(
+                        sp,
+                        format!("unsupported parameterized sort {other}"),
+                    ));
+                }
+            };
+            self.expect_token(&Token::RParen)?;
+            return Ok(s);
+        }
         let (name, sp) = self.expect_symbol()?;
         match name.as_str() {
             "Bool" => Ok(ctx.bool_sort()),
@@ -169,6 +198,8 @@ impl<'a> Parser<'a> {
             "<" => Lt,
             ">=" => Ge,
             ">" => Gt,
+            "select" => Select,
+            "store" => Store,
             _ => return None,
         })
     }
@@ -485,8 +516,18 @@ impl<'a> Parser<'a> {
                 Self::mk(ctx, Op::Builtin(BuiltinOp::Ite), &args, &sp)
             }
             BuiltinOp::Neg => unreachable!("Neg is produced only via unary '-'"),
-            BuiltinOp::Select => Err(Diagnostic::new(sp, "select is not supported in input")),
-            BuiltinOp::Store => Err(Diagnostic::new(sp, "store is not supported in input")),
+            BuiltinOp::Select => {
+                if args.len() != 2 {
+                    return Err(Diagnostic::new(sp, "select expects 2 arguments"));
+                }
+                Self::mk(ctx, Op::Builtin(BuiltinOp::Select), &args, &sp)
+            }
+            BuiltinOp::Store => {
+                if args.len() != 3 {
+                    return Err(Diagnostic::new(sp, "store expects 3 arguments"));
+                }
+                Self::mk(ctx, Op::Builtin(BuiltinOp::Store), &args, &sp)
+            }
         }
     }
 
@@ -1032,6 +1073,24 @@ mod tests {
         let cs = commands("(bad-command foo bar)\n(check-sat)");
         assert!(cs[0].is_err());
         assert!(matches!(cs[1], Ok(Command::CheckSat)));
+    }
+
+    #[test]
+    fn parses_array_sort_and_select_store() {
+        let src = "\
+(declare-sort I 0)
+(declare-sort E 0)
+(declare-fun a () (Array I E))
+(declare-fun i () I)
+(declare-fun e () E)
+(assert (= (select (store a i e) i) e))
+(check-sat)";
+        let mut ctx = shinri_core::Context::new();
+        let mut p = Parser::new(src);
+        // Drive all commands; assert none produce a parse diagnostic.
+        while let Some(cmd) = p.next_command(&mut ctx) {
+            cmd.expect("array sort / select / store must parse");
+        }
     }
 
     /// Regression: define-fun followed by a bad command must NOT drop the
