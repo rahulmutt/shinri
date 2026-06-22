@@ -194,14 +194,29 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
     }
 
     fn bind_fresh(&mut self, v: Var, atom: TermId) {
-        self.atoms.register(v, atom, Owner::Arith);
-        // Borrow-split: build the ctx from the non-arith fields, then call arith.
+        // A fresh split atom: QF_LIA branch/cut atoms (Le/Ge) → Arith; QF_UFLIA
+        // MBTC's interface `(= u v)` → Euf, `(< u v)`/`(> u v)` → Arith. Classify
+        // and route to the owning theory, mirroring `register_atom`. A fresh atom
+        // is always supported by construction; fall back to Arith defensively.
+        let owner = classify(&self.terms, atom).unwrap_or(Owner::Arith);
+        self.atoms.register(v, atom, owner);
         let mut cx = TheoryCtx {
             terms: &mut self.terms,
             eq: &mut self.eq,
             atoms: &self.atoms,
         };
-        self.arith.new_var(&mut cx, v, atom);
+        match owner {
+            Owner::Euf => self.euf.new_var(&mut cx, v, atom),
+            Owner::Arith => {
+                self.arith.new_var(&mut cx, v, atom);
+                self.euf.register_arith_uf_terms(&mut cx, atom);
+            }
+            Owner::Shared => {
+                self.euf.new_var(&mut cx, v, atom);
+                self.arith.new_var(&mut cx, v, atom);
+                self.euf.register_arith_uf_terms(&mut cx, atom);
+            }
+        }
     }
 
     fn push(&mut self) {
@@ -948,12 +963,14 @@ mod tests {
         fn pop(&mut self, _level: usize) {}
     }
 
-    /// Arith-slot stub: returns Split(one atom) on first Full check, then Sat.
+    /// Arith-slot stub: returns Split(split_atom) on first Full check, then Sat.
     /// Records (v, atom) pairs from `new_var` for bind_fresh verification.
     #[derive(Default)]
     struct ArithSplitter {
         fired: bool,
         pub bound: Vec<(Var, TermId)>,
+        /// The atom to return from the first Split; set by the test after construction.
+        pub split_atom: Option<TermId>,
     }
     impl TheorySolver for ArithSplitter {
         const THEORY_ID: u16 = 7;
@@ -973,7 +990,10 @@ mod tests {
         fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
             if !self.fired {
                 self.fired = true;
-                TCheck::Split(vec![TermId::new(42).unwrap()])
+                let atom = self
+                    .split_atom
+                    .expect("split_atom must be set before check");
+                TCheck::Split(vec![atom])
             } else {
                 TCheck::Sat
             }
@@ -988,19 +1008,51 @@ mod tests {
     fn combiner_lifts_split_and_binds_fresh() {
         use crate::types::Owner;
 
-        let mut comb: Combiner<NullTheory, ArithSplitter> = Combiner::default();
+        // Build a real Le atom so classify() can classify it as Owner::Arith.
+        let mut ctx = Context::new();
+        let x = real_var(&mut ctx, "x");
+        let y = real_var(&mut ctx, "y");
+        let le = ctx
+            .mk_app(Op::Builtin(shinri_core::BuiltinOp::Le), &[x, y])
+            .unwrap();
+
+        let mut comb: Combiner<NullTheory, ArithSplitter> = Combiner::with_context(ctx);
+        comb.arith.split_atom = Some(le);
+
         // First Full check lifts the arith Split into SplitAtoms.
         match Theory::check(&mut comb, Effort::Full) {
             TheoryResult::SplitAtoms(atoms) => {
-                assert_eq!(atoms, vec![TermId::new(42).unwrap()])
+                assert_eq!(atoms, vec![le])
             }
             other => panic!("expected SplitAtoms, got {other:?}"),
         }
         // Solver would now allocate a var and call back bind_fresh; simulate it.
         let v = Var::new(0);
-        Theory::bind_fresh(&mut comb, v, TermId::new(42).unwrap());
+        Theory::bind_fresh(&mut comb, v, le);
         // The fresh atom is registered to the Arith owner and encoded by the arith slot.
         assert_eq!(comb.atoms_ref().owner(v), Owner::Arith);
-        assert_eq!(comb.arith_ref().bound, vec![(v, TermId::new(42).unwrap())]);
+        assert_eq!(comb.arith_ref().bound, vec![(v, le)]);
+    }
+
+    #[test]
+    fn bind_fresh_routes_eq_to_euf_and_lt_to_arith() {
+        use crate::types::Owner;
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let us = ctx.declare_fun("u", &[], int);
+        let vs = ctx.declare_fun("v", &[], int);
+        let u = ctx.mk_app(Op::Uninterpreted(us), &[]).unwrap();
+        let v = ctx.mk_app(Op::Uninterpreted(vs), &[]).unwrap();
+        let eq = ctx.mk_eq(u, v).unwrap();
+        let lt = ctx
+            .mk_app(Op::Builtin(shinri_core::BuiltinOp::Lt), &[u, v])
+            .unwrap();
+        let mut c: Combiner<Spy, Spy> = Combiner::with_context(ctx);
+        let ve = Var::new(0);
+        let vl = Var::new(1);
+        Theory::bind_fresh(&mut c, ve, eq);
+        Theory::bind_fresh(&mut c, vl, lt);
+        assert_eq!(c.atoms_ref().owner(ve), Owner::Euf);
+        assert_eq!(c.atoms_ref().owner(vl), Owner::Arith);
     }
 }

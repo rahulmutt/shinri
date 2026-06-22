@@ -335,6 +335,11 @@ impl Context {
         &self.nodes[id.index()]
     }
 
+    /// Returns `true` if `id` was interned into this context (bounds check).
+    pub fn contains_term(&self, id: TermId) -> bool {
+        id.index() < self.nodes.len()
+    }
+
     /// The exact `Rational` of a numeral term, or `None` if `t` is not a numeral.
     pub fn numeral_value(&self, t: TermId) -> Option<&Rational> {
         match self.term_node(t) {

@@ -13,6 +13,12 @@ pub struct Unsupported(pub TermId);
 /// Classify a Boolean atom by its top operator and argument sorts. Returns the
 /// owning theory, or `Unsupported` for constructs outside QF_UFLRA/QF_LIA.
 pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
+    // Reject atoms not interned in this context (e.g. synthetic split TermIds
+    // from a sub-theory that are not real terms). The defensive caller uses
+    // `unwrap_or(Owner::Arith)` in such cases.
+    if !terms.contains_term(atom) {
+        return Err(Unsupported(atom));
+    }
     // Reject any nonlinear product anywhere in the atom first (spec §9).
     if contains_nonlinear_mul(terms, atom) {
         return Err(Unsupported(atom));
