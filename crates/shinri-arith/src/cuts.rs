@@ -31,7 +31,8 @@ fn frac(r: &Rational) -> Rational {
 /// rewritten row `basic = β − Σ ā_j·y_j`, the GMI cut is `Σ ψ(ā_j)·y_j ≥ f0`:
 ///
 /// - Integer nonbasic: ψ(ā) = frac(ā) if frac(ā) ≤ f0, else f0*(1−frac(ā))/(1−f0).
-/// - Continuous nonbasic: ψ(ā) = ā/f0 if ā ≥ 0, else −ā/(1−f0).
+/// - Continuous nonbasic: ψ(ā) = ā if ā ≥ 0, else −ā·f0/(1−f0).
+///   (≥f0-normalised form — matches integer branch and ge_rhs = f0 baseline.)
 ///
 /// Substituting the y's back and flipping to `≤` yields a cut over problem vars.
 pub fn derive_gmi(
@@ -65,6 +66,8 @@ pub fn derive_gmi(
         // Determine orientation and active bound.
         // at lower ⟹ y_j = x_j − lo (sign convention: x_j = y_j + lo)
         // at upper ⟹ y_j = hi − x_j (x_j = hi − y_j)
+        // δ-drop deliberate: cut is over rational/integer feasibility; δ is only a
+        // strict-bound lexicographic tie-break and does not affect which bound is active.
         let at_lower = bounds
             .lower(j)
             .map(|(d, _)| d.c() == value[j.index()].c())
@@ -102,11 +105,15 @@ pub fn derive_gmi(
                 f0.clone() * (one.clone() - f.clone()) / (one.clone() - f0.clone())
             }
         } else {
-            // Continuous nonbasic: ψ = ā/f0 if ā ≥ 0, else −ā/(1−f0)
+            // Continuous nonbasic (≥f0-normalised form, matching the integer branch
+            // and ge_rhs = f0 baseline):
+            //   ψ = ā          if ā ≥ 0  (was ā/f0 in ≥1-normalised form)
+            //   ψ = −ā·f0/(1−f0)  if ā < 0
+            // Both are ≥ 0: ā ≥ 0 → ψ = ā ≥ 0; ā < 0 → −ā > 0 and f0/(1−f0) > 0.
             if !a_bar.is_negative() {
-                a_bar.clone() / f0.clone()
+                a_bar.clone()
             } else {
-                (-a_bar.clone()) / (one.clone() - f0.clone())
+                (-a_bar.clone()) * f0.clone() / (one.clone() - f0.clone())
             }
         };
 
@@ -214,6 +221,21 @@ mod tests {
         Lit::new(Var::new(0), true)
     }
 
+    /// Evaluates `Σ c·point[v]` and asserts it is ≤ `cut.rhs`. Exact rational
+    /// arithmetic — guards soundness: all integer-feasible points must satisfy
+    /// the cut.
+    fn assert_cut_satisfied(cut: &super::GmiCut, point: &[DeltaRational], label: &str) {
+        let mut acc = Rational::zero();
+        for (v, c) in &cut.lhs {
+            acc = acc + c.clone() * point[v.index()].c().clone();
+        }
+        assert!(
+            acc <= cut.rhs,
+            "integer-feasible point {label} VIOLATES cut: lhs={acc:?} > rhs={:?}: {cut:?}",
+            cut.rhs,
+        );
+    }
+
     // Classic 2-var Gomory example: feasible LP vertex is fractional in an
     // integer var; the derived cut must separate that vertex and admit all
     // integer points. We assert separation (the robust, formula-agnostic check)
@@ -265,6 +287,39 @@ mod tests {
         assert!(
             separates(&cut, &value),
             "cut must exclude x=3/2 vertex: {cut:?}"
+        );
+
+        // VALIDITY: every integer-feasible point must satisfy the cut.
+        // Feasible integer points: x+y ≤ 1 (since s = x+y ≤ 3/2 and x,y ≥ 0 integers
+        // implies x+y ≤ 1). Build point vectors indexed by ArithVar.
+        let make_point = |xv: i128, yv: i128| -> Vec<DeltaRational> {
+            let mut pt = vec![DeltaRational::from_rational(Rational::zero()); vars.len()];
+            pt[x.index()] = dr(xv);
+            pt[y.index()] = dr(yv);
+            pt[s.index()] = dr(xv + yv);
+            pt
+        };
+        assert_cut_satisfied(&cut, &make_point(0, 0), "(x=0,y=0)");
+        assert_cut_satisfied(&cut, &make_point(1, 0), "(x=1,y=0)");
+        assert_cut_satisfied(&cut, &make_point(0, 1), "(x=0,y=1)");
+
+        // Pin the exact emitted cut: after f0-normalisation the cut must be x+y ≤ 1.
+        // Sort lhs by var index for a deterministic comparison.
+        let mut lhs_sorted = cut.lhs.clone();
+        lhs_sorted.sort_by_key(|(v, _)| v.0);
+        let expected_lhs = {
+            let mut tmp = vec![(x, Rational::one()), (y, Rational::one())];
+            tmp.sort_by_key(|(v, _)| v.0);
+            tmp
+        };
+        assert_eq!(
+            lhs_sorted, expected_lhs,
+            "cut lhs should be x+y after f0-normalisation: {cut:?}"
+        );
+        assert_eq!(
+            cut.rhs,
+            Rational::one(),
+            "cut rhs should be 1 after f0-normalisation: {cut:?}"
         );
     }
 
