@@ -1,6 +1,6 @@
-//! Differential oracle: shinri-solver vs z3 on random QF_UF and QF_LRA.
+//! Differential oracle: shinri-solver vs z3/cvc5 on random QF_UF, QF_LRA, and QF_LIA.
 //! Run with: `cargo test -p shinri-solver --features oracle -- --nocapture`
-//! Requires a `z3` binary on PATH.
+//! Requires `z3` and `cvc5` binaries on PATH (for QF_LIA tests).
 #![cfg(feature = "oracle")]
 
 use shinri_core::{BuiltinOp, Op};
@@ -1153,6 +1153,7 @@ fn differential_qf_lia_sat_direction() {
 
     let mut sat_validated = 0usize;
     let mut oracle_unsat_skipped = 0usize;
+    let mut oracle_unknown_skipped = 0usize;
     let mut shinri_timeout_skipped = 0usize;
 
     for iter in 0..N_ITERS {
@@ -1232,7 +1233,8 @@ fn differential_qf_lia_sat_direction() {
                 oracle_unsat_skipped += 1;
             }
             easy_smt::Response::Unknown => {
-                // Oracles themselves uncertain — skip without counting.
+                // Oracles themselves uncertain — skip and count.
+                oracle_unknown_skipped += 1;
             }
             easy_smt::Response::Sat => {
                 // Run shinri under a timeout, built INSIDE the thread so Solver
@@ -1273,6 +1275,7 @@ fn differential_qf_lia_sat_direction() {
     eprintln!(
         "sat_direction oracle: validated={sat_validated} \
          oracle_unsat_skipped={oracle_unsat_skipped} \
+         oracle_unknown_skipped={oracle_unknown_skipped} \
          shinri_timeout_skipped={shinri_timeout_skipped}"
     );
 
