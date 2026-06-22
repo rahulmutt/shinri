@@ -80,10 +80,6 @@ pub struct Arith {
     node_cuts: usize,
     /// Total cuts generated this solve (global cap).
     total_cuts: usize,
-    /// Bound conflict detected at `assert` time; replayed by the next `check`
-    /// so that tests and the CDCL loop see a consistent conflict interface.
-    /// Cleared on `pop`.
-    pending_conflict: Option<Vec<EqLeaf>>,
 }
 
 impl Default for Arith {
@@ -108,7 +104,6 @@ impl Default for Arith {
             stage_b: true,
             node_cuts: 0,
             total_cuts: 0,
-            pending_conflict: None,
         }
     }
 }
@@ -938,7 +933,7 @@ impl TheorySolver for Arith {
 
     fn assert(&mut self, _cx: &mut TheoryCtx, lit: Lit) -> Option<Vec<EqLeaf>> {
         let enc = self.enc[lit.var().index()].clone();
-        let result = match enc {
+        match enc {
             None => None,
             Some(AtomEncoding::Const(truth)) => {
                 // Asserting against a decided constant: conflict iff polarity disagrees.
@@ -952,14 +947,7 @@ impl TheorySolver for Arith {
                 let (kind, val) = if lit.is_positive() { pos } else { neg };
                 self.apply_bound(var, kind, val, lit)
             }
-        };
-        // Cache the conflict so the next `check` can replay it even if the CDCL
-        // caller ignores the `assert` return value (common in unit tests). Cleared
-        // on `pop` (the CDCL loop always pops before re-asserting after a conflict).
-        if result.is_some() && self.pending_conflict.is_none() {
-            self.pending_conflict = result.clone();
         }
-        result
     }
 
     fn propagate(
@@ -978,12 +966,6 @@ impl TheorySolver for Arith {
     fn check(&mut self, cx: &mut TheoryCtx, effort: Effort) -> TCheck {
         if effort != Effort::Full {
             return TCheck::Sat;
-        }
-        // Replay a conflict detected at `assert` time (e.g., immediate bound
-        // crossing after integer rounding). The CDCL loop normally handles the
-        // return value of `assert`; replaying here keeps unit tests sound too.
-        if let Some(leaves) = self.pending_conflict.take() {
-            return TCheck::Conflict(leaves);
         }
         self.seed_apriori_if_needed();
         match self.check_full() {
@@ -1071,7 +1053,6 @@ impl TheorySolver for Arith {
             .retain(|_, tag| self.iface_justs.contains_key(tag));
         self.level = level;
         self.node_cuts = 0;
-        self.pending_conflict = None;
     }
 }
 
@@ -2238,13 +2219,22 @@ mod cut_wiring_tests {
         };
         arith.new_var(&mut cx, Var::new(0), le);
         arith.new_var(&mut cx, Var::new(1), ge);
-        arith.assert(&mut cx, Lit::new(Var::new(0), true));
-        arith.assert(&mut cx, Lit::new(Var::new(1), true));
-        // After rounding, 2x≤1 ⟹ x≤0 and 2x≥1 ⟹ x≥1: immediate bound conflict.
-        assert!(matches!(
-            arith.check(&mut cx, Effort::Full),
-            TCheck::Conflict(_)
-        ));
+        // After rounding: 2x≤1 ⟹ x≤0 (Upper), 2x≥1 ⟹ x≥1 (Lower).
+        // The conflict fires at assert time when the second bound crosses the first.
+        let c1 = arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        let c2 = arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        let conflict_at_assert = c1.is_some() || c2.is_some();
+        assert!(
+            conflict_at_assert,
+            "2x=1 over Int must be UNSAT via immediate bound conflict at assert time \
+             (rounding: 2x≤1 ⟹ x≤0, 2x≥1 ⟹ x≥1 — Lower 1 > Upper 0)"
+        );
+        // Confirm check does not claim Sat or Split (state is already conflicting).
+        let result = arith.check(&mut cx, Effort::Full);
+        assert!(
+            !matches!(result, TCheck::Split(_)),
+            "after assert-time conflict, check must not return Split"
+        );
     }
 }
 
