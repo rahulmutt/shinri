@@ -3,7 +3,7 @@
 //! soundness stays existential (spec §9).
 
 use crate::types::Owner;
-use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode, Var};
+use shinri_core::{BuiltinOp, Context, Op, SortId, SortNode, TermId, TermNode, Var};
 
 /// An atom this solver cannot handle exactly (e.g. nonlinear). Refusing it at
 /// registration makes the whole query return `unknown` upstream.
@@ -22,6 +22,24 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
     // Reject any nonlinear product anywhere in the atom first (spec §9).
     if contains_nonlinear_mul(terms, atom) {
         return Err(Unsupported(atom));
+    }
+    // Extensionality fence: array-to-array (dis)equality is out of scope.
+    if let TermNode::App { op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct), args, .. } =
+        terms.term_node(atom)
+    {
+        if terms.children(*args).iter().any(|&c| is_array_sorted(terms, c)) {
+            return Err(Unsupported(atom));
+        }
+    }
+    // QF_ALIA fence: arrays over arith index/element sorts are out of scope.
+    if array_touches_arith(terms, atom) {
+        return Err(Unsupported(atom));
+    }
+    // QF_AX: any remaining atom mentioning select/store is owned by Arrays
+    // (EUF still interns the terms for congruence — see the Owner::Arrays
+    // routing in the Combiner).
+    if contains_array_op(terms, atom) {
+        return Ok(Owner::Arrays);
     }
     match terms.term_node(atom) {
         TermNode::App { op, args, .. } => {
@@ -98,6 +116,52 @@ fn contains_nonlinear_mul(terms: &Context, t: TermId) -> bool {
     }
 }
 
+/// True if any subterm of `t` is a select/store application.
+fn contains_array_op(terms: &Context, t: TermId) -> bool {
+    match terms.term_node(t) {
+        TermNode::App { op, args, .. } => {
+            if matches!(op, Op::Builtin(BuiltinOp::Select | BuiltinOp::Store)) {
+                return true;
+            }
+            terms.children(*args).iter().any(|&c| contains_array_op(terms, c))
+        }
+        TermNode::Const { .. } => false,
+    }
+}
+
+fn is_array_sorted(terms: &Context, t: TermId) -> bool {
+    matches!(terms.sort_node(terms.sort_of(t)), SortNode::Array(_, _))
+}
+
+/// True if any select/store subterm touches an arith (Int/Real) index or element
+/// sort — that is QF_ALIA, out of scope for this baseline → fence.
+fn array_touches_arith(terms: &Context, t: TermId) -> bool {
+    let int_s = terms.int_sort();
+    let real_s = terms.real_sort();
+    fn walk(terms: &Context, t: TermId, int_s: SortId, real_s: SortId) -> bool {
+        match terms.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                let kids = terms.children(*args);
+                if matches!(op, Op::Builtin(BuiltinOp::Select | BuiltinOp::Store)) {
+                    let s = terms.sort_of(t);
+                    if s == int_s || s == real_s {
+                        return true;
+                    }
+                    // index sort and element sort of the array operand
+                    if let SortNode::Array(idx, elem) = terms.sort_node(terms.sort_of(kids[0])) {
+                        if *idx == int_s || *idx == real_s || *elem == int_s || *elem == real_s {
+                            return true;
+                        }
+                    }
+                }
+                kids.iter().any(|&c| walk(terms, c, int_s, real_s))
+            }
+            TermNode::Const { .. } => false,
+        }
+    }
+    walk(terms, t, int_s, real_s)
+}
+
 /// `Var`-indexed routing table. Append-only across a solve (atoms are never
 /// un-registered on backtrack — spec §6.5).
 #[derive(Default)]
@@ -141,12 +205,18 @@ impl AtomRegistry {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shinri_core::{BuiltinOp, Op};
+    use shinri_core::{BuiltinOp, Op, SortId};
 
     // Build `(<= x y)` over Real and `(= x y)` etc. via a Context.
     fn real_var(ctx: &mut Context, name: &str) -> TermId {
         let real = ctx.real_sort();
         let sym = ctx.declare_fun(name, &[], real);
+        ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
+    }
+
+    /// Build an uninterpreted 0-arity function (constant) of the given sort.
+    fn uconst(ctx: &mut Context, name: &str, sort: SortId) -> TermId {
+        let sym = ctx.declare_fun(name, &[], sort);
         ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
     }
 
@@ -218,6 +288,32 @@ mod tests {
         let real = ctx.real_sort();
         let k = ctx.mk_numeral(shinri_core::Rational::from_int(3i128.into()), real);
         assert_eq!(classify(&ctx, k), Err(Unsupported(k)));
+    }
+
+    #[test]
+    fn classify_array_read_is_arrays() {
+        let mut ctx = Context::new();
+        let i_s = ctx.declare_sort("I");
+        let e_s = ctx.declare_sort("E");
+        let arr_s = ctx.array_sort(i_s, e_s);
+        let a = uconst(&mut ctx, "a", arr_s);
+        let i = uconst(&mut ctx, "i", i_s);
+        let e = uconst(&mut ctx, "e", e_s);
+        let sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, i]).unwrap();
+        let atom = ctx.mk_eq(sel, e).unwrap();
+        assert_eq!(classify(&ctx, atom), Ok(Owner::Arrays));
+    }
+
+    #[test]
+    fn classify_array_equality_is_fenced() {
+        let mut ctx = Context::new();
+        let i_s = ctx.declare_sort("I");
+        let e_s = ctx.declare_sort("E");
+        let arr_s = ctx.array_sort(i_s, e_s);
+        let a = uconst(&mut ctx, "a", arr_s);
+        let b = uconst(&mut ctx, "b", arr_s);
+        let atom = ctx.mk_eq(a, b).unwrap();
+        assert!(classify(&ctx, atom).is_err(), "extensionality must be fenced");
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub enum Owner {
     Euf,
     Arith,
     Shared,
+    Arrays,
 }
 
 /// A range into `EqualityEngine`'s congruence-pair arena (keeps `EqJust` `Copy`).

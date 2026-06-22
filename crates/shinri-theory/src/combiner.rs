@@ -118,6 +118,8 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
                 self.arith.new_var(&mut cx, v, atom);
                 self.euf.register_arith_uf_terms(&mut cx, atom);
             }
+            // TODO(Task 5): real 3-slot routing
+            Owner::Arrays => unreachable!("Owner::Arrays routing wired in Task 5"),
         }
         Ok(())
     }
@@ -148,6 +150,8 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
                 let a = self.arith.assert(&mut cx, lit);
                 e.or(a)
             }
+            // TODO(Task 5): real 3-slot routing
+            Owner::Arrays => unreachable!("Owner::Arrays routing wired in Task 5"),
         };
         if conflict.is_some() && self.pending_conflict.is_none() {
             self.pending_conflict = conflict;
@@ -216,6 +220,8 @@ impl<E: TheorySolver, A: TheorySolver> Theory for Combiner<E, A> {
                 self.arith.new_var(&mut cx, v, atom);
                 self.euf.register_arith_uf_terms(&mut cx, atom);
             }
+            // TODO(Task 5): real 3-slot routing
+            Owner::Arrays => unreachable!("Owner::Arrays routing wired in Task 5"),
         }
     }
 
