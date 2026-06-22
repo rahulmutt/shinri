@@ -1927,19 +1927,22 @@ mod integer_branch_tests {
         arith.new_var(&mut cx, Var::new(0), ge);
         arith.new_var(&mut cx, Var::new(1), le);
         // Assert both: 2x >= 1 AND 2x <= 1 over Int.
-        // With B2 rounding: 2x>=1 → x>=1; 2x<=1 → x<=0 — an immediate conflict.
-        // (No integer satisfies x>=1 ∧ x<=0, so UNSAT is the correct result.)
+        // With B2 rounding: 2x>=1 → x>=1; 2x<=1 → x<=0 — an immediate conflict
+        // at assert time (Lower=1 > Upper=0). This system MUST be detected UNSAT
+        // and MUST NOT produce Sat or Split.
         let conflict_at_assert = arith.assert(&mut cx, Lit::new(Var::new(0), true)).is_some()
             || arith.assert(&mut cx, Lit::new(Var::new(1), true)).is_some();
-        if conflict_at_assert {
-            // Immediate bound crossing — correct UNSAT.
-            return;
-        }
-        match arith.check(&mut cx, Effort::Full) {
-            TCheck::Conflict(_) => {} // correct: 2x=1 has no integer solution
-            TCheck::Sat => panic!("expected Conflict (no int solution for 2x=1), got Sat"),
-            TCheck::Split(_) => panic!("expected Conflict (no int solution for 2x=1), got Split"),
-        }
+        assert!(
+            conflict_at_assert,
+            "2x=1 over Int must be UNSAT (immediate bound conflict after rounding: \
+             2x>=1 → x>=1, 2x<=1 → x<=0)"
+        );
+        // Confirm the solver is also in a definitive state (not Split).
+        let result = arith.check(&mut cx, Effort::Full);
+        assert!(
+            !matches!(result, TCheck::Split(_)),
+            "after a bound conflict at assert, check must not return Split"
+        );
     }
 }
 
@@ -2014,6 +2017,42 @@ mod rounding_tests {
             } => {
                 assert_eq!(*dr.c(), Rational::from_int(2i128.into()));
                 assert!(dr.k().is_zero());
+            }
+            other => panic!("expected Upper Ineq, got {other:?}"),
+        }
+    }
+
+    // gate OFF: Int x < 5 with stage_b=false must keep its δ (B1 byte-identical baseline).
+    #[test]
+    fn stage_b_off_preserves_delta_for_int_strict() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), ctx.int_sort());
+        let lt = ctx.mk_app(Op::Builtin(BuiltinOp::Lt), &[x, five]).unwrap();
+        let mut arith = Arith::default();
+        arith.set_stage_b(false); // gate OFF → B1 baseline
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), lt);
+        match arith.enc[0].clone().unwrap() {
+            AtomEncoding::Ineq {
+                pos: (BoundKind::Upper, dr),
+                ..
+            } => {
+                assert_eq!(
+                    *dr.c(),
+                    Rational::from_int(5i128.into()),
+                    "with stage_b OFF the rhs must not be rounded"
+                );
+                assert!(
+                    !dr.k().is_zero(),
+                    "with stage_b OFF the δ must be preserved (strict bound keeps −δ)"
+                );
             }
             other => panic!("expected Upper Ineq, got {other:?}"),
         }

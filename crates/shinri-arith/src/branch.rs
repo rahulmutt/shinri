@@ -99,6 +99,8 @@ mod tests {
         );
         // Negative: x <= -5/2  ⟹  x <= -3
         assert_eq!(round_int_bound(&r(-5, 2), BoundKind::Upper, false), dri(-3));
+        // Negative Lower strict: x > -5/2 over Int  ⟹  x >= -2  (floor(-5/2)+1 = -3+1 = -2)
+        assert_eq!(round_int_bound(&r(-5, 2), BoundKind::Lower, true), dri(-2));
     }
 
     #[test]
