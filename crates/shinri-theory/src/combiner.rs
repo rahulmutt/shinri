@@ -253,20 +253,33 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
     /// in number), and EUF→arith skips pairs already asserted this round. So the
     /// number of new merges/assertions is bounded and the loop converges.
     fn drive_final_check(&mut self) -> FinalCheck {
-        // Compute the shared Real-term set S once and ensure arith has a var
+        // Compute the shared Real/Int-term set S once and ensure arith has a var
         // (incl. numeral pins) for every member BEFORE any arith check that
         // reads entailed equalities (R4: pins must be active during solving).
+        //
+        // Gate: skip the N-O exchange and MBTC entirely when EUF has no
+        // uninterpreted function applications (arity ≥ 1). In that case EUF
+        // congruence cannot derive any equality that arith does not already
+        // decide, so the exchange and MBTC are pure overhead (observed root
+        // cause of the QF_LIA B&B regression: Int vars from (dis)equality atoms
+        // were populating the shared set and triggering the full exchange on
+        // every Full check even for pure QF_LIA — no UF present).
         let shared: Vec<TermId> = {
             let mut cx = TheoryCtx {
                 terms: &mut self.terms,
                 eq: &mut self.eq,
                 atoms: &self.atoms,
             };
-            let s = self.euf.shared_arith_terms(&mut cx);
-            for &t in &s {
-                self.arith.ensure_shared_var(&mut cx, t);
+            if !self.euf.has_uf_application(&mut cx) {
+                // No UF: exchange/MBTC do nothing useful; skip entirely.
+                Vec::new()
+            } else {
+                let s = self.euf.shared_arith_terms(&mut cx);
+                for &t in &s {
+                    self.arith.ensure_shared_var(&mut cx, t);
+                }
+                s
             }
-            s
         };
         // Pairs already asserted EUF→arith this check (R5 termination guard).
         let mut iface_asserted: FxHashSet<(TermId, TermId)> = FxHashSet::default();
@@ -1124,6 +1137,12 @@ mod tests {
         fn pop(&mut self, _l: usize) {}
         fn shared_arith_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
             vec![self.t1.unwrap(), self.t2.unwrap()]
+        }
+        // SharedEuf simulates an EUF that shares terms — this implies UF presence,
+        // so the gate must fire. Without this override the N-O exchange is skipped
+        // and the MBTC test would never see the trichotomy split.
+        fn has_uf_application(&self, _cx: &mut TheoryCtx) -> bool {
+            true
         }
     }
 

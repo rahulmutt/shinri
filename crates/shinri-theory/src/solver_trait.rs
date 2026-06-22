@@ -104,6 +104,22 @@ pub trait TheorySolver: Default {
     /// implements; arith (and stubs) default to a no-op.
     fn register_arith_uf_terms(&mut self, _cx: &mut TheoryCtx, _atom: TermId) {}
 
+    /// Returns `true` iff this theory has interned at least one uninterpreted
+    /// function application (an `Op::Uninterpreted` term with arity ≥ 1).
+    ///
+    /// Used by the Combiner to gate the Nelson-Oppen equality exchange and MBTC:
+    /// those steps are only useful (and non-redundant) when uninterpreted
+    /// functions are present, because EUF congruence can only derive equalities
+    /// that arithmetic cannot when there is at least one f-application. For pure
+    /// QF_LIA/QF_LRA (only variables and (dis)equalities — no UF), running the
+    /// exchange is pure overhead.
+    ///
+    /// Default `false` is correct for non-EUF theories and unit-test stubs. EUF
+    /// overrides this to scan its registered terms.
+    fn has_uf_application(&self, _cx: &mut TheoryCtx) -> bool {
+        false
+    }
+
     /// The shared INT-sorted pairs equal under this theory's current model `β`
     /// (whether or not entailed). The combiner resolves any such pair not merged
     /// in the shared engine with an integer trichotomy split (MBTC). State-safe

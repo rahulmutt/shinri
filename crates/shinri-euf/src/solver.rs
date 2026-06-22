@@ -267,6 +267,31 @@ impl TheorySolver for Euf {
         self.walk_arith_uf_apps(cx, atom);
     }
 
+    /// Returns `true` iff EUF has interned at least one uninterpreted function
+    /// application (arity ≥ 1). Short-circuits over registered terms; pure
+    /// QF_LIA/QF_LRA instances (only variables and (dis)equalities) have no
+    /// such terms and return `false`, letting the Combiner skip the N-O exchange
+    /// and MBTC (which are redundant without UF). Static during B&B — the set
+    /// of registered terms does not grow after level-0 registration.
+    fn has_uf_application(&self, cx: &mut TheoryCtx) -> bool {
+        use shinri_core::{Op, TermNode};
+        // Snapshot registered term IDs to avoid a borrow on self.inner
+        // while also borrowing cx.terms.
+        let registered: Vec<shinri_core::TermId> = self
+            .inner
+            .registered_terms()
+            .iter()
+            .map(|(t, _)| *t)
+            .collect();
+        registered.iter().any(|&t| {
+            matches!(
+                cx.terms.term_node(t),
+                TermNode::App { op: Op::Uninterpreted(_), args, .. }
+                    if args.len >= 1
+            )
+        })
+    }
+
     /// EUF→arith: mint an explanation tag for a currently-equal pair `(a, b)`.
     /// PRECONDITION: `a` and `b` are equal in `cx.eq` (the combiner checks
     /// `are_equal` first). Resolvable via this theory's `explain`, which expands
