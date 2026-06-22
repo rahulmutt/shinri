@@ -10,7 +10,7 @@ use shinri_euf::Euf;
 use shinri_theory::Combiner;
 
 type Sat =
-    shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_theory::EmptyTheory>, shinri_core::NoProof, shinri_sat::Vmtf>;
+    shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays>, shinri_core::NoProof, shinri_sat::Vmtf>;
 
 pub struct Encoder<'a> {
     ctx: &'a Context,

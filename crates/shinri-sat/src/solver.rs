@@ -602,10 +602,24 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // integers and a unit cut clause is theory-valid by exact rational
                                     // derivation; their soundness net is the debug re-derivation check
                                     // (shinri-arith/src/cuts.rs) plus the two-stage differential oracle.
-                                    self.add_learnt(&lits);
-                                    let dl = self.trail.decision_level();
-                                    if dl > 0 {
-                                        self.backtrack_to(dl - 1);
+                                    if lits.len() == 1 {
+                                        // Unit split: treat as a theory-enforced fact rather than a
+                                        // branch. add_learnt silently drops unit clauses without
+                                        // installing a watch or enqueueing, so the literal would
+                                        // never be propagated and the solver would livelock (the
+                                        // theory keeps re-emitting the same unit split). Instead,
+                                        // enqueue it directly as a unit fact. If the literal is
+                                        // already false (the other branch was already decided),
+                                        // install_clause handles the conflict path.
+                                        if !self.install_clause(&lits) {
+                                            // install_clause enqueues false → livelock break.
+                                        }
+                                    } else {
+                                        self.add_learnt(&lits);
+                                        let dl = self.trail.decision_level();
+                                        if dl > 0 {
+                                            self.backtrack_to(dl - 1);
+                                        }
                                     }
                                 }
                             },

@@ -75,6 +75,9 @@ impl Solver {
     pub fn int_sort(&self) -> SortId {
         self.ctx.int_sort()
     }
+    pub fn array_sort(&mut self, index: shinri_core::SortId, elem: shinri_core::SortId) -> shinri_core::SortId {
+        self.ctx.array_sort(index, elem)
+    }
     pub fn numeral(&mut self, value: Rational, sort: SortId) -> TermId {
         self.ctx.mk_numeral(value, sort)
     }
@@ -203,7 +206,7 @@ impl Solver {
         use shinri_sat::{SolveResult, SolverConfig, Vmtf};
         use shinri_theory::Combiner;
 
-        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_theory::EmptyTheory>, NoProof, Vmtf>;
+        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays>, NoProof, Vmtf>;
 
         // Lower n-ary distinct to pairwise binary up front (needs &mut ctx).
         let lowered: Vec<TermId> = self
@@ -550,7 +553,7 @@ impl Solver {
         use shinri_sat::{SolverConfig, Vmtf};
         use shinri_theory::Combiner;
 
-        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_theory::EmptyTheory>, NoProof, Vmtf>;
+        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays>, NoProof, Vmtf>;
 
         let mut sat: Sat = shinri_sat::Solver::with_theory(
             SolverConfig::default(),
