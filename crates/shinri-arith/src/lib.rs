@@ -782,6 +782,27 @@ impl Arith {
             let _ = self.apply_bound(v, BoundKind::Lower, lo.clone(), lo_lit);
             let _ = self.apply_bound(v, BoundKind::Upper, hi.clone(), hi_lit);
         }
+        if self.stage_b {
+            self.run_fbbt();
+        }
+    }
+
+    /// One-shot level-0 FBBT pass: derive tighter integer bounds from the
+    /// tableau rows and install them as level-0 axiomatic bounds under stripped
+    /// sentinels (like the a-priori box). Stage-B only.
+    fn run_fbbt(&mut self) {
+        const MAX_ROUNDS: usize = 16;
+        let tightenings = crate::propagate::tighten_to_fixpoint(
+            &self.tableau,
+            &self.bounds,
+            &self.vars,
+            MAX_ROUNDS,
+        );
+        for (v, kind, val) in tightenings {
+            let lit = self.fresh_sentinel();
+            self.apriori_lits.insert(lit.code());
+            let _ = self.apply_bound(v, kind, val, lit);
+        }
     }
 
     /// Drop a-priori box sentinel lits from a conflict core (see Soundness note).
@@ -2086,5 +2107,99 @@ mod rounding_tests {
             }
             other => panic!("expected Upper Ineq, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod fbbt_wiring_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Context, Op, Var};
+    use shinri_theory::{AtomRegistry, Effort, EqualityEngine, TheoryCtx, TheorySolver};
+
+    fn int_var(ctx: &mut Context, name: &str) -> TermId {
+        let int = ctx.int_sort();
+        let s = ctx.declare_fun(name, &[], int);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    // x, y >= 0 and x + y <= 1 ⟹ FBBT must tighten x's upper bound far below M.
+    #[test]
+    fn fbbt_shrinks_box_at_level_zero() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let y = int_var(&mut ctx, "y");
+        let xy = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let zero = ctx.mk_numeral(Rational::zero(), ctx.int_sort());
+        let one = ctx.mk_numeral(Rational::one(), ctx.int_sort());
+        let gx = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, zero]).unwrap();
+        let gy = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[y, zero]).unwrap();
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xy, one]).unwrap();
+        let mut arith = Arith::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        for (i, a) in [gx, gy, le].iter().enumerate() {
+            arith.new_var(&mut cx, Var::new(i as u32), *a);
+        }
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        arith.assert(&mut cx, Lit::new(Var::new(2), true));
+        let _ = arith.check(&mut cx, Effort::Full);
+        // x is problem var 0. Its FBBT upper bound must be ≤ 1 (≪ M).
+        let xv = arith.vars.problem_var(x);
+        let ub = arith
+            .bounds
+            .upper(xv)
+            .expect("x has an upper bound")
+            .0
+            .c()
+            .clone();
+        assert!(ub <= Rational::one(), "FBBT should bound x ≤ 1, got {ub:?}");
+    }
+
+    // With the gate OFF, FBBT must NOT run: x keeps the (huge) a-priori bound.
+    #[test]
+    fn fbbt_disabled_when_stage_b_off() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let y = int_var(&mut ctx, "y");
+        let xy = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let zero = ctx.mk_numeral(Rational::zero(), ctx.int_sort());
+        let one = ctx.mk_numeral(Rational::one(), ctx.int_sort());
+        let gx = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, zero]).unwrap();
+        let gy = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[y, zero]).unwrap();
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xy, one]).unwrap();
+        let mut arith = Arith::default();
+        arith.set_stage_b(false);
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        for (i, a) in [gx, gy, le].iter().enumerate() {
+            arith.new_var(&mut cx, Var::new(i as u32), *a);
+        }
+        arith.assert(&mut cx, Lit::new(Var::new(0), true));
+        arith.assert(&mut cx, Lit::new(Var::new(1), true));
+        arith.assert(&mut cx, Lit::new(Var::new(2), true));
+        let _ = arith.check(&mut cx, Effort::Full);
+        let xv = arith.vars.problem_var(x);
+        let ub = arith
+            .bounds
+            .upper(xv)
+            .expect("x has an upper bound")
+            .0
+            .c()
+            .clone();
+        assert!(
+            ub > Rational::one(),
+            "gate OFF: x must keep the large a-priori bound, got {ub:?}"
+        );
     }
 }
