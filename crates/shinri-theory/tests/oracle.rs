@@ -6,7 +6,8 @@
 #![cfg(feature = "oracle")]
 
 #[test]
-#[ignore = "activates when Combiner<Euf, Arith> exists (shinri-euf/arith)"]
+#[ignore = "live in shinri-solver/tests/oracle.rs (differential_qf_uflia_small, --features oracle); \
+            Combiner<Euf, Arith> activated for QF_UFLIA via MBTC"]
 fn qf_uflra_matches_z3() {
     // Construction sketch (filled in when concrete theories land):
     //   let mut ctx = easy_smt::ContextBuilder::new().solver("z3", ["-in"]).build().unwrap();

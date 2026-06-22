@@ -1582,6 +1582,87 @@ fn differential_qf_lia_two_stage() {
     assert!(agree > 0, "no agreements — generator or oracles broken");
 }
 
+/// Differential QF_UFLIA vs z3. Random conjunctions of Int bounds and
+/// (dis)equalities over `f : Int -> Int`. Any definite SAT/UNSAT that disagrees
+/// with z3 is a P0 bug; `unknown` is tolerated (it should not occur for these,
+/// but the match keeps the harness robust).
+#[test]
+fn differential_qf_uflia_small() {
+    let mut rng = Lcg(0x171a);
+    for _ in 0..200 {
+        let mut s = Solver::new();
+        let consts: Vec<_> = (0..3)
+            .map(|i| {
+                let int = s.int_sort();
+                s.declare_const(&format!("c{i}"), int)
+            })
+            .collect();
+        let int = s.int_sort();
+        let f = s.declare_fun("f", &[int], int);
+
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .unwrap();
+        // Built-in sorts are referenced by atom in this harness (cf. ctx.atom("Real")).
+        let zint = ctx.atom("Int");
+        let z_consts: Vec<_> = (0..3)
+            .map(|i| ctx.declare_const(format!("c{i}"), zint).unwrap())
+            .collect();
+        let _zf = ctx.declare_fun("f", vec![zint], zint).unwrap();
+        let zf_atom = ctx.atom("f");
+
+        let n_lits = 2 + rng.below(4) as usize;
+        for _ in 0..n_lits {
+            let i = rng.below(3) as usize;
+            match rng.below(4) {
+                2 => {
+                    let k = rng.below(5) as i32;
+                    let kn = {
+                        let int = s.int_sort();
+                        s.numeral(Rational::from_int((k as i128).into()), int)
+                    };
+                    let le = s.app(Op::Builtin(BuiltinOp::Le), &[consts[i], kn]);
+                    s.assert(le);
+                    ctx.assert(ctx.lte(z_consts[i], ctx.numeral(k))).unwrap();
+                }
+                3 => {
+                    let j = rng.below(3) as usize;
+                    let fi = s.app(Op::Uninterpreted(f), &[consts[i]]);
+                    let fj = s.app(Op::Uninterpreted(f), &[consts[j]]);
+                    let dist = s.app(Op::Builtin(BuiltinOp::Distinct), &[fi, fj]);
+                    s.assert(dist);
+                    let zfi = ctx.list(vec![zf_atom, z_consts[i]]);
+                    let zfj = ctx.list(vec![zf_atom, z_consts[j]]);
+                    ctx.assert(ctx.not(ctx.eq(zfi, zfj))).unwrap();
+                }
+                other => {
+                    let j = rng.below(3) as usize;
+                    let neg = other == 1;
+                    let eqt = s.eq(consts[i], consts[j]);
+                    let lit = if neg {
+                        s.app(Op::Builtin(BuiltinOp::Not), &[eqt])
+                    } else {
+                        eqt
+                    };
+                    s.assert(lit);
+                    let zeq = ctx.eq(z_consts[i], z_consts[j]);
+                    ctx.assert(if neg { ctx.not(zeq) } else { zeq }).unwrap();
+                }
+            }
+        }
+
+        let ours = s.check_sat();
+        let theirs = ctx.check().unwrap();
+        match (ours, theirs) {
+            (SolveOutcome::Unknown, _) => {}
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => {}
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => {}
+            (o, t) => panic!("DISAGREEMENT (QF_UFLIA): shinri={o:?} z3={t:?}"),
+        }
+    }
+}
+
 // Minimal standalone reproducer for the WRONG-SAT soundness bug found in Task 9.
 // Instance: x1=-1 (from -x1=1) AND x1≠-1 → should be UNSAT.
 // With Stage-B ON, shinri incorrectly returns SAT.
