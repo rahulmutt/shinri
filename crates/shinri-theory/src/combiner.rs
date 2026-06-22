@@ -394,6 +394,46 @@ impl<E: TheorySolver, A: TheorySolver> Combiner<E, A> {
             self.merges.clear();
 
             if !progressed {
+                // MBTC: decide the first undecided shared-Int arrangement. A pair
+                // equal in arith's model but not merged in the shared engine is
+                // resolved by an integer trichotomy split. The `=` branch merges
+                // in EUF (congruence, exchanged to arith); the `<`/`>` branches
+                // separate them in arith. The disjunction is integer-valid, so SAT
+                // must pick a branch — and each split permanently decides one pair,
+                // so the undecided set strictly shrinks (termination).
+                let undecided = if shared.is_empty() {
+                    None
+                } else {
+                    let mut cx = TheoryCtx {
+                        terms: &mut self.terms,
+                        eq: &mut self.eq,
+                        atoms: &self.atoms,
+                    };
+                    let pairs = self.arith.model_equal_shared_pairs(&mut cx, &shared);
+                    pairs.into_iter().find(|&(a, b)| {
+                        let an = cx.eq.intern(a);
+                        let bn = cx.eq.intern(b);
+                        !cx.eq.are_equal(an, bn)
+                    })
+                };
+                if let Some((u, v)) = undecided {
+                    let eq = self.terms.mk_eq(u, v).expect("(= u v) well-sorted");
+                    let lt = self
+                        .terms
+                        .mk_app(
+                            shinri_core::Op::Builtin(shinri_core::BuiltinOp::Lt),
+                            &[u, v],
+                        )
+                        .expect("(< u v) well-sorted");
+                    let gt = self
+                        .terms
+                        .mk_app(
+                            shinri_core::Op::Builtin(shinri_core::BuiltinOp::Gt),
+                            &[u, v],
+                        )
+                        .expect("(> u v) well-sorted");
+                    return FinalCheck::Split(vec![eq, lt, gt]);
+                }
                 return FinalCheck::Sat;
             }
         }
@@ -1054,5 +1094,97 @@ mod tests {
         Theory::bind_fresh(&mut c, vl, lt);
         assert_eq!(c.atoms_ref().owner(ve), Owner::Euf);
         assert_eq!(c.atoms_ref().owner(vl), Owner::Arith);
+    }
+
+    /// EUF stub that declares two shared terms but never merges them.
+    #[derive(Default)]
+    struct SharedEuf {
+        t1: Option<TermId>,
+        t2: Option<TermId>,
+    }
+    impl TheorySolver for SharedEuf {
+        const THEORY_ID: u16 = 1;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _o: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            TCheck::Sat
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _t: u32, _e: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _l: usize) {}
+        fn shared_real_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
+            vec![self.t1.unwrap(), self.t2.unwrap()]
+        }
+    }
+
+    /// Arith stub that reports its two terms as model-equal (undecided pair).
+    #[derive(Default)]
+    struct ModelEqArith {
+        t1: Option<TermId>,
+        t2: Option<TermId>,
+    }
+    impl TheorySolver for ModelEqArith {
+        const THEORY_ID: u16 = 2;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _o: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            TCheck::Sat
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _t: u32, _e: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _l: usize) {}
+        fn model_equal_shared_pairs(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _shared: &[TermId],
+        ) -> Vec<(TermId, TermId)> {
+            vec![(self.t1.unwrap(), self.t2.unwrap())]
+        }
+    }
+
+    #[test]
+    fn mbtc_emits_trichotomy_split_for_undecided_int_pair() {
+        use crate::atom::classify;
+        use crate::types::Owner;
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let us = ctx.declare_fun("u", &[], int);
+        let vs = ctx.declare_fun("v", &[], int);
+        let u = ctx.mk_app(Op::Uninterpreted(us), &[]).unwrap();
+        let v = ctx.mk_app(Op::Uninterpreted(vs), &[]).unwrap();
+        let mut c: Combiner<SharedEuf, ModelEqArith> = Combiner::with_context(ctx);
+        c.euf.t1 = Some(u);
+        c.euf.t2 = Some(v);
+        c.arith.t1 = Some(u);
+        c.arith.t2 = Some(v);
+        match Theory::check(&mut c, Effort::Full) {
+            TheoryResult::SplitAtoms(atoms) => {
+                assert_eq!(atoms.len(), 3, "integer trichotomy = 3 atoms");
+                assert_eq!(classify(&c.terms, atoms[0]), Ok(Owner::Euf)); // (= u v)
+                assert_eq!(classify(&c.terms, atoms[1]), Ok(Owner::Arith)); // (< u v)
+                assert_eq!(classify(&c.terms, atoms[2]), Ok(Owner::Arith)); // (> u v)
+            }
+            other => panic!("expected SplitAtoms, got {other:?}"),
+        }
     }
 }
