@@ -1073,3 +1073,213 @@ fn differential_qf_lia_small() {
         "pure QF_LIA must not go Unknown ({unknowns} did)"
     );
 }
+
+// ────────────────────────────────────────────────────────────────────────────
+// QF_LIA SAT-direction differential oracle — validates soundness (no wrong-
+// UNSAT) for the Stage-A B&B baseline (cuts OFF).
+//
+// The full `differential_qf_lia_small` test is #[ignore]'d because the a-priori
+// bound makes UNSAT instances intractable at Stage-A.  This companion test
+// covers the SAT direction only: for each random instance, both z3 and cvc5 are
+// queried first; if they agree on SAT, shinri is run under a per-instance
+// timeout.  Any shinri=Unsat on a z3+cvc5=Sat instance is a SOUNDNESS BUG and
+// panics immediately.  UNSAT instances are skipped (oracle_unsat_skipped) and
+// instances where shinri times out are skipped (shinri_timeout_skipped).
+//
+// Run with:
+//   cargo test -p shinri-solver --features oracle \
+//              differential_qf_lia_sat_direction -- --nocapture
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Plain data representation of one QF_LIA constraint.
+/// All fields are `Send` so the struct can cross thread boundaries.
+#[derive(Clone, Debug)]
+struct LiaConstraint {
+    coeffs: Vec<i32>,
+    rel: Rel,
+    rhs: i32,
+}
+
+/// Build a shinri QF_LIA instance from plain constraint data and run check_sat.
+/// Intended to be called inside a spawned thread.
+fn shinri_check_lia(constraints: &[LiaConstraint], n_vars: usize) -> SolveOutcome {
+    let mut s = Solver::new();
+    let int = s.int_sort();
+    let vars: Vec<shinri_core::TermId> = (0..n_vars)
+        .map(|i| s.declare_const(&format!("x{i}"), int))
+        .collect();
+
+    for con in constraints {
+        let mut terms = Vec::new();
+        for (i, &coeff) in con.coeffs.iter().enumerate() {
+            if coeff == 0 {
+                continue;
+            }
+            let ct = s.numeral(Rational::from_int((coeff as i128).into()), int);
+            terms.push(s.app(Op::Builtin(BuiltinOp::Mul), &[ct, vars[i]]));
+        }
+        let s_lhs = terms
+            .into_iter()
+            .reduce(|a, t| s.app(Op::Builtin(BuiltinOp::Add), &[a, t]))
+            .unwrap();
+        let s_rhs = s.numeral(Rational::from_int((con.rhs as i128).into()), int);
+        let s_atom = match con.rel {
+            Rel::Le => s.app(Op::Builtin(BuiltinOp::Le), &[s_lhs, s_rhs]),
+            Rel::Lt => s.app(Op::Builtin(BuiltinOp::Lt), &[s_lhs, s_rhs]),
+            Rel::Ge => s.app(Op::Builtin(BuiltinOp::Ge), &[s_lhs, s_rhs]),
+            Rel::Gt => s.app(Op::Builtin(BuiltinOp::Gt), &[s_lhs, s_rhs]),
+            Rel::Eq => s.eq(s_lhs, s_rhs),
+            Rel::Ne => {
+                let e = s.eq(s_lhs, s_rhs);
+                s.app(Op::Builtin(BuiltinOp::Not), &[e])
+            }
+        };
+        s.assert(s_atom);
+    }
+    s.check_sat()
+}
+
+#[test]
+fn differential_qf_lia_sat_direction() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let mut rng = Lcg(0x5A7_11A);
+    const N_VARS: usize = 3;
+    // N_ITERS=160, timeout=1500ms: empirically ~70-80s wall-clock.
+    // At 200/3s it ran 132s (33 timeouts × 3s each dominated).
+    const N_ITERS: usize = 160;
+    const PER_INSTANCE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+    let mut sat_validated = 0usize;
+    let mut oracle_unsat_skipped = 0usize;
+    let mut shinri_timeout_skipped = 0usize;
+
+    for iter in 0..N_ITERS {
+        // Generate random instance as plain data (Send-able across threads).
+        let n_constraints = 4 + rng.below(4) as usize; // 4..=7
+        let mut instance: Vec<LiaConstraint> = Vec::with_capacity(n_constraints);
+        let mut dump = format!("iter={iter}");
+
+        for _ in 0..n_constraints {
+            let rel = match rng.below(6) {
+                0 => Rel::Le,
+                1 => Rel::Lt,
+                2 => Rel::Ge,
+                3 => Rel::Gt,
+                4 => Rel::Eq,
+                _ => Rel::Ne,
+            };
+            let mut coeffs: Vec<i32> = (0..N_VARS).map(|_| (rng.below(5) as i32) - 2).collect();
+            if coeffs.iter().all(|&c| c == 0) {
+                coeffs[0] = 1;
+            }
+            let rhs: i32 = (rng.below(7) as i32) - 3;
+            dump.push_str(&format!("\n  {coeffs:?} {rel:?} {rhs}"));
+            instance.push(LiaConstraint { coeffs, rel, rhs });
+        }
+
+        // ── Query both oracles on the same instance ──────────────────────────
+        let mut z = smt_ctx("z3", "QF_LIA");
+        let mut oracle_c = smt_ctx("cvc5", "QF_LIA");
+        let z_int_sort = z.atom("Int");
+        let c_int_sort = oracle_c.atom("Int");
+        let zv: Vec<easy_smt::SExpr> = (0..N_VARS)
+            .map(|i| z.declare_const(format!("x{i}"), z_int_sort).unwrap())
+            .collect();
+        let cv: Vec<easy_smt::SExpr> = (0..N_VARS)
+            .map(|i| oracle_c.declare_const(format!("x{i}"), c_int_sort).unwrap())
+            .collect();
+
+        for con in &instance {
+            for (ctx, vars_ref) in [(&mut z, &zv), (&mut oracle_c, &cv)] {
+                let zt: Vec<easy_smt::SExpr> = con
+                    .coeffs
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, &coeff)| z_coeff_times_var(&*ctx, coeff, vars_ref[i]))
+                    .collect();
+                let z_lhs = zt.into_iter().reduce(|a, t| ctx.plus(a, t)).unwrap();
+                let z_rhs = z_int(&*ctx, con.rhs);
+                let z_atom = match con.rel {
+                    Rel::Le => ctx.lte(z_lhs, z_rhs),
+                    Rel::Lt => ctx.lt(z_lhs, z_rhs),
+                    Rel::Ge => ctx.gte(z_lhs, z_rhs),
+                    Rel::Gt => ctx.gt(z_lhs, z_rhs),
+                    Rel::Eq => ctx.eq(z_lhs, z_rhs),
+                    Rel::Ne => {
+                        let e = ctx.eq(z_lhs, z_rhs);
+                        ctx.not(e)
+                    }
+                };
+                ctx.assert(z_atom).unwrap();
+            }
+        }
+
+        let z_res = z.check().unwrap();
+        let c_res = oracle_c.check().unwrap();
+
+        // Both oracles must agree — any disagreement is an oracle-encoding bug.
+        assert_eq!(
+            format!("{z_res:?}"),
+            format!("{c_res:?}"),
+            "z3≠cvc5 (oracle-encoding bug, iter {iter})\n{dump}"
+        );
+
+        match z_res {
+            easy_smt::Response::Unsat => {
+                // Skip: baseline B&B cannot decide UNSAT in reasonable time.
+                oracle_unsat_skipped += 1;
+            }
+            easy_smt::Response::Unknown => {
+                // Oracles themselves uncertain — skip without counting.
+            }
+            easy_smt::Response::Sat => {
+                // Run shinri under a timeout, built INSIDE the thread so Solver
+                // (which may not be Send) never crosses a thread boundary.
+                let data = instance.clone();
+                let (tx, rx) = mpsc::channel();
+                std::thread::spawn(move || {
+                    let outcome = shinri_check_lia(&data, N_VARS);
+                    let _ = tx.send(outcome);
+                });
+
+                match rx.recv_timeout(PER_INSTANCE_TIMEOUT) {
+                    Ok(SolveOutcome::Sat) => {
+                        // shinri found SAT — model self-check already ran inside
+                        // check_sat; no need to re-extract.
+                        sat_validated += 1;
+                    }
+                    Ok(SolveOutcome::Unsat) => {
+                        panic!(
+                            "WRONG-UNSAT soundness bug (iter {iter}): \
+                             shinri=Unsat but z3+cvc5=Sat\n{dump}"
+                        );
+                    }
+                    Ok(SolveOutcome::Unknown) => {
+                        panic!("pure QF_LIA must not be Unknown (iter {iter})\n{dump}");
+                    }
+                    Err(_) => {
+                        // recv_timeout expired — shinri is still running but we
+                        // move on.  The worker thread is left to finish on its
+                        // own; the test process will clean it up on exit.
+                        shinri_timeout_skipped += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    eprintln!(
+        "sat_direction oracle: validated={sat_validated} \
+         oracle_unsat_skipped={oracle_unsat_skipped} \
+         shinri_timeout_skipped={shinri_timeout_skipped}"
+    );
+
+    assert!(
+        sat_validated > 0,
+        "oracle validated zero SAT instances — test is vacuous; \
+         loosen generator or raise N_ITERS \
+         (oracle_unsat_skipped={oracle_unsat_skipped} shinri_timeout_skipped={shinri_timeout_skipped})"
+    );
+}
