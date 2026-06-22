@@ -5,6 +5,7 @@
 
 pub mod bounds;
 pub mod branch;
+pub mod cuts;
 pub mod encode;
 pub mod farkas;
 pub mod model;
