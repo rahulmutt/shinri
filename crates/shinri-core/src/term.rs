@@ -37,6 +37,9 @@ pub enum BuiltinOp {
     Lt,
     Ge,
     Gt,
+    // Arrays
+    Select,
+    Store,
 }
 
 /// A literal constant value. Numerals reference `Context.nums` by `RatId`.

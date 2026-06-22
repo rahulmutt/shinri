@@ -78,6 +78,10 @@ impl Context {
         self.intern_sort(SortNode::Uninterpreted(sym))
     }
 
+    pub fn array_sort(&mut self, index: SortId, elem: SortId) -> SortId {
+        self.intern_sort(SortNode::Array(index, elem))
+    }
+
     pub fn sort_node(&self, id: SortId) -> &SortNode {
         &self.sorts[id.index()]
     }
@@ -248,6 +252,35 @@ impl Context {
                     return Err(SortError::NotApplicable);
                 }
                 Ok(bool_s)
+            }
+            Select => {
+                expect_arity(args, 2)?;
+                let (idx, elem) = match self.sort_node(self.sort_of(args[0])) {
+                    SortNode::Array(i, e) => (*i, *e),
+                    _ => return Err(SortError::NotApplicable),
+                };
+                let found = self.sort_of(args[1]);
+                if found != idx {
+                    return Err(SortError::Mismatch { expected: idx, found });
+                }
+                Ok(elem)
+            }
+            Store => {
+                expect_arity(args, 3)?;
+                let arr = self.sort_of(args[0]);
+                let (idx, elem) = match self.sort_node(arr) {
+                    SortNode::Array(i, e) => (*i, *e),
+                    _ => return Err(SortError::NotApplicable),
+                };
+                let fi = self.sort_of(args[1]);
+                if fi != idx {
+                    return Err(SortError::Mismatch { expected: idx, found: fi });
+                }
+                let fe = self.sort_of(args[2]);
+                if fe != elem {
+                    return Err(SortError::Mismatch { expected: elem, found: fe });
+                }
+                Ok(arr)
             }
         }
     }
@@ -558,5 +591,35 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::Add), &[one, two])
             .unwrap();
         assert_eq!(ctx.substitute(sum, &[three], &[one]), sum);
+    }
+
+    #[test]
+    fn array_select_store_sorts() {
+        let mut ctx = Context::new();
+        let idx = ctx.declare_sort("I");
+        let elem = ctx.declare_sort("E");
+        let arr_sort = ctx.array_sort(idx, elem);
+
+        let sym_a = ctx_decl(&mut ctx, "a", arr_sort);
+        let sym_i = ctx_decl(&mut ctx, "i", idx);
+        let sym_e = ctx_decl(&mut ctx, "e", elem);
+        let a = ctx.mk_app(Op::Uninterpreted(sym_a), &[]).unwrap();
+        let i = ctx.mk_app(Op::Uninterpreted(sym_i), &[]).unwrap();
+        let e = ctx.mk_app(Op::Uninterpreted(sym_e), &[]).unwrap();
+
+        // (store a i e) : (Array I E)
+        let st = ctx.mk_app(Op::Builtin(BuiltinOp::Store), &[a, i, e]).unwrap();
+        assert_eq!(ctx.sort_of(st), arr_sort);
+        // (select (store a i e) i) : E
+        let sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[st, i]).unwrap();
+        assert_eq!(ctx.sort_of(sel), elem);
+        // wrong index sort is rejected
+        let e_as_idx = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, e]);
+        assert!(e_as_idx.is_err());
+    }
+
+    // helper local to the test module
+    fn ctx_decl(ctx: &mut Context, name: &str, s: SortId) -> SymbolId {
+        ctx.declare_fun(name, &[], s)
     }
 }

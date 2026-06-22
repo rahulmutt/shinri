@@ -8,4 +8,6 @@ pub enum SortNode {
     Int,
     Real,
     Uninterpreted(SymbolId),
+    /// (Array <index> <element>)
+    Array(crate::ids::SortId, crate::ids::SortId),
 }
