@@ -1,29 +1,31 @@
-# shinri QF_UFLIA — Master Design (EUF + Linear Integer Arithmetic combination)
+# shinri QF_UFLIA — Design (EUF + Linear Integer Arithmetic via Model-Based Theory Combination)
 
-**The first time shinri's Nelson–Oppen combination framework is exercised by two real cooperating theories. The convex combination plumbing already exists (built for QF_UFLRA, never activated as a pair); QF_UFLIA adds Int-sorted term sharing and the one piece integers genuinely need that rationals do not — non-convex arrangement reasoning. Delivered in two stages: a sound, shippable convex baseline that answers `unknown` exactly when the shared-variable arrangement is undecided, then a model-based theory combination (MBTC) layer that removes those `unknown`s without changing any verdict the baseline already produced.**
+**The first time shinri's Nelson–Oppen framework is exercised by two real cooperating theories. The convex combination plumbing already exists (built for QF_UFLRA, never activated as a pair); QF_UFLIA adds Int-sorted term sharing plus the one thing integers genuinely need that rationals do not — non-convex arrangement reasoning. We do this with model-based theory combination (MBTC): at the Nelson–Oppen Sat fixpoint, any two shared Int variables that are equal in the arithmetic model but not yet decided in the shared equality engine are resolved by an integer trichotomy split `(= u v) ∨ (< u v) ∨ (> u v)`, reusing the existing splitting-on-demand machinery. Single milestone, sound and complete; mixed QF_LIRA stays fenced.**
 
 - **Date:** 2026-06-22
-- **Status:** Approved design — Stage 1 ready for implementation planning; Stage 2 specified, planned later
+- **Status:** Approved design — ready for implementation planning
 - **Master design spec (north star):** `docs/superpowers/specs/2026-06-18-shinri-design.md`
 - **Combination framework spec:** `docs/superpowers/specs/2026-06-19-shinri-theory-design.md` (the `Combiner`, `EqualityEngine`, `TheorySolver`, purification, `InterfaceSet` — built targeting QF_UFLRA)
-- **Sibling theory specs:** `docs/superpowers/specs/2026-06-19-shinri-euf-qfuf-design.md` (EUF), `docs/superpowers/specs/2026-06-20-shinri-arith-lia-design.md` (QF_LIA) and its `planB1`/`planB2` successors.
-- **Predecessor:** the QF_LIA milestone (B1 complete baseline + B2 Stage-B cuts/FBBT) — the Arith theory this combines is the post-B2 solver.
-- **Successor:** QF_UFLRA (incidentally validated here; never the headline target) and mixed QF_LIRA remain separate later milestones.
+- **Sibling theory specs:** `docs/superpowers/specs/2026-06-19-shinri-euf-qfuf-design.md` (EUF); `docs/superpowers/specs/2026-06-20-shinri-arith-lia-design.md` (QF_LIA) and its `planB1`/`planB2` successors (the post-B2 Arith this combines).
+- **Successor:** QF_UFLRA is incidentally validated here but is never the headline target; mixed QF_LIRA remains a separate later milestone.
+
+> **Design-history note.** An earlier draft of this spec staged the work as a "sound convex baseline that answers `unknown` on undecided arrangements" (Stage 1), then MBTC (Stage 2). Implementation planning showed the baseline does not work: the simplex parks every unconstrained variable at 0, so *incidental* model collisions (e.g. `x` and `f(x)` both 0 with no constraint between them) are pervasive. A guard that returns `unknown` on every model-equal-unmerged pair is sound but returns `unknown` on nearly all SAT instances; a narrower guard is unsound (it misses functional congruence); a precise guard must speculatively run the congruence closure — which is exactly the MBTC split. The staging was therefore a false economy. MBTC makes the *same* simple "model-equal ∧ unmerged" predicate correct, because a harmless collision costs one split that resolves immediately rather than a spurious `unknown`. We go straight to MBTC.
 
 ---
 
 ## 1. Scope & relationship to the milestone
 
-QF_UFLIA combines **EUF** (uninterpreted functions and predicates, congruence closure) with **linear integer arithmetic** over a single shared equality engine. The combination *framework* — `Combiner<E, A>`, the shared `EqualityEngine`, `AtomRegistry`, purification, `InterfaceSet`, the bidirectional Nelson–Oppen fixpoint, model assembly, and the certificate protocol — is **already implemented** in `shinri-theory`. It was designed for QF_UFLRA and has been exercised by EUF (`Combiner<Euf, EmptyTheory>`) and by Arith separately, but `Combiner<Euf, Arith>` has **never been activated as a pair**: its oracle test (`crates/shinri-theory/tests/oracle.rs:9`) is `#[ignore]`'d, annotated *"activates when `Combiner<Euf, Arith>` exists."*
+QF_UFLIA combines **EUF** (uninterpreted functions and predicates, congruence closure) with **linear integer arithmetic** over a single shared equality engine. The combination *framework* — `Combiner<E, A>`, the shared `EqualityEngine`, `AtomRegistry`, purification, the bidirectional Nelson–Oppen fixpoint, model assembly, and the certificate protocol — is **already implemented** in `shinri-theory`. It was designed for QF_UFLRA and exercised by EUF (`Combiner<Euf, EmptyTheory>`) and Arith separately, but `Combiner<Euf, Arith>` has **never been activated as a pair**: its oracle test (`crates/shinri-theory/tests/oracle.rs:9`) is `#[ignore]`'d, annotated *"activates when `Combiner<Euf, Arith>` exists."*
 
-This milestone activates that pairing for integers. There are exactly two pieces of real work beyond turning it on:
+This milestone activates that pairing for integers. Three pieces of real work:
 
-1. **Route Int-sorted shared terms.** Today only Real-sorted terms join the shared set; Int-sorted UF applications (`f: Int→Int`) are not routed through congruence at all.
-2. **Non-convex arrangement reasoning.** Integers are non-convex: LIA can entail a *disjunction* of equalities without entailing any single one, so the convex model-based / probe-based equality propagation the framework was built around is **incomplete** for ℤ. This is the only intellectually substantial part of the milestone.
+1. **Route Int-sorted shared terms.** Today only Real-sorted terms join the shared set; Int-sorted UF applications (`f: Int→Int`) are not routed through congruence at all. This is a latent unsoundness: a pure-Int QF_UFLIA query is not fenced today, yet its Int `f`-apps are never shared, so the theories never exchange the equalities that make it sound.
+2. **Make shared Int terms integral** in the arithmetic core (so the integer layer and the simplex treat `f`-app interface variables as integers).
+3. **Non-convex arrangement reasoning via MBTC.** The interface-equality split that decides each undecided shared Int pair.
 
 ### 1.1 The non-convexity problem (why QF_UFLRA's plumbing is not enough)
 
-The framework's `Arith::entailed_equalities` is *deduction-complete for individually-entailed equalities* even over ℤ (it probes `u>v` and `u<v`; if both are infeasible, `u=v` holds in every model). That is necessary but **not sufficient** for combination, because integers are non-convex.
+The framework's `Arith::entailed_equalities` is *deduction-complete for individually-entailed equalities* even over ℤ (it probes `u>v` and `u<v`; if both are infeasible, `u=v` holds in every model). That is necessary but **not sufficient** for combination over integers, which are **non-convex**: LIA can entail a *disjunction* of equalities without entailing any single one.
 
 Canonical witness:
 
@@ -32,90 +34,88 @@ Arith (Int):  1 ≤ x ≤ 2,  y = 1,  z = 2
 EUF:          f(x) ≠ f(y),  f(x) ≠ f(z)
 ```
 
-This is **UNSAT**: x must equal y or z, so congruence forces `f(x)=f(y)` or `f(x)=f(z)`, contradicting a disequality either way. But *no single equality is individually entailed* — neither `x=y` nor `x=z` holds in all models — so an individual-equality fixpoint discovers nothing and a convex-only combiner would wrongly answer **SAT**. The arithmetic theory entails the *disjunction* `x=y ∨ x=z`; resolving such disjunctions is "arrangement reasoning."
+This is **UNSAT** (x must equal y or z, so congruence forces `f(x)=f(y)` or `f(x)=f(z)`, contradicting a disequality either way), but *no single equality is individually entailed*. An individual-equality fixpoint discovers nothing, so a convex-only combiner would wrongly answer **SAT**. The arithmetic theory entails the *disjunction* `x=y ∨ x=z`; resolving such disjunctions is arrangement reasoning, which MBTC supplies by splitting.
 
-### 1.2 In scope
+### 1.2 Why integers need splits but reals do not (verdict-soundness)
 
-- Extend EUF↔Arith term sharing from Real-only to **{Real, Int}** (Int-sorted UF applications, problem-var interning, numeral pinning, model seam).
-- Narrow the current `saw_shared → unknown` fence so EUF↔Int-arith shared terms are **supported**, not fenced.
-- A combiner-level **arrangement-completeness check** with one new arith seam (`model_equal_shared_pairs`).
-- **Stage 1:** the check maps an undecided arrangement to a sound top-level **`unknown`** (new `FinalCheck::Incomplete` surfaced through the CDCL(T) loop).
-- **Stage 2:** the check instead emits interface-equality **splits** via the existing `TCheck::Split` seam (MBTC), completing every verdict.
-- A **Stage gate** (Stage-B style) so the differential harness can run guard→unknown (Stage 1) vs guard→split (Stage 2) and assert verdict preservation.
-- Activate the `#[ignore]`'d combination oracle and add a `shinri-solver` end-to-end QF_UFLIA differential vs z3 + cvc5.
+For convex, stably-infinite theories with disjoint signatures (EUF + LRA), the Nelson–Oppen theorem guarantees that propagating *entailed* equalities to a fixpoint and checking each theory consistent yields a **correct satisfiability verdict** — no arrangement guessing required. (Our internally-built model may not exhibit a witness, but the verdict is sound; this is why the existing QF_UFLRA tests pass without splits.) Integers break convexity, so the theorem fails and a correct verdict requires deciding the arrangement. **Therefore MBTC splits Int pairs only; Real pairs are never split** — QF_UFLRA stays split-free and verdict-sound, and pure-Int QF_UFLIA additionally gets a *valid model* because every Int arrangement is decided.
 
-### 1.3 Explicitly out of scope (unchanged fences)
+### 1.3 In scope
+
+- Extend EUF↔Arith term sharing from Real-only to **{Real, Int}** (Int-sorted UF applications, problem-var interning, numeral pinning).
+- Make shared Int terms integral in Arith (`ensure_shared_var` stamps Int-sortedness).
+- An arith seam `model_equal_shared_pairs(shared) -> Vec<(TermId,TermId)>` reporting shared **Int** vars equal under the current model `β`.
+- A combiner **MBTC step**: at the N-O Sat fixpoint, take the first model-equal pair not merged in the `EqualityEngine` and emit the trichotomy split `(= u v) ∨ (< u v) ∨ (> u v)` via the existing `TCheck::Split` → `TheoryResult::SplitAtoms` path.
+- Generalize `Combiner::bind_fresh` to **classify** each fresh split atom and route it to the owning theory (so `(= u v)` reaches EUF and `(< u v)`/`(> u v)` reach Arith).
+- Activate the `#[ignore]`'d combination oracle and add a `shinri-solver` end-to-end QF_UFLIA differential vs z3 (+ cvc5).
+
+### 1.4 Explicitly out of scope (unchanged fences)
 
 - **Mixed Int/Real in a single query** — the `lira` gate (`crates/shinri-solver/src/lib.rs`) stays; pure-Int and pure-Real queries are each supported, mixed is `unknown`.
 - Nonlinear arithmetic, difference-logic specialization, eager theory propagation.
-- Proof/certificate emission beyond the existing Farkas conflicts and the dev-gated `CertLog` structural re-check.
-- **QF_UFLRA** is incidentally validated by the shared plumbing but is never the headline target; its own curated milestone (if desired) is separate.
+- Proof/certificate emission beyond the existing Farkas conflicts and the dev-gated `CertLog` structural re-check. Interface-equality split clauses are not proof-certified (consistent with the QF_LIA B2 decision that branch/cut lemmas are not certified).
+- **QF_UFLRA** is incidentally validated by the shared plumbing but is never the headline target.
 
 ---
 
 ## 2. Design principles (inherited)
 
-Specializes the combination-framework principles (`shinri-theory` spec §2):
-
-1. **Soundness is total at every stage; completeness is staged.** Stage 1 returns SAT/UNSAT *only* when the shared-variable arrangement is fully decided; otherwise `unknown`. It never guesses.
-2. **One shared source of equality truth.** A single `EqualityEngine` holds equality state for both theories. Theories never exchange equalities pairwise behind the engine's back — the classic combination soundness bug.
-3. **Closed, monomorphized theory set.** `Combiner<Euf, Arith>` is a concrete struct, enum-routed, no `dyn` on the hot path.
+1. **Soundness is total.** A SAT/UNSAT verdict is returned only when justified; `unknown` only for genuinely unsupported constructs (nonlinear, mixed-sort, QF_LIRA). The combiner never guesses.
+2. **One shared source of equality truth** — a single `EqualityEngine`; theories never exchange equalities behind it.
+3. **Closed, monomorphized theory set** — `Combiner<Euf, Arith>`, enum-routed, no `dyn` on the hot path.
 4. **Backtracking via `UndoLog`, never snapshots**, synchronized to SAT decision levels.
 5. **Exact arithmetic only** (`shinri-num` rationals, `DeltaRational`).
 
 ---
 
-## 3. The two stages
+## 3. The MBTC mechanism
 
-### 3.1 Stage 1 — Convex baseline (sound, may answer `unknown`)
+### 3.1 Detecting undecided pairs
 
-Activates the pairing for integers and is independently shippable. Reuses the existing probe-based `entailed_equalities` and bidirectional fixpoint unchanged; adds Int sharing and the arrangement guard.
+After the bidirectional N-O fixpoint reaches a Sat fixpoint (`drive_final_check`), the combiner asks Arith for `model_equal_shared_pairs(shared)`: the shared **Int** pairs `(u,v)` with `β(u)=β(v)` under the current model. A pair is **undecided** iff it is not already merged in the `EqualityEngine` (`!are_equal`). The naive predicate is correct here precisely because the action is a *split*, not an `unknown` (§ design-history note).
 
-**Soundness mechanism — the arrangement-completeness guard.** After the bidirectional fixpoint reaches a Sat fixpoint, before SAT is declared: if any two shared Int variables share the current arithmetic model value `β(u)=β(v)` but are neither merged nor separated in the `EqualityEngine`, the arrangement is **undecided** → return `unknown`. Pure QF_UFLRA (convex) never trips the guard. The §1.1 non-convex witness trips it and answers `unknown` — sound, not unsound.
+### 3.2 The integer trichotomy split
 
-### 3.2 Stage 2 — Non-convex completion (MBTC)
+For the first undecided pair `(u,v)`, the combiner builds three atoms over `self.terms` and returns them as a split:
 
-Replaces the guard's `unknown` with **model-based theory combination**: each undecided pair `(u,v)` becomes an interface-equality split `(u=v) ∨ (u≠v)` surfaced by the combiner through the existing split machinery (the same clause-forwarding path `TCheck::Split` uses for integer branching; the combiner is the emitter here rather than Arith). The SAT solver case-splits; each branch routes back as an asserted equality or disequality through `Combiner::assert`, driving the arrangement to completeness lazily. The probe-based deduction remains underneath as a cheap pre-filter (it decides individually-entailed pairs without a split). This is the cvc5/Z3 approach.
+```
+(= u v)   — EUF atom: routes to Owner::Euf
+(< u v)   — Lt atom:  routes to Owner::Arith
+(> u v)   — Gt atom:  routes to Owner::Arith
+```
 
-### 3.3 The soundness contract (the through-line)
+`drive_final_check` returns `FinalCheck::Split([eq, lt, gt])`; `Theory::check` lifts it to `TheoryResult::SplitAtoms`. The SAT loop (`crates/shinri-sat/src/solver.rs:580`) allocates a fresh Boolean var per atom, calls `bind_fresh` (which now classifies and routes each atom), learns the clause `(eq ∨ lt ∨ gt)`, and backtracks one level to force a case-split — exactly the QF_LIA splitting-on-demand protocol.
 
-> Completeness is staged; **soundness is total at every stage.** Stage 1 produces SAT/UNSAT only when the shared-variable arrangement is fully decided by asserted + congruence + individually-entailed equalities; otherwise `unknown`. Stage 2 decides the remaining arrangements, changing **no** SAT/UNSAT verdict Stage 1 already produced — it only converts `unknown` into a definite verdict.
+- The **`(= u v)`** branch → EUF merge → congruence closure → exchanged back to Arith by the existing N-O loop (so Arith installs `u=v`). EUF/Arith agree.
+- The **`(< u v)`** / **`(> u v)`** branch → Arith bound → genuinely separates `u,v`; EUF leaves them unmerged (correct, since they are unequal).
 
-This gives Stage 2 a differential oracle for free: every Stage-1 SAT/UNSAT must be preserved, and Stage-2 turns Stage-1 `unknown`s into z3/cvc5-agreeing verdicts.
+The disjunction is the integer trichotomy, hence theory-valid: SAT must pick a branch.
+
+### 3.3 Routing fresh atoms (`bind_fresh` generalization)
+
+`Combiner::bind_fresh` (`combiner.rs:196`) currently hardcodes `Owner::Arith` (QF_LIA splits are always arith atoms). MBTC's `(= u v)` is an EUF atom, so `bind_fresh` must `classify(atom)` and register/encode it under the correct owner — `arith.new_var` for `Owner::Arith` (plus `euf.register_arith_uf_terms` to match `register_atom`), `euf.new_var` for `Owner::Euf`. This is behavior-preserving for existing QF_LIA splits (`(x≤k)`/`(x≥k)` classify to `Owner::Arith`).
 
 ---
 
-## 4. Components (Stage 1)
+## 4. Components
 
-### 4.1 Sharing extension: Real → {Real, Int}  *(shinri-euf, shinri-arith)*
+### 4.1 Sharing extension: Real → {Real, Int}  *(shinri-euf)*
+- `Euf::shared_arith_terms` (renamed from `shared_real_terms`) — return registered terms of sort **Real or Int**.
+- `Euf::walk_arith_uf_apps` (renamed from `walk_real_uf_apps`) — intern **Int**-sorted UF applications so congruence applies to `f: Int→Int`.
 
-- `Euf::shared_real_terms` — also return **Int**-sorted registered terms (its role generalizes to "shared arith-sorted terms").
-- `Euf::walk_real_uf_apps` / `register_arith_uf_terms` — intern **Int**-sorted UF applications into the e-graph so congruence applies to `f: Int→Int`.
-- `Arith::ensure_shared_var` — intern a problem var for each Int-sorted shared term; pin Int numerals with fixed integer bounds (the existing Real numeral-pin path, generalized).
-- `entailed_equalities` / `consume_interface_equality` (both directions) — already operate on problem vars and the `iface_lit`/tag sentinel discipline. Work item is verification, not new logic: confirm the Int path round-trips interface sentinels through `explain` as `EqLeaf::Interface(just)` and that push/pop drops tags above the target level (existing R5 backtrack discipline).
+### 4.2 Arith seam  *(shinri-arith)*
+- `ensure_shared_var` — stamp Int-sortedness (`problem_var_sorted`) so shared Int terms (incl. `f`-apps and numerals) are integral.
+- `model_equal_shared_pairs(&mut self, shared) -> Vec<(TermId,TermId)>` (inherent) + a defaulted `TheorySolver` trait method (default returns none) + Arith override — Int-only, read-only over `β`, state-safe.
 
-### 4.2 Fence narrowing  *(shinri-solver: tseitin.rs, lib.rs:264)*
+### 4.3 Combiner MBTC  *(shinri-theory)*
+- `FinalCheck::Split` already exists; `drive_final_check` gains the §3.1–3.2 step at the terminal Sat point.
+- `bind_fresh` generalized per §3.3.
 
-`saw_shared` no longer forces `unknown` when the shared terms are EUF↔**Int-arith**. The `lira` (Int/Real mixed) gate and `classify → Unsupported` (nonlinear, mixed-sort) fences are untouched.
+### 4.4 Fences  *(shinri-solver — unchanged)*
+Pure-Int QF_UFLIA is **not** fenced today (`saw_shared` flags only mixed-*sort* equalities, which pure-Int QF_UFLIA never produces); it already reaches `sat.solve()`. No fence change is required. The `saw_shared`, `lira`, and `classify→Unsupported` fences stay exactly as-is.
 
-### 4.3 Arrangement-completeness check  *(shinri-theory: combiner.rs — the one new piece)*
-
-A single helper, run after the fixpoint reaches Sat:
-
-- `undecided_shared_pairs()` — a shared Int pair `(u,v)` is **undecided** iff arith's current β makes `β(u)=β(v)` but they are neither merged nor separated in the `EqualityEngine`.
-- New arith seam: `Arith::model_equal_shared_pairs(&shared) -> Vec<(TermId, TermId)>` returns the shared pairs equal under the current β. The combiner intersects this with "not pinned in `EqualityEngine`" (which it computes itself via `find`/diseq lookup).
-- **Stage 1** maps a non-empty undecided set → `FinalCheck::Incomplete`.
-- **Stage 2** maps the same set → one or more `(u=v) ∨ (u≠v)` splits surfaced by the combiner through the existing split machinery.
-
-Identical detection, different action — the staging seam lives entirely in this one decision.
-
-### 4.4 `unknown` surfacing seam  *(shinri-sat / shinri-theory — the one new SAT-seam touch)*
-
-Stage 1's `FinalCheck::Incomplete` must propagate up as a top-level `Unknown`. The CDCL(T) final-check path gains a distinguished give-up outcome that the loop translates to `Unknown` — **never** SAT. This is the single new interface touch in the SAT seam and the riskiest surface (§7).
-
-### 4.5 Model seam for Int shared terms  *(shinri-theory: combiner.rs build_model)*
-
-`build_model`'s `merge_check` must agree on Int-sorted shared terms: `f(x)` takes its `Num` value from arith and EUF must agree. Confirm EUF's `model()` skips Int (defers the value to arith), as it already does for Real, so `Elem` is assigned only to genuinely uninterpreted sorts.
+### 4.5 Model seam  *(shinri-theory — unchanged)*
+`build_model::merge_check` already agrees on shared terms; EUF's `model` skips Real/Int (defers values to Arith). After MBTC decides every Int arrangement, the built model is valid for pure-Int QF_UFLIA.
 
 ---
 
@@ -123,29 +123,29 @@ Stage 1's `FinalCheck::Incomplete` must propagate up as a top-level `Unknown`. T
 
 ```
 SAT assigns atoms
-  → Combiner::assert  (route Euf/Arith by Owner; mirror equalities into EqualityEngine)
+  → Combiner::assert (route by Owner; mirror equalities into EqualityEngine)
   → propagate fixpoint
   → drive_final_check:
         shared set S  (NOW Real + Int)
-        ensure_shared_var for every t ∈ S  (intern problem vars; pin numerals)
+        ensure_shared_var ∀ t ∈ S  (intern problem vars / pin numerals / stamp Int)
         bidirectional fixpoint:
             Arith → EUF:  entailed_equalities(S)  → euf.consume_interface_equality
             EUF → Arith:  congruence classes of S → arith.consume_interface_equality
         at Sat fixpoint:
-            undecided = undecided_shared_pairs()
-            Stage 1:  undecided ≠ ∅  → FinalCheck::Incomplete  → top-level `unknown`
-            Stage 2:  undecided ≠ ∅  → TCheck::Split (u=v ∨ u≠v) → SAT case-splits
-            else:     Sat  → build_model (Int-aware seam)
-  Conflict at any point → EqLeaf set → Combiner negates → clause → backjump  (unchanged)
+            undecided = first (u,v) ∈ model_equal_shared_pairs(S) with !are_equal(u,v)
+            if undecided: FinalCheck::Split([ (=u v), (<u v), (>u v) ])  → SAT case-splits
+            else:         Sat → build_model
+  Conflict at any point → EqLeaf set → clause → backjump  (unchanged)
 ```
 
 ---
 
-## 6. Why this is sound and terminating
+## 6. Soundness, termination, completeness
 
-- **Stable infiniteness.** EUF and LIA-over-ℤ are both stably infinite on their sorts, so Nelson–Oppen combination applies. The *only* completeness obstacle is integer non-convexity, isolated entirely into §4.3 and resolved by MBTC in Stage 2.
-- **Soundness (both stages).** A SAT verdict is declared only when the shared-variable arrangement is fully decided and both theory models agree on the seam (`build_model::merge_check`). An UNSAT verdict comes from a theory conflict packaged from `EqLeaf` antecedents — the existing, validated path. Stage 1 additionally refuses to declare SAT on an undecided arrangement (`unknown`).
-- **Termination.** The shared set is finite; the bidirectional fixpoint's merges are monotone (classes only shrink, asserted pairs are skipped). Stage 2's MBTC splits range over a finite pair set and each split permanently decides one pair, so the arrangement search cannot loop.
+- **Stable infiniteness.** EUF and LIA-over-ℤ are stably infinite on their sorts, so N-O applies; the only obstacle is integer non-convexity, isolated into the MBTC split.
+- **Soundness.** A SAT verdict is declared only when no undecided Int pair remains — i.e. every model-equal Int pair is merged (so congruence is respected) and no EUF-disequal pair is arith-equal (an equal-but-disequal pair is undecided → split → the `=` branch conflicts, forcing `<`/`>`). UNSAT comes from a theory conflict over `EqLeaf` antecedents (the existing path). Hence the verdict is sound and, for pure-Int queries, the built model is valid.
+- **Termination.** The shared set is finite. Each split permanently decides one pair's relation (`=`/`<`/`>`); once decided, that pair is no longer model-equal-unmerged, so it is never re-split. The undecided set strictly shrinks → finitely many splits. (This mirrors the integer-branching split, which also emits one split per check.)
+- **Completeness.** Every undecided arrangement is eventually decided by a split, so the combination explores all relevant arrangements; with EUF and LIA each complete, the verdict is decided. `unknown` is reserved for genuinely unsupported constructs only.
 
 ---
 
@@ -153,45 +153,38 @@ SAT assigns atoms
 
 | Risk | Mitigation |
 | --- | --- |
-| **`FinalCheck::Incomplete` → `Unknown` plumbing** is a new SAT-seam outcome (§4.4) — riskiest surface | Minimal, additive variant; dedicated unit test that a known non-convex instance reaches the give-up path and the solver reports `unknown` (not SAT, not a panic) |
-| **Unsound SAT on a non-convex instance** (the cardinal sin) | The arrangement guard is the gatekeeper: SAT requires an empty undecided set. The §1.1 witness is a permanent regression test asserting `unknown` (Stage 1) / correct verdict (Stage 2) |
-| **Random QF_UFLIA skews convex** → the guard rarely fires → weak non-convex coverage | A **curated non-convex tier** (the `1≤x≤2 ∧ y=1 ∧ z=2` + `f(x)≠f(y) ∧ f(x)≠f(z)` family and relatives), consistent with the project's existing tier-curation practice |
-| **Int interface sentinels** leak into conflicts or survive backtracking | Reuse the existing `iface_lit`/tag + R5 push/pop discipline already validated for Real; verification tests on the Int path |
-| **Model seam disagreement** on Int shared terms | `build_model::merge_check` debug-assert already guards this for Real; extend coverage to Int-sorted `f`-apps |
-| **MBTC split explosion** (Stage 2) | Splits only on model-equal-but-unpinned pairs (lazy); probe deduction pre-filters individually-entailed pairs so they never split |
+| **Unsound SAT on a non-convex instance** (cardinal sin) | The MBTC split is the gatekeeper: SAT requires zero undecided Int pairs. The §1.1 witness is a permanent regression test asserting UNSAT |
+| **`bind_fresh` mis-routes the EUF `=` atom** | Generalize to `classify`-based routing (§3.3); unit test that a fresh `(= u v)` registers under `Owner::Euf` and a fresh `(< u v)` under `Owner::Arith`; existing QF_LIA split tests guard the arith path |
+| **Split non-termination / livelock** | One split per check; each decides a pair permanently; undecided set strictly shrinks (§6). A property/e2e test on a multi-pair instance confirms convergence |
+| **Int interface sentinels leak into conflicts or survive backtracking** | Reuse the existing `iface_lit`/tag + R5 push/pop discipline already validated for Real; verification tests on the Int path |
+| **Spurious extra splits from incidental 0-collisions** | Accepted: each costs one immediately-resolved split (not a wrong answer). If profiling shows blow-up, restrict candidate pairs to congruence-relevant ones later — an optimization, not a correctness need |
+| **Commit-ordering unsoundness** | Land the arith seam, `bind_fresh`, and the MBTC split (all inert while the shared set has no Int terms) *before* flipping on Int sharing; every intermediate commit is sound |
 
 ---
 
 ## 8. Testing & Definition of Done
 
-**Harness.** Activate the `#[ignore]`'d `crates/shinri-theory/tests/oracle.rs` (`Combiner<Euf, Arith>`) and add a `shinri-solver` end-to-end QF_UFLIA differential vs **z3 + cvc5** on random well-typed instances. `unknown` is **never** a failure; any SAT/UNSAT disagreement is a **P0** bug.
+**Harness.** Activate the `#[ignore]`'d `crates/shinri-theory/tests/oracle.rs` (`Combiner<Euf, Arith>`) and add a `shinri-solver` end-to-end QF_UFLIA differential vs **z3 (+ cvc5)** on random well-typed instances. Any SAT/UNSAT disagreement is **P0**; `unknown` (only for unsupported constructs) is never a failure.
 
-**Stage 1 DoD (outcome-anchored):**
-1. Convex / individually-decided QF_UFLIA corpus — **SAT and UNSAT** both green vs z3 + cvc5.
-2. A curated **non-convex tier** (§1.1 family) — Stage 1 returns **`unknown`**, asserted by a dedicated test. This proves the guard *fires* rather than guessing — the soundness headline of the stage.
-3. QF_UFLRA convex cases incidentally green (free validation of the shared plumbing).
-
-**Stage 2 DoD (outcome-anchored):**
-1. The curated non-convex tier flips `unknown` → z3/cvc5-agreeing verdict (SAT and UNSAT both represented).
-2. A **Stage-1-gate-off vs Stage-2-gate-on two-stage differential** (B1/B2 style) asserts **every Stage-1 SAT/UNSAT verdict is preserved** and only `unknown`s change.
-
-**Gate.** A Stage-B-style on/off gate selects guard→unknown (Stage 1) vs guard→split (Stage 2), so the two-stage differential above is mechanically expressible.
+**Definition of done (outcome-anchored):**
+1. The non-convexity witness (§1.1) returns **UNSAT** (the soundness headline — it was wrongly SAT before).
+2. Curated convex/entailed witnesses return their definite verdicts (SAT and UNSAT): pinned-bounds congruence, non-fixed entailed equality, genuinely-SAT congruence, free-arrangement SAT.
+3. The differential vs z3 (+ cvc5) on random QF_UFLIA agrees on every definite verdict across the corpus.
+4. QF_UFLRA / QF_UF / QF_LIA suites are unchanged (Real pairs are never split; pure-Int QF_LIA has no shared EUF terms).
 
 ---
 
-## 9. Build order (Stage 1)
+## 9. Build order
 
-1. Int-sorted term sharing (§4.1) — EUF interning + Arith `ensure_shared_var`/numeral pin; unit tests on `f: Int→Int` congruence and Int numeral pinning.
-2. Fence narrowing (§4.2) — EUF↔Int-arith no longer `saw_shared`-fenced; `lira` and `Unsupported` fences preserved (regression test).
-3. Arrangement-completeness check (§4.3) + `model_equal_shared_pairs` seam.
-4. `FinalCheck::Incomplete` → `Unknown` surfacing (§4.4) — the SAT-seam touch, with its dedicated test.
-5. Int-aware model seam (§4.5).
-6. Activate the combination oracle + end-to-end differential (§8); curate the convex and non-convex tiers.
-
-Stage 2 (MBTC) is planned separately once Stage 1 is green.
+1. Arith seam: Int integrality in `ensure_shared_var` + `model_equal_shared_pairs` (Int-only) + trait method. *(inert)*
+2. Combiner `bind_fresh` generalization (classify-based routing). *(inert / behavior-preserving)*
+3. Combiner MBTC split in `drive_final_check`. *(inert until Int terms are shared)*
+4. EUF Int-sorted sharing (rename + Real∨Int filter) — **activates** MBTC, soundly, because steps 1–3 are in place.
+5. QF_UFLIA e2e witnesses (definite verdicts).
+6. Differential oracle vs z3 (+ cvc5).
 
 ---
 
 ## 10. Summary
 
-QF_UFLIA is the first activation of shinri's Nelson–Oppen framework as a real cooperating pair. The convex combination plumbing already exists; the milestone adds Int-sorted sharing and isolates integer non-convexity into a single combiner-level arrangement check. Stage 1 ships a sound solver that answers `unknown` exactly when the arrangement is undecided; Stage 2 (MBTC, via the existing `TCheck::Split` seam) removes those `unknown`s while provably preserving every Stage-1 verdict. Soundness is total throughout; mixed QF_LIRA and proof emission beyond Farkas remain fenced as separate later milestones.
+QF_UFLIA is the first activation of shinri's Nelson–Oppen framework as a real cooperating pair. The convex plumbing already exists; the milestone adds Int-sorted sharing, Int integrality, and isolates integer non-convexity into a single combiner-level MBTC step that decides each undecided shared-Int arrangement with an integer trichotomy split over the existing splitting-on-demand machinery. The result is sound and complete for pure-Int QF_UFLIA, leaves QF_UFLRA split-free and unchanged, and keeps mixed QF_LIRA and proof emission beyond Farkas fenced as separate later milestones.
