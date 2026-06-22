@@ -9,6 +9,7 @@ pub mod encode;
 pub mod farkas;
 pub mod model;
 pub mod normalize;
+pub mod propagate;
 pub mod simplex;
 pub mod tableau;
 pub mod vars;
