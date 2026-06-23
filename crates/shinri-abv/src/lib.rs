@@ -7,4 +7,4 @@ pub mod driver;
 
 pub use abstraction::{abstract_arrays, Abstraction};
 pub use collect::{collect, Collected};
-pub use driver::{Lemma, LemmaLit, SatBridge};
+pub use driver::{refine, AbvOutcome, Lemma, LemmaLit, SatBridge};
