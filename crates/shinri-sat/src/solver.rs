@@ -609,9 +609,23 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                         // installing a watch or enqueueing, so the literal would
                                         // never be propagated and the solver would livelock (the
                                         // theory keeps re-emitting the same unit split). Instead,
-                                        // enqueue it directly as a unit fact. If the literal is
-                                        // already false (the other branch was already decided),
-                                        // install_clause handles the conflict path.
+                                        // enqueue it directly as a unit fact, PINNED AT LEVEL 0
+                                        // (mirror add_clause's level-0 pin). Reason::Unit is not
+                                        // level-pinned, so a unit enqueued at level>0 would unassign
+                                        // on backtrack and the theory could re-emit it — a latent
+                                        // non-termination risk (livelock-class) on the shared
+                                        // arrays-ROW-1 + arith-GMI-cut path. Backtracking to level 0
+                                        // first makes the fact persistent across all backtracking, so
+                                        // it structurally cannot be re-emitted. We inline the pin
+                                        // rather than call add_clause because this is a derived
+                                        // theory fact, not an input clause — add_clause would record
+                                        // it into input_clauses (replayed by rebuild/pop without
+                                        // re-asserting to the theory), which is wrong here.
+                                        // If the literal is already false (the other branch was
+                                        // already decided), install_clause handles the conflict path.
+                                        if self.trail.decision_level() != 0 {
+                                            self.backtrack_to(0);
+                                        }
                                         if !self.install_clause(&lits) {
                                             // install_clause enqueues false → livelock break.
                                         }
