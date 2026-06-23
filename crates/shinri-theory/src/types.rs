@@ -114,6 +114,9 @@ pub enum ModelVal {
     Num(Rational),
     /// An abstract domain element for an uninterpreted sort.
     Elem(SortId, u32),
+    /// A bitvector value: `(width, unsigned_value)`.
+    /// `unsigned_value` is a non-negative integer in `[0, 2^width)`.
+    BitVec(u32, shinri_core::Integer), // width, value
 }
 
 /// A class-union that occurred, surfaced to consumers via `drain_merges`.

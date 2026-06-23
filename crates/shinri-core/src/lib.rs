@@ -16,7 +16,7 @@ pub use context::Context;
 pub use error::SortError;
 pub use ids::{BvId, ClauseId, Lit, RatId, SortId, SymbolId, TermId, Var};
 pub use proof::{NoProof, ProofSink, TheoryJust};
-pub use shinri_num::{DeltaRational, Rational};
+pub use shinri_num::{DeltaRational, Integer, Rational};
 pub use sort::SortNode;
 pub use term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
 pub use undo::UndoLog;

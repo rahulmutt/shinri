@@ -443,6 +443,7 @@ dependencies = [
  "rustc-hash",
  "shinri-arith",
  "shinri-arrays",
+ "shinri-bv",
  "shinri-core",
  "shinri-euf",
  "shinri-frontend",
