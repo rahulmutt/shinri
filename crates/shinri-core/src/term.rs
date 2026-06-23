@@ -1,4 +1,4 @@
-use crate::ids::{RatId, SortId, SymbolId};
+use crate::ids::{BvId, RatId, SortId, SymbolId};
 
 /// A (offset, len) view into `Context.children` — out-of-line child storage (SoA).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -43,10 +43,13 @@ pub enum BuiltinOp {
 }
 
 /// A literal constant value. Numerals reference `Context.nums` by `RatId`.
+/// Bitvector literals reference `Context.bvs` by `BvId`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ConstVal {
     Bool(bool),
     Num(RatId),
+    /// A bitvector literal; references `Context.bvs`.
+    BitVec(BvId),
 }
 
 /// A node in the hash-consed term DAG. Fixed-size; children stored out-of-line.

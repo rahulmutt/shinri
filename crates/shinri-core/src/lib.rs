@@ -14,7 +14,7 @@ pub mod undo;
 
 pub use context::Context;
 pub use error::SortError;
-pub use ids::{ClauseId, Lit, RatId, SortId, SymbolId, TermId, Var};
+pub use ids::{BvId, ClauseId, Lit, RatId, SortId, SymbolId, TermId, Var};
 pub use proof::{NoProof, ProofSink, TheoryJust};
 pub use shinri_num::{DeltaRational, Rational};
 pub use sort::SortNode;

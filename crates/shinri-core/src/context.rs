@@ -1,10 +1,10 @@
 use crate::error::SortError;
-use crate::ids::{RatId, SortId, SymbolId, TermId};
+use crate::ids::{BvId, RatId, SortId, SymbolId, TermId};
 use crate::sort::SortNode;
 use crate::symbol::StringInterner;
 use crate::term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
 use rustc_hash::FxHashMap;
-use shinri_num::Rational;
+use shinri_num::{Integer, Rational};
 
 /// The single owning arena for all interned sorts (and, after Task 4, terms).
 #[derive(Clone)]
@@ -17,6 +17,8 @@ pub struct Context {
     nums: Vec<Rational>,
     term_interner: FxHashMap<TermKey, TermId>,
     fun_sigs: FxHashMap<SymbolId, (Vec<SortId>, SortId)>,
+    /// BV literal table: index `BvId(i)` -> `(width, value in [0, 2^width))`.
+    bvs: Vec<(u32, Integer)>,
     bool_sort: SortId,
     int_sort: SortId,
     real_sort: SortId,
@@ -39,6 +41,7 @@ impl Context {
             nums: Vec::new(),
             term_interner: FxHashMap::default(),
             fun_sigs: FxHashMap::default(),
+            bvs: Vec::new(),
             // placeholders; overwritten immediately below
             bool_sort: SortId::from_index(0),
             int_sort: SortId::from_index(0),
@@ -321,6 +324,26 @@ fn expect_all(ctx: &Context, args: &[TermId], expected: SortId) -> Result<(), So
     Ok(())
 }
 
+/// Reduce `value` modulo 2^width into the range `[0, 2^width)`.
+///
+/// Builds 2^width by repeated doubling (avoids relying on `Shl` for `Integer`)
+/// then uses `div_rem` (truncated). Because `div_rem` gives a remainder with
+/// the sign of the dividend, negative inputs yield a negative remainder; we add
+/// the modulus once to bring it into `[0, 2^width)`.
+fn reduce_mod_pow2(value: &Integer, width: u32) -> Integer {
+    // Build modulus = 2^width by repeated doubling from 1.
+    let mut modulus = Integer::one();
+    let two = Integer::from(2i128);
+    for _ in 0..width {
+        modulus = modulus * two.clone();
+    }
+    let (_, mut rem) = value.div_rem(&modulus);
+    if rem.is_negative() {
+        rem = rem + modulus;
+    }
+    rem
+}
+
 /// A fully-resolved structural key for term interning. Distinct from `TermNode`
 /// because `TermNode::App` stores a `ChildSlice` (offset into the arena); two
 /// structurally identical apps built at different times would have different
@@ -398,6 +421,36 @@ impl Context {
         }
     }
 
+    /// Intern a bitvector literal. `value` is reduced mod 2^width into `[0, 2^width)`.
+    pub fn mk_bv_const(&mut self, width: u32, value: Integer) -> TermId {
+        let reduced = reduce_mod_pow2(&value, width);
+        let bv_id = match self.bvs.iter().position(|(w, v)| *w == width && *v == reduced) {
+            Some(idx) => BvId::new(idx as u32),
+            None => {
+                let id = BvId::new(self.bvs.len() as u32);
+                self.bvs.push((width, reduced));
+                id
+            }
+        };
+        let sort = self.bv_sort(width);
+        let val = ConstVal::BitVec(bv_id);
+        self.intern_with_key(TermKey::Const { val, sort }, TermNode::Const { val, sort })
+    }
+
+    /// Return the `(width, &value)` of a BV literal term, or `None` if `t` is not one.
+    pub fn bv_const_value(&self, t: TermId) -> Option<(u32, &Integer)> {
+        match self.term_node(t) {
+            TermNode::Const {
+                val: ConstVal::BitVec(id),
+                ..
+            } => {
+                let (w, v) = &self.bvs[id.index()];
+                Some((*w, v))
+            }
+            _ => None,
+        }
+    }
+
     pub fn children(&self, slice: ChildSlice) -> &[TermId] {
         let start = slice.off as usize;
         let end = start + slice.len as usize;
@@ -447,7 +500,7 @@ mod tests {
     use crate::error::SortError;
     use crate::sort::SortNode;
     use crate::term::{BuiltinOp, ConstVal, Op, TermNode};
-    use shinri_num::Rational;
+    use shinri_num::{Integer, Rational};
 
     #[test]
     fn well_known_sorts_distinct_and_stable() {
@@ -605,6 +658,32 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::Add), &[one, two])
             .unwrap();
         assert_eq!(ctx.substitute(sum, &[three], &[one]), sum);
+    }
+
+    #[test]
+    fn bv_const_roundtrips_value_and_sort() {
+        use shinri_num::Integer;
+        let mut ctx = Context::new();
+        let t = ctx.mk_bv_const(8, Integer::from(5u64));
+        assert_eq!(ctx.sort_of(t), ctx.bv_sort(8));
+        let (w, v) = ctx.bv_const_value(t).unwrap();
+        assert_eq!(w, 8);
+        assert_eq!(*v, Integer::from(5u64));
+        // Hash-consing: identical literal interns once.
+        let t2 = ctx.mk_bv_const(8, Integer::from(5u64));
+        assert_eq!(t, t2);
+    }
+
+    #[test]
+    fn reduce_mod_pow2_negative_and_over_width() {
+        // -1 mod 2^8 = 255
+        let neg_one = Integer::from(-1i128);
+        let r = reduce_mod_pow2(&neg_one, 8);
+        assert_eq!(r, Integer::from(255u64));
+        // 300 mod 2^8 = 44
+        let over = Integer::from(300i128);
+        let r2 = reduce_mod_pow2(&over, 8);
+        assert_eq!(r2, Integer::from(44u64));
     }
 
     #[test]

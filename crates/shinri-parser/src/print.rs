@@ -11,6 +11,11 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
     match ctx.term_node(t).clone() {
         TermNode::Const { val, sort } => match val {
             ConstVal::Bool(b) => out.push_str(if b { "true" } else { "false" }),
+            ConstVal::BitVec(_) => {
+                let (width, value) = ctx.bv_const_value(t).unwrap();
+                // Render as SMT-LIB indexed bitvector literal: (_ bv<value> <width>)
+                out.push_str(&format!("(_ bv{value} {width})"));
+            }
             ConstVal::Num(_) => {
                 // Minimal printer: assumes non-negative numerals; negatives are out of scope for round-trip (Phase 1).
                 let r = ctx.numeral_value(t).unwrap();
