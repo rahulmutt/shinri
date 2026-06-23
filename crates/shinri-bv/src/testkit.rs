@@ -2,7 +2,7 @@
 //! Only compiled under `#[cfg(test)]`.
 
 use crate::blast::{BitLit, Blaster, Cnf};
-use shinri_sat::{Lit, NoProof, NoTheory, Solver, SolveResult, SolverConfig, Var, Vmtf};
+use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
 
 /// Allocate `width` fresh bits in `b` and add unit clauses pinning each bit i
 /// to bit i of `val` (LSB→MSB order).
@@ -36,7 +36,9 @@ fn build_solver(cnf: &Cnf) -> Solver<NoTheory, NoProof, Vmtf> {
 fn pack_bits(s: &Solver<NoTheory, NoProof, Vmtf>, bits: &[BitLit]) -> u64 {
     let mut out: u64 = 0;
     for (i, bl) in bits.iter().enumerate() {
-        let raw = s.value_of(Var::new(bl.var)).expect("output var unassigned in model");
+        let raw = s
+            .value_of(Var::new(bl.var))
+            .expect("output var unassigned in model");
         let bit_val = if bl.pos { raw } else { !raw };
         if bit_val {
             out |= 1u64 << i;

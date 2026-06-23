@@ -90,11 +90,7 @@ fn is_bv_predicate(op: &Op) -> bool {
 /// True if any subterm of any assertion has a BitVec sort or a BV builtin op.
 pub fn solver_uses_bv(ctx: &Context, assertions: &[TermId]) -> bool {
     let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
-    fn walk(
-        ctx: &Context,
-        t: TermId,
-        seen: &mut rustc_hash::FxHashSet<TermId>,
-    ) -> bool {
+    fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
         if !seen.insert(t) {
             return false;
         }
@@ -174,11 +170,7 @@ pub fn collect_bv_atoms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
 /// `classify` recognizes as a theory atom (EUF/Arith/Arrays/Shared) — OR that
 /// `classify` refuses (Unsupported) — triggers the fence. Only pure Boolean
 /// connectives over BV atoms pass.
-pub fn has_non_bv_theory_atom(
-    ctx: &Context,
-    assertions: &[TermId],
-    bv_atoms: &[TermId],
-) -> bool {
+pub fn has_non_bv_theory_atom(ctx: &Context, assertions: &[TermId], bv_atoms: &[TermId]) -> bool {
     let bv_set: rustc_hash::FxHashSet<TermId> = bv_atoms.iter().copied().collect();
     let mut visited: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
     fn walk(
@@ -211,12 +203,10 @@ pub fn has_non_bv_theory_atom(
                 );
                 // Bool-sorted Eq/Distinct over Bool operands is also Boolean
                 // structure (iff/xor), handled by the SAT skeleton.
-                let is_bool_eq = matches!(
-                    op,
-                    Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct)
-                ) && kids
-                    .first()
-                    .is_some_and(|&k| ctx.sort_of(k) == ctx.bool_sort());
+                let is_bool_eq = matches!(op, Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct))
+                    && kids
+                        .first()
+                        .is_some_and(|&k| ctx.sort_of(k) == ctx.bool_sort());
                 if is_bool_structure || is_bool_eq {
                     return kids.iter().any(|&k| walk(ctx, k, bv_set, visited));
                 }
@@ -262,14 +252,21 @@ mod tests {
         let x = bv_var(&mut ctx, "x", 8);
         let one = ctx.mk_bv_const(8, Integer::from(1u64));
         let five = ctx.mk_bv_const(8, Integer::from(5u64));
-        let add = ctx.mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, one]).unwrap();
+        let add = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, one])
+            .unwrap();
         let eq = ctx.mk_eq(add, one).unwrap(); // BV equality
-        let ult = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[x, five]).unwrap();
+        let ult = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[x, five])
+            .unwrap();
         let assertions = vec![eq, ult];
         assert!(solver_uses_bv(&ctx, &assertions));
         let atoms = collect_bv_atoms(&ctx, &assertions);
         // Both the BV equality and the BV predicate must be collected.
-        assert!(atoms.contains(&eq), "BV equality must be collected (soundness)");
+        assert!(
+            atoms.contains(&eq),
+            "BV equality must be collected (soundness)"
+        );
         assert!(atoms.contains(&ult), "BV predicate must be collected");
         assert_eq!(atoms.len(), 2);
         // No non-BV theory atom present.

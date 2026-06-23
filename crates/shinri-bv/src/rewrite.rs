@@ -21,11 +21,7 @@ pub fn rewrite(ctx: &mut Context, t: TermId) -> TermId {
     rewrite_inner(ctx, t, &mut memo)
 }
 
-fn rewrite_inner(
-    ctx: &mut Context,
-    t: TermId,
-    memo: &mut FxHashMap<TermId, TermId>,
-) -> TermId {
+fn rewrite_inner(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -> TermId {
     if let Some(&cached) = memo.get(&t) {
         return cached;
     }
@@ -43,7 +39,10 @@ fn rewrite_inner(
                 .collect();
 
             // Rebuild the node if any child changed.
-            let changed = new_children.iter().zip(child_ids.iter()).any(|(nc, &c)| *nc != c);
+            let changed = new_children
+                .iter()
+                .zip(child_ids.iter())
+                .any(|(nc, &c)| *nc != c);
             let rebuilt = if changed {
                 match ctx.mk_app(op, &new_children) {
                     Ok(id) => id,
@@ -68,34 +67,25 @@ fn rewrite_inner(
 fn apply_rules(ctx: &mut Context, t: TermId) -> TermId {
     let node = ctx.term_node(t).clone();
     match node {
-        TermNode::App { op: Op::Builtin(bv_op), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(bv_op),
+            args,
+            ..
+        } => {
             let child_ids: Vec<TermId> = ctx.children(args).to_vec();
             match bv_op {
                 // ── Constant folding ─────────────────────────────────────────
                 // For binary ops with both operands as BV constants:
                 // compute the value over Integer, reduce mod 2^width, return constant.
-                BuiltinOp::BvAdd => {
-                    fold_binary_or_identity(ctx, t, &child_ids, bv_op)
-                }
-                BuiltinOp::BvSub => {
-                    fold_binary_or_identity(ctx, t, &child_ids, bv_op)
-                }
-                BuiltinOp::BvMul => {
-                    fold_binary_or_identity(ctx, t, &child_ids, bv_op)
-                }
-                BuiltinOp::BvAnd => {
-                    fold_binary_or_identity(ctx, t, &child_ids, bv_op)
-                }
-                BuiltinOp::BvOr => {
-                    fold_binary_or_identity(ctx, t, &child_ids, bv_op)
-                }
-                BuiltinOp::BvXor => {
-                    fold_binary_or_identity(ctx, t, &child_ids, bv_op)
-                }
+                BuiltinOp::BvAdd => fold_binary_or_identity(ctx, t, &child_ids, bv_op),
+                BuiltinOp::BvSub => fold_binary_or_identity(ctx, t, &child_ids, bv_op),
+                BuiltinOp::BvMul => fold_binary_or_identity(ctx, t, &child_ids, bv_op),
+                BuiltinOp::BvAnd => fold_binary_or_identity(ctx, t, &child_ids, bv_op),
+                BuiltinOp::BvOr => fold_binary_or_identity(ctx, t, &child_ids, bv_op),
+                BuiltinOp::BvXor => fold_binary_or_identity(ctx, t, &child_ids, bv_op),
                 BuiltinOp::BvNot => {
                     // Constant fold bvnot
                     if let Some((width, val)) = ctx.bv_const_value(child_ids[0]) {
-                        let width = width;
                         let val = val.clone();
                         let mask = make_all_ones(width);
                         let result_val = bitwise_xor_int(&val, &mask, width);
@@ -107,7 +97,6 @@ fn apply_rules(ctx: &mut Context, t: TermId) -> TermId {
                 BuiltinOp::BvNeg => {
                     // Constant fold bvneg = 0 - x
                     if let Some((width, val)) = ctx.bv_const_value(child_ids[0]) {
-                        let width = width;
                         let val = val.clone();
                         let zero = Integer::zero();
                         let result_val = reduce_mod_pow2(&(zero - val), width);
@@ -116,9 +105,7 @@ fn apply_rules(ctx: &mut Context, t: TermId) -> TermId {
                         t
                     }
                 }
-                BuiltinOp::BvShl => {
-                    fold_binary_or_identity(ctx, t, &child_ids, bv_op)
-                }
+                BuiltinOp::BvShl => fold_binary_or_identity(ctx, t, &child_ids, bv_op),
                 // ── Structural rules ─────────────────────────────────────────
                 BuiltinOp::BvExtract { hi, lo } => {
                     apply_extract_rules(ctx, t, child_ids[0], hi, lo)
@@ -156,31 +143,14 @@ fn fold_binary_or_identity(
 
 /// Compute the result value of a binary BV op applied to two concrete constants.
 /// Returns None if this op is not supported for constant folding.
-fn fold_const_binary(
-    op: BuiltinOp,
-    lv: &Integer,
-    rv: &Integer,
-    width: u32,
-) -> Option<Integer> {
+fn fold_const_binary(op: BuiltinOp, lv: &Integer, rv: &Integer, width: u32) -> Option<Integer> {
     match op {
-        BuiltinOp::BvAdd => {
-            Some(reduce_mod_pow2(&(lv.clone() + rv.clone()), width))
-        }
-        BuiltinOp::BvSub => {
-            Some(reduce_mod_pow2(&(lv.clone() - rv.clone()), width))
-        }
-        BuiltinOp::BvMul => {
-            Some(reduce_mod_pow2(&(lv.clone() * rv.clone()), width))
-        }
-        BuiltinOp::BvAnd => {
-            Some(bitwise_and_int(lv, rv, width))
-        }
-        BuiltinOp::BvOr => {
-            Some(bitwise_or_int(lv, rv, width))
-        }
-        BuiltinOp::BvXor => {
-            Some(bitwise_xor_int(lv, rv, width))
-        }
+        BuiltinOp::BvAdd => Some(reduce_mod_pow2(&(lv.clone() + rv.clone()), width)),
+        BuiltinOp::BvSub => Some(reduce_mod_pow2(&(lv.clone() - rv.clone()), width)),
+        BuiltinOp::BvMul => Some(reduce_mod_pow2(&(lv.clone() * rv.clone()), width)),
+        BuiltinOp::BvAnd => Some(bitwise_and_int(lv, rv, width)),
+        BuiltinOp::BvOr => Some(bitwise_or_int(lv, rv, width)),
+        BuiltinOp::BvXor => Some(bitwise_xor_int(lv, rv, width)),
         BuiltinOp::BvShl => {
             // lv << rv (mod 2^width); if rv >= width, result is 0.
             if let Some(shift_amount) = rv.to_i128() {
@@ -191,7 +161,7 @@ fn fold_const_binary(
                     let two = Integer::from(2i128);
                     let mut factor = Integer::one();
                     for _ in 0..shift_amount {
-                        factor = factor * two.clone();
+                        factor *= two.clone();
                     }
                     Some(reduce_mod_pow2(&(lv.clone() * factor), width))
                 }
@@ -320,10 +290,15 @@ fn apply_identity(
 /// - extract(i, j, concat(hi, lo)):
 ///   - If the range is entirely within lo: extract(i, j, lo)
 ///   - If the range is entirely within hi: extract(i - lo_width, j - lo_width, hi)
+///
 ///   (The split-across-boundary case is more complex and left to the blaster for soundness.)
 fn apply_extract_rules(ctx: &mut Context, t: TermId, inner: TermId, hi: u32, lo: u32) -> TermId {
     match ctx.term_node(inner).clone() {
-        TermNode::App { op: Op::Builtin(BuiltinOp::BvExtract { hi: _k, lo: l }), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::BvExtract { hi: _k, lo: l }),
+            args,
+            ..
+        } => {
             // extract(hi, lo, extract(k, l, a)) -> extract(hi+l, lo+l, a)
             let inner_children: Vec<TermId> = ctx.children(args).to_vec();
             let a = inner_children[0];
@@ -333,7 +308,13 @@ fn apply_extract_rules(ctx: &mut Context, t: TermId, inner: TermId, hi: u32, lo:
             let a_sort = ctx.sort_of(a);
             if let Some(a_width) = ctx.bv_width(a_sort) {
                 if new_hi < a_width && new_lo <= new_hi {
-                    match ctx.mk_app(Op::Builtin(BuiltinOp::BvExtract { hi: new_hi, lo: new_lo }), &[a]) {
+                    match ctx.mk_app(
+                        Op::Builtin(BuiltinOp::BvExtract {
+                            hi: new_hi,
+                            lo: new_lo,
+                        }),
+                        &[a],
+                    ) {
                         Ok(id) => return id,
                         Err(_) => return t,
                     }
@@ -341,7 +322,11 @@ fn apply_extract_rules(ctx: &mut Context, t: TermId, inner: TermId, hi: u32, lo:
             }
             t
         }
-        TermNode::App { op: Op::Builtin(BuiltinOp::BvConcat), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::BvConcat),
+            args,
+            ..
+        } => {
             // extract(hi, lo, concat(hi_part, lo_part))
             // concat(hi_part, lo_part): lo_part occupies bits [0, lo_width-1],
             //                          hi_part occupies bits [lo_width, total-1].
@@ -360,7 +345,13 @@ fn apply_extract_rules(ctx: &mut Context, t: TermId, inner: TermId, hi: u32, lo:
                     // Entirely within hi_part.
                     let new_hi = hi - lo_width;
                     let new_lo = lo - lo_width;
-                    match ctx.mk_app(Op::Builtin(BuiltinOp::BvExtract { hi: new_hi, lo: new_lo }), &[hi_part]) {
+                    match ctx.mk_app(
+                        Op::Builtin(BuiltinOp::BvExtract {
+                            hi: new_hi,
+                            lo: new_lo,
+                        }),
+                        &[hi_part],
+                    ) {
                         Ok(id) => return id,
                         Err(_) => return t,
                     }
@@ -380,11 +371,11 @@ fn reduce_mod_pow2(value: &Integer, width: u32) -> Integer {
     let mut modulus = Integer::one();
     let two = Integer::from(2i128);
     for _ in 0..width {
-        modulus = modulus * two.clone();
+        modulus *= two.clone();
     }
     let (_, mut rem) = value.div_rem(&modulus);
     if rem.is_negative() {
-        rem = rem + modulus;
+        rem += modulus;
     }
     rem
 }
@@ -394,7 +385,7 @@ fn make_all_ones(width: u32) -> Integer {
     let mut modulus = Integer::one();
     let two = Integer::from(2i128);
     for _ in 0..width {
-        modulus = modulus * two.clone();
+        modulus *= two.clone();
     }
     modulus - Integer::one()
 }
@@ -414,9 +405,9 @@ fn bitwise_and_int(a: &Integer, b: &Integer, width: u32) -> Integer {
         rem_b = qb;
         // AND: bit is 1 only if both are 1.
         if !ra.is_zero() && !rb.is_zero() {
-            result = result + place.clone();
+            result += place.clone();
         }
-        place = place * two.clone();
+        place *= two.clone();
     }
     result
 }
@@ -435,9 +426,9 @@ fn bitwise_or_int(a: &Integer, b: &Integer, width: u32) -> Integer {
         rem_b = qb;
         // OR: bit is 1 if either is 1.
         if !ra.is_zero() || !rb.is_zero() {
-            result = result + place.clone();
+            result += place.clone();
         }
-        place = place * two.clone();
+        place *= two.clone();
     }
     result
 }
@@ -456,9 +447,9 @@ fn bitwise_xor_int(a: &Integer, b: &Integer, width: u32) -> Integer {
         rem_b = qb;
         // XOR: bit is 1 if exactly one is 1.
         if ra.is_zero() != rb.is_zero() {
-            result = result + place.clone();
+            result += place.clone();
         }
-        place = place * two.clone();
+        place *= two.clone();
     }
     result
 }
@@ -498,7 +489,9 @@ mod tests {
         let xf = ctx.declare_fun("x", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-        let add0 = ctx.mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, zero]).unwrap();
+        let add0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, zero])
+            .unwrap();
         assert_eq!(rewrite(&mut ctx, add0), x, "x + 0 should simplify to x");
     }
 
@@ -522,7 +515,9 @@ mod tests {
         let xf = ctx.declare_fun("x_sub", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-        let sub0 = ctx.mk_app(Op::Builtin(BuiltinOp::BvSub), &[x, zero]).unwrap();
+        let sub0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvSub), &[x, zero])
+            .unwrap();
         assert_eq!(rewrite(&mut ctx, sub0), x, "x - 0 should be x");
     }
 
@@ -534,7 +529,11 @@ mod tests {
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let sub_xx = ctx.mk_app(Op::Builtin(BuiltinOp::BvSub), &[x, x]).unwrap();
         let r = rewrite(&mut ctx, sub_xx);
-        assert_eq!(ctx.bv_const_value(r).unwrap().1, &Integer::zero(), "x - x should be 0");
+        assert_eq!(
+            ctx.bv_const_value(r).unwrap().1,
+            &Integer::zero(),
+            "x - x should be 0"
+        );
     }
 
     #[test]
@@ -544,7 +543,9 @@ mod tests {
         let xf = ctx.declare_fun("x_mul1", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let one = ctx.mk_bv_const(8, Integer::from(1u64));
-        let mul1 = ctx.mk_app(Op::Builtin(BuiltinOp::BvMul), &[x, one]).unwrap();
+        let mul1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvMul), &[x, one])
+            .unwrap();
         assert_eq!(rewrite(&mut ctx, mul1), x, "x * 1 should be x");
     }
 
@@ -555,9 +556,15 @@ mod tests {
         let xf = ctx.declare_fun("x_mul0", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-        let mul0 = ctx.mk_app(Op::Builtin(BuiltinOp::BvMul), &[x, zero]).unwrap();
+        let mul0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvMul), &[x, zero])
+            .unwrap();
         let r = rewrite(&mut ctx, mul0);
-        assert_eq!(ctx.bv_const_value(r).unwrap().1, &Integer::zero(), "x * 0 should be 0");
+        assert_eq!(
+            ctx.bv_const_value(r).unwrap().1,
+            &Integer::zero(),
+            "x * 0 should be 0"
+        );
     }
 
     #[test]
@@ -567,7 +574,9 @@ mod tests {
         let xf = ctx.declare_fun("x_and_ones", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let all_ones = ctx.mk_bv_const(8, Integer::from(0xFFu64));
-        let and_ones = ctx.mk_app(Op::Builtin(BuiltinOp::BvAnd), &[x, all_ones]).unwrap();
+        let and_ones = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAnd), &[x, all_ones])
+            .unwrap();
         assert_eq!(rewrite(&mut ctx, and_ones), x, "x & 0xFF should be x");
     }
 
@@ -578,9 +587,15 @@ mod tests {
         let xf = ctx.declare_fun("x_and_zero", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-        let and0 = ctx.mk_app(Op::Builtin(BuiltinOp::BvAnd), &[x, zero]).unwrap();
+        let and0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAnd), &[x, zero])
+            .unwrap();
         let r = rewrite(&mut ctx, and0);
-        assert_eq!(ctx.bv_const_value(r).unwrap().1, &Integer::zero(), "x & 0 should be 0");
+        assert_eq!(
+            ctx.bv_const_value(r).unwrap().1,
+            &Integer::zero(),
+            "x & 0 should be 0"
+        );
     }
 
     #[test]
@@ -590,7 +605,9 @@ mod tests {
         let xf = ctx.declare_fun("x_or_zero", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-        let or0 = ctx.mk_app(Op::Builtin(BuiltinOp::BvOr), &[x, zero]).unwrap();
+        let or0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvOr), &[x, zero])
+            .unwrap();
         assert_eq!(rewrite(&mut ctx, or0), x, "x | 0 should be x");
     }
 
@@ -601,9 +618,15 @@ mod tests {
         let xf = ctx.declare_fun("x_or_ones", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let all_ones = ctx.mk_bv_const(8, Integer::from(0xFFu64));
-        let or_ones = ctx.mk_app(Op::Builtin(BuiltinOp::BvOr), &[x, all_ones]).unwrap();
+        let or_ones = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvOr), &[x, all_ones])
+            .unwrap();
         let r = rewrite(&mut ctx, or_ones);
-        assert_eq!(ctx.bv_const_value(r).unwrap().1, &Integer::from(0xFFu64), "x | 0xFF should be 0xFF");
+        assert_eq!(
+            ctx.bv_const_value(r).unwrap().1,
+            &Integer::from(0xFFu64),
+            "x | 0xFF should be 0xFF"
+        );
     }
 
     #[test]
@@ -613,7 +636,9 @@ mod tests {
         let xf = ctx.declare_fun("x_xor_zero", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-        let xor0 = ctx.mk_app(Op::Builtin(BuiltinOp::BvXor), &[x, zero]).unwrap();
+        let xor0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvXor), &[x, zero])
+            .unwrap();
         assert_eq!(rewrite(&mut ctx, xor0), x, "x ^ 0 should be x");
     }
 
@@ -624,7 +649,9 @@ mod tests {
         let xf = ctx.declare_fun("x_shl_zero", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-        let shl0 = ctx.mk_app(Op::Builtin(BuiltinOp::BvShl), &[x, zero]).unwrap();
+        let shl0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvShl), &[x, zero])
+            .unwrap();
         assert_eq!(rewrite(&mut ctx, shl0), x, "x << 0 should be x");
     }
 
@@ -644,7 +671,9 @@ mod tests {
         let xf = ctx.declare_fun("x_idem", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-        let add0 = ctx.mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, zero]).unwrap();
+        let add0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, zero])
+            .unwrap();
         let r3 = rewrite(&mut ctx, add0);
         let r4 = rewrite(&mut ctx, r3);
         assert_eq!(r3, r4, "rewrite(rewrite(x+0)) == rewrite(x+0)");
@@ -668,7 +697,7 @@ mod tests {
         use super::*;
         use crate::blast::Blaster;
         use crate::testkit::solve_value;
-        use shinri_sat::{Lit, NoProof, NoTheory, Solver, SolveResult, SolverConfig, Var, Vmtf};
+        use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
 
         /// Build a solver from a finished Cnf.
         fn build_solver(cnf: &crate::blast::Cnf) -> Solver<NoTheory, NoProof, Vmtf> {
@@ -696,7 +725,8 @@ mod tests {
             let result = s.solve();
             assert!(
                 matches!(result, SolveResult::Unsat { .. }),
-                "miter is SAT — rewrite rule is UNSOUND! got {:?}", result
+                "miter is SAT — rewrite rule is UNSOUND! got {:?}",
+                result
             );
         }
 
@@ -733,7 +763,9 @@ mod tests {
             let mut ctx = Context::new();
             let a = ctx.mk_bv_const(8, Integer::from(200u64));
             let b_term = ctx.mk_bv_const(8, Integer::from(100u64));
-            let add = ctx.mk_app(Op::Builtin(BuiltinOp::BvAdd), &[a, b_term]).unwrap();
+            let add = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[a, b_term])
+                .unwrap();
             let rw = rewrite(&mut ctx, add);
 
             // Both should produce the same value.
@@ -753,7 +785,9 @@ mod tests {
             let mut ctx = Context::new();
             let a = ctx.mk_bv_const(8, Integer::from(5u64));
             let b_term = ctx.mk_bv_const(8, Integer::from(9u64));
-            let sub = ctx.mk_app(Op::Builtin(BuiltinOp::BvSub), &[a, b_term]).unwrap();
+            let sub = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvSub), &[a, b_term])
+                .unwrap();
             let rw = rewrite(&mut ctx, sub);
 
             let mut bl1 = Blaster::new();
@@ -772,7 +806,9 @@ mod tests {
             let mut ctx = Context::new();
             let a = ctx.mk_bv_const(8, Integer::from(13u64));
             let b_term = ctx.mk_bv_const(8, Integer::from(20u64));
-            let mul = ctx.mk_app(Op::Builtin(BuiltinOp::BvMul), &[a, b_term]).unwrap();
+            let mul = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvMul), &[a, b_term])
+                .unwrap();
             let rw = rewrite(&mut ctx, mul);
 
             let mut bl1 = Blaster::new();
@@ -791,7 +827,9 @@ mod tests {
             let mut ctx = Context::new();
             let a = ctx.mk_bv_const(8, Integer::from(0b10110101u64));
             let b_term = ctx.mk_bv_const(8, Integer::from(0b11001100u64));
-            let and = ctx.mk_app(Op::Builtin(BuiltinOp::BvAnd), &[a, b_term]).unwrap();
+            let and = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvAnd), &[a, b_term])
+                .unwrap();
             let rw = rewrite(&mut ctx, and);
 
             let mut bl1 = Blaster::new();
@@ -810,7 +848,9 @@ mod tests {
             let mut ctx = Context::new();
             let a = ctx.mk_bv_const(8, Integer::from(0b10110101u64));
             let b_term = ctx.mk_bv_const(8, Integer::from(0b01001100u64));
-            let or = ctx.mk_app(Op::Builtin(BuiltinOp::BvOr), &[a, b_term]).unwrap();
+            let or = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvOr), &[a, b_term])
+                .unwrap();
             let rw = rewrite(&mut ctx, or);
 
             let mut bl1 = Blaster::new();
@@ -829,7 +869,9 @@ mod tests {
             let mut ctx = Context::new();
             let a = ctx.mk_bv_const(8, Integer::from(0b10110101u64));
             let b_term = ctx.mk_bv_const(8, Integer::from(0b01001100u64));
-            let xor = ctx.mk_app(Op::Builtin(BuiltinOp::BvXor), &[a, b_term]).unwrap();
+            let xor = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvXor), &[a, b_term])
+                .unwrap();
             let rw = rewrite(&mut ctx, xor);
 
             let mut bl1 = Blaster::new();
@@ -889,7 +931,9 @@ mod tests {
             for (x, sh) in [(0b10110101u64, 2u64), (0xFF, 0), (0x80, 7), (0x01, 8)] {
                 let a = ctx.mk_bv_const(8, Integer::from(x));
                 let b_term = ctx.mk_bv_const(8, Integer::from(sh));
-                let shl = ctx.mk_app(Op::Builtin(BuiltinOp::BvShl), &[a, b_term]).unwrap();
+                let shl = ctx
+                    .mk_app(Op::Builtin(BuiltinOp::BvShl), &[a, b_term])
+                    .unwrap();
                 let rw = rewrite(&mut ctx, shl);
 
                 let mut bl1 = Blaster::new();
@@ -913,7 +957,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_add0", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, zero]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, zero])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             // Miter: assert t != rw is UNSAT.
@@ -929,7 +975,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_sub0", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvSub), &[x, zero]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvSub), &[x, zero])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             let mut b = Blaster::new();
@@ -958,7 +1006,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_mul1", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let one = ctx.mk_bv_const(8, Integer::from(1u64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvMul), &[x, one]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvMul), &[x, one])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             let mut b = Blaster::new();
@@ -973,7 +1023,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_mul0", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvMul), &[x, zero]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvMul), &[x, zero])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             let mut b = Blaster::new();
@@ -988,7 +1040,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_and1", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let all_ones = ctx.mk_bv_const(8, Integer::from(0xFFu64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvAnd), &[x, all_ones]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvAnd), &[x, all_ones])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             let mut b = Blaster::new();
@@ -1003,7 +1057,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_and0", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvAnd), &[x, zero]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvAnd), &[x, zero])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             let mut b = Blaster::new();
@@ -1018,7 +1074,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_or0", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvOr), &[x, zero]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvOr), &[x, zero])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             let mut b = Blaster::new();
@@ -1033,7 +1091,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_or1", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let all_ones = ctx.mk_bv_const(8, Integer::from(0xFFu64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvOr), &[x, all_ones]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvOr), &[x, all_ones])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             let mut b = Blaster::new();
@@ -1048,7 +1108,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_xor0", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvXor), &[x, zero]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvXor), &[x, zero])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             let mut b = Blaster::new();
@@ -1063,7 +1125,9 @@ mod tests {
             let xf = ctx.declare_fun("x_m_shl0", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             let zero = ctx.mk_bv_const(8, Integer::from(0u64));
-            let t = ctx.mk_app(Op::Builtin(BuiltinOp::BvShl), &[x, zero]).unwrap();
+            let t = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvShl), &[x, zero])
+                .unwrap();
             let rw = rewrite(&mut ctx, t);
 
             let mut b = Blaster::new();
@@ -1080,8 +1144,15 @@ mod tests {
             let xf = ctx.declare_fun("x_m_exex", &[], s8);
             let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
             // extract(5, 2, extract(7, 1, x)) -> extract(5+1, 2+1, x) = extract(6, 3, x)
-            let inner_ext = ctx.mk_app(Op::Builtin(BuiltinOp::BvExtract { hi: 7, lo: 1 }), &[x]).unwrap();
-            let outer_ext = ctx.mk_app(Op::Builtin(BuiltinOp::BvExtract { hi: 5, lo: 2 }), &[inner_ext]).unwrap();
+            let inner_ext = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvExtract { hi: 7, lo: 1 }), &[x])
+                .unwrap();
+            let outer_ext = ctx
+                .mk_app(
+                    Op::Builtin(BuiltinOp::BvExtract { hi: 5, lo: 2 }),
+                    &[inner_ext],
+                )
+                .unwrap();
             let rw = rewrite(&mut ctx, outer_ext);
 
             // Miter: both are 4-bit results.
@@ -1100,9 +1171,13 @@ mod tests {
             let hi_t = ctx.mk_app(Op::Uninterpreted(hf), &[]).unwrap();
             let lo_t = ctx.mk_app(Op::Uninterpreted(lf), &[]).unwrap();
             // concat(hi[3:0], lo[3:0]) -> 8-bit
-            let cat = ctx.mk_app(Op::Builtin(BuiltinOp::BvConcat), &[hi_t, lo_t]).unwrap();
+            let cat = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvConcat), &[hi_t, lo_t])
+                .unwrap();
             // extract(2, 1, cat) -> lo[2:1] (entirely in lo)
-            let ext = ctx.mk_app(Op::Builtin(BuiltinOp::BvExtract { hi: 2, lo: 1 }), &[cat]).unwrap();
+            let ext = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvExtract { hi: 2, lo: 1 }), &[cat])
+                .unwrap();
             let rw = rewrite(&mut ctx, ext);
 
             let mut b = Blaster::new();
@@ -1120,9 +1195,13 @@ mod tests {
             let hi_t = ctx.mk_app(Op::Uninterpreted(hf), &[]).unwrap();
             let lo_t = ctx.mk_app(Op::Uninterpreted(lf), &[]).unwrap();
             // concat(hi[3:0], lo[3:0]) -> 8-bit
-            let cat = ctx.mk_app(Op::Builtin(BuiltinOp::BvConcat), &[hi_t, lo_t]).unwrap();
+            let cat = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvConcat), &[hi_t, lo_t])
+                .unwrap();
             // extract(6, 5, cat) -> hi[2:1] (entirely in hi, lo_width=4)
-            let ext = ctx.mk_app(Op::Builtin(BuiltinOp::BvExtract { hi: 6, lo: 5 }), &[cat]).unwrap();
+            let ext = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvExtract { hi: 6, lo: 5 }), &[cat])
+                .unwrap();
             let rw = rewrite(&mut ctx, ext);
 
             let mut b = Blaster::new();

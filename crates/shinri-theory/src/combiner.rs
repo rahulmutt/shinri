@@ -1326,8 +1326,7 @@ mod tests {
             "atom with select must be classified as Owner::Arrays"
         );
 
-        let mut comb: Combiner<NullTheory, NullTheory, ArraySplitter> =
-            Combiner::with_context(ctx);
+        let mut comb: Combiner<NullTheory, NullTheory, ArraySplitter> = Combiner::with_context(ctx);
 
         // Register the arrays atom — routes to euf (for congruence) + arrays (for watching).
         let v = Var::new(0);

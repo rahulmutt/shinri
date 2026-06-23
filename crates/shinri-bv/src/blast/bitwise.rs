@@ -59,11 +59,7 @@ mod tests {
                 let x = pin_const(&mut b, xv, 4);
                 let y = pin_const(&mut b, yv, 4);
                 let r = bvand(&mut b, &x, &y);
-                assert_eq!(
-                    solve_value(b, &r),
-                    xv & yv,
-                    "bvand({xv:#06b}, {yv:#06b})"
-                );
+                assert_eq!(solve_value(b, &r), xv & yv, "bvand({xv:#06b}, {yv:#06b})");
             }
         }
     }
@@ -87,11 +83,7 @@ mod tests {
                 let x = pin_const(&mut b, xv, 4);
                 let y = pin_const(&mut b, yv, 4);
                 let r = bvor(&mut b, &x, &y);
-                assert_eq!(
-                    solve_value(b, &r),
-                    xv | yv,
-                    "bvor({xv:#06b}, {yv:#06b})"
-                );
+                assert_eq!(solve_value(b, &r), xv | yv, "bvor({xv:#06b}, {yv:#06b})");
             }
         }
     }
@@ -115,11 +107,7 @@ mod tests {
                 let x = pin_const(&mut b, xv, 4);
                 let y = pin_const(&mut b, yv, 4);
                 let r = bvxor(&mut b, &x, &y);
-                assert_eq!(
-                    solve_value(b, &r),
-                    xv ^ yv,
-                    "bvxor({xv:#06b}, {yv:#06b})"
-                );
+                assert_eq!(solve_value(b, &r), xv ^ yv, "bvxor({xv:#06b}, {yv:#06b})");
             }
         }
     }

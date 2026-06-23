@@ -1,5 +1,5 @@
-use crate::blast::{BitLit, Blaster};
 use crate::blast::bitwise::bvnot;
+use crate::blast::{BitLit, Blaster};
 
 pub fn adder(b: &mut Blaster, x: &[BitLit], y: &[BitLit], cin: BitLit) -> (Vec<BitLit>, BitLit) {
     debug_assert_eq!(x.len(), y.len());
@@ -85,7 +85,14 @@ mod tests {
 
     #[test]
     fn bvmul_mod_256() {
-        for (x, y) in [(0u64, 7u64), (1, 1), (13, 13), (255, 255), (16, 16), (200, 3)] {
+        for (x, y) in [
+            (0u64, 7u64),
+            (1, 1),
+            (13, 13),
+            (255, 255),
+            (16, 16),
+            (200, 3),
+        ] {
             let mut b = Blaster::new();
             let xv = pin_const(&mut b, x, 8);
             let yv = pin_const(&mut b, y, 8);

@@ -52,7 +52,11 @@ const N_ITERS: usize = 200;
 /// SMT-LIB bitvector literal: #b... for small widths, #x... for multiples of 4.
 fn bv_lit_smt2(width: u32, value: u64) -> String {
     // Mask to width bits.
-    let mask = if width >= 64 { u64::MAX } else { (1u64 << width) - 1 };
+    let mask = if width >= 64 {
+        u64::MAX
+    } else {
+        (1u64 << width) - 1
+    };
     let v = value & mask;
     if width % 4 == 0 {
         // Hex: width/4 hex digits.
@@ -97,7 +101,11 @@ fn gen_instance(
     let mut pool: Vec<BvPair> = vars_s
         .iter()
         .zip(z_vars.iter())
-        .map(|(&s_t, &z_t)| BvPair { s: s_t, z: z_t, width })
+        .map(|(&s_t, &z_t)| BvPair {
+            s: s_t,
+            z: z_t,
+            width,
+        })
         .collect();
 
     // Add a small number of random BV terms to the pool.
@@ -209,7 +217,11 @@ fn gen_instance(
                 (ns, nz, width)
             }
         };
-        pool.push(BvPair { s: new_s, z: new_z, width: new_w });
+        pool.push(BvPair {
+            s: new_s,
+            z: new_z,
+            width: new_w,
+        });
     }
 
     // Occasionally add a concat/extract/extend/rotate/repeat term.
@@ -224,35 +236,44 @@ fn gen_instance(
             let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("repeat"), ctx.atom("1")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair { s: ns, z: nz, width });
+        pool.push(BvPair {
+            s: ns,
+            z: nz,
+            width,
+        });
 
         // BvRotateLeft(1) — same width.
         let i = rng.below(pool.len() as u64) as usize;
         let ns = s.app(Op::Builtin(BuiltinOp::BvRotateLeft(1)), &[pool[i].s]);
         let nz = {
-            let op_atom =
-                ctx.list(vec![ctx.atom("_"), ctx.atom("rotate_left"), ctx.atom("1")]);
+            let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("rotate_left"), ctx.atom("1")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair { s: ns, z: nz, width });
+        pool.push(BvPair {
+            s: ns,
+            z: nz,
+            width,
+        });
 
         // BvRotateRight(1) — same width.
         let i = rng.below(pool.len() as u64) as usize;
         let ns = s.app(Op::Builtin(BuiltinOp::BvRotateRight(1)), &[pool[i].s]);
         let nz = {
-            let op_atom =
-                ctx.list(vec![ctx.atom("_"), ctx.atom("rotate_right"), ctx.atom("1")]);
+            let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("rotate_right"), ctx.atom("1")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair { s: ns, z: nz, width });
+        pool.push(BvPair {
+            s: ns,
+            z: nz,
+            width,
+        });
 
         // BvExtract full-width (hi=width-1, lo=0) — same width as input, well-typed.
         if width >= 2 {
             let i = rng.below(pool.len() as u64) as usize;
             let hi = width - 1;
             let lo = 0u32;
-            let ns =
-                s.app(Op::Builtin(BuiltinOp::BvExtract { hi, lo }), &[pool[i].s]);
+            let ns = s.app(Op::Builtin(BuiltinOp::BvExtract { hi, lo }), &[pool[i].s]);
             let nz = {
                 let op_atom = ctx.list(vec![
                     ctx.atom("_"),
@@ -262,40 +283,43 @@ fn gen_instance(
                 ]);
                 ctx.list(vec![op_atom, pool[i].z])
             };
-            pool.push(BvPair { s: ns, z: nz, width });
+            pool.push(BvPair {
+                s: ns,
+                z: nz,
+                width,
+            });
         }
 
         // BvZeroExtend(0) — same width (extend by 0).
         let i = rng.below(pool.len() as u64) as usize;
         let ns = s.app(Op::Builtin(BuiltinOp::BvZeroExtend(0)), &[pool[i].s]);
         let nz = {
-            let op_atom = ctx.list(vec![
-                ctx.atom("_"),
-                ctx.atom("zero_extend"),
-                ctx.atom("0"),
-            ]);
+            let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("zero_extend"), ctx.atom("0")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair { s: ns, z: nz, width });
+        pool.push(BvPair {
+            s: ns,
+            z: nz,
+            width,
+        });
 
         // BvSignExtend(0) — same width.
         let i = rng.below(pool.len() as u64) as usize;
         let ns = s.app(Op::Builtin(BuiltinOp::BvSignExtend(0)), &[pool[i].s]);
         let nz = {
-            let op_atom = ctx.list(vec![
-                ctx.atom("_"),
-                ctx.atom("sign_extend"),
-                ctx.atom("0"),
-            ]);
+            let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("sign_extend"), ctx.atom("0")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair { s: ns, z: nz, width });
+        pool.push(BvPair {
+            s: ns,
+            z: nz,
+            width,
+        });
 
-        // BvConcat of two half-width terms (if width >= 2): produces a
-        // double-width term. We don't add it to the current-width pool — it
-        // has a different width. We just exercise the op in the pool building
-        // but don't add an atom for it to keep sort-homogeneity simple.
-        // (The concat/extract round-trip is tested in qfbv_witnesses.rs.)
+        // BvConcat is NOT added to this random op pool because it produces a
+        // different-width result, which would break sort-homogeneity.
+        // BvConcat (and the concat/extract round-trip) is covered by the
+        // dedicated witness tests in qfbv_witnesses.rs.
     }
 
     // ── Build Boolean atoms from the pool ────────────────────────────────────
@@ -434,25 +458,14 @@ fn differential_qf_bv_small() {
             .map(|name| ctx.declare_const(name.to_string(), bv_type_atom).unwrap())
             .collect();
 
-        let mut dump = format!(
-            "iter={iter} width={width}\n(set-logic QF_BV)"
-        );
+        let mut dump = format!("iter={iter} width={width}\n(set-logic QF_BV)");
         for name in &var_names {
-            dump.push_str(&format!(
-                "\n(declare-fun {name} () (_ BitVec {width}))"
-            ));
+            dump.push_str(&format!("\n(declare-fun {name} () (_ BitVec {width}))"));
         }
 
         // ── Generate random formula ─────────────────────────────────────────
         gen_instance(
-            &mut rng,
-            &mut s,
-            &mut ctx,
-            width,
-            &var_names,
-            &vars_s,
-            &z_vars,
-            &mut dump,
+            &mut rng, &mut s, &mut ctx, width, &var_names, &vars_s, &z_vars, &mut dump,
         );
 
         dump.push_str("\n(check-sat)");

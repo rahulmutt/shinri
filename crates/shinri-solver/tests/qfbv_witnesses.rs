@@ -61,7 +61,11 @@ fn bvadd_wrap_sat() {
          (assert (= (bvadd x #x01) #x00))\
          (check-sat)",
     );
-    assert_eq!(out, vec!["sat"], "x + 1 = 0 mod 256 is satisfiable (x = 0xff)");
+    assert_eq!(
+        out,
+        vec!["sat"],
+        "x + 1 = 0 mod 256 is satisfiable (x = 0xff)"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -79,7 +83,11 @@ fn bvudiv_by_zero_is_all_ones_sat() {
          (assert (= (bvudiv x #x00) #xff))\
          (check-sat)",
     );
-    assert_eq!(out, vec!["sat"], "bvudiv by zero must equal all-ones (QF_BV semantics)");
+    assert_eq!(
+        out,
+        vec!["sat"],
+        "bvudiv by zero must equal all-ones (QF_BV semantics)"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -113,7 +121,11 @@ fn bvsdiv_negative_dividend_sat() {
          (assert (= (bvsdiv #xff #x01) #xff))\
          (check-sat)",
     );
-    assert_eq!(out, vec!["sat"], "bvsdiv(-1, 1) = -1 in 8-bit signed arithmetic");
+    assert_eq!(
+        out,
+        vec!["sat"],
+        "bvsdiv(-1, 1) = -1 in 8-bit signed arithmetic"
+    );
 }
 
 #[test]
@@ -136,7 +148,11 @@ fn bvsdiv_negative_negative_sat() {
          (assert (= (bvsdiv #xfa #xfe) #x03))\
          (check-sat)",
     );
-    assert_eq!(out, vec!["sat"], "bvsdiv(-6, -2) = 3 in 8-bit signed arithmetic");
+    assert_eq!(
+        out,
+        vec!["sat"],
+        "bvsdiv(-6, -2) = 3 in 8-bit signed arithmetic"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -188,7 +204,11 @@ fn concat_extract_round_trip_unsat() {
          (assert (not (= (concat ((_ extract 15 8) x) ((_ extract 7 0) x)) x)))\
          (check-sat)",
     );
-    assert_eq!(out, vec!["unsat"], "concat(hi(x), lo(x)) = x for all x (round-trip)");
+    assert_eq!(
+        out,
+        vec!["unsat"],
+        "concat(hi(x), lo(x)) = x for all x (round-trip)"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -249,7 +269,11 @@ fn get_model_after_sat_bv() {
          (get-model)",
     );
     // First line: "sat"
-    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "should be sat");
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("sat"),
+        "should be sat"
+    );
     // Second line: the model — should start with '(' and contain a BV value.
     assert!(
         out.len() >= 2,
@@ -360,7 +384,11 @@ fn bvslt_min_lt_zero_unsat() {
          (assert (not (bvslt #x80 #x00)))\
          (check-sat)",
     );
-    assert_eq!(out, vec!["unsat"], "bvslt(-128, 0) is always true in 8-bit signed");
+    assert_eq!(
+        out,
+        vec!["unsat"],
+        "bvslt(-128, 0) is always true in 8-bit signed"
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────────────

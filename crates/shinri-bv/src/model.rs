@@ -27,17 +27,17 @@ pub fn pack(width: u32, bits: &[bool]) -> Integer {
         let end = (i + 64).min(bits.len());
         // Pack up to 64 bits into a u64.
         let mut chunk_val: u64 = 0;
-        for j in i..end {
-            if bits[j] {
+        for (j, &b) in bits.iter().enumerate().take(end).skip(i) {
+            if b {
                 chunk_val |= 1u64 << (j - i);
             }
         }
         if chunk_val != 0 {
-            result = result + chunk_base.clone() * Integer::from(chunk_val);
+            result += chunk_base.clone() * Integer::from(chunk_val);
         }
         i = end;
         if i < bits.len() {
-            chunk_base = chunk_base * two_64.clone();
+            chunk_base *= two_64.clone();
         }
     }
     result

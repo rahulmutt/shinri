@@ -32,8 +32,11 @@ trait BvSatSink {
     fn add_clause(&mut self, lits: &[shinri_core::Lit]) -> bool;
 }
 
-impl<T: shinri_sat::Theory, P: shinri_core::ProofSink + Default, H: shinri_sat::BranchHeuristic>
-    BvSatSink for shinri_sat::Solver<T, P, H>
+impl<
+        T: shinri_sat::Theory,
+        P: shinri_core::ProofSink + Default,
+        H: shinri_sat::BranchHeuristic,
+    > BvSatSink for shinri_sat::Solver<T, P, H>
 {
     fn new_var(&mut self) -> shinri_core::Var {
         shinri_sat::Solver::new_var(self)
@@ -98,7 +101,11 @@ impl Solver {
     pub fn int_sort(&self) -> SortId {
         self.ctx.int_sort()
     }
-    pub fn array_sort(&mut self, index: shinri_core::SortId, elem: shinri_core::SortId) -> shinri_core::SortId {
+    pub fn array_sort(
+        &mut self,
+        index: shinri_core::SortId,
+        elem: shinri_core::SortId,
+    ) -> shinri_core::SortId {
         self.ctx.array_sort(index, elem)
     }
     pub fn numeral(&mut self, value: Rational, sort: SortId) -> TermId {
@@ -242,7 +249,11 @@ impl Solver {
         use shinri_sat::{SolveResult, SolverConfig, Vmtf};
         use shinri_theory::Combiner;
 
-        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays>, NoProof, Vmtf>;
+        type Sat = shinri_sat::Solver<
+            Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays>,
+            NoProof,
+            Vmtf,
+        >;
 
         let assertions = self.assertions.clone();
 
@@ -279,20 +290,20 @@ impl Solver {
 
         // Replay the BV CNF into the SAT solver and build the surrogate maps.
         // On the non-BV path, clear any stale bv_var_bits from a previous BV solve.
-        let bv_atom_lit: Option<rustc_hash::FxHashMap<TermId, shinri_core::Lit>> =
-            match lowered_bv {
-                Some(lo) => {
-                    let surrogates = self.replay_bv_cnf(&mut sat, lo);
-                    // Stash var_bits (SAT Vars) for model extraction.
-                    self.bv_var_bits = surrogates.var_bits;
-                    Some(surrogates.atom_to_lit)
-                }
-                None => {
-                    // Non-BV path: clear stale bits from any previous BV solve.
-                    self.bv_var_bits.clear();
-                    None
-                }
-            };
+        let bv_atom_lit: Option<rustc_hash::FxHashMap<TermId, shinri_core::Lit>> = match lowered_bv
+        {
+            Some(lo) => {
+                let surrogates = self.replay_bv_cnf(&mut sat, lo);
+                // Stash var_bits (SAT Vars) for model extraction.
+                self.bv_var_bits = surrogates.var_bits;
+                Some(surrogates.atom_to_lit)
+            }
+            None => {
+                // Non-BV path: clear stale bits from any previous BV solve.
+                self.bv_var_bits.clear();
+                None
+            }
+        };
         // set_truth_terms MUST be called before any atom encoding (Euf::new_var
         // installs the level-0 ⊤≠⊥ diseq only if truth_terms is already Some,
         // and assert panics if truth terms are unset).
@@ -412,17 +423,14 @@ impl Solver {
             }
             first.index() as u32
         };
-        let map_lit = |bl: shinri_bv::BitLit| -> Lit {
-            Lit::new(Var::new(base + bl.var), bl.pos)
-        };
+        let map_lit = |bl: shinri_bv::BitLit| -> Lit { Lit::new(Var::new(base + bl.var), bl.pos) };
         // Add every clause.
         for clause in &lowered.cnf.clauses {
             let mapped: Vec<Lit> = clause.iter().map(|&bl| map_lit(bl)).collect();
             sat.add_clause(&mapped);
         }
         // Build the original-atom → surrogate-Lit map.
-        let mut atom_to_lit: rustc_hash::FxHashMap<TermId, Lit> =
-            rustc_hash::FxHashMap::default();
+        let mut atom_to_lit: rustc_hash::FxHashMap<TermId, Lit> = rustc_hash::FxHashMap::default();
         for (&atom, &bl) in lowered.atom_lit.iter() {
             atom_to_lit.insert(atom, map_lit(bl));
         }
@@ -433,7 +441,10 @@ impl Solver {
             let vars: Vec<Var> = bits.iter().map(|&bl| Var::new(base + bl.var)).collect();
             var_bits.insert(term, vars);
         }
-        crate::bv_stage::BvSurrogates { atom_to_lit, var_bits }
+        crate::bv_stage::BvSurrogates {
+            atom_to_lit,
+            var_bits,
+        }
     }
 
     pub fn get_model(&mut self) -> Model {
@@ -701,7 +712,11 @@ impl Solver {
         use shinri_sat::{SolverConfig, Vmtf};
         use shinri_theory::Combiner;
 
-        type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays>, NoProof, Vmtf>;
+        type Sat = shinri_sat::Solver<
+            Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays>,
+            NoProof,
+            Vmtf,
+        >;
 
         let mut sat: Sat = shinri_sat::Solver::with_theory(
             SolverConfig::default(),
@@ -1116,10 +1131,7 @@ mod bv_model_tests {
             "expected x8=3 (#b00000011 or #x03), got: {m}"
         );
         // y16 = 1000 = #x03e8
-        assert!(
-            m.contains("#x03e8"),
-            "expected y16=1000 (#x03e8), got: {m}"
-        );
+        assert!(m.contains("#x03e8"), "expected y16=1000 (#x03e8), got: {m}");
     }
 
     /// Stale-bits regression: BV solve followed by non-BV solve must NOT have BV
@@ -1180,7 +1192,10 @@ mod bv_model_tests {
         assert_eq!(s3.check_sat(), SolveOutcome::Sat);
         // BV model has a BV entry
         let m3a = s3.get_model_string();
-        assert!(m3a.contains("#b") || m3a.contains("#x"), "step1: must have BV entry: {m3a}");
+        assert!(
+            m3a.contains("#b") || m3a.contains("#x"),
+            "step1: must have BV entry: {m3a}"
+        );
         // Step 2: now do a non-BV solve — we need to reset assertions first.
         // The solver accumulates assertions, so we need fresh assertions that are non-BV.
         // Since assertions pile up and the BV one is still there, this test verifies

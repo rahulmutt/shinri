@@ -346,11 +346,7 @@ impl<'a> Parser<'a> {
 
     /// Parse `(_ bvK n)` where `_` has already been consumed.
     /// `K` is a decimal integer embedded in the symbol `bvK`; `n` is the width.
-    fn parse_bv_numeral(
-        &mut self,
-        ctx: &mut Context,
-        usp: Span,
-    ) -> Result<TermId, Diagnostic> {
+    fn parse_bv_numeral(&mut self, ctx: &mut Context, usp: Span) -> Result<TermId, Diagnostic> {
         let (sym, ssp) = self.expect_symbol()?;
         if !sym.starts_with("bv") {
             return Err(Diagnostic::new(
@@ -394,7 +390,7 @@ impl<'a> Parser<'a> {
         // Peek: if the head is '(' it may be an indexed operator `((_ id nums...) args...)`.
         if matches!(self.peek(), Some((Ok(Token::LParen), _))) {
             self.bump(); // consume inner '('
-            // Expect '_' to start an indexed identifier used as an operator.
+                         // Expect '_' to start an indexed identifier used as an operator.
             let (under, usp) = self.expect_symbol()?;
             if under != "_" {
                 return Err(Diagnostic::new(usp, "expected '_' in indexed identifier"));
@@ -670,22 +666,40 @@ impl<'a> Parser<'a> {
             }
             // BV non-indexed binary/unary ops: delegate directly to mk_app
             // (sort-checking is in Context::sort_of_app).
-            BuiltinOp::BvNot | BuiltinOp::BvNeg
-            | BuiltinOp::BvAnd | BuiltinOp::BvOr | BuiltinOp::BvXor
-            | BuiltinOp::BvNand | BuiltinOp::BvNor | BuiltinOp::BvXnor
-            | BuiltinOp::BvAdd | BuiltinOp::BvSub | BuiltinOp::BvMul
-            | BuiltinOp::BvUdiv | BuiltinOp::BvUrem | BuiltinOp::BvSdiv
-            | BuiltinOp::BvSrem | BuiltinOp::BvSmod
-            | BuiltinOp::BvShl | BuiltinOp::BvLshr | BuiltinOp::BvAshr
-            | BuiltinOp::BvUlt | BuiltinOp::BvUle | BuiltinOp::BvUgt | BuiltinOp::BvUge
-            | BuiltinOp::BvSlt | BuiltinOp::BvSle | BuiltinOp::BvSgt | BuiltinOp::BvSge
+            BuiltinOp::BvNot
+            | BuiltinOp::BvNeg
+            | BuiltinOp::BvAnd
+            | BuiltinOp::BvOr
+            | BuiltinOp::BvXor
+            | BuiltinOp::BvNand
+            | BuiltinOp::BvNor
+            | BuiltinOp::BvXnor
+            | BuiltinOp::BvAdd
+            | BuiltinOp::BvSub
+            | BuiltinOp::BvMul
+            | BuiltinOp::BvUdiv
+            | BuiltinOp::BvUrem
+            | BuiltinOp::BvSdiv
+            | BuiltinOp::BvSrem
+            | BuiltinOp::BvSmod
+            | BuiltinOp::BvShl
+            | BuiltinOp::BvLshr
+            | BuiltinOp::BvAshr
+            | BuiltinOp::BvUlt
+            | BuiltinOp::BvUle
+            | BuiltinOp::BvUgt
+            | BuiltinOp::BvUge
+            | BuiltinOp::BvSlt
+            | BuiltinOp::BvSle
+            | BuiltinOp::BvSgt
+            | BuiltinOp::BvSge
             | BuiltinOp::BvConcat
             | BuiltinOp::BvExtract { .. }
-            | BuiltinOp::BvZeroExtend(_) | BuiltinOp::BvSignExtend(_)
-            | BuiltinOp::BvRotateLeft(_) | BuiltinOp::BvRotateRight(_)
-            | BuiltinOp::BvRepeat(_) => {
-                Self::mk(ctx, Op::Builtin(op), &args, &sp)
-            }
+            | BuiltinOp::BvZeroExtend(_)
+            | BuiltinOp::BvSignExtend(_)
+            | BuiltinOp::BvRotateLeft(_)
+            | BuiltinOp::BvRotateRight(_)
+            | BuiltinOp::BvRepeat(_) => Self::mk(ctx, Op::Builtin(op), &args, &sp),
         }
     }
 
@@ -1271,7 +1285,11 @@ mod tests {
 
         // The declared constant has the BitVec(8) sort.
         if let Command::DeclareFun { result, .. } = &cmds[0] {
-            assert_eq!(*result, ctx.bv_sort(8), "declare-const must have BitVec(8) sort");
+            assert_eq!(
+                *result,
+                ctx.bv_sort(8),
+                "declare-const must have BitVec(8) sort"
+            );
         }
 
         // --- Part 2: direct literal parsing for precise value assertions ---
@@ -1300,7 +1318,9 @@ mod tests {
             let mut ctx2 = Context::new();
             let mut p = Parser::new("#b11111111");
             let t = p.parse_term(&mut ctx2).expect("#b11111111 must parse");
-            let (w, v) = ctx2.bv_const_value(t).expect("#b11111111 must be a BV const");
+            let (w, v) = ctx2
+                .bv_const_value(t)
+                .expect("#b11111111 must be a BV const");
             assert_eq!(w, 8, "#b11111111 width must be 8");
             assert_eq!(*v, Integer::from(255u64), "#b11111111 value must be 255");
         }
@@ -1309,8 +1329,14 @@ mod tests {
         {
             let mut ctx2 = Context::new();
             let mut p = Parser::new("(_ BitVec 8)");
-            let s = p.parse_sort(&mut ctx2).expect("(_ BitVec 8) must parse as a sort");
-            assert_eq!(s, ctx2.bv_sort(8), "(_ BitVec 8) must resolve to bv_sort(8)");
+            let s = p
+                .parse_sort(&mut ctx2)
+                .expect("(_ BitVec 8) must parse as a sort");
+            assert_eq!(
+                s,
+                ctx2.bv_sort(8),
+                "(_ BitVec 8) must resolve to bv_sort(8)"
+            );
         }
     }
 
@@ -1350,6 +1376,7 @@ mod tests {
     ///   - `((_ extract 3 0) x)` where x : BitVec 8 has sort bv_sort(4).
     ///   - `(_ bv1 8)` is a BitVec const of width 8, value 1.
     ///   - `(concat ((_ extract 7 4) x) ((_ extract 3 0) x))` has sort bv_sort(8).
+    ///
     /// Negative assertion:
     ///   - `(bvadd x y)` where x : BitVec 8 and y : BitVec 16 errors (sort mismatch).
     #[test]
@@ -1357,7 +1384,10 @@ mod tests {
         // --- Positive: full command round-trip ---
         let src = "(declare-const x (_ BitVec 8))\n\
                    (assert (= (concat ((_ extract 7 4) x) ((_ extract 3 0) x)) (bvadd x (_ bv1 8))))\n";
-        assert!(parse_all(src).is_ok(), "width-correct BV formula must parse");
+        assert!(
+            parse_all(src).is_ok(),
+            "width-correct BV formula must parse"
+        );
 
         // --- Positive: extract sort check ---
         {
@@ -1378,9 +1408,7 @@ mod tests {
             let mut ctx = Context::new();
             let mut p = Parser::new("(_ bv1 8)");
             let t = p.parse_term(&mut ctx).expect("(_ bv1 8) must parse");
-            let (w, v) = ctx
-                .bv_const_value(t)
-                .expect("(_ bv1 8) must be a BV const");
+            let (w, v) = ctx.bv_const_value(t).expect("(_ bv1 8) must be a BV const");
             assert_eq!(w, 8, "(_ bv1 8) width must be 8");
             assert_eq!(*v, Integer::from(1u64), "(_ bv1 8) value must be 1");
         }

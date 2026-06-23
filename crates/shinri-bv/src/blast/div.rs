@@ -1,5 +1,5 @@
-use crate::blast::{BitLit, Blaster};
 use crate::blast::arith::{adder, bvadd, bvneg};
+use crate::blast::{BitLit, Blaster};
 
 fn is_zero(b: &mut Blaster, x: &[BitLit]) -> BitLit {
     let mut acc = x[0];
@@ -46,7 +46,9 @@ pub fn udivurem(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> (Vec<BitLit>, Ve
     // Zero-divisor fixup
     let yz = is_zero(b, y);
     let all_ones: Vec<BitLit> = (0..n).map(|_| b.one()).collect();
-    let q = (0..n).map(|j| b.mux2(yz, all_ones[j], quot[j])).collect::<Vec<_>>();
+    let q = (0..n)
+        .map(|j| b.mux2(yz, all_ones[j], quot[j]))
+        .collect::<Vec<_>>();
     let r = (0..n).map(|j| b.mux2(yz, x[j], rem[j])).collect::<Vec<_>>();
     (q, r)
 }
@@ -122,11 +124,15 @@ pub fn bvsmod(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> Vec<BitLit> {
     let negu_plus_y = bvadd(b, &negu, y);
     let not_uz = b.not1(uz);
     // gate by !uz: if uz, give 0; else negu_plus_y
-    let case_10: Vec<BitLit> = (0..n).map(|j| b.mux2(not_uz, negu_plus_y[j], zero_vec[j])).collect();
+    let case_10: Vec<BitLit> = (0..n)
+        .map(|j| b.mux2(not_uz, negu_plus_y[j], zero_vec[j]))
+        .collect();
 
     // (sx=0, sy=1) branch: bvadd(u, y), or 0 if u==0
     let u_plus_y = bvadd(b, &u, y);
-    let case_01: Vec<BitLit> = (0..n).map(|j| b.mux2(not_uz, u_plus_y[j], zero_vec[j])).collect();
+    let case_01: Vec<BitLit> = (0..n)
+        .map(|j| b.mux2(not_uz, u_plus_y[j], zero_vec[j]))
+        .collect();
 
     // (sx=0, sy=0): u
     // (sx=1, sy=1): negu
@@ -136,7 +142,9 @@ pub fn bvsmod(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> Vec<BitLit> {
     //   if sy=1: inner = mux(sx, negu, case_01)   [sx=1 -> negu, sx=0 -> case_01]
     let when_sy0: Vec<BitLit> = (0..n).map(|j| b.mux2(sx, case_10[j], u[j])).collect();
     let when_sy1: Vec<BitLit> = (0..n).map(|j| b.mux2(sx, negu[j], case_01[j])).collect();
-    (0..n).map(|j| b.mux2(sy, when_sy1[j], when_sy0[j])).collect()
+    (0..n)
+        .map(|j| b.mux2(sy, when_sy1[j], when_sy0[j]))
+        .collect()
 }
 
 #[cfg(test)]
@@ -152,6 +160,9 @@ mod tests {
     fn udiv_urem_including_zero_divisor() {
         let cases: &[(u64, u64)] = &[(17, 5), (255, 16), (0, 3), (7, 7), (10, 0), (255, 0)];
         for &(x, y) in cases {
+            // SMT-LIB semantics: udiv(x, 0) = all-ones, urem(x, 0) = x.
+            // The explicit y==0 check intentionally avoids division-by-zero — not a bug.
+            #[allow(clippy::manual_checked_ops)]
             let (eq, er) = if y == 0 { (0xFF, x) } else { (x / y, x % y) };
             let mut b = Blaster::new();
             let xv = pin_const(&mut b, x, 8);
@@ -184,7 +195,10 @@ mod tests {
             let yv = pin_const(&mut b, yi as u8 as u64, 8);
             let d = bvsdiv(&mut b, &xv, &yv);
             let got = solve_value(b, &d) as u8 as i8;
-            assert_eq!(got, expected, "bvsdiv({xi},{yi}): expected {expected} got {got}");
+            assert_eq!(
+                got, expected,
+                "bvsdiv({xi},{yi}): expected {expected} got {got}"
+            );
         }
     }
 
@@ -193,12 +207,7 @@ mod tests {
     // -------------------------------------------------------------------------
     #[test]
     fn srem_sign_follows_dividend() {
-        let cases: &[(i8, i8, i8)] = &[
-            (-7, 2, -1),
-            (7, -2, 1),
-            (-7, -2, -1),
-            (7, 2, 1),
-        ];
+        let cases: &[(i8, i8, i8)] = &[(-7, 2, -1), (7, -2, 1), (-7, -2, -1), (7, 2, 1)];
         for &(xi, yi, expected) in cases {
             assert_eq!(xi % yi, expected, "native srem reference mismatch");
             let mut b = Blaster::new();
@@ -206,7 +215,10 @@ mod tests {
             let yv = pin_const(&mut b, yi as u8 as u64, 8);
             let r = bvsrem(&mut b, &xv, &yv);
             let got = solve_value(b, &r) as u8 as i8;
-            assert_eq!(got, expected, "bvsrem({xi},{yi}): expected {expected} got {got}");
+            assert_eq!(
+                got, expected,
+                "bvsrem({xi},{yi}): expected {expected} got {got}"
+            );
         }
     }
 
@@ -237,21 +249,14 @@ mod tests {
     #[test]
     fn smod_sign_follows_divisor() {
         // Cross-check reference against known values first
-        assert_eq!(smod_ref(-7, 2), 1,  "smod_ref(-7,2)");
+        assert_eq!(smod_ref(-7, 2), 1, "smod_ref(-7,2)");
         assert_eq!(smod_ref(7, -2), -1, "smod_ref(7,-2)");
         assert_eq!(smod_ref(-7, -2), -1, "smod_ref(-7,-2)");
-        assert_eq!(smod_ref(7, 2), 1,   "smod_ref(7,2)");
-        assert_eq!(smod_ref(4, 2), 0,   "smod_ref(4,2)");
-        assert_eq!(smod_ref(-4, 2), 0,  "smod_ref(-4,2)");
+        assert_eq!(smod_ref(7, 2), 1, "smod_ref(7,2)");
+        assert_eq!(smod_ref(4, 2), 0, "smod_ref(4,2)");
+        assert_eq!(smod_ref(-4, 2), 0, "smod_ref(-4,2)");
 
-        let cases: &[(i8, i8)] = &[
-            (-7, 2),
-            (7, -2),
-            (-7, -2),
-            (7, 2),
-            (4, 2),
-            (-4, 2),
-        ];
+        let cases: &[(i8, i8)] = &[(-7, 2), (7, -2), (-7, -2), (7, 2), (4, 2), (-4, 2)];
         for &(xi, yi) in cases {
             let expected = smod_ref(xi, yi);
             let mut b = Blaster::new();
@@ -259,7 +264,10 @@ mod tests {
             let yv = pin_const(&mut b, yi as u8 as u64, 8);
             let r = bvsmod(&mut b, &xv, &yv);
             let got = solve_value(b, &r) as u8 as i8;
-            assert_eq!(got, expected, "bvsmod({xi},{yi}): expected {expected} got {got}");
+            assert_eq!(
+                got, expected,
+                "bvsmod({xi},{yi}): expected {expected} got {got}"
+            );
         }
     }
 
@@ -273,12 +281,12 @@ mod tests {
         // (-7 as u8 = 249 = 0xF9)
         let cases = vec![
             // (op, x_i8, expected_u8)
-            ("bvsdiv", -7i8, 1u8),        // bvsdiv(-7, 0) = 1
-            ("bvsdiv", 7i8, 255u8),       // bvsdiv(7, 0) = 255 (0xFF)
-            ("bvsrem", -7i8, 249u8),      // bvsrem(-7, 0) = -7 = 249
-            ("bvsrem", 7i8, 7u8),         // bvsrem(7, 0) = 7
-            ("bvsmod", -7i8, 249u8),      // bvsmod(-7, 0) = -7 = 249
-            ("bvsmod", 7i8, 7u8),         // bvsmod(7, 0) = 7
+            ("bvsdiv", -7i8, 1u8),   // bvsdiv(-7, 0) = 1
+            ("bvsdiv", 7i8, 255u8),  // bvsdiv(7, 0) = 255 (0xFF)
+            ("bvsrem", -7i8, 249u8), // bvsrem(-7, 0) = -7 = 249
+            ("bvsrem", 7i8, 7u8),    // bvsrem(7, 0) = 7
+            ("bvsmod", -7i8, 249u8), // bvsmod(-7, 0) = -7 = 249
+            ("bvsmod", 7i8, 7u8),    // bvsmod(7, 0) = 7
         ];
 
         for (op, xi, expected) in cases {

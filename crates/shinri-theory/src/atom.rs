@@ -24,10 +24,17 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
         return Err(Unsupported(atom));
     }
     // Extensionality fence: array-to-array (dis)equality is out of scope.
-    if let TermNode::App { op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct), args, .. } =
-        terms.term_node(atom)
+    if let TermNode::App {
+        op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct),
+        args,
+        ..
+    } = terms.term_node(atom)
     {
-        if terms.children(*args).iter().any(|&c| is_array_sorted(terms, c)) {
+        if terms
+            .children(*args)
+            .iter()
+            .any(|&c| is_array_sorted(terms, c))
+        {
             return Err(Unsupported(atom));
         }
     }
@@ -123,7 +130,10 @@ fn contains_array_op(terms: &Context, t: TermId) -> bool {
             if matches!(op, Op::Builtin(BuiltinOp::Select | BuiltinOp::Store)) {
                 return true;
             }
-            terms.children(*args).iter().any(|&c| contains_array_op(terms, c))
+            terms
+                .children(*args)
+                .iter()
+                .any(|&c| contains_array_op(terms, c))
         }
         TermNode::Const { .. } => false,
     }
@@ -313,7 +323,10 @@ mod tests {
         let a = uconst(&mut ctx, "a", arr_s);
         let b = uconst(&mut ctx, "b", arr_s);
         let atom = ctx.mk_eq(a, b).unwrap();
-        assert!(classify(&ctx, atom).is_err(), "extensionality must be fenced");
+        assert!(
+            classify(&ctx, atom).is_err(),
+            "extensionality must be fenced"
+        );
     }
 
     #[test]

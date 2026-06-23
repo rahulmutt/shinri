@@ -282,7 +282,10 @@ impl Context {
                 };
                 let found = self.sort_of(args[1]);
                 if found != idx {
-                    return Err(SortError::Mismatch { expected: idx, found });
+                    return Err(SortError::Mismatch {
+                        expected: idx,
+                        found,
+                    });
                 }
                 Ok(elem)
             }
@@ -295,11 +298,17 @@ impl Context {
                 };
                 let fi = self.sort_of(args[1]);
                 if fi != idx {
-                    return Err(SortError::Mismatch { expected: idx, found: fi });
+                    return Err(SortError::Mismatch {
+                        expected: idx,
+                        found: fi,
+                    });
                 }
                 let fe = self.sort_of(args[2]);
                 if fe != elem {
-                    return Err(SortError::Mismatch { expected: elem, found: fe });
+                    return Err(SortError::Mismatch {
+                        expected: elem,
+                        found: fe,
+                    });
                 }
                 Ok(arr)
             }
@@ -309,10 +318,8 @@ impl Context {
                 let n = self.require_bv(args[0])?;
                 Ok(self.bv_sort(n))
             }
-            BvAnd | BvOr | BvXor | BvNand | BvNor | BvXnor
-            | BvAdd | BvSub | BvMul
-            | BvUdiv | BvUrem | BvSdiv | BvSrem | BvSmod
-            | BvShl | BvLshr | BvAshr => {
+            BvAnd | BvOr | BvXor | BvNand | BvNor | BvXnor | BvAdd | BvSub | BvMul | BvUdiv
+            | BvUrem | BvSdiv | BvSrem | BvSmod | BvShl | BvLshr | BvAshr => {
                 expect_arity(args, 2)?;
                 let n = self.require_bv(args[0])?;
                 let m = self.require_bv(args[1])?;
@@ -411,11 +418,11 @@ fn reduce_mod_pow2(value: &Integer, width: u32) -> Integer {
     let mut modulus = Integer::one();
     let two = Integer::from(2i128);
     for _ in 0..width {
-        modulus = modulus * two.clone();
+        modulus *= two.clone();
     }
     let (_, mut rem) = value.div_rem(&modulus);
     if rem.is_negative() {
-        rem = rem + modulus;
+        rem += modulus;
     }
     rem
 }
@@ -500,7 +507,11 @@ impl Context {
     /// Intern a bitvector literal. `value` is reduced mod 2^width into `[0, 2^width)`.
     pub fn mk_bv_const(&mut self, width: u32, value: Integer) -> TermId {
         let reduced = reduce_mod_pow2(&value, width);
-        let bv_id = match self.bvs.iter().position(|(w, v)| *w == width && *v == reduced) {
+        let bv_id = match self
+            .bvs
+            .iter()
+            .position(|(w, v)| *w == width && *v == reduced)
+        {
             Some(idx) => BvId::new(idx as u32),
             None => {
                 let id = BvId::new(self.bvs.len() as u32);
@@ -790,10 +801,14 @@ mod tests {
         let e = ctx.mk_app(Op::Uninterpreted(sym_e), &[]).unwrap();
 
         // (store a i e) : (Array I E)
-        let st = ctx.mk_app(Op::Builtin(BuiltinOp::Store), &[a, i, e]).unwrap();
+        let st = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Store), &[a, i, e])
+            .unwrap();
         assert_eq!(ctx.sort_of(st), arr_sort);
         // (select (store a i e) i) : E
-        let sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[st, i]).unwrap();
+        let sel = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[st, i])
+            .unwrap();
         assert_eq!(ctx.sort_of(sel), elem);
         // wrong index sort is rejected
         let e_as_idx = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, e]);
@@ -805,8 +820,14 @@ mod tests {
         use crate::term::BuiltinOp::*;
         let mut ctx = Context::new();
         let s8 = ctx.bv_sort(8);
-        let x = { let f = ctx.declare_fun("x", &[], s8); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
-        let y = { let f = ctx.declare_fun("y", &[], s8); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
+        let x = {
+            let f = ctx.declare_fun("x", &[], s8);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let y = {
+            let f = ctx.declare_fun("y", &[], s8);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
 
         let add = ctx.mk_app(Op::Builtin(BvAdd), &[x, y]).unwrap();
         assert_eq!(ctx.bv_width(ctx.sort_of(add)), Some(8));
@@ -814,7 +835,9 @@ mod tests {
         let cat = ctx.mk_app(Op::Builtin(BvConcat), &[x, y]).unwrap();
         assert_eq!(ctx.bv_width(ctx.sort_of(cat)), Some(16));
 
-        let ext = ctx.mk_app(Op::Builtin(BvExtract { hi: 3, lo: 1 }), &[x]).unwrap();
+        let ext = ctx
+            .mk_app(Op::Builtin(BvExtract { hi: 3, lo: 1 }), &[x])
+            .unwrap();
         assert_eq!(ctx.bv_width(ctx.sort_of(ext)), Some(3));
 
         let ze = ctx.mk_app(Op::Builtin(BvZeroExtend(4)), &[x]).unwrap();
@@ -830,8 +853,14 @@ mod tests {
         let mut ctx = Context::new();
         let s8 = ctx.bv_sort(8);
         let s16 = ctx.bv_sort(16);
-        let x = { let f = ctx.declare_fun("x", &[], s8); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
-        let z = { let f = ctx.declare_fun("z", &[], s16); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
+        let x = {
+            let f = ctx.declare_fun("x", &[], s8);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let z = {
+            let f = ctx.declare_fun("z", &[], s16);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
         assert!(ctx.mk_app(Op::Builtin(BvAdd), &[x, z]).is_err());
     }
 

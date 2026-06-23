@@ -184,9 +184,7 @@ fn differential_qf_ax_small() {
                         s.assert(atom);
                         let z_atom = ctx.not(ctx.eq(z_sel, z_elts[ei]));
                         ctx.assert(z_atom).unwrap();
-                        dump.push_str(&format!(
-                            "\n(assert (distinct (select a{ai} i{ii}) e{ei}))"
-                        ));
+                        dump.push_str(&format!("\n(assert (distinct (select a{ai} i{ii}) e{ei}))"));
                     }
                 }
                 2 => {

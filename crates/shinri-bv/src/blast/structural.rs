@@ -13,14 +13,14 @@ pub fn extract(a: &[BitLit], hi: u32, lo: u32) -> Vec<BitLit> {
 
 pub fn zero_extend(a: &[BitLit], k: u32, b: &Blaster) -> Vec<BitLit> {
     let mut v = a.to_vec();
-    v.extend(std::iter::repeat(b.zero()).take(k as usize));
+    v.extend(std::iter::repeat_n(b.zero(), k as usize));
     v
 }
 
 pub fn sign_extend(a: &[BitLit], k: u32) -> Vec<BitLit> {
     let msb = *a.last().expect("nonzero width");
     let mut v = a.to_vec();
-    v.extend(std::iter::repeat(msb).take(k as usize));
+    v.extend(std::iter::repeat_n(msb, k as usize));
     v
 }
 

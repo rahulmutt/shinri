@@ -1,12 +1,12 @@
 use rustc_hash::FxHashMap;
 use shinri_core::{BuiltinOp, ConstVal, Context, Op, TermId, TermNode};
 
-pub mod structural;
-pub mod bitwise;
 pub mod arith;
+pub mod bitwise;
+pub mod compare;
 pub mod div;
 pub mod shift;
-pub mod compare;
+pub mod structural;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BitLit {
@@ -16,7 +16,10 @@ pub struct BitLit {
 
 impl BitLit {
     pub fn negate(self) -> BitLit {
-        BitLit { var: self.var, pos: !self.pos }
+        BitLit {
+            var: self.var,
+            pos: !self.pos,
+        }
     }
 }
 
@@ -31,6 +34,12 @@ pub struct Blaster {
     clauses: Vec<Vec<BitLit>>,
     /// Memoized blasted words: TermId -> LSB..MSB bit literals.
     pub(crate) cache: FxHashMap<TermId, Vec<BitLit>>,
+}
+
+impl Default for Blaster {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Blaster {
@@ -65,7 +74,10 @@ impl Blaster {
     }
 
     pub fn finish(self) -> Cnf {
-        Cnf { num_vars: self.next_var, clauses: self.clauses }
+        Cnf {
+            num_vars: self.next_var,
+            clauses: self.clauses,
+        }
     }
 
     pub fn not1(&self, a: BitLit) -> BitLit {
@@ -146,23 +158,43 @@ impl Blaster {
         }
         let node = ctx.term_node(t).clone();
         let result = match node {
-            TermNode::Const { val: ConstVal::BitVec(_), .. } => {
+            TermNode::Const {
+                val: ConstVal::BitVec(_),
+                ..
+            } => {
                 let (width, value_ref) = ctx.bv_const_value(t).unwrap();
                 let mut remaining = value_ref.clone();
                 let two = shinri_num::Integer::from(2u64);
-                (0..width).map(|_| {
-                    let (q, r) = remaining.div_rem(&two);
-                    remaining = q;
-                    if r.is_zero() { self.zero() } else { self.one() }
-                }).collect()
+                (0..width)
+                    .map(|_| {
+                        let (q, r) = remaining.div_rem(&two);
+                        remaining = q;
+                        if r.is_zero() {
+                            self.zero()
+                        } else {
+                            self.one()
+                        }
+                    })
+                    .collect()
             }
-            TermNode::App { op: Op::Uninterpreted(_), args, sort } => {
+            TermNode::App {
+                op: Op::Uninterpreted(_),
+                args,
+                sort,
+            } => {
                 let child_ids = ctx.children(args).to_vec();
-                debug_assert!(child_ids.is_empty(), "non-nullary uninterpreted BV fn out of scope");
+                debug_assert!(
+                    child_ids.is_empty(),
+                    "non-nullary uninterpreted BV fn out of scope"
+                );
                 let width = ctx.bv_width(sort).expect("BV-sorted variable has BV sort");
                 (0..width).map(|_| self.fresh()).collect()
             }
-            TermNode::App { op: Op::Builtin(bv_op), args, .. } => {
+            TermNode::App {
+                op: Op::Builtin(bv_op),
+                args,
+                ..
+            } => {
                 let child_ids = ctx.children(args).to_vec();
                 match bv_op {
                     BuiltinOp::BvNot => {
@@ -289,8 +321,14 @@ impl Blaster {
                         structural::repeat(&a, k)
                     }
                     // Comparison ops are Bool-sorted — must not reach blast_word.
-                    BuiltinOp::BvUlt | BuiltinOp::BvUle | BuiltinOp::BvUgt | BuiltinOp::BvUge
-                    | BuiltinOp::BvSlt | BuiltinOp::BvSle | BuiltinOp::BvSgt | BuiltinOp::BvSge => {
+                    BuiltinOp::BvUlt
+                    | BuiltinOp::BvUle
+                    | BuiltinOp::BvUgt
+                    | BuiltinOp::BvUge
+                    | BuiltinOp::BvSlt
+                    | BuiltinOp::BvSle
+                    | BuiltinOp::BvSgt
+                    | BuiltinOp::BvSge => {
                         unreachable!("BV comparison op is Bool-sorted; use blast_atom instead");
                     }
                     _ => unreachable!("non-BV builtin reached blast_word"),
@@ -326,13 +364,21 @@ impl Blaster {
     pub fn blast_atom(&mut self, ctx: &Context, t: TermId) -> BitLit {
         let node = ctx.term_node(t).clone();
         match node {
-            TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } => {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } => {
                 let child_ids = ctx.children(args).to_vec();
                 let a = self.blast_word(ctx, child_ids[0]);
                 let b = self.blast_word(ctx, child_ids[1]);
                 compare::eq(self, &a, &b)
             }
-            TermNode::App { op: Op::Builtin(BuiltinOp::Distinct), args, .. } => {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Distinct),
+                args,
+                ..
+            } => {
                 let child_ids = ctx.children(args).to_vec();
                 // Assume binary Distinct (n-ary is lowered before this stage).
                 let a = self.blast_word(ctx, child_ids[0]);
@@ -340,7 +386,11 @@ impl Blaster {
                 let eq_lit = compare::eq(self, &a, &b);
                 self.not1(eq_lit)
             }
-            TermNode::App { op: Op::Builtin(bv_cmp), args, .. } => {
+            TermNode::App {
+                op: Op::Builtin(bv_cmp),
+                args,
+                ..
+            } => {
                 let child_ids = ctx.children(args).to_vec();
                 let a = self.blast_word(ctx, child_ids[0]);
                 let b = self.blast_word(ctx, child_ids[1]);
@@ -364,7 +414,7 @@ impl Blaster {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shinri_sat::{Lit, NoProof, NoTheory, Solver, SolveResult, SolverConfig, Var, Vmtf};
+    use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
 
     /// Build a shinri_sat::Solver from a finished Cnf, with `num_vars` pre-allocated.
     fn cnf_to_solver(cnf: &Cnf) -> Solver<NoTheory, NoProof, Vmtf> {
@@ -397,7 +447,11 @@ mod tests {
         }
         let mut s = cnf_to_solver(&cnf);
         let result = s.solve();
-        assert_eq!(result, SolveResult::Sat, "expected SAT for gate truth-table input");
+        assert_eq!(
+            result,
+            SolveResult::Sat,
+            "expected SAT for gate truth-table input"
+        );
         outputs
             .iter()
             .map(|bl| s.value_of(Var::new(bl.var)).expect("output var unassigned"))
@@ -442,7 +496,8 @@ mod tests {
         let b = bl.fresh();
         let cin = bl.fresh();
         let (sum, cout) = bl.full_adder(a, b, cin);
-        let results = solve_with_inputs_and_read(bl, &[(a, av), (b, bv), (cin, cinv)], &[sum, cout]);
+        let results =
+            solve_with_inputs_and_read(bl, &[(a, av), (b, bv), (cin, cinv)], &[sum, cout]);
         (results[0], results[1])
     }
 
@@ -523,7 +578,7 @@ mod tests {
 
     #[test]
     fn blast_word_constant_values() {
-        use shinri_core::{Context, Op, BuiltinOp};
+        use shinri_core::Context;
         use shinri_num::Integer;
         // blast constant 5 -> solve_value == 5
         {
@@ -554,16 +609,21 @@ mod tests {
 
     #[test]
     fn blast_word_bvadd_of_consts() {
-        use shinri_core::{Context, Op, BuiltinOp};
+        use shinri_core::{BuiltinOp, Context, Op};
         use shinri_num::Integer;
         let mut ctx = Context::new();
         let a = ctx.mk_bv_const(8, Integer::from(3u64));
         let b_c = ctx.mk_bv_const(8, Integer::from(200u64));
-        let add = ctx.mk_app(Op::Builtin(BuiltinOp::BvAdd), &[a, b_c]).unwrap();
+        let add = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[a, b_c])
+            .unwrap();
         let mut bl = Blaster::new();
         let bits = bl.blast_word(&ctx, add);
         assert_eq!(bits.len(), 8);
-        assert_eq!(crate::testkit::solve_value(bl, &bits), (3u64 + 200u64) & 0xFF);
+        assert_eq!(
+            crate::testkit::solve_value(bl, &bits),
+            (3u64 + 200u64) & 0xFF
+        );
     }
 
     #[test]
@@ -582,33 +642,45 @@ mod tests {
 
     #[test]
     fn blast_atom_ult_true_and_false() {
-        use shinri_core::{Context, Op, BuiltinOp};
+        use shinri_core::{BuiltinOp, Context, Op};
         use shinri_num::Integer;
         // (bvult #x03 #x05) -> 1
         {
             let mut ctx = Context::new();
             let a = ctx.mk_bv_const(8, Integer::from(3u64));
             let b_c = ctx.mk_bv_const(8, Integer::from(5u64));
-            let atom = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[a, b_c]).unwrap();
+            let atom = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[a, b_c])
+                .unwrap();
             let mut bl = Blaster::new();
             let lit = bl.blast_atom(&ctx, atom);
-            assert_eq!(crate::testkit::solve_value(bl, std::slice::from_ref(&lit)), 1, "bvult(3,5)=1");
+            assert_eq!(
+                crate::testkit::solve_value(bl, std::slice::from_ref(&lit)),
+                1,
+                "bvult(3,5)=1"
+            );
         }
         // (bvult #x05 #x03) -> 0
         {
             let mut ctx = Context::new();
             let a = ctx.mk_bv_const(8, Integer::from(5u64));
             let b_c = ctx.mk_bv_const(8, Integer::from(3u64));
-            let atom = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[a, b_c]).unwrap();
+            let atom = ctx
+                .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[a, b_c])
+                .unwrap();
             let mut bl = Blaster::new();
             let lit = bl.blast_atom(&ctx, atom);
-            assert_eq!(crate::testkit::solve_value(bl, std::slice::from_ref(&lit)), 0, "bvult(5,3)=0");
+            assert_eq!(
+                crate::testkit::solve_value(bl, std::slice::from_ref(&lit)),
+                0,
+                "bvult(5,3)=0"
+            );
         }
     }
 
     #[test]
     fn blast_atom_eq_true_and_false() {
-        use shinri_core::{Context, Op};
+        use shinri_core::Context;
         use shinri_num::Integer;
         // (= #x05 #x05) -> 1
         {
@@ -618,7 +690,11 @@ mod tests {
             let atom = ctx.mk_eq(a, b_c).unwrap();
             let mut bl = Blaster::new();
             let lit = bl.blast_atom(&ctx, atom);
-            assert_eq!(crate::testkit::solve_value(bl, std::slice::from_ref(&lit)), 1, "eq(5,5)=1");
+            assert_eq!(
+                crate::testkit::solve_value(bl, std::slice::from_ref(&lit)),
+                1,
+                "eq(5,5)=1"
+            );
         }
         // (= #x05 #x06) -> 0
         {
@@ -628,13 +704,17 @@ mod tests {
             let atom = ctx.mk_eq(a, b_c).unwrap();
             let mut bl = Blaster::new();
             let lit = bl.blast_atom(&ctx, atom);
-            assert_eq!(crate::testkit::solve_value(bl, std::slice::from_ref(&lit)), 0, "eq(5,6)=0");
+            assert_eq!(
+                crate::testkit::solve_value(bl, std::slice::from_ref(&lit)),
+                0,
+                "eq(5,6)=0"
+            );
         }
     }
 
     #[test]
     fn blast_word_constant_and_var_and_add() {
-        use shinri_core::{Context, Op, BuiltinOp};
+        use shinri_core::{BuiltinOp, Context, Op};
         use shinri_num::Integer;
         let mut ctx = Context::new();
         let s8 = ctx.bv_sort(8);
@@ -652,14 +732,16 @@ mod tests {
 
     #[test]
     fn blast_atom_eq_is_solvable_true() {
-        use shinri_core::{Context, Op, BuiltinOp};
+        use shinri_core::{BuiltinOp, Context, Op};
         use shinri_num::Integer;
         let mut ctx = Context::new();
         let s8 = ctx.bv_sort(8);
         let xf = ctx.declare_fun("x", &[], s8);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
         let one = ctx.mk_bv_const(8, Integer::from(1u64));
-        let lhs = ctx.mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, one]).unwrap();
+        let lhs = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, one])
+            .unwrap();
         let yf = ctx.declare_fun("y", &[], s8);
         let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
         let atom = ctx.mk_eq(lhs, y).unwrap();

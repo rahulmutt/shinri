@@ -62,7 +62,7 @@ macro_rules! u32_id {
 
 u32_id!(SymbolId);
 u32_id!(RatId);
-/// Index into `Context.bvs` (the BV literal table), analogous to `RatId`.
+// Index into `Context.bvs` (the BV literal table), analogous to `RatId`.
 u32_id!(BvId);
 u32_id!(ClauseId);
 u32_id!(Var);

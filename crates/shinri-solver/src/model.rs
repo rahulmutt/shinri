@@ -76,7 +76,9 @@ fn format_bin_fixed(val: &shinri_num::Integer, width: u32) -> String {
     }
     // bits is LSB-first; reverse to get MSB-first.
     bits.reverse();
-    bits.iter().map(|&b| if b == 1 { '1' } else { '0' }).collect()
+    bits.iter()
+        .map(|&b| if b == 1 { '1' } else { '0' })
+        .collect()
 }
 
 /// Format a single `ModelVal` as SMT-LIB text.

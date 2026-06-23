@@ -39,7 +39,11 @@ pub fn lower(ctx: &mut Context, bv_atoms: &[TermId]) -> Lowered {
     }
     // Extract var_bits BEFORE consuming the blaster via finish().
     let var_bits = b.exported_var_bits(ctx);
-    Lowered { cnf: b.finish(), atom_lit, var_bits }
+    Lowered {
+        cnf: b.finish(),
+        atom_lit,
+        var_bits,
+    }
 }
 
 #[cfg(test)]
@@ -64,9 +68,15 @@ mod lower_tests {
 
         let lo = lower(&mut ctx, &[atom]);
         // (1) atom_lit is keyed by the ORIGINAL atom TermId
-        assert!(lo.atom_lit.contains_key(&atom), "atom_lit must contain the original atom TermId");
+        assert!(
+            lo.atom_lit.contains_key(&atom),
+            "atom_lit must contain the original atom TermId"
+        );
         // (2) var_bits contains the BV variable x with 8 bits
-        assert!(lo.var_bits.contains_key(&x), "var_bits must contain the BV variable x");
+        assert!(
+            lo.var_bits.contains_key(&x),
+            "var_bits must contain the BV variable x"
+        );
         assert_eq!(lo.var_bits[&x].len(), 8, "x must have 8 bits");
         // (3) the CNF has at least one variable (var 0 is the pinned-true constant)
         assert!(lo.cnf.num_vars >= 1, "CNF must have at least 1 variable");
@@ -87,8 +97,12 @@ mod lower_tests {
         let zero = ctx.mk_bv_const(8, Integer::from(0u64));
         // (bvult (bvadd x #x00) x)  ->  after rewrite: (bvult x x)  (since x+0 -> x)
         // The original atom TermId is for the un-simplified form.
-        let xplus0 = ctx.mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, zero]).unwrap();
-        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[xplus0, x]).unwrap();
+        let xplus0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, zero])
+            .unwrap();
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[xplus0, x])
+            .unwrap();
 
         // Verify rewrite actually produces a different TermId.
         let rewritten = rewrite(&mut ctx, atom);
@@ -102,7 +116,8 @@ mod lower_tests {
         assert!(
             lo.atom_lit.contains_key(&atom),
             "atom_lit must contain the ORIGINAL atom TermId (original={:?}, rewritten={:?})",
-            atom, rewritten
+            atom,
+            rewritten
         );
         // If rewrite actually produced a different id, the rewritten id must NOT
         // replace the original as the key (it may coincidentally also be in the
@@ -115,7 +130,7 @@ mod lower_tests {
 
     #[test]
     fn lower_const_atom_no_var_bits() {
-        use shinri_sat::{Lit, NoProof, NoTheory, Solver, SolveResult, SolverConfig, Var, Vmtf};
+        use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
 
         let mut ctx = Context::new();
         // (bvult #x03 #x05) -> always true
@@ -126,7 +141,10 @@ mod lower_tests {
         let lo = lower(&mut ctx, &[atom]);
         assert!(lo.atom_lit.contains_key(&atom));
         // No BV variables were used, so var_bits must be empty.
-        assert!(lo.var_bits.is_empty(), "no BV variables -> var_bits must be empty");
+        assert!(
+            lo.var_bits.is_empty(),
+            "no BV variables -> var_bits must be empty"
+        );
 
         // End-to-end: the lit for a true atom must evaluate to true in the CNF.
         let lit = lo.atom_lit[&atom];

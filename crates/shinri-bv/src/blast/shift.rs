@@ -81,7 +81,11 @@ fn barrel_stage_lshr(
     (0..n)
         .map(|j| {
             // Shifted: bit j comes from position j + amount (right shift moves bits down).
-            let shifted = if j + amount < n { cur[j + amount] } else { fill };
+            let shifted = if j + amount < n {
+                cur[j + amount]
+            } else {
+                fill
+            };
             b.mux2(sel, shifted, cur[j])
         })
         .collect()
@@ -98,8 +102,8 @@ pub fn bvshl(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> Vec<BitLit> {
 
     // Per-stage muxes.
     let mut cur = x.to_vec();
-    for s in 0..stages {
-        let sel = y[s]; // y[s] is valid since y.len() == n >= 2^stages (for n >= 2)
+    for (s, &sel) in y.iter().enumerate().take(stages) {
+        // sel = y[s]; s also used as shift amount (1 << s).
         cur = barrel_stage_shl(b, &cur, sel, 1 << s, fill);
     }
 
@@ -120,8 +124,7 @@ pub fn bvlshr(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> Vec<BitLit> {
     let fill = b.zero();
 
     let mut cur = x.to_vec();
-    for s in 0..stages {
-        let sel = y[s];
+    for (s, &sel) in y.iter().enumerate().take(stages) {
         cur = barrel_stage_lshr(b, &cur, sel, 1 << s, fill);
     }
 
@@ -141,8 +144,7 @@ pub fn bvashr(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> Vec<BitLit> {
     let sign = x[n - 1]; // MSB = sign bit; this is a BitLit, not a gate
 
     let mut cur = x.to_vec();
-    for s in 0..stages {
-        let sel = y[s];
+    for (s, &sel) in y.iter().enumerate().take(stages) {
         // Fill for arith-right is the ORIGINAL sign bit (x[n-1], captured before any stage).
         cur = barrel_stage_lshr(b, &cur, sel, 1 << s, sign);
     }
@@ -256,7 +258,11 @@ mod tests {
         for &(x, sh) in cases {
             let expected = if sh >= 8 {
                 // sign-fill
-                if (x >> 7) & 1 == 1 { 0xFF } else { 0x00 }
+                if (x >> 7) & 1 == 1 {
+                    0xFF
+                } else {
+                    0x00
+                }
             } else {
                 // arithmetic shift: treat x as i8
                 let xsigned = x as u8 as i8;
@@ -308,7 +314,11 @@ mod tests {
             let mut b = Blaster::new();
             let xv = pin_const(&mut b, x as u64, 8);
             let rl = rotate_left(&xv, 8);
-            assert_eq!(solve_value(b, &rl), x as u64, "rotate_left(k=8) identity x={x:#x}");
+            assert_eq!(
+                solve_value(b, &rl),
+                x as u64,
+                "rotate_left(k=8) identity x={x:#x}"
+            );
         }
     }
 

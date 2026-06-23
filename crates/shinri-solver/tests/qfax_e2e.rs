@@ -5,7 +5,13 @@
 use shinri_core::{BuiltinOp, Op};
 use shinri_solver::{SolveOutcome, Solver};
 
-fn arr_setup(s: &mut Solver) -> (shinri_core::SortId, shinri_core::SortId, shinri_core::SortId) {
+fn arr_setup(
+    s: &mut Solver,
+) -> (
+    shinri_core::SortId,
+    shinri_core::SortId,
+    shinri_core::SortId,
+) {
     let i = s.declare_sort("I");
     let e = s.declare_sort("E");
     let a = s.array_sort(i, e);
