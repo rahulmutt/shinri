@@ -182,8 +182,16 @@ struct BlastState {
     /// blaster's namespace, so later batches' fresh SAT vars do NOT land at
     /// `base + var`. This explicit table records each BitVar's TRUE SAT `Var`.
     bitvar_to_sat: Vec<Option<Var>>,
-    /// BV term (read var, index, element, …) → its blasted SAT vars (LSB→MSB).
-    var_bits: FxHashMap<TermId, Vec<Var>>,
+    /// BV term (read var, index, element, …) → its blasted bits (LSB→MSB), each
+    /// stored as `(sat_var, pos)` so the bit's POLARITY is preserved. A bit's
+    /// concrete value is `sat.value_of(sat_var) == pos`. Polarity MUST be retained:
+    /// the blaster uses `var 0` (pinned true) for both 0-bits (`pos=false`) and
+    /// 1-bits (`pos=true`), and emits negated signal bits (`bvnot`/`bvneg`/
+    /// `zero_extend` high bits, …) as `BitLit{var:N, pos:false}`. Dropping `pos`
+    /// (storing only `Var`) would misread every such bit — a SOUNDNESS hole, since
+    /// `value_bv` feeds index/read/element values into ROW/functional-consistency
+    /// lemma checks that gate the sat/unsat verdict.
+    var_bits: FxHashMap<TermId, Vec<(Var, bool)>>,
 }
 
 /// The real `SatBridge` over a live `NoTheory` SAT solver plus a persistent
@@ -235,7 +243,11 @@ impl BlastState {
     /// SAT vars). Idempotent; cheap relative to a solve.
     fn refresh_var_bits(&mut self, ctx: &Context) {
         for (term, bits) in self.blaster.exported_var_bits(ctx) {
-            let vars: Vec<Var> = bits.iter().map(|&bl| self.sat_var(bl.var)).collect();
+            // Map each BitVar through the table for its SAT Var, but RETAIN `pos`.
+            let vars: Vec<(Var, bool)> = bits
+                .iter()
+                .map(|&bl| (self.sat_var(bl.var), bl.pos))
+                .collect();
             self.var_bits.insert(term, vars);
         }
     }
@@ -268,10 +280,16 @@ impl BlastState {
         // Replay first so definitional clauses allocate their BitVars' SAT vars.
         let batch = self.blaster.take_new_clauses();
         self.replay_batch(ctx, &batch);
-        // Then map this term's bits through the table. For a plain variable the
-        // batch is empty (no clauses), so `sat_var` allocates the fresh SAT vars
-        // here on first sight. Done after `replay_batch` so the mapping is stable.
-        let vars: Vec<Var> = bits.iter().map(|&bl| self.sat_var(bl.var)).collect();
+        // Then map this term's bits through the table, RETAINING `pos`. For a
+        // plain variable the batch is empty (no clauses), so `sat_var` allocates
+        // the fresh SAT vars here on first sight. Done after `replay_batch` so the
+        // mapping is stable. Polarity is kept because compound words (`bvnot`,
+        // `bvneg`, `zero_extend`, constant 0-bits, …) emit `pos=false` bits whose
+        // value is `value_of(sat_var) == pos`, not `value_of(sat_var)`.
+        let vars: Vec<(Var, bool)> = bits
+            .iter()
+            .map(|&bl| (self.sat_var(bl.var), bl.pos))
+            .collect();
         // Record this exact term's bits (covers compound index/word terms that
         // `exported_var_bits` — which only reports plain BV variables — omits).
         self.var_bits.insert(t, vars);
@@ -476,13 +494,6 @@ impl shinri_abv::SatBridge for RealBridge {
         // Only BV-sorted terms have bits. (A non-BV term — a Bool proxy, say —
         // has no width: return None.)
         let width = ctx.bv_width(ctx.sort_of(t))?;
-        // Short-circuit for BV literal constants: their value is known without
-        // going through SAT (and going through SAT would lose polarity since
-        // `var_bits` stores only `Var`, not `BitLit` polarity; the blaster uses
-        // `var=0` for both 0 and 1, distinguished only by the `pos` flag).
-        if let Some((w, v)) = ctx.bv_const_value(t) {
-            return Some((w, v.clone()));
-        }
         let mut st = self.st.borrow_mut();
         // Blast `t` on demand if it has never been blasted (e.g. an index or
         // extensionality witness that only ever appeared inside an abstracted-away
@@ -498,9 +509,18 @@ impl shinri_abv::SatBridge for RealBridge {
         st.ensure_word(ctx, t);
         let vars = st.var_bits.get(&t)?;
         debug_assert_eq!(vars.len() as u32, width, "var_bits width mismatch");
+        // Reconstruct each bit POLARITY-AWARE: the bit is `value_of(sat_var) == pos`.
+        // This is correct for every blasted shape, including:
+        //   * constant 0-bits / `zero()`  → BitLit{var0, pos:false}: value_of(var0)
+        //     is always the pinned `true`, and `true == false` = bit 0 (correct);
+        //   * constant 1-bits / `one()`    → BitLit{var0, pos:true}: `true == true` = 1;
+        //   * negated signal bits (`bvnot`/`bvneg`/`zero_extend` high bits, …)
+        //     → BitLit{var:N, pos:false}: bit is `value_of(N) == false`.
+        // Dropping `pos` (the prior bug) misread every such bit and could starve a
+        // ROW / functional-consistency lemma of a needed value → wrong verdict.
         let bits: Vec<bool> = vars
             .iter()
-            .map(|&v| st.sat.value_of(v).unwrap_or(false))
+            .map(|&(v, pos)| st.sat.value_of(v).unwrap_or(false) == pos)
             .collect();
         Some((width, shinri_bv::model::pack(width, &bits)))
     }
@@ -821,6 +841,54 @@ mod tests {
             shinri_abv::AbvOutcome::Unsat,
             "functional consistency over correctly-read indices i=j=7 must force \
              (select a i)=(select a j), contradicting 1 vs 2"
+        );
+    }
+
+    /// REGRESSION (value_bv polarity, COMPOUND index). The select indices here are
+    /// `(bvnot x)` and `y`, with `y = (bvnot x)` asserted — so the two effective
+    /// indices are equal, and functional consistency must force the two reads
+    /// equal, contradicting #x01 vs #x02 → UNSAT.
+    ///
+    /// `value_bv((bvnot x))` exercises the polarity path: `bvnot` blasts to
+    /// `BitLit{var:N, pos:false}` bits (negated signals). Under the OLD bug
+    /// `var_bits` dropped `pos`, so each negated bit was read as `value_of(N)`
+    /// instead of `value_of(N) == false` — i.e. the bvnot index read GARBAGE. The
+    /// functional-consistency check (`value_bv(ix) == value_bv(iy)`) then compared
+    /// a corrupted index against the correctly-read `y`, failed to detect they are
+    /// equal, never fired the ROW lemma, and returned a WRONG Sat. With the
+    /// polarity-aware read the bvnot index reads correctly, the indices match, the
+    /// lemma fires, and the verdict is the correct UNSAT.
+    #[test]
+    fn regression_value_bv_polarity_compound_index_unsat() {
+        let mut ctx = Context::new();
+        let i8 = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i8, i8);
+        let a = uconst(&mut ctx, "a", arr);
+        let x = uconst(&mut ctx, "x", i8);
+        let y = uconst(&mut ctx, "y", i8);
+        // notx = (bvnot x): a compound index whose bits carry pos=false.
+        let notx = ctx.mk_app(Op::Builtin(BuiltinOp::BvNot), &[x]).unwrap();
+        // (select a (bvnot x)) = #x01
+        let sel_notx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[a, notx])
+            .unwrap();
+        // (select a y) = #x02
+        let sel_y = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, y]).unwrap();
+        let one = ctx.mk_bv_const(8, shinri_num::Integer::from(1u64));
+        let two = ctx.mk_bv_const(8, shinri_num::Integer::from(2u64));
+        let eq_notx = ctx.mk_eq(sel_notx, one).unwrap();
+        let eq_y = ctx.mk_eq(sel_y, two).unwrap();
+        // y = (bvnot x): forces the two effective indices equal.
+        let eq_idx = ctx.mk_eq(y, notx).unwrap();
+        let conj = ctx
+            .mk_app(Op::Builtin(BuiltinOp::And), &[eq_notx, eq_y, eq_idx])
+            .unwrap();
+        assert_eq!(
+            solve_qfabv(&mut ctx, &[conj]),
+            shinri_abv::AbvOutcome::Unsat,
+            "functional consistency over the correctly-read compound index \
+             (bvnot x) = y must force (select a (bvnot x)) = (select a y), \
+             contradicting 1 vs 2"
         );
     }
 
