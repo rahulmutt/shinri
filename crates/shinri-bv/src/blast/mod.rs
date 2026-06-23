@@ -32,6 +32,7 @@ pub struct Cnf {
 pub struct Blaster {
     next_var: u32,
     clauses: Vec<Vec<BitLit>>,
+    drained: usize,
     /// Memoized blasted words: TermId -> LSB..MSB bit literals.
     pub(crate) cache: FxHashMap<TermId, Vec<BitLit>>,
 }
@@ -48,6 +49,7 @@ impl Blaster {
         let mut b = Blaster {
             next_var: 1,
             clauses: Vec::new(),
+            drained: 0,
             cache: FxHashMap::default(),
         };
         let t = BitLit { var: 0, pos: true };
@@ -78,6 +80,19 @@ impl Blaster {
             num_vars: self.next_var,
             clauses: self.clauses,
         }
+    }
+
+    /// Current variable high-water mark (equals `finish().num_vars`).
+    pub fn num_vars(&self) -> u32 {
+        self.next_var
+    }
+
+    /// Drain clauses accumulated since the last call. Leaves the blaster
+    /// reusable so further `blast_word`/`blast_atom` calls can be drained again.
+    pub fn take_new_clauses(&mut self) -> Vec<Vec<BitLit>> {
+        let new = self.clauses[self.drained..].to_vec();
+        self.drained = self.clauses.len();
+        new
     }
 
     pub fn not1(&self, a: BitLit) -> BitLit {
@@ -747,6 +762,26 @@ mod tests {
         let atom = ctx.mk_eq(lhs, y).unwrap();
         let mut b = Blaster::new();
         let _l = b.blast_atom(&ctx, atom);
+    }
+
+    #[test]
+    fn incremental_drain_returns_only_new_clauses() {
+        let mut b = Blaster::new();
+        // new() pins var0=true via one unit clause; drain it as the "initial" batch.
+        let initial = b.take_new_clauses();
+        assert_eq!(initial.len(), 1, "initial batch is the var0 unit clause");
+        let v0 = b.num_vars();
+
+        let x = b.fresh();
+        let y = b.fresh();
+        let _ = b.and2(x, y); // adds clauses + 1 fresh var
+        let batch1 = b.take_new_clauses();
+        assert!(!batch1.is_empty(), "and2 must emit clauses");
+        assert!(b.num_vars() > v0, "num_vars must grow");
+
+        // A second drain with no new work is empty.
+        let batch2 = b.take_new_clauses();
+        assert!(batch2.is_empty(), "no new clauses since last drain");
     }
 
     #[test]
