@@ -2,3 +2,6 @@
 //! See docs/superpowers/specs/2026-06-23-shinri-qfbv-design.md.
 pub mod blast;
 pub use blast::{BitLit, Blaster, Cnf};
+
+#[cfg(test)]
+pub(crate) mod testkit;

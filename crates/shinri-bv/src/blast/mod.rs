@@ -2,6 +2,7 @@ use rustc_hash::FxHashMap;
 use shinri_core::TermId;
 
 pub mod structural;
+pub mod bitwise;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BitLit {
