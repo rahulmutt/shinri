@@ -359,6 +359,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shinri-bv"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "shinri-core",
+ "shinri-num",
+ "shinri-sat",
+]
+
+[[package]]
 name = "shinri-cli"
 version = "0.1.0"
 dependencies = [
