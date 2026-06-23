@@ -82,6 +82,20 @@ impl Context {
         self.intern_sort(SortNode::Array(index, elem))
     }
 
+    /// Intern the (_ BitVec width) sort. width must be >= 1.
+    pub fn bv_sort(&mut self, width: u32) -> SortId {
+        debug_assert!(width >= 1, "BitVec width must be >= 1");
+        self.intern_sort(SortNode::BitVec(width))
+    }
+
+    /// The width of a BitVec sort, or None if `s` is not a BitVec sort.
+    pub fn bv_width(&self, s: SortId) -> Option<u32> {
+        match self.sort_node(s) {
+            SortNode::BitVec(n) => Some(*n),
+            _ => None,
+        }
+    }
+
     pub fn sort_node(&self, id: SortId) -> &SortNode {
         &self.sorts[id.index()]
     }
@@ -591,6 +605,19 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::Add), &[one, two])
             .unwrap();
         assert_eq!(ctx.substitute(sum, &[three], &[one]), sum);
+    }
+
+    #[test]
+    fn bv_sort_interns_by_width() {
+        let mut ctx = Context::new();
+        let a = ctx.bv_sort(8);
+        let b = ctx.bv_sort(8);
+        let c = ctx.bv_sort(32);
+        assert_eq!(a, b, "same width must intern to the same SortId");
+        assert_ne!(a, c);
+        assert_eq!(ctx.bv_width(a), Some(8));
+        assert_eq!(ctx.bv_width(c), Some(32));
+        assert_eq!(ctx.bv_width(ctx.bool_sort()), None);
     }
 
     #[test]
