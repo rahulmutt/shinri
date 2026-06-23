@@ -33,6 +33,21 @@ pub fn bvsub(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> Vec<BitLit> {
     adder(b, x, &ny, one).0
 }
 
+pub fn bvmul(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> Vec<BitLit> {
+    let n = x.len();
+    let zero = b.zero();
+    let mut acc: Vec<BitLit> = vec![zero; n];
+    for i in 0..n {
+        // partial = (x AND y[i]) shifted left by i, truncated to n bits.
+        let mut partial = vec![zero; n];
+        for j in 0..(n - i) {
+            partial[i + j] = b.and2(x[j], y[i]);
+        }
+        acc = adder(b, &acc, &partial, zero).0;
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use crate::blast::Blaster;
@@ -65,6 +80,17 @@ mod tests {
             let xv = pin_const(&mut b, x, 8);
             let r = super::bvneg(&mut b, &xv);
             assert_eq!(solve_value(b, &r), expected, "bvneg({x}) != {expected}");
+        }
+    }
+
+    #[test]
+    fn bvmul_mod_256() {
+        for (x, y) in [(0u64, 7u64), (1, 1), (13, 13), (255, 255), (16, 16), (200, 3)] {
+            let mut b = Blaster::new();
+            let xv = pin_const(&mut b, x, 8);
+            let yv = pin_const(&mut b, y, 8);
+            let r = super::bvmul(&mut b, &xv, &yv);
+            assert_eq!(solve_value(b, &r), (x * y) & 0xFF, "x={x} y={y}");
         }
     }
 }
