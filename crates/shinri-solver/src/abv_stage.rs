@@ -476,6 +476,13 @@ impl shinri_abv::SatBridge for RealBridge {
         // Only BV-sorted terms have bits. (A non-BV term — a Bool proxy, say —
         // has no width: return None.)
         let width = ctx.bv_width(ctx.sort_of(t))?;
+        // Short-circuit for BV literal constants: their value is known without
+        // going through SAT (and going through SAT would lose polarity since
+        // `var_bits` stores only `Var`, not `BitLit` polarity; the blaster uses
+        // `var=0` for both 0 and 1, distinguished only by the `pos` flag).
+        if let Some((w, v)) = ctx.bv_const_value(t) {
+            return Some((w, v.clone()));
+        }
         let mut st = self.st.borrow_mut();
         // Blast `t` on demand if it has never been blasted (e.g. an index or
         // extensionality witness that only ever appeared inside an abstracted-away
@@ -534,12 +541,90 @@ impl shinri_abv::SatBridge for RealBridge {
 }
 
 /// Build the abstraction, wire up the real bridge, and run the refinement loop.
-pub fn solve_qfabv(ctx: &mut Context, assertions: &[TermId]) -> shinri_abv::AbvOutcome {
-    use shinri_abv::{abstract_arrays, collect, refine};
+/// Returns only the outcome (discards array models). See `solve_qfabv_with_models`
+/// for the version that also builds array models on SAT.
+/// Used by unit tests; `lib.rs` uses `solve_qfabv_with_models` directly.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn solve_qfabv(ctx: &mut Context, assertions: &[TermId]) -> shinri_abv::AbvOutcome {
+    solve_qfabv_with_models(ctx, assertions).0
+}
+
+/// Enumerate every declared array constant (nullary `Op::Uninterpreted` whose
+/// sort is `(Array (_ BitVec _) (_ BitVec _))`) appearing in the assertions.
+/// Only top-level named constants are returned — `store(...)` subexpressions
+/// are not model entries.
+fn collect_array_consts(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
+    use shinri_core::TermNode;
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut result = Vec::new();
+    let mut stack: Vec<TermId> = assertions.to_vec();
+    while let Some(t) = stack.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        match ctx.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                let kids = ctx.children(*args).to_vec();
+                // A nullary uninterpreted const whose sort is a BV-array is a
+                // declared array constant.
+                if matches!(op, Op::Uninterpreted(_)) && kids.is_empty() && is_bv_array(ctx, t) {
+                    result.push(t);
+                }
+                for k in kids {
+                    stack.push(k);
+                }
+            }
+            TermNode::Const { .. } => {}
+        }
+    }
+    result
+}
+
+/// Like `solve_qfabv`, but on SAT additionally builds the array model for every
+/// declared array constant in the assertions, returning the rendered strings.
+/// Returns (`outcome`, `array_models`) where `array_models` maps each declared
+/// array constant `TermId` → its rendered SMT-LIB `store`-chain string.
+/// On non-SAT outcomes the map is empty.
+pub fn solve_qfabv_with_models(
+    ctx: &mut Context,
+    assertions: &[TermId],
+) -> (shinri_abv::AbvOutcome, FxHashMap<TermId, String>) {
+    use shinri_abv::{abstract_arrays, array_model, collect, refine, render};
     let mut c = collect(ctx, assertions);
     let mut abs = abstract_arrays(ctx, assertions, &c);
     let mut bridge = RealBridge::new(ctx, &abs);
-    refine(ctx, &mut abs, &mut c, &mut bridge)
+    let outcome = refine(ctx, &mut abs, &mut c, &mut bridge);
+
+    if outcome != shinri_abv::AbvOutcome::Sat {
+        return (outcome, FxHashMap::default());
+    }
+
+    // Build array models while `bridge`, `c`, and `abs` are still live.
+    let arr_consts = collect_array_consts(ctx, assertions);
+    let mut models = FxHashMap::default();
+    for arr in arr_consts {
+        let m = array_model(ctx, &c, &abs, arr, &bridge);
+        models.insert(arr, render(&m));
+    }
+    (outcome, models)
+}
+
+/// Test helper: run a QF_ABV query and return the rendered array model string
+/// for the single array term `arr`. Panics if the query is not SAT.
+#[cfg(test)]
+pub fn solve_qfabv_model_string(ctx: &mut Context, assertions: &[TermId], arr: TermId) -> String {
+    use shinri_abv::{abstract_arrays, array_model, collect, refine, render};
+    let mut c = collect(ctx, assertions);
+    let mut abs = abstract_arrays(ctx, assertions, &c);
+    let mut bridge = RealBridge::new(ctx, &abs);
+    let outcome = refine(ctx, &mut abs, &mut c, &mut bridge);
+    assert_eq!(
+        outcome,
+        shinri_abv::AbvOutcome::Sat,
+        "solve_qfabv_model_string: expected SAT"
+    );
+    let m = array_model(ctx, &c, &abs, arr, &bridge);
+    render(&m)
 }
 
 #[cfg(test)]
@@ -756,6 +841,26 @@ mod tests {
         let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[y, zero]).unwrap();
         assert!(uses_arrays_over_bv(&ctx, &[bv_atom, gt]));
         assert!(fenced(&ctx, &[bv_atom, gt]));
+    }
+
+    #[test]
+    fn get_model_renders_array_after_sat() {
+        // (= (select a #x01) #xff) is SAT; model must map a at index 1 to 0xff.
+        let mut ctx = Context::new();
+        let i8 = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i8, i8);
+        let af = ctx.declare_fun("a", &[], arr);
+        let a = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
+        let one = ctx.mk_bv_const(8, shinri_num::Integer::from(1u64));
+        let sel = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[a, one])
+            .unwrap();
+        let ff = ctx.mk_bv_const(8, shinri_num::Integer::from(255u64));
+        let atom = ctx.mk_eq(sel, ff).unwrap();
+
+        // (driver test helper that returns the model string for the array term)
+        let s = super::solve_qfabv_model_string(&mut ctx, &[atom], a);
+        assert!(s.contains("#x01") && s.contains("#xff") && s.starts_with("(store ((as const"));
     }
 
     #[test]

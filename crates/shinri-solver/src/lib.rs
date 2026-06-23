@@ -62,6 +62,9 @@ pub struct Solver {
     /// BV model bits stashed after a BV-path solve: each BV variable term →
     /// its CNF-mapped SAT vars (LSB→MSB). Consumed by Task 18's model extractor.
     bv_var_bits: rustc_hash::FxHashMap<TermId, Vec<shinri_core::Var>>,
+    /// Array models rendered after a QF_ABV SAT result: declared array constant
+    /// TermId → pre-rendered SMT-LIB `store`-chain string. Cleared on non-ABV paths.
+    abv_array_models: rustc_hash::FxHashMap<TermId, String>,
 }
 
 impl Default for Solver {
@@ -84,6 +87,7 @@ impl Solver {
             last_model: None,
             stage_b: true,
             bv_var_bits: rustc_hash::FxHashMap::default(),
+            abv_array_models: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -221,26 +225,36 @@ impl Solver {
     }
 
     fn format_value(&self, t: TermId) -> Option<String> {
-        self.last_model
-            .as_ref()?
-            .get(t)
-            .map(crate::model::format_modelval)
+        // Check BV/EUF model first.
+        if let Some(val) = self.last_model.as_ref().and_then(|m| m.get(t)) {
+            return Some(crate::model::format_modelval(val));
+        }
+        // Fall through to ABV array model (for array-sorted terms).
+        self.abv_array_models.get(&t).cloned()
     }
 
     fn format_model(&self) -> String {
-        match &self.last_model {
-            None => "()".into(),
-            Some(m) => {
-                let mut out = String::from("(");
-                for (t, v) in m.values.iter() {
-                    let name = crate::tseitin::display_term(&self.ctx, *t);
-                    let val = crate::model::format_modelval(v);
-                    out.push_str(&format!("({name} {val})"));
-                }
-                out.push(')');
-                out
+        let has_bv_euf = self.last_model.is_some();
+        let has_abv = !self.abv_array_models.is_empty();
+        if !has_bv_euf && !has_abv {
+            return "()".into();
+        }
+        let mut out = String::from("(");
+        // BV/EUF model entries (non-ABV path).
+        if let Some(m) = &self.last_model {
+            for (t, v) in m.values.iter() {
+                let name = crate::tseitin::display_term(&self.ctx, *t);
+                let val = crate::model::format_modelval(v);
+                out.push_str(&format!("({name} {val})"));
             }
         }
+        // QF_ABV array model entries: emit each as (name rendered-store-chain).
+        for (t, rendered) in &self.abv_array_models {
+            let name = crate::tseitin::display_term(&self.ctx, *t);
+            out.push_str(&format!("({name} {rendered})"));
+        }
+        out.push(')');
+        out
     }
 
     pub fn check_sat(&mut self) -> SolveOutcome {
@@ -270,7 +284,10 @@ impl Solver {
                 return SolveOutcome::Unknown;
             }
             let assertions_owned = assertions.clone();
-            return match crate::abv_stage::solve_qfabv(&mut self.ctx, &assertions_owned) {
+            let (outcome, array_models) =
+                crate::abv_stage::solve_qfabv_with_models(&mut self.ctx, &assertions_owned);
+            self.abv_array_models = array_models;
+            return match outcome {
                 shinri_abv::AbvOutcome::Sat => SolveOutcome::Sat,
                 shinri_abv::AbvOutcome::Unsat => SolveOutcome::Unsat,
                 shinri_abv::AbvOutcome::Unknown => SolveOutcome::Unknown,
@@ -285,6 +302,9 @@ impl Solver {
         // `lower()` bit-blasts the BV atoms to CNF over a private BitVar
         // namespace. It needs `&mut self.ctx` and must run BEFORE the SAT solver
         // clones the context. The resulting CNF is replayed into `sat` below.
+        // Non-ABV path: clear any stale array models from a previous QF_ABV solve.
+        self.abv_array_models.clear();
+
         let lowered_bv: Option<shinri_bv::Lowered> =
             if crate::bv_stage::solver_uses_bv(&self.ctx, &assertions) {
                 let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
