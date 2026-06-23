@@ -57,4 +57,14 @@ mod tests {
         let r = super::bvsub(&mut b, &xv, &yv); // 5-9 = -4 = 252 mod 256
         assert_eq!(solve_value(b, &r), 252);
     }
+
+    #[test]
+    fn bvneg_two_complement() {
+        for (x, expected) in [(0u64, 0u64), (1, 255), (128, 128), (2, 254), (255, 1)] {
+            let mut b = Blaster::new();
+            let xv = pin_const(&mut b, x, 8);
+            let r = super::bvneg(&mut b, &xv);
+            assert_eq!(solve_value(b, &r), expected, "bvneg({x}) != {expected}");
+        }
+    }
 }
