@@ -2,6 +2,7 @@
 //! Tseitin-encodes Boolean structure into the CDCL(T) SAT engine, registers EUF
 //! atoms, and extracts models. No SMT-LIB parser (assert via the API).
 
+mod abv_stage;
 mod bv_stage;
 mod model;
 mod tseitin;
@@ -256,6 +257,25 @@ impl Solver {
         >;
 
         let assertions = self.assertions.clone();
+
+        // ── QF_ABV path (BV-indexed, BV-valued arrays) ────────────────────────
+        // Route BEFORE the eager BV path: a query that uses select/store/array-eq
+        // over a `(Array (_ BitVec _) (_ BitVec _))` is handled by the
+        // lemmas-on-demand abstraction–refinement controller (shinri-abv) wired
+        // over a NoTheory SAT solver + persistent blaster. Arrays mixed with a
+        // non-BV/non-array theory atom (EUF/arith/uninterpreted sort) are out of
+        // scope → fence → Unknown. (Model stashing is Task 11; SAT just returns Sat.)
+        if crate::abv_stage::uses_arrays_over_bv(&self.ctx, &assertions) {
+            if crate::abv_stage::fenced(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
+            let assertions_owned = assertions.clone();
+            return match crate::abv_stage::solve_qfabv(&mut self.ctx, &assertions_owned) {
+                shinri_abv::AbvOutcome::Sat => SolveOutcome::Sat,
+                shinri_abv::AbvOutcome::Unsat => SolveOutcome::Unsat,
+                shinri_abv::AbvOutcome::Unknown => SolveOutcome::Unknown,
+            };
+        }
 
         // ── BV path ──────────────────────────────────────────────────────────
         // If the query mentions any BV sort/op, lower the BV atoms to CNF and
@@ -1005,6 +1025,61 @@ mod bv_tests {
         let pos = s.app(Op::Builtin(BuiltinOp::Gt), &[y, zero]);
         s.assert(bvatom);
         s.assert(pos);
+        assert_eq!(s.check_sat(), SolveOutcome::Unknown);
+    }
+
+    /// QF_ABV routing through the public `Solver` API: a ROW-1 UNSAT
+    /// `(= (select (store a i e) i) (bvadd e #x01))`.
+    #[test]
+    fn qfabv_row1_unsat_routed() {
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let arr = s.array_sort(s8, s8);
+        let a = s.declare_const("a", arr);
+        let i = s.declare_const("i", s8);
+        let e = s.declare_const("e", s8);
+        let st = s.app(Op::Builtin(BuiltinOp::Store), &[a, i, e]);
+        let sel = s.app(Op::Builtin(BuiltinOp::Select), &[st, i]);
+        let one = s.bv_numeral(Integer::from(1u64), 8);
+        let ep1 = s.app(Op::Builtin(BuiltinOp::BvAdd), &[e, one]);
+        let atom = s.eq(sel, ep1);
+        s.assert(atom);
+        assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    }
+
+    /// QF_ABV SAT routing: `(= (select (store a i e) i) e)`.
+    #[test]
+    fn qfabv_row1_sat_routed() {
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let arr = s.array_sort(s8, s8);
+        let a = s.declare_const("a", arr);
+        let i = s.declare_const("i", s8);
+        let e = s.declare_const("e", s8);
+        let st = s.app(Op::Builtin(BuiltinOp::Store), &[a, i, e]);
+        let sel = s.app(Op::Builtin(BuiltinOp::Select), &[st, i]);
+        let atom = s.eq(sel, e);
+        s.assert(atom);
+        assert_eq!(s.check_sat(), SolveOutcome::Sat);
+    }
+
+    /// QF_ABV mixed with arith atom → fenced to Unknown.
+    #[test]
+    fn qfabv_mixed_with_arith_is_unknown() {
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let arr = s.array_sort(s8, s8);
+        let a = s.declare_const("a", arr);
+        let i = s.declare_const("i", s8);
+        let one = s.bv_numeral(Integer::from(1u64), 8);
+        let sel = s.app(Op::Builtin(BuiltinOp::Select), &[a, i]);
+        let bv_atom = s.eq(sel, one);
+        let r = s.real_sort();
+        let y = s.declare_const("y", r);
+        let zero = s.numeral_zero(r);
+        let gt = s.app(Op::Builtin(BuiltinOp::Gt), &[y, zero]);
+        s.assert(bv_atom);
+        s.assert(gt);
         assert_eq!(s.check_sat(), SolveOutcome::Unknown);
     }
 

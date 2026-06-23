@@ -338,6 +338,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shinri-abv"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "shinri-bv",
+ "shinri-core",
+ "shinri-num",
+]
+
+[[package]]
 name = "shinri-arith"
 version = "0.0.1"
 dependencies = [
@@ -441,6 +451,7 @@ version = "0.1.0"
 dependencies = [
  "easy-smt",
  "rustc-hash",
+ "shinri-abv",
  "shinri-arith",
  "shinri-arrays",
  "shinri-bv",
