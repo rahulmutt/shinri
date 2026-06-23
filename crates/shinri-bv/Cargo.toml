@@ -1,0 +1,12 @@
+[package]
+name = "shinri-bv"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+shinri-core = { path = "../shinri-core" }
+shinri-num = { path = "../shinri-num" }
+rustc-hash = "2"
+
+[dev-dependencies]
+shinri-sat = { path = "../shinri-sat" }
