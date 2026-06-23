@@ -173,13 +173,15 @@ type Sat = shinri_sat::Solver<shinri_sat::NoTheory, shinri_core::NoProof, shinri
 struct BlastState {
     sat: Sat,
     blaster: shinri_bv::Blaster,
-    /// First SAT `Var` index of the blaster's BitVar namespace. BitVar `v` maps
-    /// to SAT `Var::new(base + v)`. The blaster's var 0 (pinned-true) lives at
-    /// `base + 0`, allocated once and reused across drained batches.
-    base: u32,
-    /// High-water mark: how many blaster BitVars already have a mirrored SAT var.
-    /// Lets `replay_batch` allocate only the genuinely new vars.
-    mirrored_vars: u32,
+    /// Blaster BitVar index → its mirrored SAT `Var`, allocated lazily the first
+    /// time the BitVar is seen and reused thereafter. Indexed by BitVar; an entry
+    /// is `None` until that BitVar has been mirrored.
+    ///
+    /// A FIXED `base + var` offset CANNOT be used: `encode_skeleton` allocates SAT
+    /// vars for Tseitin gate outputs and array-eq proxies that interleave with the
+    /// blaster's namespace, so later batches' fresh SAT vars do NOT land at
+    /// `base + var`. This explicit table records each BitVar's TRUE SAT `Var`.
+    bitvar_to_sat: Vec<Option<Var>>,
     /// BV term (read var, index, element, …) → its blasted SAT vars (LSB→MSB).
     var_bits: FxHashMap<TermId, Vec<Var>>,
 }
@@ -197,15 +199,31 @@ struct RealBridge {
 }
 
 impl BlastState {
-    /// Replay a freshly-drained batch of blaster clauses into the SAT solver,
-    /// allocating mirror vars only for BitVars that don't have one yet. Var 0 and
-    /// every previously-mirrored var are reused (no re-pinning).
-    fn replay_batch(&mut self, ctx: &Context, batch: &[Vec<shinri_bv::BitLit>]) {
-        let num = self.blaster.num_vars();
-        for _ in self.mirrored_vars..num {
-            self.sat.new_var();
+    /// Allocate (if needed) and return the SAT `Var` mirroring blaster BitVar `v`.
+    /// First sight allocates a fresh SAT var via `new_var()` and records it; later
+    /// sights reuse it. This is the single source of truth for the mapping.
+    fn sat_var(&mut self, v: u32) -> Var {
+        let idx = v as usize;
+        if idx >= self.bitvar_to_sat.len() {
+            self.bitvar_to_sat.resize(idx + 1, None);
         }
-        self.mirrored_vars = num;
+        if let Some(sv) = self.bitvar_to_sat[idx] {
+            return sv;
+        }
+        let sv = self.sat.new_var();
+        self.bitvar_to_sat[idx] = Some(sv);
+        sv
+    }
+
+    /// Map a blaster `BitLit` to a SAT `Lit`, allocating the BitVar's SAT var on
+    /// first sight (so this is `&mut self`).
+    fn map_bitlit(&mut self, bl: shinri_bv::BitLit) -> Lit {
+        Lit::new(self.sat_var(bl.var), bl.pos)
+    }
+
+    /// Replay a freshly-drained batch of blaster clauses into the SAT solver. Each
+    /// BitVar referenced is mapped (and allocated on first sight) via the table.
+    fn replay_batch(&mut self, ctx: &Context, batch: &[Vec<shinri_bv::BitLit>]) {
         for clause in batch {
             let mapped: Vec<Lit> = clause.iter().map(|&bl| self.map_bitlit(bl)).collect();
             self.sat.add_clause(&mapped);
@@ -213,19 +231,11 @@ impl BlastState {
         self.refresh_var_bits(ctx);
     }
 
-    /// Map a blaster `BitLit` to a SAT `Lit` via the contiguous `base` offset.
-    fn map_bitlit(&self, bl: shinri_bv::BitLit) -> Lit {
-        Lit::new(Var::new(self.base + bl.var), bl.pos)
-    }
-
     /// Refresh `var_bits` from the blaster's current cache (BV variable terms →
     /// SAT vars). Idempotent; cheap relative to a solve.
     fn refresh_var_bits(&mut self, ctx: &Context) {
         for (term, bits) in self.blaster.exported_var_bits(ctx) {
-            let vars: Vec<Var> = bits
-                .iter()
-                .map(|&bl| Var::new(self.base + bl.var))
-                .collect();
+            let vars: Vec<Var> = bits.iter().map(|&bl| self.sat_var(bl.var)).collect();
             self.var_bits.insert(term, vars);
         }
     }
@@ -255,12 +265,13 @@ impl BlastState {
             return;
         }
         let bits = self.blaster.blast_word(ctx, t);
-        let vars: Vec<Var> = bits
-            .iter()
-            .map(|&bl| Var::new(self.base + bl.var))
-            .collect();
+        // Replay first so definitional clauses allocate their BitVars' SAT vars.
         let batch = self.blaster.take_new_clauses();
         self.replay_batch(ctx, &batch);
+        // Then map this term's bits through the table. For a plain variable the
+        // batch is empty (no clauses), so `sat_var` allocates the fresh SAT vars
+        // here on first sight. Done after `replay_batch` so the mapping is stable.
+        let vars: Vec<Var> = bits.iter().map(|&bl| self.sat_var(bl.var)).collect();
         // Record this exact term's bits (covers compound index/word terms that
         // `exported_var_bits` — which only reports plain BV variables — omits).
         self.var_bits.insert(t, vars);
@@ -283,40 +294,26 @@ impl RealBridge {
             atom_bitlit.insert(original, bl);
         }
 
-        // (2) Build the SAT solver and allocate the contiguous mirror block for
-        //     the blaster's current BitVar namespace. The blaster's var 0 (pinned
-        //     true) is the first var of the block, so `base + 0` is forced true.
-        let mut sat: Sat = Sat::new(shinri_sat::SolverConfig::default());
-        let num = blaster.num_vars();
-        debug_assert!(num >= 1, "blaster always has var0 (pinned true)");
-        let first = sat.new_var();
-        for _ in 1..num {
-            sat.new_var();
-        }
-        let base = first.index() as u32;
-        let map_bitlit =
-            |bl: shinri_bv::BitLit| -> Lit { Lit::new(Var::new(base + bl.var), bl.pos) };
-
-        // Replay every clause produced so far (includes the var0 unit clause).
-        for clause in blaster.take_new_clauses() {
-            let mapped: Vec<Lit> = clause.iter().map(|&bl| map_bitlit(bl)).collect();
-            sat.add_clause(&mapped);
-        }
-
-        // (3) Map each BV atom's BitLit to its mirrored SAT Lit.
-        let mut atom_lit: FxHashMap<TermId, Lit> = FxHashMap::default();
-        for (&atom, &bl) in &atom_bitlit {
-            atom_lit.insert(atom, map_bitlit(bl));
-        }
-
+        // (2) Build the SAT solver and the BlastState; the BitVar→SAT-Var table
+        //     allocates mirror vars lazily through `sat_var` as each BitVar is seen.
+        let sat: Sat = Sat::new(shinri_sat::SolverConfig::default());
         let mut st = BlastState {
             sat,
             blaster,
-            base,
-            mirrored_vars: num,
+            bitvar_to_sat: Vec::new(),
             var_bits: FxHashMap::default(),
         };
-        st.refresh_var_bits(ctx);
+
+        // Replay every clause produced so far (includes the var0 pinned-true unit
+        // clause), allocating each referenced BitVar's SAT var via the table.
+        let batch = st.blaster.take_new_clauses();
+        st.replay_batch(ctx, &batch);
+
+        // (3) Map each BV atom's BitLit to its mirrored SAT Lit through the table.
+        let mut atom_lit: FxHashMap<TermId, Lit> = FxHashMap::default();
+        for (&atom, &bl) in &atom_bitlit {
+            atom_lit.insert(atom, st.map_bitlit(bl));
+        }
 
         // (4) Tseitin-encode the abstracted Boolean skeleton over `NoTheory`,
         //     mapping BV atoms → surrogate lits and array-eq proxies → fresh vars,
@@ -678,6 +675,68 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::And), &[eq_si, eq_sj])
             .unwrap();
         assert_eq!(solve_qfabv(&mut ctx, &[conj]), shinri_abv::AbvOutcome::Sat);
+    }
+
+    /// REGRESSION (BitVar→SAT-Var mapping soundness). This is the value-sensitive
+    /// instance that the OLD fixed `base + var` mapping gets WRONG.
+    ///
+    /// The abstraction here contains real Boolean structure (a top-level `And`
+    /// with several conjuncts plus a nested `Or`), so `encode_skeleton` allocates
+    /// a batch of Tseitin GATE vars at SAT indices that interleave the blaster's
+    /// namespace BEFORE any index word is blasted on demand. The correct verdict
+    /// (UNSAT) hinges on functional consistency reading the model values of the
+    /// indices `i` and `j` — which are only blasted ON DEMAND (they vanish into
+    /// the abstracted-away selects). Under the old mapping those index bits aliased
+    /// onto gate/proxy vars (e.g. an And-gate output forced true), so the indices
+    /// read garbage, functional consistency could not fire, and the solver returned
+    /// a WRONG Sat. With the explicit table the indices read their true SAT vars.
+    ///
+    /// Formula: i = #x07 ∧ j = #x07 ∧ (select a i) = #x01 ∧ (select a j) = #x02
+    ///          ∧ (true ∨ <filler>).
+    /// i = j = 7 forces (select a i) = (select a j) by functional consistency,
+    /// but they are pinned to 1 and 2 → UNSAT.
+    #[test]
+    fn regression_bitvar_mapping_value_sensitive_unsat() {
+        let mut ctx = Context::new();
+        let i8 = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i8, i8);
+        let a = uconst(&mut ctx, "a", arr);
+        let i = uconst(&mut ctx, "i", i8);
+        let j = uconst(&mut ctx, "j", i8);
+        let si = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, i]).unwrap();
+        let sj = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, j]).unwrap();
+        let seven = ctx.mk_bv_const(8, shinri_num::Integer::from(7u64));
+        let one = ctx.mk_bv_const(8, shinri_num::Integer::from(1u64));
+        let two = ctx.mk_bv_const(8, shinri_num::Integer::from(2u64));
+        // Pin both indices to the SAME value so functional consistency must fire,
+        // but only if the on-demand-blasted index bits are read correctly.
+        let eq_i7 = ctx.mk_eq(i, seven).unwrap();
+        let eq_j7 = ctx.mk_eq(j, seven).unwrap();
+        let eq_si = ctx.mk_eq(si, one).unwrap();
+        let eq_sj = ctx.mk_eq(sj, two).unwrap();
+        // Extra Boolean structure to force a batch of gate vars before on-demand
+        // index blasting: a nested Or whose first disjunct is trivially satisfiable.
+        let bvult = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[i, seven])
+            .unwrap();
+        let bvuge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvUge), &[i, seven])
+            .unwrap();
+        let disj = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Or), &[bvult, bvuge])
+            .unwrap(); // tautology, but mints gate vars
+        let conj = ctx
+            .mk_app(
+                Op::Builtin(BuiltinOp::And),
+                &[eq_i7, eq_j7, eq_si, eq_sj, disj],
+            )
+            .unwrap();
+        assert_eq!(
+            solve_qfabv(&mut ctx, &[conj]),
+            shinri_abv::AbvOutcome::Unsat,
+            "functional consistency over correctly-read indices i=j=7 must force \
+             (select a i)=(select a j), contradicting 1 vs 2"
+        );
     }
 
     #[test]
