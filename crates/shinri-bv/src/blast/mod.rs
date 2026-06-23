@@ -4,6 +4,7 @@ use shinri_core::TermId;
 pub mod structural;
 pub mod bitwise;
 pub mod arith;
+pub mod div;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BitLit {
