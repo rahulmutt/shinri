@@ -302,6 +302,25 @@ impl Blaster {
         result
     }
 
+    /// Return the bits cached for every BV *variable* term: nullary `Op::Uninterpreted`
+    /// apps whose sort is a BitVec sort.
+    ///
+    /// Approach (a): post-hoc filter over `self.cache` — no changes to `blast_word`.
+    /// Constants (`TermNode::Const`) and non-nullary or Builtin apps are excluded.
+    pub fn exported_var_bits(&self, ctx: &Context) -> FxHashMap<TermId, Vec<BitLit>> {
+        self.cache
+            .iter()
+            .filter(|(&tid, _)| {
+                matches!(
+                    ctx.term_node(tid),
+                    TermNode::App { op: Op::Uninterpreted(_), args, sort }
+                    if ctx.children(*args).is_empty() && ctx.bv_width(*sort).is_some()
+                )
+            })
+            .map(|(&tid, bits)| (tid, bits.clone()))
+            .collect()
+    }
+
     /// Bit-blast a Bool-sorted BV predicate, returning a single `BitLit`.
     /// Handles: `Eq`/`Distinct` over BV operands, and all `BvUlt..BvSge` ops.
     pub fn blast_atom(&mut self, ctx: &Context, t: TermId) -> BitLit {
