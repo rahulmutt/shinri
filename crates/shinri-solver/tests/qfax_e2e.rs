@@ -74,3 +74,19 @@ fn array_equality_is_unknown() {
     s.assert(eq);
     assert_eq!(s.check_sat(), SolveOutcome::Unknown);
 }
+
+#[test]
+fn qfalia_select_over_int_array_is_unknown() {
+    // (Array Int E) — arith INDEX sort → QF_ALIA, out of scope → Unknown (fenced, never wrong-answered)
+    let mut s = Solver::new();
+    let i_int = s.int_sort();
+    let e_s = s.declare_sort("E");
+    let arr_s = s.array_sort(i_int, e_s);
+    let a = s.declare_const("a", arr_s);
+    let i = s.declare_const("i", i_int);
+    let e = s.declare_const("e", e_s);
+    let sel = s.app(Op::Builtin(BuiltinOp::Select), &[a, i]);
+    let eq = s.eq(sel, e);
+    s.assert(eq);
+    assert_eq!(s.check_sat(), SolveOutcome::Unknown);
+}

@@ -29,7 +29,7 @@ impl Lcg {
 //
 // Each instance is structured as:
 //   - 1 "store witness": (select (store A i_s e_s) i_q) — exercises ROW-1/ROW-2
-//   - 0-3 "plain select" atoms: (= (select A i) e) or (distinct ...)
+//   - 1-3 "plain select" atoms: (= (select A i) e) or (distinct ...)
 //   - 0-2 index (dis)equalities: (= i_p i_q) / (distinct i_p i_q)
 //
 // Using at most ONE store per instance bounds the ROW-split tree depth,

@@ -571,6 +571,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     self.enqueue(asserting, reason);
                                 }
                                 TheoryResult::Lemma(lits) => {
+                                    debug_assert!(lits.len() >= 2, "unit Lemma would be silently dropped by add_learnt (use a unit SplitAtoms instead)");
                                     self.add_learnt(&lits);
                                     let dl = self.trail.decision_level();
                                     if dl > 0 {

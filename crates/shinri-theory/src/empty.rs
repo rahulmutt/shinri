@@ -1,5 +1,6 @@
-//! A no-op theory occupying the `Arith` slot of `Combiner` until shinri-arith
-//! exists, so `Combiner<Euf, EmptyTheory>` is a complete QF_UF theory.
+//! A no-op TheorySolver usable in any Combiner slot (Arith, Arrays, or future
+//! slots) that unconditionally returns Sat — a generic placeholder when a slot
+//! is unused.
 
 use crate::model::ModelBuilder;
 use crate::solver_trait::{TCheck, TheoryCtx, TheorySolver};
