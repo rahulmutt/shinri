@@ -13,4 +13,8 @@ pub enum SortError {
     NotApplicable,
     /// An uninterpreted symbol was applied but was never declared.
     UndeclaredSymbol,
+    /// An argument was expected to be a BitVec sort but was not.
+    NotBitVec,
+    /// A bitvector indexed parameter (e.g. extract hi/lo or repeat k) is out of range.
+    BvIndex,
 }

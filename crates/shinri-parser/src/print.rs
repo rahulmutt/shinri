@@ -46,7 +46,7 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
             }
             out.push('(');
             match op {
-                Op::Builtin(b) => out.push_str(builtin_name(b)),
+                Op::Builtin(b) => out.push_str(&builtin_name(b)),
                 Op::Uninterpreted(sym) => out.push_str(ctx.symbol_name(sym)),
             }
             for c in children {
@@ -58,26 +58,62 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
     }
 }
 
-fn builtin_name(b: BuiltinOp) -> &'static str {
+fn builtin_name(b: BuiltinOp) -> String {
     use BuiltinOp::*;
     match b {
-        Not => "not",
-        And => "and",
-        Or => "or",
-        Implies => "=>",
-        Xor => "xor",
-        Eq => "=",
-        Distinct => "distinct",
-        Ite => "ite",
-        Neg => "-",
-        Add => "+",
-        Sub => "-",
-        Mul => "*",
-        Le => "<=",
-        Lt => "<",
-        Ge => ">=",
-        Gt => ">",
-        Select => "select",
-        Store => "store",
+        Not => "not".to_owned(),
+        And => "and".to_owned(),
+        Or => "or".to_owned(),
+        Implies => "=>".to_owned(),
+        Xor => "xor".to_owned(),
+        Eq => "=".to_owned(),
+        Distinct => "distinct".to_owned(),
+        Ite => "ite".to_owned(),
+        Neg => "-".to_owned(),
+        Add => "+".to_owned(),
+        Sub => "-".to_owned(),
+        Mul => "*".to_owned(),
+        Le => "<=".to_owned(),
+        Lt => "<".to_owned(),
+        Ge => ">=".to_owned(),
+        Gt => ">".to_owned(),
+        Select => "select".to_owned(),
+        Store => "store".to_owned(),
+        // Bitvector fixed-arity ops — SMT-LIB names
+        BvNot => "bvnot".to_owned(),
+        BvAnd => "bvand".to_owned(),
+        BvOr => "bvor".to_owned(),
+        BvXor => "bvxor".to_owned(),
+        BvNand => "bvnand".to_owned(),
+        BvNor => "bvnor".to_owned(),
+        BvXnor => "bvxnor".to_owned(),
+        BvNeg => "bvneg".to_owned(),
+        BvAdd => "bvadd".to_owned(),
+        BvSub => "bvsub".to_owned(),
+        BvMul => "bvmul".to_owned(),
+        BvUdiv => "bvudiv".to_owned(),
+        BvUrem => "bvurem".to_owned(),
+        BvSdiv => "bvsdiv".to_owned(),
+        BvSrem => "bvsrem".to_owned(),
+        BvSmod => "bvsmod".to_owned(),
+        BvShl => "bvshl".to_owned(),
+        BvLshr => "bvlshr".to_owned(),
+        BvAshr => "bvashr".to_owned(),
+        BvUlt => "bvult".to_owned(),
+        BvUle => "bvule".to_owned(),
+        BvUgt => "bvugt".to_owned(),
+        BvUge => "bvuge".to_owned(),
+        BvSlt => "bvslt".to_owned(),
+        BvSle => "bvsle".to_owned(),
+        BvSgt => "bvsgt".to_owned(),
+        BvSge => "bvsge".to_owned(),
+        BvConcat => "concat".to_owned(),
+        // Bitvector indexed ops — SMT-LIB indexed identifier syntax: (_ op params...)
+        BvExtract { hi, lo } => format!("(_ extract {hi} {lo})"),
+        BvZeroExtend(k) => format!("(_ zero_extend {k})"),
+        BvSignExtend(k) => format!("(_ sign_extend {k})"),
+        BvRotateLeft(k) => format!("(_ rotate_left {k})"),
+        BvRotateRight(k) => format!("(_ rotate_right {k})"),
+        BvRepeat(k) => format!("(_ repeat {k})"),
     }
 }

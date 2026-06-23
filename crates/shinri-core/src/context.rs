@@ -146,7 +146,8 @@ impl Context {
     }
 
     /// Returns the result sort if the application is well-sorted.
-    fn check_app(&self, op: Op, args: &[TermId]) -> Result<SortId, SortError> {
+    /// Takes `&mut self` because BV ops may need to intern a new BitVec result sort.
+    fn check_app(&mut self, op: Op, args: &[TermId]) -> Result<SortId, SortError> {
         let bool_s = self.bool_sort();
         match op {
             Op::Uninterpreted(sym) => {
@@ -158,20 +159,23 @@ impl Context {
                         found: args.len(),
                     });
                 }
+                // Clone to avoid holding a borrow while calling sort_of.
+                let params: Vec<SortId> = params.clone();
+                let result = *result;
                 for (&arg, &expected) in args.iter().zip(params.iter()) {
                     let found = self.sort_of(arg);
                     if found != expected {
                         return Err(SortError::Mismatch { expected, found });
                     }
                 }
-                Ok(*result)
+                Ok(result)
             }
             Op::Builtin(b) => self.check_builtin(b, args, bool_s),
         }
     }
 
     fn check_builtin(
-        &self,
+        &mut self,
         b: BuiltinOp,
         args: &[TermId],
         bool_s: SortId,
@@ -299,7 +303,79 @@ impl Context {
                 }
                 Ok(arr)
             }
+            // ── Bitvector operators ───────────────────────────────────────────
+            BvNot | BvNeg => {
+                expect_arity(args, 1)?;
+                let n = self.require_bv(args[0])?;
+                Ok(self.bv_sort(n))
+            }
+            BvAnd | BvOr | BvXor | BvNand | BvNor | BvXnor
+            | BvAdd | BvSub | BvMul
+            | BvUdiv | BvUrem | BvSdiv | BvSrem | BvSmod
+            | BvShl | BvLshr | BvAshr => {
+                expect_arity(args, 2)?;
+                let n = self.require_bv(args[0])?;
+                let m = self.require_bv(args[1])?;
+                if n != m {
+                    return Err(SortError::Mismatch {
+                        expected: self.sort_of(args[0]),
+                        found: self.sort_of(args[1]),
+                    });
+                }
+                Ok(self.bv_sort(n))
+            }
+            BvUlt | BvUle | BvUgt | BvUge | BvSlt | BvSle | BvSgt | BvSge => {
+                expect_arity(args, 2)?;
+                let n = self.require_bv(args[0])?;
+                let m = self.require_bv(args[1])?;
+                if n != m {
+                    return Err(SortError::Mismatch {
+                        expected: self.sort_of(args[0]),
+                        found: self.sort_of(args[1]),
+                    });
+                }
+                Ok(bool_s)
+            }
+            BvConcat => {
+                expect_arity(args, 2)?;
+                let n = self.require_bv(args[0])?;
+                let m = self.require_bv(args[1])?;
+                Ok(self.bv_sort(n + m))
+            }
+            BvExtract { hi, lo } => {
+                expect_arity(args, 1)?;
+                let n = self.require_bv(args[0])?;
+                // Requires: lo <= hi < n  (i.e. hi < n and lo <= hi)
+                if !(hi < n && lo <= hi) {
+                    return Err(SortError::BvIndex);
+                }
+                Ok(self.bv_sort(hi - lo + 1))
+            }
+            BvZeroExtend(k) | BvSignExtend(k) => {
+                expect_arity(args, 1)?;
+                let n = self.require_bv(args[0])?;
+                Ok(self.bv_sort(n + k))
+            }
+            BvRotateLeft(_) | BvRotateRight(_) => {
+                expect_arity(args, 1)?;
+                let n = self.require_bv(args[0])?;
+                Ok(self.bv_sort(n))
+            }
+            BvRepeat(k) => {
+                expect_arity(args, 1)?;
+                if k < 1 {
+                    return Err(SortError::BvIndex);
+                }
+                let n = self.require_bv(args[0])?;
+                Ok(self.bv_sort(n * k))
+            }
         }
+    }
+
+    /// Return the width of a BitVec-sorted term, or `SortError::NotBitVec` if
+    /// the term does not have a BitVec sort.
+    fn require_bv(&self, t: TermId) -> Result<u32, SortError> {
+        self.bv_width(self.sort_of(t)).ok_or(SortError::NotBitVec)
     }
 }
 
@@ -722,6 +798,41 @@ mod tests {
         // wrong index sort is rejected
         let e_as_idx = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, e]);
         assert!(e_as_idx.is_err());
+    }
+
+    #[test]
+    fn bv_op_result_widths() {
+        use crate::term::BuiltinOp::*;
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let x = { let f = ctx.declare_fun("x", &[], s8); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
+        let y = { let f = ctx.declare_fun("y", &[], s8); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
+
+        let add = ctx.mk_app(Op::Builtin(BvAdd), &[x, y]).unwrap();
+        assert_eq!(ctx.bv_width(ctx.sort_of(add)), Some(8));
+
+        let cat = ctx.mk_app(Op::Builtin(BvConcat), &[x, y]).unwrap();
+        assert_eq!(ctx.bv_width(ctx.sort_of(cat)), Some(16));
+
+        let ext = ctx.mk_app(Op::Builtin(BvExtract { hi: 3, lo: 1 }), &[x]).unwrap();
+        assert_eq!(ctx.bv_width(ctx.sort_of(ext)), Some(3));
+
+        let ze = ctx.mk_app(Op::Builtin(BvZeroExtend(4)), &[x]).unwrap();
+        assert_eq!(ctx.bv_width(ctx.sort_of(ze)), Some(12));
+
+        let ult = ctx.mk_app(Op::Builtin(BvUlt), &[x, y]).unwrap();
+        assert_eq!(ctx.sort_of(ult), ctx.bool_sort());
+    }
+
+    #[test]
+    fn bv_width_mismatch_is_error() {
+        use crate::term::BuiltinOp::*;
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let s16 = ctx.bv_sort(16);
+        let x = { let f = ctx.declare_fun("x", &[], s8); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
+        let z = { let f = ctx.declare_fun("z", &[], s16); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
+        assert!(ctx.mk_app(Op::Builtin(BvAdd), &[x, z]).is_err());
     }
 
     // helper local to the test module

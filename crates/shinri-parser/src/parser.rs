@@ -528,6 +528,26 @@ impl<'a> Parser<'a> {
                 }
                 Self::mk(ctx, Op::Builtin(BuiltinOp::Store), &args, &sp)
             }
+            // Task-5 stubs: BV ops are not yet constructible from parsed input.
+            // `builtin_for` never returns a BV variant, so these arms are
+            // unreachable today. They will be replaced by real implementations
+            // in Task 5 (BV parser support).
+            BuiltinOp::BvNot | BuiltinOp::BvAnd | BuiltinOp::BvOr | BuiltinOp::BvXor
+            | BuiltinOp::BvNand | BuiltinOp::BvNor | BuiltinOp::BvXnor
+            | BuiltinOp::BvNeg | BuiltinOp::BvAdd | BuiltinOp::BvSub | BuiltinOp::BvMul
+            | BuiltinOp::BvUdiv | BuiltinOp::BvUrem | BuiltinOp::BvSdiv
+            | BuiltinOp::BvSrem | BuiltinOp::BvSmod
+            | BuiltinOp::BvShl | BuiltinOp::BvLshr | BuiltinOp::BvAshr
+            | BuiltinOp::BvUlt | BuiltinOp::BvUle | BuiltinOp::BvUgt | BuiltinOp::BvUge
+            | BuiltinOp::BvSlt | BuiltinOp::BvSle | BuiltinOp::BvSgt | BuiltinOp::BvSge
+            | BuiltinOp::BvConcat
+            | BuiltinOp::BvExtract { .. }
+            | BuiltinOp::BvZeroExtend(_) | BuiltinOp::BvSignExtend(_)
+            | BuiltinOp::BvRotateLeft(_) | BuiltinOp::BvRotateRight(_)
+            | BuiltinOp::BvRepeat(_) => {
+                // BV ops are not supported in input parsing yet (Task 5).
+                Err(Diagnostic::new(sp, "BV op not yet supported in input"))
+            }
         }
     }
 
