@@ -226,6 +226,90 @@ mod tests {
     }
 
     #[test]
+    fn row2_unequal_index_emits_read_equals_aliased_read() {
+        let mut ctx = Context::new();
+        let arr_s = {
+            let i = ctx.bv_sort(8);
+            let e = ctx.bv_sort(8);
+            ctx.array_sort(i, e)
+        };
+        let s8 = ctx.bv_sort(8);
+        let a = {
+            let f = ctx.declare_fun("a2", &[], arr_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let i = {
+            let f = ctx.declare_fun("i2", &[], s8);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let j = {
+            let f = ctx.declare_fun("j2", &[], s8);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let e = {
+            let f = ctx.declare_fun("e2", &[], s8);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let st = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Store), &[a, i, e])
+            .unwrap();
+        let sel = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[st, j])
+            .unwrap();
+        let atom = ctx.mk_eq(sel, e).unwrap();
+        let c = crate::collect::collect(&ctx, &[atom]);
+        let mut abs = crate::abstraction::abstract_arrays(&mut ctx, &[atom], &c);
+        let r = abs.read_of[&sel];
+
+        // Pre-create select(a, j) and pin its read var so we know raj's TermId
+        // before read_over_write runs (hash-consing guarantees same TermId).
+        let selaj = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, j]).unwrap();
+        let (raj, _) = crate::abstraction::read_of_or_make(&mut ctx, &mut abs, selaj);
+
+        // Model: val(i)=1, val(j)=2 (unequal → ROW-2), val(r)=5, val(raj)=7 (violated).
+        let mut fake = crate::driver::fake::FakeBridge::default();
+        fake.bv.insert(i, (8, shinri_num::Integer::from(1u64)));
+        fake.bv.insert(j, (8, shinri_num::Integer::from(2u64)));
+        fake.bv.insert(r, (8, shinri_num::Integer::from(5u64)));
+        fake.bv.insert(raj, (8, shinri_num::Integer::from(7u64))); // r != raj → violation
+
+        let lemmas = read_over_write(&mut ctx, &mut abs, &c, &fake);
+        let eq_ij = ctx.mk_eq(i, j).unwrap();
+        let eq_rr = ctx.mk_eq(r, raj).unwrap();
+        assert!(
+            lemmas.contains(&Lemma(vec![
+                LemmaLit {
+                    atom: eq_ij,
+                    pos: true // (i≠j) antecedent → eq(i,j) is positive in disjunction
+                },
+                LemmaLit {
+                    atom: eq_rr,
+                    pos: true
+                },
+            ])),
+            "ROW-2 lemma not found in: {lemmas:?}"
+        );
+
+        // Sanity: when model does NOT violate (r == raj), no lemma should be emitted.
+        fake.bv.insert(r, (8, shinri_num::Integer::from(7u64)));
+        // raj already 7 → no violation
+        let lemmas_no_viol = read_over_write(&mut ctx, &mut abs, &c, &fake);
+        assert!(
+            !lemmas_no_viol.contains(&Lemma(vec![
+                LemmaLit {
+                    atom: eq_ij,
+                    pos: true
+                },
+                LemmaLit {
+                    atom: eq_rr,
+                    pos: true
+                },
+            ])),
+            "ROW-2 lemma should not fire when model satisfies r == raj"
+        );
+    }
+
+    #[test]
     fn equal_index_values_but_unequal_reads_emit_congruence_lemma() {
         let mut ctx = Context::new();
         let a = arr(&mut ctx);
