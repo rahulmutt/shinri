@@ -140,10 +140,10 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a sort: `Bool`/`Int`/`Real`/user-declared, or the compound
-    /// `(Array <index> <element>)` sort.
+    /// `(Array <index> <element>)` or `(_ BitVec n)` sort.
     #[allow(dead_code)]
     fn parse_sort(&mut self, ctx: &mut Context) -> Result<SortId, Diagnostic> {
-        // Compound sort: (Array <index> <element>)
+        // Compound sort: (Array <index> <element>) or (_ BitVec n)
         if self.eat_lparen() {
             let (head, sp) = self.expect_symbol()?;
             let s = match head.as_str() {
@@ -151,6 +151,21 @@ impl<'a> Parser<'a> {
                     let index = self.parse_sort(ctx)?;
                     let elem = self.parse_sort(ctx)?;
                     ctx.array_sort(index, elem)
+                }
+                "_" => {
+                    // (_ BitVec n) — SMT-LIB indexed sort
+                    let (kw, ksp) = self.expect_symbol()?;
+                    if kw != "BitVec" {
+                        return Err(Diagnostic::new(
+                            ksp,
+                            format!("unsupported indexed sort identifier {kw}"),
+                        ));
+                    }
+                    let width = self.expect_numeral_u32()?;
+                    if width == 0 {
+                        return Err(Diagnostic::new(sp, "BitVec width must be >= 1"));
+                    }
+                    ctx.bv_sort(width)
                 }
                 other => {
                     return Err(Diagnostic::new(
@@ -248,6 +263,22 @@ impl<'a> Parser<'a> {
         match tok {
             Token::Numeral(s) => self.parse_atom_numeral(ctx, &s, false, sp),
             Token::Decimal(s) => self.parse_atom_numeral(ctx, &s, true, sp),
+            Token::Hex(s) => {
+                // #xHH... — hex digits after "#x"; width = 4 * number_of_digits
+                let digits = &s[2..]; // strip "#x"
+                let width = (digits.len() as u32) * 4;
+                let value = Integer::from_str_radix(digits, 16)
+                    .map_err(|_| Diagnostic::new(sp, "invalid hex literal"))?;
+                Ok(ctx.mk_bv_const(width, value))
+            }
+            Token::Bin(s) => {
+                // #bBB... — binary digits after "#b"; width = number_of_digits
+                let digits = &s[2..]; // strip "#b"
+                let width = digits.len() as u32;
+                let value = Integer::from_str_radix(digits, 2)
+                    .map_err(|_| Diagnostic::new(sp, "invalid binary literal"))?;
+                Ok(ctx.mk_bv_const(width, value))
+            }
             Token::Symbol(name) => self.resolve_leaf(ctx, &name, sp),
             Token::LParen => self.parse_compound(ctx, sp),
             other => Err(Diagnostic::new(sp, format!("unexpected token {other:?}"))),
@@ -1093,6 +1124,87 @@ mod tests {
         let cs = commands("(bad-command foo bar)\n(check-sat)");
         assert!(cs[0].is_err());
         assert!(matches!(cs[1], Ok(Command::CheckSat)));
+    }
+
+    /// Helper: parse all commands from `src`, asserting no diagnostic errors.
+    /// Returns (ctx, commands).
+    fn parse_all_ok(src: &str) -> (Context, Vec<Command>) {
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        let mut cmds = Vec::new();
+        while let Some(c) = p.next_command(&mut ctx) {
+            cmds.push(c.expect("unexpected parse error"));
+        }
+        (ctx, cmds)
+    }
+
+    /// Task-4 TDD test: `(_ BitVec n)` sort, `#x` hex literals, `#b` binary
+    /// literals are parsed correctly and produce the right BV constants.
+    ///
+    /// Non-vacuous assertions:
+    ///   - declare-const x (_ BitVec 8): the declared sort is exactly bv_sort(8).
+    ///   - (assert (= x #xFF)): #xFF parses without error; `bv_const_value` confirms
+    ///     width=8, value=255.
+    ///   - (assert (= x #b11111111)): #b11111111 parses without error; confirms
+    ///     width=8, value=255 (same BV const as #xFF → same TermId).
+    ///   - standalone parse_term: #b1010 gives width=4, value=10.
+    #[test]
+    fn parses_bv_sort_and_hex_binary_literals() {
+        // --- Part 1: full command pipeline ---
+        let src = "(declare-const x (_ BitVec 8))\n\
+                   (assert (= x #xFF))\n\
+                   (assert (= x #b11111111))\n";
+        let (mut ctx, cmds) = parse_all_ok(src);
+
+        // Three commands must have been produced.
+        assert_eq!(cmds.len(), 3, "expected 3 commands");
+        assert!(matches!(cmds[0], Command::DeclareFun { .. }));
+        assert!(matches!(cmds[1], Command::Assert(_)));
+        assert!(matches!(cmds[2], Command::Assert(_)));
+
+        // The declared constant has the BitVec(8) sort.
+        if let Command::DeclareFun { result, .. } = &cmds[0] {
+            assert_eq!(*result, ctx.bv_sort(8), "declare-const must have BitVec(8) sort");
+        }
+
+        // --- Part 2: direct literal parsing for precise value assertions ---
+        // #xFF — 8-bit hex, value 255.
+        {
+            let mut ctx2 = Context::new();
+            let mut p = Parser::new("#xFF");
+            let t = p.parse_term(&mut ctx2).expect("#xFF must parse");
+            let (w, v) = ctx2.bv_const_value(t).expect("#xFF must be a BV const");
+            assert_eq!(w, 8, "#xFF width must be 8");
+            assert_eq!(*v, Integer::from(255u64), "#xFF value must be 255");
+        }
+
+        // #b1010 — 4-bit binary, value 10.
+        {
+            let mut ctx2 = Context::new();
+            let mut p = Parser::new("#b1010");
+            let t = p.parse_term(&mut ctx2).expect("#b1010 must parse");
+            let (w, v) = ctx2.bv_const_value(t).expect("#b1010 must be a BV const");
+            assert_eq!(w, 4, "#b1010 width must be 4");
+            assert_eq!(*v, Integer::from(10u64), "#b1010 value must be 10");
+        }
+
+        // #b11111111 — 8-bit binary 255: same value as #xFF.
+        {
+            let mut ctx2 = Context::new();
+            let mut p = Parser::new("#b11111111");
+            let t = p.parse_term(&mut ctx2).expect("#b11111111 must parse");
+            let (w, v) = ctx2.bv_const_value(t).expect("#b11111111 must be a BV const");
+            assert_eq!(w, 8, "#b11111111 width must be 8");
+            assert_eq!(*v, Integer::from(255u64), "#b11111111 value must be 255");
+        }
+
+        // (_ BitVec 8) sort round-trip: parse_sort directly.
+        {
+            let mut ctx2 = Context::new();
+            let mut p = Parser::new("(_ BitVec 8)");
+            let s = p.parse_sort(&mut ctx2).expect("(_ BitVec 8) must parse as a sort");
+            assert_eq!(s, ctx2.bv_sort(8), "(_ BitVec 8) must resolve to bv_sort(8)");
+        }
     }
 
     #[test]
