@@ -616,7 +616,14 @@ pub fn solve_qfabv_with_models(
     ctx: &mut Context,
     assertions: &[TermId],
 ) -> (shinri_abv::AbvOutcome, FxHashMap<TermId, String>) {
-    use shinri_abv::{abstract_arrays, array_model, collect, refine, render};
+    use shinri_abv::{
+        abstract_arrays, array_model, collect, normalize_array_atoms, refine, render,
+    };
+    // SOUNDNESS: desugar n-ary + `distinct` array atoms into pairwise binary eqs
+    // BEFORE collection/abstraction, so every array atom the pipeline sees is a
+    // binary `Eq` (possibly under `Not`/`And`). See `shinri_abv::normalize`.
+    let assertions = normalize_array_atoms(ctx, assertions);
+    let assertions = assertions.as_slice();
     let mut c = collect(ctx, assertions);
     let mut abs = abstract_arrays(ctx, assertions, &c);
     let mut bridge = RealBridge::new(ctx, &abs);
@@ -640,7 +647,11 @@ pub fn solve_qfabv_with_models(
 /// for the single array term `arr`. Panics if the query is not SAT.
 #[cfg(test)]
 pub fn solve_qfabv_model_string(ctx: &mut Context, assertions: &[TermId], arr: TermId) -> String {
-    use shinri_abv::{abstract_arrays, array_model, collect, refine, render};
+    use shinri_abv::{
+        abstract_arrays, array_model, collect, normalize_array_atoms, refine, render,
+    };
+    let assertions = normalize_array_atoms(ctx, assertions);
+    let assertions = assertions.as_slice();
     let mut c = collect(ctx, assertions);
     let mut abs = abstract_arrays(ctx, assertions, &c);
     let mut bridge = RealBridge::new(ctx, &abs);
@@ -896,6 +907,109 @@ mod tests {
             "functional consistency over the correctly-read compound index \
              (bvnot x) = y must force (select a (bvnot x)) = (select a y), \
              contradicting 1 vs 2"
+        );
+    }
+
+    /// SOUNDNESS REGRESSION C1 — array `(distinct a b)` must NOT be read as `(= a b)`.
+    /// a,b are 1-bit-indexed (only cells #b0,#b1). They agree at both cells, so
+    /// extensionality forces a=b — contradicting `(distinct a b)` → UNSAT.
+    /// Pre-fix the proxy was forced TRUE (eq semantics), emitting agreement lemmas
+    /// and never a witness disequality, so distinctness was lost → WRONG Sat.
+    #[test]
+    fn regression_c1_array_distinct_is_not_equality_unsat() {
+        let mut ctx = Context::new();
+        let i1 = ctx.bv_sort(1);
+        let e8 = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i1, e8);
+        let a = uconst(&mut ctx, "a", arr);
+        let b = uconst(&mut ctx, "b", arr);
+        let zero = ctx.mk_bv_const(1, shinri_num::Integer::from(0u64));
+        let one = ctx.mk_bv_const(1, shinri_num::Integer::from(1u64));
+        let sa0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[a, zero])
+            .unwrap();
+        let sb0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[b, zero])
+            .unwrap();
+        let sa1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[a, one])
+            .unwrap();
+        let sb1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[b, one])
+            .unwrap();
+        let dist = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, b])
+            .unwrap();
+        let eq0 = ctx.mk_eq(sa0, sb0).unwrap();
+        let eq1 = ctx.mk_eq(sa1, sb1).unwrap();
+        let conj = ctx
+            .mk_app(Op::Builtin(BuiltinOp::And), &[dist, eq0, eq1])
+            .unwrap();
+        assert_eq!(
+            solve_qfabv(&mut ctx, &[conj]),
+            shinri_abv::AbvOutcome::Unsat,
+            "(distinct a b) with agreement at both (only) 1-bit cells must be UNSAT"
+        );
+    }
+
+    /// SOUNDNESS REGRESSION C2 — n-ary array `(distinct a b c)` must not collapse to
+    /// a single binary proxy. `(= a b)` contradicts `(distinct a b c)` → UNSAT.
+    /// Pre-fix only the (a,b) pair survived and was read with eq semantics, so
+    /// distinctness was never enforced → WRONG Sat.
+    #[test]
+    fn regression_c2_nary_array_distinct_unsat() {
+        let mut ctx = Context::new();
+        let i1 = ctx.bv_sort(1);
+        let e8 = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i1, e8);
+        let a = uconst(&mut ctx, "a", arr);
+        let b = uconst(&mut ctx, "b", arr);
+        let c = uconst(&mut ctx, "c", arr);
+        let dist = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, b, c])
+            .unwrap();
+        let eq_ab = ctx.mk_eq(a, b).unwrap();
+        let conj = ctx
+            .mk_app(Op::Builtin(BuiltinOp::And), &[dist, eq_ab])
+            .unwrap();
+        assert_eq!(
+            solve_qfabv(&mut ctx, &[conj]),
+            shinri_abv::AbvOutcome::Unsat,
+            "(= a b) contradicts (distinct a b c) → UNSAT"
+        );
+    }
+
+    /// Complement: n-ary `(= a b c)` with c forced to differ from a must be UNSAT
+    /// (exercises the n-ary `=` desugar chain, not just distinct).
+    #[test]
+    fn regression_c2_nary_array_eq_chain_unsat() {
+        let mut ctx = Context::new();
+        let i1 = ctx.bv_sort(1);
+        let e8 = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i1, e8);
+        let a = uconst(&mut ctx, "a", arr);
+        let b = uconst(&mut ctx, "b", arr);
+        let c = uconst(&mut ctx, "c", arr);
+        let zero = ctx.mk_bv_const(1, shinri_num::Integer::from(0u64));
+        // (= a b c) forces a=c at cell 0, but reads are pinned to differ.
+        let sa0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[a, zero])
+            .unwrap();
+        let sc0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[c, zero])
+            .unwrap();
+        let one8 = ctx.mk_bv_const(8, shinri_num::Integer::from(1u64));
+        let two8 = ctx.mk_bv_const(8, shinri_num::Integer::from(2u64));
+        let eq_all = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[a, b, c]).unwrap();
+        let pin_a = ctx.mk_eq(sa0, one8).unwrap();
+        let pin_c = ctx.mk_eq(sc0, two8).unwrap();
+        let conj = ctx
+            .mk_app(Op::Builtin(BuiltinOp::And), &[eq_all, pin_a, pin_c])
+            .unwrap();
+        assert_eq!(
+            solve_qfabv(&mut ctx, &[conj]),
+            shinri_abv::AbvOutcome::Unsat,
+            "(= a b c) forces a=c, contradicting (select a 0)=1 vs (select c 0)=2"
         );
     }
 

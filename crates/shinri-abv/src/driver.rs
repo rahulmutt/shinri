@@ -57,8 +57,6 @@ pub fn refine<B: SatBridge>(
         if !bridge.solve() {
             return AbvOutcome::Unsat;
         }
-        // Snapshot selects so newly-minted reads (this round) are picked up next.
-        let before = c.selects.len();
 
         let mut round: Vec<Lemma> = Vec::new();
         round.extend(crate::check::functional_consistency(ctx, abs, c, bridge));
@@ -73,7 +71,6 @@ pub fn refine<B: SatBridge>(
 
         // Register any selects minted this round (recorded in abs.read_of) into c.
         sync_new_selects(ctx, abs, c);
-        let _ = before; // documented: growth observed via sync_new_selects
 
         let mut progress = false;
         for lemma in round {

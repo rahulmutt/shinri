@@ -41,7 +41,7 @@ const N_ITERS: usize = 200;
 // QF_ABV instance generator
 //
 // Per instance:
-//   - 2 BV-arrays a0, a1 of type (Array (_ BitVec 8) (_ BitVec 8))
+//   - 3 BV-arrays a0, a1, a2 of type (Array (_ BitVec 8) (_ BitVec 8))
 //   - 3 index consts i0, i1, i2 of (_ BitVec 8)
 //   - 3 element consts e0, e1, e2 of (_ BitVec 8)
 //
@@ -57,10 +57,15 @@ const N_ITERS: usize = 200;
 //             (= (select a{ai} i{p}) (select a{ai} i{q}))  or  (distinct ...)
 //           Exercises the functional-consistency lemma path.
 //
-//   Atom 2: 1 extensionality atom:
-//             (= a0 a1)  or  (distinct a0 a1)
-//           Exercises the array-equality abstraction (eq_proxy) path.
-//           BV-array equality is IN SCOPE for QF_ABV (the fence allows it).
+//   Atom 2: 1 extensionality atom — binary OR n-ary, `=` OR `distinct`:
+//             (= a0 a1) | (distinct a0 a1) | (= a0 a1 a2) | (distinct a0 a1 a2)
+//           Exercises the array-equality abstraction (eq_proxy) path AND the
+//           n-ary/distinct desugar (the soundness fix). BV-array (dis)equality is
+//           IN SCOPE for QF_ABV (the fence allows it).
+//
+//   Atom 3 (with prob 1/2): a `(distinct ax ay)` paired with a pinned per-cell
+//           agreement `(= (select ax i{p}) (select ay i{p}))` — drives the
+//           `distinct` extensionality WITNESS path.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate one QF_ABV instance.
@@ -69,7 +74,7 @@ const N_ITERS: usize = 200;
 /// SMT-LIB2 script (without `(check-sat)`) that exactly represents the same
 /// formula sent to z3.  The two are built in lockstep so they are always in sync.
 fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
-    const N_ARR: usize = 2;
+    const N_ARR: usize = 3;
     const N_IDX: usize = 3;
     const N_ELT: usize = 3;
     let width: u32 = 8;
@@ -160,19 +165,71 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
         }
     }
 
-    // ── Atom 2: extensionality ───────────────────────────────────────────────
-    // (= a0 a1) or (distinct a0 a1) exercises the array-equality abstraction.
+    // ── Atom 2: extensionality (binary + n-ary, = and distinct) ───────────────
+    // Exercises the array-equality abstraction (eq_proxy) and — crucially after
+    // the soundness fix — the n-ary `=`/`distinct` desugar and the `distinct`
+    // witness path. `kind` selects among:
+    //   0: (= a0 a1)            1: (distinct a0 a1)
+    //   2: (= a0 a1 a2)         3: (distinct a0 a1 a2)
     // BV-array (dis)equality is IN SCOPE: the fence allows it (is_bv_array=true).
     {
-        let neg = rng.below(2) == 1;
-        if neg {
-            let atom = s.app(Op::Builtin(BuiltinOp::Distinct), &[arrays[0], arrays[1]]);
-            s.assert(atom);
-            dump.push_str("\n(assert (distinct a0 a1))");
-        } else {
-            let atom = s.eq(arrays[0], arrays[1]);
-            s.assert(atom);
-            dump.push_str("\n(assert (= a0 a1))");
+        let kind = rng.below(4);
+        match kind {
+            0 => {
+                let atom = s.eq(arrays[0], arrays[1]);
+                s.assert(atom);
+                dump.push_str("\n(assert (= a0 a1))");
+            }
+            1 => {
+                let atom = s.app(Op::Builtin(BuiltinOp::Distinct), &[arrays[0], arrays[1]]);
+                s.assert(atom);
+                dump.push_str("\n(assert (distinct a0 a1))");
+            }
+            2 => {
+                let atom = s.app(
+                    Op::Builtin(BuiltinOp::Eq),
+                    &[arrays[0], arrays[1], arrays[2]],
+                );
+                s.assert(atom);
+                dump.push_str("\n(assert (= a0 a1 a2))");
+            }
+            _ => {
+                let atom = s.app(
+                    Op::Builtin(BuiltinOp::Distinct),
+                    &[arrays[0], arrays[1], arrays[2]],
+                );
+                s.assert(atom);
+                dump.push_str("\n(assert (distinct a0 a1 a2))");
+            }
+        }
+    }
+
+    // ── Atom 3 (sometimes): a distinct that can force a witness ───────────────
+    // With probability 1/2, additionally assert agreement of a pair of arrays at
+    // EVERY accessed cell while also asserting they are distinct — this drives the
+    // `distinct` extensionality witness path (the array must differ at SOME index
+    // not pinned). Choose two arrays and pin them equal at i{p} via two reads, then
+    // assert (distinct ax ay): SAT iff there is a free index where they may differ.
+    {
+        if rng.below(2) == 1 {
+            let ax = rng.below(N_ARR as u64) as usize;
+            let mut ay = rng.below(N_ARR as u64) as usize;
+            if ay == ax {
+                ay = (ay + 1) % N_ARR;
+            }
+            let p = rng.below(N_IDX as u64) as usize;
+            // (= (select ax i{p}) (select ay i{p}))
+            let sax = s.app(Op::Builtin(BuiltinOp::Select), &[arrays[ax], idxs[p]]);
+            let say = s.app(Op::Builtin(BuiltinOp::Select), &[arrays[ay], idxs[p]]);
+            let eqp = s.eq(sax, say);
+            s.assert(eqp);
+            dump.push_str(&format!(
+                "\n(assert (= (select a{ax} i{p}) (select a{ay} i{p})))"
+            ));
+            // (distinct ax ay)
+            let dist = s.app(Op::Builtin(BuiltinOp::Distinct), &[arrays[ax], arrays[ay]]);
+            s.assert(dist);
+            dump.push_str(&format!("\n(assert (distinct a{ax} a{ay}))"));
         }
     }
 
