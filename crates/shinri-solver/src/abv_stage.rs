@@ -533,7 +533,14 @@ impl shinri_abv::SatBridge for RealBridge {
     }
 
     fn ensure_atom(&mut self, ctx: &mut Context, atom: TermId) {
+        // Already surrogated as a BV atom — nothing to do.
         if self.atom_lit.contains_key(&atom) {
+            return;
+        }
+        // A Bool proxy (array-eq abstraction) is already live as a SAT var in
+        // `proxy_var`; it does NOT need to be blasted. Calling `blast_atom` on it
+        // would panic because it is not a BV predicate.
+        if self.proxy_var.contains_key(&atom) {
             return;
         }
         let lit = self.st.borrow_mut().ensure_atom_lit(ctx, atom);
