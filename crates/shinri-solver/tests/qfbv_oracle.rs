@@ -103,7 +103,7 @@ fn gen_instance(
     // Add a small number of random BV terms to the pool.
     let n_extra = 2 + rng.below(4) as usize; // 2..=5 extra computed terms
     for _ in 0..n_extra {
-        let op_kind = rng.below(18); // pick from BV ops that keep the same width
+        let op_kind = rng.below(19); // pick from BV ops that keep the same width
         let i = rng.below(pool.len() as u64) as usize;
         let j = rng.below(pool.len() as u64) as usize;
 
@@ -187,13 +187,18 @@ fn gen_instance(
                 let nz = ctx.list(vec![ctx.atom("bvsrem"), pool[i].z, pool[j].z]);
                 (ns, nz, width)
             }
-            // Shifts: bvshl, bvlshr, bvashr
             15 => {
+                let ns = s.app(Op::Builtin(BuiltinOp::BvSmod), &[pool[i].s, pool[j].s]);
+                let nz = ctx.list(vec![ctx.atom("bvsmod"), pool[i].z, pool[j].z]);
+                (ns, nz, width)
+            }
+            // Shifts: bvshl, bvlshr, bvashr
+            16 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvShl), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvshl"), pool[i].z, pool[j].z]);
                 (ns, nz, width)
             }
-            16 => {
+            17 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvLshr), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvlshr"), pool[i].z, pool[j].z]);
                 (ns, nz, width)
