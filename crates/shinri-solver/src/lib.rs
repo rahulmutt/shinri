@@ -2,6 +2,7 @@
 //! Tseitin-encodes Boolean structure into the CDCL(T) SAT engine, registers EUF
 //! atoms, and extracts models. No SMT-LIB parser (assert via the API).
 
+mod bv_stage;
 mod model;
 mod tseitin;
 
@@ -24,6 +25,24 @@ use shinri_core::{Context, Op, SortId, SymbolId, TermId};
 use shinri_frontend::Command;
 use shinri_num::Rational;
 
+/// Minimal sink for replaying a bit-blasted BV CNF into a SAT solver, so
+/// `replay_bv_cnf` need not name the (large) concrete `Solver<Combiner<..>>` type.
+trait BvSatSink {
+    fn new_var(&mut self) -> shinri_core::Var;
+    fn add_clause(&mut self, lits: &[shinri_core::Lit]) -> bool;
+}
+
+impl<T: shinri_sat::Theory, P: shinri_core::ProofSink + Default, H: shinri_sat::BranchHeuristic>
+    BvSatSink for shinri_sat::Solver<T, P, H>
+{
+    fn new_var(&mut self) -> shinri_core::Var {
+        shinri_sat::Solver::new_var(self)
+    }
+    fn add_clause(&mut self, lits: &[shinri_core::Lit]) -> bool {
+        shinri_sat::Solver::add_clause(self, lits)
+    }
+}
+
 pub struct Solver {
     ctx: Context,
     assertions: Vec<TermId>,
@@ -36,6 +55,9 @@ pub struct Solver {
     last_model: Option<Model>,
     /// Plan B2 Stage-B optimization gate, forwarded to Arith in check_sat.
     stage_b: bool,
+    /// BV model bits stashed after a BV-path solve: each BV variable term →
+    /// its CNF-mapped SAT vars (LSB→MSB). Consumed by Task 18's model extractor.
+    bv_var_bits: rustc_hash::FxHashMap<TermId, Vec<shinri_core::Var>>,
 }
 
 impl Default for Solver {
@@ -57,6 +79,7 @@ impl Solver {
             t_false,
             last_model: None,
             stage_b: true,
+            bv_var_bits: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -80,6 +103,19 @@ impl Solver {
     }
     pub fn numeral(&mut self, value: Rational, sort: SortId) -> TermId {
         self.ctx.mk_numeral(value, sort)
+    }
+    /// Build the numeral 0 of an arithmetic (Int/Real) sort. Thin wrapper used by
+    /// tests and the mixed-theory paths.
+    pub fn numeral_zero(&mut self, sort: SortId) -> TermId {
+        self.ctx.mk_numeral(Rational::zero(), sort)
+    }
+    /// The `(_ BitVec width)` sort.
+    pub fn bv_sort(&mut self, width: u32) -> SortId {
+        self.ctx.bv_sort(width)
+    }
+    /// A bitvector literal of the given width and unsigned value.
+    pub fn bv_numeral(&mut self, value: shinri_num::Integer, width: u32) -> TermId {
+        self.ctx.mk_bv_const(width, value)
     }
     pub fn declare_const(&mut self, name: &str, sort: SortId) -> TermId {
         let f = self.ctx.declare_fun(name, &[], sort);
@@ -208,18 +244,47 @@ impl Solver {
 
         type Sat = shinri_sat::Solver<Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays>, NoProof, Vmtf>;
 
+        let assertions = self.assertions.clone();
+
+        // ── BV path ──────────────────────────────────────────────────────────
+        // If the query mentions any BV sort/op, lower the BV atoms to CNF and
+        // replay them into the SAT solver, surrogating each BV atom to a SAT
+        // literal so the existing Tseitin encoder handles the Boolean skeleton.
+        // Mixed BV + other-theory queries are fenced to Unknown.
+        // `lower()` bit-blasts the BV atoms to CNF over a private BitVar
+        // namespace. It needs `&mut self.ctx` and must run BEFORE the SAT solver
+        // clones the context. The resulting CNF is replayed into `sat` below.
+        let lowered_bv: Option<shinri_bv::Lowered> =
+            if crate::bv_stage::solver_uses_bv(&self.ctx, &assertions) {
+                let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
+                // SOUNDNESS FENCE (conservative): any non-BV theory atom present
+                // alongside BV → Unknown.
+                if crate::bv_stage::has_non_bv_theory_atom(&self.ctx, &assertions, &bv_atoms) {
+                    return SolveOutcome::Unknown;
+                }
+                Some(shinri_bv::lower(&mut self.ctx, &bv_atoms))
+            } else {
+                None
+            };
+
         // Lower n-ary distinct to pairwise binary up front (needs &mut ctx).
-        let lowered: Vec<TermId> = self
-            .assertions
-            .clone()
-            .into_iter()
-            .map(|a| self.lower(a))
-            .collect();
+        // BV atoms pass through unchanged (not arith-sorted), so their TermIds
+        // are preserved and the surrogate keys still match.
+        let lowered: Vec<TermId> = assertions.into_iter().map(|a| self.lower(a)).collect();
 
         let mut sat: Sat = shinri_sat::Solver::with_theory(
             SolverConfig::default(),
             Combiner::with_context(self.ctx.clone()),
         );
+
+        // Replay the BV CNF into the SAT solver and build the surrogate maps.
+        let bv_atom_lit: Option<rustc_hash::FxHashMap<TermId, shinri_core::Lit>> =
+            lowered_bv.map(|lo| {
+                let surrogates = self.replay_bv_cnf(&mut sat, lo);
+                // Stash var_bits (SAT Vars) for Task 18's model extractor.
+                self.bv_var_bits = surrogates.var_bits;
+                surrogates.atom_to_lit
+            });
         // set_truth_terms MUST be called before any atom encoding (Euf::new_var
         // installs the level-0 ⊤≠⊥ diseq only if truth_terms is already Some,
         // and assert panics if truth terms are unset).
@@ -234,6 +299,9 @@ impl Solver {
         let lira: bool;
         {
             let mut enc = Encoder::new(&self.ctx, &mut sat, self.t_true, self.t_false);
+            if let Some(map) = bv_atom_lit {
+                enc.set_bv_surrogates(map);
+            }
             // Phase 1: encode all formulas, registering all theory atoms with the
             // Combiner BEFORE asserting any unit clauses. This ensures every term
             // is present in the EGraph when the first merge fires, so congruence
@@ -292,6 +360,58 @@ impl Solver {
                 SolveOutcome::Sat
             }
         }
+    }
+
+    /// Replay a bit-blasted BV CNF into `sat`: allocate a contiguous block of
+    /// `num_vars` fresh SAT vars (recording `base` = the first index), map every
+    /// `BitLit{var,pos}` to `Lit::new(Var(base+var), pos)`, add every clause,
+    /// and return the `original-atom-TermId → surrogate Lit` map. Also stashes
+    /// `var_bits` (mapped to SAT `Var`s) for Task 18's model extractor.
+    ///
+    /// Var 0 of the blaster namespace is the pinned-true constant; its unit
+    /// clause is present in the CNF, so `base+0` is forced true automatically.
+    fn replay_bv_cnf<S>(
+        &mut self,
+        sat: &mut S,
+        lowered: shinri_bv::Lowered,
+    ) -> crate::bv_stage::BvSurrogates
+    where
+        S: BvSatSink,
+    {
+        use shinri_core::{Lit, Var};
+        // Allocate the contiguous var block; record the first index as `base`.
+        let num = lowered.cnf.num_vars;
+        let base = if num == 0 {
+            0
+        } else {
+            let first = sat.new_var();
+            for _ in 1..num {
+                sat.new_var();
+            }
+            first.index() as u32
+        };
+        let map_lit = |bl: shinri_bv::BitLit| -> Lit {
+            Lit::new(Var::new(base + bl.var), bl.pos)
+        };
+        // Add every clause.
+        for clause in &lowered.cnf.clauses {
+            let mapped: Vec<Lit> = clause.iter().map(|&bl| map_lit(bl)).collect();
+            sat.add_clause(&mapped);
+        }
+        // Build the original-atom → surrogate-Lit map.
+        let mut atom_to_lit: rustc_hash::FxHashMap<TermId, Lit> =
+            rustc_hash::FxHashMap::default();
+        for (&atom, &bl) in lowered.atom_lit.iter() {
+            atom_to_lit.insert(atom, map_lit(bl));
+        }
+        // Map var_bits (to SAT Vars) for Task 18's model extractor.
+        let mut var_bits: rustc_hash::FxHashMap<TermId, Vec<Var>> =
+            rustc_hash::FxHashMap::default();
+        for (&term, bits) in lowered.var_bits.iter() {
+            let vars: Vec<Var> = bits.iter().map(|&bl| Var::new(base + bl.var)).collect();
+            var_bits.insert(term, vars);
+        }
+        crate::bv_stage::BvSurrogates { atom_to_lit, var_bits }
     }
 
     pub fn get_model(&mut self) -> Model {
@@ -794,6 +914,81 @@ mod tests {
         let neq = s.app(Op::Builtin(BuiltinOp::Not), &[eq]);
         s.assert(eq);
         s.assert(neq);
+        assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    }
+}
+
+#[cfg(test)]
+mod bv_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Op};
+    use shinri_num::Integer;
+
+    #[test]
+    fn bv_query_sat_and_unsat() {
+        // SAT: exists x:8. (x bvadd 1) = 2   (x = 1)
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let x = s.declare_const("x", s8);
+        let one = s.bv_numeral(Integer::from(1u64), 8);
+        let two = s.bv_numeral(Integer::from(2u64), 8);
+        let lhs = s.app(Op::Builtin(BuiltinOp::BvAdd), &[x, one]);
+        let eq = s.eq(lhs, two);
+        s.assert(eq);
+        assert_eq!(s.check_sat(), SolveOutcome::Sat);
+
+        // UNSAT: (x bvadd 1) = x  — SOUNDNESS GATE: must be Unsat, NOT EUF-routed Sat.
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let x = s.declare_const("x", s8);
+        let one = s.bv_numeral(Integer::from(1u64), 8);
+        let lhs = s.app(Op::Builtin(BuiltinOp::BvAdd), &[x, one]);
+        let eq = s.eq(lhs, x);
+        s.assert(eq);
+        assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    }
+
+    #[test]
+    fn bv_mixed_with_arith_is_unknown() {
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let x = s.declare_const("x", s8);
+        let one = s.bv_numeral(Integer::from(1u64), 8);
+        let add = s.app(Op::Builtin(BuiltinOp::BvAdd), &[x, one]);
+        let bvatom = s.eq(add, one);
+        let r = s.real_sort();
+        let y = s.declare_const("y", r);
+        let zero = s.numeral_zero(r);
+        let pos = s.app(Op::Builtin(BuiltinOp::Gt), &[y, zero]);
+        s.assert(bvatom);
+        s.assert(pos);
+        assert_eq!(s.check_sat(), SolveOutcome::Unknown);
+    }
+
+    #[test]
+    fn bv_boolean_skeleton_mixed_atom_kinds() {
+        // (and (bvult x #x05) (= x #x03)) -> Sat (x=3)
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let x = s.declare_const("x", s8);
+        let five = s.bv_numeral(Integer::from(5u64), 8);
+        let three = s.bv_numeral(Integer::from(3u64), 8);
+        let ult = s.app(Op::Builtin(BuiltinOp::BvUlt), &[x, five]);
+        let eq3 = s.eq(x, three);
+        let conj = s.app(Op::Builtin(BuiltinOp::And), &[ult, eq3]);
+        s.assert(conj);
+        assert_eq!(s.check_sat(), SolveOutcome::Sat);
+
+        // (and (bvult x #x05) (= x #x07)) -> Unsat (7 is not < 5)
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let x = s.declare_const("x", s8);
+        let five = s.bv_numeral(Integer::from(5u64), 8);
+        let seven = s.bv_numeral(Integer::from(7u64), 8);
+        let ult = s.app(Op::Builtin(BuiltinOp::BvUlt), &[x, five]);
+        let eq7 = s.eq(x, seven);
+        let conj = s.app(Op::Builtin(BuiltinOp::And), &[ult, eq7]);
+        s.assert(conj);
         assert_eq!(s.check_sat(), SolveOutcome::Unsat);
     }
 }

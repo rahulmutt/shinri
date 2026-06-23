@@ -31,6 +31,12 @@ pub struct Encoder<'a> {
     pub saw_int_arith: bool,
     /// True if any arith atom's operands are Real-sorted.
     pub saw_real_arith: bool,
+    /// Optional BV surrogate map: original BV atom TermId → its pre-blasted SAT
+    /// literal. When set and `t` is a key, the Encoder returns the surrogate
+    /// literal DIRECTLY instead of registering a theory atom — BV atoms must
+    /// NEVER reach `register_atom`/`classify` (they would be mis-routed to EUF
+    /// as uninterpreted functions, an unsoundness). See bv_stage module doc.
+    bv_atom_lit: Option<FxHashMap<TermId, Lit>>,
     t_true: TermId,
     t_false: TermId,
 }
@@ -49,9 +55,16 @@ impl<'a> Encoder<'a> {
             saw_euf_nonreal: false,
             saw_int_arith: false,
             saw_real_arith: false,
+            bv_atom_lit: None,
             t_true,
             t_false,
         }
+    }
+
+    /// Install the BV surrogate map. After this, any term in the map encodes to
+    /// its pre-blasted literal instead of becoming a theory atom.
+    pub fn set_bv_surrogates(&mut self, map: FxHashMap<TermId, Lit>) {
+        self.bv_atom_lit = Some(map);
     }
 
     /// Force the encoded top-level formula literal to be true.
@@ -74,6 +87,17 @@ impl<'a> Encoder<'a> {
     }
 
     fn encode_uncached(&mut self, t: TermId) -> Lit {
+        // BV surrogate interception (SOUNDNESS-CRITICAL): if `t` is a collected
+        // BV atom, return its pre-blasted SAT literal WITHOUT registering a
+        // theory atom. Must come first so BV (dis)equalities never reach
+        // `atom()`/`register_atom`/`classify` (where they would mis-route to
+        // EUF). The Boolean skeleton (and/or/not over BV atoms) still encodes
+        // normally because those connective nodes are not in the map.
+        if let Some(map) = &self.bv_atom_lit {
+            if let Some(&lit) = map.get(&t) {
+                return lit;
+            }
+        }
         match self.ctx.term_node(t) {
             TermNode::App {
                 op: Op::Builtin(b),

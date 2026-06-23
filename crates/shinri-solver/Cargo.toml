@@ -12,6 +12,7 @@ shinri-theory = { path = "../shinri-theory" }
 shinri-euf = { path = "../shinri-euf" }
 shinri-arith = { path = "../shinri-arith" }
 shinri-arrays = { path = "../shinri-arrays" }
+shinri-bv = { path = "../shinri-bv" }
 shinri-num = { path = "../shinri-num" }
 shinri-frontend = { path = "../shinri-frontend" }
 rustc-hash = "2"
