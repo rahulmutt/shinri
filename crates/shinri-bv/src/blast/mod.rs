@@ -5,6 +5,7 @@ pub mod structural;
 pub mod bitwise;
 pub mod arith;
 pub mod div;
+pub mod shift;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct BitLit {
