@@ -2,6 +2,9 @@
 use crate::collect::Collected;
 use rustc_hash::FxHashMap;
 use shinri_core::{Context, Op, TermId, TermNode};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static FRESH_CTR: AtomicUsize = AtomicUsize::new(1_000_000);
 
 pub struct Abstraction {
     pub assertions: Vec<TermId>,
@@ -10,9 +13,26 @@ pub struct Abstraction {
 }
 
 /// Mint a fresh nullary uninterpreted constant of the given sort.
-fn fresh_const(ctx: &mut Context, name: &str, sort: shinri_core::SortId) -> TermId {
+pub(crate) fn fresh_const(ctx: &mut Context, name: &str, sort: shinri_core::SortId) -> TermId {
     let sym = ctx.declare_fun(name, &[], sort);
     ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
+}
+
+/// Read var for `sel`, minting one if absent. Returns `(read_var, Some(sel))`
+/// when a new read was introduced (so the caller can blast it), else `None`.
+pub fn read_of_or_make(
+    ctx: &mut Context,
+    abs: &mut Abstraction,
+    sel: TermId,
+) -> (TermId, Option<TermId>) {
+    if let Some(&r) = abs.read_of.get(&sel) {
+        return (r, None);
+    }
+    let elem_sort = ctx.sort_of(sel);
+    let n = FRESH_CTR.fetch_add(1, Ordering::Relaxed);
+    let r = fresh_const(ctx, &format!("$abv_read_{n}"), elem_sort);
+    abs.read_of.insert(sel, r);
+    (r, Some(sel))
 }
 
 pub fn abstract_arrays(ctx: &mut Context, assertions: &[TermId], c: &Collected) -> Abstraction {
@@ -100,6 +120,27 @@ mod tests {
     fn uconst(ctx: &mut Context, name: &str, s: shinri_core::SortId) -> TermId {
         let f = ctx.declare_fun(name, &[], s);
         ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+    }
+
+    #[test]
+    fn read_of_or_make_is_idempotent() {
+        let mut ctx = Context::new();
+        let arr = bv_arr(&mut ctx, 8, 8);
+        let a = uconst(&mut ctx, "a", arr);
+        let s8 = ctx.bv_sort(8);
+        let j = uconst(&mut ctx, "j", s8);
+        let sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, j]).unwrap();
+        let mut abs = Abstraction {
+            assertions: vec![],
+            read_of: FxHashMap::default(),
+            eq_proxy: FxHashMap::default(),
+        };
+        let (r1, fresh1) = read_of_or_make(&mut ctx, &mut abs, sel);
+        let (r2, fresh2) = read_of_or_make(&mut ctx, &mut abs, sel);
+        assert_eq!(r1, r2);
+        assert_eq!(fresh1, Some(sel));
+        assert_eq!(fresh2, None);
+        assert_eq!(ctx.bv_width(ctx.sort_of(r1)), Some(8));
     }
 
     #[test]
