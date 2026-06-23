@@ -262,4 +262,42 @@ mod tests {
             assert_eq!(got, expected, "bvsmod({xi},{yi}): expected {expected} got {got}");
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Signed div/rem/mod by zero — SMT-LIB compositional semantics confirmed against z3.
+    // Note: bvsdiv(neg, 0) = 1 (not all-ones); bvsrem/bvsmod(x, 0) = x.
+    // -------------------------------------------------------------------------
+    #[test]
+    fn signed_div_by_zero() {
+        // 8-bit signed div-by-zero cases. Encode negatives as u8 two's-complement.
+        // (-7 as u8 = 249 = 0xF9)
+        let cases = vec![
+            // (op, x_i8, expected_u8)
+            ("bvsdiv", -7i8, 1u8),        // bvsdiv(-7, 0) = 1
+            ("bvsdiv", 7i8, 255u8),       // bvsdiv(7, 0) = 255 (0xFF)
+            ("bvsrem", -7i8, 249u8),      // bvsrem(-7, 0) = -7 = 249
+            ("bvsrem", 7i8, 7u8),         // bvsrem(7, 0) = 7
+            ("bvsmod", -7i8, 249u8),      // bvsmod(-7, 0) = -7 = 249
+            ("bvsmod", 7i8, 7u8),         // bvsmod(7, 0) = 7
+        ];
+
+        for (op, xi, expected) in cases {
+            let mut b = Blaster::new();
+            let xv = pin_const(&mut b, xi as u8 as u64, 8);
+            let yv = pin_const(&mut b, 0u64, 8);
+
+            let result = match op {
+                "bvsdiv" => bvsdiv(&mut b, &xv, &yv),
+                "bvsrem" => bvsrem(&mut b, &xv, &yv),
+                "bvsmod" => bvsmod(&mut b, &xv, &yv),
+                _ => panic!("unknown op: {}", op),
+            };
+
+            let got = solve_value(b, &result) as u8;
+            assert_eq!(
+                got, expected,
+                "{op}({xi}, 0): expected {expected} got {got}"
+            );
+        }
+    }
 }
