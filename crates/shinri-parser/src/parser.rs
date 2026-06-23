@@ -215,6 +215,35 @@ impl<'a> Parser<'a> {
             ">" => Gt,
             "select" => Select,
             "store" => Store,
+            // BV non-indexed operators (SMT-LIB QF_BV)
+            "bvnot" => BvNot,
+            "bvand" => BvAnd,
+            "bvor" => BvOr,
+            "bvxor" => BvXor,
+            "bvnand" => BvNand,
+            "bvnor" => BvNor,
+            "bvxnor" => BvXnor,
+            "bvneg" => BvNeg,
+            "bvadd" => BvAdd,
+            "bvsub" => BvSub,
+            "bvmul" => BvMul,
+            "bvudiv" => BvUdiv,
+            "bvurem" => BvUrem,
+            "bvsdiv" => BvSdiv,
+            "bvsrem" => BvSrem,
+            "bvsmod" => BvSmod,
+            "bvshl" => BvShl,
+            "bvlshr" => BvLshr,
+            "bvashr" => BvAshr,
+            "bvult" => BvUlt,
+            "bvule" => BvUle,
+            "bvugt" => BvUgt,
+            "bvuge" => BvUge,
+            "bvslt" => BvSlt,
+            "bvsle" => BvSle,
+            "bvsgt" => BvSgt,
+            "bvsge" => BvSge,
+            "concat" => BvConcat,
             _ => return None,
         })
     }
@@ -285,6 +314,61 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// Parse the body of an indexed identifier `(_ <id> <nums...>)` where the
+    /// `_` has already been consumed.  Returns the corresponding `BuiltinOp`.
+    ///
+    /// Handles: `extract i j`, `zero_extend k`, `sign_extend k`,
+    /// `rotate_left k`, `rotate_right k`, `repeat k`.
+    fn parse_indexed_op(&mut self, usp: Span) -> Result<shinri_core::BuiltinOp, Diagnostic> {
+        use shinri_core::BuiltinOp::*;
+        let (id, isp) = self.expect_symbol()?;
+        let op = match id.as_str() {
+            "extract" => {
+                let hi = self.expect_numeral_u32()?;
+                let lo = self.expect_numeral_u32()?;
+                BvExtract { hi, lo }
+            }
+            "zero_extend" => BvZeroExtend(self.expect_numeral_u32()?),
+            "sign_extend" => BvSignExtend(self.expect_numeral_u32()?),
+            "rotate_left" => BvRotateLeft(self.expect_numeral_u32()?),
+            "rotate_right" => BvRotateRight(self.expect_numeral_u32()?),
+            "repeat" => BvRepeat(self.expect_numeral_u32()?),
+            other => {
+                return Err(Diagnostic::new(
+                    isp,
+                    format!("unknown indexed identifier '_{other}'"),
+                ));
+            }
+        };
+        let _ = usp;
+        Ok(op)
+    }
+
+    /// Parse `(_ bvK n)` where `_` has already been consumed.
+    /// `K` is a decimal integer embedded in the symbol `bvK`; `n` is the width.
+    fn parse_bv_numeral(
+        &mut self,
+        ctx: &mut Context,
+        usp: Span,
+    ) -> Result<TermId, Diagnostic> {
+        let (sym, ssp) = self.expect_symbol()?;
+        if !sym.starts_with("bv") {
+            return Err(Diagnostic::new(
+                ssp,
+                format!("expected indexed BV numeral `bvK`, got `{sym}`"),
+            ));
+        }
+        let k_str = &sym[2..];
+        let k: u64 = k_str.parse().map_err(|_| {
+            Diagnostic::new(ssp.clone(), format!("invalid BV numeral suffix `{k_str}`"))
+        })?;
+        let width = self.expect_numeral_u32()?;
+        if width == 0 {
+            return Err(Diagnostic::new(usp, "BV numeral width must be >= 1"));
+        }
+        Ok(ctx.mk_bv_const(width, Integer::from(k)))
+    }
+
     fn resolve_leaf(
         &mut self,
         ctx: &mut Context,
@@ -307,6 +391,22 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_compound(&mut self, ctx: &mut Context, open: Span) -> Result<TermId, Diagnostic> {
+        // Peek: if the head is '(' it may be an indexed operator `((_ id nums...) args...)`.
+        if matches!(self.peek(), Some((Ok(Token::LParen), _))) {
+            self.bump(); // consume inner '('
+            // Expect '_' to start an indexed identifier used as an operator.
+            let (under, usp) = self.expect_symbol()?;
+            if under != "_" {
+                return Err(Diagnostic::new(usp, "expected '_' in indexed identifier"));
+            }
+            let op = self.parse_indexed_op(usp.clone())?;
+            // consume closing ')' of the indexed identifier
+            self.expect_token(&Token::RParen)?;
+            // now parse the argument(s) and the outer closing ')'
+            let args = self.parse_arg_list(ctx)?;
+            return Self::mk(ctx, shinri_core::Op::Builtin(op), &args, &open);
+        }
+
         // Head must be a symbol (Phase 1: no higher-order heads).
         let (head, hsp) = match self.bump() {
             Some((Ok(Token::Symbol(s)), sp)) => (s, sp),
@@ -323,11 +423,20 @@ impl<'a> Parser<'a> {
 
         match head.as_str() {
             "let" => return self.parse_let(ctx),
-            "forall" | "exists" | "_" | "as" | "match" => {
+            "forall" | "exists" | "as" | "match" => {
                 return Err(Diagnostic::new(
                     hsp,
                     format!("unsupported construct: {head}"),
                 ));
+            }
+            // `(_ id nums...)` in term position: `(_ bvK n)` is a BV literal.
+            // Indexed operators in *head* position without a wrapping `( )` are
+            // not valid SMT-LIB syntax; parse_indexed_op will error if the
+            // identifier doesn't resolve to a known literal form.
+            "_" => {
+                let result = self.parse_bv_numeral(ctx, hsp)?;
+                self.expect_token(&Token::RParen)?;
+                return Ok(result);
             }
             _ => {}
         }
@@ -559,13 +668,12 @@ impl<'a> Parser<'a> {
                 }
                 Self::mk(ctx, Op::Builtin(BuiltinOp::Store), &args, &sp)
             }
-            // Task-5 stubs: BV ops are not yet constructible from parsed input.
-            // `builtin_for` never returns a BV variant, so these arms are
-            // unreachable today. They will be replaced by real implementations
-            // in Task 5 (BV parser support).
-            BuiltinOp::BvNot | BuiltinOp::BvAnd | BuiltinOp::BvOr | BuiltinOp::BvXor
+            // BV non-indexed binary/unary ops: delegate directly to mk_app
+            // (sort-checking is in Context::sort_of_app).
+            BuiltinOp::BvNot | BuiltinOp::BvNeg
+            | BuiltinOp::BvAnd | BuiltinOp::BvOr | BuiltinOp::BvXor
             | BuiltinOp::BvNand | BuiltinOp::BvNor | BuiltinOp::BvXnor
-            | BuiltinOp::BvNeg | BuiltinOp::BvAdd | BuiltinOp::BvSub | BuiltinOp::BvMul
+            | BuiltinOp::BvAdd | BuiltinOp::BvSub | BuiltinOp::BvMul
             | BuiltinOp::BvUdiv | BuiltinOp::BvUrem | BuiltinOp::BvSdiv
             | BuiltinOp::BvSrem | BuiltinOp::BvSmod
             | BuiltinOp::BvShl | BuiltinOp::BvLshr | BuiltinOp::BvAshr
@@ -576,8 +684,7 @@ impl<'a> Parser<'a> {
             | BuiltinOp::BvZeroExtend(_) | BuiltinOp::BvSignExtend(_)
             | BuiltinOp::BvRotateLeft(_) | BuiltinOp::BvRotateRight(_)
             | BuiltinOp::BvRepeat(_) => {
-                // BV ops are not supported in input parsing yet (Task 5).
-                Err(Diagnostic::new(sp, "BV op not yet supported in input"))
+                Self::mk(ctx, Op::Builtin(op), &args, &sp)
             }
         }
     }
@@ -1222,6 +1329,89 @@ mod tests {
         // Drive all commands; assert none produce a parse diagnostic.
         while let Some(cmd) = p.next_command(&mut ctx) {
             cmd.expect("array sort / select / store must parse");
+        }
+    }
+
+    /// Helper: parse all commands from `src`; return Ok(cmds) or the first Err.
+    fn parse_all(src: &str) -> Result<Vec<Command>, Diagnostic> {
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        let mut cmds = Vec::new();
+        while let Some(c) = p.next_command(&mut ctx) {
+            cmds.push(c?);
+        }
+        Ok(cmds)
+    }
+
+    /// Task-5 TDD test: BV operator symbols + indexed identifiers.
+    ///
+    /// Positive assertions:
+    ///   - The width-correct formula parses without error.
+    ///   - `((_ extract 3 0) x)` where x : BitVec 8 has sort bv_sort(4).
+    ///   - `(_ bv1 8)` is a BitVec const of width 8, value 1.
+    ///   - `(concat ((_ extract 7 4) x) ((_ extract 3 0) x))` has sort bv_sort(8).
+    /// Negative assertion:
+    ///   - `(bvadd x y)` where x : BitVec 8 and y : BitVec 16 errors (sort mismatch).
+    #[test]
+    fn parses_indexed_bv_ops_and_bv_numeral() {
+        // --- Positive: full command round-trip ---
+        let src = "(declare-const x (_ BitVec 8))\n\
+                   (assert (= (concat ((_ extract 7 4) x) ((_ extract 3 0) x)) (bvadd x (_ bv1 8))))\n";
+        assert!(parse_all(src).is_ok(), "width-correct BV formula must parse");
+
+        // --- Positive: extract sort check ---
+        {
+            let mut ctx = Context::new();
+            let mut p = Parser::new("(declare-const x (_ BitVec 8))");
+            p.next_command(&mut ctx).unwrap().unwrap();
+            let mut p2 = Parser::with_env("((_ extract 3 0) x)", p.into_env());
+            let t = p2.parse_term(&mut ctx).expect("extract must parse");
+            assert_eq!(
+                ctx.sort_of(t),
+                ctx.bv_sort(4),
+                "extract [3:0] of bv8 must have sort bv4"
+            );
+        }
+
+        // --- Positive: (_ bv1 8) literal ---
+        {
+            let mut ctx = Context::new();
+            let mut p = Parser::new("(_ bv1 8)");
+            let t = p.parse_term(&mut ctx).expect("(_ bv1 8) must parse");
+            let (w, v) = ctx
+                .bv_const_value(t)
+                .expect("(_ bv1 8) must be a BV const");
+            assert_eq!(w, 8, "(_ bv1 8) width must be 8");
+            assert_eq!(*v, Integer::from(1u64), "(_ bv1 8) value must be 1");
+        }
+
+        // --- Positive: concat sort ---
+        {
+            let mut ctx = Context::new();
+            let mut p = Parser::new("(declare-const x (_ BitVec 8))");
+            p.next_command(&mut ctx).unwrap().unwrap();
+            let mut p2 = Parser::with_env(
+                "(concat ((_ extract 7 4) x) ((_ extract 3 0) x))",
+                p.into_env(),
+            );
+            let t = p2.parse_term(&mut ctx).expect("concat must parse");
+            assert_eq!(
+                ctx.sort_of(t),
+                ctx.bv_sort(8),
+                "concat of two bv4 must have sort bv8"
+            );
+        }
+
+        // --- Negative: width-mismatched bvadd must error ---
+        {
+            let src_bad = "(declare-const x (_ BitVec 8))\n\
+                           (declare-const y (_ BitVec 16))\n\
+                           (assert (bvadd x y))\n";
+            let result = parse_all(src_bad);
+            assert!(
+                result.is_err(),
+                "bvadd of bv8 and bv16 must produce a sort error"
+            );
         }
     }
 
