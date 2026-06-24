@@ -19,6 +19,10 @@ pub struct Context {
     fun_sigs: FxHashMap<SymbolId, (Vec<SortId>, SortId)>,
     /// BV literal table: index `BvId(i)` -> `(width, value in [0, 2^width))`.
     bvs: Vec<(u32, Integer)>,
+    /// FP literal table: (eb, sb, bits) where bits is the W = eb+sb bit pattern,
+    /// laid out MSB->LSB as [sign | exponent | trailing-significand].
+    #[allow(dead_code)] // populated by the FP-literal task
+    fps: Vec<(u32, u32, Integer)>,
     /// String literal table: index `StringId(i)` -> interned string value.
     str_lits: Vec<Box<str>>,
     bool_sort: SortId,
@@ -45,6 +49,7 @@ impl Context {
             term_interner: FxHashMap::default(),
             fun_sigs: FxHashMap::default(),
             bvs: Vec::new(),
+            fps: Vec::new(),
             str_lits: Vec::new(),
             // placeholders; overwritten immediately below
             bool_sort: SortId::from_index(0),
@@ -105,6 +110,25 @@ impl Context {
     pub fn bv_width(&self, s: SortId) -> Option<u32> {
         match self.sort_node(s) {
             SortNode::BitVec(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Intern the (_ FloatingPoint eb sb) sort. Requires eb >= 2 and sb >= 2.
+    pub fn fp_sort(&mut self, eb: u32, sb: u32) -> SortId {
+        debug_assert!(eb >= 2 && sb >= 2, "FloatingPoint requires eb>=2, sb>=2");
+        self.intern_sort(SortNode::Float(eb, sb))
+    }
+
+    /// Intern the RoundingMode sort.
+    pub fn rm_sort(&mut self) -> SortId {
+        self.intern_sort(SortNode::RoundingMode)
+    }
+
+    /// (eb, sb) of a Float sort, or None if `s` is not a Float sort.
+    pub fn fp_widths(&self, s: SortId) -> Option<(u32, u32)> {
+        match self.sort_node(s) {
+            SortNode::Float(eb, sb) => Some((*eb, *sb)),
             _ => None,
         }
     }
@@ -1006,6 +1030,24 @@ mod tests {
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[i]).is_err());
         // Ill-sorted: str.at with String index must fail.
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrAt), &[x, y]).is_err());
+    }
+
+    #[test]
+    fn fp_and_rm_sorts_intern_and_roundtrip() {
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let f32_again = ctx.fp_sort(8, 24);
+        let f64 = ctx.fp_sort(11, 53);
+        assert_eq!(f32, f32_again, "equal FP sorts must intern to the same SortId");
+        assert_ne!(f32, f64, "different widths must be different sorts");
+        assert_eq!(ctx.fp_widths(f32), Some((8, 24)));
+        assert_eq!(ctx.fp_widths(f64), Some((11, 53)));
+        assert_eq!(ctx.fp_widths(ctx.bool_sort()), None);
+
+        let rm = ctx.rm_sort();
+        let rm2 = ctx.rm_sort();
+        assert_eq!(rm, rm2, "RoundingMode sort must be unique");
+        assert_eq!(ctx.fp_widths(rm), None);
     }
 
     // helper local to the test module
