@@ -22,6 +22,7 @@ pub struct Context {
     bool_sort: SortId,
     int_sort: SortId,
     real_sort: SortId,
+    string_sort: SortId,
 }
 
 impl Default for Context {
@@ -46,10 +47,12 @@ impl Context {
             bool_sort: SortId::from_index(0),
             int_sort: SortId::from_index(0),
             real_sort: SortId::from_index(0),
+            string_sort: SortId::from_index(0),
         };
         ctx.bool_sort = ctx.intern_sort(SortNode::Bool);
         ctx.int_sort = ctx.intern_sort(SortNode::Int);
         ctx.real_sort = ctx.intern_sort(SortNode::Real);
+        ctx.string_sort = ctx.intern_sort(SortNode::String);
         ctx
     }
 
@@ -74,6 +77,10 @@ impl Context {
     #[inline]
     pub fn real_sort(&self) -> SortId {
         self.real_sort
+    }
+    #[inline]
+    pub fn string_sort(&self) -> SortId {
+        self.string_sort
     }
 
     pub fn declare_sort(&mut self, name: &str) -> SortId {
@@ -862,6 +869,17 @@ mod tests {
             ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
         };
         assert!(ctx.mk_app(Op::Builtin(BvAdd), &[x, z]).is_err());
+    }
+
+    #[test]
+    fn string_sort_is_stable_singleton() {
+        let ctx = Context::new();
+        let a = ctx.string_sort();
+        let b = ctx.string_sort();
+        assert_eq!(a, b, "string_sort must intern to one stable SortId");
+        assert_ne!(a, ctx.int_sort());
+        assert_ne!(a, ctx.bool_sort());
+        assert!(matches!(ctx.sort_node(a), crate::sort::SortNode::String));
     }
 
     // helper local to the test module
