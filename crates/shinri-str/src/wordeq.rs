@@ -197,40 +197,40 @@ pub fn resolve_equation(
                 _ => None,
             };
         if let Some((var, cst)) = vc_pair {
-            // Extract first character of the constant (guaranteed non-empty above).
+            // Extract first character of the constant (guaranteed non-empty above by
+            // the `!s.is_empty()` guard in the match arm that produced `vc_pair`).
             let cs = terms.string_const_value(cst).unwrap().to_owned();
-            if let Some(ch) = cs.chars().next() {
-                // Canonical dedup key: order by index to be unordered.
-                let key = if var.index() <= cst.index() {
-                    (var, cst)
-                } else {
-                    (cst, var)
+            let ch = cs.chars().next().expect("non-empty constant by construction");
+            // Canonical dedup key: order by index to be unordered.
+            let key = if var.index() <= cst.index() {
+                (var, cst)
+            } else {
+                (cst, var)
+            };
+            if emitted.insert(key) {
+                // v = ""
+                let empty = terms.mk_string_const("");
+                let v_empty = terms.mk_eq(var, empty).expect("well-sorted");
+                // v = "ch" ++ z
+                let head = terms.mk_string_const(&ch.to_string());
+                let z = fresh_str(terms, fresh_ctr);
+                let hz = terms
+                    .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[head, z])
+                    .expect("well-sorted");
+                let v_head = terms.mk_eq(var, hz).expect("well-sorted");
+                // GUARD with ¬eqn: the disjunction `v="" ∨ v="ch"++z` is valid
+                // ONLY given the triggering word equation. Without the guard this
+                // would be a non-entailed permanent learnt clause causing spurious
+                // UNSAT (e.g. v="xy", c="b": neither disjunct holds, so the bare
+                // clause would make {v="xy"} UNSAT). The guard turns it into the
+                // valid implication `eqn → (v="" ∨ v="ch"++z)`.
+                return StepResult::Split {
+                    atoms: vec![v_empty, v_head],
+                    guard: eqn_lit.negate(),
                 };
-                if emitted.insert(key) {
-                    // v = ""
-                    let empty = terms.mk_string_const("");
-                    let v_empty = terms.mk_eq(var, empty).expect("well-sorted");
-                    // v = "ch" ++ z
-                    let head = terms.mk_string_const(&ch.to_string());
-                    let z = fresh_str(terms, fresh_ctr);
-                    let hz = terms
-                        .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[head, z])
-                        .expect("well-sorted");
-                    let v_head = terms.mk_eq(var, hz).expect("well-sorted");
-                    // GUARD with ¬eqn: the disjunction `v="" ∨ v="ch"++z` is valid
-                    // ONLY given the triggering word equation. Without the guard this
-                    // would be a non-entailed permanent learnt clause causing spurious
-                    // UNSAT (e.g. v="xy", c="b": neither disjunct holds, so the bare
-                    // clause would make {v="xy"} UNSAT). The guard turns it into the
-                    // valid implication `eqn → (v="" ∨ v="ch"++z)`.
-                    return StepResult::Split {
-                        atoms: vec![v_empty, v_head],
-                        guard: eqn_lit.negate(),
-                    };
-                }
-                // Already split this pair; wait for SAT to case-split.
-                return StepResult::Done;
             }
+            // Already split this pair; wait for SAT to case-split.
+            return StepResult::Done;
         }
     }
 
@@ -465,6 +465,11 @@ mod tests {
                     if has_empty_branch {
                         // The specialized var-vs-const split MUST be guarded (sound).
                         assert!(guard.is_some(), "var-vs-const split with empty branch must carry a guard (¬eqn)");
+                        let g = guard.unwrap();
+                        // test_force_eq_true uses Lit::new(Var::new(0), true) as the
+                        // asserting literal; the guard must be its negation.
+                        let expected_guard = Lit::new(Var::new(0), true).negate();
+                        assert_eq!(g, expected_guard, "guard must be ¬eqn (negation of the asserting literal)");
                         saw_guarded_split_with_empty_branch = true;
                         ok = true;
                         break;
