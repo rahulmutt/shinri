@@ -198,21 +198,6 @@ pub fn next_axiom(
         }
     }
 
-    // TEMP DEBUG: naive empty-length link to reproduce wrong-UNSAT.
-    {
-        let int_s = terms.int_sort();
-        let zero = terms.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
-        let len_eq_zero = terms.mk_eq(len_term, zero).expect("ws");
-        let empty = terms.mk_string_const("");
-        let arg_eq_empty = terms.mk_eq(arg, empty).expect("ws");
-        let empty_link = terms
-            .mk_app(Op::Builtin(BuiltinOp::Implies), &[len_eq_zero, arg_eq_empty])
-            .expect("ws");
-        if !emitted.contains(&empty_link) {
-            return Some(empty_link);
-        }
-    }
-
     // NOTE: the empty-length link `len(s)=0 → s=""` is NOT emitted here. The
     // solver emits, on demand, the guarded lemma `(s≠"") → len(s)≥1` (a pure-arith
     // consequent) and ONLY for `s ≠ ""` disequalities — the only place it is
