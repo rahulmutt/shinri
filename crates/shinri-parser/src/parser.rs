@@ -1520,6 +1520,72 @@ mod tests {
         );
     }
 
+    /// Parse `(str.at x 1)` and verify the App's op is StrAt.
+    #[test]
+    fn parses_strings_str_at() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = r#"
+            (declare-fun x () String)
+            (assert (= (str.at x 1) "a"))
+        "#;
+        let (ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 2, "expected declare-fun + assert");
+        let assert_term = match &cmds[1] {
+            Command::Assert(t) => *t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        // Top-level term must be Eq.
+        let eq_args = match ctx.term_node(assert_term).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } => ctx.children(args).to_vec(),
+            other => panic!("expected Eq App at top level, got {other:?}"),
+        };
+        // First child of Eq must be StrAt.
+        match ctx.term_node(eq_args[0]).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrAt),
+                ..
+            } => {}
+            other => panic!("expected StrAt as lhs of Eq, got {other:?}"),
+        }
+    }
+
+    /// Parse `(str.substr x 1 2)` and verify the App's op is StrSubstr.
+    #[test]
+    fn parses_strings_str_substr() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = r#"
+            (declare-fun x () String)
+            (assert (= (str.substr x 1 2) "ab"))
+        "#;
+        let (ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 2, "expected declare-fun + assert");
+        let assert_term = match &cmds[1] {
+            Command::Assert(t) => *t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        // Top-level term must be Eq.
+        let eq_args = match ctx.term_node(assert_term).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } => ctx.children(args).to_vec(),
+            other => panic!("expected Eq App at top level, got {other:?}"),
+        };
+        // First child of Eq must be StrSubstr.
+        match ctx.term_node(eq_args[0]).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrSubstr),
+                ..
+            } => {}
+            other => panic!("expected StrSubstr as lhs of Eq, got {other:?}"),
+        }
+    }
+
     /// Regression: define-fun followed by a bad command must NOT drop the
     /// command after the bad one. Before the fix, double error-recovery caused
     /// `(check-sat)` to be silently consumed.
