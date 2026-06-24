@@ -5,6 +5,13 @@ use shinri_theory::EqualityEngine;
 
 pub enum StepResult {
     Done,
+    /// The word equation has a variable-headed residual whose F-split was ALREADY
+    /// emitted (dedup hit) — the search is saturated WITHOUT having ground-resolved
+    /// the equation. The caller must NOT conclude SAT from this state (the model
+    /// builder cannot reliably realise the chained F-split merges into a satisfying
+    /// witness — the (B′) premature-SAT hazard), and instead returns a SOUND
+    /// `Unknown`. Distinct from `Done` (which means trivially resolved / consumed).
+    Saturated,
     Conflict(Vec<EqLeaf>),
     /// A GUARDED F-split. `atoms` are the fresh-positive disjuncts
     /// `[len_eq, a_pref, b_pref]`; `guard` is the NEGATION of the triggering
@@ -190,7 +197,7 @@ fn occurs_unsat(
 
 /// Compare two atoms for definite equality: same TermId, same literal string
 /// value, or same EqualityEngine equivalence class.
-fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: TermId) -> bool {
+pub(crate) fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: TermId) -> bool {
     if a == b {
         return true;
     }
@@ -272,6 +279,99 @@ pub fn resolve_equation(
             && occurs_unsat(terms, eq, rhs[j], &lhs[i..le])
         {
             return StepResult::Conflict(just);
+        }
+    }
+
+    // Both residuals fully constant: compare the concatenated words. When neither
+    // residual contains a variable, each side denotes a FIXED word; if those words
+    // differ (including the case where one is a proper prefix of the other, e.g.
+    // `"b" = "ba"` after stripping a common prefix), the equation is UNSAT in the
+    // free monoid. The head-char walk below catches a differing character but NOT a
+    // length difference with a common prefix (`"b"` vs `"ba"`), so handle the
+    // all-constant case explicitly here.
+    {
+        let all_const = |sl: &[TermId], terms: &Context| {
+            sl.iter().all(|&a| terms.string_const_value(a).is_some())
+        };
+        if all_const(&lhs[i..le], terms) && all_const(&rhs[j..re], terms) {
+            let cat = |sl: &[TermId], terms: &Context| -> String {
+                sl.iter()
+                    .map(|&a| terms.string_const_value(a).unwrap().to_owned())
+                    .collect()
+            };
+            if cat(&lhs[i..le], terms) != cat(&rhs[j..re], terms) {
+                return StepResult::Conflict(just);
+            }
+        }
+
+        // Constant-length bound: a FULLY-CONSTANT residual has an EXACT length; the
+        // other residual has a MINIMUM length = the sum of its string-constant atoms'
+        // char counts (variables are ≥ 0). If the exact length of a fully-constant
+        // side is STRICTLY LESS than the other side's minimum length, the equation is
+        // UNSAT in the free monoid — the constant side is too short to ever hold the
+        // other side's mandatory constant characters. This catches e.g.
+        // `s2++"ba" = "b"` (RHS exact 1 < LHS min 2 ⟹ UNSAT), which the single-level
+        // word-equation resolver otherwise leaves SAT (its NF does not expand the
+        // `s2 = "b"++z` merge the char-peel split mints). No fresh terms are created,
+        // so unlike a per-equation length lemma it cannot flood the String↔Arith seam.
+        {
+            let const_chars = |a: TermId, terms: &Context| -> usize {
+                terms.string_const_value(a).map_or(0, |s| s.chars().count())
+            };
+            let min_len = |sl: &[TermId], terms: &Context| -> usize {
+                sl.iter().map(|&a| const_chars(a, terms)).sum()
+            };
+            let l_res = &lhs[i..le];
+            let r_res = &rhs[j..re];
+            let l_all_const = all_const(l_res, terms);
+            let r_all_const = all_const(r_res, terms);
+            let l_min = min_len(l_res, terms);
+            let r_min = min_len(r_res, terms);
+            // A fully-constant side has exact length == its min_len.
+            if (l_all_const && l_min < r_min) || (r_all_const && r_min < l_min) {
+                return StepResult::Conflict(just);
+            }
+
+            // Character-set containment: when ONE side is fully constant, its word
+            // fixes the entire alphabet of the equal word, so every character of any
+            // CONSTANT atom on the other side must occur in that fixed word. If a
+            // constant atom on the variable side uses a character absent from the
+            // fully-constant side, the equation is UNSAT in the free monoid (e.g.
+            // `s1 ++ "cc" ++ s2 = "bbb"`: 'c' ∉ {b} ⟹ UNSAT). Sound and needs no
+            // fresh terms; it catches a class of premature-SAT word equations the
+            // F-split fixpoint would otherwise dedup-terminate as (wrongly) SAT.
+            let char_set = |sl: &[TermId], terms: &Context| -> Option<std::collections::BTreeSet<char>> {
+                if !all_const(sl, terms) {
+                    return None;
+                }
+                let mut s = std::collections::BTreeSet::new();
+                for &a in sl {
+                    for c in terms.string_const_value(a).unwrap().chars() {
+                        s.insert(c);
+                    }
+                }
+                Some(s)
+            };
+            let other_const_chars_subset = |fixed: &std::collections::BTreeSet<char>, other: &[TermId], terms: &Context| -> bool {
+                for &a in other {
+                    if let Some(cs) = terms.string_const_value(a) {
+                        if cs.chars().any(|c| !fixed.contains(&c)) {
+                            return false;
+                        }
+                    }
+                }
+                true
+            };
+            if let Some(lset) = char_set(l_res, terms) {
+                if !other_const_chars_subset(&lset, r_res, terms) {
+                    return StepResult::Conflict(just);
+                }
+            }
+            if let Some(rset) = char_set(r_res, terms) {
+                if !other_const_chars_subset(&rset, l_res, terms) {
+                    return StepResult::Conflict(just);
+                }
+            }
         }
     }
 
@@ -365,8 +465,8 @@ pub fn resolve_equation(
                     guard: eqn_lit.negate(),
                 };
             }
-            // Already split this pair; wait for SAT to case-split.
-            return StepResult::Done;
+            // Already split this pair; the search is saturated without resolution.
+            return StepResult::Saturated;
         }
     }
 
@@ -391,8 +491,8 @@ pub fn resolve_equation(
                 // UNSAT.
                 return StepResult::Split { atoms, guard: eqn_lit.negate() };
             }
-            // Already split this pair; wait for SAT to case-split.
-            return StepResult::Done;
+            // Already split this pair; the search is saturated without resolution.
+            return StepResult::Saturated;
         }
     }
 

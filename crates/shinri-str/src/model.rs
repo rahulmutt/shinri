@@ -50,6 +50,37 @@ pub fn len_of_in_model(terms: &mut Context, m: &ModelBuilder, t: TermId) -> usiz
     }
 }
 
+/// Model length of `t`, consulting `t`'s EUF class: returns `len_of_in_model(t)`
+/// if positive, else the max model length over the class members in `known` that
+/// are EUF-equal to `t`. A derived concat term's own `(str.len …)` may be absent
+/// from the arith model while an EUF-equal variable's is pinned, so the class read
+/// recovers the true length (needed by the cycle-guard fallback).
+fn class_len_in_model(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    m: &ModelBuilder,
+    t: TermId,
+) -> usize {
+    let direct = len_of_in_model(terms, m, t);
+    if direct > 0 {
+        return direct;
+    }
+    let tn = eq.intern(t);
+    let troot = eq.find(tn);
+    let mut best = 0usize;
+    for &k in known {
+        let kn = eq.intern(k);
+        if eq.find(kn) == troot {
+            let n = len_of_in_model(terms, m, k);
+            if n > best {
+                best = n;
+            }
+        }
+    }
+    best
+}
+
 /// Assign each string term a concrete `ModelVal::String` value, assembling
 /// compound (concat) terms from their operands and overlaying constant
 /// characters pinned by the equality-engine normal forms.
@@ -123,9 +154,15 @@ fn value_of(
         return s;
     }
     // Cycle guard: if we re-enter `t` while resolving it, fall back to a
-    // length-filled free value (avoids infinite recursion on degenerate merges).
+    // length-filled free value (avoids infinite recursion on degenerate merges,
+    // e.g. the self-referential `s1 = s0 ++ s1` with `s0 = ""`). Read the length
+    // from `t`'s EUF class — `(str.len t)` itself may not be pinned in the arith
+    // model when `t` is a derived concat, but an EUF-equal term (e.g. the variable
+    // `s1`, whose `str.len` IS pinned) gives the correct class length. Using a bare
+    // `len_of_in_model(t)` here returned 0 for such concats, producing an empty
+    // word that violated an asserted `len ≥ k` (a wrong model / witness failure).
     if !in_progress.insert(t) {
-        let n = len_of_in_model(terms, m, t);
+        let n = class_len_in_model(terms, eq, known, m, t);
         return free_fill(eq, t, n);
     }
 
@@ -204,11 +241,16 @@ fn value_concat(
         }
         _ => return String::new(),
     };
-    // Is the whole concat anchored to a constant word in its EUF class?
+    // Is the whole concat anchored to a fixed word in its EUF class? Accept either
+    // a string constant OR a concat whose operands are ALL constants (e.g.
+    // `"ab"++"cc"`, which the asserted equality `"a"++s1 = "ab"++"cc"` leaves
+    // unfolded) — the latter still denotes a fixed word and must anchor the slicing,
+    // else the operands (`s1`) get a free fill that violates the equation (a wrong
+    // model / witness failure).
     let anchor = class_member(terms, eq, known, t, |terms, mm| {
-        terms.string_const_value(mm).is_some()
+        const_word_of(terms, mm).is_some()
     })
-    .and_then(|c| terms.string_const_value(c).map(|s| s.to_owned()));
+    .and_then(|c| const_word_of(terms, c));
 
     if let Some(word) = anchor {
         let chars: Vec<char> = word.chars().collect();
@@ -308,6 +350,27 @@ fn class_member(
         }
     }
     None
+}
+
+/// If `t` denotes a FIXED word — a string constant, or a `str.++` whose operands
+/// all (recursively) denote fixed words — return that word. Otherwise `None`.
+/// Used by `value_concat` to recognise an unfolded constant concat (e.g.
+/// `"ab"++"cc"`) as a slicing anchor.
+fn const_word_of(terms: &Context, t: TermId) -> Option<String> {
+    if let Some(s) = terms.string_const_value(t) {
+        return Some(s.to_owned());
+    }
+    match terms.term_node(t) {
+        TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), args, .. } => {
+            let kids = terms.children(*args).to_vec();
+            let mut out = String::new();
+            for k in kids {
+                out.push_str(&const_word_of(terms, k)?);
+            }
+            Some(out)
+        }
+        _ => None,
+    }
 }
 
 /// True iff `t` is a `str.++` application.

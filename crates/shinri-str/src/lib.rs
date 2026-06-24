@@ -15,7 +15,6 @@ use shinri_sat::Effort;
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
-#[derive(Default)]
 pub struct StrSolver {
     /// Asserted string equalities: (atom, the literal that asserted it).
     /// The `Lit` is used to build `EqLeaf::Asserted` justifications for conflicts.
@@ -33,6 +32,22 @@ pub struct StrSolver {
     #[allow(dead_code)] // used in Task 15 (unfolding fuel budget)
     fuel: Fuel,
     trail: trail::Trail,
+}
+
+impl Default for StrSolver {
+    fn default() -> Self {
+        StrSolver {
+            eq_true: Vec::new(),
+            diseq_true: Vec::new(),
+            len_terms: FxHashSet::default(),
+            str_terms: FxHashSet::default(),
+            emitted_len_axioms: FxHashSet::default(),
+            emitted_splits: FxHashSet::default(),
+            fresh_ctr: 0,
+            fuel: Fuel::default(),
+            trail: trail::Trail::default(),
+        }
+    }
 }
 
 impl TheorySolver for StrSolver {
@@ -128,8 +143,17 @@ impl TheorySolver for StrSolver {
         // congruence function here, so arith would otherwise assign inconsistent
         // lengths → a non-satisfying model). SAFE for atom equalities (no fresh
         // concat skolems, so it does not feed the unbounded String↔Arith MBTC).
-        // NOT emitted for concat equalities (there it over-constrains / livelocks;
-        // their length contradictions are caught by the word-equation occurs-check).
+        // NOT emitted for concat equalities: there the word-equation F-split mints
+        // fresh `str.len(skolem)` terms every round, so a per-concat length lemma
+        // both floods the seam AND (interacting with the length-defining axioms over
+        // those skolems) produced an unsound conflict — so concat length
+        // contradictions are caught DIRECTLY in `resolve_equation` by the
+        // constant-length bound check (a fully-constant side shorter than the other
+        // side's minimum constant length is UNSAT — e.g. `s2++"ba" = "b"`), which
+        // needs no fresh terms. A concat-vs-variable-bound length mismatch that
+        // depends on an arith-only bound (e.g. `s2++"c"++"bc" = (str.at s0 2)`, where
+        // the str.at result is length-bounded only in arith) is left to the bounded
+        // fuel/round/pivot caps, which yield a SOUND `Unknown`.
         {
             let eqs: Vec<(TermId, Lit)> = self.eq_true.clone();
             for (atom, lit) in eqs {
@@ -210,6 +234,90 @@ impl TheorySolver for StrSolver {
             // model.rs).
             let lhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, l);
             let rhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, r);
+
+            // Empty-residual lemma (sound, model-preserving). After cancelling the
+            // common prefix/suffix, if ONE side's residual is empty and the other is
+            // entirely variables (no non-empty constant), then EACH of those variables
+            // must be empty: `eq → (Σ len(vars) ≤ 0)`. This pins e.g. the self-
+            // referential `s1 = s0 ++ s1` (suffix-cancel `s1` ⟹ `"" = s0` ⟹ `s0=""`),
+            // whose single-level resolver otherwise returns Done (SAT) and leaves the
+            // model builder free to assign `s0` a non-empty value — yielding a witness
+            // that does NOT satisfy the equation (a wrong model). Forcing the residual
+            // length to 0 makes every SAT model satisfy the equation. Guarded by `¬eq`
+            // and deduped via `emitted_len_axioms`; `Σlen ≤ 0` adds no fresh skolems.
+            {
+                use crate::wordeq::same;
+                let (mut i, mut j) = (0usize, 0usize);
+                let (mut le2, mut re2) = (lhs.len(), rhs.len());
+                while i < le2 && j < re2 && same(cx.terms, cx.eq, lhs[i], rhs[j]) {
+                    i += 1;
+                    j += 1;
+                }
+                while le2 > i && re2 > j && same(cx.terms, cx.eq, lhs[le2 - 1], rhs[re2 - 1]) {
+                    le2 -= 1;
+                    re2 -= 1;
+                }
+                let l_res = &lhs[i..le2];
+                let r_res = &rhs[j..re2];
+                let other: Option<&[TermId]> = if l_res.is_empty() && !r_res.is_empty() {
+                    Some(r_res)
+                } else if r_res.is_empty() && !l_res.is_empty() {
+                    Some(l_res)
+                } else {
+                    None
+                };
+                if let Some(vars) = other {
+                    let all_var =
+                        vars.iter().all(|&a| cx.terms.string_const_value(a).is_none());
+                    if all_var {
+                        let int_s = cx.terms.int_sort();
+                        let len_atoms: Vec<TermId> = vars
+                            .iter()
+                            .map(|&a| {
+                                cx.terms
+                                    .mk_app(Op::Builtin(BuiltinOp::StrLen), &[a])
+                                    .expect("str.len(var) well-sorted")
+                            })
+                            .collect();
+                        let sum = if len_atoms.len() == 1 {
+                            len_atoms[0]
+                        } else {
+                            cx.terms
+                                .mk_app(Op::Builtin(BuiltinOp::Add), &len_atoms)
+                                .expect("(+ len ...) well-sorted")
+                        };
+                        let zero = cx
+                            .terms
+                            .mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
+                        let le_atom = cx
+                            .terms
+                            .mk_app(Op::Builtin(BuiltinOp::Le), &[sum, zero])
+                            .expect("(<= Σlen 0) well-sorted");
+                        if !self.emitted_len_axioms.contains(&le_atom) {
+                            self.emitted_len_axioms.insert(le_atom);
+                            for &la in &len_atoms {
+                                self.len_terms.insert(la);
+                            }
+                            if !self.fuel.spend() {
+                                return TCheck::Unknown;
+                            }
+                            let mut seen = FxHashSet::default();
+                            collect::collect(
+                                cx.terms,
+                                le_atom,
+                                &mut self.len_terms,
+                                &mut self.str_terms,
+                                &mut seen,
+                            );
+                            return TCheck::Split {
+                                atoms: vec![le_atom],
+                                guard: Some(lit.negate()),
+                            };
+                        }
+                    }
+                }
+            }
+
             // Build the EqLeaf justification from the asserted equality literal.
             // This feeds `expand_conflict` so the conflict clause cites the right input literal.
             let just = vec![EqLeaf::Asserted(lit)];
@@ -251,6 +359,14 @@ impl TheorySolver for StrSolver {
                     return TCheck::Split { atoms, guard: Some(guard) };
                 }
                 crate::wordeq::StepResult::Done => {}
+                // A dedup-saturated variable-headed residual: the SAT layer must
+                // case-split on the already-emitted F-split disjunction to make
+                // progress. Treated like `Done` here (wait for SAT). The (B′)
+                // premature-SAT hazard — concluding SAT with a model that does not
+                // actually satisfy the equation — is caught instead by the post-solve
+                // witness self-check in `Solver::solve` (model-substitution re-check),
+                // which downgrades an unrealisable SAT to a SOUND `Unknown`.
+                crate::wordeq::StepResult::Saturated => {}
             }
         }
 
@@ -301,6 +417,135 @@ impl TheorySolver for StrSolver {
                         let mut just = vec![EqLeaf::Asserted(lit)];
                         cx.eq.explain(ln, zn, &mut just);
                         return TCheck::Conflict(just);
+                    }
+                }
+            }
+
+            // Non-empty separation lemma (sound, model-preserving). After cancelling
+            // the common prefix and suffix of the two sides (free-monoid
+            // cancellation: `u·L·w ≠ u·R·w ⟺ L ≠ R`), two DISTINCT words cannot both
+            // be empty, so the residuals `L`, `R` satisfy the necessary condition
+            //   `s ≠ t  →  (Σlen(L) ≥ 1) ∨ (Σlen(R) ≥ 1)`.
+            // This forces arith to give at least one residual a non-empty length, so
+            // every SAT model genuinely separates the two sides; the both-residuals-
+            // empty case becomes a sound CONFLICT (e.g. `s≠t ∧ len(s)=0 ∧ len(t)=0`,
+            // or `"b" ≠ "b"++s1++s2` with `s1=s2=""`). Without it, the model builder
+            // would assign all the free residual vars `""`, the residuals would
+            // coincide, and `s ≠ t` would be VIOLATED — a premature / wrong SAT whose
+            // witness fails z3 (the (B′) class). The lemma is a sound NECESSARY (not
+            // sufficient) condition: it never rejects a real model — equal-length
+            // non-empty residuals that genuinely differ (e.g. "a" vs "b") are
+            // separated by the model builder's per-class fill char. It is GUARDED by
+            // `¬(s≠t)` (constrains only branches asserting the disequality) and deduped
+            // via `emitted_len_axioms`.
+            //
+            // Skipped when EITHER residual already contains a NON-EMPTY string
+            // constant: that residual's length is already ≥ 1, so the disjunct holds
+            // trivially and the lemma is pure overhead. Also skipped when both
+            // residuals are empty (handled as a CONFLICT by the `nf_equal` check in
+            // Case 2 below).
+            {
+                use crate::wordeq::same;
+                let mut known_d = known.clone();
+                known_d.push(l);
+                known_d.push(r);
+                let lhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, l);
+                let rhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, r);
+                // Cancel common prefix, then common suffix (free-monoid cancellation).
+                let (mut i, mut j) = (0usize, 0usize);
+                let (mut le, mut re) = (lhs.len(), rhs.len());
+                while i < le && j < re && same(cx.terms, cx.eq, lhs[i], rhs[j]) {
+                    i += 1;
+                    j += 1;
+                }
+                while le > i && re > j && same(cx.terms, cx.eq, lhs[le - 1], rhs[re - 1]) {
+                    le -= 1;
+                    re -= 1;
+                }
+                let l_res = &lhs[i..le];
+                let r_res = &rhs[j..re];
+                let has_nonempty_const = |atoms: &[TermId], terms: &Context| {
+                    atoms.iter().any(|&a| {
+                        terms.string_const_value(a).map_or(false, |s| !s.is_empty())
+                    })
+                };
+                // Emit only for the genuinely-ambiguous shape: neither residual pins a
+                // non-empty constant, and not both empty (the s=t conflict is Case 2).
+                if !has_nonempty_const(l_res, cx.terms)
+                    && !has_nonempty_const(r_res, cx.terms)
+                    && !(l_res.is_empty() && r_res.is_empty())
+                {
+                    let int_s = cx.terms.int_sort();
+                    let one = cx
+                        .terms
+                        .mk_numeral(shinri_core::Rational::from_int(1i128.into()), int_s);
+                    // Build `Σlen(side) ≥ 1` for one residual side. An EMPTY residual
+                    // contributes the unsatisfiable `0 ≥ 1` disjunct (i.e. that side
+                    // is forced empty), correctly degenerating the disjunction to the
+                    // other side's `Σlen ≥ 1`.
+                    let build_side = |atoms: &[TermId],
+                                      len_terms: &mut FxHashSet<TermId>,
+                                      terms: &mut Context|
+                     -> TermId {
+                        if atoms.is_empty() {
+                            // `0 ≥ 1`: this side is forced empty.
+                            let zero = terms
+                                .mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
+                            return terms
+                                .mk_app(Op::Builtin(BuiltinOp::Ge), &[zero, one])
+                                .expect("(>= 0 1) well-sorted");
+                        }
+                        let len_atoms: Vec<TermId> = atoms
+                            .iter()
+                            .map(|&a| {
+                                terms
+                                    .mk_app(Op::Builtin(BuiltinOp::StrLen), &[a])
+                                    .expect("str.len(atom) well-sorted")
+                            })
+                            .collect();
+                        for &la in &len_atoms {
+                            len_terms.insert(la);
+                        }
+                        let sum = if len_atoms.len() == 1 {
+                            len_atoms[0]
+                        } else {
+                            terms
+                                .mk_app(Op::Builtin(BuiltinOp::Add), &len_atoms)
+                                .expect("(+ len ...) well-sorted")
+                        };
+                        terms
+                            .mk_app(Op::Builtin(BuiltinOp::Ge), &[sum, one])
+                            .expect("(>= Σlen 1) well-sorted")
+                    };
+                    let ge_l = build_side(l_res, &mut self.len_terms, cx.terms);
+                    let ge_r = build_side(r_res, &mut self.len_terms, cx.terms);
+                    if !self.emitted_len_axioms.contains(&ge_l)
+                        || !self.emitted_len_axioms.contains(&ge_r)
+                    {
+                        self.emitted_len_axioms.insert(ge_l);
+                        self.emitted_len_axioms.insert(ge_r);
+                        if !self.fuel.spend() {
+                            return TCheck::Unknown;
+                        }
+                        let mut seen = FxHashSet::default();
+                        collect::collect(
+                            cx.terms,
+                            ge_l,
+                            &mut self.len_terms,
+                            &mut self.str_terms,
+                            &mut seen,
+                        );
+                        collect::collect(
+                            cx.terms,
+                            ge_r,
+                            &mut self.len_terms,
+                            &mut self.str_terms,
+                            &mut seen,
+                        );
+                        return TCheck::Split {
+                            atoms: vec![ge_l, ge_r],
+                            guard: Some(lit.negate()),
+                        };
                     }
                 }
             }

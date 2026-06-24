@@ -69,6 +69,44 @@ fn next_fresh() -> u32 {
     FRESH_CTR.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Returns `true` if `t` (or any subterm) is a `str.at`/`str.substr` application
+/// that will NOT constant-fold — i.e. whose base is not a string constant or whose
+/// index/length operands are not integer numerals.
+///
+/// Such applications are reduced to the generic `pre++mid++post` + length-guard
+/// encoding, which the engine's String↔Arith seam does NOT decide soundly: it can
+/// diverge OR report a SPURIOUS UNSAT (e.g. `(str.at s 2) = s`, sat in SMT-LIB but
+/// reported unsat — a documented, pre-existing flaw). The solver fences any query
+/// containing such an application to a SOUND `Unknown` rather than risk a wrong
+/// verdict. Constant-base/constant-index applications (the soundly-decidable
+/// fast path, e.g. `(str.substr "abc" 1 1)`) fold to a literal and are EXCLUDED
+/// here, so the soundly-supported substr fragment is unaffected.
+pub fn has_unfoldable_substr_or_at(ctx: &Context, t: TermId) -> bool {
+    match ctx.term_node(t) {
+        TermNode::App { op, args, .. } => {
+            let children = ctx.children(*args).to_vec();
+            let foldable = match op {
+                Op::Builtin(BuiltinOp::StrSubstr) => {
+                    eval_substr_const(ctx, children[0], children[1], children[2]).is_some()
+                }
+                Op::Builtin(BuiltinOp::StrAt) => {
+                    // str.at(s,i) ≡ str.substr(s,i,1): folds iff base const & i numeral.
+                    ctx.string_const_value(children[0]).is_some()
+                        && int_numeral(ctx, children[1]).is_some()
+                }
+                _ => true, // not a substr/at op: "foldable" is irrelevant here
+            };
+            let self_unfoldable = matches!(
+                op,
+                Op::Builtin(BuiltinOp::StrAt | BuiltinOp::StrSubstr)
+            ) && !foldable;
+            self_unfoldable
+                || children.iter().any(|&c| has_unfoldable_substr_or_at(ctx, c))
+        }
+        TermNode::Const { .. } => false,
+    }
+}
+
 /// Returns `true` if the term `t` (or any subterm) is a `str.at` or
 /// `str.substr` application.
 pub fn contains_substr_or_at(ctx: &Context, t: TermId) -> bool {
