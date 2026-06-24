@@ -35,6 +35,19 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
                     out.push_str(&format!("(/ {numer} {denom})"));
                 }
             }
+            ConstVal::String(_) => {
+                // Render as SMT-LIB string literal: "" wraps, internal " is escaped as "".
+                let s = ctx.string_const_value(t).unwrap();
+                out.push('"');
+                for ch in s.chars() {
+                    if ch == '"' {
+                        out.push_str("\"\"");
+                    } else {
+                        out.push(ch);
+                    }
+                }
+                out.push('"');
+            }
         },
         TermNode::App { op, args, .. } => {
             let children: Vec<TermId> = ctx.children(args).to_vec();

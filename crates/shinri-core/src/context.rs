@@ -1,5 +1,5 @@
 use crate::error::SortError;
-use crate::ids::{BvId, RatId, SortId, SymbolId, TermId};
+use crate::ids::{BvId, RatId, SortId, StringId, SymbolId, TermId};
 use crate::sort::SortNode;
 use crate::symbol::StringInterner;
 use crate::term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
@@ -19,6 +19,8 @@ pub struct Context {
     fun_sigs: FxHashMap<SymbolId, (Vec<SortId>, SortId)>,
     /// BV literal table: index `BvId(i)` -> `(width, value in [0, 2^width))`.
     bvs: Vec<(u32, Integer)>,
+    /// String literal table: index `StringId(i)` -> interned string value.
+    str_lits: Vec<Box<str>>,
     bool_sort: SortId,
     int_sort: SortId,
     real_sort: SortId,
@@ -43,6 +45,7 @@ impl Context {
             term_interner: FxHashMap::default(),
             fun_sigs: FxHashMap::default(),
             bvs: Vec::new(),
+            str_lits: Vec::new(),
             // placeholders; overwritten immediately below
             bool_sort: SortId::from_index(0),
             int_sort: SortId::from_index(0),
@@ -545,6 +548,32 @@ impl Context {
         }
     }
 
+    /// Intern a string literal constant. Equal values hash-cons to the same `TermId`.
+    pub fn mk_string_const(&mut self, value: &str) -> TermId {
+        let sort = self.string_sort();
+        let id = match self.str_lits.iter().position(|s| s.as_ref() == value) {
+            Some(idx) => StringId::new(idx as u32),
+            None => {
+                let id = StringId::new(self.str_lits.len() as u32);
+                self.str_lits.push(value.into());
+                id
+            }
+        };
+        let val = ConstVal::String(id);
+        self.intern_with_key(TermKey::Const { val, sort }, TermNode::Const { val, sort })
+    }
+
+    /// Return the string value of a string-literal term, or `None` if `t` is not one.
+    pub fn string_const_value(&self, t: TermId) -> Option<&str> {
+        match self.term_node(t) {
+            TermNode::Const {
+                val: ConstVal::String(id),
+                ..
+            } => Some(self.str_lits[id.index()].as_ref()),
+            _ => None,
+        }
+    }
+
     pub fn children(&self, slice: ChildSlice) -> &[TermId] {
         let start = slice.off as usize;
         let end = start + slice.len as usize;
@@ -869,6 +898,19 @@ mod tests {
             ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
         };
         assert!(ctx.mk_app(Op::Builtin(BvAdd), &[x, z]).is_err());
+    }
+
+    #[test]
+    fn string_const_roundtrips_and_dedups() {
+        let mut ctx = Context::new();
+        let a = ctx.mk_string_const("ab\"c");
+        let b = ctx.mk_string_const("ab\"c");
+        let d = ctx.mk_string_const("xyz");
+        assert_eq!(a, b, "equal string literals must hash-cons to one TermId");
+        assert_ne!(a, d);
+        assert_eq!(ctx.sort_of(a), ctx.string_sort());
+        assert_eq!(ctx.string_const_value(a), Some("ab\"c"));
+        assert_eq!(ctx.string_const_value(d), Some("xyz"));
     }
 
     #[test]
