@@ -1,6 +1,7 @@
 mod collect;
 mod fuel;
 mod length;
+pub mod model;
 pub mod normalize;
 pub mod reduce;
 mod trail;
@@ -223,7 +224,9 @@ impl TheorySolver for StrSolver {
 
     fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {}
 
-    fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+    fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
+        self.model_with(cx, m);
+    }
 
     fn push(&mut self) {
         self.trail.push(self.eq_true.len(), self.diseq_true.len());
@@ -238,6 +241,17 @@ impl TheorySolver for StrSolver {
 
     fn shared_arith_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
         self.len_terms.iter().copied().collect()
+    }
+}
+
+impl StrSolver {
+    /// Assemble concrete string values into the model.
+    ///
+    /// Called by `TheorySolver::model`; also exposed so tests can inject a
+    /// pre-seeded `ModelBuilder` (e.g. with arith-model lengths already set).
+    pub fn model_with(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
+        let str_terms: Vec<TermId> = self.str_terms.iter().copied().collect();
+        model::assign(cx.terms, cx.eq, &str_terms, m);
     }
 }
 
@@ -262,6 +276,12 @@ impl StrSolver {
     pub fn test_set_fuel(&mut self, n: u32) {
         self.fuel = Fuel { remaining: n };
     }
+
+    /// Force a term into `str_terms` without going through `new_var`.
+    /// Used in unit tests to seed model construction.
+    pub fn test_force_str_term(&mut self, t: TermId) {
+        self.str_terms.insert(t);
+    }
 }
 
 #[cfg(test)]
@@ -269,7 +289,8 @@ mod tests {
     use super::*;
     use shinri_core::{BuiltinOp, Context, Op, Var};
     use shinri_sat::Effort;
-    use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
+    use shinri_theory::{AtomRegistry, EqualityEngine, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
+    use shinri_theory::types::ModelVal;
 
     #[test]
     fn collects_len_terms_and_reaches_sat_fixpoint() {
@@ -360,5 +381,25 @@ mod tests {
             }
         }
         assert!(got_unknown, "tiny fuel must force Unknown, never an infinite split loop");
+    }
+
+    // With len(x)=2 fixed and no constant constraints, x's model is "AA".
+    #[test]
+    fn free_var_model_filled_with_default_char() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = { let f = ctx.declare_fun("x", &[], str_s); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
+        let lenx = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
+        let mut s = StrSolver::default();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut m = ModelBuilder::default();
+        // Seed the model with len(x) = 2 (as arith would).
+        m.assign(lenx, ModelVal::Num(shinri_core::Rational::from_int(2i64.into())));
+        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &areg };
+        s.new_var(&mut cx, shinri_core::Var::new(0), lenx);
+        s.test_force_str_term(x);
+        s.model_with(&mut cx, &mut m);
+        assert_eq!(m.get(x), Some(&ModelVal::String("AA".into())));
     }
 }
