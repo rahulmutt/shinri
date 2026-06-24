@@ -372,6 +372,19 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory 
 
     fn pop(&mut self, n: usize) {
         let target = self.level - n;
+        // Discard any pending congruence-merge notifications before popping. A merge
+        // notification is a transient signal for the N-O exchange to react to in the
+        // SAME `drive_final_check` round; an early return from that loop (an arith
+        // conflict / split surfacing right after an `arith→EUF` interface merge, e.g.
+        // a length contradiction `len(s) < 0` co-asserted with a substr/concat
+        // equality) can leave the queue non-empty. The merges have already been
+        // applied to the EUF structure and are about to be UNDONE by this pop, so any
+        // unconsumed notification is stale — draining (discarding) it is sound and
+        // satisfies the `EqualityEngine::pop` drained-queue invariant (which would
+        // otherwise panic in debug builds: "pop with undrained merge events").
+        self.merges.clear();
+        self.eq.drain_merges(&mut self.merges);
+        self.merges.clear();
         self.eq.pop(target);
         self.euf.pop(target);
         self.arith.pop(target);
@@ -432,13 +445,17 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
         let mut iface_asserted: FxHashSet<(TermId, TermId)> = FxHashSet::default();
 
         // Round bound (sound termination guard). The Nelson-Oppen exchange + MBTC
-        // is claimed to converge over the FIXED shared set, but the String↔Arith
-        // substr seam can feed it a degenerate, ever-growing arith system whose
-        // entailed-equality probing keeps minting slacks — so the fixpoint may not
-        // be reached in practice. We cap the round count generously (far above any
-        // legitimate convergence, which needs O(|shared|) rounds) and return a
-        // sound `Unknown` on exhaustion rather than looping forever.
-        let round_cap: u64 = 1_000 + 100 * (shared.len() as u64);
+        // converges over the FIXED shared set in O(|shared|) rounds (each productive
+        // round makes one new merge / interface assertion, and the shared set is
+        // finite), but the String↔Arith length seam can feed it a degenerate arith
+        // system whose `entailed_equalities` simplex probing reports a fresh entailed
+        // pair every round (over ever-changing slacks) — so the fixpoint is never
+        // reached in practice and the loop spins. We cap the round count to a small
+        // multiple of |shared| (far above the ~2·|shared| any legitimate convergence
+        // needs) and return a SOUND `Unknown` on exhaustion. The per-round cost is a
+        // full simplex re-solve, so this is kept tight: a divergent length seam bails
+        // to Unknown in well under a second instead of spinning for many seconds.
+        let round_cap: u64 = 256 + 32 * (shared.len() as u64);
         let mut rounds: u64 = 0;
         loop {
             rounds += 1;

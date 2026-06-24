@@ -89,6 +89,35 @@ pub struct Arith {
     /// is far above any realistic QF_LIA/QF_UFLRA workload, so it never trips on the
     /// soundly-decidable fragment.
     total_pivots: u64,
+    /// Total integer branch-and-bound splits emitted this solve (global, monotone,
+    /// never reset on backtrack). Branch-and-bound on UNBOUNDED integer variables
+    /// is not guaranteed to terminate: when the LP relaxation optimum keeps moving
+    /// to ever-larger fractional points (e.g. MBTC strict `<`/`>` separations over
+    /// shared `str.len` terms repeatedly push the relaxation away from an integer
+    /// point), each branch `x≤⌊v⌋ ∨ x≥⌈v⌉` mints a FRESH atom over a new numeral, so
+    /// atom-dedup cannot stop it and the search diverges (branch value → ∞). The SAT
+    /// `step_budget` only bounds this after millions of steps (minutes). Capping the
+    /// CUMULATIVE branch count here bounds it directly: on exhaustion `integer_check`
+    /// returns `Unknown` (SOUND — declines to decide rather than diverge). The budget
+    /// is far above any realistic finite-domain QF_LIA search, so it never trips on
+    /// the soundly-decidable fragment.
+    total_branches: u64,
+    /// Cumulative integer branch-and-bound budget for one solve (see
+    /// `total_branches`). On exhaustion `integer_check` returns a SOUND `Unknown`.
+    /// Defaults to a value above the largest branch count any legitimately-bounded
+    /// QF_LIA/QF_UFLIA instance needs (so it never trips on the pure-arith fragment),
+    /// and is lowered on the STRING path — where the LP relaxation over unbounded
+    /// `str.len` terms can diverge under MBTC strict separations, and where the
+    /// soundly-decidable string fragment needs only a handful of arith branches, so a
+    /// small cap bounds the divergence quickly without affecting any decidable query.
+    branch_budget: u64,
+    /// Cumulative simplex pivot budget for one solve (the `total_pivots` cap; see
+    /// `total_pivots`). Defaults high (no realistic QF_LIA/QF_UFLRA workload reaches
+    /// it) and is lowered on the STRING path, where the String↔Arith length seam can
+    /// feed an ever-growing degenerate system whose `entailed_equalities` /
+    /// `model_equal_shared_pairs` probing re-solves simplex unboundedly. On exhaustion
+    /// `check_full` returns a SOUND `Unknown`.
+    pivot_budget: u64,
 }
 
 impl Default for Arith {
@@ -114,6 +143,9 @@ impl Default for Arith {
             node_cuts: 0,
             total_cuts: 0,
             total_pivots: 0,
+            total_branches: 0,
+            branch_budget: Self::DEFAULT_BRANCH_BUDGET,
+            pivot_budget: Self::DEFAULT_PIVOT_BUDGET,
         }
     }
 }
@@ -121,6 +153,27 @@ impl Default for Arith {
 impl Arith {
     const MAX_CUTS_PER_NODE: usize = 4;
     const MAX_CUTS_TOTAL: usize = 10_000;
+    /// Default cumulative integer branch-and-bound split budget for one solve.
+    /// Branch-and-bound on unbounded integers may diverge (branch value → ∞); this
+    /// bounds it to a SOUND `Unknown`. Set above the largest branch count any
+    /// legitimately-bounded QF_LIA/QF_UFLIA instance in the differential corpus needs
+    /// (observed ≈80k), so it never trips on the pure-arith decidable fragment.
+    const DEFAULT_BRANCH_BUDGET: u64 = 150_000;
+    /// Branch-and-bound budget used on the STRING path. The soundly-decidable string
+    /// fragment needs only a handful of arith branches, while the LP relaxation over
+    /// unbounded `str.len` terms can diverge under MBTC strict separations; a small
+    /// cap bounds that divergence in well under a second (the per-branch cost grows
+    /// with the SAT trail) without making any decidable query Unknown.
+    pub const STRING_PATH_BRANCH_BUDGET: u64 = 4_000;
+    /// Default cumulative simplex pivot budget (see `pivot_budget`). Far above any
+    /// realistic QF_LIA/QF_UFLRA workload.
+    const DEFAULT_PIVOT_BUDGET: u64 = 2_000_000;
+    /// Simplex pivot budget used on the STRING path. The String↔Arith length seam's
+    /// degenerate `entailed_equalities` probing can re-solve simplex unboundedly;
+    /// this tight cap bails such a divergent seam to a SOUND `Unknown` in well under a
+    /// second, while the soundly-decidable string fragment finishes in far fewer
+    /// pivots.
+    pub const STRING_PATH_PIVOT_BUDGET: u64 = 2_000;
 
     fn grow_value(&mut self) {
         while self.value.len() < self.vars.len() {
@@ -133,6 +186,20 @@ impl Arith {
     /// Toggle the Plan B2 optimization gate (default ON). OFF = B1 baseline.
     pub fn set_stage_b(&mut self, on: bool) {
         self.stage_b = on;
+    }
+
+    /// Override the cumulative integer branch-and-bound budget (see `branch_budget`).
+    /// The solver lowers this on the string path so unbounded-`str.len` B&B
+    /// divergence is bounded to a SOUND `Unknown` quickly.
+    pub fn set_branch_budget(&mut self, n: u64) {
+        self.branch_budget = n;
+    }
+
+    /// Override the cumulative simplex pivot budget (see `pivot_budget`). The solver
+    /// lowers this on the string path so the degenerate String↔Arith length-seam
+    /// probing is bounded to a SOUND `Unknown` quickly.
+    pub fn set_pivot_budget(&mut self, n: u64) {
+        self.pivot_budget = n;
     }
 
     /// Reduce a normalized atom to a *bound on one variable*. For a single-term
@@ -290,7 +357,7 @@ impl Arith {
         // termination even when each individual `check_full` would finish. On
         // exhaustion we return `Unknown` — SOUND (decline to decide, never loop or
         // report a wrong verdict). The budget is far above any realistic workload.
-        const TOTAL_PIVOT_BUDGET: u64 = 2_000_000;
+        let total_pivot_budget: u64 = self.pivot_budget;
         // Coefficient-blowup guard: a degenerate system (the String↔Arith
         // `str.substr` seam) can make simplex coefficients grow without bound, so a
         // SINGLE BigInt gcd/division dominates runtime (an effective hang the pivot
@@ -298,9 +365,20 @@ impl Arith {
         // many 64-bit limbs (~ thousands of decimal digits — far beyond any
         // legitimate QF_LIA/QF_UFLRA coefficient), bail to a sound `Unknown`.
         const MAX_LIMBS: usize = 64;
+        // Restore the DdM invariant before checking feasibility: every basic var's
+        // value must equal its row evaluated at the current nonbasic values. New
+        // slacks introduced by theory-emitted defining axioms (e.g. the string
+        // theory's `len(a++b) = len(a)+len(b)`), and nonbasic bound tightenings that
+        // did not trigger a value move, can leave a basic slack's cached value STALE
+        // — first_violated_basic would then read a phantom infeasibility and report a
+        // SPURIOUS conflict (observed wrong-UNSAT on `len(s2)=1 ∧ len(s2++"b")=2`,
+        // where the defining-axiom slack read 1 against its [.,0] bound instead of the
+        // true 0). Recomputing here is O(tableau) and makes the feasibility check
+        // consistent.
+        self.recompute_basic_values();
         loop {
             self.total_pivots += 1;
-            if self.total_pivots > TOTAL_PIVOT_BUDGET {
+            if self.total_pivots > total_pivot_budget {
                 return TCheck::Unknown;
             }
             let Some((basic, dir)) = first_violated_basic(&self.tableau, &self.bounds, &self.value)
@@ -768,6 +846,24 @@ impl Arith {
         let Some((bv, _)) = best else {
             return TCheck::Sat; // all Int problem vars integral
         };
+        // Cumulative branch-and-bound budget (anti-divergence guard). B&B on
+        // UNBOUNDED integer variables is not guaranteed to terminate: when the LP
+        // relaxation optimum keeps moving to ever-larger fractional points (e.g.
+        // MBTC strict `<`/`>` separations over shared `str.len` terms repeatedly
+        // push the relaxation away from an integer point — observed branch values
+        // creep up roughly linearly: 1/2, 1999/2, 7999/2, …), each branch
+        // `x≤⌊v⌋ ∨ x≥⌈v⌉` mints a FRESH atom over a new numeral, so atom-dedup cannot
+        // stop it and the search diverges (branch value → ∞). The SAT `step_budget`
+        // only bounds this after millions of steps (minutes). Capping the CUMULATIVE
+        // branch count here bounds it directly: on exhaustion `integer_check` returns
+        // a SOUND `Unknown` (declines to decide rather than diverge). The budget is
+        // chosen above the largest branch count any legitimately-bounded
+        // QF_LIA/QF_UFLIA instance in the differential corpus needs, so it never
+        // trips on the soundly-decidable fragment.
+        self.total_branches += 1;
+        if self.total_branches > self.branch_budget {
+            return TCheck::Unknown;
+        }
         // Stage-B: try a GMI cut before branching, within budget.
         if self.stage_b
             && self.node_cuts < Self::MAX_CUTS_PER_NODE

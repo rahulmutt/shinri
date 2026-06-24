@@ -669,7 +669,16 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                             self.backtrack_to(0);
                                         }
                                         if !self.install_clause(&lits) {
-                                            // install_clause enqueues false → livelock break.
+                                            // The unit theory fact is already FALSE at
+                                            // level 0 (e.g. the theory derived `len(s) ≥ 0`
+                                            // but the input asserted `len(s) < 0`):
+                                            // `install_clause` set `self.unsat`. This is a
+                                            // genuine level-0 conflict — return UNSAT now.
+                                            // Falling through would loop back to a theory
+                                            // `check` that (the fact already emitted /
+                                            // deduped) returns Sat, fabricating a WRONG SAT.
+                                            self.unsat = true;
+                                            return SolveResult::Unsat { core: vec![] };
                                         }
                                     } else {
                                         self.add_learnt(&lits);
