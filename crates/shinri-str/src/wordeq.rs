@@ -1,12 +1,16 @@
 use rustc_hash::FxHashSet;
-use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
+use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode};
 use shinri_theory::types::EqLeaf;
 use shinri_theory::EqualityEngine;
 
 pub enum StepResult {
     Done,
     Conflict(Vec<EqLeaf>),
-    Split(Vec<TermId>),
+    /// A GUARDED F-split. `atoms` are the fresh-positive disjuncts
+    /// `[len_eq, a_pref, b_pref]`; `guard` is the NEGATION of the triggering
+    /// word-equation literal. The learnt clause is `guard ∨ len_eq ∨ a_pref ∨
+    /// b_pref` ≡ `eqn → (len_eq ∨ a_pref ∨ b_pref)` — the sound Nielsen lemma.
+    Split { atoms: Vec<TermId>, guard: Lit },
 }
 
 /// Mint a fresh string constant `!strk<N>` and return its term ID.
@@ -33,11 +37,15 @@ pub fn len_of(terms: &mut Context, t: TermId) -> TermId {
 ///   `b_pref`  = `(= b (str.++ a z2))`   for a fresh remainder `z2`
 ///
 /// Soundness: the disjunction `len_eq ∨ a_pref ∨ b_pref` is valid over string
-/// algebra given the triggering word equation (Nielsen transformation: if two words
-/// starting with `a` resp. `b` are equal, one head is a prefix of the other or
-/// they have equal length). The clause is learned as a persistent split (mirroring
-/// the arrays ROW-2 pattern); the fresh z1/z2 have no other constraints, so the
-/// clause is always satisfiable and cannot cause spurious UNSAT.
+/// algebra ONLY GIVEN the triggering word equation (Nielsen transformation: if
+/// two words starting with `a` resp. `b` are equal, one head is a prefix of the
+/// other or they have equal length). It is NOT a tautology: a="xy", b="z" makes
+/// all three disjuncts false. Therefore the caller MUST guard the learnt clause
+/// with `¬eqn` (the negation of the asserted word equation), turning it into the
+/// VALID implication `eqn → (len_eq ∨ a_pref ∨ b_pref)`. Without the guard the
+/// clause is a non-entailed permanent learnt clause and causes spurious UNSAT
+/// (it would forbid e.g. x="xy" on EVERY branch). The fresh z1/z2 are existential
+/// witnesses under that implication.
 pub fn fsplit_atoms(terms: &mut Context, a: TermId, b: TermId, ctr: &mut u32) -> Vec<TermId> {
     let la = len_of(terms, a);
     let lb = len_of(terms, b);
@@ -92,12 +100,22 @@ fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: TermId) -> b
 ///
 /// `fresh_ctr` is used to mint fresh string variables for the split remainders.
 /// `emitted` deduplicates splits to prevent re-emitting the same pair (termination).
+/// `eqn_lit` is the literal that asserted this word equation (positive). The
+/// F-split it may emit is GUARDED with `eqn_lit.negate()` so the learnt clause is
+/// the valid implication `eqn → (len_eq ∨ a_pref ∨ b_pref)`, never the unsound
+/// bare disjunction.
+// The `eqn_lit` guard arg pushes this to 8 params; all are load-bearing
+// (context, equality engine, both word sides, conflict justification, guard
+// literal, fresh counter, dedup set) — grouping them into a struct would only
+// obscure the data flow at the single call site.
+#[allow(clippy::too_many_arguments)]
 pub fn resolve_equation(
     terms: &mut Context,
     eq: &mut EqualityEngine,
     lhs: &[TermId],
     rhs: &[TermId],
     just: Vec<EqLeaf>,
+    eqn_lit: Lit,
     fresh_ctr: &mut u32,
     emitted: &mut FxHashSet<(TermId, TermId)>,
 ) -> StepResult {
@@ -172,7 +190,13 @@ pub fn resolve_equation(
                 (hb, ha)
             };
             if emitted.insert(key) {
-                return StepResult::Split(fsplit_atoms(terms, ha, hb, fresh_ctr));
+                let atoms = fsplit_atoms(terms, ha, hb, fresh_ctr);
+                // GUARD with ¬eqn: the learnt clause is `¬eqn ∨ len_eq ∨ a_pref ∨
+                // b_pref` ≡ `eqn → (len_eq ∨ a_pref ∨ b_pref)`, the valid Nielsen
+                // lemma. On branches where the equation is false, ¬eqn satisfies
+                // the clause and the head variable is unconstrained — no spurious
+                // UNSAT.
+                return StepResult::Split { atoms, guard: eqn_lit.negate() };
             }
             // Already split this pair; wait for SAT to case-split.
             return StepResult::Done;
@@ -184,12 +208,18 @@ pub fn resolve_equation(
 
 #[cfg(test)]
 mod tests {
-    use shinri_core::{BuiltinOp, Context, Op};
+    use shinri_core::{BuiltinOp, Context, Lit, Op, Var};
     use shinri_sat::Effort;
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
     use crate::StrSolver;
     use rustc_hash::FxHashSet;
     use crate::wordeq::{resolve_equation, StepResult};
+
+    /// A dummy positive equation literal for `resolve_equation` calls whose guard
+    /// is not under test.
+    fn dummy_eqn_lit() -> Lit {
+        Lit::new(Var::new(0), true)
+    }
 
     // Helper: make a string variable term in `ctx`.
     fn mk_var(ctx: &mut Context, name: &str) -> shinri_core::TermId {
@@ -216,7 +246,7 @@ mod tests {
         let rhs = [abc, y];
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], &mut ctr, &mut emitted);
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
         assert!(
             matches!(result, StepResult::Done),
             "prefix-of-constant residual must be Done (satisfiable: X = \"c\" ++ Y)"
@@ -240,9 +270,9 @@ mod tests {
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
         // First call: emits F-split (not Conflict).
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], &mut ctr, &mut emitted);
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
         assert!(
-            matches!(result, StepResult::Split(_) | StepResult::Done),
+            matches!(result, StepResult::Split { .. } | StepResult::Done),
             "variable-headed residual must NOT be Conflict (X could equal \"b\" ++ ...)"
         );
         assert!(
@@ -266,7 +296,7 @@ mod tests {
         let rhs = [x, a]; // identical slices
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], &mut ctr, &mut emitted);
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
         assert!(
             matches!(result, StepResult::Done),
             "fully-consumed (trivially equal) sides must be Done"
@@ -286,7 +316,7 @@ mod tests {
         let rhs = [y];
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], &mut ctr, &mut emitted);
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
         assert!(
             matches!(result, StepResult::Done),
             "empty lhs vs single-variable rhs must be Done (Y could be \"\")"
@@ -320,8 +350,14 @@ mod tests {
         let mut saw_split = false;
         for _ in 0..32 {
             match s.check(&mut cx, Effort::Full) {
-                TCheck::Split(atoms) => {
+                TCheck::Split { atoms, guard } => {
                     if atoms.len() >= 2 {
+                        // The F-split MUST be guarded by the negated word equation
+                        // (sound Nielsen lemma), never a bare disjunction.
+                        assert!(
+                            guard.is_some(),
+                            "variable-head F-split must carry a guard (¬eqn)"
+                        );
                         saw_split = true;
                         break;
                     }
@@ -356,7 +392,7 @@ mod tests {
         // Drain length axioms, then expect a conflict.
         loop {
             match s.check(&mut cx, Effort::Full) {
-                TCheck::Split(_) => continue,
+                TCheck::Split { .. } => continue,
                 TCheck::Conflict(_) => break,
                 TCheck::Sat => panic!("expected conflict on prefix mismatch"),
             }

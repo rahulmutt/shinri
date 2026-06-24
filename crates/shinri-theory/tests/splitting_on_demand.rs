@@ -85,7 +85,10 @@ impl TheorySolver for OneShotSplitter {
     fn check(&mut self, _cx: &mut TheoryCtx, _effort: Effort) -> TCheck {
         if !self.fired {
             self.fired = true;
-            TCheck::Split(vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()])
+            TCheck::Split {
+                atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                guard: None,
+            }
         } else {
             TCheck::Sat
         }

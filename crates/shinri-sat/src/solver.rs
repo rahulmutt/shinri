@@ -578,7 +578,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                         self.backtrack_to(dl - 1);
                                     }
                                 }
-                                TheoryResult::SplitAtoms(atoms) => {
+                                TheoryResult::SplitAtoms { atoms, guard } => {
                                     debug_assert!(
                                         !atoms.is_empty(),
                                         "a theory must not emit an empty SplitAtoms clause (would livelock)"
@@ -588,7 +588,18 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // bind+encode it BEFORE the clause exists. new_var() updates
                                     // assignment/heuristic/watches/analyzer, so the fresh vars
                                     // are immediately usable in a learnt clause.
-                                    let mut lits: Vec<Lit> = Vec::with_capacity(atoms.len());
+                                    let mut lits: Vec<Lit> = Vec::with_capacity(atoms.len() + 1);
+                                    // GUARD (optional): a literal over an ALREADY-allocated SAT var
+                                    // (e.g. the negation of an asserted equality). It is pushed
+                                    // AS-IS — no fresh var, no bind_fresh — because it must refer to
+                                    // the existing boolean variable so the clause expresses a real
+                                    // implication `¬guard → (atom1 ∨ …)`. A tautology split passes
+                                    // guard=None; the string F-split passes guard=Some(¬eqn) so the
+                                    // disjunction is only enforced on branches where the triggering
+                                    // word equation is asserted true (sound Nielsen lemma).
+                                    if let Some(g) = guard {
+                                        lits.push(g);
+                                    }
                                     for atom in atoms {
                                         let v = self.new_var();
                                         self.theory.bind_fresh(v, atom);
@@ -1199,10 +1210,10 @@ mod tests {
                 if !self.fired {
                     self.fired = true;
                     // Two split atoms named by sentinel TermIds; solver mints vars.
-                    TheoryResult::SplitAtoms(vec![
-                        TermId::new(100).unwrap(),
-                        TermId::new(101).unwrap(),
-                    ])
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                        guard: None,
+                    }
                 } else {
                     TheoryResult::Sat
                 }
@@ -1226,6 +1237,108 @@ mod tests {
         let bound = s.theory().bound_vars.borrow().clone();
         assert_eq!(bound.len(), 2);
         assert!(bound.iter().all(|v| v.index() > a.index()));
+    }
+
+    // ── Task 12 regression: GUARDED split must not cause spurious UNSAT ─────────
+    //
+    // This is the wrong-UNSAT soundness test for the string F-split guard.
+    //
+    // Scenario (the concrete counterexample from the bug report, modeled at the
+    // SAT layer): a word equation `eqn` is NOT asserted true on this branch, and
+    // the head variable takes a value (e.g. x="xy") for which NONE of the three
+    // F-split disjuncts hold — i.e. all split atoms are FALSE. The instance is
+    // SATISFIABLE (set eqn=false, head var free).
+    //
+    //   * UNGUARDED clause `a1 ∨ a2` with a1=a2=false  →  spurious UNSAT.
+    //   * GUARDED   clause `¬eqn ∨ a1 ∨ a2` with eqn=false  →  satisfied by ¬eqn,
+    //     SAT preserved.
+    //
+    // The theory below emits the guarded split `SplitAtoms{ atoms:[a1,a2],
+    // guard: Some(¬eqn) }` where `¬eqn` references the ALREADY-allocated eqn var,
+    // and theory-propagates BOTH fresh split atoms FALSE (the "non-prefix, unequal
+    // length" head value). A unit clause forces eqn=false. The solver MUST return
+    // Sat; it can only do so by satisfying the clause through the guard literal,
+    // which is exactly the model-preservation property the guard provides.
+    //
+    // Replacing `guard: Some(¬eqn)` with `guard: None` makes this test return
+    // Unsat — i.e. the test FAILS without the guard and PASSES with it.
+    #[test]
+    fn guarded_split_does_not_force_spurious_unsat() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct GuardedSplitter {
+            fired: bool,
+            // The eqn var whose NEGATION guards the split.
+            eqn: Option<Var>,
+            // Fresh split-atom vars, captured via bind_fresh.
+            fresh: Rc<RefCell<Vec<Var>>>,
+            // Once we've theory-propagated both fresh atoms false, stop re-doing it.
+            forced: Rc<RefCell<bool>>,
+        }
+        impl Theory for GuardedSplitter {
+            fn new_var(&mut self, v: Var) {
+                // The FIRST real var minted is the eqn literal.
+                if self.eqn.is_none() {
+                    self.eqn = Some(v);
+                }
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                // After the split has fired and both fresh vars are bound, force
+                // them FALSE (the head value is neither a prefix nor equal length).
+                let fresh = self.fresh.borrow();
+                if self.fired && fresh.len() == 2 && !*self.forced.borrow() {
+                    *self.forced.borrow_mut() = true;
+                    let j = TheoryJust { theory: 99, tag: 0 };
+                    out.push((Lit::new(fresh[0], false), j));
+                    out.push((Lit::new(fresh[1], false), j));
+                }
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    let eqn = self.eqn.expect("eqn var must exist before check");
+                    // GUARDED split: `¬eqn ∨ a1 ∨ a2`. The guard references the
+                    // existing eqn var (negated) — NOT a fresh var.
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                        guard: Some(Lit::new(eqn, false)),
+                    }
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            // The forced-false propagations are unconditional theory facts: no
+            // antecedents (they model a closed theory deduction about the head value).
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn bind_fresh(&mut self, v: Var, _atom: TermId) {
+                self.fresh.borrow_mut().push(v);
+            }
+        }
+
+        let mut s: Solver<GuardedSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        // eqn is the FIRST var (so new_var captures it as the guard target).
+        let eqn = s.new_var();
+        // Force eqn FALSE: the branch where the word equation is NOT asserted true.
+        // The head variable must remain free; the split clause must NOT forbid its
+        // value. This is exactly the situation the unguarded clause got wrong.
+        s.add_clause(&[Lit::new(eqn, false)]);
+
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Sat),
+            "GUARDED split must preserve SAT when eqn is false and all split atoms \
+             are false (head var takes a non-prefix value). An UNSAT here is the \
+             wrong-UNSAT soundness bug — it means the split clause was learnt as a \
+             bare disjunction, forbidding the model on every branch. got {:?}",
+            res
+        );
     }
 }
 

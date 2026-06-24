@@ -43,12 +43,21 @@ pub enum Effort {
 /// carries a clause of *positive atoms* (as `TermId`s) the solver must mint
 /// fresh vars for, bind into the theory, then learn + case-split (splitting on
 /// demand — QF_LIA Plan A).
+///
+/// `SplitAtoms.guard` carries an OPTIONAL pre-existing literal (referencing an
+/// already-allocated SAT var, e.g. an asserted equality) that is added to the
+/// learnt clause AS-IS (no fresh var minted). It is the mechanism for emitting a
+/// GUARDED split — a clause `guard ∨ atom1 ∨ … ∨ atomN` that encodes an
+/// implication `¬guard → (atom1 ∨ …)`. A tautology split (arrays ROW-2, arith
+/// branch/cut) passes `guard = None`; the string F-split passes
+/// `guard = Some(¬eqn)` so the disjunction is only forced when the triggering
+/// word equation is true (sound Nielsen lemma). See `shinri-str`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TheoryResult {
     Sat,
     Conflict(Vec<Lit>),
     Lemma(Vec<Lit>),
-    SplitAtoms(Vec<TermId>),
+    SplitAtoms { atoms: Vec<TermId>, guard: Option<Lit> },
 }
 
 /// The outcome of a solve. `Unsat.core` is the failed-assumption set
@@ -98,9 +107,12 @@ mod tests {
     #[test]
     fn split_atoms_holds_term_ids() {
         let t = shinri_core::TermId::new(7).unwrap();
-        let r = TheoryResult::SplitAtoms(vec![t]);
+        let r = TheoryResult::SplitAtoms { atoms: vec![t], guard: None };
         match r {
-            TheoryResult::SplitAtoms(atoms) => assert_eq!(atoms, vec![t]),
+            TheoryResult::SplitAtoms { atoms, guard } => {
+                assert_eq!(atoms, vec![t]);
+                assert_eq!(guard, None);
+            }
             _ => panic!("expected SplitAtoms"),
         }
     }

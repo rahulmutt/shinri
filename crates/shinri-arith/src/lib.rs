@@ -599,7 +599,7 @@ impl Arith {
             TightenResult::Tightened => match self.check_full() {
                 TCheck::Sat => None,
                 TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
-                TCheck::Split(_) => unreachable!("arith check_full never emits Split"),
+                TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
             },
         }
     }
@@ -658,7 +658,7 @@ impl Arith {
         match self.check_full() {
             TCheck::Sat => None,
             TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
-            TCheck::Split(_) => unreachable!("arith check_full never emits Split"),
+            TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
         }
     }
 
@@ -723,7 +723,9 @@ impl Arith {
             if let Some(cut_atom) = self.try_gmi_cut(cx, bv) {
                 self.node_cuts += 1;
                 self.total_cuts += 1;
-                return TCheck::Split(vec![cut_atom]);
+                // GMI cut is a theory-valid clause over the integers — a tautology
+                // split, no guard.
+                return TCheck::Split { atoms: vec![cut_atom], guard: None };
             }
         }
         let (floor, ceil) = crate::branch::floor_ceil(&self.value[bv.index()]);
@@ -742,7 +744,8 @@ impl Arith {
             .terms
             .mk_app(Op::Builtin(BuiltinOp::Ge), &[term, ceil_num])
             .expect("(x >= ceil) well-sorted");
-        TCheck::Split(vec![le, ge])
+        // Branch `(x ≤ ⌊v⌋) ∨ (x ≥ ⌈v⌉)` is a tautology over the integers — no guard.
+        TCheck::Split { atoms: vec![le, ge], guard: None }
     }
 
     /// Derive a GMI cut from `bv`'s row and build a `≤` cut atom term over
@@ -1008,7 +1011,7 @@ impl TheorySolver for Arith {
         self.seed_apriori_if_needed();
         match self.check_full() {
             TCheck::Conflict(leaves) => return TCheck::Conflict(self.strip_apriori(leaves)),
-            TCheck::Split(_) => unreachable!("check_full never emits Split"),
+            TCheck::Split { .. } => unreachable!("check_full never emits Split"),
             TCheck::Sat => {}
         }
         self.integer_check(cx)
@@ -1337,7 +1340,7 @@ mod check_tests {
                 assert!(leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(1), true))));
             }
             TCheck::Sat => panic!("expected conflict"),
-            TCheck::Split(_) => unreachable!("Arith check never emits Split in its own tests"),
+            TCheck::Split { .. } => unreachable!("Arith check never emits Split in its own tests"),
         }
     }
 
@@ -2211,7 +2214,7 @@ mod integer_branch_tests {
         // Confirm the solver is also in a definitive state (not Split).
         let result = arith.check(&mut cx, Effort::Full);
         assert!(
-            !matches!(result, TCheck::Split(_)),
+            !matches!(result, TCheck::Split { .. }),
             "after a bound conflict at assert, check must not return Split"
         );
     }
@@ -2406,7 +2409,7 @@ mod cut_wiring_tests {
         // Confirm check does not claim Sat or Split (state is already conflicting).
         let result = arith.check(&mut cx, Effort::Full);
         assert!(
-            !matches!(result, TCheck::Split(_)),
+            !matches!(result, TCheck::Split { .. }),
             "after assert-time conflict, check must not return Split"
         );
     }

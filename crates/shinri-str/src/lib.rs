@@ -84,7 +84,10 @@ impl TheorySolver for StrSolver {
         for lt in lens {
             if let Some(axiom) = length::next_axiom(cx.terms, lt, &self.emitted_len_axioms) {
                 self.emitted_len_axioms.insert(axiom);
-                return TCheck::Split(vec![axiom]);
+                // Length axioms (e.g. (= (str.len "café") 4), len(x++y)=len x+len y,
+                // len ≥ 0) are unconditionally valid over the string/length theory —
+                // tautology splits, no guard.
+                return TCheck::Split { atoms: vec![axiom], guard: None };
             }
         }
 
@@ -114,11 +117,12 @@ impl TheorySolver for StrSolver {
                 &lhs,
                 &rhs,
                 just,
+                lit,
                 &mut self.fresh_ctr,
                 &mut self.emitted_splits,
             ) {
                 crate::wordeq::StepResult::Conflict(cf) => return TCheck::Conflict(cf),
-                crate::wordeq::StepResult::Split(atoms) => {
+                crate::wordeq::StepResult::Split { atoms, guard } => {
                     // Register the new str.len terms produced by the F-split so
                     // their length axioms are emitted on the next check round.
                     // The F-split atoms are: [len_eq, a_pref, b_pref].
@@ -133,7 +137,10 @@ impl TheorySolver for StrSolver {
                             &mut seen,
                         );
                     }
-                    return TCheck::Split(atoms);
+                    // GUARDED split: `guard = ¬eqn`. The learnt clause is
+                    // `¬eqn ∨ len_eq ∨ a_pref ∨ b_pref` ≡ `eqn → (…)`, a valid
+                    // implication (Nielsen lemma) — NOT the unsound bare disjunction.
+                    return TCheck::Split { atoms, guard: Some(guard) };
                 }
                 crate::wordeq::StepResult::Done => {}
             }
@@ -222,7 +229,7 @@ mod tests {
         // (the >=0 lemma) and then reaches Sat fixpoint.
         let first = s.check(&mut cx, Effort::Full);
         assert!(
-            matches!(first, TCheck::Split(_)),
+            matches!(first, TCheck::Split { .. }),
             "should emit >=0 axiom for str.len(x)"
         );
         assert!(

@@ -18,7 +18,7 @@ use shinri_sat::{Effort, Theory, TheoryResult};
 enum FinalCheck {
     Sat,
     Conflict(Vec<crate::types::EqLeaf>),
-    Split(Vec<TermId>),
+    Split { atoms: Vec<TermId>, guard: Option<Lit> },
 }
 
 pub struct Combiner<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> {
@@ -240,7 +240,7 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory 
         match self.drive_final_check() {
             FinalCheck::Sat => TheoryResult::Sat,
             FinalCheck::Conflict(leaves) => TheoryResult::Conflict(self.expand_conflict(leaves)),
-            FinalCheck::Split(atoms) => TheoryResult::SplitAtoms(atoms),
+            FinalCheck::Split { atoms, guard } => TheoryResult::SplitAtoms { atoms, guard },
         }
     }
 
@@ -359,23 +359,23 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                 };
                 match self.euf.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split(_) => unreachable!("EUF never splits"),
+                    TCheck::Split { .. } => unreachable!("EUF never splits"),
                     TCheck::Sat => {}
                 }
                 match self.arith.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split(atoms) => return FinalCheck::Split(atoms),
+                    TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
                     TCheck::Sat => {}
                 }
                 match self.arrays.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split(atoms) => return FinalCheck::Split(atoms),
+                    TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
                     TCheck::Sat => {}
                 }
                 // String checks last (lowest priority).
                 match self.string.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split(atoms) => return FinalCheck::Split(atoms),
+                    TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
                     TCheck::Sat => {}
                 }
             }
@@ -522,7 +522,9 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                             &[u, v],
                         )
                         .expect("(> u v) well-sorted");
-                    return FinalCheck::Split(vec![eq, lt, gt]);
+                    // MBTC trichotomy `(= u v) ∨ (< u v) ∨ (> u v)` is a tautology
+                    // over a totally-ordered arith domain — no guard needed.
+                    return FinalCheck::Split { atoms: vec![eq, lt, gt], guard: None };
                 }
                 return FinalCheck::Sat;
             }
@@ -1154,7 +1156,7 @@ mod tests {
                 let atom = self
                     .split_atom
                     .expect("split_atom must be set before check");
-                TCheck::Split(vec![atom])
+                TCheck::Split { atoms: vec![atom], guard: None }
             } else {
                 TCheck::Sat
             }
@@ -1182,8 +1184,9 @@ mod tests {
 
         // First Full check lifts the arith Split into SplitAtoms.
         match Theory::check(&mut comb, Effort::Full) {
-            TheoryResult::SplitAtoms(atoms) => {
-                assert_eq!(atoms, vec![le])
+            TheoryResult::SplitAtoms { atoms, guard } => {
+                assert_eq!(atoms, vec![le]);
+                assert_eq!(guard, None);
             }
             other => panic!("expected SplitAtoms, got {other:?}"),
         }
@@ -1305,7 +1308,8 @@ mod tests {
         c.arith.t1 = Some(u);
         c.arith.t2 = Some(v);
         match Theory::check(&mut c, Effort::Full) {
-            TheoryResult::SplitAtoms(atoms) => {
+            TheoryResult::SplitAtoms { atoms, guard } => {
+                assert_eq!(guard, None, "MBTC trichotomy is a tautology, no guard");
                 assert_eq!(atoms.len(), 3, "integer trichotomy = 3 atoms");
                 assert_eq!(classify(&c.terms, atoms[0]), Ok(Owner::Euf)); // (= u v)
                 assert_eq!(classify(&c.terms, atoms[1]), Ok(Owner::Arith)); // (< u v)
@@ -1342,7 +1346,7 @@ mod tests {
         fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
             if !self.fired {
                 self.fired = true;
-                TCheck::Split(vec![self.atom.unwrap()])
+                TCheck::Split { atoms: vec![self.atom.unwrap()], guard: None }
             } else {
                 TCheck::Sat
             }
@@ -1400,8 +1404,9 @@ mod tests {
 
         // First Full check: arrays.check returns Split — must be lifted to SplitAtoms.
         match Theory::check(&mut comb, Effort::Full) {
-            TheoryResult::SplitAtoms(atoms) => {
+            TheoryResult::SplitAtoms { atoms, guard } => {
                 assert_eq!(atoms, vec![sel_atom], "split atom must round-trip");
+                assert_eq!(guard, None);
             }
             other => panic!("expected SplitAtoms from arrays slot, got {other:?}"),
         }

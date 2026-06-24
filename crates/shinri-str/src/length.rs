@@ -129,7 +129,7 @@ mod tests {
         let mut found_literal_axiom = false;
         for _ in 0..8 {
             match s.check(&mut cx, Effort::Full) {
-                TCheck::Split(a) => {
+                TCheck::Split { atoms: a, .. } => {
                     assert_eq!(a.len(), 1, "length axioms are unit lemmas");
                     if a[0] == expected_axiom {
                         found_literal_axiom = true;
@@ -186,7 +186,7 @@ mod tests {
         let mut emitted = 0;
         for _ in 0..8 {
             match s.check(&mut cx, Effort::Full) {
-                TCheck::Split(a) => {
+                TCheck::Split { atoms: a, .. } => {
                     assert_eq!(a.len(), 1, "length axioms are unit lemmas");
                     emitted += 1;
                 }
