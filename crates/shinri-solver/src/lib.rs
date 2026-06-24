@@ -270,7 +270,16 @@ impl Solver {
             Vmtf,
         >;
 
-        let assertions = self.assertions.clone();
+        let mut assertions = self.assertions.clone();
+
+        // ── str.at / str.substr pre-pass ─────────────────────────────────────
+        // If any assertion contains a String operation (str.at, str.substr,
+        // str.concat, or str.len), desugar all str.at/str.substr applications
+        // into fresh variables + concat/length-guard constraints BEFORE routing
+        // to any theory. Non-string queries are completely untouched.
+        if shinri_str::reduce::any_has_string_op(&self.ctx, &assertions) {
+            assertions = shinri_str::reduce::reduce_assertions(&mut self.ctx, &assertions);
+        }
 
         // ── QF_ABV path (BV-indexed, BV-valued arrays) ────────────────────────
         // Route BEFORE the eager BV path: a query that uses select/store/array-eq

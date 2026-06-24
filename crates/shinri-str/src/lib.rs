@@ -2,6 +2,7 @@ mod collect;
 mod fuel;
 mod length;
 pub mod normalize;
+pub mod reduce;
 mod trail;
 pub mod wordeq;
 pub use fuel::Fuel;
