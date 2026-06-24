@@ -14,14 +14,18 @@ use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
 #[derive(Default)]
 pub struct StrSolver {
-    eq_true: Vec<TermId>,
+    /// Asserted string equalities: (atom, the literal that asserted it).
+    /// The `Lit` is used to build `EqLeaf::Asserted` justifications for conflicts.
+    eq_true: Vec<(TermId, Lit)>,
     diseq_true: Vec<TermId>,
     len_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
     emitted_len_axioms: FxHashSet<TermId>,
-    #[allow(dead_code)] // used in Task 12 (split lemma deduplication)
+    /// Dedup set for F-splits: keyed on the canonical (unordered) head pair.
+    /// Monotone (never cleared on backtrack); prevents re-emitting the same
+    /// split after dedup (termination guarantee).
     emitted_splits: FxHashSet<(TermId, TermId)>,
-    #[allow(dead_code)] // used in Task 12 (fresh skolem variable counter for splits)
+    /// Counter for fresh string skolem variables minted by F-split.
     fresh_ctr: u32,
     #[allow(dead_code)] // used in Task 15 (unfolding fuel budget)
     fuel: Fuel,
@@ -49,7 +53,7 @@ impl TheorySolver for StrSolver {
                 match op {
                     Op::Builtin(BuiltinOp::Eq) => {
                         if lit.is_positive() {
-                            self.eq_true.push(atom);
+                            self.eq_true.push((atom, lit));
                         } else {
                             self.diseq_true.push(atom);
                         }
@@ -58,7 +62,7 @@ impl TheorySolver for StrSolver {
                         if lit.is_positive() {
                             self.diseq_true.push(atom);
                         } else {
-                            self.eq_true.push(atom);
+                            self.eq_true.push((atom, lit));
                         }
                     }
                     _ => {}
@@ -88,26 +92,49 @@ impl TheorySolver for StrSolver {
         // plus both sides of each asserted equality (so rep() resolves global merges,
         // preferring constants — required by the Task 10 fix in normal_form).
         let mut known: Vec<TermId> = self.str_terms.iter().copied().collect();
-        for &atom in &self.eq_true {
+        for &(atom, _) in &self.eq_true {
             let (l, r) = crate::wordeq::sides(cx.terms, atom);
             known.push(l);
             known.push(r);
         }
 
         // Word-equation resolution: strip equal heads/tails, detect constant
-        // prefix mismatches. Variable-headed residuals are handled in Task 12.
-        let eqs = self.eq_true.clone();
-        for atom in eqs {
+        // prefix mismatches. Variable-headed residuals emit F-splits (Task 12).
+        let eqs: Vec<(TermId, Lit)> = self.eq_true.clone();
+        for (atom, lit) in eqs {
             let (l, r) = crate::wordeq::sides(cx.terms, atom);
             let lhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, l);
             let rhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, r);
-            // NOTE: `just` is empty here — justification is refined in Task 12
-            // once proof traces are wired. The conflict is still sound because the
-            // equality is on the decision trail.
-            let just = vec![];
-            match crate::wordeq::resolve_equation(cx.terms, cx.eq, &lhs, &rhs, just) {
+            // Build the EqLeaf justification from the asserted equality literal.
+            // This feeds `expand_conflict` so the conflict clause cites the right input literal.
+            let just = vec![EqLeaf::Asserted(lit)];
+            match crate::wordeq::resolve_equation(
+                cx.terms,
+                cx.eq,
+                &lhs,
+                &rhs,
+                just,
+                &mut self.fresh_ctr,
+                &mut self.emitted_splits,
+            ) {
                 crate::wordeq::StepResult::Conflict(cf) => return TCheck::Conflict(cf),
-                crate::wordeq::StepResult::Split(atoms) => return TCheck::Split(atoms),
+                crate::wordeq::StepResult::Split(atoms) => {
+                    // Register the new str.len terms produced by the F-split so
+                    // their length axioms are emitted on the next check round.
+                    // The F-split atoms are: [len_eq, a_pref, b_pref].
+                    // len_eq = (= (str.len a) (str.len b)); extract the len sub-terms.
+                    let mut seen = FxHashSet::default();
+                    for &split_atom in &atoms {
+                        collect::collect(
+                            cx.terms,
+                            split_atom,
+                            &mut self.len_terms,
+                            &mut self.str_terms,
+                            &mut seen,
+                        );
+                    }
+                    return TCheck::Split(atoms);
+                }
                 crate::wordeq::StepResult::Done => {}
             }
         }
@@ -138,8 +165,10 @@ impl TheorySolver for StrSolver {
 impl StrSolver {
     /// Push `atom` directly onto `eq_true`, simulating the SAT layer asserting
     /// a string equality without going through `assert`. Used only in unit tests.
+    /// Uses a dummy Lit (var 0, positive) since the justification is not exercised
+    /// in unit tests (no combiner expand_conflict path).
     pub fn test_force_eq_true(&mut self, atom: TermId) {
-        self.eq_true.push(atom);
+        self.eq_true.push((atom, Lit::new(Var::new(0), true)));
     }
 }
 
