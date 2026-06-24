@@ -252,6 +252,12 @@ impl<'a> Encoder<'a> {
                     self.saw_euf = true;
                     self.saw_euf_nonreal = true;
                 }
+                Ok(shinri_theory::types::Owner::String) => {
+                    // String equality atoms are EUF-adjacent in v1 (parked with
+                    // EUF until the string theory slot is wired in Task 7).
+                    self.saw_euf = true;
+                    self.saw_euf_nonreal = true;
+                }
                 Err(_) => {}
             }
         }

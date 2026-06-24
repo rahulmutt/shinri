@@ -134,6 +134,16 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
                 self.euf.new_var(&mut cx, v, atom);
                 self.arrays.new_var(&mut cx, v, atom);
             }
+            // String atoms are interned into EUF for congruence. The dedicated
+            // string theory slot is wired in Task 7; until then EUF holds them.
+            Owner::String => {
+                let mut cx = TheoryCtx {
+                    terms: &mut self.terms,
+                    eq: &mut self.eq,
+                    atoms: &self.atoms,
+                };
+                self.euf.new_var(&mut cx, v, atom);
+            }
         }
         Ok(())
     }
@@ -169,6 +179,9 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Theory for Combiner<E, A
                 let r = self.arrays.assert(&mut cx, lit);
                 e.or(r)
             }
+            // String atoms route to EUF for congruence until the string slot
+            // (Task 7) is wired in.
+            Owner::String => self.euf.assert(&mut cx, lit),
         };
         if conflict.is_some() && self.pending_conflict.is_none() {
             self.pending_conflict = conflict;
@@ -241,6 +254,9 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Theory for Combiner<E, A
                 self.euf.new_var(&mut cx, v, atom);
                 self.arrays.new_var(&mut cx, v, atom);
             }
+            // String split atoms (Task 7+): park with EUF until the string slot
+            // is wired in.
+            Owner::String => self.euf.new_var(&mut cx, v, atom),
         }
     }
 
