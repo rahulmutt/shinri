@@ -224,14 +224,46 @@ impl Gen {
         }
     }
 
+    /// A self-referential word equation `(= x (str.++ … x …))`: a BARE variable
+    /// equated to a concat that RE-CONTAINS that same variable, flanked by other
+    /// variables and/or literals. This exercises the occurs-check soundness class
+    /// (Task 19): with only variable flanks it is SAT via emptiness (every flank
+    /// can be ""), but with a non-empty CONSTANT flank it is genuinely UNSAT
+    /// (len(x) = len(x) + (>0)). The flanks are drawn from `atom_term` (var or
+    /// literal) so both regimes appear in the corpus. The engine must answer Sat
+    /// or a sound Unknown for the variable-only case (never wrong UNSAT) and Unsat
+    /// for the non-empty-constant-flank case.
+    fn self_ref_eq(&mut self) -> String {
+        let x = self.var();
+        // 1..=2 flank atoms split before/after the recurring `x`.
+        let pre = self.atom_term();
+        // Sometimes a trailing flank too.
+        if self.rng.below(2) == 0 {
+            let post = self.atom_term();
+            format!("(= {x} (str.++ {pre} {x} {post}))")
+        } else {
+            format!("(= {x} (str.++ {pre} {x}))")
+        }
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
-    /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, and
-    /// length constraints. Instances that are undecidable / non-terminating for this
-    /// engine are bounded to a SOUND Unknown by the fuel / branch-budget / step caps;
-    /// the oracle skips Unknown as a non-disagreement.
+    /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
+    /// constraints, AND self-referential word equations `(= x (str.++ … x …))` that
+    /// exercise the occurs-check soundness class. Instances that are undecidable /
+    /// non-terminating for this engine are bounded to a SOUND Unknown by the fuel /
+    /// branch-budget / step caps; the oracle skips Unknown as a non-disagreement.
     fn assertion(&mut self) {
         let neg = self.rng.below(4) == 0; // sometimes wrap in (not …)
+        // Occasionally (1 in 5) emit a self-referential occurs-check equation,
+        // independent of the main shape dispatch below, so this soundness class is
+        // exercised by the random corpus going forward.
+        if self.rng.below(5) == 0 {
+            let atom = self.self_ref_eq();
+            let atom = if neg { format!("(not {atom})") } else { atom };
+            self.body.push_str(&format!("(assert {atom})\n"));
+            return;
+        }
         let atom = match self.rng.below(4) {
             // general word equation (either side may be var/literal/concat/substr)
             0 => {
@@ -525,6 +557,59 @@ fn targeted_constrained_len_with_diseq_stays_sat() {
     );
 }
 
+/// Helper: assert shinri's verdict is NOT a (wrong) Unsat — it may be Sat or a
+/// sound Unknown — AND cross-check against z3 (which must NOT be Unsat either,
+/// i.e. shinri never claims UNSAT where z3 is SAT). Used for the occurs-check
+/// soundness class where shinri is allowed to answer Sat or Unknown.
+fn expect_not_unsat(src: &str) {
+    let got = shinri_verdict(src);
+    assert_ne!(
+        got,
+        Verdict::Unsat,
+        "shinri returned WRONG UNSAT for a satisfiable formula:\n{src}"
+    );
+    let z = z3_verdict(src);
+    assert_ne!(z, Verdict::Unsat, "z3 ground truth is not Unsat for:\n{src}");
+    // If shinri decided Sat, z3 must agree it is Sat (no wrong SAT either).
+    if got == Verdict::Sat && z != Verdict::Unknown {
+        assert_eq!(got, z, "shinri/z3 disagree (shinri Sat):\n{src}");
+    }
+}
+
+// ── Task 19: occurs-check soundness regression (free-monoid emptiness) ───────
+// A bare variable equated to a concat that RE-CONTAINS it, flanked ONLY by other
+// variables, is SAT via emptiness — the occurs-check must NOT report UNSAT. With
+// a NON-EMPTY constant flank it IS genuinely UNSAT (the length would grow).
+
+#[test]
+fn targeted_occurs_var_flank_not_unsat() {
+    // v = w ++ v ++ u : SAT (w=u=v=""). Was a wrong-UNSAT before the fix.
+    expect_not_unsat(
+        "(set-logic QF_S)(declare-fun v () String)(declare-fun w () String)\
+         (declare-fun u () String)(assert (= v (str.++ w v u)))(check-sat)",
+    );
+}
+
+#[test]
+fn targeted_occurs_repeated_var_flank_not_unsat() {
+    // v = u ++ v ++ u : SAT (u=""). Was a wrong-UNSAT before the fix.
+    expect_not_unsat(
+        "(set-logic QF_S)(declare-fun v () String)(declare-fun u () String)\
+         (assert (= v (str.++ u v u)))(check-sat)",
+    );
+}
+
+#[test]
+fn targeted_occurs_nonempty_const_flank_unsat() {
+    // s = "b" ++ t ++ s : UNSAT — a non-empty constant flank forces len(s) > len(s).
+    // This is the SOUND part of the occurs-check and MUST stay UNSAT.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(declare-fun t () String)\
+         (assert (= s (str.++ \"b\" t s)))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
 #[test]
 fn targeted_disequality_witness_sat() {
     // x ≠ y with len 1 each ⇒ SAT; the model must satisfy x ≠ y.
@@ -546,27 +631,15 @@ fn targeted_disequality_witness_sat() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// str.substr / str.at targeted cases — currently #[ignore]d (KNOWN-BROKEN).
+// str.substr / str.at targeted cases — LIVE (no longer #[ignore]d).
 //
-// CONCERN (reported as DONE_WITH_CONCERNS): the Task-16 reduction of
-// str.substr/str.at produces a 3-variable nested concat `pre++mid++post` plus
-// several CONDITIONAL length constraints (ITE-eliminated to implications) that all
-// reference `str.len`. That pattern overwhelms the String↔Arith Nelson-Oppen /
-// MBTC seam: each word-equation F-split introduces fresh `str.len(skolem)` shared
-// terms, MBTC then enumerates arrangements over an ever-growing shared set, and
-// the two never converge — yielding a spurious UNSAT (e.g. `(str.substr "abc" 1 1)
-// = "b"`, which is SAT) or non-termination. On the pristine pre-Task-19 code these
-// same queries PANICKED in the EUF use-list undo; the EUF fix in this change turns
-// the panic into the (still unsound) UNSAT/hang.
-//
-// Fixing this requires bounding/redesigning the String↔Arith MBTC interaction
-// under nested concat (out of Task 19's reasonable scope). These tests document
-// the intended behavior and are kept (ignored) as the regression target. They are
-// NOT deleted and NOT masked by over-fencing — substr is genuinely in-scope per
-// the spec; it simply is not yet soundly supported end-to-end.
-//
-// Reproduce a minimal wrong-UNSAT:
-//   (set-logic QF_S)(assert (= (str.substr "abc" 1 1) "b"))(check-sat)  ; shinri: unsat, z3: sat
+// These were previously ignored as KNOWN-BROKEN (the Task-16 substr/at reduction
+// over a nested `pre++mid++post` concat overwhelmed the String↔Arith MBTC seam and
+// produced a spurious UNSAT or hang). Following the length-search bounding and the
+// premature-SAT/word-equation fixes (commits b10bd27, ac181b9) and the Task-19
+// occurs-check soundness fix, these queries now decide correctly and AGREE with z3,
+// so the tests run as live regression guards (verified via `expect`, which
+// cross-checks z3 on every call).
 
 #[test]
 fn targeted_substr_in_range_sat() {

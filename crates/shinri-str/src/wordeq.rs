@@ -149,9 +149,21 @@ pub fn nf_equal_explain(
 
 /// Occurs-check helper for `resolve_equation`. Returns `true` iff a single
 /// variable `single` cannot equal the word `rest` because `rest` contains an
-/// occurrence of `single` PLUS at least one necessarily-non-empty atom (a
-/// non-empty string constant, or a second variable occurrence) — i.e.
+/// occurrence of `single` PLUS at least one NON-EMPTY string CONSTANT — i.e.
 /// `len(single) = len(single) + (>0)`, impossible.
+///
+/// SOUNDNESS (free-monoid emptiness): in the free monoid `Σ*` every string
+/// variable can take the EMPTY word `ε`. So a second VARIABLE occurrence (the
+/// same `single` again, or any other distinct variable) is NOT necessarily
+/// non-empty — it can be `ε`, contributing length 0. The ONLY syntactic atom
+/// that is GUARANTEED to contribute strictly positive length is a non-empty
+/// string CONSTANT. Therefore the equation `single = …single…X…` (with `X` the
+/// surrounding material) forces `len(single) = len(single) + len(X)`, i.e.
+/// `len(X) = 0`, which is a contradiction ONLY when `X` is forced to be
+/// non-empty — and that happens iff some atom of `rest` is a non-empty constant.
+/// A second variable / second `single` occurrence is satisfiable via emptiness
+/// (e.g. `v = w v u` with `w=u=v=ε`, or `v = u v u` with `u=ε`), so it must NOT
+/// conflict here; it falls through to the normal F-split/Done machinery.
 fn occurs_unsat(
     terms: &mut Context,
     eq: &mut EqualityEngine,
@@ -176,23 +188,14 @@ fn occurs_unsat(
     if !contains {
         return false;
     }
-    // … plus at least one necessarily-non-empty atom.
-    let mut seen_v_once = false;
-    for &a in rest {
-        if let Some(s) = terms.string_const_value(a) {
-            if !s.is_empty() {
-                return true; // non-empty constant alongside the occurrence ⇒ unsat
-            }
-        } else if same_as_single(eq, a) {
-            if seen_v_once {
-                return true; // a second occurrence of `single` ⇒ unsat
-            }
-            seen_v_once = true;
-        } else {
-            return true; // a distinct second variable ⇒ extra material ⇒ unsat
-        }
-    }
-    false
+    // … PLUS at least one NON-EMPTY string constant. Only a non-empty constant is
+    // necessarily non-empty material; a second variable (or a second occurrence
+    // of `single`) can be ε and so does NOT force a length contradiction.
+    rest.iter().any(|&a| {
+        terms
+            .string_const_value(a)
+            .map_or(false, |s| !s.is_empty())
+    })
 }
 
 /// Compare two atoms for definite equality: same TermId, same literal string
@@ -263,12 +266,18 @@ pub fn resolve_equation(
     // OCCURS CHECK (length-based contradiction in the free monoid). If one side
     // is the SINGLE variable `v` and the residual of the other side both
     //   (a) contains an occurrence of `v` (same TermId / same EUF class), and
-    //   (b) contains some atom that is necessarily NON-EMPTY (a non-empty string
-    //       constant, or any second variable occurrence),
-    // then `v = …v… + extra` forces `len(v) = len(v) + extra > len(v)`, which is
-    // impossible. This is UNSAT. It is the decidable length-contradiction core of
-    // variable-headed word equations such as `s = "b" ++ t ++ s ++ "c"`, which the
-    // pure F-split would otherwise diverge on (→ Unknown) or wrongly call SAT.
+    //   (b) contains a NON-EMPTY string CONSTANT,
+    // then `v = …v… + nonempty-const + …` forces `len(v) = len(v) + (>0)`, which
+    // is impossible. This is UNSAT. It is the decidable length-contradiction core
+    // of variable-headed word equations such as `s = "b" ++ t ++ s ++ "c"`, which
+    // the pure F-split would otherwise diverge on (→ Unknown) or wrongly call SAT.
+    //
+    // SOUNDNESS: a SECOND VARIABLE (a distinct variable, or a second occurrence of
+    // `v` itself) is NOT necessarily non-empty — in the free monoid any variable
+    // can be ε. So cases like `v = w ++ v ++ u` (w=u=v=ε) and `v = u ++ v ++ u`
+    // (u=ε) are SAT and must NOT conflict here; without a non-empty constant the
+    // occurs-check returns false and the equation falls through to the F-split/Done
+    // machinery (which splits or saturates → Unknown — never wrong UNSAT/SAT).
     {
         if le - i == 1 && terms.string_const_value(lhs[i]).is_none()
             && occurs_unsat(terms, eq, lhs[i], &rhs[j..re])
@@ -750,6 +759,98 @@ mod tests {
                 TCheck::Sat => panic!("expected conflict on prefix mismatch"),
                 TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
+        }
+    }
+
+    // ── Task 19: occurs-check soundness (free-monoid emptiness) ──────────────
+    // The occurs-check must conflict ONLY when a non-empty CONSTANT accompanies
+    // the recurring variable. A second variable / second occurrence of the same
+    // variable is satisfiable via emptiness and must NOT conflict.
+
+    // `v = w ++ v ++ u`  (residual after suffix-stripping `v`: `w ++ v ++ u` on
+    // RHS, `v` alone on LHS — actually after head/tail strip it's a variable
+    // residual). w=u=v="" is a model ⇒ must NOT be Conflict.
+    #[test]
+    fn occurs_distinct_vars_not_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let v = mk_var(&mut ctx, "v_occ1");
+        let w = mk_var(&mut ctx, "w_occ1");
+        let u = mk_var(&mut ctx, "u_occ1");
+        // lhs = [v], rhs = [w, v, u]
+        let lhs = [v];
+        let rhs = [w, v, u];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        assert!(
+            !matches!(result, StepResult::Conflict(_)),
+            "v = w++v++u is SAT (w=u=v=\"\"); occurs-check must NOT conflict (got Conflict)"
+        );
+    }
+
+    // `v = u ++ v ++ u`  — second occurrence of a DISTINCT variable `u` flanks `v`.
+    // u="" is a model ⇒ must NOT be Conflict.
+    #[test]
+    fn occurs_repeated_flank_var_not_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let v = mk_var(&mut ctx, "v_occ2");
+        let u = mk_var(&mut ctx, "u_occ2");
+        let lhs = [v];
+        let rhs = [u, v, u];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        assert!(
+            !matches!(result, StepResult::Conflict(_)),
+            "v = u++v++u is SAT (u=\"\"); occurs-check must NOT conflict (got Conflict)"
+        );
+    }
+
+    // `v = v ++ v`  — a SECOND occurrence of the SAME variable `v`. v="" is a model
+    // ⇒ must NOT be Conflict (free-monoid emptiness).
+    #[test]
+    fn occurs_second_same_var_not_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let v = mk_var(&mut ctx, "v_occ3");
+        let lhs = [v];
+        let rhs = [v, v];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        assert!(
+            !matches!(result, StepResult::Conflict(_)),
+            "v = v++v is SAT (v=\"\"); occurs-check must NOT conflict (got Conflict)"
+        );
+    }
+
+    // SOUND occurs-check: `s = "b" ++ t ++ s` — a NON-EMPTY constant flanks the
+    // recurring `s`, forcing len(s) = len(s) + (>0): genuine UNSAT. Must Conflict
+    // and cite the asserted equation literal.
+    #[test]
+    fn occurs_nonempty_const_flank_is_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let s = mk_var(&mut ctx, "s_occ4");
+        let t = mk_var(&mut ctx, "t_occ4");
+        let b = ctx.mk_string_const("b");
+        let lhs = [s];
+        let rhs = [b, t, s];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let lit = dummy_eqn_lit();
+        let just = vec![shinri_theory::types::EqLeaf::Asserted(lit)];
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, just, lit, &mut ctr, &mut emitted);
+        match result {
+            StepResult::Conflict(cf) => {
+                assert!(
+                    cf.iter().any(|l| matches!(l, shinri_theory::types::EqLeaf::Asserted(x) if *x == lit)),
+                    "occurs-check conflict must cite the asserting word-equation literal"
+                );
+            }
+            _ => panic!("s = \"b\"++t++s is UNSAT (non-empty constant flank); expected Conflict"),
         }
     }
 
