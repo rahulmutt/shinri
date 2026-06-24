@@ -260,9 +260,17 @@ fn rewrite(ctx: &mut Context, t: TermId, guards: &mut Vec<TermId>) -> TermId {
 
 /// Pre-pass entry point.
 ///
-/// Rewrites every `str.at` / `str.substr` in `assertions` (bottom-up) to a
-/// fresh String variable, collecting the guard constraints that define it.
-/// Returns `(rewritten assertions) ++ (guard atoms)`.
+/// 1. Rewrites every `str.at` / `str.substr` in `assertions` (bottom-up) to a
+///    fresh String variable, collecting the guard constraints that define it.
+/// 2. Eliminates every NON-Boolean `(ite c a b)` term (introduced by the substr
+///    guards as `(ite in_range i 0)` etc.) into a fresh variable `w` plus the
+///    implications `c → w=a` and `¬c → w=b`. The core solver does not interpret
+///    term-level ITE — arith/EUF treat `(ite …)` as an opaque value, so the
+///    length guards would be unconstrained (wrong SAT / divergent word-equation
+///    search). This pass makes them effective using only Bool structure +
+///    equalities the theories already handle.
+///
+/// Returns `(rewritten assertions) ++ (guard atoms) ++ (ite-defining atoms)`.
 ///
 /// Non-string queries (no `StrAt`/`StrSubstr`/`StrConcat`/`StrLen`) are
 /// returned unchanged.
@@ -274,7 +282,79 @@ pub fn reduce_assertions(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId
         .collect();
     let mut out = rewritten;
     out.extend(guards);
-    out
+
+    // Eliminate non-Boolean ITE terms across the whole reduced set.
+    let mut ite_defs: Vec<TermId> = Vec::new();
+    let mut memo = std::collections::HashMap::new();
+    let elim: Vec<TermId> = out
+        .iter()
+        .map(|&a| elim_term_ite(ctx, a, &mut ite_defs, &mut memo))
+        .collect();
+    let mut result = elim;
+    result.extend(ite_defs);
+    result
+}
+
+/// Bottom-up: replace every non-Boolean `(ite c a b)` subterm with a fresh
+/// variable `w` (of the ITE's sort) and append `(=> c (= w a))` and
+/// `(=> (not c) (= w b))` to `defs`. Boolean-sorted ITEs are left intact (the
+/// Tseitin encoder handles those). Memoized on TermId so shared ITEs get one var.
+fn elim_term_ite(
+    ctx: &mut Context,
+    t: TermId,
+    defs: &mut Vec<TermId>,
+    memo: &mut std::collections::HashMap<TermId, TermId>,
+) -> TermId {
+    if let Some(&r) = memo.get(&t) {
+        return r;
+    }
+    let result = match ctx.term_node(t).clone() {
+        TermNode::Const { .. } => t,
+        TermNode::App { op, args, .. } => {
+            let children: Vec<TermId> = ctx.children(args).to_vec();
+            let new_children: Vec<TermId> = children
+                .iter()
+                .map(|&c| elim_term_ite(ctx, c, defs, memo))
+                .collect();
+
+            if matches!(op, Op::Builtin(BuiltinOp::Ite)) && ctx.sort_of(t) != ctx.bool_sort() {
+                // Non-Boolean ITE: introduce a fresh var and two implications.
+                let cond = new_children[0];
+                let then_b = new_children[1];
+                let else_b = new_children[2];
+                let sort = ctx.sort_of(t);
+                let n = next_fresh();
+                let w_sym = ctx.declare_fun(&format!("!ite{n}"), &[], sort);
+                let w = ctx.mk_app(Op::Uninterpreted(w_sym), &[]).expect("fresh ite var");
+                let eq_then = ctx.mk_eq(w, then_b).expect("w = then");
+                let eq_else = ctx.mk_eq(w, else_b).expect("w = else");
+                let not_cond = ctx
+                    .mk_app(Op::Builtin(BuiltinOp::Not), &[cond])
+                    .expect("not cond");
+                let imp_then = ctx
+                    .mk_app(Op::Builtin(BuiltinOp::Implies), &[cond, eq_then])
+                    .expect("c => w=then");
+                let imp_else = ctx
+                    .mk_app(Op::Builtin(BuiltinOp::Implies), &[not_cond, eq_else])
+                    .expect("¬c => w=else");
+                defs.push(imp_then);
+                defs.push(imp_else);
+                w
+            } else {
+                let changed = new_children
+                    .iter()
+                    .zip(children.iter())
+                    .any(|(nc, oc)| nc != oc);
+                if changed {
+                    ctx.mk_app(op, &new_children).expect("rebuild after ite elim")
+                } else {
+                    t
+                }
+            }
+        }
+    };
+    memo.insert(t, result);
+    result
 }
 
 #[cfg(test)]
