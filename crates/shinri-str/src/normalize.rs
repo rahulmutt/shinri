@@ -1,50 +1,112 @@
 use rustc_hash::FxHashMap;
-use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
+use shinri_core::{BuiltinOp, ConstVal, Context, Op, TermId, TermNode};
 use shinri_theory::types::ENodeId;
 use shinri_theory::EqualityEngine;
 
-/// Return the representative `TermId` of `t`'s equivalence class.
+/// Build an authoritative `ENodeId → TermId` reverse map for the given set of
+/// known string terms.  For each equivalence class, we prefer to record a string
+/// **constant** (`ConstVal::String`) so that `rep()` returns the constant when
+/// the class contains one (needed for correct normal-form comparison in Task 11).
 ///
-/// The `EqualityEngine` maintains a `TermId → ENodeId` map (via `intern`) and a
-/// union-find over `ENodeId`s (via `find`), but has no reverse `ENodeId → TermId`
-/// map.  We thread our own `node_of: FxHashMap<ENodeId, TermId>` — one entry per
-/// distinct interned term — so we can resolve a representative node back to a term.
+/// Tie-breaking rule (applied in iteration order of `known`):
+/// - If the class has no entry yet, insert the term.
+/// - If the class already has a non-constant entry and the new term is a
+///   constant, replace it (promote constant to representative).
+/// - If the class already has a constant, keep it (don't demote).
+pub(crate) fn build_node_of(
+    terms: &Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+) -> FxHashMap<ENodeId, TermId> {
+    let mut node_of: FxHashMap<ENodeId, TermId> = FxHashMap::default();
+    for &t in known {
+        let n = eq.intern(t);
+        let root = eq.find(n);
+        let is_const = matches!(terms.term_node(t), TermNode::Const { val: ConstVal::String(_), .. });
+        match node_of.get(&root).copied() {
+            None => {
+                node_of.insert(root, t);
+            }
+            Some(prev) => {
+                // Promote to constant if current entry is not already a constant.
+                let prev_is_const = matches!(
+                    terms.term_node(prev),
+                    TermNode::Const { val: ConstVal::String(_), .. }
+                );
+                if is_const && !prev_is_const {
+                    node_of.insert(root, t);
+                }
+            }
+        }
+    }
+    node_of
+}
+
+/// Return the representative `TermId` of `t`'s equivalence class, consulting
+/// the global `node_of` map (built from all known string terms via
+/// `build_node_of`).
 ///
-/// If `t` was never interned, it is its own representative.
+/// Preference order:
+/// 1. A string constant in the same class (so `rep(x)` returns `"ab"` when
+///    `x = "ab"` was merged, enabling correct constant/constant alignment in
+///    Task 11).
+/// 2. Any term in `node_of` that shares `t`'s root.
+/// 3. `t` itself as a conservative fallback (never incorrect, just opaque).
 pub(crate) fn rep(
     eq: &mut EqualityEngine,
-    node_of: &mut FxHashMap<ENodeId, TermId>,
+    node_of: &FxHashMap<ENodeId, TermId>,
     t: TermId,
 ) -> TermId {
     let n = eq.intern(t);
-    node_of.entry(n).or_insert(t);
     let r = eq.find(n);
-    // If the representative node was never explicitly inserted (e.g. it was
-    // created by a merge that happened after our intern), it defaults to `t`
-    // itself — which is a sound conservative choice: two terms in the same class
-    // but neither was inserted here will each keep their own value, and literal
-    // folding will still fold them once the class rep appears.
     *node_of.get(&r).unwrap_or(&t)
 }
 
-/// Flatten `str.++` into a sequence; map each atom to its class representative;
-/// fold adjacent string-literal atoms; drop empty-string `""` atoms.
-pub fn normal_form(terms: &mut Context, eq: &mut EqualityEngine, t: TermId) -> Vec<TermId> {
+/// Flatten `str.++` into a sequence; map each atom to its class representative
+/// (reflecting global EqualityEngine merges, preferring constants); fold
+/// adjacent string-literal atoms; drop empty-string `""` atoms.
+///
+/// `known` must include every string-sorted term visible to the solver so that
+/// `rep()` can honour merges with terms that do not appear in `t` itself
+/// (e.g. when `x = "ab"` was asserted, `known` must contain `"ab"`).
+pub fn normal_form(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    t: TermId,
+) -> Vec<TermId> {
     let mut flat = Vec::new();
     flatten(terms, t, &mut flat);
 
-    // Build a local node_of map so we can translate ENodeId reps back to TermIds.
-    let mut node_of: FxHashMap<ENodeId, TermId> = FxHashMap::default();
-    // Pre-populate with each atom we flattened, in order (so the first term
-    // interned at a given node "owns" that node slot for rep resolution).
+    // Build the authoritative reverse map from ALL known string terms so rep()
+    // reflects global EqualityEngine merges (not just the atoms in this concat).
+    let mut node_of = build_node_of(terms, eq, known);
+
+    // Also ensure every atom we just flattened is in the map (covers the case
+    // where `known` was not yet updated to include a fresh atom).
     for &a in &flat {
         let n = eq.intern(a);
-        node_of.entry(n).or_insert(a);
+        let root = eq.find(n);
+        let is_const = matches!(terms.term_node(a), TermNode::Const { val: ConstVal::String(_), .. });
+        match node_of.get(&root).copied() {
+            None => {
+                node_of.insert(root, a);
+            }
+            Some(prev) => {
+                let prev_is_const = matches!(
+                    terms.term_node(prev),
+                    TermNode::Const { val: ConstVal::String(_), .. }
+                );
+                if is_const && !prev_is_const {
+                    node_of.insert(root, a);
+                }
+            }
+        }
     }
 
     let mut out: Vec<TermId> = Vec::new();
     for a in flat {
-        let r = rep(eq, &mut node_of, a);
+        let r = rep(eq, &node_of, a);
         if let Some(s) = terms.string_const_value(r) {
             let s = s.to_owned();
             if s.is_empty() {
@@ -63,6 +125,16 @@ pub fn normal_form(terms: &mut Context, eq: &mut EqualityEngine, t: TermId) -> V
         out.push(r);
     }
     out
+}
+
+/// Returns `true` iff `a` and `b` are in the same EqualityEngine class.
+///
+/// This is the canonical check for string-theory conflict detection (Task 11/14).
+#[allow(dead_code)] // used in Task 11/14
+pub fn atoms_equal(eq: &mut EqualityEngine, a: TermId, b: TermId) -> bool {
+    let na = eq.intern(a);
+    let nb = eq.intern(b);
+    eq.are_equal(na, nb)
 }
 
 /// Recursively flatten a (possibly nested) `str.++` into its atom leaves.
@@ -85,9 +157,17 @@ fn flatten(terms: &Context, t: TermId, out: &mut Vec<TermId>) {
 #[cfg(test)]
 mod tests {
     use shinri_core::{BuiltinOp, Context, Op};
+    use shinri_theory::types::EqJust;
     use shinri_theory::EqualityEngine;
+    use shinri_core::Lit;
+    use shinri_core::Var;
 
-    use crate::normalize::normal_form;
+    use crate::normalize::{atoms_equal, normal_form};
+
+    /// Helper: build an asserted justification for use in merge calls.
+    fn just(seed: u32) -> EqJust {
+        EqJust::Asserted(Lit::new(Var::new(seed), true))
+    }
 
     #[test]
     fn flattens_nested_concat_and_folds_literals() {
@@ -106,9 +186,91 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, inner])
             .unwrap();
         let mut eq = EqualityEngine::default();
-        let nf = normal_form(&mut ctx, &mut eq, outer);
+        // known = all string-sorted terms visible to the solver
+        let known = vec![x, ab, cd];
+        let nf = normal_form(&mut ctx, &mut eq, &known, outer);
         // x ++ "ab" ++ "cd"  ==  x ++ "abcd"  (literals folded)
         assert_eq!(nf.len(), 2);
         assert_eq!(ctx.string_const_value(nf[1]), Some("abcd"));
+    }
+
+    /// Discriminating test: rep() must return the CONSTANT "ab" for variable x
+    /// when x = "ab" was merged in the EqualityEngine.
+    ///
+    /// This test catches the original bug where `node_of` was built only from
+    /// the atoms in the concat call, causing rep(x) to return x instead of "ab".
+    #[test]
+    fn rep_reflects_global_merge_prefers_constant() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+
+        // Build: string var x, string var y, string literal "ab"
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let y = {
+            let s = ctx.declare_fun("y", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let ab = ctx.mk_string_const("ab");
+
+        // Intern x and "ab" in the EqualityEngine and MERGE them (x = "ab").
+        let mut eq = EqualityEngine::default();
+        let nx = eq.intern(x);
+        let nab = eq.intern(ab);
+        eq.merge(nx, nab, just(1)).unwrap();
+
+        // Build the concatenation x ++ y
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
+
+        // `known` includes "ab" (mirrors how StrSolver.str_terms collects all terms).
+        let known = vec![x, y, ab];
+
+        let nf = normal_form(&mut ctx, &mut eq, &known, concat);
+
+        // After the fix: nf[0] must be the CONSTANT "ab", not the variable x.
+        // This fails against the old code (which returned x) and passes after the fix.
+        assert_eq!(
+            nf.len(),
+            2,
+            "normal form of x++y should have 2 atoms (neither is empty)"
+        );
+        assert_eq!(
+            ctx.string_const_value(nf[0]),
+            Some("ab"),
+            "rep(x) must return the constant \"ab\" (x was merged with \"ab\")"
+        );
+        // nf[1] should be y (no merge for y)
+        assert_eq!(
+            nf[1], y,
+            "rep(y) should be y (no merge)"
+        );
+    }
+
+    /// atoms_equal returns true iff two terms share an EqualityEngine class.
+    #[test]
+    fn atoms_equal_reflects_merges() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x_ae", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let ab = ctx.mk_string_const("ab_ae");
+
+        let mut eq = EqualityEngine::default();
+
+        // Before merge: not equal
+        assert!(!atoms_equal(&mut eq, x, ab));
+
+        // After merge: equal
+        let nx = eq.intern(x);
+        let nab = eq.intern(ab);
+        eq.merge(nx, nab, just(2)).unwrap();
+
+        assert!(atoms_equal(&mut eq, x, ab));
     }
 }

@@ -37,24 +37,31 @@ impl TheorySolver for StrSolver {
 
     fn assert(&mut self, cx: &mut TheoryCtx, lit: Lit) -> Option<Vec<EqLeaf>> {
         // Record asserted string (dis)equalities for consumption by Task 11+.
+        // Gate on the operands being String-sorted so non-string equalities
+        // (e.g. integer or bitvector) cannot pollute eq_true/diseq_true.
         let atom = cx.atoms.atom(lit.var());
-        if let TermNode::App { op, .. } = cx.terms.term_node(atom) {
-            match op {
-                Op::Builtin(BuiltinOp::Eq) => {
-                    if lit.is_positive() {
-                        self.eq_true.push(atom);
-                    } else {
-                        self.diseq_true.push(atom);
+        if let TermNode::App { op, args, .. } = cx.terms.term_node(atom) {
+            let args = cx.terms.children(*args).to_vec();
+            let is_str_eq = !args.is_empty()
+                && cx.terms.sort_of(args[0]) == cx.terms.string_sort();
+            if is_str_eq {
+                match op {
+                    Op::Builtin(BuiltinOp::Eq) => {
+                        if lit.is_positive() {
+                            self.eq_true.push(atom);
+                        } else {
+                            self.diseq_true.push(atom);
+                        }
                     }
-                }
-                Op::Builtin(BuiltinOp::Distinct) => {
-                    if lit.is_positive() {
-                        self.diseq_true.push(atom);
-                    } else {
-                        self.eq_true.push(atom);
+                    Op::Builtin(BuiltinOp::Distinct) => {
+                        if lit.is_positive() {
+                            self.diseq_true.push(atom);
+                        } else {
+                            self.eq_true.push(atom);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
         None
