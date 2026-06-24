@@ -15,9 +15,13 @@ pub struct StrSolver {
     diseq_true: Vec<TermId>,
     len_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
+    #[allow(dead_code)] // used in Task 9 (len-axiom deduplication) and Task 17 (str-equality propagation)
     emitted_len_axioms: FxHashSet<TermId>,
+    #[allow(dead_code)] // used in Task 12 (split lemma deduplication)
     emitted_splits: FxHashSet<(TermId, TermId)>,
+    #[allow(dead_code)] // used in Task 12 (fresh skolem variable counter for splits)
     fresh_ctr: u32,
+    #[allow(dead_code)] // used in Task 15 (unfolding fuel budget)
     fuel: Fuel,
     trail: trail::Trail,
 }

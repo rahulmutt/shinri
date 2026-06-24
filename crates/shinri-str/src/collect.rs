@@ -1,7 +1,7 @@
 use rustc_hash::FxHashSet;
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 
-pub fn is_string_sorted(terms: &Context, t: TermId) -> bool {
+pub(crate) fn is_string_sorted(terms: &Context, t: TermId) -> bool {
     matches!(
         terms.sort_node(terms.sort_of(t)),
         shinri_core::SortNode::String
