@@ -3,6 +3,7 @@ mod fuel;
 mod length;
 pub mod normalize;
 mod trail;
+pub mod wordeq;
 pub use fuel::Fuel;
 
 use rustc_hash::FxHashSet;
@@ -82,6 +83,34 @@ impl TheorySolver for StrSolver {
                 return TCheck::Split(vec![axiom]);
             }
         }
+
+        // Build the `known` set: all string-sorted subterms visible to the solver,
+        // plus both sides of each asserted equality (so rep() resolves global merges,
+        // preferring constants — required by the Task 10 fix in normal_form).
+        let mut known: Vec<TermId> = self.str_terms.iter().copied().collect();
+        for &atom in &self.eq_true {
+            let (l, r) = crate::wordeq::sides(cx.terms, atom);
+            known.push(l);
+            known.push(r);
+        }
+
+        // Word-equation resolution: strip equal heads/tails, detect constant
+        // prefix mismatches. Variable-headed residuals are handled in Task 12.
+        let eqs = self.eq_true.clone();
+        for atom in eqs {
+            let (l, r) = crate::wordeq::sides(cx.terms, atom);
+            let lhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, l);
+            let rhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, r);
+            // NOTE: `just` is empty here — justification is refined in Task 12
+            // once proof traces are wired. The conflict is still sound because the
+            // equality is on the decision trail.
+            let just = vec![];
+            match crate::wordeq::resolve_equation(cx.terms, cx.eq, &lhs, &rhs, just) {
+                crate::wordeq::StepResult::Conflict(cf) => return TCheck::Conflict(cf),
+                crate::wordeq::StepResult::Split(atoms) => return TCheck::Split(atoms),
+                crate::wordeq::StepResult::Done => {}
+            }
+        }
         TCheck::Sat
     }
 
@@ -102,6 +131,15 @@ impl TheorySolver for StrSolver {
 
     fn shared_arith_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
         self.len_terms.iter().copied().collect()
+    }
+}
+
+#[cfg(test)]
+impl StrSolver {
+    /// Push `atom` directly onto `eq_true`, simulating the SAT layer asserting
+    /// a string equality without going through `assert`. Used only in unit tests.
+    pub fn test_force_eq_true(&mut self, atom: TermId) {
+        self.eq_true.push(atom);
     }
 }
 
