@@ -265,64 +265,6 @@ impl TheorySolver for StrSolver {
         // antecedents via `eq.explain`, mirroring the EUF conflict pattern in
         // `shinri-euf/src/egraph.rs::conflict_leaves` (the `explain(a, b, out)` path
         // for the merge-antecedent part).
-        // Empty-length link (sound PROPAGATION direction): for each disequality
-        // `s ≠ ""`, emit the GUARDED arith lemma `(s ≠ "") → len(s) ≥ 1` once. The
-        // learnt clause is `¬(s≠"") ∨ (len(s) ≥ 1)`, a VALID implication (a
-        // non-empty string has length ≥ 1). This feeds Arith the lower bound so the
-        // `len(s) = 0` ∧ `s ≠ ""` contradiction is caught even when the length is
-        // entailed ONLY through arith bounds (e.g. `len(s) ≤ 0 ∧ len(s) ≥ 0`),
-        // where no `len(s) ≈ 0` merge reaches the shared engine.
-        //
-        // Why this is the SOUND, narrow form (vs the removed broad ones): it is
-        // emitted ONLY for disequalities with an EMPTY-literal side — NOT for every
-        // `str.len` term, and NOT for every disequality. So it introduces exactly
-        // one extra arith bound per `s ≠ ""` atom, GUARDED by that atom's own
-        // literal, and contributes nothing on branches where `s ≠ ""` is false. It
-        // therefore cannot over-constrain unrelated satisfiable queries: there is no
-        // empty-side disequality in the must-stay-SAT cases (`len(x)=2`, etc.).
-        {
-            let diseqs: Vec<(TermId, Lit)> = self.diseq_true.clone();
-            for (atom, lit) in diseqs {
-                let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
-                for (empty_side, other) in [(l, r), (r, l)] {
-                    if cx.terms.string_const_value(empty_side) != Some("") {
-                        continue;
-                    }
-                    let len_other = cx
-                        .terms
-                        .mk_app(Op::Builtin(BuiltinOp::StrLen), &[other])
-                        .expect("str.len(other) well-sorted");
-                    let int_s = cx.terms.int_sort();
-                    let one = cx
-                        .terms
-                        .mk_numeral(shinri_core::Rational::from_int(1i128.into()), int_s);
-                    let ge1 = cx
-                        .terms
-                        .mk_app(Op::Builtin(BuiltinOp::Ge), &[len_other, one])
-                        .expect("(>= len 1) well-sorted");
-                    if self.emitted_len_axioms.contains(&ge1) {
-                        continue;
-                    }
-                    self.emitted_len_axioms.insert(ge1);
-                    if !self.fuel.spend() {
-                        return TCheck::Unknown;
-                    }
-                    let mut seen = FxHashSet::default();
-                    collect::collect(
-                        cx.terms,
-                        ge1,
-                        &mut self.len_terms,
-                        &mut self.str_terms,
-                        &mut seen,
-                    );
-                    // Guard = ¬(s ≠ ""), i.e. the diseq literal negated, so the bound
-                    // is enforced only on branches where `s ≠ ""` holds (Nielsen-style
-                    // guarded lemma — never the unsound bare disjunction).
-                    return TCheck::Split { atoms: vec![ge1], guard: Some(lit.negate()) };
-                }
-            }
-        }
-
         let diseqs: Vec<(TermId, Lit)> = self.diseq_true.clone();
         for (atom, lit) in diseqs {
             let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
@@ -427,8 +369,32 @@ impl TheorySolver for StrSolver {
         }
     }
 
-    fn shared_arith_terms(&self, _cx: &mut TheoryCtx) -> Vec<TermId> {
-        self.len_terms.iter().copied().collect()
+    fn shared_arith_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
+        let mut out: Vec<TermId> = self.len_terms.iter().copied().collect();
+        // Empty-length link, robust (arith-entailed) direction: if any disequality
+        // has an empty-literal side, expose the Int numeral `0` as a shared term.
+        // The N-O exchange then ENTAILS `len(s) = 0` (merging it into the shared
+        // engine with a proper arith tag) whenever arith forces the length to zero
+        // — even when that is implied only by bounds (`len(s) ≤ 0 ∧ len(s) ≥ 0`),
+        // which produce NO `len(s) ≈ 0` merge on their own. The diseq-loop conflict
+        // check (`len_class_zero`) then fires with a correct, theory-resolved
+        // justification. We add `0` ONLY in the presence of an empty-side
+        // disequality, so unrelated queries see no extra shared term (and the MBTC
+        // arrangement set is unperturbed for them).
+        let has_empty_diseq = self.diseq_true.iter().any(|&(atom, _)| {
+            let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
+            cx.terms.string_const_value(l) == Some("")
+                || cx.terms.string_const_value(r) == Some("")
+        });
+        if has_empty_diseq {
+            let int_s = cx.terms.int_sort();
+            let zero =
+                cx.terms.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
+            if !out.contains(&zero) {
+                out.push(zero);
+            }
+        }
+        out
     }
 }
 
@@ -594,8 +560,9 @@ mod tests {
         );
         // For an opaque variable x (no concat/literal) with NO disequality, check
         // emits only the `(>= (str.len x) 0)` axiom, then reaches Sat fixpoint. The
-        // empty-length link is emitted on demand only for `s ≠ ""` disequalities
-        // (see `side_is_empty`), so it does NOT fire here.
+        // empty-length link is a CONFLICT CHECK in the disequality loop (it reads
+        // the entailed length from the shared engine, emitting no atoms), and only
+        // fires for an empty-side `s ≠ ""` disequality — none here — so it stays Sat.
         let first = s.check(&mut cx, Effort::Full);
         assert!(
             matches!(first, TCheck::Split { .. }),

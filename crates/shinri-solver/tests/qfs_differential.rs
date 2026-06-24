@@ -468,6 +468,45 @@ fn targeted_empty_length_link_unsat() {
 }
 
 #[test]
+fn targeted_empty_length_link_bounds_entailed_unsat() {
+    // Same contradiction, but `len(x)=0` is entailed ONLY through arith bounds
+    // (`len(x) ≤ 0 ∧ len(x) ≥ 0`) — no `(= (str.len x) 0)` literal, so no direct
+    // EUF merge. The `0`-numeral exposed in `shared_arith_terms` lets the N-O
+    // exchange entail `len(x)=0` into the shared engine, so this is UNSAT too.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (<= (str.len x) 0))(assert (>= (str.len x) 0))\
+         (assert (distinct x \"\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_constrained_len_with_diseq_stays_sat() {
+    // REGRESSION GUARD for the prior broad wrong-UNSAT: a NON-zero constrained
+    // length together with `x ≠ ""` must stay SAT (a length-k>0 string can differ
+    // from ""). The earlier guarded/eager empty-link forms wrongly reported these
+    // UNSAT because re-emitting `(>= len 1)` as a theory split minted a second SAT
+    // var for an atom that already had one, and the two were never linked.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (= (str.len x) 1))(assert (distinct x \"\"))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (= (str.len x) 5))(assert (distinct x \"\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // And a bare constrained length with NO empty-side disequality stays SAT.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (= (str.len x) 2))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
 fn targeted_disequality_witness_sat() {
     // x ≠ y with len 1 each ⇒ SAT; the model must satisfy x ≠ y.
     let body = "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
