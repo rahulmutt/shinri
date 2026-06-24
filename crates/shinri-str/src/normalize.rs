@@ -22,24 +22,32 @@ pub(crate) fn build_node_of(
     for &t in known {
         let n = eq.intern(t);
         let root = eq.find(n);
-        let is_const = matches!(terms.term_node(t), TermNode::Const { val: ConstVal::String(_), .. });
         match node_of.get(&root).copied() {
             None => {
                 node_of.insert(root, t);
             }
             Some(prev) => {
-                // Promote to constant if current entry is not already a constant.
-                let prev_is_const = matches!(
-                    terms.term_node(prev),
-                    TermNode::Const { val: ConstVal::String(_), .. }
-                );
-                if is_const && !prev_is_const {
+                // Promote to a string constant if the current entry is not one.
+                // (Constants give exact characters for normal-form comparison; we
+                // deliberately do NOT prefer concats here — letting a concat become
+                // the class rep can make `rep(x)` point at an unrelated concat in
+                // the same class and corrupt normalization. Concat expansion for
+                // the model is handled separately in `model::value_of`.)
+                if rep_rank(terms, t) > rep_rank(terms, prev) {
                     node_of.insert(root, t);
                 }
             }
         }
     }
     node_of
+}
+
+/// Representative preference rank: string constant (1) > anything else (0).
+fn rep_rank(terms: &Context, t: TermId) -> u8 {
+    match terms.term_node(t) {
+        TermNode::Const { val: ConstVal::String(_), .. } => 1,
+        _ => 0,
+    }
 }
 
 /// Return the representative `TermId` of `t`'s equivalence class, consulting
@@ -87,17 +95,12 @@ pub fn normal_form(
     for &a in &flat {
         let n = eq.intern(a);
         let root = eq.find(n);
-        let is_const = matches!(terms.term_node(a), TermNode::Const { val: ConstVal::String(_), .. });
         match node_of.get(&root).copied() {
             None => {
                 node_of.insert(root, a);
             }
             Some(prev) => {
-                let prev_is_const = matches!(
-                    terms.term_node(prev),
-                    TermNode::Const { val: ConstVal::String(_), .. }
-                );
-                if is_const && !prev_is_const {
+                if rep_rank(terms, a) > rep_rank(terms, prev) {
                     node_of.insert(root, a);
                 }
             }
@@ -143,54 +146,68 @@ pub fn deep_normal_form(
     known: &[TermId],
     t: TermId,
 ) -> Vec<TermId> {
-    // First compute the regular normal form.
-    let nf = normal_form(terms, eq, known, t);
-    // If any atom in the normal form is itself a concat (because rep() substituted
-    // a variable with a concat-valued class member), recursively expand it.
-    let needs_expansion = nf.iter().any(|&a| {
-        matches!(
-            terms.term_node(a),
-            TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
-        )
-    });
-    if !needs_expansion {
-        return nf;
-    }
-    // Expand each atom: recursively compute the NF of any concat-rep atoms.
-    let mut out = Vec::new();
-    for a in nf {
-        if matches!(
-            terms.term_node(a),
-            TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
-        ) {
-            // Recursively expand (one level: concat atoms in `known` should not
-            // themselves have concat reps since we build `known` from problem terms).
-            let sub = normal_form(terms, eq, known, a);
-            out.extend(sub);
-        } else {
-            out.push(a);
+    // Start from the regular (single-level) normal form, then expand to a
+    // FIXPOINT: each round re-normalizes every atom and re-flattens any concat
+    // that surfaced (because rep() substituted a variable with a concat-valued
+    // class member). Iterating is required because an expanded concat's own atoms
+    // may ALSO be merged with concats (e.g. `x = "a"++z`, `z = "b"++w`): a single
+    // pass would leave `z` un-expanded, missing ground conflicts (issue #3).
+    let mut cur = normal_form(terms, eq, known, t);
+    // Bound iterations defensively; the number of distinct atoms is finite and
+    // each productive round strictly increases resolved structure, so this
+    // converges well within the bound. (A self-referential merge cycle, which a
+    // sound model can't produce, is also stopped by the bound.)
+    for _ in 0..64 {
+        let needs_expansion = cur.iter().any(|&a| {
+            a != t
+                && matches!(
+                    terms.term_node(a),
+                    TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
+                )
+        });
+        // Also re-resolve atoms whose class now has a different (concat/const) rep.
+        if !needs_expansion {
+            break;
         }
-    }
-    // Fold adjacent string literals in the final result.
-    let mut folded = Vec::new();
-    for a in out {
-        if let Some(s) = terms.string_const_value(a) {
-            let s = s.to_owned();
-            if s.is_empty() {
-                continue;
+        let mut out = Vec::new();
+        for a in &cur {
+            let a = *a;
+            if a != t
+                && matches!(
+                    terms.term_node(a),
+                    TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
+                )
+            {
+                out.extend(normal_form(terms, eq, known, a));
+            } else {
+                out.push(a);
             }
-            if let Some(&last) = folded.last() {
-                if let Some(ls) = terms.string_const_value(last) {
-                    let merged = format!("{ls}{s}");
-                    let m = terms.mk_string_const(&merged);
-                    *folded.last_mut().unwrap() = m;
+        }
+        // Fold adjacent string literals.
+        let mut folded = Vec::new();
+        for a in out {
+            if let Some(s) = terms.string_const_value(a) {
+                let s = s.to_owned();
+                if s.is_empty() {
                     continue;
                 }
+                if let Some(&last) = folded.last() {
+                    if let Some(ls) = terms.string_const_value(last) {
+                        let merged = format!("{ls}{s}");
+                        let mm = terms.mk_string_const(&merged);
+                        *folded.last_mut().unwrap() = mm;
+                        continue;
+                    }
+                }
             }
+            folded.push(a);
         }
-        folded.push(a);
+        if folded == cur {
+            break; // fixpoint
+        }
+        cur = folded;
     }
-    folded
+    cur
 }
 
 /// Returns `true` iff `a` and `b` are in the same EqualityEngine class.
