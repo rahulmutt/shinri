@@ -267,8 +267,30 @@ impl TheorySolver for StrSolver {
                     None
                 };
                 if let Some(vars) = other {
-                    let all_var =
-                        vars.iter().all(|&a| cx.terms.string_const_value(a).is_none());
+                    // Every residual atom must be a genuine string VARIABLE (an
+                    // uninterpreted nullary symbol). A residual atom may be:
+                    //   * a non-empty CONSTANT — then `Σlen ≤ 0` is plainly wrong
+                    //     (already excluded by `string_const_value(a).is_none()`); OR
+                    //   * a CONCAT term — `normal_form`/`rep()` can substitute a
+                    //     residual variable by a concat-valued class representative
+                    //     (e.g. via a self-referential merge `s1 ≈ s1·s1·s2` whose
+                    //     rep chain surfaces `(s2·"bb")·z`). That concat is NOT a
+                    //     string constant, so the old `string_const_value` check let
+                    //     it through, and `len(concat) ≤ 0` over a concat that
+                    //     contains the non-empty constant "bb" forced `2 ≤ 0` — a
+                    //     SPURIOUS UNSAT (the documented wrong-UNSAT class). A concat
+                    //     residual carries hidden mandatory constant length, so the
+                    //     empty-residual lemma is unsound over it. Require each atom
+                    //     be a bare uninterpreted variable; if any is a concat (or
+                    //     other compound), SKIP the lemma (fall through to the bounded
+                    //     word-equation machinery → sound Split/Done/Unknown).
+                    let all_var = vars.iter().all(|&a| {
+                        cx.terms.string_const_value(a).is_none()
+                            && matches!(
+                                cx.terms.term_node(a),
+                                TermNode::App { op: Op::Uninterpreted(_), .. }
+                            )
+                    });
                     if all_var {
                         let int_s = cx.terms.int_sort();
                         let len_atoms: Vec<TermId> = vars
@@ -449,8 +471,19 @@ impl TheorySolver for StrSolver {
                 let mut known_d = known.clone();
                 known_d.push(l);
                 known_d.push(r);
-                let lhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, l);
-                let rhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, r);
+                // A self-referential class merge (e.g. `s ≈ str.++ s s u`) makes the
+                // deep normal form non-convergent; `deep_normal_form` returns `None`.
+                // We cannot soundly derive a separation lemma from a side we could
+                // not ground-resolve, so yield a SOUND `Unknown` (never a wrong
+                // verdict). This is the UNIFORM bound for the divergent
+                // self-referential word-equation / disequality shapes.
+                let (lhs, rhs) = match (
+                    crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, l),
+                    crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, r),
+                ) {
+                    (Some(lhs), Some(rhs)) => (lhs, rhs),
+                    _ => return TCheck::Unknown,
+                };
                 // Cancel common prefix, then common suffix (free-monoid cancellation).
                 let (mut i, mut j) = (0usize, 0usize);
                 let (mut le, mut re) = (lhs.len(), rhs.len());
@@ -584,9 +617,17 @@ impl TheorySolver for StrSolver {
             known_d.push(r);
             // Use `deep_normal_form` which recursively expands concat-valued class
             // representatives (e.g. when `x = "a"++y` was merged, the NF of `x`
-            // should be `["a", y]` after one expansion level).
-            let lhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, l);
-            let rhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, r);
+            // should be `["a", y]` after one expansion level). A non-convergent
+            // self-referential merge yields `None`; we then cannot soundly compare
+            // the two words for a same-word conflict, so yield a SOUND `Unknown`
+            // rather than risk a wrong verdict or diverge.
+            let (lhs, rhs) = match (
+                crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, l),
+                crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, r),
+            ) {
+                (Some(lhs), Some(rhs)) => (lhs, rhs),
+                _ => return TCheck::Unknown,
+            };
             if crate::wordeq::nf_equal(cx.terms, cx.eq, &lhs, &rhs) {
                 
                 // Build conflict: diseq literal + merge antecedents for each pair.

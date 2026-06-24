@@ -1,4 +1,4 @@
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, ConstVal, Context, Op, TermId, TermNode};
 use shinri_theory::types::ENodeId;
 use shinri_theory::EqualityEngine;
@@ -130,6 +130,18 @@ pub fn normal_form(
     out
 }
 
+/// Upper bound on the number of atoms a `deep_normal_form` expansion may produce
+/// before it is declared NON-CONVERGENT. A self-referential class merge (e.g.
+/// `s ≈ str.++ s s u`, asserted by `s = s ++ s ++ u`) makes `rep(s)` resolve to a
+/// concat that RE-CONTAINS `s`, so each expansion round at least DOUBLES the count
+/// of the recurring atom — the form never reaches a syntactic fixpoint and grows
+/// without bound (2, 4, 8, … atoms). A plain iteration cap does NOT bound the work
+/// because the per-round size grows exponentially, so we bound the OUTPUT SIZE and
+/// bail to `None` (a SOUND "cannot decide deeply") when it is exceeded. The cap is
+/// generous: any genuinely-decidable disequality over the small QF_S corpus
+/// resolves in a handful of atoms, well under this bound.
+pub(crate) const DEEP_NF_ATOM_CAP: usize = 256;
+
 /// Compute a "deep" normal form that recursively expands class representatives
 /// that are concat terms.
 ///
@@ -140,12 +152,24 @@ pub fn normal_form(
 ///
 /// Used for disequality checking (Task 14) where we need to detect that both sides
 /// of an asserted disequality represent the same word.
+///
+/// TERMINATION / SOUNDNESS: returns `None` when the expansion is NON-CONVERGENT —
+/// a self-referential class merge (e.g. `s ≈ str.++ s s u`) re-introduces the
+/// recurring atom every round so the form doubles without ever reaching a fixpoint.
+/// We detect this two ways, both bailing to `None`:
+///   * a concat that is ABOUT to be re-expanded a second time (`expanded` dedup set
+///     — a structural cycle: the same concat resurfaced), and
+///   * the running atom count exceeding `DEEP_NF_ATOM_CAP` (a defensive size fence
+///     for any growth pattern the cycle set does not catch).
+/// `None` means the caller must NOT draw a disequality conflict / separation lemma
+/// from this side (it cannot be ground-resolved here) and instead yield a SOUND
+/// `Unknown` — never a wrong UNSAT (a spurious same-word conflict) or wrong SAT.
 pub fn deep_normal_form(
     terms: &mut Context,
     eq: &mut EqualityEngine,
     known: &[TermId],
     t: TermId,
-) -> Vec<TermId> {
+) -> Option<Vec<TermId>> {
     // Start from the regular (single-level) normal form, then expand to a
     // FIXPOINT: each round re-normalizes every atom and re-flattens any concat
     // that surfaced (because rep() substituted a variable with a concat-valued
@@ -153,10 +177,16 @@ pub fn deep_normal_form(
     // may ALSO be merged with concats (e.g. `x = "a"++z`, `z = "b"++w`): a single
     // pass would leave `z` un-expanded, missing ground conflicts (issue #3).
     let mut cur = normal_form(terms, eq, known, t);
-    // Bound iterations defensively; the number of distinct atoms is finite and
-    // each productive round strictly increases resolved structure, so this
-    // converges well within the bound. (A self-referential merge cycle, which a
-    // sound model can't produce, is also stopped by the bound.)
+    if cur.len() > DEEP_NF_ATOM_CAP {
+        return None;
+    }
+    // The set of concat TermIds we have already expanded once. Re-encountering one
+    // is a self-referential merge CYCLE (the concat's own expansion produced itself
+    // again), which never converges — bail to `None` rather than loop/grow.
+    let mut expanded: FxHashSet<TermId> = FxHashSet::default();
+    // The number of distinct atoms is finite, so absent a self-referential merge
+    // this converges in far fewer than 64 rounds; the cycle/size fences below
+    // convert a non-convergent (divergent) merge into a sound `None`.
     for _ in 0..64 {
         let needs_expansion = cur.iter().any(|&a| {
             a != t
@@ -178,7 +208,16 @@ pub fn deep_normal_form(
                     TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
                 )
             {
+                // A concat already expanded once that resurfaced is a
+                // self-referential merge cycle (e.g. `s ≈ str.++ s s u`): its
+                // expansion re-mints itself, so the form never converges. Bail.
+                if !expanded.insert(a) {
+                    return None;
+                }
                 out.extend(normal_form(terms, eq, known, a));
+                if out.len() > DEEP_NF_ATOM_CAP {
+                    return None;
+                }
             } else {
                 out.push(a);
             }
@@ -202,12 +241,15 @@ pub fn deep_normal_form(
             }
             folded.push(a);
         }
+        if folded.len() > DEEP_NF_ATOM_CAP {
+            return None;
+        }
         if folded == cur {
             break; // fixpoint
         }
         cur = folded;
     }
-    cur
+    Some(cur)
 }
 
 /// Returns `true` iff `a` and `b` are in the same EqualityEngine class.
