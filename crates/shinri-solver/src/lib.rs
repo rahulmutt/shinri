@@ -2,6 +2,7 @@
 //! Tseitin-encodes Boolean structure into the CDCL(T) SAT engine, registers EUF
 //! atoms, and extracts models. No SMT-LIB parser (assert via the API).
 
+mod abv_stage;
 mod bv_stage;
 mod model;
 mod tseitin;
@@ -61,6 +62,9 @@ pub struct Solver {
     /// BV model bits stashed after a BV-path solve: each BV variable term →
     /// its CNF-mapped SAT vars (LSB→MSB). Consumed by Task 18's model extractor.
     bv_var_bits: rustc_hash::FxHashMap<TermId, Vec<shinri_core::Var>>,
+    /// Array models rendered after a QF_ABV SAT result: declared array constant
+    /// TermId → pre-rendered SMT-LIB `store`-chain string. Cleared on non-ABV paths.
+    abv_array_models: rustc_hash::FxHashMap<TermId, String>,
 }
 
 impl Default for Solver {
@@ -83,6 +87,7 @@ impl Solver {
             last_model: None,
             stage_b: true,
             bv_var_bits: rustc_hash::FxHashMap::default(),
+            abv_array_models: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -220,26 +225,36 @@ impl Solver {
     }
 
     fn format_value(&self, t: TermId) -> Option<String> {
-        self.last_model
-            .as_ref()?
-            .get(t)
-            .map(crate::model::format_modelval)
+        // Check BV/EUF model first.
+        if let Some(val) = self.last_model.as_ref().and_then(|m| m.get(t)) {
+            return Some(crate::model::format_modelval(val));
+        }
+        // Fall through to ABV array model (for array-sorted terms).
+        self.abv_array_models.get(&t).cloned()
     }
 
     fn format_model(&self) -> String {
-        match &self.last_model {
-            None => "()".into(),
-            Some(m) => {
-                let mut out = String::from("(");
-                for (t, v) in m.values.iter() {
-                    let name = crate::tseitin::display_term(&self.ctx, *t);
-                    let val = crate::model::format_modelval(v);
-                    out.push_str(&format!("({name} {val})"));
-                }
-                out.push(')');
-                out
+        let has_bv_euf = self.last_model.is_some();
+        let has_abv = !self.abv_array_models.is_empty();
+        if !has_bv_euf && !has_abv {
+            return "()".into();
+        }
+        let mut out = String::from("(");
+        // BV/EUF model entries (non-ABV path).
+        if let Some(m) = &self.last_model {
+            for (t, v) in m.values.iter() {
+                let name = crate::tseitin::display_term(&self.ctx, *t);
+                let val = crate::model::format_modelval(v);
+                out.push_str(&format!("({name} {val})"));
             }
         }
+        // QF_ABV array model entries: emit each as (name rendered-store-chain).
+        for (t, rendered) in &self.abv_array_models {
+            let name = crate::tseitin::display_term(&self.ctx, *t);
+            out.push_str(&format!("({name} {rendered})"));
+        }
+        out.push(')');
+        out
     }
 
     pub fn check_sat(&mut self) -> SolveOutcome {
@@ -257,6 +272,28 @@ impl Solver {
 
         let assertions = self.assertions.clone();
 
+        // ── QF_ABV path (BV-indexed, BV-valued arrays) ────────────────────────
+        // Route BEFORE the eager BV path: a query that uses select/store/array-eq
+        // over a `(Array (_ BitVec _) (_ BitVec _))` is handled by the
+        // lemmas-on-demand abstraction–refinement controller (shinri-abv) wired
+        // over a NoTheory SAT solver + persistent blaster. Arrays mixed with a
+        // non-BV/non-array theory atom (EUF/arith/uninterpreted sort) are out of
+        // scope → fence → Unknown. (Model stashing is Task 11; SAT just returns Sat.)
+        if crate::abv_stage::uses_arrays_over_bv(&self.ctx, &assertions) {
+            if crate::abv_stage::fenced(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
+            let assertions_owned = assertions.clone();
+            let (outcome, array_models) =
+                crate::abv_stage::solve_qfabv_with_models(&mut self.ctx, &assertions_owned);
+            self.abv_array_models = array_models;
+            return match outcome {
+                shinri_abv::AbvOutcome::Sat => SolveOutcome::Sat,
+                shinri_abv::AbvOutcome::Unsat => SolveOutcome::Unsat,
+                shinri_abv::AbvOutcome::Unknown => SolveOutcome::Unknown,
+            };
+        }
+
         // ── BV path ──────────────────────────────────────────────────────────
         // If the query mentions any BV sort/op, lower the BV atoms to CNF and
         // replay them into the SAT solver, surrogating each BV atom to a SAT
@@ -265,6 +302,9 @@ impl Solver {
         // `lower()` bit-blasts the BV atoms to CNF over a private BitVar
         // namespace. It needs `&mut self.ctx` and must run BEFORE the SAT solver
         // clones the context. The resulting CNF is replayed into `sat` below.
+        // Non-ABV path: clear any stale array models from a previous QF_ABV solve.
+        self.abv_array_models.clear();
+
         let lowered_bv: Option<shinri_bv::Lowered> =
             if crate::bv_stage::solver_uses_bv(&self.ctx, &assertions) {
                 let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
@@ -1005,6 +1045,61 @@ mod bv_tests {
         let pos = s.app(Op::Builtin(BuiltinOp::Gt), &[y, zero]);
         s.assert(bvatom);
         s.assert(pos);
+        assert_eq!(s.check_sat(), SolveOutcome::Unknown);
+    }
+
+    /// QF_ABV routing through the public `Solver` API: a ROW-1 UNSAT
+    /// `(= (select (store a i e) i) (bvadd e #x01))`.
+    #[test]
+    fn qfabv_row1_unsat_routed() {
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let arr = s.array_sort(s8, s8);
+        let a = s.declare_const("a", arr);
+        let i = s.declare_const("i", s8);
+        let e = s.declare_const("e", s8);
+        let st = s.app(Op::Builtin(BuiltinOp::Store), &[a, i, e]);
+        let sel = s.app(Op::Builtin(BuiltinOp::Select), &[st, i]);
+        let one = s.bv_numeral(Integer::from(1u64), 8);
+        let ep1 = s.app(Op::Builtin(BuiltinOp::BvAdd), &[e, one]);
+        let atom = s.eq(sel, ep1);
+        s.assert(atom);
+        assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    }
+
+    /// QF_ABV SAT routing: `(= (select (store a i e) i) e)`.
+    #[test]
+    fn qfabv_row1_sat_routed() {
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let arr = s.array_sort(s8, s8);
+        let a = s.declare_const("a", arr);
+        let i = s.declare_const("i", s8);
+        let e = s.declare_const("e", s8);
+        let st = s.app(Op::Builtin(BuiltinOp::Store), &[a, i, e]);
+        let sel = s.app(Op::Builtin(BuiltinOp::Select), &[st, i]);
+        let atom = s.eq(sel, e);
+        s.assert(atom);
+        assert_eq!(s.check_sat(), SolveOutcome::Sat);
+    }
+
+    /// QF_ABV mixed with arith atom → fenced to Unknown.
+    #[test]
+    fn qfabv_mixed_with_arith_is_unknown() {
+        let mut s = Solver::new();
+        let s8 = s.bv_sort(8);
+        let arr = s.array_sort(s8, s8);
+        let a = s.declare_const("a", arr);
+        let i = s.declare_const("i", s8);
+        let one = s.bv_numeral(Integer::from(1u64), 8);
+        let sel = s.app(Op::Builtin(BuiltinOp::Select), &[a, i]);
+        let bv_atom = s.eq(sel, one);
+        let r = s.real_sort();
+        let y = s.declare_const("y", r);
+        let zero = s.numeral_zero(r);
+        let gt = s.app(Op::Builtin(BuiltinOp::Gt), &[y, zero]);
+        s.assert(bv_atom);
+        s.assert(gt);
         assert_eq!(s.check_sat(), SolveOutcome::Unknown);
     }
 
