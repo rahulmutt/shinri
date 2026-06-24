@@ -10,7 +10,7 @@ use shinri_euf::Euf;
 use shinri_theory::Combiner;
 
 type Sat = shinri_sat::Solver<
-    Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays, shinri_theory::EmptyTheory>,
+    Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays, shinri_str::StrSolver>,
     shinri_core::NoProof,
     shinri_sat::Vmtf,
 >;
