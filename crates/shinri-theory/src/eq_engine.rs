@@ -29,6 +29,14 @@ struct DiseqRecord {
     rhs: ENodeId,
 }
 
+/// Undo entry for one proof-forest `fparent`/`flabel` write: restore `node`'s
+/// parent and label to their pre-write values.
+struct ForestUndo {
+    node: ENodeId,
+    old_parent: ENodeId,
+    old_label: EqJust,
+}
+
 /// Undo entry for the diseq map.
 enum DiseqUndo {
     /// A fresh key was inserted; remove it on undo.
@@ -70,7 +78,13 @@ pub struct EqualityEngine {
     /// `fparent[n] == n` means n is a forest root. Backtracked via `forest_undo`.
     fparent: Vec<ENodeId>,
     flabel: Vec<EqJust>,
-    forest_undo: UndoLog<ENodeId>, // the node whose forest edge was added
+    /// Undo records for the proof forest. A merge mutates `fparent`/`flabel` for
+    /// the SPLICED node AND for every node on the rerooted path; EACH such write
+    /// is logged so pop can restore the exact prior state. (Previously only the
+    /// spliced node was recorded, leaving `reroot_forest`'s path reversal
+    /// un-undone — over backtracks the forest desynced from union-find and grew an
+    /// `fparent` cycle, hanging every later `explain`/`forest_root` walk.)
+    forest_undo: UndoLog<ForestUndo>,
     merges: Vec<crate::types::MergeEvent>,
     /// Arena of congruence argument pairs; `EqJust::Congruence` indexes into it.
     cong_pairs: Vec<(ENodeId, ENodeId)>,
@@ -167,10 +181,16 @@ impl EqualityEngine {
             });
         }
         // Splice the explanation edge a—b labelled j into the proof forest.
+        // `reroot_forest(a)` makes `a` a root (logging every path write it does);
+        // then point a→b. Log this final splice write too so pop restores it.
         self.reroot_forest(a);
+        self.forest_undo.record(ForestUndo {
+            node: a,
+            old_parent: self.fparent[a.index()],
+            old_label: self.flabel[a.index()],
+        });
         self.fparent[a.index()] = b;
         self.flabel[a.index()] = j;
-        self.forest_undo.record(a);
         let (root, child) = if self.nodes[ra.index()].size >= self.nodes[rb.index()].size {
             (ra, rb)
         } else {
@@ -258,14 +278,28 @@ impl EqualityEngine {
     }
 
     /// Reverse the forest path from `n` up to its root so `n` becomes a root.
+    /// EVERY `fparent`/`flabel` write is logged to `forest_undo` so `pop` restores
+    /// the exact prior forest (required for backtracking correctness — see the
+    /// `forest_undo` field doc).
     fn reroot_forest(&mut self, n: ENodeId) {
         let mut prev = n;
         let mut prev_label = self.flabel[n.index()];
         let mut cur = self.fparent[n.index()];
-        self.fparent[n.index()] = n; // n is now a root
+        // n becomes a root.
+        self.forest_undo.record(ForestUndo {
+            node: n,
+            old_parent: self.fparent[n.index()],
+            old_label: self.flabel[n.index()],
+        });
+        self.fparent[n.index()] = n;
         while cur != prev {
             let next = self.fparent[cur.index()];
             let next_label = self.flabel[cur.index()];
+            self.forest_undo.record(ForestUndo {
+                node: cur,
+                old_parent: self.fparent[cur.index()],
+                old_label: self.flabel[cur.index()],
+            });
             self.fparent[cur.index()] = prev;
             self.flabel[cur.index()] = prev_label;
             prev = cur;
@@ -302,8 +336,32 @@ impl EqualityEngine {
     /// node up to their nearest common ancestor in the proof forest, so the
     /// returned leaf set is minimal (no edges above the NCA are included).
     pub fn explain(&self, a: ENodeId, b: ENodeId, out: &mut Vec<EqLeaf>) {
+        // `visited` guards the Congruence recursion (`expand_edge` re-enters
+        // `explain` for each congruence-child pair). In a well-formed proof forest
+        // that recursion is a finite DAG, but a congruence whose child-pair
+        // explanation transitively cites the SAME pair (a latent cycle that the
+        // substr reduction's `str.len`-over-fresh-skolem congruences can surface)
+        // would recurse forever. Skipping an already-expanded (a,b) pair is SOUND:
+        // its leaves were already emitted, and the caller dedups the leaf set, so
+        // completeness is preserved while termination is guaranteed.
+        let mut visited: rustc_hash::FxHashSet<(ENodeId, ENodeId)> =
+            rustc_hash::FxHashSet::default();
+        self.explain_rec(a, b, out, &mut visited);
+    }
+
+    fn explain_rec(
+        &self,
+        a: ENodeId,
+        b: ENodeId,
+        out: &mut Vec<EqLeaf>,
+        visited: &mut rustc_hash::FxHashSet<(ENodeId, ENodeId)>,
+    ) {
         if a == b {
             return;
+        }
+        let key = if a.index() <= b.index() { (a, b) } else { (b, a) };
+        if !visited.insert(key) {
+            return; // already expanded this pair — avoid re-expansion / cycles
         }
         debug_assert_eq!(
             self.forest_root(a),
@@ -316,7 +374,7 @@ impl EqualityEngine {
         self.forest_path(a, nca, &mut path_a);
         self.forest_path(b, nca, &mut path_b);
         for n in path_a.into_iter().chain(path_b) {
-            self.expand_edge(self.flabel[n.index()], out);
+            self.expand_edge(self.flabel[n.index()], out, visited);
         }
     }
 
@@ -348,8 +406,15 @@ impl EqualityEngine {
         }
     }
 
-    /// Turn one edge label into leaves, recursing through congruences.
-    fn expand_edge(&self, label: EqJust, out: &mut Vec<EqLeaf>) {
+    /// Turn one edge label into leaves, recursing through congruences. `visited`
+    /// is threaded from `explain_rec` so the congruence recursion cannot revisit
+    /// a pair (cycle-safe; see `explain`).
+    fn expand_edge(
+        &self,
+        label: EqJust,
+        out: &mut Vec<EqLeaf>,
+        visited: &mut rustc_hash::FxHashSet<(ENodeId, ENodeId)>,
+    ) {
         match label {
             EqJust::Asserted(l) => out.push(EqLeaf::Asserted(l)),
             EqJust::Interface(j) => out.push(EqLeaf::Interface(j)),
@@ -358,7 +423,7 @@ impl EqualityEngine {
                 let hi = lo + cref.len as usize;
                 for i in lo..hi {
                     let (s, t) = self.cong_pairs[i];
-                    self.explain(s, t, out);
+                    self.explain_rec(s, t, out, visited);
                 }
             }
             EqJust::Definitional => {}
@@ -405,8 +470,12 @@ impl EqualityEngine {
             }
         });
         let fparent = &mut self.fparent;
-        self.forest_undo.pop_to(level, |n| {
-            fparent[n.index()] = n; // detach the spliced edge; n becomes a root again
+        let flabel = &mut self.flabel;
+        self.forest_undo.pop_to(level, |u| {
+            // Restore the exact pre-write parent/label (LIFO order undoes both the
+            // edge splice AND every reroot path reversal in reverse).
+            fparent[u.node.index()] = u.old_parent;
+            flabel[u.node.index()] = u.old_label;
         });
         let cong_pairs = &mut self.cong_pairs;
         self.cong_undo.pop_to(level, |len_before| {
