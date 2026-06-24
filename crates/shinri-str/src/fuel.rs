@@ -5,7 +5,7 @@ pub struct Fuel {
 
 impl Default for Fuel {
     fn default() -> Self {
-        Fuel { remaining: 10_000 }
+        Fuel { remaining: 2000 }
     }
 }
 

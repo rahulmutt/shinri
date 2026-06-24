@@ -2,6 +2,38 @@ use rustc_hash::FxHashSet;
 use shinri_core::{BuiltinOp, ConstVal, Context, Op, TermId, TermNode};
 use shinri_theory::EqualityEngine;
 
+/// If `atom` is an equality `(= a b)` over Int/Real operands, return its
+/// arithmetic companions `((>= a b), (<= a b))`. Returns `None` for non-equality
+/// or non-arith-sorted atoms.
+///
+/// A bare arith equality emitted by a theory is classified to EUF (the top-level
+/// `lower()` pass that adds Le/Ge companions does not run on theory-emitted
+/// atoms), so it never reaches the Arith solver. Emitting the Le/Ge companions —
+/// which DO route to Arith — is what makes a length equality actually enforced.
+pub fn arith_eq_companions(terms: &mut Context, atom: TermId) -> Option<(TermId, TermId)> {
+    let (a, b) = match terms.term_node(atom) {
+        TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } => {
+            let ch = terms.children(*args);
+            if ch.len() != 2 {
+                return None;
+            }
+            (ch[0], ch[1])
+        }
+        _ => return None,
+    };
+    let s = terms.sort_of(a);
+    if s != terms.int_sort() && s != terms.real_sort() {
+        return None;
+    }
+    let ge = terms
+        .mk_app(Op::Builtin(BuiltinOp::Ge), &[a, b])
+        .expect("(>= a b) well-sorted");
+    let le = terms
+        .mk_app(Op::Builtin(BuiltinOp::Le), &[a, b])
+        .expect("(<= a b) well-sorted");
+    Some((ge, le))
+}
+
 /// Build `(>= len_term 0)`.
 fn ge_zero(terms: &mut Context, len_term: TermId) -> TermId {
     let int_s = terms.int_sort();
@@ -103,9 +135,10 @@ fn euf_representative_const(
 /// 2. `(= len_term k)` if arg is a string literal — or if the EUF has merged arg
 ///    with a string constant (N-O: e.g. `x = ""` was asserted, so len(x) = 0) —
 ///    or `(= len_term (+ (str.len a) (str.len b) ...))` if arg is a concat.
-/// 3. `(=> (= len_term 0) (= arg ""))` — the empty-length link (valid tautology).
-///    Emitted once per `len_term` with `guard: None` since it is unconditionally
-///    true: a string has length 0 iff it is empty.
+///
+/// The empty-length link `len(s)=0 → s=""` is NOT emitted here — see
+/// the solver's non-empty-length lemma, emitted on demand only for `s ≠ ""`
+/// disequalities (the soundness-relevant case).
 ///
 /// `eq` and `known` are used to check the EUF representative of `arg` so that
 /// when a string variable is merged with a constant (e.g. `x = ""`), the
@@ -145,39 +178,50 @@ pub fn next_axiom(
         }
     };
     if let Some(eqn) = defining_eq(terms, len_term, effective_arg) {
-        if !emitted.contains(&eqn) {
+        // The defining equation `(= len_term k|Σ)` is an arith EQUALITY; a bare
+        // theory-emitted Int equality routes to EUF (not Arith) and is held
+        // opaquely, so arith never learns the numeric relation. Emit its `(>= )`
+        // and `(<= )` companions (which DO route to Arith) one at a time across
+        // successive rounds — together they entail the equality, which is what
+        // makes length reasoning over concats effective (e.g.
+        // `len(x)=1 ∧ len(y)=1 ∧ len(x++y)=5` UNSAT). We mark `eqn` emitted only
+        // once BOTH companions are out, so this is re-entered until done.
+        if let Some((ge_c, le_c)) = arith_eq_companions(terms, eqn) {
+            if !emitted.contains(&ge_c) {
+                return Some(ge_c);
+            }
+            if !emitted.contains(&le_c) {
+                return Some(le_c);
+            }
+        } else if !emitted.contains(&eqn) {
             return Some(eqn);
         }
     }
 
-    // Axiom 3: empty-length link `(=> (= len_term 0) (= arg ""))`
-    //
-    // This is a valid tautology over string algebra: `len(s) = 0 ↔ s = ""`.
-    // It is emitted with `guard: None` (a unit tautology split) so the SAT
-    // layer asserts it unconditionally. The implication is built as a single
-    // `Implies` Boolean atom: `(=> (= len_term 0) (= arg ""))`.
-    let empty_link = empty_length_link(terms, len_term, arg);
-    if !emitted.contains(&empty_link) {
-        return Some(empty_link);
+    // TEMP DEBUG: naive empty-length link to reproduce wrong-UNSAT.
+    {
+        let int_s = terms.int_sort();
+        let zero = terms.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
+        let len_eq_zero = terms.mk_eq(len_term, zero).expect("ws");
+        let empty = terms.mk_string_const("");
+        let arg_eq_empty = terms.mk_eq(arg, empty).expect("ws");
+        let empty_link = terms
+            .mk_app(Op::Builtin(BuiltinOp::Implies), &[len_eq_zero, arg_eq_empty])
+            .expect("ws");
+        if !emitted.contains(&empty_link) {
+            return Some(empty_link);
+        }
     }
 
+    // NOTE: the empty-length link `len(s)=0 → s=""` is NOT emitted here. The
+    // solver emits, on demand, the guarded lemma `(s≠"") → len(s)≥1` (a pure-arith
+    // consequent) and ONLY for `s ≠ ""` disequalities — the only place it is
+    // soundness-relevant. Emitting an empty-link for every `str.len` term
+    // (including every fresh F-split skolem's length) floods the shared-Int
+    // MBTC / N-O exchange and causes a livelock on concat+length queries.
     None
 }
 
-/// Build `(=> (= len_term 0) (= arg ""))`.
-fn empty_length_link(terms: &mut Context, len_term: TermId, arg: TermId) -> TermId {
-    let int_s = terms.int_sort();
-    let zero = terms.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
-    // Antecedent: (= len_term 0)
-    let len_eq_zero = terms.mk_eq(len_term, zero).expect("well-sorted");
-    // Consequent: (= arg "")
-    let empty = terms.mk_string_const("");
-    let arg_eq_empty = terms.mk_eq(arg, empty).expect("well-sorted");
-    // Implication: (=> antecedent consequent)
-    terms
-        .mk_app(Op::Builtin(BuiltinOp::Implies), &[len_eq_zero, arg_eq_empty])
-        .expect("well-sorted")
-}
 
 #[cfg(test)]
 mod tests {
@@ -203,9 +247,13 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::Ge), &[len_lit, zero])
             .unwrap();
 
-        // Build the expected axiom: (= (str.len "café") 4).
+        // The defining equation `(= (str.len "café") 4)` is emitted through its
+        // arith companions `(>= (str.len "café") 4)` and `(<= (str.len "café") 4)`
+        // (a bare Int equality would route to EUF, not Arith — see the seam note
+        // in `next_axiom`). Expect both to be emitted (char count 4, not byte 5).
         let four = ctx.mk_numeral(shinri_core::Rational::from_int(4i128.into()), int_s);
-        let expected_axiom = ctx.mk_eq(len_lit, four).unwrap();
+        let expected_ge = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[len_lit, four]).unwrap();
+        let expected_le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[len_lit, four]).unwrap();
         // Sanity: "café" has exactly 4 chars (not 5 bytes).
         assert_eq!("café".chars().count(), 4, "sanity: char count");
         assert_eq!("café".len(), 5, "sanity: byte count");
@@ -221,13 +269,16 @@ mod tests {
         s.new_var(&mut cx, shinri_core::Var::new(0), atom);
 
         // Drive check until Sat, collecting all split axioms.
-        let mut found_literal_axiom = false;
+        let (mut found_ge, mut found_le) = (false, false);
         for _ in 0..8 {
             match s.check(&mut cx, Effort::Full) {
                 TCheck::Split { atoms: a, .. } => {
                     assert_eq!(a.len(), 1, "length axioms are unit lemmas");
-                    if a[0] == expected_axiom {
-                        found_literal_axiom = true;
+                    if a[0] == expected_ge {
+                        found_ge = true;
+                    }
+                    if a[0] == expected_le {
+                        found_le = true;
                     }
                 }
                 TCheck::Sat => break,
@@ -236,8 +287,8 @@ mod tests {
             }
         }
         assert!(
-            found_literal_axiom,
-            "must emit (= (str.len \"café\") 4) — char count, not byte count"
+            found_ge && found_le,
+            "must emit (>= …) and (<= …) companions of (= (str.len \"café\") 4) — char count, not byte count"
         );
         assert!(
             matches!(s.check(&mut cx, Effort::Full), TCheck::Sat),

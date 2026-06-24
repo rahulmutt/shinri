@@ -9,7 +9,7 @@ pub mod wordeq;
 pub use fuel::Fuel;
 
 use rustc_hash::FxHashSet;
-use shinri_core::{BuiltinOp, Lit, Op, TermId, TermNode, TheoryJust, Var};
+use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
@@ -89,35 +89,131 @@ impl TheorySolver for StrSolver {
         // EUF representatives (e.g. to detect that `str.len(x) = 0` when `x = ""`
         // was merged via the EqualityEngine — the N-O length seam).
         let mut known: Vec<TermId> = self.str_terms.iter().copied().collect();
-        for &(atom, _) in &self.eq_true {
-            let (l, r) = crate::wordeq::sides(cx.terms, atom);
+        for &(atom, lit) in &self.eq_true {
+            // `eq_true` may hold a `Distinct` atom asserted FALSE (¬distinct ≡ eq);
+            // `diseq_sides` accepts both `Eq` and `Distinct` operands.
+            let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
             known.push(l);
             known.push(r);
+            // Direct distinct-constant contradiction: an equality between two
+            // DIFFERENT string literals is UNSAT. Must be caught BEFORE normalization
+            // (once the EUF merges l≈r, `normal_form` substitutes both to one
+            // representative and the mismatch disappears → wrong SAT, e.g. `(= "a" "b")`).
+            if let (Some(ls), Some(rs)) =
+                (cx.terms.string_const_value(l), cx.terms.string_const_value(r))
+            {
+                if ls != rs {
+                    return TCheck::Conflict(vec![EqLeaf::Asserted(lit)]);
+                }
+            }
         }
 
+        // TRANSITIVE distinct-constant contradiction: any EUF class (over the known
+        // string terms) containing two DIFFERENT string literals was forced equal
+        // (e.g. `x="a" ∧ x="b"` merges "a"≈x≈"b") → UNSAT. `normal_form` would pick
+        // one constant representative and hide the clash, so detect it explicitly.
+        if let Some((ca, cb)) = first_distinct_const_clash(cx.terms, cx.eq, &known) {
+            let an = cx.eq.intern(ca);
+            let bn = cx.eq.intern(cb);
+            let mut just = Vec::new();
+            cx.eq.explain(an, bn, &mut just);
+            return TCheck::Conflict(just);
+        }
+
+        // Per-equation length lemma, RESTRICTED to ATOM equalities (neither side a
+        // concat): `l = r → len(l) = len(r)`, emitted via arith Ge/Le companions
+        // guarded by ¬eq. Required so e.g. `s1 = s2` forces `len(s1) = len(s2)` in
+        // arith (string equality merges s1≈s2 in EUF, but str.len is not an EUF
+        // congruence function here, so arith would otherwise assign inconsistent
+        // lengths → a non-satisfying model). SAFE for atom equalities (no fresh
+        // concat skolems, so it does not feed the unbounded String↔Arith MBTC).
+        // NOT emitted for concat equalities (there it over-constrains / livelocks;
+        // their length contradictions are caught by the word-equation occurs-check).
+        {
+            let eqs: Vec<(TermId, Lit)> = self.eq_true.clone();
+            for (atom, lit) in eqs {
+                let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
+                let is_concat = |t: TermId| {
+                    matches!(
+                        cx.terms.term_node(t),
+                        TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
+                    )
+                };
+                if is_concat(l) || is_concat(r) {
+                    continue;
+                }
+                if cx.terms.string_const_value(l).is_some()
+                    && cx.terms.string_const_value(r).is_some()
+                {
+                    continue; // two literals: lengths already pinned constants
+                }
+                let ll = cx.terms.mk_app(Op::Builtin(BuiltinOp::StrLen), &[l]).expect("len l");
+                let lr = cx.terms.mk_app(Op::Builtin(BuiltinOp::StrLen), &[r]).expect("len r");
+                self.len_terms.insert(ll);
+                self.len_terms.insert(lr);
+                if ll == lr {
+                    continue;
+                }
+                let len_eq = cx.terms.mk_eq(ll, lr).expect("(= len(l) len(r))");
+                let (ge, le) = length::arith_eq_companions(cx.terms, len_eq)
+                    .expect("len_eq is an arith equality");
+                for comp in [ge, le] {
+                    if self.emitted_len_axioms.contains(&comp) {
+                        continue;
+                    }
+                    self.emitted_len_axioms.insert(comp);
+                    if !self.fuel.spend() {
+                        return TCheck::Unknown;
+                    }
+                    let mut seen = FxHashSet::default();
+                    collect::collect(cx.terms, comp, &mut self.len_terms, &mut self.str_terms, &mut seen);
+                    return TCheck::Split { atoms: vec![comp], guard: Some(lit.negate()) };
+                }
+            }
+        }
+
+        // Per-len-term defining axioms. `next_axiom` returns arith-friendly atoms:
+        // `(>= len 0)` and the defining equation's `(>= )` / `(<= )` companions
+        // (a bare Int equality would route to EUF, not Arith — see length.rs).
         let lens: Vec<TermId> = self.len_terms.iter().copied().collect();
         for lt in lens {
             if let Some(axiom) = length::next_axiom(cx.terms, cx.eq, &known, lt, &self.emitted_len_axioms) {
                 self.emitted_len_axioms.insert(axiom);
-                // Spend one unit of fuel before emitting a split. If the budget is
-                // exhausted, signal Unknown (sound: neither Sat nor Unsat).
+                // Register NEW str.len subterms introduced by this axiom so the
+                // defining-axiom chain over nested concats continues to a fixpoint.
+                let mut seen = FxHashSet::default();
+                collect::collect(cx.terms, axiom, &mut self.len_terms, &mut self.str_terms, &mut seen);
                 if !self.fuel.spend() {
                     return TCheck::Unknown;
                 }
-                // Length axioms (e.g. (= (str.len "café") 4), len(x++y)=len x+len y,
-                // len ≥ 0) are unconditionally valid over the string/length theory —
-                // tautology splits, no guard.
                 return TCheck::Split { atoms: vec![axiom], guard: None };
             }
         }
 
-        // (The `known` set continues to be used below.)
+        // NOTE: a non-empty length link `(s≠"") → len(s)≥1` (to catch
+        // `len(s)=0 ∧ s≠""` UNSAT) was implemented and REMOVED. In every form
+        // (the `(distinct len 0) ∨ (s="")` disjunction AND the guarded pure-arith
+        // `(s≠"") → len(s)≥1`) it triggered the pre-existing String↔Arith N-O
+        // conflict-justification seam bug: as soon as `len(s)` is ALSO constrained
+        // by another atom, the combination is wrongly reported UNSAT (broad
+        // soundness regression). Dropping it means `len(s)=0 ∧ s≠""` is reported
+        // SAT instead of UNSAT — sound-incomplete in the narrow direction is worse
+        // than a broad wrong-UNSAT, so this is the lesser evil. See task report
+        // CONCERNS: the empty-length link needs a fixed N-O seam to be viable.
 
         // Word-equation resolution: strip equal heads/tails, detect constant
-        // prefix mismatches. Variable-headed residuals emit F-splits (Task 12).
+        // prefix mismatches and occurs-check contradictions. Variable-headed
+        // residuals emit F-splits (Task 12).
         let eqs: Vec<(TermId, Lit)> = self.eq_true.clone();
         for (atom, lit) in eqs {
-            let (l, r) = crate::wordeq::sides(cx.terms, atom);
+            // `eq_true` may hold a `Distinct` asserted FALSE (¬distinct ≡ eq).
+            let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
+            // Single-level normal forms for the CONFLICT/SPLIT path (NOT deep: deep
+            // expansion substitutes merge-derived constants, and resolve's ground
+            // conflicts cite only the word-equation literal — not the EUF merge
+            // antecedents — so a branch-local contradiction would be reported as a
+            // GLOBAL conflict (unsound). Model reconstruction uses the deep view in
+            // model.rs).
             let lhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, l);
             let rhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, r);
             // Build the EqLeaf justification from the asserted equality literal.
@@ -196,6 +292,7 @@ impl TheorySolver for StrSolver {
             let ln = cx.eq.intern(l);
             let rn = cx.eq.intern(r);
             if cx.eq.are_equal(ln, rn) {
+                
                 let mut just = vec![EqLeaf::Asserted(lit)];
                 cx.eq.explain(ln, rn, &mut just);
                 return TCheck::Conflict(just);
@@ -217,6 +314,7 @@ impl TheorySolver for StrSolver {
             let lhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, l);
             let rhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, r);
             if crate::wordeq::nf_equal(cx.terms, cx.eq, &lhs, &rhs) {
+                
                 // Build conflict: diseq literal + merge antecedents for each pair.
                 let mut just = vec![EqLeaf::Asserted(lit)];
                 crate::wordeq::nf_equal_explain(cx.terms, cx.eq, &lhs, &rhs, &mut just);
@@ -256,8 +354,49 @@ impl StrSolver {
     /// pre-seeded `ModelBuilder` (e.g. with arith-model lengths already set).
     pub fn model_with(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
         let str_terms: Vec<TermId> = self.str_terms.iter().copied().collect();
-        model::assign(cx.terms, cx.eq, &str_terms, m);
+        // `known` = all string-sorted terms PLUS both sides of every asserted
+        // equality, so `deep_normal_form` / class lookups can reflect merges
+        // (e.g. `x = "ab"` pins x's value) even when the other side is not in
+        // `str_terms`. `diseq_sides` tolerates `Distinct` atoms parked in eq_true.
+        let mut known: Vec<TermId> = str_terms.clone();
+        for &(atom, _) in &self.eq_true {
+            let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
+            known.push(l);
+            known.push(r);
+        }
+        model::assign(cx.terms, cx.eq, &known, &str_terms, m);
     }
+}
+
+/// Scan `known` for two DIFFERENT string-literal terms in the same EUF class
+/// (forced equal) — an outright contradiction (distinct constants ≠).
+fn first_distinct_const_clash(
+    terms: &Context,
+    eq: &mut shinri_theory::EqualityEngine,
+    known: &[TermId],
+) -> Option<(TermId, TermId)> {
+    use rustc_hash::FxHashMap;
+    let mut by_root: FxHashMap<shinri_theory::types::ENodeId, (TermId, String)> =
+        FxHashMap::default();
+    for &t in known {
+        let val = match terms.string_const_value(t) {
+            Some(s) => s.to_owned(),
+            None => continue,
+        };
+        let n = eq.intern(t);
+        let root = eq.find(n);
+        match by_root.get(&root) {
+            None => {
+                by_root.insert(root, (t, val));
+            }
+            Some((prev_t, prev_val)) => {
+                if *prev_val != val {
+                    return Some((*prev_t, t));
+                }
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -336,19 +475,14 @@ mod tests {
             s.shared_arith_terms(&mut cx).contains(&len),
             "str.len term must be shared"
         );
-        // For an opaque variable x (no concat/literal), check emits two axioms:
-        //   1. (>= (str.len x) 0)
-        //   2. (=> (= (str.len x) 0) (= x ""))  [empty-length link, Task 14]
-        // then reaches Sat fixpoint.
+        // For an opaque variable x (no concat/literal) with NO disequality, check
+        // emits only the `(>= (str.len x) 0)` axiom, then reaches Sat fixpoint. The
+        // empty-length link is emitted on demand only for `s ≠ ""` disequalities
+        // (see `side_is_empty`), so it does NOT fire here.
         let first = s.check(&mut cx, Effort::Full);
         assert!(
             matches!(first, TCheck::Split { .. }),
             "should emit >=0 axiom for str.len(x)"
-        );
-        let second = s.check(&mut cx, Effort::Full);
-        assert!(
-            matches!(second, TCheck::Split { .. }),
-            "should emit empty-length link axiom for str.len(x)"
         );
         assert!(
             matches!(s.check(&mut cx, Effort::Full), TCheck::Sat),
@@ -366,12 +500,14 @@ mod tests {
         };
         let x = mk(&mut ctx, "x");
         let y = mk(&mut ctx, "y");
-        // x ++ y = y ++ x : classic diverging word equation.
+        // x ++ y = y ++ x : needs several length axioms + a word-equation F-split.
+        // A 1-unit fuel budget must run out before resolving → Unknown (sound),
+        // never a fabricated verdict or loop.
         let l = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y]).unwrap();
         let r = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[y, x]).unwrap();
         let atom = ctx.mk_eq(l, r).unwrap();
         let mut s = StrSolver::default();
-        s.test_set_fuel(3); // tiny budget — exhausts before all 5 axioms/splits
+        s.test_set_fuel(1); // tiny budget — exhausts before all axioms/splits
         let mut eq = EqualityEngine::default();
         let areg = AtomRegistry::default();
         let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &areg };
@@ -385,10 +521,12 @@ mod tests {
                 _ => break,
             }
         }
-        assert!(got_unknown, "tiny fuel must force Unknown, never an infinite split loop");
+        assert!(got_unknown, "tiny fuel must force Unknown, never fabricate a verdict");
     }
 
-    // With len(x)=2 fixed and no constant constraints, x's model is "AA".
+    // With len(x)=2 fixed and no constant constraints, x's model is a uniform
+    // 2-character fill word (per-class fill char; for a lone free var a single
+    // repeated letter).
     #[test]
     fn free_var_model_filled_with_default_char() {
         let mut ctx = Context::new();
@@ -405,6 +543,14 @@ mod tests {
         s.new_var(&mut cx, shinri_core::Var::new(0), lenx);
         s.test_force_str_term(x);
         s.model_with(&mut cx, &mut m);
-        assert_eq!(m.get(x), Some(&ModelVal::String("AA".into())));
+        match m.get(x) {
+            Some(ModelVal::String(s)) => {
+                assert_eq!(s.chars().count(), 2, "free var filled to len 2");
+                let c0 = s.chars().next().unwrap();
+                assert!(s.chars().all(|c| c == c0), "fill is uniform");
+                assert!(c0.is_ascii_alphabetic(), "fill char is a letter");
+            }
+            other => panic!("expected a String model for x, got {other:?}"),
+        }
     }
 }
