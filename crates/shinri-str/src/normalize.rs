@@ -127,6 +127,72 @@ pub fn normal_form(
     out
 }
 
+/// Compute a "deep" normal form that recursively expands class representatives
+/// that are concat terms.
+///
+/// Unlike `normal_form`, this function handles the case where a variable `x` is
+/// merged in the EqualityEngine with a concat term `"a"++y`: after `rep(x)` returns
+/// `"a"++y`, we further flatten and recurse so the result is `["a", y]` rather
+/// than the opaque `[x]` or `["a"++y]`.
+///
+/// Used for disequality checking (Task 14) where we need to detect that both sides
+/// of an asserted disequality represent the same word.
+pub fn deep_normal_form(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    t: TermId,
+) -> Vec<TermId> {
+    // First compute the regular normal form.
+    let nf = normal_form(terms, eq, known, t);
+    // If any atom in the normal form is itself a concat (because rep() substituted
+    // a variable with a concat-valued class member), recursively expand it.
+    let needs_expansion = nf.iter().any(|&a| {
+        matches!(
+            terms.term_node(a),
+            TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
+        )
+    });
+    if !needs_expansion {
+        return nf;
+    }
+    // Expand each atom: recursively compute the NF of any concat-rep atoms.
+    let mut out = Vec::new();
+    for a in nf {
+        if matches!(
+            terms.term_node(a),
+            TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
+        ) {
+            // Recursively expand (one level: concat atoms in `known` should not
+            // themselves have concat reps since we build `known` from problem terms).
+            let sub = normal_form(terms, eq, known, a);
+            out.extend(sub);
+        } else {
+            out.push(a);
+        }
+    }
+    // Fold adjacent string literals in the final result.
+    let mut folded = Vec::new();
+    for a in out {
+        if let Some(s) = terms.string_const_value(a) {
+            let s = s.to_owned();
+            if s.is_empty() {
+                continue;
+            }
+            if let Some(&last) = folded.last() {
+                if let Some(ls) = terms.string_const_value(last) {
+                    let merged = format!("{ls}{s}");
+                    let m = terms.mk_string_const(&merged);
+                    *folded.last_mut().unwrap() = m;
+                    continue;
+                }
+            }
+        }
+        folded.push(a);
+    }
+    folded
+}
+
 /// Returns `true` iff `a` and `b` are in the same EqualityEngine class.
 ///
 /// This is the canonical check for string-theory conflict detection (Task 11/14).

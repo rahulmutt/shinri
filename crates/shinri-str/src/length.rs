@@ -53,6 +53,9 @@ fn defining_eq(terms: &mut Context, len_term: TermId, arg: TermId) -> Option<Ter
 /// 1. `(>= len_term 0)`
 /// 2. `(= len_term k)` if arg is a string literal  —or—
 ///    `(= len_term (+ (str.len a) (str.len b) ...))` if arg is a concat
+/// 3. `(=> (= len_term 0) (= arg ""))` — the empty-length link (valid tautology).
+///    Emitted once per `len_term` with `guard: None` since it is unconditionally
+///    true: a string has length 0 iff it is empty.
 pub fn next_axiom(
     terms: &mut Context,
     len_term: TermId,
@@ -81,7 +84,33 @@ pub fn next_axiom(
         }
     }
 
+    // Axiom 3: empty-length link `(=> (= len_term 0) (= arg ""))`
+    //
+    // This is a valid tautology over string algebra: `len(s) = 0 ↔ s = ""`.
+    // It is emitted with `guard: None` (a unit tautology split) so the SAT
+    // layer asserts it unconditionally. The implication is built as a single
+    // `Implies` Boolean atom: `(=> (= len_term 0) (= arg ""))`.
+    let empty_link = empty_length_link(terms, len_term, arg);
+    if !emitted.contains(&empty_link) {
+        return Some(empty_link);
+    }
+
     None
+}
+
+/// Build `(=> (= len_term 0) (= arg ""))`.
+fn empty_length_link(terms: &mut Context, len_term: TermId, arg: TermId) -> TermId {
+    let int_s = terms.int_sort();
+    let zero = terms.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
+    // Antecedent: (= len_term 0)
+    let len_eq_zero = terms.mk_eq(len_term, zero).expect("well-sorted");
+    // Consequent: (= arg "")
+    let empty = terms.mk_string_const("");
+    let arg_eq_empty = terms.mk_eq(arg, empty).expect("well-sorted");
+    // Implication: (=> antecedent consequent)
+    terms
+        .mk_app(Op::Builtin(BuiltinOp::Implies), &[len_eq_zero, arg_eq_empty])
+        .expect("well-sorted")
 }
 
 #[cfg(test)]

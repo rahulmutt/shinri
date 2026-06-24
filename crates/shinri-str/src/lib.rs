@@ -17,7 +17,7 @@ pub struct StrSolver {
     /// Asserted string equalities: (atom, the literal that asserted it).
     /// The `Lit` is used to build `EqLeaf::Asserted` justifications for conflicts.
     eq_true: Vec<(TermId, Lit)>,
-    diseq_true: Vec<TermId>,
+    diseq_true: Vec<(TermId, Lit)>,
     len_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
     emitted_len_axioms: FxHashSet<TermId>,
@@ -55,12 +55,12 @@ impl TheorySolver for StrSolver {
                         if lit.is_positive() {
                             self.eq_true.push((atom, lit));
                         } else {
-                            self.diseq_true.push(atom);
+                            self.diseq_true.push((atom, lit));
                         }
                     }
                     Op::Builtin(BuiltinOp::Distinct) => {
                         if lit.is_positive() {
-                            self.diseq_true.push(atom);
+                            self.diseq_true.push((atom, lit));
                         } else {
                             self.eq_true.push((atom, lit));
                         }
@@ -145,6 +145,68 @@ impl TheorySolver for StrSolver {
                 crate::wordeq::StepResult::Done => {}
             }
         }
+
+        // Disequality same-word conflict check (Task 14).
+        //
+        // For each asserted `s ≠ t`, compute the normal forms of both sides and
+        // check atom-wise equality. If the normal forms are identical (the two sides
+        // denote the same word), the disequality is contradicted → Conflict.
+        //
+        // Soundness: the conflict justification MUST include the disequality literal
+        // AND any equality antecedents that caused pairs in the normal forms to be
+        // merged in the EqualityEngine (e.g. `x = "a"` was asserted, so `x` and `"a"`
+        // appear equal in the normal form). `nf_equal_explain` gathers those
+        // antecedents via `eq.explain`, mirroring the EUF conflict pattern in
+        // `shinri-euf/src/egraph.rs::conflict_leaves` (the `explain(a, b, out)` path
+        // for the merge-antecedent part).
+        let diseqs: Vec<(TermId, Lit)> = self.diseq_true.clone();
+        for (atom, lit) in diseqs {
+            let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
+
+            // Case 1: direct EUF class equality — `l` and `r` are in the same
+            // EqualityEngine class, so they trivially denote the same word. This
+            // handles e.g. `x ≠ "a"++y` when `x = "a"++y` was merged in the EUF
+            // (the normal-form comparison cannot detect this since `x` is opaque).
+            //
+            // Soundness (mirroring EUF `egraph.rs::assert_diseq` conflict pattern):
+            // The conflict cites the diseq literal PLUS the equality antecedents from
+            // the proof forest (via `eq.explain`). `eq.explain` walks the path
+            // between l and r in the proof forest, collecting `EqLeaf::Asserted`
+            // leaves — these are the input equality literals that forced the merge.
+            // If the merge was `EqJust::Definitional`, explain returns nothing (which
+            // is still sound: a definitional equality is unconditionally true, so the
+            // diseq literal alone is a sufficient contradiction).
+            let ln = cx.eq.intern(l);
+            let rn = cx.eq.intern(r);
+            if cx.eq.are_equal(ln, rn) {
+                let mut just = vec![EqLeaf::Asserted(lit)];
+                cx.eq.explain(ln, rn, &mut just);
+                return TCheck::Conflict(just);
+            }
+
+            // Case 2: same-word conflict via normal-form comparison — catches cases
+            // like `"a"++x ≠ "a"++y` when `x = y` was asserted in the EUF. Here l
+            // and r are NOT in the same EUF class directly, but their normal forms
+            // (after substituting class representatives) are atom-wise equal.
+            //
+            // Extend `known` to include both sides of the disequality so that
+            // normal_form can reflect any merges involving these terms.
+            let mut known_d = known.clone();
+            known_d.push(l);
+            known_d.push(r);
+            // Use `deep_normal_form` which recursively expands concat-valued class
+            // representatives (e.g. when `x = "a"++y` was merged, the NF of `x`
+            // should be `["a", y]` after one expansion level).
+            let lhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, l);
+            let rhs = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, r);
+            if crate::wordeq::nf_equal(cx.terms, cx.eq, &lhs, &rhs) {
+                // Build conflict: diseq literal + merge antecedents for each pair.
+                let mut just = vec![EqLeaf::Asserted(lit)];
+                crate::wordeq::nf_equal_explain(cx.terms, cx.eq, &lhs, &rhs, &mut just);
+                return TCheck::Conflict(just);
+            }
+        }
+
         TCheck::Sat
     }
 
@@ -176,6 +238,13 @@ impl StrSolver {
     /// in unit tests (no combiner expand_conflict path).
     pub fn test_force_eq_true(&mut self, atom: TermId) {
         self.eq_true.push((atom, Lit::new(Var::new(0), true)));
+    }
+
+    /// Push `atom` directly onto `diseq_true`, simulating the SAT layer asserting
+    /// a string disequality. Uses a dummy Lit (var 0, positive) since the test
+    /// exercises the conflict detection path, not the full conflict-expansion path.
+    pub fn test_force_diseq_true(&mut self, atom: TermId) {
+        self.diseq_true.push((atom, Lit::new(Var::new(0), true)));
     }
 }
 
@@ -225,16 +294,23 @@ mod tests {
             s.shared_arith_terms(&mut cx).contains(&len),
             "str.len term must be shared"
         );
-        // For an opaque variable x (no concat/literal), check emits exactly one axiom
-        // (the >=0 lemma) and then reaches Sat fixpoint.
+        // For an opaque variable x (no concat/literal), check emits two axioms:
+        //   1. (>= (str.len x) 0)
+        //   2. (=> (= (str.len x) 0) (= x ""))  [empty-length link, Task 14]
+        // then reaches Sat fixpoint.
         let first = s.check(&mut cx, Effort::Full);
         assert!(
             matches!(first, TCheck::Split { .. }),
             "should emit >=0 axiom for str.len(x)"
         );
+        let second = s.check(&mut cx, Effort::Full);
+        assert!(
+            matches!(second, TCheck::Split { .. }),
+            "should emit empty-length link axiom for str.len(x)"
+        );
         assert!(
             matches!(s.check(&mut cx, Effort::Full), TCheck::Sat),
-            "fixpoint after >=0 emitted"
+            "fixpoint after all axioms emitted"
         );
     }
 }

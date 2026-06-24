@@ -74,6 +74,72 @@ pub fn sides(terms: &Context, atom: TermId) -> (TermId, TermId) {
     }
 }
 
+/// Returns the two children of a disequality atom (either `Eq` or `Distinct`).
+///
+/// A disequality is represented either as a positive `(distinct s t)` atom or as
+/// the proposition of a negative `(= s t)` literal. Both forms have their two
+/// string-sorted operands as the first two children.
+pub fn diseq_sides(terms: &Context, atom: TermId) -> (TermId, TermId) {
+    match terms.term_node(atom) {
+        TermNode::App { op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct), args, .. } => {
+            let ch = terms.children(*args);
+            (ch[0], ch[1])
+        }
+        _ => panic!("diseq_sides: expected Eq or Distinct atom"),
+    }
+}
+
+/// True iff the two normal forms are atom-wise equal (definitely the same word).
+///
+/// "Equal" here means each positional pair satisfies `same()`: same TermId, same
+/// string literal value, or same EqualityEngine equivalence class. Returns `false`
+/// immediately if the lengths differ.
+pub fn nf_equal(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    lhs: &[TermId],
+    rhs: &[TermId],
+) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    lhs.iter().zip(rhs).all(|(&a, &b)| same(terms, eq, a, b))
+}
+
+/// Build the EqLeaf conflict justification explaining WHY `lhs` and `rhs` are
+/// atom-wise equal. Must be called only after `nf_equal` returned `true`.
+///
+/// For each positional pair `(a, b)` that is NOT the same TermId but is in the
+/// same EqualityEngine class, calls `eq.explain(an, bn, out)` to gather the
+/// asserted-equality antecedents that caused the merge. Pairs with `a == b`
+/// contribute no leaves (trivially equal; no merge was needed).
+pub fn nf_equal_explain(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    lhs: &[TermId],
+    rhs: &[TermId],
+    out: &mut Vec<EqLeaf>,
+) {
+    debug_assert_eq!(lhs.len(), rhs.len(), "nf_equal_explain: mismatched lengths");
+    for (&a, &b) in lhs.iter().zip(rhs) {
+        if a == b {
+            continue; // trivially equal; no EUF merge involved
+        }
+        // Literal-value equality: both string constants with the same value.
+        if let (Some(sa), Some(sb)) = (terms.string_const_value(a), terms.string_const_value(b)) {
+            if sa == sb {
+                continue; // same constant value, different TermIds — no merge antecedent
+            }
+        }
+        // EUF equality: explain the merge path.
+        let an = eq.intern(a);
+        let bn = eq.intern(b);
+        if eq.are_equal(an, bn) {
+            eq.explain(an, bn, out);
+        }
+    }
+}
+
 /// Compare two atoms for definite equality: same TermId, same literal string
 /// value, or same EqualityEngine equivalence class.
 fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: TermId) -> bool {
@@ -512,5 +578,44 @@ mod tests {
                 TCheck::Sat => panic!("expected conflict on prefix mismatch"),
             }
         }
+    }
+
+    // ── Task 14: disequality same-word conflict ──────────────────────────────
+    // x = "a" ++ y  AND  x != "a" ++ y  → UNSAT (same normal form, asserted distinct).
+    #[test]
+    fn disequality_on_equal_normal_forms_conflicts() {
+        use shinri_theory::types::EqJust;
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mk = |c: &mut Context, n: &str| {
+            let s = c.declare_fun(n, &[], str_s);
+            c.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let x = mk(&mut ctx, "x");
+        let y = mk(&mut ctx, "y");
+        let a = ctx.mk_string_const("a");
+        let ay = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[a, y]).unwrap();
+        let eq_atom = ctx.mk_eq(x, ay).unwrap();
+        let diseq_atom = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, ay]).unwrap();
+        let mut s = StrSolver::default();
+        let mut eqe = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eqe, atoms: &areg };
+        s.new_var(&mut cx, shinri_core::Var::new(0), eq_atom);
+        s.new_var(&mut cx, shinri_core::Var::new(1), diseq_atom);
+        // Merge x and (a++y) in the EqualityEngine to model the asserted equality.
+        let xn = cx.eq.intern(x);
+        let an = cx.eq.intern(ay);
+        let _ = cx.eq.merge(xn, an, EqJust::Definitional);
+        s.test_force_diseq_true(diseq_atom);
+        let mut conflicted = false;
+        for _ in 0..16 {
+            match s.check(&mut cx, Effort::Full) {
+                TCheck::Conflict(_) => { conflicted = true; break; }
+                TCheck::Split { .. } => continue,
+                TCheck::Sat => break,
+            }
+        }
+        assert!(conflicted, "asserted distinct over equal normal forms is UNSAT");
     }
 }
