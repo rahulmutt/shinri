@@ -386,6 +386,65 @@ impl Context {
                 let n = self.require_bv(args[0])?;
                 Ok(self.bv_sort(n * k))
             }
+            // ── String operators ─────────────────────────────────────────────
+            StrConcat => {
+                if args.len() < 2 {
+                    return Err(SortError::Arity {
+                        expected: 2,
+                        found: args.len(),
+                    });
+                }
+                let str_s = self.string_sort();
+                expect_all(self, args, str_s)?;
+                Ok(str_s)
+            }
+            StrLen => {
+                expect_arity(args, 1)?;
+                let str_s = self.string_sort();
+                if self.sort_of(args[0]) != str_s {
+                    return Err(SortError::Mismatch {
+                        expected: str_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                Ok(self.int_sort())
+            }
+            StrAt => {
+                expect_arity(args, 2)?;
+                let (str_s, int_s) = (self.string_sort(), self.int_sort());
+                if self.sort_of(args[0]) != str_s {
+                    return Err(SortError::Mismatch {
+                        expected: str_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                if self.sort_of(args[1]) != int_s {
+                    return Err(SortError::Mismatch {
+                        expected: int_s,
+                        found: self.sort_of(args[1]),
+                    });
+                }
+                Ok(str_s)
+            }
+            StrSubstr => {
+                expect_arity(args, 3)?;
+                let (str_s, int_s) = (self.string_sort(), self.int_sort());
+                if self.sort_of(args[0]) != str_s {
+                    return Err(SortError::Mismatch {
+                        expected: str_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                for &a in &args[1..3] {
+                    if self.sort_of(a) != int_s {
+                        return Err(SortError::Mismatch {
+                            expected: int_s,
+                            found: self.sort_of(a),
+                        });
+                    }
+                }
+                Ok(str_s)
+            }
         }
     }
 
@@ -922,6 +981,31 @@ mod tests {
         assert_ne!(a, ctx.int_sort());
         assert_ne!(a, ctx.bool_sort());
         assert!(matches!(ctx.sort_node(a), crate::sort::SortNode::String));
+    }
+
+    #[test]
+    fn string_ops_sort_check() {
+        use crate::term::{BuiltinOp, Op};
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let int_s = ctx.int_sort();
+        let x = { let s = ctx.declare_fun("x", &[], str_s); ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+        let y = { let s = ctx.declare_fun("y", &[], str_s); ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+        let i = { let s = ctx.declare_fun("i", &[], int_s); ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+
+        let cc = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y]).unwrap();
+        assert_eq!(ctx.sort_of(cc), str_s);
+        let len = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
+        assert_eq!(ctx.sort_of(len), int_s);
+        let at = ctx.mk_app(Op::Builtin(BuiltinOp::StrAt), &[x, i]).unwrap();
+        assert_eq!(ctx.sort_of(at), str_s);
+        let ss = ctx.mk_app(Op::Builtin(BuiltinOp::StrSubstr), &[x, i, i]).unwrap();
+        assert_eq!(ctx.sort_of(ss), str_s);
+
+        // Ill-sorted: str.len on Int must fail.
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[i]).is_err());
+        // Ill-sorted: str.at with String index must fail.
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrAt), &[x, y]).is_err());
     }
 
     // helper local to the test module

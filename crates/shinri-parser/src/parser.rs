@@ -700,6 +700,11 @@ impl<'a> Parser<'a> {
             | BuiltinOp::BvRotateLeft(_)
             | BuiltinOp::BvRotateRight(_)
             | BuiltinOp::BvRepeat(_) => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            // String ops: delegate directly to mk_app (sort-checking in Context).
+            BuiltinOp::StrConcat
+            | BuiltinOp::StrLen
+            | BuiltinOp::StrAt
+            | BuiltinOp::StrSubstr => Self::mk(ctx, Op::Builtin(op), &args, &sp),
         }
     }
 

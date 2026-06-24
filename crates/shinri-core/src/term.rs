@@ -76,6 +76,11 @@ pub enum BuiltinOp {
     BvRotateLeft(u32),
     BvRotateRight(u32),
     BvRepeat(u32),
+    // Strings (QF_S core)
+    StrConcat,
+    StrLen,
+    StrAt,
+    StrSubstr,
 }
 
 /// A literal constant value. Numerals reference `Context.nums` by `RatId`.

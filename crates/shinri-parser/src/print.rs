@@ -128,5 +128,10 @@ fn builtin_name(b: BuiltinOp) -> String {
         BvRotateLeft(k) => format!("(_ rotate_left {k})"),
         BvRotateRight(k) => format!("(_ rotate_right {k})"),
         BvRepeat(k) => format!("(_ repeat {k})"),
+        // String ops — SMT-LIB names
+        StrConcat => "str.++".to_owned(),
+        StrLen => "str.len".to_owned(),
+        StrAt => "str.at".to_owned(),
+        StrSubstr => "str.substr".to_owned(),
     }
 }
