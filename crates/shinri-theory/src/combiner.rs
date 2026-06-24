@@ -724,19 +724,22 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
             };
             self.arrays.model(&mut cx, &mut arrays_m);
         }
-        let mut string_m = ModelBuilder::default();
+        let mut combined = arith_m;
+        combined.absorb(euf_m);
+        combined.absorb(arrays_m);
+        // Build the string model LAST, directly into `combined`, so it can read
+        // the arith-assigned `(str.len ·)` values (needed to fill free string
+        // variables to their correct length) and any EUF-assigned string values.
+        // A separate empty builder would hide those, yielding length-0 strings
+        // that violate their own `str.len` constraint.
         {
             let mut cx = TheoryCtx {
                 terms: &mut self.terms,
                 eq: &mut self.eq,
                 atoms: &self.atoms,
             };
-            self.string.model(&mut cx, &mut string_m);
+            self.string.model(&mut cx, &mut combined);
         }
-        let mut combined = arith_m;
-        combined.absorb(euf_m);
-        combined.absorb(arrays_m);
-        combined.absorb(string_m);
         combined
     }
 

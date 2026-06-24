@@ -432,8 +432,15 @@ impl Solver {
                     }
                 }
                 // Also surface values for all terms assigned by the theories.
+                // Skip terms that do not exist in the solver's own context: the
+                // Combiner runs over a *clone* of the context and may mint fresh
+                // terms (e.g. string-theory F-split skolems) whose TermIds are out
+                // of range for `self.ctx`. Surfacing them would make `get-model` /
+                // `display_term` index out of bounds.
                 for (term, val) in mb.iter() {
-                    model.values.insert(term, val.clone());
+                    if self.ctx.contains_term(term) {
+                        model.values.insert(term, val.clone());
+                    }
                 }
                 // BV model extraction: for each declared BV constant with recorded
                 // SAT vars, read each var's assignment and pack into a ModelVal::BitVec.
