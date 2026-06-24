@@ -93,6 +93,7 @@ pub(crate) fn format_modelval(v: &ModelVal) -> String {
         }
         ModelVal::Num(r) => format_rational(r),
         ModelVal::Elem(_, idx) => format!("@elem{idx}"),
+        ModelVal::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
         ModelVal::BitVec(width, val) => {
             if width % 4 == 0 {
                 // Format as #x with width/4 hex digits.
@@ -103,5 +104,20 @@ pub(crate) fn format_modelval(v: &ModelVal) -> String {
                 format!("#b{}", format_bin_fixed(val, *width))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shinri_theory::types::ModelVal;
+
+    #[test]
+    fn format_string_modelval_escapes_quotes() {
+        assert_eq!(format_modelval(&ModelVal::String("ab".into())), "\"ab\"");
+        assert_eq!(
+            format_modelval(&ModelVal::String("a\"b".into())),
+            "\"a\"\"b\""
+        );
     }
 }
