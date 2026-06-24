@@ -82,9 +82,22 @@ impl TheorySolver for StrSolver {
         if effort != Effort::Full {
             return TCheck::Sat;
         }
+
+        // Build the `known` set FIRST: all string-sorted subterms visible to the
+        // solver, plus both sides of each asserted equality.
+        // This must be built before the len_terms loop so `next_axiom` can consult
+        // EUF representatives (e.g. to detect that `str.len(x) = 0` when `x = ""`
+        // was merged via the EqualityEngine — the N-O length seam).
+        let mut known: Vec<TermId> = self.str_terms.iter().copied().collect();
+        for &(atom, _) in &self.eq_true {
+            let (l, r) = crate::wordeq::sides(cx.terms, atom);
+            known.push(l);
+            known.push(r);
+        }
+
         let lens: Vec<TermId> = self.len_terms.iter().copied().collect();
         for lt in lens {
-            if let Some(axiom) = length::next_axiom(cx.terms, lt, &self.emitted_len_axioms) {
+            if let Some(axiom) = length::next_axiom(cx.terms, cx.eq, &known, lt, &self.emitted_len_axioms) {
                 self.emitted_len_axioms.insert(axiom);
                 // Spend one unit of fuel before emitting a split. If the budget is
                 // exhausted, signal Unknown (sound: neither Sat nor Unsat).
@@ -98,15 +111,7 @@ impl TheorySolver for StrSolver {
             }
         }
 
-        // Build the `known` set: all string-sorted subterms visible to the solver,
-        // plus both sides of each asserted equality (so rep() resolves global merges,
-        // preferring constants — required by the Task 10 fix in normal_form).
-        let mut known: Vec<TermId> = self.str_terms.iter().copied().collect();
-        for &(atom, _) in &self.eq_true {
-            let (l, r) = crate::wordeq::sides(cx.terms, atom);
-            known.push(l);
-            known.push(r);
-        }
+        // (The `known` set continues to be used below.)
 
         // Word-equation resolution: strip equal heads/tails, detect constant
         // prefix mismatches. Variable-headed residuals emit F-splits (Task 12).

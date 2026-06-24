@@ -1,5 +1,6 @@
 use rustc_hash::FxHashSet;
 use shinri_core::{BuiltinOp, ConstVal, Context, Op, TermId, TermNode};
+use shinri_theory::EqualityEngine;
 
 /// Build `(>= len_term 0)`.
 fn ge_zero(terms: &mut Context, len_term: TermId) -> TermId {
@@ -47,17 +48,72 @@ fn defining_eq(terms: &mut Context, len_term: TermId, arg: TermId) -> Option<Ter
     }
 }
 
+/// Attempt to resolve the EUF class representative of `arg` to a string
+/// constant. Returns the constant TermId if `arg` is in a class with a known
+/// string constant (e.g. because `x = ""` was merged), or `None` otherwise.
+///
+/// This enables `next_axiom` to emit the defining equation `(= len_term k)`
+/// even when `arg` is an opaque variable whose value was set via EUF merging
+/// (N-O boundary: the String theory discovers the variable's value via
+/// the shared EqualityEngine).
+fn euf_representative_const(
+    terms: &Context,
+    eq: &mut EqualityEngine,
+    arg: TermId,
+    known: &[TermId],
+) -> Option<TermId> {
+    // Build an ENodeId → preferred TermId map, preferring constants.
+    let mut node_of: rustc_hash::FxHashMap<shinri_theory::types::ENodeId, TermId> =
+        rustc_hash::FxHashMap::default();
+    for &t in known {
+        let n = eq.intern(t);
+        let root = eq.find(n);
+        let is_str_const = matches!(
+            terms.term_node(t),
+            TermNode::Const { val: ConstVal::String(_), .. }
+        );
+        match node_of.get(&root).copied() {
+            None => { node_of.insert(root, t); }
+            Some(prev) => {
+                let prev_is_const = matches!(
+                    terms.term_node(prev),
+                    TermNode::Const { val: ConstVal::String(_), .. }
+                );
+                if is_str_const && !prev_is_const {
+                    node_of.insert(root, t);
+                }
+            }
+        }
+    }
+    let arg_n = eq.intern(arg);
+    let arg_root = eq.find(arg_n);
+    let rep = *node_of.get(&arg_root)?;
+    // Only return if it's a string constant (not an opaque variable).
+    if matches!(terms.term_node(rep), TermNode::Const { val: ConstVal::String(_), .. }) {
+        Some(rep)
+    } else {
+        None
+    }
+}
+
 /// Return the next axiom for `len_term` not yet emitted, or `None` if all are done.
 ///
 /// Axiom order per `len_term`:
 /// 1. `(>= len_term 0)`
-/// 2. `(= len_term k)` if arg is a string literal  —or—
-///    `(= len_term (+ (str.len a) (str.len b) ...))` if arg is a concat
+/// 2. `(= len_term k)` if arg is a string literal — or if the EUF has merged arg
+///    with a string constant (N-O: e.g. `x = ""` was asserted, so len(x) = 0) —
+///    or `(= len_term (+ (str.len a) (str.len b) ...))` if arg is a concat.
 /// 3. `(=> (= len_term 0) (= arg ""))` — the empty-length link (valid tautology).
 ///    Emitted once per `len_term` with `guard: None` since it is unconditionally
 ///    true: a string has length 0 iff it is empty.
+///
+/// `eq` and `known` are used to check the EUF representative of `arg` so that
+/// when a string variable is merged with a constant (e.g. `x = ""`), the
+/// defining equation is emitted eagerly via N-O.
 pub fn next_axiom(
     terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
     len_term: TermId,
     emitted: &FxHashSet<TermId>,
 ) -> Option<TermId> {
@@ -77,8 +133,18 @@ pub fn next_axiom(
         return Some(ge);
     }
 
-    // Axiom 2: structural defining equation (literal or concat)
-    if let Some(eqn) = defining_eq(terms, len_term, arg) {
+    // Axiom 2: structural defining equation (literal or concat).
+    // First try the structural form of `arg` directly.
+    // If arg is opaque but its EUF class representative is a string constant
+    // (e.g. x = "" was asserted), use the representative instead.
+    let effective_arg = match terms.term_node(arg).clone() {
+        TermNode::Const { val: ConstVal::String(_), .. } | TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. } => arg,
+        _ => {
+            // Try to resolve via EUF.
+            euf_representative_const(terms, eq, arg, known).unwrap_or(arg)
+        }
+    };
+    if let Some(eqn) = defining_eq(terms, len_term, effective_arg) {
         if !emitted.contains(&eqn) {
             return Some(eqn);
         }

@@ -103,6 +103,13 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                     atoms: &self.atoms,
                 };
                 self.euf.new_var(&mut cx, v, atom);
+                // N-O boundary: if the atom contains str.len subterms (e.g.
+                // `(= (str.len x) 1)` routes to EUF as an Int equality), also
+                // notify the String theory so it can track len_terms for axiom
+                // emission and the N-O shared-arith interface.
+                if atom_contains_str_len(&cx.terms, atom) {
+                    self.string.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Arith => {
                 let mut cx = TheoryCtx {
@@ -115,6 +122,14 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                 // linear arith atom (e.g. `(- (f x0) (f x1))`) must be interned
                 // into EUF so congruence applies and it joins the shared set S.
                 self.euf.register_arith_uf_terms(&mut cx, atom);
+                // N-O boundary: if the atom contains str.len subterms (e.g.
+                // `(<= (str.len x) 1)` routes to Arith), also notify the String
+                // theory so it can track len_terms for axiom emission and the
+                // N-O shared-arith interface. This is required for the String↔Arith
+                // seam to detect contradictions such as `len(x)=1 ∧ x=""`.
+                if atom_contains_str_len(&cx.terms, atom) {
+                    self.string.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Shared => {
                 // Purify first: splits mixed terms, emitting defining equalities
@@ -162,6 +177,41 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
         }
         Ok(())
     }
+}
+
+/// Returns true if `atom` (or any of its subterms) is a `str.len` application.
+/// Used by `register_atom` to notify the String theory about len_terms that
+/// appear in Arith/EUF atoms (N-O boundary fix).
+///
+/// Returns false immediately for synthetic TermIds that are not interned in
+/// `terms` (e.g. mock atoms from tests or split atoms from sub-theories using
+/// their own Context). This is safe because any real `str.len` atom must be
+/// interned before it can reach `register_atom` / `bind_fresh`.
+fn atom_contains_str_len(terms: &Context, atom: TermId) -> bool {
+    use shinri_core::{BuiltinOp, Op, TermNode};
+    fn walk(terms: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
+        if !seen.insert(t) {
+            return false;
+        }
+        if !terms.contains_term(t) {
+            return false;
+        }
+        match terms.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                if matches!(op, Op::Builtin(BuiltinOp::StrLen)) {
+                    return true;
+                }
+                let kids = terms.children(*args).to_vec();
+                kids.iter().any(|&k| walk(terms, k, seen))
+            }
+            TermNode::Const { .. } => false,
+        }
+    }
+    if !terms.contains_term(atom) {
+        return false;
+    }
+    let mut seen = rustc_hash::FxHashSet::default();
+    walk(terms, atom, &mut seen)
 }
 
 impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory for Combiner<E, A, R, S> {
@@ -250,9 +300,19 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory 
     fn bind_fresh(&mut self, v: Var, atom: TermId) {
         // A fresh split atom: QF_LIA branch/cut atoms (Le/Ge) → Arith; QF_UFLIA
         // MBTC's interface `(= u v)` → Euf, `(< u v)`/`(> u v)` → Arith. Classify
-        // and route to the owning theory, mirroring `register_atom`. A fresh atom
-        // is always supported by construction; fall back to Arith defensively.
-        let owner = classify(&self.terms, atom).unwrap_or(Owner::Arith);
+        // and route to the owning theory, mirroring `register_atom`. Boolean
+        // connectives (e.g. `(=> A B)` tautology splits emitted by String theory)
+        // and synthetic TermIds (from sub-theories or mock theories in tests) are
+        // SAT-layer constructs not owned by any theory. For interned Boolean
+        // connectives, fall back to EUF (which harmlessly interns the term).
+        // For non-interned synthetic TermIds, skip theory registration entirely.
+        let classify_result = classify(&self.terms, atom);
+        let is_interned = self.terms.contains_term(atom);
+        let owner = match classify_result {
+            Ok(o) => o,
+            Err(_) if is_interned => Owner::Euf, // Boolean connective (e.g. `(=> A B)`) → EUF
+            Err(_) => Owner::Arith, // Synthetic TermId (e.g. Arith branch/cut atoms) → Arith (original behavior)
+        };
         self.atoms.register(v, atom, owner);
         let mut cx = TheoryCtx {
             terms: &mut self.terms,
@@ -260,10 +320,18 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory 
             atoms: &self.atoms,
         };
         match owner {
-            Owner::Euf => self.euf.new_var(&mut cx, v, atom),
+            Owner::Euf => {
+                self.euf.new_var(&mut cx, v, atom);
+                if atom_contains_str_len(&cx.terms, atom) {
+                    self.string.new_var(&mut cx, v, atom);
+                }
+            }
             Owner::Arith => {
                 self.arith.new_var(&mut cx, v, atom);
                 self.euf.register_arith_uf_terms(&mut cx, atom);
+                if atom_contains_str_len(&cx.terms, atom) {
+                    self.string.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Shared => {
                 self.euf.new_var(&mut cx, v, atom);

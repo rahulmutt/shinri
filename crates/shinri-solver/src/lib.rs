@@ -5,6 +5,7 @@
 mod abv_stage;
 mod bv_stage;
 mod model;
+mod string_stage;
 mod tseitin;
 
 pub use model::{Model, SolveOutcome};
@@ -272,12 +273,21 @@ impl Solver {
 
         let mut assertions = self.assertions.clone();
 
-        // ── str.at / str.substr pre-pass ─────────────────────────────────────
-        // If any assertion contains a String operation (str.at, str.substr,
-        // str.concat, or str.len), desugar all str.at/str.substr applications
-        // into fresh variables + concat/length-guard constraints BEFORE routing
-        // to any theory. Non-string queries are completely untouched.
-        if shinri_str::reduce::any_has_string_op(&self.ctx, &assertions) {
+        // ── String theory routing ─────────────────────────────────────────────
+        // If any assertion uses strings (String-sorted subterm or str.* op):
+        //   1. Check the soundness fence: strings mixed with BV ops, uninterpreted
+        //      functions over String, or arrays over String → Unknown.
+        //   2. Otherwise reduce (desugar str.at/str.substr) and fall through to
+        //      the Combiner path.
+        // This consolidates the old Task-16 reduce pre-pass (which ran
+        // unconditionally) into one guarded block: detect → fence → reduce.
+        // The QF_ABV and BV paths below do NOT involve strings (they run only
+        // when there are no string subterms), so routing here is exclusive.
+        if crate::string_stage::uses_strings(&self.ctx, &assertions) {
+            if crate::string_stage::fenced(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
+            // Not fenced: desugar str.at / str.substr before the Combiner.
             assertions = shinri_str::reduce::reduce_assertions(&mut self.ctx, &assertions);
         }
 
@@ -1169,6 +1179,75 @@ mod stage_b_gate_tests {
     fn gate_toggles_without_changing_verdict() {
         assert!(matches!(build(true), SolveOutcome::Unsat));
         assert!(matches!(build(false), SolveOutcome::Unsat));
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helper: parse an SMT-LIB snippet and return the first check-sat outcome.
+// Shared by string routing tests and any future parse+solve harness.
+// ─────────────────────────────────────────────────────────────────────────────
+#[cfg(test)]
+fn run_outcome(src: &str) -> SolveOutcome {
+    use shinri_parser::Parser;
+    let mut s = Solver::new();
+    let mut p = Parser::new(src);
+    let mut outcome = SolveOutcome::Unknown;
+    while let Some(cmd) = p.next_command(s.ctx_mut()) {
+        let cmd = cmd.expect("parse error");
+        match s.execute(cmd) {
+            CommandResponse::Sat => {
+                outcome = SolveOutcome::Sat;
+            }
+            CommandResponse::Unsat => {
+                outcome = SolveOutcome::Unsat;
+            }
+            CommandResponse::Unknown => {
+                outcome = SolveOutcome::Unknown;
+            }
+            _ => {}
+        }
+    }
+    outcome
+}
+
+#[cfg(test)]
+mod string_routing_tests {
+    use super::*;
+
+    /// `(= (str.++ x "a") (str.++ "a" y))` → SAT (x=y="").
+    #[test]
+    fn string_concat_equation_routes_and_solves_sat() {
+        let src = "(declare-fun x () String)(declare-fun y () String)\
+                   (assert (= (str.++ x \"a\") (str.++ \"a\" y)))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
+    }
+
+    /// `(= (str.len x) 1)` ∧ `(= x "")` → UNSAT (len("") = 0 ≠ 1).
+    #[test]
+    fn string_length_contradiction_is_unsat() {
+        let src = "(declare-fun x () String)\
+                   (assert (= (str.len x) 1))(assert (= x \"\"))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unsat);
+    }
+
+    /// `(declare-fun f (String) String)` with `(= (f x) x)` → Unknown (UF over String).
+    #[test]
+    fn string_under_uninterpreted_function_is_unknown() {
+        let src = "(declare-fun f (String) String)(declare-fun x () String)\
+                   (assert (= (f x) x))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+    }
+
+    /// Carry-forward (Task 6): `(Array String String)` with select/store → Unknown.
+    /// The classify-layer string fence (Task 6) only handled string-under-UF, not
+    /// arrays-over-string. This ensures the latter is also fenced conservatively.
+    #[test]
+    fn array_over_string_is_unknown() {
+        let src = "(declare-fun a () (Array String String))\
+                   (declare-fun i () String)\
+                   (declare-fun v () String)\
+                   (assert (= (select a i) v))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
     }
 }
 
