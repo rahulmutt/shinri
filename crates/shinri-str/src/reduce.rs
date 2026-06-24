@@ -27,6 +27,40 @@
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// If `t` is an integer numeral, return its value as `i128`. Non-integer
+/// (fractional) or non-numeral terms return `None`.
+fn int_numeral(ctx: &Context, t: TermId) -> Option<i128> {
+    let r = ctx.numeral_value(t)?;
+    // Reject non-integers: denominator must be exactly 1.
+    if r.denom().to_i128() != Some(1) {
+        return None;
+    }
+    r.numer().to_i128()
+}
+
+/// Concretely evaluate `(str.substr s i l)` when `s` is a string constant and
+/// `i`, `l` are integer numerals — the SMT-LIB 2.6 semantics, by Unicode scalar
+/// (char) index. Returns the resulting constant string, or `None` if any operand
+/// is not a literal/numeral. This is the SOUND fast path that avoids the
+/// (semi-decidable, diverging) Nielsen word-equation expansion the generic
+/// `pre++mid++post` encoding would otherwise trigger for constant inputs.
+///
+/// Semantics: if `0 <= i < |s|` and `l > 0`, result = `s[i .. i+min(l, |s|-i)]`;
+/// otherwise the empty string.
+fn eval_substr_const(ctx: &Context, s: TermId, i: TermId, l: TermId) -> Option<String> {
+    let sv = ctx.string_const_value(s)?;
+    let iv = int_numeral(ctx, i)?;
+    let lv = int_numeral(ctx, l)?;
+    let chars: Vec<char> = sv.chars().collect();
+    let n = chars.len() as i128;
+    if iv < 0 || iv >= n || lv <= 0 {
+        return Some(String::new());
+    }
+    let start = iv as usize;
+    let take = std::cmp::min(lv, n - iv) as usize;
+    Some(chars[start..start + take].iter().collect())
+}
+
 // Global counter for fresh variable names so that multiple calls across
 // multiple assertions never collide.
 static FRESH_CTR: AtomicU32 = AtomicU32::new(0);
@@ -227,7 +261,14 @@ fn rewrite(ctx: &mut Context, t: TermId, guards: &mut Vec<TermId>) -> TermId {
                     let s = new_children[0];
                     let i = new_children[1];
                     let l = new_children[2];
-                    encode_substr(ctx, s, i, l, guards)
+                    // SOUND fast path: fully-constant arguments fold to a literal,
+                    // sidestepping the diverging Nielsen expansion of the generic
+                    // `pre++mid++post` encoding over a constant string.
+                    if let Some(v) = eval_substr_const(ctx, s, i, l) {
+                        ctx.mk_string_const(&v)
+                    } else {
+                        encode_substr(ctx, s, i, l, guards)
+                    }
                 }
                 Op::Builtin(BuiltinOp::StrAt) => {
                     // str.at(s, i) ≡ str.substr(s, i, 1)
@@ -238,7 +279,11 @@ fn rewrite(ctx: &mut Context, t: TermId, guards: &mut Vec<TermId>) -> TermId {
                         shinri_core::Rational::from_int(1i128.into()),
                         int_s,
                     );
-                    encode_substr(ctx, s, i, one, guards)
+                    if let Some(v) = eval_substr_const(ctx, s, i, one) {
+                        ctx.mk_string_const(&v)
+                    } else {
+                        encode_substr(ctx, s, i, one, guards)
+                    }
                 }
                 _ => {
                     // Rebuild with potentially-rewritten children.

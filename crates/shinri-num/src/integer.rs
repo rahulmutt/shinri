@@ -48,6 +48,18 @@ impl Integer {
         matches!(self.0, Repr::Small(0))
     }
 
+    /// Number of 64-bit limbs in the magnitude (1 for any inline `Small`). A cheap
+    /// proxy for "how big has this grown", used by the simplex to detect the
+    /// coefficient blowup that a degenerate system (e.g. the String↔Arith
+    /// `str.substr` seam) can trigger — where a single BigInt gcd/division would
+    /// otherwise dominate runtime — so it can bail to a sound `Unknown`.
+    pub fn limb_count(&self) -> usize {
+        match &self.0 {
+            Repr::Small(_) => 1,
+            Repr::Big { limbs, .. } => limbs.len(),
+        }
+    }
+
     pub fn is_negative(&self) -> bool {
         match &self.0 {
             Repr::Small(v) => *v < 0,

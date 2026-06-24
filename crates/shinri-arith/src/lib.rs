@@ -80,6 +80,15 @@ pub struct Arith {
     node_cuts: usize,
     /// Total cuts generated this solve (global cap).
     total_cuts: usize,
+    /// Total simplex pivots performed this solve (global, monotone, never reset on
+    /// backtrack). The String↔Arith `str.substr` seam can feed Arith an
+    /// ever-growing degenerate system whose per-`check_full` cost balloons across
+    /// successive SAT decisions; bounding CUMULATIVE pivots guarantees the whole
+    /// solve terminates. On exhaustion `check_full` returns `Unknown` (SOUND — it
+    /// declines to decide rather than loop or report a wrong verdict). The budget
+    /// is far above any realistic QF_LIA/QF_UFLRA workload, so it never trips on the
+    /// soundly-decidable fragment.
+    total_pivots: u64,
 }
 
 impl Default for Arith {
@@ -104,6 +113,7 @@ impl Default for Arith {
             stage_b: true,
             node_cuts: 0,
             total_cuts: 0,
+            total_pivots: 0,
         }
     }
 }
@@ -274,12 +284,44 @@ impl Arith {
 
     fn check_full(&mut self) -> TCheck {
         use crate::simplex::{entering_for, first_violated_basic, Below};
+        // Cumulative anti-divergence guard (see `total_pivots`). The String↔Arith
+        // `str.substr` seam can drive an ever-growing degenerate system across many
+        // SAT decisions; capping the TOTAL pivots performed this solve guarantees
+        // termination even when each individual `check_full` would finish. On
+        // exhaustion we return `Unknown` — SOUND (decline to decide, never loop or
+        // report a wrong verdict). The budget is far above any realistic workload.
+        const TOTAL_PIVOT_BUDGET: u64 = 2_000_000;
+        // Coefficient-blowup guard: a degenerate system (the String↔Arith
+        // `str.substr` seam) can make simplex coefficients grow without bound, so a
+        // SINGLE BigInt gcd/division dominates runtime (an effective hang the pivot
+        // COUNT cap cannot catch). If any current value's magnitude exceeds this
+        // many 64-bit limbs (~ thousands of decimal digits — far beyond any
+        // legitimate QF_LIA/QF_UFLRA coefficient), bail to a sound `Unknown`.
+        const MAX_LIMBS: usize = 64;
         loop {
+            self.total_pivots += 1;
+            if self.total_pivots > TOTAL_PIVOT_BUDGET {
+                return TCheck::Unknown;
+            }
             let Some((basic, dir)) = first_violated_basic(&self.tableau, &self.bounds, &self.value)
             else {
                 // All bounds feasible: the system is satisfiable.
                 return TCheck::Sat;
             };
+            // Bail to a sound `Unknown` if a row coefficient has blown up past
+            // MAX_LIMBS (defense-in-depth against any residual degenerate growth;
+            // the primary fix for the substr seam is the proof-forest undo
+            // correctness in `EqualityEngine`).
+            {
+                let row = self.tableau.row(basic);
+                let blown = row.vars().any(|j| {
+                    let c = row.coeff(j);
+                    c.numer().limb_count() > MAX_LIMBS || c.denom().limb_count() > MAX_LIMBS
+                });
+                if blown {
+                    return TCheck::Unknown;
+                }
+            }
             let increase = dir == Below::Lower;
             match entering_for(&self.tableau, &self.bounds, &self.value, basic, increase) {
                 Some(entering) => {
@@ -600,7 +642,12 @@ impl Arith {
                 TCheck::Sat => None,
                 TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
                 TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
-                TCheck::Unknown => unreachable!("arith check_full never returns Unknown"),
+                // The pivot cap tripped (degenerate system). Conservatively treat
+                // the probe as "feasible / not proven entailed": returning `None`
+                // simply means we do NOT claim `u = v` is entailed. That is SOUND —
+                // it only forgoes a possible interface equality (a completeness
+                // concession), never asserts a false one.
+                TCheck::Unknown => None,
             },
         }
     }
@@ -660,7 +707,11 @@ impl Arith {
             TCheck::Sat => None,
             TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
             TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
-            TCheck::Unknown => unreachable!("arith check_full never returns Unknown"),
+            // Pivot cap tripped (degenerate). Report no conflict from this interface
+            // equality: SOUND (we only forgo detecting a possible infeasibility — a
+            // completeness concession that surfaces upstream as `Unknown`, never a
+            // wrong verdict).
+            TCheck::Unknown => None,
         }
     }
 
@@ -1015,7 +1066,9 @@ impl TheorySolver for Arith {
             TCheck::Conflict(leaves) => return TCheck::Conflict(self.strip_apriori(leaves)),
             TCheck::Split { .. } => unreachable!("check_full never emits Split"),
             TCheck::Sat => {}
-            TCheck::Unknown => unreachable!("arith check_full never returns Unknown"),
+            // The simplex pivot cap tripped (degenerate cycle); surface Unknown so
+            // the combiner reports a SOUND `unknown` instead of looping forever.
+            TCheck::Unknown => return TCheck::Unknown,
         }
         self.integer_check(cx)
     }

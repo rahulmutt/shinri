@@ -448,7 +448,18 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
             return SolveResult::Unsat { core: vec![] };
         }
         self.backtrack_to(0);
+        let mut steps: u64 = 0;
         loop {
+            // Resource limit (sound `Unknown`, opt-in via config): bounds the
+            // semi-decidable word-equation search so it cannot diverge into an
+            // unbounded fresh-variable CDCL loop. `None` = unlimited (default), so
+            // no existing caller is affected.
+            if let Some(budget) = self.config.step_budget {
+                steps += 1;
+                if steps > budget {
+                    return SolveResult::Unknown;
+                }
+            }
             match self.propagate() {
                 Some(conflict) => {
                     if self.trail.decision_level() == 0 {
@@ -607,8 +618,22 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                         lits.push(g);
                                     }
                                     for atom in atoms {
-                                        let v = self.new_var();
-                                        self.theory.bind_fresh(v, atom);
+                                        // Reuse the existing SAT var if the theory already
+                                        // registered this atom (e.g. an MBTC `(= u v)` that was
+                                        // previously asserted, or a length atom shared by
+                                        // String/Arith). Minting a fresh var here would leave the
+                                        // theory holding TWO unlinked vars for one atom (its truth
+                                        // value split across both) → spurious UNSAT or a
+                                        // never-converging split loop. Mint+bind a fresh var only
+                                        // for a genuinely new atom.
+                                        let v = match self.theory.var_for_atom(atom) {
+                                            Some(existing) => existing,
+                                            None => {
+                                                let v = self.new_var();
+                                                self.theory.bind_fresh(v, atom);
+                                                v
+                                            }
+                                        };
                                         lits.push(Lit::new(v, true));
                                     }
                                     // Phase 2: learn the split clause and backtrack one level so

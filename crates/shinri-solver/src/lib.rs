@@ -283,12 +283,19 @@ impl Solver {
         // unconditionally) into one guarded block: detect → fence → reduce.
         // The QF_ABV and BV paths below do NOT involve strings (they run only
         // when there are no string subterms), so routing here is exclusive.
+        // True when the (post-fence) query exercises the String theory. The
+        // String word-equation search is only SEMI-decidable, so on this path we
+        // give the SAT engine a step budget (sound `Unknown` on exhaustion) to
+        // guarantee termination — the `str.substr` reduction over a variable
+        // string can otherwise diverge into an unbounded fresh-variable search.
+        let mut on_string_path = false;
         if crate::string_stage::uses_strings(&self.ctx, &assertions) {
             if crate::string_stage::fenced(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
             // Not fenced: desugar str.at / str.substr before the Combiner.
             assertions = shinri_str::reduce::reduce_assertions(&mut self.ctx, &assertions);
+            on_string_path = true;
         }
 
         // ── QF_ABV path (BV-indexed, BV-valued arrays) ────────────────────────
@@ -342,8 +349,17 @@ impl Solver {
         // are preserved and the surrogate keys still match.
         let lowered: Vec<TermId> = assertions.into_iter().map(|a| self.lower(a)).collect();
 
+        let mut sat_config = SolverConfig::default();
+        if on_string_path {
+            // Bound the semi-decidable string search. The cap is generous: the
+            // soundly-decidable fragment (constant-folded substr, prefix/length
+            // contradictions, bounded word equations) finishes in far fewer steps;
+            // only a genuinely divergent search hits it, and then we return a sound
+            // `Unknown` instead of hanging.
+            sat_config.step_budget = Some(2_000_000);
+        }
         let mut sat: Sat = shinri_sat::Solver::with_theory(
-            SolverConfig::default(),
+            sat_config,
             Combiner::with_context(self.ctx.clone()),
         );
 

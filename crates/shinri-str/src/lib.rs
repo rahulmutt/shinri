@@ -8,6 +8,7 @@ mod trail;
 pub mod wordeq;
 pub use fuel::Fuel;
 
+
 use rustc_hash::FxHashSet;
 use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
@@ -239,7 +240,8 @@ impl TheorySolver for StrSolver {
                         );
                     }
                     // Spend one unit of fuel before emitting a word-equation split.
-                    // If the budget is exhausted, signal Unknown (sound).
+                    // If the budget is exhausted, signal Unknown (sound). The
+                    // word-equation search is only semi-decidable; this bounds it.
                     if !self.fuel.spend() {
                         return TCheck::Unknown;
                     }

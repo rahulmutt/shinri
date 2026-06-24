@@ -549,7 +549,6 @@ fn targeted_disequality_witness_sat() {
 // Reproduce a minimal wrong-UNSAT:
 //   (set-logic QF_S)(assert (= (str.substr "abc" 1 1) "b"))(check-sat)  ; shinri: unsat, z3: sat
 
-#[ignore = "KNOWN-BROKEN: substr reduction overwhelms the String↔Arith MBTC seam (spurious unsat). See module note / task report."]
 #[test]
 fn targeted_substr_in_range_sat() {
     // (str.substr "abc" 1 1) = "b" ⇒ SAT (in-range single-char substring).
@@ -560,7 +559,6 @@ fn targeted_substr_in_range_sat() {
     );
 }
 
-#[ignore = "KNOWN-BROKEN: substr reduction overwhelms the String↔Arith MBTC seam (may hang). See module note / task report."]
 #[test]
 fn targeted_substr_in_range_wrong_unsat() {
     // (str.substr "abc" 1 1) = "a" ⇒ UNSAT (the char at index 1 is "b").
@@ -571,7 +569,6 @@ fn targeted_substr_in_range_wrong_unsat() {
     );
 }
 
-#[ignore = "KNOWN-BROKEN: substr reduction overwhelms the String↔Arith MBTC seam. See module note / task report."]
 #[test]
 fn targeted_substr_out_of_range_sat() {
     // Out-of-range index ⇒ "" per SMT-LIB; asserting = "" is SAT.
@@ -582,7 +579,6 @@ fn targeted_substr_out_of_range_sat() {
     );
 }
 
-#[ignore = "KNOWN-BROKEN: substr reduction overwhelms the String↔Arith MBTC seam. See module note / task report."]
 #[test]
 fn targeted_substr_out_of_range_nonempty_unsat() {
     // Out-of-range substring is "" — asserting it equals a non-empty string ⇒ UNSAT.
