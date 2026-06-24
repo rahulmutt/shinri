@@ -3,7 +3,7 @@
 //! soundness stays existential (spec §9).
 
 use crate::types::Owner;
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Op, SortId, SortNode, TermId, TermNode, Var};
 
 /// An atom this solver cannot handle exactly (e.g. nonlinear). Refusing it at
@@ -226,9 +226,17 @@ fn array_touches_arith(terms: &Context, t: TermId) -> bool {
 
 /// `Var`-indexed routing table. Append-only across a solve (atoms are never
 /// un-registered on backtrack — spec §6.5).
+///
+/// Carries a reverse `atom → var` map (`by_atom`) so the SAT layer can REUSE the
+/// existing SAT var when a theory re-emits an already-registered atom as a split
+/// atom. Without this, the two-phase split protocol minted a SECOND, unlinked
+/// var for an atom that already had one (the theory then held both the atom and
+/// its negation in different vars → spurious UNSAT / non-termination). The first
+/// var registered for an atom is authoritative (atoms are append-only).
 #[derive(Default)]
 pub struct AtomRegistry {
     by_var: Vec<Option<(TermId, Owner)>>,
+    by_atom: FxHashMap<TermId, Var>,
 }
 
 impl AtomRegistry {
@@ -238,6 +246,17 @@ impl AtomRegistry {
             self.by_var.resize(idx + 1, None);
         }
         self.by_var[idx] = Some((atom, owner));
+        // First registration wins (atoms are never un-registered). Keep the
+        // earliest var so a re-emitted split atom resolves to its original var.
+        self.by_atom.entry(atom).or_insert(v);
+    }
+
+    /// The SAT var previously registered for `atom`, if any. Used by the SAT
+    /// layer's split-atom protocol to reuse an existing var instead of minting a
+    /// fresh, unlinked one (the duplicate-var hazard).
+    #[inline]
+    pub fn var_of_atom(&self, atom: TermId) -> Option<Var> {
+        self.by_atom.get(&atom).copied()
     }
 
     #[inline]

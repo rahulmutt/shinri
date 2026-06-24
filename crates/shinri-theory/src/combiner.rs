@@ -351,6 +351,16 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory 
         }
     }
 
+    fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+        // Reuse the existing SAT var for an already-registered atom so a re-emitted
+        // split atom does not mint a SECOND, unlinked var (the duplicate-var hazard
+        // that splits an atom's truth value across two vars → spurious UNSAT /
+        // non-termination). Only interned, previously-registered atoms resolve here;
+        // synthetic split TermIds are absent from the registry and correctly fall
+        // through to a fresh var.
+        self.atoms.var_of_atom(atom)
+    }
+
     fn push(&mut self) {
         self.level += 1;
         self.eq.push();
@@ -421,7 +431,20 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
         // Pairs already asserted EUF→arith this check (R5 termination guard).
         let mut iface_asserted: FxHashSet<(TermId, TermId)> = FxHashSet::default();
 
+        // Round bound (sound termination guard). The Nelson-Oppen exchange + MBTC
+        // is claimed to converge over the FIXED shared set, but the String↔Arith
+        // substr seam can feed it a degenerate, ever-growing arith system whose
+        // entailed-equality probing keeps minting slacks — so the fixpoint may not
+        // be reached in practice. We cap the round count generously (far above any
+        // legitimate convergence, which needs O(|shared|) rounds) and return a
+        // sound `Unknown` on exhaustion rather than looping forever.
+        let round_cap: u64 = 1_000 + 100 * (shared.len() as u64);
+        let mut rounds: u64 = 0;
         loop {
+            rounds += 1;
+            if rounds > round_cap {
+                return FinalCheck::Unknown;
+            }
             {
                 let mut cx = TheoryCtx {
                     terms: &mut self.terms,
@@ -438,7 +461,10 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
                     TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
                     TCheck::Sat => {}
-                    TCheck::Unknown => unreachable!("Arith never returns Unknown"),
+                    // Arith now returns Unknown when its simplex pivot cap trips on a
+                    // degenerate system (the String↔Arith substr seam). Propagate it
+                    // as a sound overall Unknown rather than looping forever.
+                    TCheck::Unknown => return FinalCheck::Unknown,
                 }
                 match self.arrays.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
