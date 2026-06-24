@@ -80,6 +80,44 @@ pub struct Arith {
     node_cuts: usize,
     /// Total cuts generated this solve (global cap).
     total_cuts: usize,
+    /// Total simplex pivots performed this solve (global, monotone, never reset on
+    /// backtrack). The String↔Arith `str.substr` seam can feed Arith an
+    /// ever-growing degenerate system whose per-`check_full` cost balloons across
+    /// successive SAT decisions; bounding CUMULATIVE pivots guarantees the whole
+    /// solve terminates. On exhaustion `check_full` returns `Unknown` (SOUND — it
+    /// declines to decide rather than loop or report a wrong verdict). The budget
+    /// is far above any realistic QF_LIA/QF_UFLRA workload, so it never trips on the
+    /// soundly-decidable fragment.
+    total_pivots: u64,
+    /// Total integer branch-and-bound splits emitted this solve (global, monotone,
+    /// never reset on backtrack). Branch-and-bound on UNBOUNDED integer variables
+    /// is not guaranteed to terminate: when the LP relaxation optimum keeps moving
+    /// to ever-larger fractional points (e.g. MBTC strict `<`/`>` separations over
+    /// shared `str.len` terms repeatedly push the relaxation away from an integer
+    /// point), each branch `x≤⌊v⌋ ∨ x≥⌈v⌉` mints a FRESH atom over a new numeral, so
+    /// atom-dedup cannot stop it and the search diverges (branch value → ∞). The SAT
+    /// `step_budget` only bounds this after millions of steps (minutes). Capping the
+    /// CUMULATIVE branch count here bounds it directly: on exhaustion `integer_check`
+    /// returns `Unknown` (SOUND — declines to decide rather than diverge). The budget
+    /// is far above any realistic finite-domain QF_LIA search, so it never trips on
+    /// the soundly-decidable fragment.
+    total_branches: u64,
+    /// Cumulative integer branch-and-bound budget for one solve (see
+    /// `total_branches`). On exhaustion `integer_check` returns a SOUND `Unknown`.
+    /// Defaults to a value above the largest branch count any legitimately-bounded
+    /// QF_LIA/QF_UFLIA instance needs (so it never trips on the pure-arith fragment),
+    /// and is lowered on the STRING path — where the LP relaxation over unbounded
+    /// `str.len` terms can diverge under MBTC strict separations, and where the
+    /// soundly-decidable string fragment needs only a handful of arith branches, so a
+    /// small cap bounds the divergence quickly without affecting any decidable query.
+    branch_budget: u64,
+    /// Cumulative simplex pivot budget for one solve (the `total_pivots` cap; see
+    /// `total_pivots`). Defaults high (no realistic QF_LIA/QF_UFLRA workload reaches
+    /// it) and is lowered on the STRING path, where the String↔Arith length seam can
+    /// feed an ever-growing degenerate system whose `entailed_equalities` /
+    /// `model_equal_shared_pairs` probing re-solves simplex unboundedly. On exhaustion
+    /// `check_full` returns a SOUND `Unknown`.
+    pivot_budget: u64,
 }
 
 impl Default for Arith {
@@ -104,6 +142,10 @@ impl Default for Arith {
             stage_b: true,
             node_cuts: 0,
             total_cuts: 0,
+            total_pivots: 0,
+            total_branches: 0,
+            branch_budget: Self::DEFAULT_BRANCH_BUDGET,
+            pivot_budget: Self::DEFAULT_PIVOT_BUDGET,
         }
     }
 }
@@ -111,6 +153,27 @@ impl Default for Arith {
 impl Arith {
     const MAX_CUTS_PER_NODE: usize = 4;
     const MAX_CUTS_TOTAL: usize = 10_000;
+    /// Default cumulative integer branch-and-bound split budget for one solve.
+    /// Branch-and-bound on unbounded integers may diverge (branch value → ∞); this
+    /// bounds it to a SOUND `Unknown`. Set above the largest branch count any
+    /// legitimately-bounded QF_LIA/QF_UFLIA instance in the differential corpus needs
+    /// (observed ≈80k), so it never trips on the pure-arith decidable fragment.
+    const DEFAULT_BRANCH_BUDGET: u64 = 150_000;
+    /// Branch-and-bound budget used on the STRING path. The soundly-decidable string
+    /// fragment needs only a handful of arith branches, while the LP relaxation over
+    /// unbounded `str.len` terms can diverge under MBTC strict separations; a small
+    /// cap bounds that divergence in well under a second (the per-branch cost grows
+    /// with the SAT trail) without making any decidable query Unknown.
+    pub const STRING_PATH_BRANCH_BUDGET: u64 = 4_000;
+    /// Default cumulative simplex pivot budget (see `pivot_budget`). Far above any
+    /// realistic QF_LIA/QF_UFLRA workload.
+    const DEFAULT_PIVOT_BUDGET: u64 = 2_000_000;
+    /// Simplex pivot budget used on the STRING path. The String↔Arith length seam's
+    /// degenerate `entailed_equalities` probing can re-solve simplex unboundedly;
+    /// this tight cap bails such a divergent seam to a SOUND `Unknown` in well under a
+    /// second, while the soundly-decidable string fragment finishes in far fewer
+    /// pivots.
+    pub const STRING_PATH_PIVOT_BUDGET: u64 = 2_000;
 
     fn grow_value(&mut self) {
         while self.value.len() < self.vars.len() {
@@ -123,6 +186,20 @@ impl Arith {
     /// Toggle the Plan B2 optimization gate (default ON). OFF = B1 baseline.
     pub fn set_stage_b(&mut self, on: bool) {
         self.stage_b = on;
+    }
+
+    /// Override the cumulative integer branch-and-bound budget (see `branch_budget`).
+    /// The solver lowers this on the string path so unbounded-`str.len` B&B
+    /// divergence is bounded to a SOUND `Unknown` quickly.
+    pub fn set_branch_budget(&mut self, n: u64) {
+        self.branch_budget = n;
+    }
+
+    /// Override the cumulative simplex pivot budget (see `pivot_budget`). The solver
+    /// lowers this on the string path so the degenerate String↔Arith length-seam
+    /// probing is bounded to a SOUND `Unknown` quickly.
+    pub fn set_pivot_budget(&mut self, n: u64) {
+        self.pivot_budget = n;
     }
 
     /// Reduce a normalized atom to a *bound on one variable*. For a single-term
@@ -274,12 +351,55 @@ impl Arith {
 
     fn check_full(&mut self) -> TCheck {
         use crate::simplex::{entering_for, first_violated_basic, Below};
+        // Cumulative anti-divergence guard (see `total_pivots`). The String↔Arith
+        // `str.substr` seam can drive an ever-growing degenerate system across many
+        // SAT decisions; capping the TOTAL pivots performed this solve guarantees
+        // termination even when each individual `check_full` would finish. On
+        // exhaustion we return `Unknown` — SOUND (decline to decide, never loop or
+        // report a wrong verdict). The budget is far above any realistic workload.
+        let total_pivot_budget: u64 = self.pivot_budget;
+        // Coefficient-blowup guard: a degenerate system (the String↔Arith
+        // `str.substr` seam) can make simplex coefficients grow without bound, so a
+        // SINGLE BigInt gcd/division dominates runtime (an effective hang the pivot
+        // COUNT cap cannot catch). If any current value's magnitude exceeds this
+        // many 64-bit limbs (~ thousands of decimal digits — far beyond any
+        // legitimate QF_LIA/QF_UFLRA coefficient), bail to a sound `Unknown`.
+        const MAX_LIMBS: usize = 64;
+        // Restore the DdM invariant before checking feasibility: every basic var's
+        // value must equal its row evaluated at the current nonbasic values. New
+        // slacks introduced by theory-emitted defining axioms (e.g. the string
+        // theory's `len(a++b) = len(a)+len(b)`), and nonbasic bound tightenings that
+        // did not trigger a value move, can leave a basic slack's cached value STALE
+        // — first_violated_basic would then read a phantom infeasibility and report a
+        // SPURIOUS conflict (observed wrong-UNSAT on `len(s2)=1 ∧ len(s2++"b")=2`,
+        // where the defining-axiom slack read 1 against its [.,0] bound instead of the
+        // true 0). Recomputing here is O(tableau) and makes the feasibility check
+        // consistent.
+        self.recompute_basic_values();
         loop {
+            self.total_pivots += 1;
+            if self.total_pivots > total_pivot_budget {
+                return TCheck::Unknown;
+            }
             let Some((basic, dir)) = first_violated_basic(&self.tableau, &self.bounds, &self.value)
             else {
                 // All bounds feasible: the system is satisfiable.
                 return TCheck::Sat;
             };
+            // Bail to a sound `Unknown` if a row coefficient has blown up past
+            // MAX_LIMBS (defense-in-depth against any residual degenerate growth;
+            // the primary fix for the substr seam is the proof-forest undo
+            // correctness in `EqualityEngine`).
+            {
+                let row = self.tableau.row(basic);
+                let blown = row.vars().any(|j| {
+                    let c = row.coeff(j);
+                    c.numer().limb_count() > MAX_LIMBS || c.denom().limb_count() > MAX_LIMBS
+                });
+                if blown {
+                    return TCheck::Unknown;
+                }
+            }
             let increase = dir == Below::Lower;
             match entering_for(&self.tableau, &self.bounds, &self.value, basic, increase) {
                 Some(entering) => {
@@ -599,7 +719,13 @@ impl Arith {
             TightenResult::Tightened => match self.check_full() {
                 TCheck::Sat => None,
                 TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
-                TCheck::Split(_) => unreachable!("arith check_full never emits Split"),
+                TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
+                // The pivot cap tripped (degenerate system). Conservatively treat
+                // the probe as "feasible / not proven entailed": returning `None`
+                // simply means we do NOT claim `u = v` is entailed. That is SOUND —
+                // it only forgoes a possible interface equality (a completeness
+                // concession), never asserts a false one.
+                TCheck::Unknown => None,
             },
         }
     }
@@ -658,7 +784,12 @@ impl Arith {
         match self.check_full() {
             TCheck::Sat => None,
             TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
-            TCheck::Split(_) => unreachable!("arith check_full never emits Split"),
+            TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
+            // Pivot cap tripped (degenerate). Report no conflict from this interface
+            // equality: SOUND (we only forgo detecting a possible infeasibility — a
+            // completeness concession that surfaces upstream as `Unknown`, never a
+            // wrong verdict).
+            TCheck::Unknown => None,
         }
     }
 
@@ -715,6 +846,24 @@ impl Arith {
         let Some((bv, _)) = best else {
             return TCheck::Sat; // all Int problem vars integral
         };
+        // Cumulative branch-and-bound budget (anti-divergence guard). B&B on
+        // UNBOUNDED integer variables is not guaranteed to terminate: when the LP
+        // relaxation optimum keeps moving to ever-larger fractional points (e.g.
+        // MBTC strict `<`/`>` separations over shared `str.len` terms repeatedly
+        // push the relaxation away from an integer point — observed branch values
+        // creep up roughly linearly: 1/2, 1999/2, 7999/2, …), each branch
+        // `x≤⌊v⌋ ∨ x≥⌈v⌉` mints a FRESH atom over a new numeral, so atom-dedup cannot
+        // stop it and the search diverges (branch value → ∞). The SAT `step_budget`
+        // only bounds this after millions of steps (minutes). Capping the CUMULATIVE
+        // branch count here bounds it directly: on exhaustion `integer_check` returns
+        // a SOUND `Unknown` (declines to decide rather than diverge). The budget is
+        // chosen above the largest branch count any legitimately-bounded
+        // QF_LIA/QF_UFLIA instance in the differential corpus needs, so it never
+        // trips on the soundly-decidable fragment.
+        self.total_branches += 1;
+        if self.total_branches > self.branch_budget {
+            return TCheck::Unknown;
+        }
         // Stage-B: try a GMI cut before branching, within budget.
         if self.stage_b
             && self.node_cuts < Self::MAX_CUTS_PER_NODE
@@ -723,7 +872,9 @@ impl Arith {
             if let Some(cut_atom) = self.try_gmi_cut(cx, bv) {
                 self.node_cuts += 1;
                 self.total_cuts += 1;
-                return TCheck::Split(vec![cut_atom]);
+                // GMI cut is a theory-valid clause over the integers — a tautology
+                // split, no guard.
+                return TCheck::Split { atoms: vec![cut_atom], guard: None };
             }
         }
         let (floor, ceil) = crate::branch::floor_ceil(&self.value[bv.index()]);
@@ -742,7 +893,8 @@ impl Arith {
             .terms
             .mk_app(Op::Builtin(BuiltinOp::Ge), &[term, ceil_num])
             .expect("(x >= ceil) well-sorted");
-        TCheck::Split(vec![le, ge])
+        // Branch `(x ≤ ⌊v⌋) ∨ (x ≥ ⌈v⌉)` is a tautology over the integers — no guard.
+        TCheck::Split { atoms: vec![le, ge], guard: None }
     }
 
     /// Derive a GMI cut from `bv`'s row and build a `≤` cut atom term over
@@ -1008,8 +1160,11 @@ impl TheorySolver for Arith {
         self.seed_apriori_if_needed();
         match self.check_full() {
             TCheck::Conflict(leaves) => return TCheck::Conflict(self.strip_apriori(leaves)),
-            TCheck::Split(_) => unreachable!("check_full never emits Split"),
+            TCheck::Split { .. } => unreachable!("check_full never emits Split"),
             TCheck::Sat => {}
+            // The simplex pivot cap tripped (degenerate cycle); surface Unknown so
+            // the combiner reports a SOUND `unknown` instead of looping forever.
+            TCheck::Unknown => return TCheck::Unknown,
         }
         self.integer_check(cx)
     }
@@ -1337,7 +1492,8 @@ mod check_tests {
                 assert!(leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(1), true))));
             }
             TCheck::Sat => panic!("expected conflict"),
-            TCheck::Split(_) => unreachable!("Arith check never emits Split in its own tests"),
+            TCheck::Split { .. } => unreachable!("Arith check never emits Split in its own tests"),
+            TCheck::Unknown => unreachable!("Arith never returns Unknown"),
         }
     }
 
@@ -2211,7 +2367,7 @@ mod integer_branch_tests {
         // Confirm the solver is also in a definitive state (not Split).
         let result = arith.check(&mut cx, Effort::Full);
         assert!(
-            !matches!(result, TCheck::Split(_)),
+            !matches!(result, TCheck::Split { .. }),
             "after a bound conflict at assert, check must not return Split"
         );
     }
@@ -2406,7 +2562,7 @@ mod cut_wiring_tests {
         // Confirm check does not claim Sat or Split (state is already conflicting).
         let result = arith.check(&mut cx, Effort::Full);
         assert!(
-            !matches!(result, TCheck::Split(_)),
+            !matches!(result, TCheck::Split { .. }),
             "after assert-time conflict, check must not return Split"
         );
     }

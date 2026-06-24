@@ -28,6 +28,15 @@ pub trait Theory: Default {
     /// theory can register `v -> atom` and build its encoding. Default no-op:
     /// theories that never emit `SplitAtoms` need not implement it.
     fn bind_fresh(&mut self, _v: Var, _atom: TermId) {}
+    /// If `atom` already has a SAT var registered with the theory, return it.
+    /// The split-atom protocol calls this BEFORE minting a fresh var so an
+    /// already-registered atom (e.g. an MBTC `(= u v)` that was previously
+    /// asserted, or a length atom shared with String/Arith) REUSES its existing
+    /// var instead of getting a second, unlinked one. Returning `None` (the
+    /// default) preserves the original mint-fresh behaviour.
+    fn var_for_atom(&self, _atom: TermId) -> Option<Var> {
+        None
+    }
 }
 
 /// The zero-cost default theory: a ZST whose methods compile to nothing.

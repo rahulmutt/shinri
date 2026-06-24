@@ -1,6 +1,6 @@
 //! End-to-end split-and-converge integration test (QF_LIA Plan A, Task 6).
 //!
-//! Drives a real `Solver<Combiner<NullTheory, OneShotSplitter, NullTheory>, NoProof, Vmtf>`
+//! Drives a real `Solver<Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory>, NoProof, Vmtf>`
 //! through the full splitting-on-demand loop:
 //!   sub-theory `TCheck::Split` → Combiner `TheoryResult::SplitAtoms`
 //!   → Solver mints+binds+learns+backtracks → search assigns split literals → Sat.
@@ -85,7 +85,10 @@ impl TheorySolver for OneShotSplitter {
     fn check(&mut self, _cx: &mut TheoryCtx, _effort: Effort) -> TCheck {
         if !self.fired {
             self.fired = true;
-            TCheck::Split(vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()])
+            TCheck::Split {
+                atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                guard: None,
+            }
         } else {
             TCheck::Sat
         }
@@ -107,10 +110,10 @@ fn split_once_then_sat_end_to_end() {
     // Reset the thread-local so a re-run in the same thread starts clean.
     BOUND.with(|b| b.borrow_mut().clear());
 
-    // Build a Solver whose theory is a real Combiner<NullTheory, OneShotSplitter, NullTheory>.
+    // Build a Solver whose theory is a real Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory>.
     // Combiner::default() uses Context::new() internally; no atoms are registered
     // here, so assert/propagate are no-ops for the single real var `a`.
-    let mut s: Solver<Combiner<NullTheory, OneShotSplitter, NullTheory>, NoProof, Vmtf> =
+    let mut s: Solver<Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory>, NoProof, Vmtf> =
         Solver::new(SolverConfig::default());
 
     // Mint one real var and force it true with a unit clause. This ensures the

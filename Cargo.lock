@@ -461,6 +461,17 @@ dependencies = [
  "shinri-num",
  "shinri-parser",
  "shinri-sat",
+ "shinri-str",
+ "shinri-theory",
+]
+
+[[package]]
+name = "shinri-str"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "shinri-core",
+ "shinri-sat",
  "shinri-theory",
 ]
 

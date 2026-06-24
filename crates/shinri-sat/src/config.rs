@@ -17,6 +17,17 @@ pub struct SolverConfig {
     pub reduce_interval: u32,
     pub lbd_keep_threshold: u32,
     pub random_seed: u64,
+    /// Optional resource limit: maximum number of `solve` main-loop steps
+    /// (propagate / decide / theory-callback iterations) before `solve` returns
+    /// `Unknown` (sound — it stops searching rather than reporting a verdict).
+    /// `None` (the default) means unlimited, preserving the original behaviour
+    /// for every existing caller. Used by the String path to bound the
+    /// semi-decidable word-equation search (e.g. the `str.substr` reduction over a
+    /// variable string) so it cannot diverge into an unbounded fresh-variable
+    /// CDCL search — a true non-termination that the per-theory `Full`-check fuel
+    /// cannot bound (the search may keep minting fresh decision vars and never
+    /// complete an assignment to re-reach the fuel-spending check).
+    pub step_budget: Option<u64>,
 }
 
 impl Default for SolverConfig {
@@ -26,6 +37,7 @@ impl Default for SolverConfig {
             reduce_interval: 2000,
             lbd_keep_threshold: 2,
             random_seed: 0,
+            step_budget: None,
         }
     }
 }

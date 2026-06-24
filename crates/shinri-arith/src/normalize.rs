@@ -171,7 +171,16 @@ fn linearize(
                     )
                 }
                 _ => {
-                    debug_assert!(false, "unexpected op in arith term");
+                    // Opaque leaf: any non-arithmetic builtin that is Int/Real-sorted
+                    // (e.g. `str.len(x)`) is treated as an opaque variable by the
+                    // arithmetic theory. The String theory owns the concrete value;
+                    // arith sees it as an abstract Int-sorted atom via N-O sharing.
+                    // This is sound: arith simply introduces a fresh problem variable
+                    // for it and constraints propagate through the combiner.
+                    debug_assert!(
+                        !matches!(op, Op::Builtin(BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Neg)),
+                        "arithmetic op should have been handled above"
+                    );
                     (
                         vec![(vars.problem_var(t), Rational::one())],
                         Rational::zero(),

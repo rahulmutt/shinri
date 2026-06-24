@@ -10,7 +10,7 @@ use shinri_euf::Euf;
 use shinri_theory::Combiner;
 
 type Sat = shinri_sat::Solver<
-    Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays>,
+    Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays, shinri_str::StrSolver>,
     shinri_core::NoProof,
     shinri_sat::Vmtf,
 >;
@@ -249,6 +249,12 @@ impl<'a> Encoder<'a> {
                 Ok(shinri_theory::types::Owner::Arrays) => {
                     // Arrays atoms are EUF-adjacent (select/store/array-eq);
                     // treat them like EUF for the mixed-theory fence.
+                    self.saw_euf = true;
+                    self.saw_euf_nonreal = true;
+                }
+                Ok(shinri_theory::types::Owner::String) => {
+                    // String equality atoms are EUF-adjacent in v1 (parked with
+                    // EUF until the string theory slot is wired in Task 7).
                     self.saw_euf = true;
                     self.saw_euf_nonreal = true;
                 }

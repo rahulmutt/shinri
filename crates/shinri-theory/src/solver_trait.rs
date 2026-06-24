@@ -20,11 +20,19 @@ pub struct TheoryCtx<'a> {
 /// A sub-theory consistency verdict. Convex Phase-1 theories produce conflicts,
 /// never free-standing lemmas. `Split` is the SINGLE sanctioned exception (QF_LIA
 /// Plan A): a clause of theory-valid positive atoms (`TermId`s) the Combiner
-/// lifts to `TheoryResult::SplitAtoms`. Only arithmetic emits it; EUF/Empty never do.
+/// lifts to `TheoryResult::SplitAtoms`. Arithmetic and arrays emit TAUTOLOGY
+/// splits (`guard = None`); the String theory emits a GUARDED split
+/// (`guard = Some(¬eqn)`) whose disjunction is only valid given the triggering
+/// word equation (sound Nielsen lemma). The optional `guard` is a literal over an
+/// already-allocated SAT var, threaded verbatim into the learnt clause.
 pub enum TCheck {
     Sat,
     Conflict(Vec<EqLeaf>),
-    Split(Vec<TermId>),
+    Split { atoms: Vec<TermId>, guard: Option<Lit> },
+    /// The theory's fuel budget was exhausted; the result is unknown (neither
+    /// sat nor unsat). The solver must propagate this to `SolveOutcome::Unknown`
+    /// without treating it as satisfiable.
+    Unknown,
 }
 
 /// `pop(level)` uses ABSOLUTE target levels (matching `EqualityEngine`/`UndoLog`).
@@ -176,16 +184,19 @@ mod tests {
             eq: &mut eq,
             atoms: &atoms,
         };
-        assert!(matches!(t.check(&mut cx, Effort::Full), TCheck::Sat));
+        assert!(matches!(t.check(&mut cx, Effort::Full), TCheck::Sat), "NullTheory must always return Sat");
     }
 
     #[test]
     fn tcheck_split_carries_atoms() {
         let t = shinri_core::TermId::new(5).unwrap();
-        let c = TCheck::Split(vec![t]);
+        let c = TCheck::Split { atoms: vec![t], guard: None };
         match c {
-            TCheck::Split(atoms) => assert_eq!(atoms, vec![t]),
-            _ => panic!("expected Split"),
+            TCheck::Split { atoms, guard } => {
+                assert_eq!(atoms, vec![t]);
+                assert_eq!(guard, None);
+            }
+            TCheck::Sat | TCheck::Conflict(_) | TCheck::Unknown => panic!("expected Split"),
         }
     }
 }

@@ -182,6 +182,7 @@ impl<'a> Parser<'a> {
             "Bool" => Ok(ctx.bool_sort()),
             "Int" => Ok(ctx.int_sort()),
             "Real" => Ok(ctx.real_sort()),
+            "String" => Ok(ctx.string_sort()),
             other => self
                 .env
                 .lookup_sort(other)
@@ -244,6 +245,11 @@ impl<'a> Parser<'a> {
             "bvsgt" => BvSgt,
             "bvsge" => BvSge,
             "concat" => BvConcat,
+            // String operators (QF_S / SLIA)
+            "str.++" => StrConcat,
+            "str.len" => StrLen,
+            "str.at" => StrAt,
+            "str.substr" => StrSubstr,
             _ => return None,
         })
     }
@@ -307,6 +313,12 @@ impl<'a> Parser<'a> {
                 let value = Integer::from_str_radix(digits, 2)
                     .map_err(|_| Diagnostic::new(sp, "invalid binary literal"))?;
                 Ok(ctx.mk_bv_const(width, value))
+            }
+            Token::Str(s) => {
+                // Strip outer quotes and unescape "" -> " (SMT-LIB string literal syntax).
+                let raw = &s[1..s.len() - 1];
+                let val = raw.replace("\"\"", "\"");
+                Ok(ctx.mk_string_const(&val))
             }
             Token::Symbol(name) => self.resolve_leaf(ctx, &name, sp),
             Token::LParen => self.parse_compound(ctx, sp),
@@ -700,6 +712,11 @@ impl<'a> Parser<'a> {
             | BuiltinOp::BvRotateLeft(_)
             | BuiltinOp::BvRotateRight(_)
             | BuiltinOp::BvRepeat(_) => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            // String ops: delegate directly to mk_app (sort-checking in Context).
+            BuiltinOp::StrConcat
+            | BuiltinOp::StrLen
+            | BuiltinOp::StrAt
+            | BuiltinOp::StrSubstr => Self::mk(ctx, Op::Builtin(op), &args, &sp),
         }
     }
 
@@ -1440,6 +1457,132 @@ mod tests {
                 result.is_err(),
                 "bvadd of bv8 and bv16 must produce a sort error"
             );
+        }
+    }
+
+    /// Task-4 TDD test: String sort, string literals, and str.* operators.
+    ///
+    /// The script declares `x : String`, then asserts
+    /// `(= (str.len (str.++ x "ab")) 5)`.
+    ///
+    /// Assertions:
+    ///   - Parsing returns Ok (no diagnostics).
+    ///   - The assert term is an Eq whose first child is StrLen.
+    ///   - The literal "ab" round-trips as a string const of value "ab".
+    #[test]
+    fn parses_strings_concat_len_and_literal() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = r#"
+            (declare-fun x () String)
+            (assert (= (str.len (str.++ x "ab")) 5))
+        "#;
+        let (ctx, cmds) = parse_all_ok(src);
+        // Two commands: declare-fun + assert.
+        assert_eq!(cmds.len(), 2, "expected declare-fun + assert");
+        // The second command is an Assert.
+        let assert_term = match &cmds[1] {
+            Command::Assert(t) => *t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        // Top-level term must be Eq.
+        let eq_args = match ctx.term_node(assert_term).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } => ctx.children(args).to_vec(),
+            other => panic!("expected Eq App at top level, got {other:?}"),
+        };
+        // First child of Eq is StrLen.
+        let strlen_arg = match ctx.term_node(eq_args[0]).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrLen),
+                args,
+                ..
+            } => ctx.children(args).to_vec(),
+            other => panic!("expected StrLen as lhs of Eq, got {other:?}"),
+        };
+        // The StrLen's argument is StrConcat.
+        let concat_args = match ctx.term_node(strlen_arg[0]).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrConcat),
+                args,
+                ..
+            } => ctx.children(args).to_vec(),
+            other => panic!("expected StrConcat inside StrLen, got {other:?}"),
+        };
+        // Second arg of StrConcat is the literal "ab".
+        let lit_ab = concat_args[1];
+        assert_eq!(
+            ctx.string_const_value(lit_ab),
+            Some("ab"),
+            "literal \"ab\" must round-trip as string const"
+        );
+    }
+
+    /// Parse `(str.at x 1)` and verify the App's op is StrAt.
+    #[test]
+    fn parses_strings_str_at() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = r#"
+            (declare-fun x () String)
+            (assert (= (str.at x 1) "a"))
+        "#;
+        let (ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 2, "expected declare-fun + assert");
+        let assert_term = match &cmds[1] {
+            Command::Assert(t) => *t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        // Top-level term must be Eq.
+        let eq_args = match ctx.term_node(assert_term).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } => ctx.children(args).to_vec(),
+            other => panic!("expected Eq App at top level, got {other:?}"),
+        };
+        // First child of Eq must be StrAt.
+        match ctx.term_node(eq_args[0]).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrAt),
+                ..
+            } => {}
+            other => panic!("expected StrAt as lhs of Eq, got {other:?}"),
+        }
+    }
+
+    /// Parse `(str.substr x 1 2)` and verify the App's op is StrSubstr.
+    #[test]
+    fn parses_strings_str_substr() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = r#"
+            (declare-fun x () String)
+            (assert (= (str.substr x 1 2) "ab"))
+        "#;
+        let (ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 2, "expected declare-fun + assert");
+        let assert_term = match &cmds[1] {
+            Command::Assert(t) => *t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        // Top-level term must be Eq.
+        let eq_args = match ctx.term_node(assert_term).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } => ctx.children(args).to_vec(),
+            other => panic!("expected Eq App at top level, got {other:?}"),
+        };
+        // First child of Eq must be StrSubstr.
+        match ctx.term_node(eq_args[0]).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrSubstr),
+                ..
+            } => {}
+            other => panic!("expected StrSubstr as lhs of Eq, got {other:?}"),
         }
     }
 

@@ -94,7 +94,8 @@ impl TheorySolver for Arrays {
                     // ROW-1: sel = e
                     if !Self::equal(cx, sel, e) {
                         let lemma = cx.terms.mk_eq(sel, e).expect("well-sorted");
-                        return TCheck::Split(vec![lemma]);
+                        // ROW-1 is a McCarthy-axiom T-tautology — no guard.
+                        return TCheck::Split { atoms: vec![lemma], guard: None };
                     }
                 } else {
                     // ROW-2: (i = j) ∨ (sel = select(b, j))
@@ -105,7 +106,8 @@ impl TheorySolver for Arrays {
                     if !Self::equal(cx, sel, selbj) {
                         let eqij = cx.terms.mk_eq(i, j).expect("well-sorted");
                         let eqsel = cx.terms.mk_eq(sel, selbj).expect("well-sorted");
-                        return TCheck::Split(vec![eqij, eqsel]);
+                        // ROW-2 is a McCarthy-axiom T-tautology — no guard.
+                        return TCheck::Split { atoms: vec![eqij, eqsel], guard: None };
                     }
                 }
             }
@@ -164,7 +166,7 @@ mod tests {
         arrays.new_var(&mut cx, shinri_core::Var::new(0), atom);
 
         match arrays.check(&mut cx, Effort::Full) {
-            TCheck::Split(atoms) => {
+            TCheck::Split { atoms, .. } => {
                 // The lemma forces sel = e (the same eq term, or a fresh equal one).
                 assert!(!atoms.is_empty(), "ROW-1 must emit a lemma");
             }
@@ -173,7 +175,8 @@ mod tests {
                 match other {
                     TCheck::Sat => "Sat",
                     TCheck::Conflict(_) => "Conflict",
-                    TCheck::Split(_) => unreachable!(),
+                    TCheck::Split { .. } => unreachable!(),
+                    TCheck::Unknown => unreachable!("Arrays never returns Unknown"),
                 }
             ),
         }
@@ -214,13 +217,14 @@ mod tests {
         arrays.new_var(&mut cx, shinri_core::Var::new(0), atom);
 
         match arrays.check(&mut cx, Effort::Full) {
-            TCheck::Split(atoms) => assert_eq!(atoms.len(), 2, "ROW-2 split has two disjuncts"),
+            TCheck::Split { atoms, .. } => assert_eq!(atoms.len(), 2, "ROW-2 split has two disjuncts"),
             other => panic!(
                 "expected 2-atom Split, got {:?}",
                 match other {
                     TCheck::Sat => "Sat",
                     TCheck::Conflict(_) => "Conflict",
-                    TCheck::Split(_) => unreachable!(),
+                    TCheck::Split { .. } => unreachable!(),
+                    TCheck::Unknown => unreachable!("Arrays never returns Unknown"),
                 }
             ),
         }

@@ -18,10 +18,12 @@ use shinri_sat::{Effort, Theory, TheoryResult};
 enum FinalCheck {
     Sat,
     Conflict(Vec<crate::types::EqLeaf>),
-    Split(Vec<TermId>),
+    Split { atoms: Vec<TermId>, guard: Option<Lit> },
+    /// A sub-theory exhausted its fuel budget; the overall result is unknown.
+    Unknown,
 }
 
-pub struct Combiner<E: TheorySolver, A: TheorySolver, R: TheorySolver> {
+pub struct Combiner<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> {
     terms: Context,
     eq: EqualityEngine,
     atoms: AtomRegistry,
@@ -29,6 +31,7 @@ pub struct Combiner<E: TheorySolver, A: TheorySolver, R: TheorySolver> {
     euf: E,
     arith: A,
     arrays: R,
+    string: S,
     level: usize,
     merges: Vec<MergeEvent>,
     /// A conflict detected during `assert` (the SAT seam's `assert` is
@@ -37,13 +40,13 @@ pub struct Combiner<E: TheorySolver, A: TheorySolver, R: TheorySolver> {
     cert: CertLog,
 }
 
-impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Default for Combiner<E, A, R> {
+impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Default for Combiner<E, A, R, S> {
     fn default() -> Self {
         Combiner::with_context(Context::new())
     }
 }
 
-impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
+impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combiner<E, A, R, S> {
     pub fn with_context(terms: Context) -> Self {
         Combiner {
             terms,
@@ -53,11 +56,17 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
             euf: E::default(),
             arith: A::default(),
             arrays: R::default(),
+            string: S::default(),
             level: 0,
             merges: Vec::new(),
             pending_conflict: None,
             cert: CertLog::default(),
         }
+    }
+
+    /// Expose the term context for tests and callers that need to build atoms.
+    pub fn context_mut(&mut self) -> &mut Context {
+        &mut self.terms
     }
 
     /// Expose the EUF theory field for EUF-specific setup (e.g. set_truth_terms).
@@ -76,6 +85,11 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
         &mut self.arrays
     }
 
+    /// Mutable access to the string theory slot (mirrors `arrays_mut`).
+    pub fn string_mut(&mut self) -> &mut S {
+        &mut self.string
+    }
+
     /// Classify and register an atom, refusing unsupported constructs (spec §9).
     pub fn register_atom(&mut self, v: Var, atom: TermId) -> Result<(), Unsupported> {
         let owner = classify(&self.terms, atom)?;
@@ -89,6 +103,13 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
                     atoms: &self.atoms,
                 };
                 self.euf.new_var(&mut cx, v, atom);
+                // N-O boundary: if the atom contains str.len subterms (e.g.
+                // `(= (str.len x) 1)` routes to EUF as an Int equality), also
+                // notify the String theory so it can track len_terms for axiom
+                // emission and the N-O shared-arith interface.
+                if atom_contains_str_len(&cx.terms, atom) {
+                    self.string.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Arith => {
                 let mut cx = TheoryCtx {
@@ -101,6 +122,14 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
                 // linear arith atom (e.g. `(- (f x0) (f x1))`) must be interned
                 // into EUF so congruence applies and it joins the shared set S.
                 self.euf.register_arith_uf_terms(&mut cx, atom);
+                // N-O boundary: if the atom contains str.len subterms (e.g.
+                // `(<= (str.len x) 1)` routes to Arith), also notify the String
+                // theory so it can track len_terms for axiom emission and the
+                // N-O shared-arith interface. This is required for the String↔Arith
+                // seam to detect contradictions such as `len(x)=1 ∧ x=""`.
+                if atom_contains_str_len(&cx.terms, atom) {
+                    self.string.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Shared => {
                 // Purify first: splits mixed terms, emitting defining equalities
@@ -134,12 +163,58 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
                 self.euf.new_var(&mut cx, v, atom);
                 self.arrays.new_var(&mut cx, v, atom);
             }
+            // String atoms route to BOTH EUF (for congruence over string terms)
+            // and the string theory slot.
+            Owner::String => {
+                let mut cx = TheoryCtx {
+                    terms: &mut self.terms,
+                    eq: &mut self.eq,
+                    atoms: &self.atoms,
+                };
+                self.euf.new_var(&mut cx, v, atom);
+                self.string.new_var(&mut cx, v, atom);
+            }
         }
         Ok(())
     }
 }
 
-impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Theory for Combiner<E, A, R> {
+/// Returns true if `atom` (or any of its subterms) is a `str.len` application.
+/// Used by `register_atom` to notify the String theory about len_terms that
+/// appear in Arith/EUF atoms (N-O boundary fix).
+///
+/// Returns false immediately for synthetic TermIds that are not interned in
+/// `terms` (e.g. mock atoms from tests or split atoms from sub-theories using
+/// their own Context). This is safe because any real `str.len` atom must be
+/// interned before it can reach `register_atom` / `bind_fresh`.
+fn atom_contains_str_len(terms: &Context, atom: TermId) -> bool {
+    use shinri_core::{BuiltinOp, Op, TermNode};
+    fn walk(terms: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
+        if !seen.insert(t) {
+            return false;
+        }
+        if !terms.contains_term(t) {
+            return false;
+        }
+        match terms.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                if matches!(op, Op::Builtin(BuiltinOp::StrLen)) {
+                    return true;
+                }
+                let kids = terms.children(*args).to_vec();
+                kids.iter().any(|&k| walk(terms, k, seen))
+            }
+            TermNode::Const { .. } => false,
+        }
+    }
+    if !terms.contains_term(atom) {
+        return false;
+    }
+    let mut seen = rustc_hash::FxHashSet::default();
+    walk(terms, atom, &mut seen)
+}
+
+impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory for Combiner<E, A, R, S> {
     fn assert(&mut self, lit: Lit) {
         // The SAT layer asserts EVERY trail literal, including auxiliary Tseitin
         // variables minted for Boolean connectives (And/Or/Implies/Xor/Ite/...).
@@ -168,6 +243,13 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Theory for Combiner<E, A
                 let e = self.euf.assert(&mut cx, lit);
                 let r = self.arrays.assert(&mut cx, lit);
                 e.or(r)
+            }
+            // String atoms route to BOTH EUF (for congruence) and the string
+            // theory slot.
+            Owner::String => {
+                let e = self.euf.assert(&mut cx, lit);
+                let s = self.string.assert(&mut cx, lit);
+                e.or(s)
             }
         };
         if conflict.is_some() && self.pending_conflict.is_none() {
@@ -210,16 +292,27 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Theory for Combiner<E, A
         match self.drive_final_check() {
             FinalCheck::Sat => TheoryResult::Sat,
             FinalCheck::Conflict(leaves) => TheoryResult::Conflict(self.expand_conflict(leaves)),
-            FinalCheck::Split(atoms) => TheoryResult::SplitAtoms(atoms),
+            FinalCheck::Split { atoms, guard } => TheoryResult::SplitAtoms { atoms, guard },
+            FinalCheck::Unknown => TheoryResult::Unknown,
         }
     }
 
     fn bind_fresh(&mut self, v: Var, atom: TermId) {
         // A fresh split atom: QF_LIA branch/cut atoms (Le/Ge) → Arith; QF_UFLIA
         // MBTC's interface `(= u v)` → Euf, `(< u v)`/`(> u v)` → Arith. Classify
-        // and route to the owning theory, mirroring `register_atom`. A fresh atom
-        // is always supported by construction; fall back to Arith defensively.
-        let owner = classify(&self.terms, atom).unwrap_or(Owner::Arith);
+        // and route to the owning theory, mirroring `register_atom`. Boolean
+        // connectives (e.g. `(=> A B)` tautology splits emitted by String theory)
+        // and synthetic TermIds (from sub-theories or mock theories in tests) are
+        // SAT-layer constructs not owned by any theory. For interned Boolean
+        // connectives, fall back to EUF (which harmlessly interns the term).
+        // For non-interned synthetic TermIds, skip theory registration entirely.
+        let classify_result = classify(&self.terms, atom);
+        let is_interned = self.terms.contains_term(atom);
+        let owner = match classify_result {
+            Ok(o) => o,
+            Err(_) if is_interned => Owner::Euf, // Boolean connective (e.g. `(=> A B)`) → EUF
+            Err(_) => Owner::Arith, // Synthetic TermId (e.g. Arith branch/cut atoms) → Arith (original behavior)
+        };
         self.atoms.register(v, atom, owner);
         let mut cx = TheoryCtx {
             terms: &mut self.terms,
@@ -227,10 +320,18 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Theory for Combiner<E, A
             atoms: &self.atoms,
         };
         match owner {
-            Owner::Euf => self.euf.new_var(&mut cx, v, atom),
+            Owner::Euf => {
+                self.euf.new_var(&mut cx, v, atom);
+                if atom_contains_str_len(&cx.terms, atom) {
+                    self.string.new_var(&mut cx, v, atom);
+                }
+            }
             Owner::Arith => {
                 self.arith.new_var(&mut cx, v, atom);
                 self.euf.register_arith_uf_terms(&mut cx, atom);
+                if atom_contains_str_len(&cx.terms, atom) {
+                    self.string.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Shared => {
                 self.euf.new_var(&mut cx, v, atom);
@@ -241,7 +342,23 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Theory for Combiner<E, A
                 self.euf.new_var(&mut cx, v, atom);
                 self.arrays.new_var(&mut cx, v, atom);
             }
+            // String split atoms route to BOTH EUF (for congruence) and the
+            // string theory slot.
+            Owner::String => {
+                self.euf.new_var(&mut cx, v, atom);
+                self.string.new_var(&mut cx, v, atom);
+            }
         }
+    }
+
+    fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+        // Reuse the existing SAT var for an already-registered atom so a re-emitted
+        // split atom does not mint a SECOND, unlinked var (the duplicate-var hazard
+        // that splits an atom's truth value across two vars → spurious UNSAT /
+        // non-termination). Only interned, previously-registered atoms resolve here;
+        // synthetic split TermIds are absent from the registry and correctly fall
+        // through to a fresh var.
+        self.atoms.var_of_atom(atom)
     }
 
     fn push(&mut self) {
@@ -250,19 +367,34 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Theory for Combiner<E, A
         self.euf.push();
         self.arith.push();
         self.arrays.push();
+        self.string.push();
     }
 
     fn pop(&mut self, n: usize) {
         let target = self.level - n;
+        // Discard any pending congruence-merge notifications before popping. A merge
+        // notification is a transient signal for the N-O exchange to react to in the
+        // SAME `drive_final_check` round; an early return from that loop (an arith
+        // conflict / split surfacing right after an `arith→EUF` interface merge, e.g.
+        // a length contradiction `len(s) < 0` co-asserted with a substr/concat
+        // equality) can leave the queue non-empty. The merges have already been
+        // applied to the EUF structure and are about to be UNDONE by this pop, so any
+        // unconsumed notification is stale — draining (discarding) it is sound and
+        // satisfies the `EqualityEngine::pop` drained-queue invariant (which would
+        // otherwise panic in debug builds: "pop with undrained merge events").
+        self.merges.clear();
+        self.eq.drain_merges(&mut self.merges);
+        self.merges.clear();
         self.eq.pop(target);
         self.euf.pop(target);
         self.arith.pop(target);
         self.arrays.pop(target);
+        self.string.pop(target);
         self.level = target;
     }
 }
 
-impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
+impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combiner<E, A, R, S> {
     /// Run both theories' Full check to a joint fixpoint over the shared engine,
     /// with BIDIRECTIONAL Nelson-Oppen equality propagation (Task 12b).
     /// Returns the conflicting antecedent leaves, or None if jointly consistent.
@@ -297,21 +429,39 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
                 eq: &mut self.eq,
                 atoms: &self.atoms,
             };
-            if !self.euf.has_uf_application(&mut cx) {
-                // No UF: exchange/MBTC do nothing useful; skip entirely.
+            let euf_uf = self.euf.has_uf_application(&mut cx);
+            let str_lens = self.string.shared_arith_terms(&mut cx); // str.len terms (empty for the stub)
+            if !euf_uf && str_lens.is_empty() {
+                // No UF and no string-length terms: exchange/MBTC do nothing useful; skip entirely.
                 Vec::new()
             } else {
-                let s = self.euf.shared_arith_terms(&mut cx);
-                for &t in &s {
-                    self.arith.ensure_shared_var(&mut cx, t);
-                }
+                let mut s = self.euf.shared_arith_terms(&mut cx);
+                for t in str_lens { if !s.contains(&t) { s.push(t); } }
+                for &t in &s { self.arith.ensure_shared_var(&mut cx, t); }
                 s
             }
         };
         // Pairs already asserted EUF→arith this check (R5 termination guard).
         let mut iface_asserted: FxHashSet<(TermId, TermId)> = FxHashSet::default();
 
+        // Round bound (sound termination guard). The Nelson-Oppen exchange + MBTC
+        // converges over the FIXED shared set in O(|shared|) rounds (each productive
+        // round makes one new merge / interface assertion, and the shared set is
+        // finite), but the String↔Arith length seam can feed it a degenerate arith
+        // system whose `entailed_equalities` simplex probing reports a fresh entailed
+        // pair every round (over ever-changing slacks) — so the fixpoint is never
+        // reached in practice and the loop spins. We cap the round count to a small
+        // multiple of |shared| (far above the ~2·|shared| any legitimate convergence
+        // needs) and return a SOUND `Unknown` on exhaustion. The per-round cost is a
+        // full simplex re-solve, so this is kept tight: a divergent length seam bails
+        // to Unknown in well under a second instead of spinning for many seconds.
+        let round_cap: u64 = 256 + 32 * (shared.len() as u64);
+        let mut rounds: u64 = 0;
         loop {
+            rounds += 1;
+            if rounds > round_cap {
+                return FinalCheck::Unknown;
+            }
             {
                 let mut cx = TheoryCtx {
                     terms: &mut self.terms,
@@ -320,18 +470,31 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
                 };
                 match self.euf.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split(_) => unreachable!("EUF never splits"),
+                    TCheck::Split { .. } => unreachable!("EUF never splits"),
                     TCheck::Sat => {}
+                    TCheck::Unknown => unreachable!("EUF never returns Unknown"),
                 }
                 match self.arith.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split(atoms) => return FinalCheck::Split(atoms),
+                    TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
                     TCheck::Sat => {}
+                    // Arith now returns Unknown when its simplex pivot cap trips on a
+                    // degenerate system (the String↔Arith substr seam). Propagate it
+                    // as a sound overall Unknown rather than looping forever.
+                    TCheck::Unknown => return FinalCheck::Unknown,
                 }
                 match self.arrays.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split(atoms) => return FinalCheck::Split(atoms),
+                    TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
                     TCheck::Sat => {}
+                    TCheck::Unknown => unreachable!("Arrays never returns Unknown"),
+                }
+                // String checks last (lowest priority).
+                match self.string.check(&mut cx, Effort::Full) {
+                    TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
+                    TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
+                    TCheck::Sat => {}
+                    TCheck::Unknown => return FinalCheck::Unknown,
                 }
             }
             // Did the existing round produce a new interface/congruence merge?
@@ -477,7 +640,9 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
                             &[u, v],
                         )
                         .expect("(> u v) well-sorted");
-                    return FinalCheck::Split(vec![eq, lt, gt]);
+                    // MBTC trichotomy `(= u v) ∨ (< u v) ∨ (> u v)` is a tautology
+                    // over a totally-ordered arith domain — no guard needed.
+                    return FinalCheck::Split { atoms: vec![eq, lt, gt], guard: None };
                 }
                 return FinalCheck::Sat;
             }
@@ -504,6 +669,9 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
                     return Some(cf);
                 }
                 if let Some(cf) = self.arrays.propagate(&mut cx, out) {
+                    return Some(cf);
+                }
+                if let Some(cf) = self.string.propagate(&mut cx, out) {
                     return Some(cf);
                 }
             }
@@ -602,6 +770,19 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
         let mut combined = arith_m;
         combined.absorb(euf_m);
         combined.absorb(arrays_m);
+        // Build the string model LAST, directly into `combined`, so it can read
+        // the arith-assigned `(str.len ·)` values (needed to fill free string
+        // variables to their correct length) and any EUF-assigned string values.
+        // A separate empty builder would hide those, yielding length-0 strings
+        // that violate their own `str.len` constraint.
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut self.terms,
+                eq: &mut self.eq,
+                atoms: &self.atoms,
+            };
+            self.string.model(&mut cx, &mut combined);
+        }
         combined
     }
 
@@ -625,6 +806,8 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver> Combiner<E, A, R> {
                 self.arith.explain(&mut cx, j.tag, exp);
             } else if j.theory == R::THEORY_ID {
                 self.arrays.explain(&mut cx, j.tag, exp);
+            } else if j.theory == S::THEORY_ID {
+                self.string.explain(&mut cx, j.tag, exp);
             } else {
                 debug_assert!(false, "explain: unknown theory id {}", j.theory);
             }
@@ -720,7 +903,7 @@ mod tests {
         let le = ctx
             .mk_app(Op::Builtin(shinri_core::BuiltinOp::Le), &[x, y])
             .unwrap();
-        let mut c: Combiner<Spy, Spy, NullTheory> = Combiner::with_context(ctx);
+        let mut c: Combiner<Spy, Spy, NullTheory, NullTheory> = Combiner::with_context(ctx);
         let v = Var::new(0);
         c.register_atom(v, le).unwrap();
         c.assert(Lit::new(v, true));
@@ -730,7 +913,7 @@ mod tests {
 
     #[test]
     fn push_pop_track_absolute_levels() {
-        let mut c: Combiner<Spy, Spy, NullTheory> = Combiner::default();
+        let mut c: Combiner<Spy, Spy, NullTheory, NullTheory> = Combiner::default();
         c.push();
         c.push();
         assert_eq!(c.level, 2);
@@ -758,7 +941,7 @@ mod tests {
                 &[xy, z],
             )
             .unwrap();
-        let mut c: Combiner<Spy, Spy, NullTheory> = Combiner::with_context(ctx);
+        let mut c: Combiner<Spy, Spy, NullTheory, NullTheory> = Combiner::with_context(ctx);
         assert!(c.register_atom(Var::new(0), le).is_err());
     }
 
@@ -798,7 +981,7 @@ mod tests {
 
     #[test]
     fn propagate_collects_theory_implications_to_fixpoint() {
-        let mut c: Combiner<OneShotProp, OneShotProp, NullTheory> = Combiner::default();
+        let mut c: Combiner<OneShotProp, OneShotProp, NullTheory, NullTheory> = Combiner::default();
         c.euf.p = Some(Lit::new(Var::new(7), true));
         let mut out = Vec::new();
         assert!(c.propagate(&mut out).is_none());
@@ -879,14 +1062,14 @@ mod tests {
 
     #[test]
     fn final_check_sat_when_theories_agree() {
-        let mut c: Combiner<OneShotProp, OneShotProp, NullTheory> = Combiner::default();
+        let mut c: Combiner<OneShotProp, OneShotProp, NullTheory, NullTheory> = Combiner::default();
         assert!(matches!(c.check(Effort::Full), TheoryResult::Sat));
     }
 
     #[test]
     fn final_check_conflicts_when_an_interface_merge_violates_the_other_theory() {
         // euf = Merger (merges 1,2), arith = Splitter (conflicts if 1==2).
-        let mut c: Combiner<Merger, Splitter, NullTheory> = Combiner::default();
+        let mut c: Combiner<Merger, Splitter, NullTheory, NullTheory> = Combiner::default();
         match c.check(Effort::Full) {
             TheoryResult::Conflict(lits) => assert!(
                 lits.is_empty(),
@@ -933,7 +1116,7 @@ mod tests {
     fn conflict_expands_interface_leaves_to_input_literals_and_negates() {
         // euf = Explained (merges 1,2 with an interface just it can explain),
         // arith = Splitter (conflicts when 1==2, citing that interface just).
-        let mut c: Combiner<Explained, Splitter, NullTheory> = Combiner::default();
+        let mut c: Combiner<Explained, Splitter, NullTheory, NullTheory> = Combiner::default();
         match c.check(Effort::Full) {
             TheoryResult::Conflict(clause) => {
                 // The interface leaf resolved to lit(50,+); the clause negates it.
@@ -945,7 +1128,7 @@ mod tests {
 
     #[test]
     fn emitted_conflict_is_recorded_and_rechecks() {
-        let mut c: Combiner<Explained, Splitter, NullTheory> = Combiner::default();
+        let mut c: Combiner<Explained, Splitter, NullTheory, NullTheory> = Combiner::default();
         let _ = c.check(Effort::Full);
         assert_eq!(c.cert_log().steps().len(), 1);
         assert_eq!(c.cert_log().recheck(), Ok(()));
@@ -987,7 +1170,7 @@ mod tests {
 
     #[test]
     fn build_model_collects_theory_assignments() {
-        let mut c: Combiner<OneShotProp, ValTheory, NullTheory> = Combiner::default();
+        let mut c: Combiner<OneShotProp, ValTheory, NullTheory, NullTheory> = Combiner::default();
         c.arith.k = 42;
         let m = c.build_model();
         assert_eq!(
@@ -1004,7 +1187,7 @@ mod tests {
         // Splitter then conflicts because they are equal. After the conflict the
         // SAT loop pops — the engine's merge queue must already be drained, else
         // EqualityEngine::pop's debug_assert fires.
-        let mut c: Combiner<Merger, Splitter, NullTheory> = Combiner::default();
+        let mut c: Combiner<Merger, Splitter, NullTheory, NullTheory> = Combiner::default();
         c.push();
         match c.check(Effort::Full) {
             TheoryResult::Conflict(_) => {}
@@ -1024,7 +1207,7 @@ mod tests {
         let le = ctx
             .mk_app(Op::Builtin(shinri_core::BuiltinOp::Le), &[x, y])
             .unwrap();
-        let mut c: Combiner<Spy, AssertConflicter, NullTheory> = Combiner::with_context(ctx);
+        let mut c: Combiner<Spy, AssertConflicter, NullTheory, NullTheory> = Combiner::with_context(ctx);
         let v = Var::new(0);
         c.register_atom(v, le).unwrap();
         c.assert(Lit::new(v, true));
@@ -1094,7 +1277,7 @@ mod tests {
                 let atom = self
                     .split_atom
                     .expect("split_atom must be set before check");
-                TCheck::Split(vec![atom])
+                TCheck::Split { atoms: vec![atom], guard: None }
             } else {
                 TCheck::Sat
             }
@@ -1117,13 +1300,14 @@ mod tests {
             .mk_app(Op::Builtin(shinri_core::BuiltinOp::Le), &[x, y])
             .unwrap();
 
-        let mut comb: Combiner<NullTheory, ArithSplitter, NullTheory> = Combiner::with_context(ctx);
+        let mut comb: Combiner<NullTheory, ArithSplitter, NullTheory, NullTheory> = Combiner::with_context(ctx);
         comb.arith.split_atom = Some(le);
 
         // First Full check lifts the arith Split into SplitAtoms.
         match Theory::check(&mut comb, Effort::Full) {
-            TheoryResult::SplitAtoms(atoms) => {
-                assert_eq!(atoms, vec![le])
+            TheoryResult::SplitAtoms { atoms, guard } => {
+                assert_eq!(atoms, vec![le]);
+                assert_eq!(guard, None);
             }
             other => panic!("expected SplitAtoms, got {other:?}"),
         }
@@ -1148,7 +1332,7 @@ mod tests {
         let lt = ctx
             .mk_app(Op::Builtin(shinri_core::BuiltinOp::Lt), &[u, v])
             .unwrap();
-        let mut c: Combiner<Spy, Spy, NullTheory> = Combiner::with_context(ctx);
+        let mut c: Combiner<Spy, Spy, NullTheory, NullTheory> = Combiner::with_context(ctx);
         let ve = Var::new(0);
         let vl = Var::new(1);
         Theory::bind_fresh(&mut c, ve, eq);
@@ -1239,13 +1423,14 @@ mod tests {
         let vs = ctx.declare_fun("v", &[], int);
         let u = ctx.mk_app(Op::Uninterpreted(us), &[]).unwrap();
         let v = ctx.mk_app(Op::Uninterpreted(vs), &[]).unwrap();
-        let mut c: Combiner<SharedEuf, ModelEqArith, NullTheory> = Combiner::with_context(ctx);
+        let mut c: Combiner<SharedEuf, ModelEqArith, NullTheory, NullTheory> = Combiner::with_context(ctx);
         c.euf.t1 = Some(u);
         c.euf.t2 = Some(v);
         c.arith.t1 = Some(u);
         c.arith.t2 = Some(v);
         match Theory::check(&mut c, Effort::Full) {
-            TheoryResult::SplitAtoms(atoms) => {
+            TheoryResult::SplitAtoms { atoms, guard } => {
+                assert_eq!(guard, None, "MBTC trichotomy is a tautology, no guard");
                 assert_eq!(atoms.len(), 3, "integer trichotomy = 3 atoms");
                 assert_eq!(classify(&c.terms, atoms[0]), Ok(Owner::Euf)); // (= u v)
                 assert_eq!(classify(&c.terms, atoms[1]), Ok(Owner::Arith)); // (< u v)
@@ -1282,7 +1467,7 @@ mod tests {
         fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
             if !self.fired {
                 self.fired = true;
-                TCheck::Split(vec![self.atom.unwrap()])
+                TCheck::Split { atoms: vec![self.atom.unwrap()], guard: None }
             } else {
                 TCheck::Sat
             }
@@ -1326,7 +1511,7 @@ mod tests {
             "atom with select must be classified as Owner::Arrays"
         );
 
-        let mut comb: Combiner<NullTheory, NullTheory, ArraySplitter> = Combiner::with_context(ctx);
+        let mut comb: Combiner<NullTheory, NullTheory, ArraySplitter, NullTheory> = Combiner::with_context(ctx);
 
         // Register the arrays atom — routes to euf (for congruence) + arrays (for watching).
         let v = Var::new(0);
@@ -1340,8 +1525,9 @@ mod tests {
 
         // First Full check: arrays.check returns Split — must be lifted to SplitAtoms.
         match Theory::check(&mut comb, Effort::Full) {
-            TheoryResult::SplitAtoms(atoms) => {
+            TheoryResult::SplitAtoms { atoms, guard } => {
                 assert_eq!(atoms, vec![sel_atom], "split atom must round-trip");
+                assert_eq!(guard, None);
             }
             other => panic!("expected SplitAtoms from arrays slot, got {other:?}"),
         }
@@ -1351,5 +1537,33 @@ mod tests {
             TheoryResult::Sat => {}
             other => panic!("expected Sat on second check, got {other:?}"),
         }
+    }
+
+    // ── Task 7: 4th (String) theory slot ─────────────────────────────────────
+
+    /// No-op stub for the String theory slot — always Sat, registers nothing.
+    #[derive(Default)]
+    struct StubStr;
+    impl TheorySolver for StubStr {
+        const THEORY_ID: u16 = 4;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> { None }
+        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> { None }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck { TCheck::Sat }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _t: u32, _e: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _l: usize) {}
+    }
+
+    #[test]
+    fn combiner_accepts_fourth_theory_slot() {
+        // Construct a 4-theory combiner; a string equality registers as Owner::String.
+        let mut c: Combiner<NullTheory, NullTheory, NullTheory, StubStr> = Combiner::default();
+        let str_s = c.context_mut().string_sort();
+        let x = { let s = c.context_mut().declare_fun("x", &[], str_s); c.context_mut().mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+        let y = { let s = c.context_mut().declare_fun("y", &[], str_s); c.context_mut().mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+        let atom = c.context_mut().mk_eq(x, y).unwrap();
+        assert!(c.register_atom(Var::new(0), atom).is_ok());
     }
 }

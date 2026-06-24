@@ -3,6 +3,7 @@
 //! soundness stays existential (spec §9).
 
 use crate::types::Owner;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Op, SortId, SortNode, TermId, TermNode, Var};
 
 /// An atom this solver cannot handle exactly (e.g. nonlinear). Refusing it at
@@ -47,6 +48,27 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
     // routing in the Combiner).
     if contains_array_op(terms, atom) {
         return Ok(Owner::Arrays);
+    }
+    // String fence: an uninterpreted function (arity >= 1) applied to or
+    // returning a String-sorted term is out of scope for QF_S core v1.
+    if string_under_uf(terms, atom) {
+        return Err(Unsupported(atom));
+    }
+    // String routing: a (dis)equality whose arguments are String-sorted belongs
+    // to the String theory.
+    if let TermNode::App {
+        op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct),
+        args,
+        ..
+    } = terms.term_node(atom)
+    {
+        if terms
+            .children(*args)
+            .iter()
+            .any(|&c| is_string_sorted(terms, c))
+        {
+            return Ok(Owner::String);
+        }
     }
     match terms.term_node(atom) {
         TermNode::App { op, args, .. } => {
@@ -101,6 +123,36 @@ fn classify_equality(terms: &Context, args: &[TermId]) -> Owner {
         // lower() decided they need EUF (function-application args).
         Owner::Euf
     }
+}
+
+fn is_string_sorted(terms: &Context, t: TermId) -> bool {
+    matches!(terms.sort_node(terms.sort_of(t)), SortNode::String)
+}
+
+/// True if `atom` applies an uninterpreted function (arity >= 1) to, or
+/// returns, a String-sorted term — out of scope in QF_S core v1.
+fn string_under_uf(terms: &Context, atom: TermId) -> bool {
+    fn walk(terms: &Context, t: TermId, seen: &mut FxHashSet<TermId>) -> bool {
+        if !seen.insert(t) {
+            return false;
+        }
+        if let TermNode::App { op, args, .. } = terms.term_node(t) {
+            let kids = terms.children(*args);
+            if let Op::Uninterpreted(_) = op {
+                if !kids.is_empty()
+                    && (is_string_sorted(terms, t)
+                        || kids.iter().any(|&k| is_string_sorted(terms, k)))
+                {
+                    return true;
+                }
+            }
+            kids.iter().any(|&k| walk(terms, k, seen))
+        } else {
+            false
+        }
+    }
+    let mut seen = FxHashSet::default();
+    walk(terms, atom, &mut seen)
 }
 
 /// True if `t` contains a `Mul` whose operands are not all numeric constants.
@@ -174,9 +226,17 @@ fn array_touches_arith(terms: &Context, t: TermId) -> bool {
 
 /// `Var`-indexed routing table. Append-only across a solve (atoms are never
 /// un-registered on backtrack — spec §6.5).
+///
+/// Carries a reverse `atom → var` map (`by_atom`) so the SAT layer can REUSE the
+/// existing SAT var when a theory re-emits an already-registered atom as a split
+/// atom. Without this, the two-phase split protocol minted a SECOND, unlinked
+/// var for an atom that already had one (the theory then held both the atom and
+/// its negation in different vars → spurious UNSAT / non-termination). The first
+/// var registered for an atom is authoritative (atoms are append-only).
 #[derive(Default)]
 pub struct AtomRegistry {
     by_var: Vec<Option<(TermId, Owner)>>,
+    by_atom: FxHashMap<TermId, Var>,
 }
 
 impl AtomRegistry {
@@ -186,6 +246,17 @@ impl AtomRegistry {
             self.by_var.resize(idx + 1, None);
         }
         self.by_var[idx] = Some((atom, owner));
+        // First registration wins (atoms are never un-registered). Keep the
+        // earliest var so a re-emitted split atom resolves to its original var.
+        self.by_atom.entry(atom).or_insert(v);
+    }
+
+    /// The SAT var previously registered for `atom`, if any. Used by the SAT
+    /// layer's split-atom protocol to reuse an existing var instead of minting a
+    /// fresh, unlinked one (the duplicate-var hazard).
+    #[inline]
+    pub fn var_of_atom(&self, atom: TermId) -> Option<Var> {
+        self.by_atom.get(&atom).copied()
     }
 
     #[inline]
@@ -326,6 +397,37 @@ mod tests {
         assert!(
             classify(&ctx, atom).is_err(),
             "extensionality must be fenced"
+        );
+    }
+
+    #[test]
+    fn classify_string_equality_is_owned_by_string() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mk = |c: &mut Context, n: &str| {
+            let s = c.declare_fun(n, &[], str_s);
+            c.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let x = mk(&mut ctx, "x");
+        let y = mk(&mut ctx, "y");
+        let atom = ctx.mk_eq(x, y).unwrap();
+        assert!(matches!(classify(&ctx, atom), Ok(Owner::String)));
+    }
+
+    #[test]
+    fn classify_fences_string_under_uninterpreted_function() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let f = ctx.declare_fun("f", &[str_s], str_s); // f : String -> String
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+        let atom = ctx.mk_eq(fx, x).unwrap();
+        assert!(
+            classify(&ctx, atom).is_err(),
+            "string under a UF is out of scope in v1"
         );
     }
 
