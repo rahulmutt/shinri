@@ -42,7 +42,7 @@ pub fn len_of_in_model(terms: &mut Context, m: &ModelBuilder, t: TermId) -> usiz
                 // numer() returns Integer; use to_i128() -> Option<i128>.
                 r.numer()
                     .to_i128()
-                    .map(|v| v.max(0) as usize)
+                    .map(|v| v as usize)
                     .unwrap_or(0)
             }
         }

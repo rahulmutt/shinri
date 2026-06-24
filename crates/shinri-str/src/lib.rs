@@ -29,7 +29,6 @@ pub struct StrSolver {
     emitted_splits: FxHashSet<(TermId, TermId)>,
     /// Counter for fresh string skolem variables minted by F-split.
     fresh_ctr: u32,
-    #[allow(dead_code)] // used in Task 15 (unfolding fuel budget)
     fuel: Fuel,
     trail: trail::Trail,
 }
@@ -203,14 +202,16 @@ impl TheorySolver for StrSolver {
         let lens: Vec<TermId> = self.len_terms.iter().copied().collect();
         for lt in lens {
             if let Some(axiom) = length::next_axiom(cx.terms, cx.eq, &known, lt, &self.emitted_len_axioms) {
-                self.emitted_len_axioms.insert(axiom);
                 // Register NEW str.len subterms introduced by this axiom so the
                 // defining-axiom chain over nested concats continues to a fixpoint.
                 let mut seen = FxHashSet::default();
                 collect::collect(cx.terms, axiom, &mut self.len_terms, &mut self.str_terms, &mut seen);
+                // Spend fuel FIRST; only record the axiom as emitted if the split is
+                // actually delivered (tracks only delivered axioms invariant).
                 if !self.fuel.spend() {
                     return TCheck::Unknown;
                 }
+                self.emitted_len_axioms.insert(axiom);
                 return TCheck::Split { atoms: vec![axiom], guard: None };
             }
         }
@@ -640,7 +641,12 @@ impl TheorySolver for StrSolver {
         TCheck::Sat
     }
 
-    fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {}
+    fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {
+        // String theory does not mint self-tagged interface (theory:4) leaves:
+        // string conflicts use EqLeaf::Asserted / resolve through EUF tags.
+        // This guard makes a future invariant break fail loud in debug.
+        debug_assert!(false, "StrSolver::explain reached — string theory should not mint self-tagged interface (theory:4) leaves");
+    }
 
     fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
         self.model_with(cx, m);
@@ -691,7 +697,7 @@ impl StrSolver {
     ///
     /// Called by `TheorySolver::model`; also exposed so tests can inject a
     /// pre-seeded `ModelBuilder` (e.g. with arith-model lengths already set).
-    pub fn model_with(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
+    pub(crate) fn model_with(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
         let str_terms: Vec<TermId> = self.str_terms.iter().copied().collect();
         // `known` = all string-sorted terms PLUS both sides of every asserted
         // equality, so `deep_normal_form` / class lookups can reflect merges

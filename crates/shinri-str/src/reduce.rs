@@ -62,7 +62,9 @@ fn eval_substr_const(ctx: &Context, s: TermId, i: TermId, l: TermId) -> Option<S
 }
 
 // Global counter for fresh variable names so that multiple calls across
-// multiple assertions never collide.
+// multiple assertions never collide. Relaxed ordering is sufficient here:
+// the counter is used only for name uniqueness (no ordering or identity
+// dependency — any unique name is acceptable regardless of sequencing).
 static FRESH_CTR: AtomicU32 = AtomicU32::new(0);
 
 fn next_fresh() -> u32 {
@@ -343,6 +345,13 @@ fn rewrite(ctx: &mut Context, t: TermId, guards: &mut Vec<TermId>) -> TermId {
 
 /// Pre-pass entry point.
 ///
+/// This pre-pass triggers on ANY query that contains a String-sorted term or
+/// String-sorted operation (see `any_has_string_op`). It is a no-op (returns
+/// assertions unchanged, structurally) when no `str.at` / `str.substr`
+/// application is present.
+///
+/// When `str.at` / `str.substr` are present the pass performs two rewrites:
+///
 /// 1. Rewrites every `str.at` / `str.substr` in `assertions` (bottom-up) to a
 ///    fresh String variable, collecting the guard constraints that define it.
 /// 2. Eliminates every NON-Boolean `(ite c a b)` term (introduced by the substr
@@ -354,9 +363,6 @@ fn rewrite(ctx: &mut Context, t: TermId, guards: &mut Vec<TermId>) -> TermId {
 ///    equalities the theories already handle.
 ///
 /// Returns `(rewritten assertions) ++ (guard atoms) ++ (ite-defining atoms)`.
-///
-/// Non-string queries (no `StrAt`/`StrSubstr`/`StrConcat`/`StrLen`) are
-/// returned unchanged.
 pub fn reduce_assertions(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId> {
     let mut guards: Vec<TermId> = Vec::new();
     let rewritten: Vec<TermId> = assertions

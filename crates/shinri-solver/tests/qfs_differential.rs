@@ -631,15 +631,15 @@ fn targeted_disequality_witness_sat() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// str.substr / str.at targeted cases — LIVE (no longer #[ignore]d).
+// str.substr / str.at targeted cases — LIVE and passing.
 //
-// These were previously ignored as KNOWN-BROKEN (the Task-16 substr/at reduction
-// over a nested `pre++mid++post` concat overwhelmed the String↔Arith MBTC seam and
-// produced a spurious UNSAT or hang). Following the length-search bounding and the
-// premature-SAT/word-equation fixes (commits b10bd27, ac181b9) and the Task-19
-// occurs-check soundness fix, these queries now decide correctly and AGREE with z3,
-// so the tests run as live regression guards (verified via `expect`, which
-// cross-checks z3 on every call).
+// Historical note: an earlier revision of this file had these tests #[ignore]d
+// because the Task-16 substr/at reduction over a nested `pre++mid++post` concat
+// overwhelmed the String↔Arith MBTC seam and produced a spurious UNSAT or hang.
+// That is no longer the case: the length-search bounding and the
+// premature-SAT/word-equation fixes (commits b10bd27, ac181b9) together with the
+// Task-19 occurs-check soundness fix resolved the issues. These tests now run as
+// live regression guards, each verified via `expect` which cross-checks z3.
 
 #[test]
 fn targeted_substr_in_range_sat() {
