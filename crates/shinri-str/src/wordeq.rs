@@ -121,7 +121,98 @@ mod tests {
     use shinri_sat::Effort;
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
     use crate::StrSolver;
+    use crate::wordeq::{resolve_equation, StepResult};
 
+    // Helper: make a string variable term in `ctx`.
+    fn mk_var(ctx: &mut Context, name: &str) -> shinri_core::TermId {
+        let str_s = ctx.string_sort();
+        let s = ctx.declare_fun(name, &[], str_s);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    // ── Non-conflict case 1: prefix-of-constant ───────────────────────────────
+    // Normal forms: lhs = ["ab", X],  rhs = ["abc", Y]
+    // After stripping: both heads are constants "ab" vs "abc".
+    // "ab" is a proper prefix of "abc" — no character mismatch, just one is
+    // shorter.  This is satisfiable (X = "c" ++ Y), so resolve_equation MUST
+    // return Done, not Conflict.
+    #[test]
+    fn prefix_of_constant_is_done_not_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = mk_var(&mut ctx, "x_pfx");
+        let y = mk_var(&mut ctx, "y_pfx");
+        let ab  = ctx.mk_string_const("ab");
+        let abc = ctx.mk_string_const("abc");
+        let lhs = [ab,  x];
+        let rhs = [abc, y];
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![]);
+        assert!(
+            matches!(result, StepResult::Done),
+            "prefix-of-constant residual must be Done (satisfiable: X = \"c\" ++ Y)"
+        );
+    }
+
+    // ── Non-conflict case 2: variable head ───────────────────────────────────
+    // Normal forms: lhs = [X, "a"],  rhs = ["b", Y]
+    // After stripping: lhs head is variable X — cannot determine a conflict
+    // without knowing X's value.  Must be Done (F-split handles it later).
+    #[test]
+    fn variable_head_is_done_not_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = mk_var(&mut ctx, "x_vh");
+        let y = mk_var(&mut ctx, "y_vh");
+        let a = ctx.mk_string_const("a");
+        let b = ctx.mk_string_const("b");
+        let lhs = [x, a];
+        let rhs = [b, y];
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![]);
+        assert!(
+            matches!(result, StepResult::Done),
+            "variable-headed residual must be Done (X could equal \"b\" ++ ...)"
+        );
+    }
+
+    // ── Non-conflict case 3: both sides fully consumed after strip ────────────
+    // Normal forms: lhs = [X, "a"],  rhs = [X, "a"]
+    // Both heads are equal (same TermId X), both tails "a" are equal.
+    // After stripping the solver exhausts both sides — trivially satisfied.
+    // Must return Done.
+    #[test]
+    fn equal_sides_fully_consumed_is_done() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = mk_var(&mut ctx, "x_eq");
+        let a = ctx.mk_string_const("a");
+        let lhs = [x, a];
+        let rhs = [x, a]; // identical slices
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![]);
+        assert!(
+            matches!(result, StepResult::Done),
+            "fully-consumed (trivially equal) sides must be Done"
+        );
+    }
+
+    // ── Non-conflict case 4: one side empty, other is all-variable ────────────
+    // Normal forms: lhs = [],  rhs = [Y]
+    // lhs is exhausted; rhs has only a variable Y.  Y = "" is a valid
+    // assignment, so this is NOT a conflict.  Must return Done.
+    #[test]
+    fn empty_vs_single_variable_is_done_not_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let y = mk_var(&mut ctx, "y_emp");
+        let lhs: [shinri_core::TermId; 0] = [];
+        let rhs = [y];
+        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![]);
+        assert!(
+            matches!(result, StepResult::Done),
+            "empty lhs vs single-variable rhs must be Done (Y could be \"\")"
+        );
+    }
+
+    // ── Positive control: conflict still detected ─────────────────────────────
     // "ab" ++ x  =  "ac" ++ x   is UNSAT by prefix mismatch (b != c at index 1).
     #[test]
     fn constant_prefix_mismatch_is_conflict() {
