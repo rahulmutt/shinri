@@ -177,7 +177,64 @@ pub fn resolve_equation(
         }
     }
 
-    // Residual has at least one variable head: emit an F-split if not yet emitted.
+    // Residual has at least one variable head: check for var-vs-nonempty-constant
+    // before falling through to the generic F-split. When one head is a variable
+    // and the other is a non-empty constant with known first character `ch`, emit
+    // the two-way split:
+    //   `(= v "")` ∨ `(= v ("ch" ++ z))`
+    // This is the Nielsen character-peel lemma for the constant-head case: given
+    // the triggering word equation, the variable head is either empty or begins
+    // with the known constant character. The split is GUARDED with `¬eqn` so the
+    // learnt clause is `¬eqn ∨ (= v "") ∨ (= v ("ch" ++ z))` ≡
+    // `eqn → (v="" ∨ v="ch"++z)`, which IS valid given the words are equal.
+    if i < le && j < re {
+        let (ha, hb) = (lhs[i], rhs[j]);
+        // Identify the (variable, nonempty-constant) pair, if any.
+        let vc_pair: Option<(TermId, TermId)> =
+            match (terms.string_const_value(ha), terms.string_const_value(hb)) {
+                (None, Some(s)) if !s.is_empty() => Some((ha, hb)),
+                (Some(s), None) if !s.is_empty() => Some((hb, ha)),
+                _ => None,
+            };
+        if let Some((var, cst)) = vc_pair {
+            // Extract first character of the constant (guaranteed non-empty above).
+            let cs = terms.string_const_value(cst).unwrap().to_owned();
+            if let Some(ch) = cs.chars().next() {
+                // Canonical dedup key: order by index to be unordered.
+                let key = if var.index() <= cst.index() {
+                    (var, cst)
+                } else {
+                    (cst, var)
+                };
+                if emitted.insert(key) {
+                    // v = ""
+                    let empty = terms.mk_string_const("");
+                    let v_empty = terms.mk_eq(var, empty).expect("well-sorted");
+                    // v = "ch" ++ z
+                    let head = terms.mk_string_const(&ch.to_string());
+                    let z = fresh_str(terms, fresh_ctr);
+                    let hz = terms
+                        .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[head, z])
+                        .expect("well-sorted");
+                    let v_head = terms.mk_eq(var, hz).expect("well-sorted");
+                    // GUARD with ¬eqn: the disjunction `v="" ∨ v="ch"++z` is valid
+                    // ONLY given the triggering word equation. Without the guard this
+                    // would be a non-entailed permanent learnt clause causing spurious
+                    // UNSAT (e.g. v="xy", c="b": neither disjunct holds, so the bare
+                    // clause would make {v="xy"} UNSAT). The guard turns it into the
+                    // valid implication `eqn → (v="" ∨ v="ch"++z)`.
+                    return StepResult::Split {
+                        atoms: vec![v_empty, v_head],
+                        guard: eqn_lit.negate(),
+                    };
+                }
+                // Already split this pair; wait for SAT to case-split.
+                return StepResult::Done;
+            }
+        }
+    }
+
+    // Residual has at least one variable head: emit a generic F-split if not yet emitted.
     if i < le && j < re {
         let (ha, hb) = (lhs[i], rhs[j]);
         let var_head = terms.string_const_value(ha).is_none()
@@ -208,7 +265,7 @@ pub fn resolve_equation(
 
 #[cfg(test)]
 mod tests {
-    use shinri_core::{BuiltinOp, Context, Lit, Op, Var};
+    use shinri_core::{BuiltinOp, Context, Lit, Op, TermNode, Var};
     use shinri_sat::Effort;
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
     use crate::StrSolver;
@@ -367,6 +424,59 @@ mod tests {
             }
         }
         assert!(saw_split, "a variable-headed word equation must emit a multi-atom F-split");
+    }
+
+    // ── Task 13: variable-vs-constant head split ─────────────────────────────
+    // x = "ab" with x a variable → must NOT conflict; must emit a GUARDED split
+    // whose atoms include the empty-branch `(= x "")`.
+    #[test]
+    fn variable_equals_constant_splits_then_sat() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = { let s = ctx.declare_fun("x", &[], str_s); ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+        let ab = ctx.mk_string_const("ab");
+        let atom = ctx.mk_eq(x, ab).unwrap();
+        let mut s = StrSolver::default();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &areg };
+        s.new_var(&mut cx, shinri_core::Var::new(0), atom);
+        s.test_force_eq_true(atom);
+        // Must not conflict; must emit a split (or be Sat).
+        let mut ok = false;
+        let mut saw_guarded_split_with_empty_branch = false;
+        for _ in 0..32 {
+            match s.check(&mut cx, Effort::Full) {
+                TCheck::Conflict(_) => panic!("x = \"ab\" is satisfiable — must not conflict"),
+                TCheck::Split { atoms, guard } => {
+                    // The specialized split must contain the empty-branch atom (= x "").
+                    // Check that at least one atom is an equality of x with the empty string.
+                    let has_empty_branch = atoms.iter().any(|&a| {
+                        if let TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } = cx.terms.term_node(a) {
+                            let ch = cx.terms.children(*args);
+                            let (lhs, rhs) = (ch[0], ch[1]);
+                            // Either side equals x and the other equals "".
+                            (lhs == x && cx.terms.string_const_value(rhs).map_or(false, |s| s.is_empty()))
+                                || (rhs == x && cx.terms.string_const_value(lhs).map_or(false, |s| s.is_empty()))
+                        } else {
+                            false
+                        }
+                    });
+                    if has_empty_branch {
+                        // The specialized var-vs-const split MUST be guarded (sound).
+                        assert!(guard.is_some(), "var-vs-const split with empty branch must carry a guard (¬eqn)");
+                        saw_guarded_split_with_empty_branch = true;
+                        ok = true;
+                        break;
+                    }
+                    // Non-empty-branch splits (e.g. length axioms) may be unguarded tautologies.
+                }
+                TCheck::Sat => { ok = true; break; }
+            }
+        }
+        assert!(ok, "x = \"ab\" must reach Sat or emit a split without conflict");
+        assert!(saw_guarded_split_with_empty_branch,
+            "specialized var-vs-const split must emit an empty-branch atom (= x \"\") with a guard");
     }
 
     // ── Positive control: conflict still detected ─────────────────────────────
