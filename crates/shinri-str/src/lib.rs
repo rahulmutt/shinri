@@ -1,11 +1,12 @@
 mod collect;
 mod fuel;
 mod length;
+pub mod normalize;
 mod trail;
 pub use fuel::Fuel;
 
 use rustc_hash::FxHashSet;
-use shinri_core::{Lit, TermId, TheoryJust, Var};
+use shinri_core::{BuiltinOp, Lit, Op, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
@@ -34,8 +35,28 @@ impl TheorySolver for StrSolver {
         collect::collect(cx.terms, atom, &mut self.len_terms, &mut self.str_terms, &mut seen);
     }
 
-    fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> {
-        // Filled in Task 10 (records asserted string (dis)equalities).
+    fn assert(&mut self, cx: &mut TheoryCtx, lit: Lit) -> Option<Vec<EqLeaf>> {
+        // Record asserted string (dis)equalities for consumption by Task 11+.
+        let atom = cx.atoms.atom(lit.var());
+        if let TermNode::App { op, .. } = cx.terms.term_node(atom) {
+            match op {
+                Op::Builtin(BuiltinOp::Eq) => {
+                    if lit.is_positive() {
+                        self.eq_true.push(atom);
+                    } else {
+                        self.diseq_true.push(atom);
+                    }
+                }
+                Op::Builtin(BuiltinOp::Distinct) => {
+                    if lit.is_positive() {
+                        self.diseq_true.push(atom);
+                    } else {
+                        self.eq_true.push(atom);
+                    }
+                }
+                _ => {}
+            }
+        }
         None
     }
 
