@@ -1,5 +1,6 @@
 mod collect;
 mod fuel;
+mod length;
 mod trail;
 pub use fuel::Fuel;
 
@@ -15,7 +16,6 @@ pub struct StrSolver {
     diseq_true: Vec<TermId>,
     len_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
-    #[allow(dead_code)] // used in Task 9 (len-axiom deduplication) and Task 17 (str-equality propagation)
     emitted_len_axioms: FxHashSet<TermId>,
     #[allow(dead_code)] // used in Task 12 (split lemma deduplication)
     emitted_splits: FxHashSet<(TermId, TermId)>,
@@ -43,7 +43,17 @@ impl TheorySolver for StrSolver {
         None
     }
 
-    fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+    fn check(&mut self, cx: &mut TheoryCtx, effort: Effort) -> TCheck {
+        if effort != Effort::Full {
+            return TCheck::Sat;
+        }
+        let lens: Vec<TermId> = self.len_terms.iter().copied().collect();
+        for lt in lens {
+            if let Some(axiom) = length::next_axiom(cx.terms, lt, &self.emitted_len_axioms) {
+                self.emitted_len_axioms.insert(axiom);
+                return TCheck::Split(vec![axiom]);
+            }
+        }
         TCheck::Sat
     }
 
@@ -75,7 +85,7 @@ mod tests {
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
 
     #[test]
-    fn collects_len_terms_and_returns_sat_initially() {
+    fn collects_len_terms_and_reaches_sat_fixpoint() {
         let mut ctx = Context::new();
         let str_s = ctx.string_sort();
         let x = {
@@ -113,6 +123,16 @@ mod tests {
             s.shared_arith_terms(&mut cx).contains(&len),
             "str.len term must be shared"
         );
-        assert!(matches!(s.check(&mut cx, Effort::Full), TCheck::Sat));
+        // For an opaque variable x (no concat/literal), check emits exactly one axiom
+        // (the >=0 lemma) and then reaches Sat fixpoint.
+        let first = s.check(&mut cx, Effort::Full);
+        assert!(
+            matches!(first, TCheck::Split(_)),
+            "should emit >=0 axiom for str.len(x)"
+        );
+        assert!(
+            matches!(s.check(&mut cx, Effort::Full), TCheck::Sat),
+            "fixpoint after >=0 emitted"
+        );
     }
 }
