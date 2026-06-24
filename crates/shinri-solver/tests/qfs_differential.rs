@@ -455,14 +455,11 @@ fn targeted_x_eq_ab_sat_with_model() {
     );
 }
 
-#[ignore = "KNOWN-BROKEN: the empty-length link `(s≠\"\")→len(s)≥1` triggers the \
-            String↔Arith N-O conflict-justification seam bug whenever len(s) is also \
-            otherwise constrained (broad wrong-UNSAT), so it was removed; this niche \
-            (len(s)=0 ∧ s≠\"\") is now wrongly SAT. See task report CONCERNS."]
 #[test]
 fn targeted_empty_length_link_unsat() {
-    // (str.len x)=0 ∧ x ≠ "" ⇒ UNSAT. Requires an effective empty-length link,
-    // which is not viable on the current N-O seam (see the #[ignore] note).
+    // (str.len x)=0 ∧ x ≠ "" ⇒ UNSAT. Enforced by reading the entailed length from
+    // the shared engine (`len_class_zero`): when len(x) is EUF-equal to 0, a
+    // co-asserted `x ≠ ""` is a conflict.
     expect(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (= (str.len x) 0))(assert (distinct x \"\"))(check-sat)",

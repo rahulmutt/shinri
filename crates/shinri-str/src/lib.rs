@@ -190,16 +190,9 @@ impl TheorySolver for StrSolver {
             }
         }
 
-        // NOTE: a non-empty length link `(s≠"") → len(s)≥1` (to catch
-        // `len(s)=0 ∧ s≠""` UNSAT) was implemented and REMOVED. In every form
-        // (the `(distinct len 0) ∨ (s="")` disjunction AND the guarded pure-arith
-        // `(s≠"") → len(s)≥1`) it triggered the pre-existing String↔Arith N-O
-        // conflict-justification seam bug: as soon as `len(s)` is ALSO constrained
-        // by another atom, the combination is wrongly reported UNSAT (broad
-        // soundness regression). Dropping it means `len(s)=0 ∧ s≠""` is reported
-        // SAT instead of UNSAT — sound-incomplete in the narrow direction is worse
-        // than a broad wrong-UNSAT, so this is the lesser evil. See task report
-        // CONCERNS: the empty-length link needs a fixed N-O seam to be viable.
+        // (The empty-length link is enforced in the disequality loop below via
+        // `len_class_zero`: a read of the shared engine rather than an emitted
+        // lemma, so it cannot flood the String↔Arith N-O seam.)
 
         // Word-equation resolution: strip equal heads/tails, detect constant
         // prefix mismatches and occurs-check contradictions. Variable-headed
@@ -272,9 +265,101 @@ impl TheorySolver for StrSolver {
         // antecedents via `eq.explain`, mirroring the EUF conflict pattern in
         // `shinri-euf/src/egraph.rs::conflict_leaves` (the `explain(a, b, out)` path
         // for the merge-antecedent part).
+        // Empty-length link (sound PROPAGATION direction): for each disequality
+        // `s ≠ ""`, emit the GUARDED arith lemma `(s ≠ "") → len(s) ≥ 1` once. The
+        // learnt clause is `¬(s≠"") ∨ (len(s) ≥ 1)`, a VALID implication (a
+        // non-empty string has length ≥ 1). This feeds Arith the lower bound so the
+        // `len(s) = 0` ∧ `s ≠ ""` contradiction is caught even when the length is
+        // entailed ONLY through arith bounds (e.g. `len(s) ≤ 0 ∧ len(s) ≥ 0`),
+        // where no `len(s) ≈ 0` merge reaches the shared engine.
+        //
+        // Why this is the SOUND, narrow form (vs the removed broad ones): it is
+        // emitted ONLY for disequalities with an EMPTY-literal side — NOT for every
+        // `str.len` term, and NOT for every disequality. So it introduces exactly
+        // one extra arith bound per `s ≠ ""` atom, GUARDED by that atom's own
+        // literal, and contributes nothing on branches where `s ≠ ""` is false. It
+        // therefore cannot over-constrain unrelated satisfiable queries: there is no
+        // empty-side disequality in the must-stay-SAT cases (`len(x)=2`, etc.).
+        {
+            let diseqs: Vec<(TermId, Lit)> = self.diseq_true.clone();
+            for (atom, lit) in diseqs {
+                let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
+                for (empty_side, other) in [(l, r), (r, l)] {
+                    if cx.terms.string_const_value(empty_side) != Some("") {
+                        continue;
+                    }
+                    let len_other = cx
+                        .terms
+                        .mk_app(Op::Builtin(BuiltinOp::StrLen), &[other])
+                        .expect("str.len(other) well-sorted");
+                    let int_s = cx.terms.int_sort();
+                    let one = cx
+                        .terms
+                        .mk_numeral(shinri_core::Rational::from_int(1i128.into()), int_s);
+                    let ge1 = cx
+                        .terms
+                        .mk_app(Op::Builtin(BuiltinOp::Ge), &[len_other, one])
+                        .expect("(>= len 1) well-sorted");
+                    if self.emitted_len_axioms.contains(&ge1) {
+                        continue;
+                    }
+                    self.emitted_len_axioms.insert(ge1);
+                    if !self.fuel.spend() {
+                        return TCheck::Unknown;
+                    }
+                    let mut seen = FxHashSet::default();
+                    collect::collect(
+                        cx.terms,
+                        ge1,
+                        &mut self.len_terms,
+                        &mut self.str_terms,
+                        &mut seen,
+                    );
+                    // Guard = ¬(s ≠ ""), i.e. the diseq literal negated, so the bound
+                    // is enforced only on branches where `s ≠ ""` holds (Nielsen-style
+                    // guarded lemma — never the unsound bare disjunction).
+                    return TCheck::Split { atoms: vec![ge1], guard: Some(lit.negate()) };
+                }
+            }
+        }
+
         let diseqs: Vec<(TermId, Lit)> = self.diseq_true.clone();
         for (atom, lit) in diseqs {
             let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
+
+            // Empty-length link (sound conflict direction): `s ≠ "" ∧ len(s)=0` is
+            // UNSAT, because a string of length 0 IS the empty string. We detect it
+            // by reading the entailed length from the shared engine: if one side of
+            // the disequality is the empty literal and the OTHER side's `str.len` is
+            // EUF-equal to 0 (e.g. `(= (str.len s) 0)` was asserted — that Int
+            // equality routes to EUF, merging `len(s) ≈ 0`), the disequality is
+            // contradicted.
+            //
+            // Soundness / justification: the conflict cites the diseq literal PLUS
+            // `eq.explain(len(s), 0)` — the exact input literals that forced
+            // `len(s) ≈ 0` (mirroring the EUF diseq-conflict pattern used in Case 1
+            // below and in `egraph.rs::assert_diseq`). The learnt clause is therefore
+            // `¬(len(s)=0) ∨ ¬(s≠"")`, a VALID lemma (`len(s)=0 ∧ s≠"" ⟹ ⊥`), so it
+            // is model-preserving. Crucially this fires ONLY when an empty-side
+            // disequality is present AND the length is entailed to 0 — it adds NO
+            // constraint to satisfiable queries where `len(s)` is merely otherwise
+            // bounded (e.g. `len(x)=2` with no `x≠""`), so it cannot cause the broad
+            // wrong-UNSAT that the eager/guarded forms did at the N-O seam.
+            for (empty_side, other) in [(l, r), (r, l)] {
+                if cx.terms.string_const_value(empty_side) == Some("") {
+                    let len_other = cx
+                        .terms
+                        .mk_app(Op::Builtin(BuiltinOp::StrLen), &[other])
+                        .expect("str.len(other) well-sorted");
+                    if let Some(zero) = len_class_zero(cx.terms, cx.eq, len_other) {
+                        let ln = cx.eq.intern(len_other);
+                        let zn = cx.eq.intern(zero);
+                        let mut just = vec![EqLeaf::Asserted(lit)];
+                        cx.eq.explain(ln, zn, &mut just);
+                        return TCheck::Conflict(just);
+                    }
+                }
+            }
 
             // Case 1: direct EUF class equality — `l` and `r` are in the same
             // EqualityEngine class, so they trivially denote the same word. This
@@ -365,6 +450,38 @@ impl StrSolver {
             known.push(r);
         }
         model::assign(cx.terms, cx.eq, &known, &str_terms, m);
+    }
+}
+
+/// If `str.len(s)` is interned in the shared EqualityEngine and lives in a class
+/// that contains a numeral whose value is `0`, return that numeral's TermId.
+/// Returns `None` otherwise (length unknown, non-zero, or `str.len(s)` never
+/// interned). Pure read of the shared engine — no merges, no side effects.
+///
+/// This is the sound side of the empty-length link (`len(s)=0 ⟹ s=""`): when the
+/// length is *entailed* to be `0` (e.g. `(= (str.len s) 0)` was asserted, which
+/// routes to EUF and merges `len(s) ≈ 0`), a co-asserted `s ≠ ""` is a genuine
+/// contradiction. Reading the entailment from the shared engine — rather than
+/// emitting an opaque `(=> (= len 0) (= s ""))` implication (EUF holds it without
+/// decoding it ⇒ no-op) or a guarded `(s≠"") → len(s)≥1` arith lemma (floods the
+/// String↔Arith N-O seam ⇒ broad wrong-UNSAT) — keeps the mechanism local and
+/// model-preserving, with a justification built from the actual antecedents.
+fn len_class_zero(
+    terms: &mut Context,
+    eq: &mut shinri_theory::EqualityEngine,
+    len_term: TermId,
+) -> Option<TermId> {
+    // Only meaningful if `len_term` was actually interned (some atom referenced
+    // it). `intern` is idempotent, but interning a term never seen by any theory
+    // would create a fresh singleton class that can't be equal to anything, so a
+    // negative result is still correct.
+    let zero = terms.mk_numeral(shinri_core::Rational::from_int(0i128.into()), terms.int_sort());
+    let ln = eq.intern(len_term);
+    let zn = eq.intern(zero);
+    if eq.are_equal(ln, zn) {
+        Some(zero)
+    } else {
+        None
     }
 }
 
