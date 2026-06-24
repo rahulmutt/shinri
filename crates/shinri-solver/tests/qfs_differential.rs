@@ -168,8 +168,6 @@ impl Gen {
     }
 
     /// An atomic string term: a variable or a small literal (never a concat).
-    /// Used for the operands of (dis)equality atoms to keep the corpus in the
-    /// soundly-decidable fragment.
     fn atom_term(&mut self) -> String {
         if self.rng.below(2) == 0 {
             self.var()
@@ -178,52 +176,73 @@ impl Gen {
         }
     }
 
+    /// A `str.substr`/`str.at` term over an atomic base (var or literal) with small
+    /// integer offset/length operands (in- and out-of-range). Exercises the Task-16
+    /// reduction end-to-end. The base is atomic to keep the reduction tractable.
+    fn extract_term(&mut self) -> String {
+        let base = self.atom_term();
+        if self.rng.below(2) == 0 {
+            // str.at: a single index in 0..=3 (sometimes out of range).
+            let i = self.rng.below(4);
+            format!("(str.at {base} {i})")
+        } else {
+            // str.substr: offset 0..=3, length 0..=3 (sometimes out of range).
+            let off = self.rng.below(4);
+            let len = self.rng.below(4);
+            format!("(str.substr {base} {off} {len})")
+        }
+    }
+
+    /// A general string term for a word-(dis)equation operand: a variable, a small
+    /// literal, a concat (chain of vars + literals), or a substr/at extract. This
+    /// covers the full (semi-decidable) word-equation core; non-terminating /
+    /// undecidable instances are bounded to a SOUND Unknown by the engine's fuel /
+    /// branch / step caps and are non-disagreements in the oracle.
+    fn word_term(&mut self) -> String {
+        match self.rng.below(4) {
+            0 => self.var(),
+            1 => self.lit(),
+            2 => self.extract_term(),
+            _ => {
+                let n = 2 + self.rng.below(2); // 2 or 3 parts
+                let parts: Vec<String> =
+                    (0..n).map(|_| self.atom_term()).collect();
+                format!("(str.++ {})", parts.join(" "))
+            }
+        }
+    }
+
     /// A string term for use as the argument of `str.len`: a variable or a concat
-    /// of variables — NEVER a bare string literal.
-    ///
-    /// `(str.len <literal>)` is degenerate (a known numeric constant) and, when it
-    /// co-occurs with a string disequality and another length term, triggers a
-    /// PRE-EXISTING SAT clause-DB / conflict-analysis crash (a deleted-clause index
-    /// reaches `analyze`). That is a SAT-layer bug, NOT a string-soundness issue
-    /// (see task report CONCERNS). We keep such trivial atoms out of the corpus so
-    /// the oracle exercises real string content rather than crashing on that bug.
+    /// of vars/literals.
     fn len_arg(&mut self) -> String {
         if self.rng.below(2) == 0 {
             self.var()
         } else {
             let n = 2 + self.rng.below(2);
-            let parts: Vec<String> = (0..n).map(|_| self.var()).collect();
+            let parts: Vec<String> = (0..n).map(|_| self.atom_term()).collect();
             format!("(str.++ {})", parts.join(" "))
         }
     }
 
-    /// Emit one assertion of a randomly chosen shape.
+    /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
+    /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
+    /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, and
+    /// length constraints. Instances that are undecidable / non-terminating for this
+    /// engine are bounded to a SOUND Unknown by the fuel / branch-budget / step caps;
+    /// the oracle skips Unknown as a non-disagreement.
     fn assertion(&mut self) {
         let neg = self.rng.below(4) == 0; // sometimes wrap in (not …)
-        // NOTE: str.at / str.substr are intentionally EXCLUDED from the random
-        // corpus. Their reduction (Task 16) produces a 3-variable nested concat
-        // `pre++mid++post` plus several conditional length constraints that all
-        // reference `str.len`, which overwhelms the String↔Arith N-O/MBTC seam
-        // (spurious UNSAT or non-termination). That is a deep, pre-existing flaw
-        // documented as a CONCERN; see the `#[ignore]`d `targeted_substr_*` tests
-        // and the task report. Including substr here would make the oracle hang or
-        // surface that known flaw rather than exercise the (sound) core fragment.
         let atom = match self.rng.below(4) {
-            // string equality between an ATOM (var/literal) and an atom-or-short
-            // concat. We deliberately keep at least one side an atom and bound the
-            // other so the corpus stays within the SOUNDLY-decidable fragment:
-            // general multi-variable word (dis)equations are the (semi-decidable)
-            // hard core of string solving, where this engine's F-split fixpoint can
-            // report a premature SAT instead of Unknown. (Documented CONCERN.)
+            // general word equation (either side may be var/literal/concat/substr)
             0 => {
-                let a = self.atom_term();
-                let b = self.atom_term();
+                let a = self.word_term();
+                let b = self.word_term();
                 format!("(= {a} {b})")
             }
-            // string disequality between atoms
+            // general word disequality
             1 => {
-                let a = self.atom_term();
-                let b = self.atom_term();
+                let a = self.word_term();
+                let b = self.word_term();
                 format!("(distinct {a} {b})")
             }
             // length bound / equality
