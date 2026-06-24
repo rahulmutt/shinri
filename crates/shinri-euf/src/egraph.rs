@@ -148,8 +148,20 @@ impl EGraph {
                 }
                 let app_id = self.apps.len() as AppId;
                 for &an in &arg_nodes {
-                    self.ensure_node(an);
-                    self.use_list[an.index()].push(app_id);
+                    // Push the new app onto the use-list of the arg's CURRENT
+                    // REPRESENTATIVE, not the raw arg node. Use-lists are maintained
+                    // at class representatives: `recanonicalize_use_list` drains a
+                    // loser's use-list into the winner on merge and records a
+                    // `UseSplice` undo that asserts the loser's list is empty when
+                    // unwound. If we pushed onto a raw arg node that is already a
+                    // *loser* of an earlier same-level merge, that list would be
+                    // non-empty at undo time → "loser use-list not empty on undo"
+                    // panic. Interning a fresh app mid-search (e.g. a string F-split
+                    // skolem or an empty-length-link disjunct) is exactly when this
+                    // happens. Keying by the representative keeps the invariant.
+                    let rep = cx.eq.find(an);
+                    self.ensure_node(rep);
+                    self.use_list[rep.index()].push(app_id);
                 }
                 self.apps.push(AppNode {
                     node,
@@ -304,6 +316,13 @@ impl EGraph {
     /// Move `loser`'s use-list into `winner`'s, re-canonicalizing each app;
     /// a signature collision enqueues a congruence.
     fn recanonicalize_use_list(&mut self, eq: &EqualityEngine, winner: ENodeId, loser: ENodeId) {
+        // Both endpoints may be e-nodes the EGraph has never interned as apps
+        // (e.g. a node that exists only in the shared EqualityEngine because an
+        // arith/interface merge created it — its `str.len`/numeral term was never
+        // added to the EGraph's use-list arrays). Accessing `use_list[idx]` for
+        // such a node would index out of bounds; ensure both are covered first.
+        self.ensure_node(winner);
+        self.ensure_node(loser);
         let moved: Vec<AppId> = std::mem::take(&mut self.use_list[loser.index()]);
         let count = moved.len();
         for app in moved.iter().copied() {
