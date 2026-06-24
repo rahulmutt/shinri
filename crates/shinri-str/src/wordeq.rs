@@ -140,6 +140,54 @@ pub fn nf_equal_explain(
     }
 }
 
+/// Occurs-check helper for `resolve_equation`. Returns `true` iff a single
+/// variable `single` cannot equal the word `rest` because `rest` contains an
+/// occurrence of `single` PLUS at least one necessarily-non-empty atom (a
+/// non-empty string constant, or a second variable occurrence) — i.e.
+/// `len(single) = len(single) + (>0)`, impossible.
+fn occurs_unsat(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    single: TermId,
+    rest: &[TermId],
+) -> bool {
+    let same_as_single = |eq: &mut EqualityEngine, a: TermId| -> bool {
+        a == single || {
+            let an = eq.intern(a);
+            let sn = eq.intern(single);
+            eq.are_equal(an, sn)
+        }
+    };
+    // `rest` must contain `single` again.
+    let mut contains = false;
+    for &a in rest {
+        if same_as_single(eq, a) {
+            contains = true;
+            break;
+        }
+    }
+    if !contains {
+        return false;
+    }
+    // … plus at least one necessarily-non-empty atom.
+    let mut seen_v_once = false;
+    for &a in rest {
+        if let Some(s) = terms.string_const_value(a) {
+            if !s.is_empty() {
+                return true; // non-empty constant alongside the occurrence ⇒ unsat
+            }
+        } else if same_as_single(eq, a) {
+            if seen_v_once {
+                return true; // a second occurrence of `single` ⇒ unsat
+            }
+            seen_v_once = true;
+        } else {
+            return true; // a distinct second variable ⇒ extra material ⇒ unsat
+        }
+    }
+    false
+}
+
 /// Compare two atoms for definite equality: same TermId, same literal string
 /// value, or same EqualityEngine equivalence class.
 fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: TermId) -> bool {
@@ -203,6 +251,28 @@ pub fn resolve_equation(
     // Both exhausted: equation holds trivially.
     if i == le && j == re {
         return StepResult::Done;
+    }
+
+    // OCCURS CHECK (length-based contradiction in the free monoid). If one side
+    // is the SINGLE variable `v` and the residual of the other side both
+    //   (a) contains an occurrence of `v` (same TermId / same EUF class), and
+    //   (b) contains some atom that is necessarily NON-EMPTY (a non-empty string
+    //       constant, or any second variable occurrence),
+    // then `v = …v… + extra` forces `len(v) = len(v) + extra > len(v)`, which is
+    // impossible. This is UNSAT. It is the decidable length-contradiction core of
+    // variable-headed word equations such as `s = "b" ++ t ++ s ++ "c"`, which the
+    // pure F-split would otherwise diverge on (→ Unknown) or wrongly call SAT.
+    {
+        if le - i == 1 && terms.string_const_value(lhs[i]).is_none()
+            && occurs_unsat(terms, eq, lhs[i], &rhs[j..re])
+        {
+            return StepResult::Conflict(just);
+        }
+        if re - j == 1 && terms.string_const_value(rhs[j]).is_none()
+            && occurs_unsat(terms, eq, rhs[j], &lhs[i..le])
+        {
+            return StepResult::Conflict(just);
+        }
     }
 
     // Both sides non-empty: check for constant-head character mismatch.
