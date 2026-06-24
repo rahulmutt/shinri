@@ -600,6 +600,7 @@ impl Arith {
                 TCheck::Sat => None,
                 TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
                 TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
+                TCheck::Unknown => unreachable!("arith check_full never returns Unknown"),
             },
         }
     }
@@ -659,6 +660,7 @@ impl Arith {
             TCheck::Sat => None,
             TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
             TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
+            TCheck::Unknown => unreachable!("arith check_full never returns Unknown"),
         }
     }
 
@@ -1013,6 +1015,7 @@ impl TheorySolver for Arith {
             TCheck::Conflict(leaves) => return TCheck::Conflict(self.strip_apriori(leaves)),
             TCheck::Split { .. } => unreachable!("check_full never emits Split"),
             TCheck::Sat => {}
+            TCheck::Unknown => unreachable!("arith check_full never returns Unknown"),
         }
         self.integer_check(cx)
     }
@@ -1341,6 +1344,7 @@ mod check_tests {
             }
             TCheck::Sat => panic!("expected conflict"),
             TCheck::Split { .. } => unreachable!("Arith check never emits Split in its own tests"),
+            TCheck::Unknown => unreachable!("Arith never returns Unknown"),
         }
     }
 

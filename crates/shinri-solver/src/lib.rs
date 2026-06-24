@@ -402,6 +402,7 @@ impl Solver {
         }
 
         match sat.solve() {
+            SolveResult::Unknown => SolveOutcome::Unknown,
             SolveResult::Unsat { .. } => SolveOutcome::Unsat,
             SolveResult::Sat => {
                 let mb = sat.theory_mut().build_model();

@@ -166,6 +166,7 @@ mod tests {
                 }
                 TCheck::Sat => break,
                 TCheck::Conflict(_) => panic!("no conflict expected"),
+                TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
         assert!(
@@ -221,6 +222,7 @@ mod tests {
                 }
                 TCheck::Sat => break,
                 TCheck::Conflict(_) => panic!("no conflict expected"),
+                TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
         assert!(

@@ -84,6 +84,11 @@ impl TheorySolver for StrSolver {
         for lt in lens {
             if let Some(axiom) = length::next_axiom(cx.terms, lt, &self.emitted_len_axioms) {
                 self.emitted_len_axioms.insert(axiom);
+                // Spend one unit of fuel before emitting a split. If the budget is
+                // exhausted, signal Unknown (sound: neither Sat nor Unsat).
+                if !self.fuel.spend() {
+                    return TCheck::Unknown;
+                }
                 // Length axioms (e.g. (= (str.len "café") 4), len(x++y)=len x+len y,
                 // len ≥ 0) are unconditionally valid over the string/length theory —
                 // tautology splits, no guard.
@@ -136,6 +141,11 @@ impl TheorySolver for StrSolver {
                             &mut self.str_terms,
                             &mut seen,
                         );
+                    }
+                    // Spend one unit of fuel before emitting a word-equation split.
+                    // If the budget is exhausted, signal Unknown (sound).
+                    if !self.fuel.spend() {
+                        return TCheck::Unknown;
                     }
                     // GUARDED split: `guard = ¬eqn`. The learnt clause is
                     // `¬eqn ∨ len_eq ∨ a_pref ∨ b_pref` ≡ `eqn → (…)`, a valid
@@ -246,12 +256,17 @@ impl StrSolver {
     pub fn test_force_diseq_true(&mut self, atom: TermId) {
         self.diseq_true.push((atom, Lit::new(Var::new(0), true)));
     }
+
+    /// Override the fuel budget. Used only in unit tests to force exhaustion.
+    pub fn test_set_fuel(&mut self, n: u32) {
+        self.fuel = Fuel { remaining: n };
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shinri_core::{Context, Op, Var};
+    use shinri_core::{BuiltinOp, Context, Op, Var};
     use shinri_sat::Effort;
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
 
@@ -312,5 +327,37 @@ mod tests {
             matches!(s.check(&mut cx, Effort::Full), TCheck::Sat),
             "fixpoint after all axioms emitted"
         );
+    }
+
+    #[test]
+    fn fuel_exhaustion_yields_unknown_not_hang() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mk = |c: &mut Context, n: &str| {
+            let s = c.declare_fun(n, &[], str_s);
+            c.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let x = mk(&mut ctx, "x");
+        let y = mk(&mut ctx, "y");
+        // x ++ y = y ++ x : classic diverging word equation.
+        let l = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y]).unwrap();
+        let r = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[y, x]).unwrap();
+        let atom = ctx.mk_eq(l, r).unwrap();
+        let mut s = StrSolver::default();
+        s.test_set_fuel(3); // tiny budget — exhausts before all 5 axioms/splits
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &areg };
+        s.new_var(&mut cx, shinri_core::Var::new(0), atom);
+        s.test_force_eq_true(atom);
+        let mut got_unknown = false;
+        for _ in 0..50 {
+            match s.check(&mut cx, Effort::Full) {
+                TCheck::Unknown => { got_unknown = true; break; }
+                TCheck::Split { .. } => continue,
+                _ => break,
+            }
+        }
+        assert!(got_unknown, "tiny fuel must force Unknown, never an infinite split loop");
     }
 }

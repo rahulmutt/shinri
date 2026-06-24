@@ -19,6 +19,8 @@ enum FinalCheck {
     Sat,
     Conflict(Vec<crate::types::EqLeaf>),
     Split { atoms: Vec<TermId>, guard: Option<Lit> },
+    /// A sub-theory exhausted its fuel budget; the overall result is unknown.
+    Unknown,
 }
 
 pub struct Combiner<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> {
@@ -241,6 +243,7 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory 
             FinalCheck::Sat => TheoryResult::Sat,
             FinalCheck::Conflict(leaves) => TheoryResult::Conflict(self.expand_conflict(leaves)),
             FinalCheck::Split { atoms, guard } => TheoryResult::SplitAtoms { atoms, guard },
+            FinalCheck::Unknown => TheoryResult::Unknown,
         }
     }
 
@@ -361,22 +364,26 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
                     TCheck::Split { .. } => unreachable!("EUF never splits"),
                     TCheck::Sat => {}
+                    TCheck::Unknown => unreachable!("EUF never returns Unknown"),
                 }
                 match self.arith.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
                     TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
                     TCheck::Sat => {}
+                    TCheck::Unknown => unreachable!("Arith never returns Unknown"),
                 }
                 match self.arrays.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
                     TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
                     TCheck::Sat => {}
+                    TCheck::Unknown => unreachable!("Arrays never returns Unknown"),
                 }
                 // String checks last (lowest priority).
                 match self.string.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
                     TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
                     TCheck::Sat => {}
+                    TCheck::Unknown => return FinalCheck::Unknown,
                 }
             }
             // Did the existing round produce a new interface/congruence merge?

@@ -58,6 +58,10 @@ pub enum TheoryResult {
     Conflict(Vec<Lit>),
     Lemma(Vec<Lit>),
     SplitAtoms { atoms: Vec<TermId>, guard: Option<Lit> },
+    /// A theory's fuel budget was exhausted; the result is unknown. The SAT
+    /// solver must propagate this to `SolveResult::Unknown` without treating
+    /// it as satisfiable (soundness).
+    Unknown,
 }
 
 /// The outcome of a solve. `Unsat.core` is the failed-assumption set
@@ -66,6 +70,9 @@ pub enum TheoryResult {
 pub enum SolveResult {
     Sat,
     Unsat { core: Vec<Lit> },
+    /// A theory's fuel budget was exhausted; the result is unknown (neither
+    /// sat nor unsat). The top-level solver maps this to `SolveOutcome::Unknown`.
+    Unknown,
 }
 
 /// The antecedent of a trail assignment: why a variable holds its value.

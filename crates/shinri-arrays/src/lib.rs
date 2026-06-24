@@ -176,6 +176,7 @@ mod tests {
                     TCheck::Sat => "Sat",
                     TCheck::Conflict(_) => "Conflict",
                     TCheck::Split { .. } => unreachable!(),
+                    TCheck::Unknown => unreachable!("Arrays never returns Unknown"),
                 }
             ),
         }
@@ -223,6 +224,7 @@ mod tests {
                     TCheck::Sat => "Sat",
                     TCheck::Conflict(_) => "Conflict",
                     TCheck::Split { .. } => unreachable!(),
+                    TCheck::Unknown => unreachable!("Arrays never returns Unknown"),
                 }
             ),
         }

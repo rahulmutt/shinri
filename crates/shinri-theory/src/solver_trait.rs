@@ -29,6 +29,10 @@ pub enum TCheck {
     Sat,
     Conflict(Vec<EqLeaf>),
     Split { atoms: Vec<TermId>, guard: Option<Lit> },
+    /// The theory's fuel budget was exhausted; the result is unknown (neither
+    /// sat nor unsat). The solver must propagate this to `SolveOutcome::Unknown`
+    /// without treating it as satisfiable.
+    Unknown,
 }
 
 /// `pop(level)` uses ABSOLUTE target levels (matching `EqualityEngine`/`UndoLog`).
@@ -180,7 +184,7 @@ mod tests {
             eq: &mut eq,
             atoms: &atoms,
         };
-        assert!(matches!(t.check(&mut cx, Effort::Full), TCheck::Sat));
+        assert!(matches!(t.check(&mut cx, Effort::Full), TCheck::Sat), "NullTheory must always return Sat");
     }
 
     #[test]
@@ -192,7 +196,7 @@ mod tests {
                 assert_eq!(atoms, vec![t]);
                 assert_eq!(guard, None);
             }
-            _ => panic!("expected Split"),
+            TCheck::Sat | TCheck::Conflict(_) | TCheck::Unknown => panic!("expected Split"),
         }
     }
 }

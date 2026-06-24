@@ -487,6 +487,7 @@ mod tests {
                 }
                 TCheck::Sat => break,
                 TCheck::Conflict(_) => break,
+                TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
         assert!(saw_split, "a variable-headed word equation must emit a multi-atom F-split");
@@ -543,6 +544,7 @@ mod tests {
                     // Non-empty-branch splits (e.g. length axioms) may be unguarded tautologies.
                 }
                 TCheck::Sat => { ok = true; break; }
+                TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
         assert!(ok, "x = \"ab\" must reach Sat or emit a split without conflict");
@@ -576,6 +578,7 @@ mod tests {
                 TCheck::Split { .. } => continue,
                 TCheck::Conflict(_) => break,
                 TCheck::Sat => panic!("expected conflict on prefix mismatch"),
+                TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
     }
@@ -614,6 +617,7 @@ mod tests {
                 TCheck::Conflict(_) => { conflicted = true; break; }
                 TCheck::Split { .. } => continue,
                 TCheck::Sat => break,
+                TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
         assert!(conflicted, "asserted distinct over equal normal forms is UNSAT");

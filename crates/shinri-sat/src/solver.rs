@@ -532,6 +532,12 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                 self.enqueue(l, Reason::Decision);
                             }
                             None => match self.theory.check(Effort::Full) {
+                                TheoryResult::Unknown => {
+                                    // A theory exhausted its fuel budget; the result is
+                                    // unknown (neither sat nor unsat). Stop immediately —
+                                    // do NOT fall through to Sat (soundness).
+                                    return SolveResult::Unknown;
+                                }
                                 TheoryResult::Sat => {
                                     debug_assert!(
                                         self.check_model(),
