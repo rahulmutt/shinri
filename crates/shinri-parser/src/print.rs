@@ -48,6 +48,8 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
                 }
                 out.push('"');
             }
+            ConstVal::Float(_) => out.push_str("<fp>"),
+            ConstVal::Rm(_) => out.push_str("<rm>"),
         },
         TermNode::App { op, args, .. } => {
             let children: Vec<TermId> = ctx.children(args).to_vec();

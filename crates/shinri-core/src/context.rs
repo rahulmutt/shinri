@@ -1,5 +1,5 @@
 use crate::error::SortError;
-use crate::ids::{BvId, RatId, SortId, StringId, SymbolId, TermId};
+use crate::ids::{BvId, FpId, RatId, SortId, StringId, SymbolId, TermId};
 use crate::sort::SortNode;
 use crate::symbol::StringInterner;
 use crate::term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
@@ -21,7 +21,6 @@ pub struct Context {
     bvs: Vec<(u32, Integer)>,
     /// FP literal table: (eb, sb, bits) where bits is the W = eb+sb bit pattern,
     /// laid out MSB->LSB as [sign | exponent | trailing-significand].
-    #[allow(dead_code)] // populated by the FP-literal task
     fps: Vec<(u32, u32, Integer)>,
     /// String literal table: index `StringId(i)` -> interned string value.
     str_lits: Vec<Box<str>>,
@@ -657,6 +656,51 @@ impl Context {
         }
     }
 
+    /// Intern an FP literal of sort (eb, sb) with the given W = eb+sb bit pattern.
+    pub fn mk_fp_const(&mut self, eb: u32, sb: u32, bits: Integer) -> TermId {
+        let fp_id = match self
+            .fps
+            .iter()
+            .position(|(e, s, v)| *e == eb && *s == sb && *v == bits)
+        {
+            Some(idx) => FpId::new(idx as u32),
+            None => {
+                let id = FpId::new(self.fps.len() as u32);
+                self.fps.push((eb, sb, bits));
+                id
+            }
+        };
+        let sort = self.fp_sort(eb, sb);
+        let val = ConstVal::Float(fp_id);
+        self.intern_with_key(TermKey::Const { val, sort }, TermNode::Const { val, sort })
+    }
+
+    /// Intern a rounding-mode constant.
+    pub fn mk_rm_const(&mut self, rm: crate::term::RoundingMode) -> TermId {
+        let sort = self.rm_sort();
+        let val = ConstVal::Rm(rm);
+        self.intern_with_key(TermKey::Const { val, sort }, TermNode::Const { val, sort })
+    }
+
+    /// (eb, sb, bits) of an FP literal term, or None.
+    pub fn fp_const_value(&self, t: TermId) -> Option<(u32, u32, &Integer)> {
+        match self.term_node(t) {
+            TermNode::Const { val: ConstVal::Float(id), .. } => {
+                let (e, s, v) = &self.fps[id.index()];
+                Some((*e, *s, v))
+            }
+            _ => None,
+        }
+    }
+
+    /// The rounding mode of an RM constant term, or None.
+    pub fn rm_const_value(&self, t: TermId) -> Option<crate::term::RoundingMode> {
+        match self.term_node(t) {
+            TermNode::Const { val: ConstVal::Rm(rm), .. } => Some(*rm),
+            _ => None,
+        }
+    }
+
     pub fn children(&self, slice: ChildSlice) -> &[TermId] {
         let start = slice.off as usize;
         let end = start + slice.len as usize;
@@ -1030,6 +1074,28 @@ mod tests {
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[i]).is_err());
         // Ill-sorted: str.at with String index must fail.
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrAt), &[x, y]).is_err());
+    }
+
+    #[test]
+    fn fp_and_rm_constants_roundtrip() {
+        use crate::term::RoundingMode;
+        use shinri_num::Integer;
+        let mut ctx = Context::new();
+
+        // +zero in Float32 is all zero bits.
+        let pz = ctx.mk_fp_const(8, 24, Integer::zero());
+        let pz_again = ctx.mk_fp_const(8, 24, Integer::zero());
+        assert_eq!(pz, pz_again, "identical FP consts must be interned equal");
+        assert_eq!(ctx.sort_of(pz), ctx.fp_sort(8, 24));
+        let (eb, sb, bits) = ctx.fp_const_value(pz).expect("fp const");
+        assert_eq!((eb, sb), (8, 24));
+        assert!(bits.is_zero());
+
+        let r = ctx.mk_rm_const(RoundingMode::Rne);
+        assert_eq!(ctx.sort_of(r), ctx.rm_sort());
+        assert_eq!(ctx.rm_const_value(r), Some(RoundingMode::Rne));
+        assert_eq!(ctx.rm_const_value(pz), None);
+        assert_eq!(ctx.fp_const_value(r), None);
     }
 
     #[test]

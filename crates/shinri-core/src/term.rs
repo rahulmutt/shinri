@@ -1,4 +1,4 @@
-use crate::ids::{BvId, RatId, SortId, StringId, SymbolId};
+use crate::ids::{BvId, FpId, RatId, SortId, StringId, SymbolId};
 
 /// A (offset, len) view into `Context.children` — out-of-line child storage (SoA).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -83,6 +83,21 @@ pub enum BuiltinOp {
     StrSubstr,
 }
 
+/// The five SMT-LIB rounding modes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RoundingMode {
+    /// roundNearestTiesToEven (RNE)
+    Rne,
+    /// roundNearestTiesToAway (RNA)
+    Rna,
+    /// roundTowardPositive (RTP)
+    Rtp,
+    /// roundTowardNegative (RTN)
+    Rtn,
+    /// roundTowardZero (RTZ)
+    Rtz,
+}
+
 /// A literal constant value. Numerals reference `Context.nums` by `RatId`.
 /// Bitvector literals reference `Context.bvs` by `BvId`.
 /// String literals reference `Context.str_lits` by `StringId`.
@@ -94,6 +109,10 @@ pub enum ConstVal {
     BitVec(BvId),
     /// A string literal; references `Context.str_lits`.
     String(StringId),
+    /// An FP literal; references `Context.fps`.
+    Float(FpId),
+    /// A rounding-mode constant.
+    Rm(RoundingMode),
 }
 
 /// A node in the hash-consed term DAG. Fixed-size; children stored out-of-line.
