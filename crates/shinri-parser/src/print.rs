@@ -48,8 +48,20 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
                 }
                 out.push('"');
             }
-            ConstVal::Float(_) => out.push_str("<fp>"),
-            ConstVal::Rm(_) => out.push_str("<rm>"),
+            ConstVal::Float(_) => {
+                let (eb, sb, bits) = ctx.fp_const_value(t).expect("Float const");
+                out.push_str(&format_fp_triple(eb, sb, bits));
+            }
+            ConstVal::Rm(_) => {
+                let rm = ctx.rm_const_value(t).expect("RM const");
+                out.push_str(match rm {
+                    shinri_core::RoundingMode::Rne => "RNE",
+                    shinri_core::RoundingMode::Rna => "RNA",
+                    shinri_core::RoundingMode::Rtp => "RTP",
+                    shinri_core::RoundingMode::Rtn => "RTN",
+                    shinri_core::RoundingMode::Rtz => "RTZ",
+                });
+            }
         },
         TermNode::App { op, args, .. } => {
             let children: Vec<TermId> = ctx.children(args).to_vec();
@@ -71,6 +83,43 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
             out.push(')');
         }
     }
+}
+
+/// Render an FP literal as `(fp #b<sign> #b<exp> #b<trailing-sig>)`.
+fn format_fp_triple(eb: u32, sb: u32, bits: &shinri_num::Integer) -> String {
+    let two = shinri_num::Integer::from(2u64);
+    let bin = |val: &shinri_num::Integer, width: u32| -> String {
+        let mut rem = val.clone();
+        let mut b: Vec<u8> = Vec::with_capacity(width as usize);
+        for _ in 0..width {
+            let (q, r) = rem.div_rem(&two);
+            b.push(r.to_i128().unwrap_or(0) as u8);
+            rem = q;
+        }
+        b.reverse();
+        b.iter().map(|&x| if x == 1 { '1' } else { '0' }).collect()
+    };
+    // Layout: bits = sign | exp | trailing-sig (MSB to LSB)
+    // low (sb-1) bits = trailing significand; next eb bits = exponent; top bit = sign.
+    let mut sig_mod = shinri_num::Integer::one();
+    for _ in 0..(sb - 1) {
+        sig_mod = sig_mod * two.clone();
+    }
+    let sig = bits.div_rem(&sig_mod).1;
+    let mut hi = bits.clone();
+    for _ in 0..(sb - 1) {
+        hi = hi.div_rem(&two).0;
+    }
+    let mut exp_mod = shinri_num::Integer::one();
+    for _ in 0..eb {
+        exp_mod = exp_mod * two.clone();
+    }
+    let exp = hi.div_rem(&exp_mod).1;
+    let mut sign = hi;
+    for _ in 0..eb {
+        sign = sign.div_rem(&two).0;
+    }
+    format!("(fp #b{} #b{} #b{})", bin(&sign, 1), bin(&exp, eb), bin(&sig, sb - 1))
 }
 
 fn builtin_name(b: BuiltinOp) -> String {
@@ -167,5 +216,23 @@ fn builtin_name(b: BuiltinOp) -> String {
         FpToUbv(m) => format!("(_ fp.to_ubv {m})"),
         FpToSbv(m) => format!("(_ fp.to_sbv {m})"),
         FpToReal => "fp.to_real".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prints_fp_const_and_rm() {
+        use shinri_core::{Context, RoundingMode};
+        use shinri_num::Integer;
+        let mut ctx = Context::new();
+        // Float32 +zero
+        let pz = ctx.mk_fp_const(8, 24, Integer::zero());
+        assert_eq!(print_term(&ctx, pz), "(fp #b0 #b00000000 #b00000000000000000000000)");
+        // rounding mode
+        let rne = ctx.mk_rm_const(RoundingMode::Rne);
+        assert_eq!(print_term(&ctx, rne), "RNE");
     }
 }
