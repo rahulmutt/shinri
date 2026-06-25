@@ -468,6 +468,94 @@ impl Context {
                 }
                 Ok(str_s)
             }
+            // ── Floating-point: arithmetic ────────────────────────────────────
+            FpAbs | FpNeg => {
+                expect_arity(args, 1)?;
+                let (eb, sb) = self.require_fp(args[0])?;
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpAdd | FpSub | FpMul | FpDiv => {
+                expect_arity(args, 3)?;
+                self.require_rm(args[0])?;
+                let (eb, sb) = self.require_fp(args[1])?;
+                let (eb2, sb2) = self.require_fp(args[2])?;
+                if (eb, sb) != (eb2, sb2) {
+                    return Err(SortError::Mismatch {
+                        expected: self.sort_of(args[1]),
+                        found: self.sort_of(args[2]),
+                    });
+                }
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpFma => {
+                expect_arity(args, 4)?;
+                self.require_rm(args[0])?;
+                let (eb, sb) = self.require_fp(args[1])?;
+                for &a in &args[2..4] {
+                    let (e, s) = self.require_fp(a)?;
+                    if (e, s) != (eb, sb) {
+                        return Err(SortError::Mismatch {
+                            expected: self.sort_of(args[1]),
+                            found: self.sort_of(a),
+                        });
+                    }
+                }
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpSqrt | FpRoundToIntegral => {
+                expect_arity(args, 2)?;
+                self.require_rm(args[0])?;
+                let (eb, sb) = self.require_fp(args[1])?;
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpRem | FpMin | FpMax => {
+                expect_arity(args, 2)?;
+                let (eb, sb) = self.require_fp(args[0])?;
+                let (eb2, sb2) = self.require_fp(args[1])?;
+                if (eb, sb) != (eb2, sb2) {
+                    return Err(SortError::Mismatch {
+                        expected: self.sort_of(args[0]),
+                        found: self.sort_of(args[1]),
+                    });
+                }
+                Ok(self.fp_sort(eb, sb))
+            }
+            // ── Floating-point: comparisons → Bool ────────────────────────────
+            FpLeq | FpLt | FpGeq | FpGt | FpEq => {
+                expect_arity(args, 2)?;
+                let (eb, sb) = self.require_fp(args[0])?;
+                let (eb2, sb2) = self.require_fp(args[1])?;
+                if (eb, sb) != (eb2, sb2) {
+                    return Err(SortError::Mismatch {
+                        expected: self.sort_of(args[0]),
+                        found: self.sort_of(args[1]),
+                    });
+                }
+                Ok(bool_s)
+            }
+            // ── Floating-point: classification → Bool ─────────────────────────
+            FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite | FpIsNaN
+            | FpIsNegative | FpIsPositive => {
+                expect_arity(args, 1)?;
+                self.require_fp(args[0])?;
+                Ok(bool_s)
+            }
+            // ── Floating-point: bit constructor ───────────────────────────────
+            FpFromBits => {
+                expect_arity(args, 3)?;
+                let w_sign = self.require_bv(args[0])?;
+                let w_exp = self.require_bv(args[1])?;
+                let w_sig = self.require_bv(args[2])?;
+                if w_sign != 1 {
+                    return Err(SortError::FpIndex);
+                }
+                let eb = w_exp;
+                let sb = w_sig + 1;
+                if eb < 2 || sb < 2 {
+                    return Err(SortError::FpIndex);
+                }
+                Ok(self.fp_sort(eb, sb))
+            }
         }
     }
 
@@ -475,6 +563,21 @@ impl Context {
     /// the term does not have a BitVec sort.
     fn require_bv(&self, t: TermId) -> Result<u32, SortError> {
         self.bv_width(self.sort_of(t)).ok_or(SortError::NotBitVec)
+    }
+
+    /// (eb, sb) of a Float-sorted term, or `SortError::NotFloat`.
+    fn require_fp(&self, t: TermId) -> Result<(u32, u32), SortError> {
+        self.fp_widths(self.sort_of(t)).ok_or(SortError::NotFloat)
+    }
+
+    /// Ok(()) iff `t` has the RoundingMode sort, else `SortError::NotRoundingMode`.
+    fn require_rm(&mut self, t: TermId) -> Result<(), SortError> {
+        let rm = self.rm_sort();
+        if self.sort_of(t) == rm {
+            Ok(())
+        } else {
+            Err(SortError::NotRoundingMode)
+        }
     }
 }
 
@@ -1114,6 +1217,49 @@ mod tests {
         let rm2 = ctx.rm_sort();
         assert_eq!(rm, rm2, "RoundingMode sort must be unique");
         assert_eq!(ctx.fp_widths(rm), None);
+    }
+
+    #[test]
+    fn fp_arith_compare_classify_sortcheck() {
+        use crate::term::RoundingMode;
+        use crate::{BuiltinOp, Op};
+        use shinri_num::Integer;
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let yf = ctx.declare_fun("y", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(RoundingMode::Rne);
+
+        // fp.add : (RM, F, F) -> F
+        let add = ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y]).unwrap();
+        assert_eq!(ctx.sort_of(add), f32);
+
+        // fp.neg : (F) -> F ; fp.abs : (F) -> F
+        let neg = ctx.mk_app(Op::Builtin(BuiltinOp::FpNeg), &[x]).unwrap();
+        assert_eq!(ctx.sort_of(neg), f32);
+
+        // fp.leq : (F, F) -> Bool ; fp.isNaN : (F) -> Bool
+        let leq = ctx.mk_app(Op::Builtin(BuiltinOp::FpLeq), &[x, y]).unwrap();
+        assert_eq!(ctx.sort_of(leq), ctx.bool_sort());
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
+        assert_eq!(ctx.sort_of(isnan), ctx.bool_sort());
+
+        // fp : (BV1, BV8, BV23) -> Float(8,24)
+        let b1 = ctx.mk_bv_const(1, Integer::zero());
+        let b8 = ctx.mk_bv_const(8, Integer::zero());
+        let b23 = ctx.mk_bv_const(23, Integer::zero());
+        let ctor = ctx.mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[b1, b8, b23]).unwrap();
+        assert_eq!(ctx.sort_of(ctor), f32);
+
+        // width mismatch on fp.add operands must be a SortError, not a panic
+        let f64 = ctx.fp_sort(11, 53);
+        let zf = ctx.declare_fun("z", &[], f64);
+        let z = ctx.mk_app(Op::Uninterpreted(zf), &[]).unwrap();
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, z]).is_err());
+        // missing rounding mode (passing a Float where RM expected) must error
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[x, x, y]).is_err());
     }
 
     // helper local to the test module

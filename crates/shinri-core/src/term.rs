@@ -81,6 +81,18 @@ pub enum BuiltinOp {
     StrLen,
     StrAt,
     StrSubstr,
+    // Floating-point — arithmetic. Rounded ops take a RoundingMode as arg 0.
+    FpAbs, FpNeg,                 // (F) -> F
+    FpAdd, FpSub, FpMul, FpDiv,   // (RM, F, F) -> F
+    FpFma,                        // (RM, F, F, F) -> F
+    FpSqrt, FpRoundToIntegral,    // (RM, F) -> F
+    FpRem, FpMin, FpMax,          // (F, F) -> F
+    // Floating-point — comparisons: (F, F) -> Bool
+    FpLeq, FpLt, FpGeq, FpGt, FpEq,
+    // Floating-point — classification: (F) -> Bool
+    FpIsNormal, FpIsSubnormal, FpIsZero, FpIsInfinite, FpIsNaN, FpIsNegative, FpIsPositive,
+    // Floating-point — bit constructor: (BV1, BVeb, BV(sb-1)) -> Float(eb, sb)
+    FpFromBits,
 }
 
 /// The five SMT-LIB rounding modes.

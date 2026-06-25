@@ -717,6 +717,32 @@ impl<'a> Parser<'a> {
             | BuiltinOp::StrLen
             | BuiltinOp::StrAt
             | BuiltinOp::StrSubstr => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            // Floating-point ops: delegate directly to mk_app (sort-checking in Context).
+            BuiltinOp::FpAbs
+            | BuiltinOp::FpNeg
+            | BuiltinOp::FpAdd
+            | BuiltinOp::FpSub
+            | BuiltinOp::FpMul
+            | BuiltinOp::FpDiv
+            | BuiltinOp::FpFma
+            | BuiltinOp::FpSqrt
+            | BuiltinOp::FpRoundToIntegral
+            | BuiltinOp::FpRem
+            | BuiltinOp::FpMin
+            | BuiltinOp::FpMax
+            | BuiltinOp::FpLeq
+            | BuiltinOp::FpLt
+            | BuiltinOp::FpGeq
+            | BuiltinOp::FpGt
+            | BuiltinOp::FpEq
+            | BuiltinOp::FpIsNormal
+            | BuiltinOp::FpIsSubnormal
+            | BuiltinOp::FpIsZero
+            | BuiltinOp::FpIsInfinite
+            | BuiltinOp::FpIsNaN
+            | BuiltinOp::FpIsNegative
+            | BuiltinOp::FpIsPositive
+            | BuiltinOp::FpFromBits => Self::mk(ctx, Op::Builtin(op), &args, &sp),
         }
     }
 
