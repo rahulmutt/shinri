@@ -308,6 +308,31 @@ impl<'a> Parser<'a> {
             "str.substr" => StrSubstr,
             // Floating-point bit constructor (SMT-LIB QF_FP)
             "fp" => FpFromBits,
+            // Floating-point arithmetic and classification operators (QF_FP)
+            "fp.abs" => FpAbs,
+            "fp.neg" => FpNeg,
+            "fp.add" => FpAdd,
+            "fp.sub" => FpSub,
+            "fp.mul" => FpMul,
+            "fp.div" => FpDiv,
+            "fp.fma" => FpFma,
+            "fp.sqrt" => FpSqrt,
+            "fp.rem" => FpRem,
+            "fp.roundToIntegral" => FpRoundToIntegral,
+            "fp.min" => FpMin,
+            "fp.max" => FpMax,
+            "fp.leq" => FpLeq,
+            "fp.lt" => FpLt,
+            "fp.geq" => FpGeq,
+            "fp.gt" => FpGt,
+            "fp.eq" => FpEq,
+            "fp.isNormal" => FpIsNormal,
+            "fp.isSubnormal" => FpIsSubnormal,
+            "fp.isZero" => FpIsZero,
+            "fp.isInfinite" => FpIsInfinite,
+            "fp.isNaN" => FpIsNaN,
+            "fp.isNegative" => FpIsNegative,
+            "fp.isPositive" => FpIsPositive,
             // Floating-point non-indexed conversion
             "fp.to_real" => FpToReal,
             _ => return None,
@@ -1850,6 +1875,63 @@ mod tests {
         let (ctx, t) = parse("(_ NaN 8 24)");
         let (_, _, bits) = ctx.fp_const_value(t).unwrap();
         assert_eq!(bits.to_i128(), Some(0x7FC0_0000));
+    }
+
+    /// Task-8 TDD test: `fp.*` operator names and indexed FP conversions parse
+    /// and sort-check correctly.
+    ///
+    /// Assertions:
+    ///   - `(fp.add RNE x x)` with x:Float32 → Float32 (fp_widths == Some((8,24)))
+    ///   - `(fp.isNaN x)` with x:Float32 → Bool
+    ///   - `((_ to_fp 11 53) RNE x)` with x:Float32 → Float64 (fp_widths == Some((11,53)))
+    ///   - `((_ fp.to_sbv 16) RNE x)` with x:Float32 → BV16 (bv_width == Some(16))
+    #[test]
+    fn parse_fp_operators_and_conversions() {
+        use shinri_core::Context;
+
+        /// Declare `x` of sort `decl_sort` into a Context, then parse `expr`
+        /// in that same environment (sharing the declared symbol).
+        fn parse_with_x(decl_sort: &str, expr: &str) -> (Context, shinri_core::TermId) {
+            let mut ctx = Context::new();
+            let decl = format!("(declare-fun x () {decl_sort})");
+            let mut p = Parser::new(&decl);
+            p.next_command(&mut ctx).unwrap().unwrap();
+            let mut p2 = Parser::with_env(expr, p.into_env());
+            let t = p2.parse_term(&mut ctx).expect("parse expr");
+            (ctx, t)
+        }
+
+        // fp.add RNE x x : Float32 → Float32
+        let (ctx, t) = parse_with_x("Float32", "(fp.add RNE x x)");
+        assert_eq!(
+            ctx.fp_widths(ctx.sort_of(t)),
+            Some((8, 24)),
+            "fp.add result must be Float32"
+        );
+
+        // fp.isNaN x : Bool
+        let (ctx, t) = parse_with_x("Float32", "(fp.isNaN x)");
+        assert_eq!(
+            ctx.sort_of(t),
+            ctx.bool_sort(),
+            "fp.isNaN result must be Bool"
+        );
+
+        // ((_ to_fp 11 53) RNE x) : Float32 → Float64
+        let (ctx, t) = parse_with_x("Float32", "((_ to_fp 11 53) RNE x)");
+        assert_eq!(
+            ctx.fp_widths(ctx.sort_of(t)),
+            Some((11, 53)),
+            "to_fp 11 53 result must be Float64"
+        );
+
+        // ((_ fp.to_sbv 16) RNE x) : Float32 → BV16
+        let (ctx, t) = parse_with_x("Float32", "((_ fp.to_sbv 16) RNE x)");
+        assert_eq!(
+            ctx.bv_width(ctx.sort_of(t)),
+            Some(16),
+            "fp.to_sbv 16 result must be BV16"
+        );
     }
 
     /// Regression: define-fun followed by a bad command must NOT drop the
