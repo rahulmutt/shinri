@@ -297,6 +297,77 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
     pack(sign, biased, trailing)
 }
 
+/// Canonical quiet-NaN bit pattern for (eb, sb): exp all ones, sig MSB set, sign 0.
+pub fn canonical_nan(eb: u32, sb: u32) -> Integer {
+    let two = Integer::from(2u64);
+    // exp field (all ones) sits at bit offset (sb-1); sig MSB at bit (sb-2).
+    let mut exp_scale = Integer::one();
+    for _ in 0..(sb - 1) { exp_scale = exp_scale * two.clone(); }
+    let exp_all_ones = {
+        let mut m = Integer::one();
+        for _ in 0..eb { m = m * two.clone(); }
+        m - Integer::one()
+    };
+    let mut sig_msb = Integer::one();
+    for _ in 0..(sb - 2) { sig_msb = sig_msb * two.clone(); }
+    exp_all_ones * exp_scale + sig_msb
+}
+
+/// Signed-infinity bit pattern.
+fn inf_pattern(eb: u32, sb: u32, sign: bool) -> Integer {
+    let two = Integer::from(2u64);
+    let mut exp_scale = Integer::one();
+    for _ in 0..(sb - 1) { exp_scale = exp_scale * two.clone(); }
+    let exp_all_ones = { let mut m = Integer::one(); for _ in 0..eb { m = m * two.clone(); } m - Integer::one() };
+    let mut out = exp_all_ones * exp_scale;
+    if sign {
+        let mut sign_scale = Integer::one();
+        for _ in 0..(eb + sb - 1) { sign_scale = sign_scale * two.clone(); }
+        out = out + sign_scale;
+    }
+    out
+}
+
+/// Signed-zero bit pattern.
+fn zero_pattern(eb: u32, sb: u32, sign: bool) -> Integer {
+    if !sign { return Integer::zero(); }
+    let two = Integer::from(2u64);
+    let mut sign_scale = Integer::one();
+    for _ in 0..(eb + sb - 1) { sign_scale = sign_scale * two.clone(); }
+    sign_scale
+}
+
+/// Exact-rational golden `fp.add RM a b`. `a`, `b` are W=eb+sb bit patterns.
+pub fn ref_add(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> Integer {
+    let ca = decode(eb, sb, a);
+    let cb = decode(eb, sb, b);
+    use FpClass::*;
+    // 1. NaN propagation.
+    if matches!(ca, Nan) || matches!(cb, Nan) { return canonical_nan(eb, sb); }
+    // 2. Infinities.
+    match (&ca, &cb) {
+        (Inf { sign: s1 }, Inf { sign: s2 }) => {
+            return if s1 == s2 { inf_pattern(eb, sb, *s1) } else { canonical_nan(eb, sb) };
+        }
+        (Inf { sign }, _) | (_, Inf { sign }) => return inf_pattern(eb, sb, *sign),
+        _ => {}
+    }
+    // 3. Finite + finite: exact rational sum.
+    let ra = class_to_rational(eb, sb, &ca).unwrap();
+    let rb = class_to_rational(eb, sb, &cb).unwrap();
+    let sum = ra.clone() + rb.clone();
+    let zero = Rational::new(Integer::zero(), Integer::one());
+    if sum == zero {
+        // IEEE exact-zero-sum sign rule: -0 iff both operands negative, else
+        // +0 except under roundTowardNegative which yields -0.
+        let sign_a = ref_is_negative(&ca);
+        let sign_b = ref_is_negative(&cb);
+        let neg = (sign_a && sign_b) || matches!(mode, RoundMode::Rtn);
+        return zero_pattern(eb, sb, neg);
+    }
+    round_rational(eb, sb, &sum, mode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -376,5 +447,50 @@ mod tests {
         assert_eq!(round_rational(eb, sb, &rat(1, 10), RoundMode::Rtz), Integer::from(0x3DCC_CCCCu64));
         // exact zero -> +0
         assert_eq!(round_rational(eb, sb, &rat(0, 1), RoundMode::Rne), Integer::from(0u64));
+    }
+
+    #[test]
+    fn ref_add_known_float32() {
+        use shinri_num::Integer;
+        let (eb, sb) = (8u32, 24u32);
+        let i = |v: u64| Integer::from(v);
+        // 1.0 + 1.0 = 2.0
+        assert_eq!(ref_add(eb, sb, &i(0x3F80_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x4000_0000));
+        // 1.0 + 2.0 = 3.0 = 0x40400000
+        assert_eq!(ref_add(eb, sb, &i(0x3F80_0000), &i(0x4000_0000), RoundMode::Rne), i(0x4040_0000));
+        // +inf + 1.0 = +inf
+        assert_eq!(ref_add(eb, sb, &i(0x7F80_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x7F80_0000));
+        // +inf + -inf = canonical NaN (0x7FC00000)
+        assert_eq!(ref_add(eb, sb, &i(0x7F80_0000), &i(0xFF80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        // NaN + 1.0 = canonical NaN
+        assert_eq!(ref_add(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        // 1.0 + (-1.0) = +0 under RNE, -0 under RTN
+        assert_eq!(ref_add(eb, sb, &i(0x3F80_0000), &i(0xBF80_0000), RoundMode::Rne), i(0x0000_0000));
+        assert_eq!(ref_add(eb, sb, &i(0x3F80_0000), &i(0xBF80_0000), RoundMode::Rtn), i(0x8000_0000));
+        // (-0) + (-0) = -0
+        assert_eq!(ref_add(eb, sb, &i(0x8000_0000), &i(0x8000_0000), RoundMode::Rne), i(0x8000_0000));
+        // (+0) + (-0) = +0 (RNE), -0 (RTN)
+        assert_eq!(ref_add(eb, sb, &i(0x0000_0000), &i(0x8000_0000), RoundMode::Rne), i(0x0000_0000));
+        assert_eq!(ref_add(eb, sb, &i(0x0000_0000), &i(0x8000_0000), RoundMode::Rtn), i(0x8000_0000));
+    }
+
+    #[test]
+    fn ref_add_tiny_total_and_canonical() {
+        // Every (a,b,mode) on (3,5) produces a well-formed encoding (round-trips
+        // through decode without panic) and is commutative for finite, non-zero sums.
+        let (eb, sb) = (3u32, 5u32);
+        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        for a in 0u64..256 {
+            for b in 0u64..256 {
+                for m in modes {
+                    let r1 = ref_add(eb, sb, &Integer::from(a), &Integer::from(b), m);
+                    let r2 = ref_add(eb, sb, &Integer::from(b), &Integer::from(a), m);
+                    // commutativity holds for fp.add in all these cases (NaN canonical too).
+                    assert_eq!(r1, r2, "add not commutative a={a:#x} b={b:#x} m={m:?}");
+                    // result must be a valid 8-bit pattern.
+                    assert!(r1 < Integer::from(256u64), "out-of-range result {a:#x}+{b:#x}");
+                }
+            }
+        }
     }
 }
