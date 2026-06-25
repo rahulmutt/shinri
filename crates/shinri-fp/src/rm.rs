@@ -22,6 +22,13 @@ pub fn literal(b: &Blaster, rm: RoundingMode) -> RmSel {
 /// Symbolic mode: 3 fresh bits (e2 e1 e0), codes 000..100 only.
 /// Decode to one-hot; exclude illegal codes 101/110/111 with two clauses.
 pub fn symbolic(b: &mut Blaster) -> RmSel {
+    symbolic_bits(b).0
+}
+
+/// Like [`symbolic`] but also returns the three raw input bits `[e0, e1, e2]`
+/// (LSB→MSB) so tests can pin the encoded code and exercise the exclusion
+/// clauses directly. The public one-hot contract is identical to [`symbolic`].
+fn symbolic_bits(b: &mut Blaster) -> (RmSel, [BitLit; 3]) {
     let e0 = b.fresh();
     let e1 = b.fresh();
     let e2 = b.fresh();
@@ -37,7 +44,7 @@ pub fn symbolic(b: &mut Blaster) -> RmSel {
     let rtp = { let t = b.and2(n2, e1); b.and2(t, n0) }; // 010
     let rtn = { let t = b.and2(n2, e1); b.and2(t, e0) }; // 011
     let rtz = { let t = b.and2(e2, n1); b.and2(t, n0) }; // 100
-    RmSel { sel: [rne, rna, rtp, rtn, rtz] }
+    (RmSel { sel: [rne, rna, rtp, rtn, rtz] }, [e0, e1, e2])
 }
 
 #[cfg(test)]
@@ -74,14 +81,73 @@ mod tests {
         }
     }
 
+    /// Build a solver from `b`'s CNF plus `extra` pinning clauses, then solve.
+    fn solve_with(b: Blaster, extra: &[Vec<BitLit>]) -> SolveResult {
+        let cnf = b.finish();
+        let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..cnf.num_vars { s.new_var(); }
+        for c in cnf.clauses.iter().chain(extra.iter()) {
+            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            s.add_clause(&ls);
+        }
+        s.solve()
+    }
+
+    /// Unit clause pinning bit `bl` to `val`.
+    fn pin(bl: BitLit, val: bool) -> Vec<BitLit> {
+        // `bl` is a fresh literal (pos == true), so pinning its var to `val`
+        // is simply the unit literal with polarity `val`.
+        vec![BitLit { var: bl.var, pos: val }]
+    }
+
     #[test]
     fn symbolic_is_exactly_one_hot_and_excludes_illegal() {
-        // The CNF must force exactly one selector true across ALL satisfying
-        // assignments. Enumerate by adding a unit clause forcing each selector and
-        // confirming consistency; here we just check one solution is one-hot.
+        // 1) The default (unpinned) symbolic RM yields a one-hot assignment.
         let mut b = Blaster::new();
         let s = symbolic(&mut b);
         let got = eval_sel(b, &s.sel);
         assert_eq!(got.iter().filter(|x| **x).count(), 1, "symbolic RM must be one-hot");
+
+        // 2) Each legal code 0..=4 is SAT and decodes to *exactly* its own
+        //    selector. We pin (e2,e1,e0) to the code, then require sel[code]=true
+        //    and every other sel[j]=false; SAT proves the decode is correct.
+        for code in 0u8..=4 {
+            let mut b = Blaster::new();
+            let (s, bits) = symbolic_bits(&mut b);
+            let mut extra: Vec<Vec<BitLit>> = Vec::new();
+            for k in 0..3 {
+                extra.push(pin(bits[k], (code >> k) & 1 == 1));
+            }
+            for j in 0..5 {
+                extra.push(pin(s.sel[j], j == code as usize));
+            }
+            assert_eq!(
+                solve_with(b, &extra), SolveResult::Sat,
+                "legal code {code} must decode to selector {code}"
+            );
+        }
+
+        // 3) The exclusion clauses must make every illegal code 5/6/7 UNSAT.
+        //    This is the falsifiable coverage of the two `add_clause` lines:
+        //    removing either exclusion clause makes one of these SAT.
+        for code in [5u8, 6, 7] {
+            let mut b = Blaster::new();
+            let (_s, bits) = symbolic_bits(&mut b);
+            let extra: Vec<Vec<BitLit>> =
+                (0..3).map(|k| pin(bits[k], (code >> k) & 1 == 1)).collect();
+            assert!(
+                matches!(solve_with(b, &extra), SolveResult::Unsat { .. }),
+                "illegal code {code} must be excluded (UNSAT)"
+            );
+        }
+
+        // 4) Genuine mutual exclusivity: forcing two selectors true is UNSAT.
+        let mut b = Blaster::new();
+        let s = symbolic(&mut b);
+        let extra = vec![pin(s.sel[0], true), pin(s.sel[1], true)];
+        assert!(
+            matches!(solve_with(b, &extra), SolveResult::Unsat { .. }),
+            "two selectors cannot be simultaneously true"
+        );
     }
 }
