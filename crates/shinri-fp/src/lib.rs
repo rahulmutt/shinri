@@ -22,11 +22,29 @@ pub struct FpBlaster {
     pub b: Blaster,
     cache: FxHashMap<TermId, Vec<BitLit>>,
     var_bits: FxHashMap<TermId, Vec<BitLit>>,
+    rm_cache: FxHashMap<TermId, [BitLit; 5]>,
 }
 
 impl FpBlaster {
     pub fn new() -> Self {
-        FpBlaster { b: Blaster::new(), cache: FxHashMap::default(), var_bits: FxHashMap::default() }
+        FpBlaster { b: Blaster::new(), cache: FxHashMap::default(),
+                    var_bits: FxHashMap::default(), rm_cache: FxHashMap::default() }
+    }
+
+    /// Blast a RoundingMode operand to a one-hot selector. Literal modes fold to
+    /// constants; a symbolic RM variable becomes 3 fresh bits (cached per TermId).
+    fn blast_rm(&mut self, ctx: &Context, t: TermId) -> crate::rm::RmSel {
+        if let Some(sel) = self.rm_cache.get(&t) {
+            return crate::rm::RmSel { sel: *sel };
+        }
+        let sel = if let Some(rm) = ctx.rm_const_value(t) {
+            crate::rm::literal(&self.b, rm)
+        } else {
+            // symbolic RoundingMode variable (nullary uninterpreted of RM sort).
+            crate::rm::symbolic(&mut self.b)
+        };
+        self.rm_cache.insert(t, sel.sel);
+        sel
     }
 
     /// Blast an FP-sorted term to its W=eb+sb bit word (LSB→MSB), memoized.
@@ -66,6 +84,19 @@ impl FpBlaster {
                     FpNeg => {
                         let w = self.blast_word(ctx, kids[0]);
                         crate::blast::structural::neg(&mut self.b, &w, eb, sb)
+                    }
+                    FpAdd => {
+                        let rm = self.blast_rm(ctx, kids[0]);
+                        let xw = self.blast_word(ctx, kids[1]);
+                        let yw = self.blast_word(ctx, kids[2]);
+                        crate::blast::add::fp_add(&mut self.b, &xw, &yw, &rm, eb, sb)
+                    }
+                    FpSub => {
+                        let rm = self.blast_rm(ctx, kids[0]);
+                        let xw = self.blast_word(ctx, kids[1]);
+                        let yw = self.blast_word(ctx, kids[2]);
+                        let neg_y = crate::blast::structural::neg(&mut self.b, &yw, eb, sb);
+                        crate::blast::add::fp_add(&mut self.b, &xw, &neg_y, &rm, eb, sb)
                     }
                     other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
                 }
@@ -181,6 +212,24 @@ mod lower_tests {
         let eq = ctx.mk_eq(x, pz).unwrap();
         let lo = lower(&mut ctx, &[eq]);
         assert!(lo.atom_lit.contains_key(&eq), "FP core = must be surrogated");
+    }
+
+    #[test]
+    fn lower_fp_add_eq_atom() {
+        use shinri_core::BuiltinOp;
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let yf = ctx.declare_fun("y", &[], f32);
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let add = ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y]).unwrap();
+        let two = ctx.mk_fp_const(8, 24, Integer::from(0x4000_0000u64));
+        let eq = ctx.mk_eq(add, two).unwrap();
+        let lo = lower(&mut ctx, &[eq]);
+        assert!(lo.atom_lit.contains_key(&eq), "core = over fp.add must be surrogated");
+        assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
     }
 }
 
