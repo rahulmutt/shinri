@@ -4,6 +4,7 @@
 
 mod abv_stage;
 mod bv_stage;
+mod fp_stage;
 mod model;
 mod string_stage;
 mod tseitin;
