@@ -1513,13 +1513,14 @@ mod fp_routing_tests {
 
     // ── Bug-fix regression tests (slice-1 fence for unsupported FP constructs) ──
 
-    /// SOUNDNESS: fp.isNaN applied to fp.add (out-of-slice-1 word op) must be
-    /// Unknown, NOT a panic at unreachable! in blast_word.
+    /// SLICE-2A: fp.add is now supported; fp.isNaN(fp.add RNE x x) is Sat
+    /// (x can be a NaN bit-pattern, and fp.add(NaN, NaN) = NaN).
+    /// No panic — this exercises the slice-2a fp.add blast path end-to-end.
     #[test]
-    fn isnan_of_fpadd_is_unknown_not_panic() {
+    fn isnan_of_fpadd_is_sat_slice2a() {
         let src = "(declare-fun x () Float32) \
                    (assert (fp.isNaN (fp.add RNE x x))) (check-sat)";
-        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
     }
 
     /// SOUNDNESS: fp.isNaN applied to ite (FP-sorted ite is out of scope) must be
