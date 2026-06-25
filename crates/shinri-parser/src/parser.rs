@@ -4,6 +4,42 @@ use shinri_core::{Context, Rational, SortId, TermId};
 use shinri_frontend::Command;
 use shinri_num::Integer;
 
+/// IEEE special-value kinds that the `(_ <kind> eb sb)` syntax can name.
+#[derive(Clone, Copy)]
+enum FpSpecial {
+    PosInf,
+    NegInf,
+    PosZero,
+    NegZero,
+    Nan,
+}
+
+/// 2^k as an Integer (k may exceed 127, so build it generally via a loop).
+fn pow2(k: u32) -> Integer {
+    let mut acc = Integer::one();
+    let two = Integer::from(2u64);
+    for _ in 0..k {
+        acc = acc * two.clone();
+    }
+    acc
+}
+
+/// Canonical W = eb+sb bit pattern for an FP special value.
+/// Layout MSB->LSB: [ sign(1) | exp(eb) | trailing-sig(sb-1) ].
+fn fp_special_bits(eb: u32, sb: u32, kind: FpSpecial) -> Integer {
+    let w = eb + sb;
+    let sign_bit = pow2(w - 1); // bit (W-1)
+    let exp_all_ones = (pow2(eb) - Integer::one()) * pow2(sb - 1); // exp field set, sig 0
+    let quiet_bit = pow2(sb - 2); // MSB of the (sb-1)-bit trailing sig
+    match kind {
+        FpSpecial::PosZero => Integer::zero(),
+        FpSpecial::NegZero => sign_bit,
+        FpSpecial::PosInf => exp_all_ones,
+        FpSpecial::NegInf => sign_bit + exp_all_ones,
+        FpSpecial::Nan => exp_all_ones + quiet_bit, // sign=0, canonical quiet NaN
+    }
+}
+
 /// A recoverable parse / well-sortedness error (design §8). Never panicked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -153,19 +189,34 @@ impl<'a> Parser<'a> {
                     ctx.array_sort(index, elem)
                 }
                 "_" => {
-                    // (_ BitVec n) — SMT-LIB indexed sort
+                    // (_ BitVec n) or (_ FloatingPoint eb sb) — SMT-LIB indexed sorts
                     let (kw, ksp) = self.expect_symbol()?;
-                    if kw != "BitVec" {
-                        return Err(Diagnostic::new(
-                            ksp,
-                            format!("unsupported indexed sort identifier {kw}"),
-                        ));
+                    match kw.as_str() {
+                        "BitVec" => {
+                            let width = self.expect_numeral_u32()?;
+                            if width == 0 {
+                                return Err(Diagnostic::new(sp, "BitVec width must be >= 1"));
+                            }
+                            ctx.bv_sort(width)
+                        }
+                        "FloatingPoint" => {
+                            let eb = self.expect_numeral_u32()?;
+                            let sb = self.expect_numeral_u32()?;
+                            if eb < 2 || sb < 2 {
+                                return Err(Diagnostic::new(
+                                    sp,
+                                    "FloatingPoint requires eb>=2, sb>=2",
+                                ));
+                            }
+                            ctx.fp_sort(eb, sb)
+                        }
+                        other => {
+                            return Err(Diagnostic::new(
+                                ksp,
+                                format!("unsupported indexed sort identifier {other}"),
+                            ));
+                        }
                     }
-                    let width = self.expect_numeral_u32()?;
-                    if width == 0 {
-                        return Err(Diagnostic::new(sp, "BitVec width must be >= 1"));
-                    }
-                    ctx.bv_sort(width)
                 }
                 other => {
                     return Err(Diagnostic::new(
@@ -183,6 +234,11 @@ impl<'a> Parser<'a> {
             "Int" => Ok(ctx.int_sort()),
             "Real" => Ok(ctx.real_sort()),
             "String" => Ok(ctx.string_sort()),
+            "Float16" => Ok(ctx.fp_sort(5, 11)),
+            "Float32" => Ok(ctx.fp_sort(8, 24)),
+            "Float64" => Ok(ctx.fp_sort(11, 53)),
+            "Float128" => Ok(ctx.fp_sort(15, 113)),
+            "RoundingMode" => Ok(ctx.rm_sort()),
             other => self
                 .env
                 .lookup_sort(other)
@@ -250,6 +306,35 @@ impl<'a> Parser<'a> {
             "str.len" => StrLen,
             "str.at" => StrAt,
             "str.substr" => StrSubstr,
+            // Floating-point bit constructor (SMT-LIB QF_FP)
+            "fp" => FpFromBits,
+            // Floating-point arithmetic and classification operators (QF_FP)
+            "fp.abs" => FpAbs,
+            "fp.neg" => FpNeg,
+            "fp.add" => FpAdd,
+            "fp.sub" => FpSub,
+            "fp.mul" => FpMul,
+            "fp.div" => FpDiv,
+            "fp.fma" => FpFma,
+            "fp.sqrt" => FpSqrt,
+            "fp.rem" => FpRem,
+            "fp.roundToIntegral" => FpRoundToIntegral,
+            "fp.min" => FpMin,
+            "fp.max" => FpMax,
+            "fp.leq" => FpLeq,
+            "fp.lt" => FpLt,
+            "fp.geq" => FpGeq,
+            "fp.gt" => FpGt,
+            "fp.eq" => FpEq,
+            "fp.isNormal" => FpIsNormal,
+            "fp.isSubnormal" => FpIsSubnormal,
+            "fp.isZero" => FpIsZero,
+            "fp.isInfinite" => FpIsInfinite,
+            "fp.isNaN" => FpIsNaN,
+            "fp.isNegative" => FpIsNegative,
+            "fp.isPositive" => FpIsPositive,
+            // Floating-point non-indexed conversion
+            "fp.to_real" => FpToReal,
             _ => return None,
         })
     }
@@ -345,6 +430,19 @@ impl<'a> Parser<'a> {
             "rotate_left" => BvRotateLeft(self.expect_numeral_u32()?),
             "rotate_right" => BvRotateRight(self.expect_numeral_u32()?),
             "repeat" => BvRepeat(self.expect_numeral_u32()?),
+            // Floating-point indexed conversions
+            "to_fp" => {
+                let eb = self.expect_numeral_u32()?;
+                let sb = self.expect_numeral_u32()?;
+                ToFp { eb, sb }
+            }
+            "to_fp_unsigned" => {
+                let eb = self.expect_numeral_u32()?;
+                let sb = self.expect_numeral_u32()?;
+                ToFpUnsigned { eb, sb }
+            }
+            "fp.to_ubv" => FpToUbv(self.expect_numeral_u32()?),
+            "fp.to_sbv" => FpToSbv(self.expect_numeral_u32()?),
             other => {
                 return Err(Diagnostic::new(
                     isp,
@@ -354,27 +452,6 @@ impl<'a> Parser<'a> {
         };
         let _ = usp;
         Ok(op)
-    }
-
-    /// Parse `(_ bvK n)` where `_` has already been consumed.
-    /// `K` is a decimal integer embedded in the symbol `bvK`; `n` is the width.
-    fn parse_bv_numeral(&mut self, ctx: &mut Context, usp: Span) -> Result<TermId, Diagnostic> {
-        let (sym, ssp) = self.expect_symbol()?;
-        if !sym.starts_with("bv") {
-            return Err(Diagnostic::new(
-                ssp,
-                format!("expected indexed BV numeral `bvK`, got `{sym}`"),
-            ));
-        }
-        let k_str = &sym[2..];
-        let k: u64 = k_str.parse().map_err(|_| {
-            Diagnostic::new(ssp.clone(), format!("invalid BV numeral suffix `{k_str}`"))
-        })?;
-        let width = self.expect_numeral_u32()?;
-        if width == 0 {
-            return Err(Diagnostic::new(usp, "BV numeral width must be >= 1"));
-        }
-        Ok(ctx.mk_bv_const(width, Integer::from(k)))
     }
 
     fn resolve_leaf(
@@ -390,6 +467,21 @@ impl<'a> Parser<'a> {
         match name {
             "true" => return Ok(ctx.mk_const_bool(true)),
             "false" => return Ok(ctx.mk_const_bool(false)),
+            "RNE" | "roundNearestTiesToEven" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rne));
+            }
+            "RNA" | "roundNearestTiesToAway" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rna));
+            }
+            "RTP" | "roundTowardPositive" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rtp));
+            }
+            "RTN" | "roundTowardNegative" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rtn));
+            }
+            "RTZ" | "roundTowardZero" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rtz));
+            }
             _ => {}
         }
         if let Some(sym) = self.env.lookup_fun(name) {
@@ -437,12 +529,52 @@ impl<'a> Parser<'a> {
                     format!("unsupported construct: {head}"),
                 ));
             }
-            // `(_ id nums...)` in term position: `(_ bvK n)` is a BV literal.
-            // Indexed operators in *head* position without a wrapping `( )` are
-            // not valid SMT-LIB syntax; parse_indexed_op will error if the
-            // identifier doesn't resolve to a known literal form.
+            // `(_ id nums...)` in term position: `(_ bvK n)` is a BV literal;
+            // `(_ +oo eb sb)` / `(_ -oo eb sb)` / `(_ +zero eb sb)` /
+            // `(_ -zero eb sb)` / `(_ NaN eb sb)` are FP special literals.
             "_" => {
-                let result = self.parse_bv_numeral(ctx, hsp)?;
+                let (id, isp) = self.expect_symbol()?;
+                let result = match id.as_str() {
+                    "+oo" | "-oo" | "+zero" | "-zero" | "NaN" => {
+                        let eb = self.expect_numeral_u32()?;
+                        let sb = self.expect_numeral_u32()?;
+                        if eb < 2 || sb < 2 {
+                            return Err(Diagnostic::new(
+                                isp,
+                                "FloatingPoint requires eb>=2, sb>=2",
+                            ));
+                        }
+                        let kind = match id.as_str() {
+                            "+oo" => FpSpecial::PosInf,
+                            "-oo" => FpSpecial::NegInf,
+                            "+zero" => FpSpecial::PosZero,
+                            "-zero" => FpSpecial::NegZero,
+                            _ => FpSpecial::Nan,
+                        };
+                        ctx.mk_fp_const(eb, sb, fp_special_bits(eb, sb, kind))
+                    }
+                    sym if sym.starts_with("bv") => {
+                        // (_ bvK n) BV numeral — preserve existing behavior.
+                        let k_str = &sym[2..];
+                        let k: u64 = k_str.parse().map_err(|_| {
+                            Diagnostic::new(
+                                isp.clone(),
+                                format!("invalid BV numeral suffix `{k_str}`"),
+                            )
+                        })?;
+                        let width = self.expect_numeral_u32()?;
+                        if width == 0 {
+                            return Err(Diagnostic::new(isp, "BV numeral width must be >= 1"));
+                        }
+                        ctx.mk_bv_const(width, Integer::from(k))
+                    }
+                    other => {
+                        return Err(Diagnostic::new(
+                            isp,
+                            format!("unknown indexed literal `_ {other}`"),
+                        ));
+                    }
+                };
                 self.expect_token(&Token::RParen)?;
                 return Ok(result);
             }
@@ -717,6 +849,40 @@ impl<'a> Parser<'a> {
             | BuiltinOp::StrLen
             | BuiltinOp::StrAt
             | BuiltinOp::StrSubstr => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            // Floating-point ops: delegate directly to mk_app (sort-checking in Context).
+            BuiltinOp::FpAbs
+            | BuiltinOp::FpNeg
+            | BuiltinOp::FpAdd
+            | BuiltinOp::FpSub
+            | BuiltinOp::FpMul
+            | BuiltinOp::FpDiv
+            | BuiltinOp::FpFma
+            | BuiltinOp::FpSqrt
+            | BuiltinOp::FpRoundToIntegral
+            | BuiltinOp::FpRem
+            | BuiltinOp::FpMin
+            | BuiltinOp::FpMax
+            | BuiltinOp::FpLeq
+            | BuiltinOp::FpLt
+            | BuiltinOp::FpGeq
+            | BuiltinOp::FpGt
+            | BuiltinOp::FpEq
+            | BuiltinOp::FpIsNormal
+            | BuiltinOp::FpIsSubnormal
+            | BuiltinOp::FpIsZero
+            | BuiltinOp::FpIsInfinite
+            | BuiltinOp::FpIsNaN
+            | BuiltinOp::FpIsNegative
+            | BuiltinOp::FpIsPositive
+            | BuiltinOp::FpFromBits => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            // Floating-point conversion ops: delegate directly to mk_app.
+            // Indexed variants (ToFp/ToFpUnsigned/FpToUbv/FpToSbv) are reached via
+            // parse_indexed_op, not builtin_for; FpToReal is reached via builtin_for.
+            BuiltinOp::ToFp { .. }
+            | BuiltinOp::ToFpUnsigned { .. }
+            | BuiltinOp::FpToUbv(_)
+            | BuiltinOp::FpToSbv(_)
+            | BuiltinOp::FpToReal => Self::mk(ctx, Op::Builtin(op), &args, &sp),
         }
     }
 
@@ -1584,6 +1750,188 @@ mod tests {
             } => {}
             other => panic!("expected StrSubstr as lhs of Eq, got {other:?}"),
         }
+    }
+
+    /// Task-5 TDD test: `(_ FloatingPoint eb sb)`, `FloatNN` aliases, and
+    /// `RoundingMode` are recognised by `parse_sort`.
+    #[test]
+    fn parse_fp_and_rm_sorts() {
+        use shinri_core::Context;
+        fn sort_of_str(src: &str) -> (Context, shinri_core::SortId) {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            let s = p.parse_sort(&mut ctx).expect("parse sort");
+            (ctx, s)
+        }
+        let (ctx, s) = sort_of_str("(_ FloatingPoint 8 24)");
+        assert_eq!(ctx.fp_widths(s), Some((8, 24)));
+
+        let (ctx, s) = sort_of_str("Float64");
+        assert_eq!(ctx.fp_widths(s), Some((11, 53)));
+
+        let (ctx, s) = sort_of_str("Float16");
+        assert_eq!(ctx.fp_widths(s), Some((5, 11)));
+
+        let (ctx, s) = sort_of_str("Float32");
+        assert_eq!(ctx.fp_widths(s), Some((8, 24)));
+
+        let (ctx, s) = sort_of_str("Float128");
+        assert_eq!(ctx.fp_widths(s), Some((15, 113)));
+
+        let (mut ctx, s) = sort_of_str("RoundingMode");
+        assert_eq!(s, ctx.rm_sort());
+    }
+
+    /// Task-6 TDD test: rounding-mode constant leaf symbols resolve to RM constants.
+    ///
+    /// Covers both short forms (RNE, RNA, RTP, RTN, RTZ) and long forms
+    /// (roundNearestTiesToEven, etc.).  Each is parsed as a bare symbol term
+    /// and the resulting TermId is checked via `ctx.rm_const_value`.
+    #[test]
+    fn parse_rounding_mode_constants() {
+        use shinri_core::{term::RoundingMode, Context};
+        fn rm_of(src: &str) -> Option<RoundingMode> {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            let t = p.parse_term_pub(&mut ctx).expect("parse term");
+            ctx.rm_const_value(t)
+        }
+        assert_eq!(rm_of("RNE"), Some(RoundingMode::Rne));
+        assert_eq!(rm_of("roundNearestTiesToEven"), Some(RoundingMode::Rne));
+        assert_eq!(rm_of("RNA"), Some(RoundingMode::Rna));
+        assert_eq!(rm_of("roundNearestTiesToAway"), Some(RoundingMode::Rna));
+        assert_eq!(rm_of("RTP"), Some(RoundingMode::Rtp));
+        assert_eq!(rm_of("roundTowardPositive"), Some(RoundingMode::Rtp));
+        assert_eq!(rm_of("RTN"), Some(RoundingMode::Rtn));
+        assert_eq!(rm_of("roundTowardNegative"), Some(RoundingMode::Rtn));
+        assert_eq!(rm_of("RTZ"), Some(RoundingMode::Rtz));
+        assert_eq!(rm_of("roundTowardZero"), Some(RoundingMode::Rtz));
+    }
+
+    /// Task-5 negative-path coverage: the `(_ FloatingPoint eb sb)` parser
+    /// boundary guard rejects `eb < 2` or `sb < 2` with a recoverable
+    /// Diagnostic (never a panic).
+    #[test]
+    fn parse_fp_sort_rejects_too_small_widths() {
+        use shinri_core::Context;
+        fn err_of_str(src: &str) -> Diagnostic {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            p.parse_sort(&mut ctx)
+                .expect_err("FloatingPoint with eb<2/sb<2 must be rejected")
+        }
+        let e = err_of_str("(_ FloatingPoint 1 24)");
+        assert!(
+            e.message.contains("eb>=2") && e.message.contains("sb>=2"),
+            "diagnostic should mention the eb>=2/sb>=2 requirement, got: {}",
+            e.message
+        );
+        let e = err_of_str("(_ FloatingPoint 8 1)");
+        assert!(
+            e.message.contains("eb>=2") && e.message.contains("sb>=2"),
+            "diagnostic should mention the eb>=2/sb>=2 requirement, got: {}",
+            e.message
+        );
+    }
+
+    /// Task-7 TDD test: `(fp s e m)` bit-constructor and `(_ ±oo/±zero/NaN eb sb)`
+    /// special FP literals parse correctly and produce the right bit patterns.
+    #[test]
+    fn parse_fp_constructor_and_specials() {
+        use shinri_core::Context;
+        fn parse(src: &str) -> (Context, shinri_core::TermId) {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            let t = p.parse_term_pub(&mut ctx).expect("parse term");
+            (ctx, t)
+        }
+
+        // (fp #b0 #b00000000 #b00000000000000000000000) is +zero in Float32.
+        let (ctx, t) = parse("(fp #b0 #b00000000 #b00000000000000000000000)");
+        assert_eq!(ctx.fp_widths(ctx.sort_of(t)), Some((8, 24)));
+
+        // (_ +zero 8 24): all bits zero.
+        let (ctx, t) = parse("(_ +zero 8 24)");
+        let (eb, sb, bits) = ctx.fp_const_value(t).expect("fp const");
+        assert_eq!((eb, sb), (8, 24));
+        assert!(bits.is_zero(), "+zero must be all-zero bits");
+
+        // (_ -zero 8 24): only the sign bit (bit 31) set => 2^31.
+        let (ctx, t) = parse("(_ -zero 8 24)");
+        let (_, _, bits) = ctx.fp_const_value(t).unwrap();
+        assert_eq!(bits.to_i128(), Some(1i128 << 31));
+
+        // (_ +oo 8 24): exp all ones, sig 0 => 0xFF << 23 = 0x7F800000.
+        let (ctx, t) = parse("(_ +oo 8 24)");
+        let (_, _, bits) = ctx.fp_const_value(t).unwrap();
+        assert_eq!(bits.to_i128(), Some(0x7F80_0000));
+
+        // (_ -oo 8 24): sign + exp all ones => 0xFF800000.
+        let (ctx, t) = parse("(_ -oo 8 24)");
+        let (_, _, bits) = ctx.fp_const_value(t).unwrap();
+        assert_eq!(bits.to_i128(), Some(0xFF80_0000u32 as i128));
+
+        // (_ NaN 8 24): exp all ones, quiet bit (sig MSB, bit 22) set => 0x7FC00000.
+        let (ctx, t) = parse("(_ NaN 8 24)");
+        let (_, _, bits) = ctx.fp_const_value(t).unwrap();
+        assert_eq!(bits.to_i128(), Some(0x7FC0_0000));
+    }
+
+    /// Task-8 TDD test: `fp.*` operator names and indexed FP conversions parse
+    /// and sort-check correctly.
+    ///
+    /// Assertions:
+    ///   - `(fp.add RNE x x)` with x:Float32 → Float32 (fp_widths == Some((8,24)))
+    ///   - `(fp.isNaN x)` with x:Float32 → Bool
+    ///   - `((_ to_fp 11 53) RNE x)` with x:Float32 → Float64 (fp_widths == Some((11,53)))
+    ///   - `((_ fp.to_sbv 16) RNE x)` with x:Float32 → BV16 (bv_width == Some(16))
+    #[test]
+    fn parse_fp_operators_and_conversions() {
+        use shinri_core::Context;
+
+        /// Declare `x` of sort `decl_sort` into a Context, then parse `expr`
+        /// in that same environment (sharing the declared symbol).
+        fn parse_with_x(decl_sort: &str, expr: &str) -> (Context, shinri_core::TermId) {
+            let mut ctx = Context::new();
+            let decl = format!("(declare-fun x () {decl_sort})");
+            let mut p = Parser::new(&decl);
+            p.next_command(&mut ctx).unwrap().unwrap();
+            let mut p2 = Parser::with_env(expr, p.into_env());
+            let t = p2.parse_term(&mut ctx).expect("parse expr");
+            (ctx, t)
+        }
+
+        // fp.add RNE x x : Float32 → Float32
+        let (ctx, t) = parse_with_x("Float32", "(fp.add RNE x x)");
+        assert_eq!(
+            ctx.fp_widths(ctx.sort_of(t)),
+            Some((8, 24)),
+            "fp.add result must be Float32"
+        );
+
+        // fp.isNaN x : Bool
+        let (ctx, t) = parse_with_x("Float32", "(fp.isNaN x)");
+        assert_eq!(
+            ctx.sort_of(t),
+            ctx.bool_sort(),
+            "fp.isNaN result must be Bool"
+        );
+
+        // ((_ to_fp 11 53) RNE x) : Float32 → Float64
+        let (ctx, t) = parse_with_x("Float32", "((_ to_fp 11 53) RNE x)");
+        assert_eq!(
+            ctx.fp_widths(ctx.sort_of(t)),
+            Some((11, 53)),
+            "to_fp 11 53 result must be Float64"
+        );
+
+        // ((_ fp.to_sbv 16) RNE x) : Float32 → BV16
+        let (ctx, t) = parse_with_x("Float32", "((_ fp.to_sbv 16) RNE x)");
+        assert_eq!(
+            ctx.bv_width(ctx.sort_of(t)),
+            Some(16),
+            "fp.to_sbv 16 result must be BV16"
+        );
     }
 
     /// Regression: define-fun followed by a bad command must NOT drop the

@@ -48,6 +48,8 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
                 }
                 out.push('"');
             }
+            ConstVal::Float(_) => out.push_str("<fp>"),
+            ConstVal::Rm(_) => out.push_str("<rm>"),
         },
         TermNode::App { op, args, .. } => {
             let children: Vec<TermId> = ctx.children(args).to_vec();
@@ -133,5 +135,37 @@ fn builtin_name(b: BuiltinOp) -> String {
         StrLen => "str.len".to_owned(),
         StrAt => "str.at".to_owned(),
         StrSubstr => "str.substr".to_owned(),
+        // Floating-point ops — SMT-LIB names
+        FpAbs => "fp.abs".to_owned(),
+        FpNeg => "fp.neg".to_owned(),
+        FpAdd => "fp.add".to_owned(),
+        FpSub => "fp.sub".to_owned(),
+        FpMul => "fp.mul".to_owned(),
+        FpDiv => "fp.div".to_owned(),
+        FpFma => "fp.fma".to_owned(),
+        FpSqrt => "fp.sqrt".to_owned(),
+        FpRoundToIntegral => "fp.roundToIntegral".to_owned(),
+        FpRem => "fp.rem".to_owned(),
+        FpMin => "fp.min".to_owned(),
+        FpMax => "fp.max".to_owned(),
+        FpLeq => "fp.leq".to_owned(),
+        FpLt => "fp.lt".to_owned(),
+        FpGeq => "fp.geq".to_owned(),
+        FpGt => "fp.gt".to_owned(),
+        FpEq => "fp.eq".to_owned(),
+        FpIsNormal => "fp.isNormal".to_owned(),
+        FpIsSubnormal => "fp.isSubnormal".to_owned(),
+        FpIsZero => "fp.isZero".to_owned(),
+        FpIsInfinite => "fp.isInfinite".to_owned(),
+        FpIsNaN => "fp.isNaN".to_owned(),
+        FpIsNegative => "fp.isNegative".to_owned(),
+        FpIsPositive => "fp.isPositive".to_owned(),
+        FpFromBits => "fp".to_owned(),
+        // Floating-point indexed conversion ops — SMT-LIB indexed identifier syntax
+        ToFp { eb, sb } => format!("(_ to_fp {eb} {sb})"),
+        ToFpUnsigned { eb, sb } => format!("(_ to_fp_unsigned {eb} {sb})"),
+        FpToUbv(m) => format!("(_ fp.to_ubv {m})"),
+        FpToSbv(m) => format!("(_ fp.to_sbv {m})"),
+        FpToReal => "fp.to_real".to_owned(),
     }
 }

@@ -1,5 +1,5 @@
 use crate::error::SortError;
-use crate::ids::{BvId, RatId, SortId, StringId, SymbolId, TermId};
+use crate::ids::{BvId, FpId, RatId, SortId, StringId, SymbolId, TermId};
 use crate::sort::SortNode;
 use crate::symbol::StringInterner;
 use crate::term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
@@ -19,6 +19,9 @@ pub struct Context {
     fun_sigs: FxHashMap<SymbolId, (Vec<SortId>, SortId)>,
     /// BV literal table: index `BvId(i)` -> `(width, value in [0, 2^width))`.
     bvs: Vec<(u32, Integer)>,
+    /// FP literal table: (eb, sb, bits) where bits is the W = eb+sb bit pattern,
+    /// laid out MSB->LSB as [sign | exponent | trailing-significand].
+    fps: Vec<(u32, u32, Integer)>,
     /// String literal table: index `StringId(i)` -> interned string value.
     str_lits: Vec<Box<str>>,
     bool_sort: SortId,
@@ -45,6 +48,7 @@ impl Context {
             term_interner: FxHashMap::default(),
             fun_sigs: FxHashMap::default(),
             bvs: Vec::new(),
+            fps: Vec::new(),
             str_lits: Vec::new(),
             // placeholders; overwritten immediately below
             bool_sort: SortId::from_index(0),
@@ -105,6 +109,25 @@ impl Context {
     pub fn bv_width(&self, s: SortId) -> Option<u32> {
         match self.sort_node(s) {
             SortNode::BitVec(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Intern the (_ FloatingPoint eb sb) sort. Requires eb >= 2 and sb >= 2.
+    pub fn fp_sort(&mut self, eb: u32, sb: u32) -> SortId {
+        debug_assert!(eb >= 2 && sb >= 2, "FloatingPoint requires eb>=2, sb>=2");
+        self.intern_sort(SortNode::Float(eb, sb))
+    }
+
+    /// Intern the RoundingMode sort.
+    pub fn rm_sort(&mut self) -> SortId {
+        self.intern_sort(SortNode::RoundingMode)
+    }
+
+    /// (eb, sb) of a Float sort, or None if `s` is not a Float sort.
+    pub fn fp_widths(&self, s: SortId) -> Option<(u32, u32)> {
+        match self.sort_node(s) {
+            SortNode::Float(eb, sb) => Some((*eb, *sb)),
             _ => None,
         }
     }
@@ -445,6 +468,146 @@ impl Context {
                 }
                 Ok(str_s)
             }
+            // ── Floating-point: arithmetic ────────────────────────────────────
+            FpAbs | FpNeg => {
+                expect_arity(args, 1)?;
+                let (eb, sb) = self.require_fp(args[0])?;
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpAdd | FpSub | FpMul | FpDiv => {
+                expect_arity(args, 3)?;
+                self.require_rm(args[0])?;
+                let (eb, sb) = self.require_fp(args[1])?;
+                let (eb2, sb2) = self.require_fp(args[2])?;
+                if (eb, sb) != (eb2, sb2) {
+                    return Err(SortError::Mismatch {
+                        expected: self.sort_of(args[1]),
+                        found: self.sort_of(args[2]),
+                    });
+                }
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpFma => {
+                expect_arity(args, 4)?;
+                self.require_rm(args[0])?;
+                let (eb, sb) = self.require_fp(args[1])?;
+                for &a in &args[2..4] {
+                    let (e, s) = self.require_fp(a)?;
+                    if (e, s) != (eb, sb) {
+                        return Err(SortError::Mismatch {
+                            expected: self.sort_of(args[1]),
+                            found: self.sort_of(a),
+                        });
+                    }
+                }
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpSqrt | FpRoundToIntegral => {
+                expect_arity(args, 2)?;
+                self.require_rm(args[0])?;
+                let (eb, sb) = self.require_fp(args[1])?;
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpRem | FpMin | FpMax => {
+                expect_arity(args, 2)?;
+                let (eb, sb) = self.require_fp(args[0])?;
+                let (eb2, sb2) = self.require_fp(args[1])?;
+                if (eb, sb) != (eb2, sb2) {
+                    return Err(SortError::Mismatch {
+                        expected: self.sort_of(args[0]),
+                        found: self.sort_of(args[1]),
+                    });
+                }
+                Ok(self.fp_sort(eb, sb))
+            }
+            // ── Floating-point: comparisons → Bool ────────────────────────────
+            FpLeq | FpLt | FpGeq | FpGt | FpEq => {
+                expect_arity(args, 2)?;
+                let (eb, sb) = self.require_fp(args[0])?;
+                let (eb2, sb2) = self.require_fp(args[1])?;
+                if (eb, sb) != (eb2, sb2) {
+                    return Err(SortError::Mismatch {
+                        expected: self.sort_of(args[0]),
+                        found: self.sort_of(args[1]),
+                    });
+                }
+                Ok(bool_s)
+            }
+            // ── Floating-point: classification → Bool ─────────────────────────
+            FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite | FpIsNaN
+            | FpIsNegative | FpIsPositive => {
+                expect_arity(args, 1)?;
+                self.require_fp(args[0])?;
+                Ok(bool_s)
+            }
+            // ── Floating-point: bit constructor ───────────────────────────────
+            FpFromBits => {
+                expect_arity(args, 3)?;
+                let w_sign = self.require_bv(args[0])?;
+                let w_exp = self.require_bv(args[1])?;
+                let w_sig = self.require_bv(args[2])?;
+                if w_sign != 1 {
+                    return Err(SortError::FpIndex);
+                }
+                let eb = w_exp;
+                let sb = w_sig + 1;
+                if eb < 2 || sb < 2 {
+                    return Err(SortError::FpIndex);
+                }
+                Ok(self.fp_sort(eb, sb))
+            }
+            // ── Floating-point: conversions ───────────────────────────────────
+            ToFp { eb, sb } => {
+                if eb < 2 || sb < 2 {
+                    return Err(SortError::FpIndex);
+                }
+                match args.len() {
+                    // bitcast: a single BV of width eb+sb
+                    1 => {
+                        let n = self.require_bv(args[0])?;
+                        if n != eb + sb {
+                            return Err(SortError::FpIndex);
+                        }
+                        Ok(self.fp_sort(eb, sb))
+                    }
+                    // (RM, X): X is Float, BV (signed int), or Real
+                    2 => {
+                        self.require_rm(args[0])?;
+                        let s1 = self.sort_of(args[1]);
+                        let ok = self.fp_widths(s1).is_some()
+                            || self.bv_width(s1).is_some()
+                            || s1 == real_s;
+                        if !ok {
+                            return Err(SortError::NotApplicable);
+                        }
+                        Ok(self.fp_sort(eb, sb))
+                    }
+                    n => Err(SortError::Arity { expected: 2, found: n }),
+                }
+            }
+            ToFpUnsigned { eb, sb } => {
+                if eb < 2 || sb < 2 {
+                    return Err(SortError::FpIndex);
+                }
+                expect_arity(args, 2)?;
+                self.require_rm(args[0])?;
+                self.require_bv(args[1])?;
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpToUbv(m) | FpToSbv(m) => {
+                expect_arity(args, 2)?;
+                if m < 1 {
+                    return Err(SortError::FpIndex);
+                }
+                self.require_rm(args[0])?;
+                self.require_fp(args[1])?;
+                Ok(self.bv_sort(m))
+            }
+            FpToReal => {
+                expect_arity(args, 1)?;
+                self.require_fp(args[0])?;
+                Ok(real_s)
+            }
         }
     }
 
@@ -452,6 +615,21 @@ impl Context {
     /// the term does not have a BitVec sort.
     fn require_bv(&self, t: TermId) -> Result<u32, SortError> {
         self.bv_width(self.sort_of(t)).ok_or(SortError::NotBitVec)
+    }
+
+    /// (eb, sb) of a Float-sorted term, or `SortError::NotFloat`.
+    fn require_fp(&self, t: TermId) -> Result<(u32, u32), SortError> {
+        self.fp_widths(self.sort_of(t)).ok_or(SortError::NotFloat)
+    }
+
+    /// Ok(()) iff `t` has the RoundingMode sort, else `SortError::NotRoundingMode`.
+    fn require_rm(&mut self, t: TermId) -> Result<(), SortError> {
+        let rm = self.rm_sort();
+        if self.sort_of(t) == rm {
+            Ok(())
+        } else {
+            Err(SortError::NotRoundingMode)
+        }
     }
 }
 
@@ -629,6 +807,51 @@ impl Context {
                 val: ConstVal::String(id),
                 ..
             } => Some(self.str_lits[id.index()].as_ref()),
+            _ => None,
+        }
+    }
+
+    /// Intern an FP literal of sort (eb, sb) with the given W = eb+sb bit pattern.
+    pub fn mk_fp_const(&mut self, eb: u32, sb: u32, bits: Integer) -> TermId {
+        let fp_id = match self
+            .fps
+            .iter()
+            .position(|(e, s, v)| *e == eb && *s == sb && *v == bits)
+        {
+            Some(idx) => FpId::new(idx as u32),
+            None => {
+                let id = FpId::new(self.fps.len() as u32);
+                self.fps.push((eb, sb, bits));
+                id
+            }
+        };
+        let sort = self.fp_sort(eb, sb);
+        let val = ConstVal::Float(fp_id);
+        self.intern_with_key(TermKey::Const { val, sort }, TermNode::Const { val, sort })
+    }
+
+    /// Intern a rounding-mode constant.
+    pub fn mk_rm_const(&mut self, rm: crate::term::RoundingMode) -> TermId {
+        let sort = self.rm_sort();
+        let val = ConstVal::Rm(rm);
+        self.intern_with_key(TermKey::Const { val, sort }, TermNode::Const { val, sort })
+    }
+
+    /// (eb, sb, bits) of an FP literal term, or None.
+    pub fn fp_const_value(&self, t: TermId) -> Option<(u32, u32, &Integer)> {
+        match self.term_node(t) {
+            TermNode::Const { val: ConstVal::Float(id), .. } => {
+                let (e, s, v) = &self.fps[id.index()];
+                Some((*e, *s, v))
+            }
+            _ => None,
+        }
+    }
+
+    /// The rounding mode of an RM constant term, or None.
+    pub fn rm_const_value(&self, t: TermId) -> Option<crate::term::RoundingMode> {
+        match self.term_node(t) {
+            TermNode::Const { val: ConstVal::Rm(rm), .. } => Some(*rm),
             _ => None,
         }
     }
@@ -1006,6 +1229,127 @@ mod tests {
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[i]).is_err());
         // Ill-sorted: str.at with String index must fail.
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrAt), &[x, y]).is_err());
+    }
+
+    #[test]
+    fn fp_and_rm_constants_roundtrip() {
+        use crate::term::RoundingMode;
+        use shinri_num::Integer;
+        let mut ctx = Context::new();
+
+        // +zero in Float32 is all zero bits.
+        let pz = ctx.mk_fp_const(8, 24, Integer::zero());
+        let pz_again = ctx.mk_fp_const(8, 24, Integer::zero());
+        assert_eq!(pz, pz_again, "identical FP consts must be interned equal");
+        assert_eq!(ctx.sort_of(pz), ctx.fp_sort(8, 24));
+        let (eb, sb, bits) = ctx.fp_const_value(pz).expect("fp const");
+        assert_eq!((eb, sb), (8, 24));
+        assert!(bits.is_zero());
+
+        let r = ctx.mk_rm_const(RoundingMode::Rne);
+        assert_eq!(ctx.sort_of(r), ctx.rm_sort());
+        assert_eq!(ctx.rm_const_value(r), Some(RoundingMode::Rne));
+        assert_eq!(ctx.rm_const_value(pz), None);
+        assert_eq!(ctx.fp_const_value(r), None);
+    }
+
+    #[test]
+    fn fp_and_rm_sorts_intern_and_roundtrip() {
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let f32_again = ctx.fp_sort(8, 24);
+        let f64 = ctx.fp_sort(11, 53);
+        assert_eq!(f32, f32_again, "equal FP sorts must intern to the same SortId");
+        assert_ne!(f32, f64, "different widths must be different sorts");
+        assert_eq!(ctx.fp_widths(f32), Some((8, 24)));
+        assert_eq!(ctx.fp_widths(f64), Some((11, 53)));
+        assert_eq!(ctx.fp_widths(ctx.bool_sort()), None);
+
+        let rm = ctx.rm_sort();
+        let rm2 = ctx.rm_sort();
+        assert_eq!(rm, rm2, "RoundingMode sort must be unique");
+        assert_eq!(ctx.fp_widths(rm), None);
+    }
+
+    #[test]
+    fn fp_arith_compare_classify_sortcheck() {
+        use crate::term::RoundingMode;
+        use crate::{BuiltinOp, Op};
+        use shinri_num::Integer;
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let yf = ctx.declare_fun("y", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(RoundingMode::Rne);
+
+        // fp.add : (RM, F, F) -> F
+        let add = ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y]).unwrap();
+        assert_eq!(ctx.sort_of(add), f32);
+
+        // fp.neg : (F) -> F ; fp.abs : (F) -> F
+        let neg = ctx.mk_app(Op::Builtin(BuiltinOp::FpNeg), &[x]).unwrap();
+        assert_eq!(ctx.sort_of(neg), f32);
+
+        // fp.leq : (F, F) -> Bool ; fp.isNaN : (F) -> Bool
+        let leq = ctx.mk_app(Op::Builtin(BuiltinOp::FpLeq), &[x, y]).unwrap();
+        assert_eq!(ctx.sort_of(leq), ctx.bool_sort());
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
+        assert_eq!(ctx.sort_of(isnan), ctx.bool_sort());
+
+        // fp : (BV1, BV8, BV23) -> Float(8,24)
+        let b1 = ctx.mk_bv_const(1, Integer::zero());
+        let b8 = ctx.mk_bv_const(8, Integer::zero());
+        let b23 = ctx.mk_bv_const(23, Integer::zero());
+        let ctor = ctx.mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[b1, b8, b23]).unwrap();
+        assert_eq!(ctx.sort_of(ctor), f32);
+
+        // width mismatch on fp.add operands must be a SortError, not a panic
+        let f64 = ctx.fp_sort(11, 53);
+        let zf = ctx.declare_fun("z", &[], f64);
+        let z = ctx.mk_app(Op::Uninterpreted(zf), &[]).unwrap();
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, z]).is_err());
+        // missing rounding mode (passing a Float where RM expected) must error
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[x, x, y]).is_err());
+    }
+
+    #[test]
+    fn fp_conversion_sortcheck() {
+        use crate::term::RoundingMode;
+        use crate::{BuiltinOp, Op};
+        use shinri_num::Integer;
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(RoundingMode::Rne);
+
+        // bitcast: (_ to_fp 8 24) over a BV32 (1 arg, no RM) -> Float(8,24)
+        let b32 = ctx.mk_bv_const(32, Integer::zero());
+        let cast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32]).unwrap();
+        assert_eq!(ctx.sort_of(cast), f32);
+
+        // FP->FP: (_ to_fp 11 53) RM Float32 -> Float64
+        let f64 = ctx.fp_sort(11, 53);
+        let widen = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x]).unwrap();
+        assert_eq!(ctx.sort_of(widen), f64);
+
+        // fp.to_sbv 16 : (RM, Float) -> BV16
+        let tosbv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(16)), &[rne, x]).unwrap();
+        assert_eq!(ctx.sort_of(tosbv), ctx.bv_sort(16));
+
+        // fp.to_real : (Float) -> Real
+        let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        assert_eq!(ctx.sort_of(toreal), ctx.real_sort());
+
+        // bitcast width mismatch (BV31 into Float(8,24)=32 bits) must error
+        let b31 = ctx.mk_bv_const(31, Integer::zero());
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b31]).is_err());
+
+        // boundary: eb<2 must error even if bitcast width eb+sb matches (eb=1,sb=1 -> BV2)
+        let b2 = ctx.mk_bv_const(2, Integer::zero());
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 1, sb: 1 }), &[b2]).is_err());
     }
 
     // helper local to the test module

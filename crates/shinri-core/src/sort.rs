@@ -13,4 +13,9 @@ pub enum SortNode {
     Array(crate::ids::SortId, crate::ids::SortId),
     /// (_ BitVec n) — n >= 1.
     BitVec(u32),
+    /// (_ FloatingPoint eb sb): eb = exponent bits, sb = significand bits
+    /// (including the hidden bit). Total width eb + sb. Requires eb >= 2, sb >= 2.
+    Float(u32, u32),
+    /// The RoundingMode sort (5 enumerated values; see term::RoundingMode).
+    RoundingMode,
 }

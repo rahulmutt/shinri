@@ -1,4 +1,4 @@
-use crate::ids::{BvId, RatId, SortId, StringId, SymbolId};
+use crate::ids::{BvId, FpId, RatId, SortId, StringId, SymbolId};
 
 /// A (offset, len) view into `Context.children` — out-of-line child storage (SoA).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -81,6 +81,45 @@ pub enum BuiltinOp {
     StrLen,
     StrAt,
     StrSubstr,
+    // Floating-point — arithmetic. Rounded ops take a RoundingMode as arg 0.
+    FpAbs, FpNeg,                 // (F) -> F
+    FpAdd, FpSub, FpMul, FpDiv,   // (RM, F, F) -> F
+    FpFma,                        // (RM, F, F, F) -> F
+    FpSqrt, FpRoundToIntegral,    // (RM, F) -> F
+    FpRem, FpMin, FpMax,          // (F, F) -> F
+    // Floating-point — comparisons: (F, F) -> Bool
+    FpLeq, FpLt, FpGeq, FpGt, FpEq,
+    // Floating-point — classification: (F) -> Bool
+    FpIsNormal, FpIsSubnormal, FpIsZero, FpIsInfinite, FpIsNaN, FpIsNegative, FpIsPositive,
+    // Floating-point — bit constructor: (BV1, BVeb, BV(sb-1)) -> Float(eb, sb)
+    FpFromBits,
+    // Floating-point — conversions (indexed; parameters carried in the op).
+    /// (_ to_fp eb sb): bitcast from BV(eb+sb) [1 arg], or RM-rounded from
+    /// Float / signed-int BV / Real [2 args: (RM, X)].
+    ToFp { eb: u32, sb: u32 },
+    /// (_ to_fp_unsigned eb sb): (RM, BV) unsigned-int -> Float(eb, sb).
+    ToFpUnsigned { eb: u32, sb: u32 },
+    /// (_ fp.to_ubv m): (RM, Float) -> BV(m).
+    FpToUbv(u32),
+    /// (_ fp.to_sbv m): (RM, Float) -> BV(m).
+    FpToSbv(u32),
+    /// fp.to_real: (Float) -> Real.
+    FpToReal,
+}
+
+/// The five SMT-LIB rounding modes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum RoundingMode {
+    /// roundNearestTiesToEven (RNE)
+    Rne,
+    /// roundNearestTiesToAway (RNA)
+    Rna,
+    /// roundTowardPositive (RTP)
+    Rtp,
+    /// roundTowardNegative (RTN)
+    Rtn,
+    /// roundTowardZero (RTZ)
+    Rtz,
 }
 
 /// A literal constant value. Numerals reference `Context.nums` by `RatId`.
@@ -94,6 +133,10 @@ pub enum ConstVal {
     BitVec(BvId),
     /// A string literal; references `Context.str_lits`.
     String(StringId),
+    /// An FP literal; references `Context.fps`.
+    Float(FpId),
+    /// A rounding-mode constant.
+    Rm(RoundingMode),
 }
 
 /// A node in the hash-consed term DAG. Fixed-size; children stored out-of-line.

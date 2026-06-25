@@ -64,6 +64,8 @@ u32_id!(SymbolId);
 u32_id!(RatId);
 // Index into `Context.bvs` (the BV literal table), analogous to `RatId`.
 u32_id!(BvId);
+// Index into `Context.fps` (the FP literal table), analogous to `BvId`.
+u32_id!(FpId);
 // Index into `Context.str_lits` (the string literal table), analogous to `BvId`.
 u32_id!(StringId);
 u32_id!(ClauseId);

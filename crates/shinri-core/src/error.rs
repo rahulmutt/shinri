@@ -17,4 +17,11 @@ pub enum SortError {
     NotBitVec,
     /// A bitvector indexed parameter (e.g. extract hi/lo or repeat k) is out of range.
     BvIndex,
+    /// An argument was expected to be a FloatingPoint sort but was not.
+    NotFloat,
+    /// An argument was expected to be the RoundingMode sort but was not.
+    NotRoundingMode,
+    /// A floating-point indexed parameter (eb/sb/m) is out of range, or `fp`
+    /// constructor operand widths are inconsistent.
+    FpIndex,
 }

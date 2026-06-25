@@ -18,5 +18,5 @@ pub use ids::{BvId, ClauseId, Lit, RatId, SortId, StringId, SymbolId, TermId, Va
 pub use proof::{NoProof, ProofSink, TheoryJust};
 pub use shinri_num::{DeltaRational, Integer, Rational};
 pub use sort::SortNode;
-pub use term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
+pub use term::{BuiltinOp, ChildSlice, ConstVal, Op, RoundingMode, TermNode};
 pub use undo::UndoLog;
