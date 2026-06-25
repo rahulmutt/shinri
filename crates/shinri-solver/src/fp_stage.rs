@@ -107,10 +107,13 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
 }
 
 /// Positively-enumerated check: is an FP-sorted `word` term one that
-/// `shinri_fp::FpBlaster::blast_word` can handle in slice 1?
+/// `shinri_fp::FpBlaster::blast_word` can handle in slice 1 (FpAbs/FpNeg)
+/// or slice 2a (FpAdd/FpSub)?
 ///
-/// Supported: FP constants, nullary FP variables, and FpAbs/FpNeg applied
-/// (recursively) to supported words. EVERYTHING else is NOT supported (any
+/// Supported: FP constants, nullary FP variables, FpAbs/FpNeg applied
+/// (recursively) to supported words, and FpAdd/FpSub where the RM operand is a
+/// RoundingMode term (literal const or nullary RM variable) and both FP operands
+/// are recursively supported. EVERYTHING else is NOT supported (any
 /// unknown/future FP op defaults to unsupported). This ensures that adding a new
 /// FP op to the core does not silently route through blast_word and panic.
 fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
@@ -126,8 +129,30 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 1 && is_supported_fp_word(ctx, kids[0])
         }
-        // Anything else (FpAdd, FpSub, ..., Ite over FP, non-nullary UF, etc.)
-        // is not in scope for slice 1.
+        // FpAdd / FpSub: (RM, F, F). RM operand must be a RoundingMode term
+        // (literal const or nullary RM variable); both FP operands supported.
+        TermNode::App { op: Op::Builtin(BuiltinOp::FpAdd | BuiltinOp::FpSub), args, .. } => {
+            let kids = ctx.children(*args).to_vec();
+            kids.len() == 3
+                && is_rounding_mode_term(ctx, kids[0])
+                && is_supported_fp_word(ctx, kids[1])
+                && is_supported_fp_word(ctx, kids[2])
+        }
+        // Anything else (FpMul, FpDiv, ..., Ite over FP, non-nullary UF, etc.)
+        // is not in scope for slice 1 or slice 2a.
+        _ => false,
+    }
+}
+
+/// A RoundingMode operand we can blast: a RoundingMode literal constant, or a
+/// nullary uninterpreted symbol of RoundingMode sort.
+fn is_rounding_mode_term(ctx: &Context, t: TermId) -> bool {
+    if !matches!(ctx.sort_node(ctx.sort_of(t)), SortNode::RoundingMode) {
+        return false;
+    }
+    match ctx.term_node(t) {
+        TermNode::Const { val: ConstVal::Rm(_), .. } => true,
+        TermNode::App { op: Op::Uninterpreted(_), args, .. } => ctx.children(*args).is_empty(),
         _ => false,
     }
 }
@@ -219,5 +244,44 @@ mod tests {
         assert!(atoms.contains(&isnan));
         assert!(has_non_fp_theory_atom(&ctx, &assertions, &atoms),
                 "BV atom alongside FP must trigger the fence");
+    }
+
+    #[test]
+    fn fp_add_word_is_supported() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let y = fp_var(&mut ctx, "y");
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let add = ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y]).unwrap();
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[add]).unwrap();
+        let atoms = collect_fp_atoms(&ctx, &[isnan]);
+        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.add inside a predicate is supported");
+    }
+
+    #[test]
+    fn fp_add_with_symbolic_rm_is_supported() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let y = fp_var(&mut ctx, "y");
+        let rms = ctx.rm_sort();
+        let rmf = ctx.declare_fun("rm", &[], rms);
+        let rm = ctx.mk_app(Op::Uninterpreted(rmf), &[]).unwrap();
+        let add = ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rm, x, y]).unwrap();
+        let z = fp_var(&mut ctx, "z");
+        let eq = ctx.mk_eq(add, z).unwrap();
+        let atoms = collect_fp_atoms(&ctx, &[eq]);
+        assert!(fp_atoms_fully_supported(&ctx, &atoms), "symbolic RM operand is supported");
+    }
+
+    #[test]
+    fn fp_mul_word_is_not_supported() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let y = fp_var(&mut ctx, "y");
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let mul = ctx.mk_app(Op::Builtin(BuiltinOp::FpMul), &[rne, x, y]).unwrap();
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[mul]).unwrap();
+        let atoms = collect_fp_atoms(&ctx, &[isnan]);
+        assert!(!fp_atoms_fully_supported(&ctx, &atoms), "fp.mul stays fenced in slice 2a");
     }
 }
