@@ -4,6 +4,42 @@ use shinri_core::{Context, Rational, SortId, TermId};
 use shinri_frontend::Command;
 use shinri_num::Integer;
 
+/// IEEE special-value kinds that the `(_ <kind> eb sb)` syntax can name.
+#[derive(Clone, Copy)]
+enum FpSpecial {
+    PosInf,
+    NegInf,
+    PosZero,
+    NegZero,
+    Nan,
+}
+
+/// 2^k as an Integer (k may exceed 127, so build it generally via a loop).
+fn pow2(k: u32) -> Integer {
+    let mut acc = Integer::one();
+    let two = Integer::from(2u64);
+    for _ in 0..k {
+        acc = acc * two.clone();
+    }
+    acc
+}
+
+/// Canonical W = eb+sb bit pattern for an FP special value.
+/// Layout MSB->LSB: [ sign(1) | exp(eb) | trailing-sig(sb-1) ].
+fn fp_special_bits(eb: u32, sb: u32, kind: FpSpecial) -> Integer {
+    let w = eb + sb;
+    let sign_bit = pow2(w - 1); // bit (W-1)
+    let exp_all_ones = (pow2(eb) - Integer::one()) * pow2(sb - 1); // exp field set, sig 0
+    let quiet_bit = pow2(sb - 2); // MSB of the (sb-1)-bit trailing sig
+    match kind {
+        FpSpecial::PosZero => Integer::zero(),
+        FpSpecial::NegZero => sign_bit,
+        FpSpecial::PosInf => exp_all_ones,
+        FpSpecial::NegInf => sign_bit + exp_all_ones,
+        FpSpecial::Nan => exp_all_ones + quiet_bit, // sign=0, canonical quiet NaN
+    }
+}
+
 /// A recoverable parse / well-sortedness error (design §8). Never panicked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -270,6 +306,8 @@ impl<'a> Parser<'a> {
             "str.len" => StrLen,
             "str.at" => StrAt,
             "str.substr" => StrSubstr,
+            // Floating-point bit constructor (SMT-LIB QF_FP)
+            "fp" => FpFromBits,
             // Floating-point non-indexed conversion
             "fp.to_real" => FpToReal,
             _ => return None,
@@ -391,27 +429,6 @@ impl<'a> Parser<'a> {
         Ok(op)
     }
 
-    /// Parse `(_ bvK n)` where `_` has already been consumed.
-    /// `K` is a decimal integer embedded in the symbol `bvK`; `n` is the width.
-    fn parse_bv_numeral(&mut self, ctx: &mut Context, usp: Span) -> Result<TermId, Diagnostic> {
-        let (sym, ssp) = self.expect_symbol()?;
-        if !sym.starts_with("bv") {
-            return Err(Diagnostic::new(
-                ssp,
-                format!("expected indexed BV numeral `bvK`, got `{sym}`"),
-            ));
-        }
-        let k_str = &sym[2..];
-        let k: u64 = k_str.parse().map_err(|_| {
-            Diagnostic::new(ssp.clone(), format!("invalid BV numeral suffix `{k_str}`"))
-        })?;
-        let width = self.expect_numeral_u32()?;
-        if width == 0 {
-            return Err(Diagnostic::new(usp, "BV numeral width must be >= 1"));
-        }
-        Ok(ctx.mk_bv_const(width, Integer::from(k)))
-    }
-
     fn resolve_leaf(
         &mut self,
         ctx: &mut Context,
@@ -487,12 +504,52 @@ impl<'a> Parser<'a> {
                     format!("unsupported construct: {head}"),
                 ));
             }
-            // `(_ id nums...)` in term position: `(_ bvK n)` is a BV literal.
-            // Indexed operators in *head* position without a wrapping `( )` are
-            // not valid SMT-LIB syntax; parse_indexed_op will error if the
-            // identifier doesn't resolve to a known literal form.
+            // `(_ id nums...)` in term position: `(_ bvK n)` is a BV literal;
+            // `(_ +oo eb sb)` / `(_ -oo eb sb)` / `(_ +zero eb sb)` /
+            // `(_ -zero eb sb)` / `(_ NaN eb sb)` are FP special literals.
             "_" => {
-                let result = self.parse_bv_numeral(ctx, hsp)?;
+                let (id, isp) = self.expect_symbol()?;
+                let result = match id.as_str() {
+                    "+oo" | "-oo" | "+zero" | "-zero" | "NaN" => {
+                        let eb = self.expect_numeral_u32()?;
+                        let sb = self.expect_numeral_u32()?;
+                        if eb < 2 || sb < 2 {
+                            return Err(Diagnostic::new(
+                                isp,
+                                "FloatingPoint requires eb>=2, sb>=2",
+                            ));
+                        }
+                        let kind = match id.as_str() {
+                            "+oo" => FpSpecial::PosInf,
+                            "-oo" => FpSpecial::NegInf,
+                            "+zero" => FpSpecial::PosZero,
+                            "-zero" => FpSpecial::NegZero,
+                            _ => FpSpecial::Nan,
+                        };
+                        ctx.mk_fp_const(eb, sb, fp_special_bits(eb, sb, kind))
+                    }
+                    sym if sym.starts_with("bv") => {
+                        // (_ bvK n) BV numeral — preserve existing behavior.
+                        let k_str = &sym[2..];
+                        let k: u64 = k_str.parse().map_err(|_| {
+                            Diagnostic::new(
+                                isp.clone(),
+                                format!("invalid BV numeral suffix `{k_str}`"),
+                            )
+                        })?;
+                        let width = self.expect_numeral_u32()?;
+                        if width == 0 {
+                            return Err(Diagnostic::new(isp, "BV numeral width must be >= 1"));
+                        }
+                        ctx.mk_bv_const(width, Integer::from(k))
+                    }
+                    other => {
+                        return Err(Diagnostic::new(
+                            isp,
+                            format!("unknown indexed literal `_ {other}`"),
+                        ));
+                    }
+                };
                 self.expect_token(&Token::RParen)?;
                 return Ok(result);
             }
@@ -1750,6 +1807,49 @@ mod tests {
             "diagnostic should mention the eb>=2/sb>=2 requirement, got: {}",
             e.message
         );
+    }
+
+    /// Task-7 TDD test: `(fp s e m)` bit-constructor and `(_ ±oo/±zero/NaN eb sb)`
+    /// special FP literals parse correctly and produce the right bit patterns.
+    #[test]
+    fn parse_fp_constructor_and_specials() {
+        use shinri_core::Context;
+        fn parse(src: &str) -> (Context, shinri_core::TermId) {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            let t = p.parse_term_pub(&mut ctx).expect("parse term");
+            (ctx, t)
+        }
+
+        // (fp #b0 #b00000000 #b00000000000000000000000) is +zero in Float32.
+        let (ctx, t) = parse("(fp #b0 #b00000000 #b00000000000000000000000)");
+        assert_eq!(ctx.fp_widths(ctx.sort_of(t)), Some((8, 24)));
+
+        // (_ +zero 8 24): all bits zero.
+        let (ctx, t) = parse("(_ +zero 8 24)");
+        let (eb, sb, bits) = ctx.fp_const_value(t).expect("fp const");
+        assert_eq!((eb, sb), (8, 24));
+        assert!(bits.is_zero(), "+zero must be all-zero bits");
+
+        // (_ -zero 8 24): only the sign bit (bit 31) set => 2^31.
+        let (ctx, t) = parse("(_ -zero 8 24)");
+        let (_, _, bits) = ctx.fp_const_value(t).unwrap();
+        assert_eq!(bits.to_i128(), Some(1i128 << 31));
+
+        // (_ +oo 8 24): exp all ones, sig 0 => 0xFF << 23 = 0x7F800000.
+        let (ctx, t) = parse("(_ +oo 8 24)");
+        let (_, _, bits) = ctx.fp_const_value(t).unwrap();
+        assert_eq!(bits.to_i128(), Some(0x7F80_0000));
+
+        // (_ -oo 8 24): sign + exp all ones => 0xFF800000.
+        let (ctx, t) = parse("(_ -oo 8 24)");
+        let (_, _, bits) = ctx.fp_const_value(t).unwrap();
+        assert_eq!(bits.to_i128(), Some(0xFF80_0000u32 as i128));
+
+        // (_ NaN 8 24): exp all ones, quiet bit (sig MSB, bit 22) set => 0x7FC00000.
+        let (ctx, t) = parse("(_ NaN 8 24)");
+        let (_, _, bits) = ctx.fp_const_value(t).unwrap();
+        assert_eq!(bits.to_i128(), Some(0x7FC0_0000));
     }
 
     /// Regression: define-fun followed by a bad command must NOT drop the
