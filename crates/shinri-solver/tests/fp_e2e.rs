@@ -57,10 +57,10 @@ fn fp_eq_pos_neg_zero_is_sat() {
 // fence. All four tests below use these forms instead of `(fp ...)` literals.
 
 #[test]
-fn fp_add_one_plus_one_is_two_sat() {
+fn fp_add_inf_plus_inf_is_inf_sat() {
     // SAT: fp.add(RNE, +inf, +inf) = +inf. Uses (_ +oo 8 24) (ConstVal::Float)
-    // because (fp #b0 #x7f ...) literals route through FpFromBits (App w/ BV
-    // children), which is not in is_supported_fp_word → soundness fence → Unknown.
+    // because (fp #b...) literals route through FpFromBits (App w/ BV children),
+    // which is not in is_supported_fp_word → soundness fence → Unknown.
     let src = "\
 (set-logic QF_FP)
 (declare-fun x () (_ FloatingPoint 8 24))
@@ -72,8 +72,9 @@ fn fp_add_one_plus_one_is_two_sat() {
 }
 
 #[test]
-fn fp_add_one_plus_one_not_three_unsat() {
-    // UNSAT: fp.add(RNE, +inf, +inf) ≠ -inf. Analogous to 1+1≠3.
+fn fp_add_inf_plus_inf_not_neg_inf_unsat() {
+    // UNSAT: fp.add(RNE, +inf, +inf) ≠ -inf. Uses (_ +oo 8 24) / (_ -oo 8 24)
+    // (ConstVal::Float) for the same reason as the SAT sibling above.
     let src = "\
 (set-logic QF_FP)
 (declare-fun x () (_ FloatingPoint 8 24))
