@@ -131,6 +131,101 @@ fn shinri_outcome(src: &str) -> SolveOutcome {
     outcome
 }
 
+/// Feed a QF_FP arithmetic script to z3 via easy_smt.
+///
+/// Unlike `z3_outcome` (which hardcodes declaring only `x`), this version
+/// forwards every `(declare-fun …)` and `(assert …)` line verbatim, making it
+/// suitable for scripts that declare x, y, z, and optionally an `rm` variable.
+fn z3_outcome_arith(ctx: &mut easy_smt::Context, src: &str) -> easy_smt::Response {
+    ctx.set_logic("QF_FP").expect("z3 set-logic failed");
+    for line in src.lines() {
+        let t = line.trim();
+        if t.starts_with("(declare-fun ") || t.starts_with("(assert ") {
+            let sexpr = ctx.atom(t);
+            ctx.raw_send(sexpr).expect("z3 send failed");
+            ctx.raw_recv().expect("z3 ack failed");
+        }
+    }
+    ctx.check().expect("z3 check-sat failed")
+}
+
+/// Rounding mode literals for QF_FP arithmetic oracle.
+const RMS: &[&str] = &["RNE", "RNA", "RTP", "RTN", "RTZ"];
+
+/// Generate a random QF_FP script with fp.add/fp.sub over all five rounding modes.
+///
+/// Declares three fp32 variables (x, y, z) and optionally a symbolic rounding mode.
+/// Builds 1–3 assertions mixing fp.add/fp.sub with fp.eq/=/fp.isNaN atoms,
+/// some negated, so that both SAT and UNSAT witnesses arise across iterations.
+fn gen_arith_script(rng: &mut Lcg) -> String {
+    let mut s = String::from(
+        "(set-logic QF_FP)\n\
+         (declare-fun x () (_ FloatingPoint 8 24))\n\
+         (declare-fun y () (_ FloatingPoint 8 24))\n\
+         (declare-fun z () (_ FloatingPoint 8 24))\n",
+    );
+    let use_sym_rm = rng.below(4) == 0;
+    if use_sym_rm {
+        s.push_str("(declare-fun rm () RoundingMode)\n");
+    }
+    let rm = |rng: &mut Lcg| -> String {
+        if use_sym_rm && rng.below(2) == 0 {
+            "rm".to_string()
+        } else {
+            RMS[rng.below(RMS.len() as u64) as usize].to_string()
+        }
+    };
+    let n_asserts = 1 + rng.below(3) as usize;
+    for _ in 0..n_asserts {
+        let op = if rng.below(2) == 0 { "fp.add" } else { "fp.sub" };
+        let term = format!("({op} {} x y)", rm(rng));
+        let atom = match rng.below(3) {
+            0 => format!("(fp.eq z {term})"),
+            1 => format!("(= z {term})"),
+            _ => format!("(fp.isNaN {term})"),
+        };
+        if rng.below(2) == 0 {
+            s.push_str(&format!("(assert (not {atom}))\n"));
+        } else {
+            s.push_str(&format!("(assert {atom})\n"));
+        }
+    }
+    s.push_str("(check-sat)\n");
+    s
+}
+
+#[test]
+fn differential_qf_fp_add_sub() {
+    // Seed: brief had invalid hex 0xADD_5UB_0001 ('U' is not a hex digit).
+    // Fixed to 0x0ADD_5AB_0001 (replaced U→A, prepended 0 for valid u64 literal).
+    let mut rng = Lcg(0x0ADD_5AB_0001);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..N_ITERS {
+        let src = gen_arith_script(&mut rng);
+        let ours = shinri_outcome(&src);
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_sat += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!(
+                "QF_FP add/sub DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"
+            ),
+        }
+    }
+    println!("differential_qf_fp_add_sub: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+    assert!(n_sat > 0 && n_unsat > 0, "oracle produced no coverage");
+}
+
 /// Feed a QF_FP script to z3 via easy_smt and return its check-sat response.
 ///
 /// Mirrors qfbv_oracle.rs: create a fresh easy_smt context (= fresh z3 subprocess)
