@@ -2,14 +2,7 @@
 //! mixed-theory fence. Mirrors bv_stage.rs. FP gets its own Blaster (QF_BVFP
 //! unification is a later plan), so BV atoms count as non-FP and trigger the fence.
 
-use rustc_hash::FxHashMap;
-use shinri_core::{BuiltinOp, Context, Lit, Op, SortNode, TermId, TermNode, Var};
-
-/// Surrogate maps produced by lowering FP atoms (parallel to `BvSurrogates`).
-pub struct FpSurrogates {
-    pub atom_to_lit: FxHashMap<TermId, Lit>,
-    pub var_bits: FxHashMap<TermId, Vec<Var>>,
-}
+use shinri_core::{BuiltinOp, Context, Op, SortNode, TermId, TermNode};
 
 fn is_fp_sorted(ctx: &Context, t: TermId) -> bool {
     matches!(ctx.sort_node(ctx.sort_of(t)), SortNode::Float(_, _))

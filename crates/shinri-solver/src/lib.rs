@@ -64,6 +64,9 @@ pub struct Solver {
     /// BV model bits stashed after a BV-path solve: each BV variable term →
     /// its CNF-mapped SAT vars (LSB→MSB). Consumed by Task 18's model extractor.
     bv_var_bits: rustc_hash::FxHashMap<TermId, Vec<shinri_core::Var>>,
+    /// FP model bits stashed after a FP-path solve: each FP variable term →
+    /// its CNF-mapped SAT vars (LSB→MSB). Consumed by FP model extraction.
+    fp_var_bits: rustc_hash::FxHashMap<TermId, Vec<shinri_core::Var>>,
     /// Array models rendered after a QF_ABV SAT result: declared array constant
     /// TermId → pre-rendered SMT-LIB `store`-chain string. Cleared on non-ABV paths.
     abv_array_models: rustc_hash::FxHashMap<TermId, String>,
@@ -89,6 +92,7 @@ impl Solver {
             last_model: None,
             stage_b: true,
             bv_var_bits: rustc_hash::FxHashMap::default(),
+            fp_var_bits: rustc_hash::FxHashMap::default(),
             abv_array_models: rustc_hash::FxHashMap::default(),
         }
     }
@@ -361,6 +365,23 @@ impl Solver {
                 None
             };
 
+        // ── FP path (QF_FP, FP-private Blaster) ────────────────────────────────
+        // Pure-FP queries lower their FP atoms to CNF here. A query that ALSO
+        // uses BV (or any non-FP theory atom) is fenced to Unknown — BVFP
+        // unification is a later plan. (If lowered_bv is Some, the BV fence above
+        // already caught FP atoms as non-BV and returned Unknown, so FP only runs
+        // when there is no BV.)
+        let lowered_fp: Option<shinri_bv::Lowered> =
+            if lowered_bv.is_none() && crate::fp_stage::solver_uses_fp(&self.ctx, &assertions) {
+                let fp_atoms = crate::fp_stage::collect_fp_atoms(&self.ctx, &assertions);
+                if crate::fp_stage::has_non_fp_theory_atom(&self.ctx, &assertions, &fp_atoms) {
+                    return SolveOutcome::Unknown;
+                }
+                Some(shinri_fp::lower(&mut self.ctx, &fp_atoms))
+            } else {
+                None
+            };
+
         // Lower n-ary distinct to pairwise binary up front (needs &mut ctx).
         // BV atoms pass through unchanged (not arith-sorted), so their TermIds
         // are preserved and the surrogate keys still match.
@@ -380,22 +401,34 @@ impl Solver {
             Combiner::with_context(self.ctx.clone()),
         );
 
-        // Replay the BV CNF into the SAT solver and build the surrogate maps.
-        // On the non-BV path, clear any stale bv_var_bits from a previous BV solve.
-        let bv_atom_lit: Option<rustc_hash::FxHashMap<TermId, shinri_core::Lit>> = match lowered_bv
-        {
+        // Replay the BV and FP CNFs into the SAT solver and build merged surrogate maps.
+        // On non-BV/FP paths, clear any stale var_bits from a previous solve.
+        let mut surrogate_map: rustc_hash::FxHashMap<TermId, shinri_core::Lit> =
+            rustc_hash::FxHashMap::default();
+        match lowered_bv {
             Some(lo) => {
                 let surrogates = self.replay_bv_cnf(&mut sat, lo);
-                // Stash var_bits (SAT Vars) for model extraction.
                 self.bv_var_bits = surrogates.var_bits;
-                Some(surrogates.atom_to_lit)
+                surrogate_map.extend(surrogates.atom_to_lit);
             }
             None => {
-                // Non-BV path: clear stale bits from any previous BV solve.
                 self.bv_var_bits.clear();
-                None
             }
-        };
+        }
+        match lowered_fp {
+            Some(lo) => {
+                // Reuse replay_bv_cnf: it allocates a fresh contiguous var block,
+                // so FP and BV namespaces never collide.
+                let surrogates = self.replay_bv_cnf(&mut sat, lo);
+                self.fp_var_bits = surrogates.var_bits;
+                surrogate_map.extend(surrogates.atom_to_lit);
+            }
+            None => {
+                self.fp_var_bits.clear();
+            }
+        }
+        let bv_atom_lit: Option<rustc_hash::FxHashMap<TermId, shinri_core::Lit>> =
+            if surrogate_map.is_empty() { None } else { Some(surrogate_map) };
         // set_truth_terms MUST be called before any atom encoding (Euf::new_var
         // installs the level-0 ⊤≠⊥ diseq only if truth_terms is already Some,
         // and assert panics if truth terms are unset).
@@ -505,6 +538,20 @@ impl Solver {
                     let packed = shinri_bv::model::pack(width, &bits);
                     use shinri_theory::types::ModelVal;
                     model.values.insert(term, ModelVal::BitVec(width, packed));
+                }
+                // FP model extraction: pack each FP constant's bits into ModelVal::Float.
+                for (&term, sat_vars) in &self.fp_var_bits {
+                    let width = sat_vars.len() as u32;
+                    let bits_bool: Vec<bool> = sat_vars
+                        .iter()
+                        .map(|&v| sat.value_of(v).unwrap_or(false))
+                        .collect();
+                    let packed = shinri_bv::model::pack(width, &bits_bool);
+                    // recover (eb, sb) from the term's Float sort.
+                    if let Some((eb, sb)) = self.ctx.fp_widths(self.ctx.sort_of(term)) {
+                        use shinri_theory::types::ModelVal;
+                        model.values.insert(term, ModelVal::Float { eb, sb, bits: packed });
+                    }
                 }
                 // Witness self-check (string path): the word-equation F-split can
                 // dedup-saturate and let SAT conclude SAT with a model the model
@@ -1417,6 +1464,41 @@ mod string_routing_tests {
                    (declare-fun i () String)\
                    (declare-fun v () String)\
                    (assert (= (select a i) v))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod fp_routing_tests {
+    use super::*;
+
+    #[test]
+    fn isnan_is_sat() {
+        // (assert (fp.isNaN x)) is satisfiable (x = NaN).
+        let src = "(declare-fun x () Float32) (assert (fp.isNaN x)) (check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
+    }
+
+    #[test]
+    fn zero_and_inf_is_unsat() {
+        // x cannot be both zero and infinite.
+        let src = "(declare-fun x () Float32) \
+                   (assert (fp.isZero x)) (assert (fp.isInfinite x)) (check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unsat);
+    }
+
+    #[test]
+    fn pos_zero_neg_zero_core_distinct_but_fp_eq() {
+        // (= x (_ +zero 8 24)) ∧ (= x (_ -zero 8 24)) is UNSAT under core =.
+        let src = "(declare-fun x () Float32) \
+                   (assert (= x (_ +zero 8 24))) (assert (= x (_ -zero 8 24))) (check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unsat);
+    }
+
+    #[test]
+    fn fp_mixed_with_bv_is_unknown() {
+        let src = "(declare-fun x () Float32) (declare-fun b () (_ BitVec 8)) \
+                   (assert (fp.isNaN x)) (assert (bvult b #x01)) (check-sat)";
         assert_eq!(run_outcome(src), SolveOutcome::Unknown);
     }
 }
