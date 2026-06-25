@@ -2,6 +2,7 @@
 //! as a gate/clause factory. See
 //! docs/superpowers/specs/2026-06-25-shinri-qffp-vertical-slice-design.md.
 
+pub mod blast;
 pub mod pack;
 pub mod reference;
 pub mod unpack;
