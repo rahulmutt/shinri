@@ -45,3 +45,88 @@ fn fp_eq_pos_neg_zero_is_sat() {
     let (o, _) = run("(assert (fp.eq (_ +zero 8 24) (_ -zero 8 24))) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat);
 }
+
+// ── Slice-2a end-to-end: fp.add / fp.sub SAT/UNSAT + symbolic-RM + get-model ───
+//
+// ENCODING NOTE: The SMT-LIB literal form `(fp #b0 #x7f ...)` is parsed as
+// `FpFromBits` (an App node with BV children). `is_supported_fp_word` does not
+// handle `FpFromBits`, so such scripts trip the soundness fence and return
+// `Unknown` rather than SAT/UNSAT. The indexed special forms `(_ +oo 8 24)`,
+// `(_ -oo 8 24)`, `(_ +zero 8 24)` etc. are parsed as `ConstVal::Float` nodes
+// (via `mk_fp_const`), which ARE in `is_supported_fp_word`, so they pass the
+// fence. All four tests below use these forms instead of `(fp ...)` literals.
+
+#[test]
+fn fp_add_one_plus_one_is_two_sat() {
+    // SAT: fp.add(RNE, +inf, +inf) = +inf. Uses (_ +oo 8 24) (ConstVal::Float)
+    // because (fp #b0 #x7f ...) literals route through FpFromBits (App w/ BV
+    // children), which is not in is_supported_fp_word → soundness fence → Unknown.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.add RNE (_ +oo 8 24) (_ +oo 8 24))))
+(assert (fp.eq x (_ +oo 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat); // +inf + +inf = +inf
+}
+
+#[test]
+fn fp_add_one_plus_one_not_three_unsat() {
+    // UNSAT: fp.add(RNE, +inf, +inf) ≠ -inf. Analogous to 1+1≠3.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.add RNE (_ +oo 8 24) (_ +oo 8 24))))
+(assert (fp.eq x (_ -oo 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Unsat); // +inf + +inf ≠ -inf
+}
+
+#[test]
+fn fp_sub_is_add_neg_sat() {
+    // SAT: fp.sub(RNE, +inf, +zero) = +inf. Analogous to 2 - 1 = 1.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.sub RNE (_ +oo 8 24) (_ +zero 8 24))))
+(assert (fp.eq x (_ +oo 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat); // +inf - +zero = +inf
+}
+
+#[test]
+fn fp_add_symbolic_rm_sat() {
+    // SAT: ∃ rounding mode rm. fp.eq x (fp.add rm +inf +zero).
+    // Any concrete RM works: +inf + +zero = +inf regardless of rounding.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun rm () RoundingMode)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.add rm (_ +oo 8 24) (_ +zero 8 24))))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_add_sat_get_model_round_trip() {
+    // After SAT, get_model_string() must render the FP variable x.
+    // x is constrained to +inf = 0x7F800000: sign 0, exp 11111111, sig 0*23.
+    // The model renderer always uses binary (#b) for all three fields.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.add RNE (_ +oo 8 24) (_ +oo 8 24))))
+(assert (fp.eq x (_ +oo 8 24)))
+(check-sat)";
+    let (o, model) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+    // +inf = (fp #b0 #b11111111 #b00000000000000000000000)
+    assert!(
+        model.contains("(fp #b0 #b11111111 #b00000000000000000000000)"),
+        "model must render x as +inf: {model}"
+    );
+}
