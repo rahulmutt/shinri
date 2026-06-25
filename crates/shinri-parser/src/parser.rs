@@ -425,6 +425,21 @@ impl<'a> Parser<'a> {
         match name {
             "true" => return Ok(ctx.mk_const_bool(true)),
             "false" => return Ok(ctx.mk_const_bool(false)),
+            "RNE" | "roundNearestTiesToEven" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rne));
+            }
+            "RNA" | "roundNearestTiesToAway" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rna));
+            }
+            "RTP" | "roundTowardPositive" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rtp));
+            }
+            "RTN" | "roundTowardNegative" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rtn));
+            }
+            "RTZ" | "roundTowardZero" => {
+                return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rtz));
+            }
             _ => {}
         }
         if let Some(sym) = self.env.lookup_fun(name) {
@@ -1683,6 +1698,32 @@ mod tests {
 
         let (mut ctx, s) = sort_of_str("RoundingMode");
         assert_eq!(s, ctx.rm_sort());
+    }
+
+    /// Task-6 TDD test: rounding-mode constant leaf symbols resolve to RM constants.
+    ///
+    /// Covers both short forms (RNE, RNA, RTP, RTN, RTZ) and long forms
+    /// (roundNearestTiesToEven, etc.).  Each is parsed as a bare symbol term
+    /// and the resulting TermId is checked via `ctx.rm_const_value`.
+    #[test]
+    fn parse_rounding_mode_constants() {
+        use shinri_core::{term::RoundingMode, Context};
+        fn rm_of(src: &str) -> Option<RoundingMode> {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            let t = p.parse_term_pub(&mut ctx).expect("parse term");
+            ctx.rm_const_value(t)
+        }
+        assert_eq!(rm_of("RNE"), Some(RoundingMode::Rne));
+        assert_eq!(rm_of("roundNearestTiesToEven"), Some(RoundingMode::Rne));
+        assert_eq!(rm_of("RNA"), Some(RoundingMode::Rna));
+        assert_eq!(rm_of("roundNearestTiesToAway"), Some(RoundingMode::Rna));
+        assert_eq!(rm_of("RTP"), Some(RoundingMode::Rtp));
+        assert_eq!(rm_of("roundTowardPositive"), Some(RoundingMode::Rtp));
+        assert_eq!(rm_of("RTN"), Some(RoundingMode::Rtn));
+        assert_eq!(rm_of("roundTowardNegative"), Some(RoundingMode::Rtn));
+        assert_eq!(rm_of("RTZ"), Some(RoundingMode::Rtz));
+        assert_eq!(rm_of("roundTowardZero"), Some(RoundingMode::Rtz));
     }
 
     /// Task-5 negative-path coverage: the `(_ FloatingPoint eb sb)` parser
