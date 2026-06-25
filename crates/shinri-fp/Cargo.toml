@@ -1,0 +1,14 @@
+[package]
+name = "shinri-fp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.96.0"
+
+[dependencies]
+shinri-core = { path = "../shinri-core" }
+shinri-bv = { path = "../shinri-bv" }
+shinri-num = { path = "../shinri-num" }
+rustc-hash = "2"
+
+[dev-dependencies]
+shinri-sat = { path = "../shinri-sat" }
