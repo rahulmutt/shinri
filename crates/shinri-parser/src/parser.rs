@@ -153,19 +153,34 @@ impl<'a> Parser<'a> {
                     ctx.array_sort(index, elem)
                 }
                 "_" => {
-                    // (_ BitVec n) — SMT-LIB indexed sort
+                    // (_ BitVec n) or (_ FloatingPoint eb sb) — SMT-LIB indexed sorts
                     let (kw, ksp) = self.expect_symbol()?;
-                    if kw != "BitVec" {
-                        return Err(Diagnostic::new(
-                            ksp,
-                            format!("unsupported indexed sort identifier {kw}"),
-                        ));
+                    match kw.as_str() {
+                        "BitVec" => {
+                            let width = self.expect_numeral_u32()?;
+                            if width == 0 {
+                                return Err(Diagnostic::new(sp, "BitVec width must be >= 1"));
+                            }
+                            ctx.bv_sort(width)
+                        }
+                        "FloatingPoint" => {
+                            let eb = self.expect_numeral_u32()?;
+                            let sb = self.expect_numeral_u32()?;
+                            if eb < 2 || sb < 2 {
+                                return Err(Diagnostic::new(
+                                    sp,
+                                    "FloatingPoint requires eb>=2, sb>=2",
+                                ));
+                            }
+                            ctx.fp_sort(eb, sb)
+                        }
+                        other => {
+                            return Err(Diagnostic::new(
+                                ksp,
+                                format!("unsupported indexed sort identifier {other}"),
+                            ));
+                        }
                     }
-                    let width = self.expect_numeral_u32()?;
-                    if width == 0 {
-                        return Err(Diagnostic::new(sp, "BitVec width must be >= 1"));
-                    }
-                    ctx.bv_sort(width)
                 }
                 other => {
                     return Err(Diagnostic::new(
@@ -183,6 +198,11 @@ impl<'a> Parser<'a> {
             "Int" => Ok(ctx.int_sort()),
             "Real" => Ok(ctx.real_sort()),
             "String" => Ok(ctx.string_sort()),
+            "Float16" => Ok(ctx.fp_sort(5, 11)),
+            "Float32" => Ok(ctx.fp_sort(8, 24)),
+            "Float64" => Ok(ctx.fp_sort(11, 53)),
+            "Float128" => Ok(ctx.fp_sort(15, 113)),
+            "RoundingMode" => Ok(ctx.rm_sort()),
             other => self
                 .env
                 .lookup_sort(other)
@@ -1633,6 +1653,62 @@ mod tests {
             } => {}
             other => panic!("expected StrSubstr as lhs of Eq, got {other:?}"),
         }
+    }
+
+    /// Task-5 TDD test: `(_ FloatingPoint eb sb)`, `FloatNN` aliases, and
+    /// `RoundingMode` are recognised by `parse_sort`.
+    #[test]
+    fn parse_fp_and_rm_sorts() {
+        use shinri_core::Context;
+        fn sort_of_str(src: &str) -> (Context, shinri_core::SortId) {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            let s = p.parse_sort(&mut ctx).expect("parse sort");
+            (ctx, s)
+        }
+        let (ctx, s) = sort_of_str("(_ FloatingPoint 8 24)");
+        assert_eq!(ctx.fp_widths(s), Some((8, 24)));
+
+        let (ctx, s) = sort_of_str("Float64");
+        assert_eq!(ctx.fp_widths(s), Some((11, 53)));
+
+        let (ctx, s) = sort_of_str("Float16");
+        assert_eq!(ctx.fp_widths(s), Some((5, 11)));
+
+        let (ctx, s) = sort_of_str("Float32");
+        assert_eq!(ctx.fp_widths(s), Some((8, 24)));
+
+        let (ctx, s) = sort_of_str("Float128");
+        assert_eq!(ctx.fp_widths(s), Some((15, 113)));
+
+        let (mut ctx, s) = sort_of_str("RoundingMode");
+        assert_eq!(s, ctx.rm_sort());
+    }
+
+    /// Task-5 negative-path coverage: the `(_ FloatingPoint eb sb)` parser
+    /// boundary guard rejects `eb < 2` or `sb < 2` with a recoverable
+    /// Diagnostic (never a panic).
+    #[test]
+    fn parse_fp_sort_rejects_too_small_widths() {
+        use shinri_core::Context;
+        fn err_of_str(src: &str) -> Diagnostic {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            p.parse_sort(&mut ctx)
+                .expect_err("FloatingPoint with eb<2/sb<2 must be rejected")
+        }
+        let e = err_of_str("(_ FloatingPoint 1 24)");
+        assert!(
+            e.message.contains("eb>=2") && e.message.contains("sb>=2"),
+            "diagnostic should mention the eb>=2/sb>=2 requirement, got: {}",
+            e.message
+        );
+        let e = err_of_str("(_ FloatingPoint 8 1)");
+        assert!(
+            e.message.contains("eb>=2") && e.message.contains("sb>=2"),
+            "diagnostic should mention the eb>=2/sb>=2 requirement, got: {}",
+            e.message
+        );
     }
 
     /// Regression: define-fun followed by a bad command must NOT drop the
