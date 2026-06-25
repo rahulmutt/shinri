@@ -93,6 +93,18 @@ pub enum BuiltinOp {
     FpIsNormal, FpIsSubnormal, FpIsZero, FpIsInfinite, FpIsNaN, FpIsNegative, FpIsPositive,
     // Floating-point — bit constructor: (BV1, BVeb, BV(sb-1)) -> Float(eb, sb)
     FpFromBits,
+    // Floating-point — conversions (indexed; parameters carried in the op).
+    /// (_ to_fp eb sb): bitcast from BV(eb+sb) [1 arg], or RM-rounded from
+    /// Float / signed-int BV / Real [2 args: (RM, X)].
+    ToFp { eb: u32, sb: u32 },
+    /// (_ to_fp_unsigned eb sb): (RM, BV) unsigned-int -> Float(eb, sb).
+    ToFpUnsigned { eb: u32, sb: u32 },
+    /// (_ fp.to_ubv m): (RM, Float) -> BV(m).
+    FpToUbv(u32),
+    /// (_ fp.to_sbv m): (RM, Float) -> BV(m).
+    FpToSbv(u32),
+    /// fp.to_real: (Float) -> Real.
+    FpToReal,
 }
 
 /// The five SMT-LIB rounding modes.

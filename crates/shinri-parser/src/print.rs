@@ -161,5 +161,11 @@ fn builtin_name(b: BuiltinOp) -> String {
         FpIsNegative => "fp.isNegative".to_owned(),
         FpIsPositive => "fp.isPositive".to_owned(),
         FpFromBits => "fp".to_owned(),
+        // Floating-point indexed conversion ops — SMT-LIB indexed identifier syntax
+        ToFp { eb, sb } => format!("(_ to_fp {eb} {sb})"),
+        ToFpUnsigned { eb, sb } => format!("(_ to_fp_unsigned {eb} {sb})"),
+        FpToUbv(m) => format!("(_ fp.to_ubv {m})"),
+        FpToSbv(m) => format!("(_ fp.to_sbv {m})"),
+        FpToReal => "fp.to_real".to_owned(),
     }
 }

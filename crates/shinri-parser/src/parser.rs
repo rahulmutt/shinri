@@ -250,6 +250,8 @@ impl<'a> Parser<'a> {
             "str.len" => StrLen,
             "str.at" => StrAt,
             "str.substr" => StrSubstr,
+            // Floating-point non-indexed conversion
+            "fp.to_real" => FpToReal,
             _ => return None,
         })
     }
@@ -345,6 +347,19 @@ impl<'a> Parser<'a> {
             "rotate_left" => BvRotateLeft(self.expect_numeral_u32()?),
             "rotate_right" => BvRotateRight(self.expect_numeral_u32()?),
             "repeat" => BvRepeat(self.expect_numeral_u32()?),
+            // Floating-point indexed conversions
+            "to_fp" => {
+                let eb = self.expect_numeral_u32()?;
+                let sb = self.expect_numeral_u32()?;
+                ToFp { eb, sb }
+            }
+            "to_fp_unsigned" => {
+                let eb = self.expect_numeral_u32()?;
+                let sb = self.expect_numeral_u32()?;
+                ToFpUnsigned { eb, sb }
+            }
+            "fp.to_ubv" => FpToUbv(self.expect_numeral_u32()?),
+            "fp.to_sbv" => FpToSbv(self.expect_numeral_u32()?),
             other => {
                 return Err(Diagnostic::new(
                     isp,
@@ -743,6 +758,14 @@ impl<'a> Parser<'a> {
             | BuiltinOp::FpIsNegative
             | BuiltinOp::FpIsPositive
             | BuiltinOp::FpFromBits => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            // Floating-point conversion ops: delegate directly to mk_app.
+            // Indexed variants (ToFp/ToFpUnsigned/FpToUbv/FpToSbv) are reached via
+            // parse_indexed_op, not builtin_for; FpToReal is reached via builtin_for.
+            BuiltinOp::ToFp { .. }
+            | BuiltinOp::ToFpUnsigned { .. }
+            | BuiltinOp::FpToUbv(_)
+            | BuiltinOp::FpToSbv(_)
+            | BuiltinOp::FpToReal => Self::mk(ctx, Op::Builtin(op), &args, &sp),
         }
     }
 

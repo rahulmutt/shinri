@@ -556,6 +556,58 @@ impl Context {
                 }
                 Ok(self.fp_sort(eb, sb))
             }
+            // ── Floating-point: conversions ───────────────────────────────────
+            ToFp { eb, sb } => {
+                if eb < 2 || sb < 2 {
+                    return Err(SortError::FpIndex);
+                }
+                match args.len() {
+                    // bitcast: a single BV of width eb+sb
+                    1 => {
+                        let n = self.require_bv(args[0])?;
+                        if n != eb + sb {
+                            return Err(SortError::FpIndex);
+                        }
+                        Ok(self.fp_sort(eb, sb))
+                    }
+                    // (RM, X): X is Float, BV (signed int), or Real
+                    2 => {
+                        self.require_rm(args[0])?;
+                        let s1 = self.sort_of(args[1]);
+                        let ok = self.fp_widths(s1).is_some()
+                            || self.bv_width(s1).is_some()
+                            || s1 == real_s;
+                        if !ok {
+                            return Err(SortError::NotApplicable);
+                        }
+                        Ok(self.fp_sort(eb, sb))
+                    }
+                    n => Err(SortError::Arity { expected: 2, found: n }),
+                }
+            }
+            ToFpUnsigned { eb, sb } => {
+                if eb < 2 || sb < 2 {
+                    return Err(SortError::FpIndex);
+                }
+                expect_arity(args, 2)?;
+                self.require_rm(args[0])?;
+                self.require_bv(args[1])?;
+                Ok(self.fp_sort(eb, sb))
+            }
+            FpToUbv(m) | FpToSbv(m) => {
+                expect_arity(args, 2)?;
+                if m < 1 {
+                    return Err(SortError::FpIndex);
+                }
+                self.require_rm(args[0])?;
+                self.require_fp(args[1])?;
+                Ok(self.bv_sort(m))
+            }
+            FpToReal => {
+                expect_arity(args, 1)?;
+                self.require_fp(args[0])?;
+                Ok(real_s)
+            }
         }
     }
 
@@ -1260,6 +1312,44 @@ mod tests {
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, z]).is_err());
         // missing rounding mode (passing a Float where RM expected) must error
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[x, x, y]).is_err());
+    }
+
+    #[test]
+    fn fp_conversion_sortcheck() {
+        use crate::term::RoundingMode;
+        use crate::{BuiltinOp, Op};
+        use shinri_num::Integer;
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(RoundingMode::Rne);
+
+        // bitcast: (_ to_fp 8 24) over a BV32 (1 arg, no RM) -> Float(8,24)
+        let b32 = ctx.mk_bv_const(32, Integer::zero());
+        let cast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32]).unwrap();
+        assert_eq!(ctx.sort_of(cast), f32);
+
+        // FP->FP: (_ to_fp 11 53) RM Float32 -> Float64
+        let f64 = ctx.fp_sort(11, 53);
+        let widen = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x]).unwrap();
+        assert_eq!(ctx.sort_of(widen), f64);
+
+        // fp.to_sbv 16 : (RM, Float) -> BV16
+        let tosbv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(16)), &[rne, x]).unwrap();
+        assert_eq!(ctx.sort_of(tosbv), ctx.bv_sort(16));
+
+        // fp.to_real : (Float) -> Real
+        let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        assert_eq!(ctx.sort_of(toreal), ctx.real_sort());
+
+        // bitcast width mismatch (BV31 into Float(8,24)=32 bits) must error
+        let b31 = ctx.mk_bv_const(31, Integer::zero());
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b31]).is_err());
+
+        // boundary: eb<2 must error even if bitcast width eb+sb matches (eb=1,sb=1 -> BV2)
+        let b2 = ctx.mk_bv_const(2, Integer::zero());
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 1, sb: 1 }), &[b2]).is_err());
     }
 
     // helper local to the test module
