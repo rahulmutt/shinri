@@ -77,7 +77,7 @@ mod tests {
             let b = Blaster::new();
             let s = literal(&b, rm);
             let got = eval_sel(b, &s.sel);
-            for i in 0..5 { assert_eq!(got[i], i == idx, "rm={rm:?} bit {i}"); }
+            for (i, &g) in got.iter().enumerate() { assert_eq!(g, i == idx, "rm={rm:?} bit {i}"); }
         }
     }
 
@@ -115,8 +115,8 @@ mod tests {
             let mut b = Blaster::new();
             let (s, bits) = symbolic_bits(&mut b);
             let mut extra: Vec<Vec<BitLit>> = Vec::new();
-            for k in 0..3 {
-                extra.push(pin(bits[k], (code >> k) & 1 == 1));
+            for (k, &bit) in bits.iter().take(3).enumerate() {
+                extra.push(pin(bit, (code >> k) & 1 == 1));
             }
             for j in 0..5 {
                 extra.push(pin(s.sel[j], j == code as usize));

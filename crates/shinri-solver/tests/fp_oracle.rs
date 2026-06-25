@@ -198,7 +198,7 @@ fn gen_arith_script(rng: &mut Lcg) -> String {
 fn differential_qf_fp_add_sub() {
     // Seed: brief had invalid hex 0xADD_5UB_0001 ('U' is not a hex digit).
     // Fixed to 0x0ADD_5AB_0001 (replaced U→A, prepended 0 for valid u64 literal).
-    let mut rng = Lcg(0x0ADD_5AB_0001);
+    let mut rng = Lcg(0x00AD_D5AB_0001);
     let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
     for iter in 0..N_ITERS {
         let src = gen_arith_script(&mut rng);
@@ -268,7 +268,7 @@ fn z3_outcome(ctx: &mut easy_smt::Context, src: &str) -> easy_smt::Response {
 
 #[test]
 fn differential_qf_fp_rounding_free() {
-    let mut rng = Lcg(0xF10A7_1234);
+    let mut rng = Lcg(0x000F_10A7_1234);
 
     let mut n_sat = 0usize;
     let mut n_unsat = 0usize;

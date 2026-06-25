@@ -136,6 +136,7 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
 
     let mut out: Vec<BitLit> = Vec::with_capacity((eb + sb) as usize);
     // trailing significand sig[0..sb-1]; zeroed on overflow (∞ has sig 0).
+    #[allow(clippy::needless_range_loop)] // norm_sig[i] — index is the operand, not just a counter
     for i in 0..(sbu - 1) {
         out.push(b.mux2(overflow, b.zero(), norm_sig[i]));
     }
@@ -210,7 +211,7 @@ mod tests {
         while m < Rational::new(Integer::one(), Integer::one()) { m = m * two.clone(); e -= 1; }
         // X = m * 2^(sb-1) ∈ [2^(sb-1), 2^sb): the normalized significand + fraction.
         let mut scale = Integer::one();
-        for _ in 0..(sb - 1) { scale = scale * Integer::from(2u64); }
+        for _ in 0..(sb - 1) { scale *= Integer::from(2u64); }
         let x = m * Rational::new(scale, Integer::one());
         let isig = x.numer().div_rem(&x.denom()).0; // floor
         let frac = x.clone() - Rational::new(isig.clone(), Integer::one()); // [0,1)
@@ -232,6 +233,7 @@ mod tests {
         (sign, e, sig, g, r, s)
     }
 
+    #[allow(clippy::too_many_arguments)] // test helper — bundling into a struct is a larger refactor
     fn build_ext(b: &Blaster, eb: u32, sb: u32,
                  sign: bool, exp: i64, sig: &[bool], g: bool, r: bool, s: bool) -> ExtFp {
         let bit = |x: bool| if x { b.one() } else { b.zero() };
@@ -270,7 +272,7 @@ mod tests {
             // also a value 3/8 of the way to the next ULP up, to force rounding.
             let ulp_probe = v.clone() + Rational::new(Integer::from(3u64),
                 Integer::from(8u64) * { let mut p = Integer::one();
-                    for _ in 0..(sb - 1) { p = p * Integer::from(2u64); } p });
+                    for _ in 0..(sb - 1) { p *= Integer::from(2u64); } p });
             for value in [v.clone(), ulp_probe.clone()] {
                 for m in modes {
                     let want = round_rational(eb, sb, &value, m);

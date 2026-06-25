@@ -180,6 +180,7 @@ fn select_operands(b: &mut Blaster, x_ge_y: BitLit, ox: &Operand, oy: &Operand, 
 }
 
 /// IEEE fp.add special cases override the datapath result.
+#[allow(clippy::too_many_arguments)]
 fn special_case(b: &mut Blaster, normal: &[BitLit], ox: &Operand, oy: &Operand,
                 cancel_zero: BitLit, rm: &RmSel, eb: u32, sb: u32) -> Vec<BitLit> {
     let w = (eb + sb) as usize;
@@ -209,6 +210,7 @@ fn special_case(b: &mut Blaster, normal: &[BitLit], ox: &Operand, oy: &Operand,
     out
 }
 
+#[allow(clippy::needless_range_loop)] // index arithmetic bounds are load-bearing; iterator skip/take harder to verify
 fn canon_nan_bits(b: &Blaster, eb: u32, sb: u32) -> Vec<BitLit> {
     // exp all ones; sig MSB (index sb-2) set; sign 0.
     let mut v: Vec<BitLit> = (0..(eb + sb)).map(|_| b.zero()).collect();
@@ -216,6 +218,7 @@ fn canon_nan_bits(b: &Blaster, eb: u32, sb: u32) -> Vec<BitLit> {
     v[sb as usize - 2] = b.one(); // sig MSB
     v
 }
+#[allow(clippy::needless_range_loop)] // index arithmetic bounds are load-bearing; iterator skip/take harder to verify
 fn inf_pattern_bits(b: &Blaster, eb: u32, sb: u32, sign: BitLit) -> Vec<BitLit> {
     let mut v: Vec<BitLit> = (0..(eb + sb)).map(|_| b.zero()).collect();
     for i in (sb as usize - 1)..(sb as usize - 1 + eb as usize) { v[i] = b.one(); } // exp all ones
