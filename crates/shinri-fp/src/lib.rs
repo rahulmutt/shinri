@@ -8,6 +8,7 @@ pub mod model;
 pub mod pack;
 pub mod reference;
 pub mod rm;
+pub mod round;
 pub mod unpack;
 
 use rustc_hash::FxHashMap;

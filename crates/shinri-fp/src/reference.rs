@@ -212,10 +212,15 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
     // now 1 <= m < 2, value = m * 2^e
 
     // Step B: choose target precision. Normal if e >= emin, else subnormal at emin.
+    // Subnormals keep the full `sb-1` trailing-fraction bits at the fixed exponent
+    // `emin`; the value's true exponent `e < emin` is captured by scaling against
+    // `2^emin` (so bits below the subnormal grid fall past the binary point and are
+    // rounded). Previously this subtracted `(emin - e)` here, double-counting the
+    // exponent gap and collapsing small subnormals to zero (e.g. 1/64 in (3,5)).
     let (target_exp, frac_bits) = if e >= emin {
         (e, sb as i64 - 1)
     } else {
-        (emin, sb as i64 - 1 - (emin - e)) // fewer significand bits for subnormals
+        (emin, sb as i64 - 1)
     };
     // scaled = significand * 2^frac_bits as an exact rational, where significand
     // includes the hidden 1 for normals.
