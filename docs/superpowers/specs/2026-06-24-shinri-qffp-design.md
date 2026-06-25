@@ -177,7 +177,24 @@ Reals live in the *lazy* arith engine, not the eager bit-blaster:
 This keeps v1 fully eager and self-contained while still covering essentially
 every real-world QF_FP benchmark (symbolic-Real conversions are rare).
 
+> **⟶ carry-forward (from the foundation).** The foundation only *parses and
+> sort-checks* `fp.to_real` and `to_fp`-from-Real — `check_builtin` accepts a
+> `Real`-sorted operand to `ToFp` and produces a `Real` from `FpToReal` with no
+> fence (deliberately: sort-checking must not depend on whether the operand is a
+> literal or symbolic Real). These are the **`unknown` fence sites**, and the
+> fence belongs in the **solver/lowering stage** (`shinri-fp` orchestration),
+> **not** in `check_builtin`. When routing FP atoms: constant-Real conversions
+> round via `reference.rs`; a symbolic/variable Real on either side fences the
+> whole query to `unknown`. Do not retrofit this into core sort-checking.
+
 ## 6. Module Decomposition
+
+> **Foundation status (landed 2026-06-25).** §6.1 (`shinri-core`) and §6.2
+> (`shinri-parser`) are implemented and merged: every QF_FP/QF_BVFP term parses
+> and sort-checks into a well-sorted DAG. Two follow-up obligations surfaced
+> during that work and are pinned inline below — see the **⟶ carry-forward**
+> notes in §5 (the symbolic-Real fence) and §8 (the model/printer placeholders).
+> Both MUST be honored by the plans that build `shinri-fp` (§6.3).
 
 ### 6.1 `shinri-core` additions
 - `SortNode::Float(eb, sb)` (sb includes the hidden bit; total width `eb+sb`),
@@ -246,6 +263,19 @@ It covers every format and all five modes — no native-`f32`/`f64` blind spots.
   blasting is a v1 non-goal.
 - **Model extraction:** `model.rs` reads each declared FP constant's bit-vars
   from the SAT assignment and formats them; NaN renders as the canonical pattern.
+
+> **⟶ carry-forward (from the foundation).** The foundation added **inert
+> placeholder** arms to `shinri-parser/src/print.rs` for `ConstVal::Float`
+> (`"<fp>"`) and `ConstVal::Rm` (`"<rm>"`), added only to keep the exhaustive
+> `match` compiling. They are provably unreachable in the foundation's scope
+> (the printer is exercised by `roundtrip.rs`, which contains no FP terms), so
+> they are correct *today*. But the moment `print_term` is wired into any
+> `get-value`/`get-model`/counterexample path, those placeholders become a
+> **wrong-output bug**. The plan that delivers `model.rs` MUST replace both with
+> real SMT-LIB rendering (FP literals as `(fp #b… #b… #b…)` or the `(_ …)`
+> special form; rounding modes as their `RNE`/… tokens) **before** any model
+> path goes live. Treat this as a prerequisite of model extraction, not a
+> cleanup afterthought.
 
 ## 9. Summary of Decisions
 
