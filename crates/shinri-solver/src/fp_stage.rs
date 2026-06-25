@@ -2,7 +2,7 @@
 //! mixed-theory fence. Mirrors bv_stage.rs. FP gets its own Blaster (QF_BVFP
 //! unification is a later plan), so BV atoms count as non-FP and trigger the fence.
 
-use shinri_core::{BuiltinOp, Context, Op, SortNode, TermId, TermNode};
+use shinri_core::{BuiltinOp, ConstVal, Context, Op, SortNode, TermId, TermNode};
 
 fn is_fp_sorted(ctx: &Context, t: TermId) -> bool {
     matches!(ctx.sort_node(ctx.sort_of(t)), SortNode::Float(_, _))
@@ -104,6 +104,75 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
         }
     }
     assertions.iter().any(|&a| walk(ctx, a, &fp_set, &mut visited))
+}
+
+/// Positively-enumerated check: is an FP-sorted `word` term one that
+/// `shinri_fp::FpBlaster::blast_word` can handle in slice 1?
+///
+/// Supported: FP constants, nullary FP variables, and FpAbs/FpNeg applied
+/// (recursively) to supported words. EVERYTHING else is NOT supported (any
+/// unknown/future FP op defaults to unsupported). This ensures that adding a new
+/// FP op to the core does not silently route through blast_word and panic.
+fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
+    match ctx.term_node(t) {
+        // FP constant → supported.
+        TermNode::Const { val: ConstVal::Float(_), .. } => true,
+        // Nullary uninterpreted symbol (FP variable) → supported.
+        TermNode::App { op: Op::Uninterpreted(_), args, .. } => {
+            ctx.children(*args).is_empty()
+        }
+        // FpAbs / FpNeg: supported if the single child is supported.
+        TermNode::App { op: Op::Builtin(BuiltinOp::FpAbs | BuiltinOp::FpNeg), args, .. } => {
+            let kids = ctx.children(*args).to_vec();
+            kids.len() == 1 && is_supported_fp_word(ctx, kids[0])
+        }
+        // Anything else (FpAdd, FpSub, ..., Ite over FP, non-nullary UF, etc.)
+        // is not in scope for slice 1.
+        _ => false,
+    }
+}
+
+/// Soundness fence: true iff EVERY collected FP atom is fully supported by the
+/// slice-1 blaster. An atom is supported iff:
+/// - Its op is one of the 7 classifications, FpEq, or core Eq/Distinct with
+///   Float-sorted operands, AND
+/// - Every FP-sorted operand subtree is a `is_supported_fp_word`.
+///
+/// Call this BEFORE `shinri_fp::lower` so that `blast_atom`/`blast_word`'s
+/// `unreachable!` arms remain true internal invariants rather than user-triggered
+/// panics. Returns false if ANY atom is out of scope.
+pub fn fp_atoms_fully_supported(ctx: &Context, fp_atoms: &[TermId]) -> bool {
+    fp_atoms.iter().all(|&atom| fp_atom_is_supported(ctx, atom))
+}
+
+fn fp_atom_is_supported(ctx: &Context, atom: TermId) -> bool {
+    use BuiltinOp::*;
+    let TermNode::App { op, args, .. } = ctx.term_node(atom) else {
+        return false;
+    };
+    let kids = ctx.children(*args).to_vec();
+    match op {
+        // 7 classification predicates: single FP-sorted operand required.
+        Op::Builtin(FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite
+                    | FpIsNaN | FpIsNegative | FpIsPositive) => {
+            kids.len() == 1 && is_supported_fp_word(ctx, kids[0])
+        }
+        // fp.eq: two FP-sorted operands.
+        Op::Builtin(FpEq) => {
+            kids.len() == 2
+                && is_supported_fp_word(ctx, kids[0])
+                && is_supported_fp_word(ctx, kids[1])
+        }
+        // core = or distinct over Float-sorted operands.
+        Op::Builtin(Eq | Distinct) => {
+            kids.iter().all(|&k| {
+                matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::Float(_, _))
+                    && is_supported_fp_word(ctx, k)
+            })
+        }
+        // Any other op (fp.lt, fp.leq, fp.gt, fp.geq, etc.) is not handled.
+        _ => false,
+    }
 }
 
 #[cfg(test)]

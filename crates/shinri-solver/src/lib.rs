@@ -377,6 +377,15 @@ impl Solver {
                 if crate::fp_stage::has_non_fp_theory_atom(&self.ctx, &assertions, &fp_atoms) {
                     return SolveOutcome::Unknown;
                 }
+                // SOUNDNESS FENCE: positively-enumerated slice-1 support check.
+                // Any FP atom whose word operands contain an out-of-scope op
+                // (fp.add/sub/mul/div/..., FP-sorted ite, non-nullary UF, etc.)
+                // or whose predicate op is unhandled (fp.lt/leq/gt/geq) would
+                // panic at blast_atom/blast_word's unreachable!. Fence those to
+                // Unknown BEFORE lower() is ever called.
+                if !crate::fp_stage::fp_atoms_fully_supported(&self.ctx, &fp_atoms) {
+                    return SolveOutcome::Unknown;
+                }
                 Some(shinri_fp::lower(&mut self.ctx, &fp_atoms))
             } else {
                 None
@@ -1500,6 +1509,44 @@ mod fp_routing_tests {
         let src = "(declare-fun x () Float32) (declare-fun b () (_ BitVec 8)) \
                    (assert (fp.isNaN x)) (assert (bvult b #x01)) (check-sat)";
         assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+    }
+
+    // ── Bug-fix regression tests (slice-1 fence for unsupported FP constructs) ──
+
+    /// SOUNDNESS: fp.isNaN applied to fp.add (out-of-slice-1 word op) must be
+    /// Unknown, NOT a panic at unreachable! in blast_word.
+    #[test]
+    fn isnan_of_fpadd_is_unknown_not_panic() {
+        let src = "(declare-fun x () Float32) \
+                   (assert (fp.isNaN (fp.add RNE x x))) (check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+    }
+
+    /// SOUNDNESS: fp.isNaN applied to ite (FP-sorted ite is out of scope) must be
+    /// Unknown, NOT a panic.
+    #[test]
+    fn isnan_of_fp_ite_is_unknown_not_panic() {
+        let src = "(declare-fun x () Float32) (declare-fun c () Bool) \
+                   (assert (fp.isNaN (ite c x x))) (check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+    }
+
+    /// SOUNDNESS: fp.lt (a comparison predicate collected by collect_fp_atoms
+    /// but not handled by blast_atom) must be Unknown, NOT a panic.
+    #[test]
+    fn fp_lt_is_unknown_not_panic() {
+        let src = "(declare-fun x () Float32) \
+                   (assert (fp.lt x x)) (check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+    }
+
+    /// REGRESSION: fp.isNaN applied to (fp.abs (fp.neg x)) must still be Sat
+    /// (fp.abs and fp.neg are in-scope word ops; the chain is fully supported).
+    #[test]
+    fn isnan_of_abs_neg_is_sat_regression() {
+        let src = "(declare-fun x () Float32) \
+                   (assert (fp.isNaN (fp.abs (fp.neg x)))) (check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
     }
 }
 
