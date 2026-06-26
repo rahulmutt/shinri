@@ -55,8 +55,8 @@ pub fn fp_mul(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, 
     let r = if pw - sbu >= 2 { prod_n[pw - sbu - 2] } else { b.zero() };
     // S = OR of all remaining low bits below R, i.e. prod_n[0 .. pw-sb-2].
     let mut s = b.zero();
-    let s_hi = if pw - sbu >= 2 { pw - sbu - 2 } else { 0 };
-    for i in 0..s_hi { s = b.or2(s, prod_n[i]); }
+    let s_hi = (pw - sbu).saturating_sub(2);
+    for bit in prod_n.iter().take(s_hi) { s = b.or2(s, *bit); }
 
     let ext = ExtFp { sign: res_sign, exp: norm_exp, sig, grs: (g, r, s) };
     let rounded = round(b, ext, eb, sb, rm);
