@@ -765,44 +765,105 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
 
     /// True if `l` can be removed: every literal of its reason is already in the
     /// clause (`seen`), at level 0, or itself recursively redundant.
-    fn lit_redundant(&mut self, l: Lit, newly_seen: &mut Vec<Var>) -> bool {
+    ///
+    /// Implemented iteratively (explicit worklist) to avoid stack overflow on
+    /// large circuits (e.g. fp.div over Float32) whose deep implication graphs
+    /// would exhaust the thread stack in a naive mutually-recursive formulation.
+    fn lit_redundant(&mut self, start: Lit, newly_seen: &mut Vec<Var>) -> bool {
+        // Build the initial set of children for `start` (without checking seen[start],
+        // which is always true for literals in the learnt clause).
+        let init_kids = match self.lit_redundant_children(start) {
+            None => return false,
+            Some(k) if k.is_empty() => return true,
+            Some(k) => k,
+        };
+
+        // stack: (children_to_check, next_child_idx, var_to_mark_when_all_done)
+        let mut stack: Vec<(Vec<Lit>, usize, Var)> =
+            vec![(init_kids, 0, start.var())];
+
+        loop {
+            // Have all children of the top frame been processed?
+            let top_done = match stack.last() {
+                None => break,
+                Some((kids, idx, _)) => *idx >= kids.len(),
+            };
+
+            if top_done {
+                // All children confirmed redundant — mark this var and pop.
+                let (_, _, var) = stack.pop().unwrap();
+                if !self.analyzer.seen[var.index()] {
+                    self.analyzer.seen[var.index()] = true;
+                    newly_seen.push(var);
+                }
+                continue;
+            }
+
+            // Take the next child from the top frame.
+            let child = {
+                let (kids, idx, _) = stack.last_mut().unwrap();
+                let c = kids[*idx];
+                *idx += 1;
+                c
+            };
+
+            let cv = child.var();
+            // Already confirmed redundant (seen) or level-0?
+            if self.analyzer.seen[cv.index()] || self.assign.level(cv) == 0 {
+                continue;
+            }
+
+            // Explore the child's reason.
+            match self.lit_redundant_children(child) {
+                None => return false, // Decision/Theory — not redundant
+                Some(grandkids) if grandkids.is_empty() => {
+                    // Immediately redundant (Unit or all children pre-filtered).
+                    if !self.analyzer.seen[cv.index()] {
+                        self.analyzer.seen[cv.index()] = true;
+                        newly_seen.push(cv);
+                    }
+                }
+                Some(grandkids) => {
+                    stack.push((grandkids, 0, cv));
+                }
+            }
+        }
+
+        true
+    }
+
+    /// Collect the children of `l` in the implication graph that are not yet
+    /// confirmed redundant (not in `seen` and not at level 0).
+    ///
+    /// Returns `None` if `l` cannot be redundant (Decision/Theory reason).
+    /// Returns `Some(kids)` with the remaining children to explore.
+    fn lit_redundant_children(&self, l: Lit) -> Option<Vec<Lit>> {
         match self.assign.reason(l.var()) {
-            Reason::Decision => false,
-            Reason::Unit => true,
-            Reason::Binary(other) => self.redundant_step(other, newly_seen),
+            Reason::Decision => None,
+            Reason::Unit => Some(Vec::new()),
+            Reason::Theory(_) => None,
+            Reason::Binary(other) => {
+                let ov = other.var();
+                if self.analyzer.seen[ov.index()] || self.assign.level(ov) == 0 {
+                    Some(Vec::new())
+                } else {
+                    Some(vec![other])
+                }
+            }
             Reason::Clause(r) => {
-                let lits: Vec<Lit> = self
+                let kids: Vec<Lit> = self
                     .db
                     .lits(r)
                     .iter()
                     .copied()
                     .filter(|&x| x != l)
+                    .filter(|x| {
+                        !self.analyzer.seen[x.var().index()]
+                            && self.assign.level(x.var()) > 0
+                    })
                     .collect();
-                for x in lits {
-                    if !self.redundant_step(x, newly_seen) {
-                        return false;
-                    }
-                }
-                true
+                Some(kids)
             }
-            Reason::Theory(_) => false, // don't minimize across theory reasons (Phase 1)
-        }
-    }
-
-    fn redundant_step(&mut self, x: Lit, newly_seen: &mut Vec<Var>) -> bool {
-        let v = x.var();
-        if self.analyzer.seen[v.index()] || self.assign.level(v) == 0 {
-            return true;
-        }
-        if matches!(self.assign.reason(v), Reason::Decision) {
-            return false;
-        }
-        if self.lit_redundant(x, newly_seen) {
-            self.analyzer.seen[v.index()] = true;
-            newly_seen.push(v);
-            true
-        } else {
-            false
         }
     }
 
