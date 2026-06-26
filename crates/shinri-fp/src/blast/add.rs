@@ -3,49 +3,8 @@
 use shinri_bv::{BitLit, Blaster};
 use crate::round::{exp_w, round, ExtFp};
 use crate::rm::RmSel;
-use crate::unpack::unpack;
 use crate::lzc::lzc;
-
-/// Effective unbiased exponent (signed, exp_w bits) and explicit significand
-/// (sb bits, hidden bit materialized) for an unpacked operand.
-struct Operand {
-    sign: BitLit,
-    exp: Vec<BitLit>,   // signed unbiased, exp_w
-    sig: Vec<BitLit>,   // sb bits LSB→MSB, hidden bit at index sb-1
-    is_nan: BitLit,
-    is_inf: BitLit,
-    is_zero: BitLit,
-}
-
-fn to_operand(b: &mut Blaster, bits: &[BitLit], eb: u32, sb: u32) -> Operand {
-    let u = unpack(b, bits, eb, sb);
-    let ew = exp_w(eb);
-    let bias = (1i128 << (eb - 1)) - 1;
-    // biased exp field → signed unbiased. Subnormal (exp field 0): effective
-    // exponent is emin = 1 - bias, hidden bit 0; Normal: exp - bias, hidden 1.
-    // Build signed exp from the eb-bit field, zero-extended, minus bias.
-    let mut field: Vec<BitLit> = u.exp.clone();
-    while field.len() < ew { field.push(b.zero()); }
-    let bias_v: Vec<BitLit> = {
-        let v = bias & ((1i128 << ew) - 1);
-        (0..ew).map(|i| if (v >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
-    };
-    let unbiased = shinri_bv::blast::arith::bvsub(b, &field, &bias_v); // exp - bias
-    // is exp field all zero? (subnormal/zero). Just test field == 0.
-    let mut field_zero = b.one();
-    for &e in &u.exp { let ne = b.not1(e); field_zero = b.and2(field_zero, ne); }
-    // effective exp: if field_zero then emin else unbiased.
-    let emin_v: Vec<BitLit> = {
-        let v = (1 - bias) & ((1i128 << ew) - 1);
-        (0..ew).map(|i| if (v >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
-    };
-    let exp: Vec<BitLit> = (0..ew).map(|i| b.mux2(field_zero, emin_v[i], unbiased[i])).collect();
-    // explicit significand: trailing (sb-1) bits, hidden bit = NOT field_zero.
-    let hidden = b.not1(field_zero);
-    let mut sig: Vec<BitLit> = u.sig.clone();      // sb-1 bits
-    sig.push(hidden);                               // index sb-1 = hidden
-    Operand { sign: u.sign, exp, sig, is_nan: u.is_nan, is_inf: u.is_inf, is_zero: u.is_zero }
-}
+use crate::blast::operand::{to_operand, Operand, canon_nan_bits, inf_pattern_bits, signed_zero_bits};
 
 pub fn fp_add(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, sb: u32) -> Vec<BitLit> {
     let ew = exp_w(eb);
@@ -208,27 +167,6 @@ fn special_case(b: &mut Blaster, normal: &[BitLit], ox: &Operand, oy: &Operand,
     for i in 0..w { out[i] = b.mux2(any_inf, inf_bits[i], out[i]); }
     for i in 0..w { out[i] = b.mux2(want_nan, nan[i], out[i]); }
     out
-}
-
-#[allow(clippy::needless_range_loop)] // index arithmetic bounds are load-bearing; iterator skip/take harder to verify
-fn canon_nan_bits(b: &Blaster, eb: u32, sb: u32) -> Vec<BitLit> {
-    // exp all ones; sig MSB (index sb-2) set; sign 0.
-    let mut v: Vec<BitLit> = (0..(eb + sb)).map(|_| b.zero()).collect();
-    for i in (sb as usize - 1)..(sb as usize - 1 + eb as usize) { v[i] = b.one(); } // exp
-    v[sb as usize - 2] = b.one(); // sig MSB
-    v
-}
-#[allow(clippy::needless_range_loop)] // index arithmetic bounds are load-bearing; iterator skip/take harder to verify
-fn inf_pattern_bits(b: &Blaster, eb: u32, sb: u32, sign: BitLit) -> Vec<BitLit> {
-    let mut v: Vec<BitLit> = (0..(eb + sb)).map(|_| b.zero()).collect();
-    for i in (sb as usize - 1)..(sb as usize - 1 + eb as usize) { v[i] = b.one(); } // exp all ones
-    v[(eb + sb) as usize - 1] = sign;
-    v
-}
-fn signed_zero_bits(b: &Blaster, eb: u32, sb: u32, sign: BitLit) -> Vec<BitLit> {
-    let mut v: Vec<BitLit> = (0..(eb + sb)).map(|_| b.zero()).collect();
-    v[(eb + sb) as usize - 1] = sign;
-    v
 }
 
 #[cfg(test)]
