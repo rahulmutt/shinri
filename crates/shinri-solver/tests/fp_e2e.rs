@@ -131,3 +131,75 @@ fn fp_add_sat_get_model_round_trip() {
         "model must render x as +inf: {model}"
     );
 }
+
+// ── Slice-2b end-to-end: fp.mul SAT/UNSAT + symbolic-RM + get-model ───────────
+
+#[test]
+fn fp_mul_inf_times_two_is_inf_sat() {
+    // SAT: fp.mul(RNE, +inf, +inf) = +inf (inf * inf = inf, exact).
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.mul RNE (_ +oo 8 24) (_ +oo 8 24))))
+(assert (fp.eq x (_ +oo 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_mul_inf_times_zero_is_nan_sat() {
+    // SAT: fp.mul(RNE, +inf, +zero) = NaN; x asserted isNaN.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (_ +zero 8 24)))
+(assert (fp.isNaN (fp.mul RNE (_ +oo 8 24) x)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat); // +inf * +0 = NaN
+}
+
+#[test]
+fn fp_mul_inf_times_zero_not_inf_unsat() {
+    // UNSAT: (+inf * +0) is NaN, never +inf, so isInfinite of it cannot hold.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (_ +zero 8 24)))
+(assert (fp.isInfinite (fp.mul RNE (_ +oo 8 24) x)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn fp_mul_symbolic_rm_sat() {
+    // SAT: ∃ rounding mode rm. fp.eq x (fp.mul rm +inf +inf).
+    // inf * inf = +inf regardless of rounding.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun rm () RoundingMode)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.mul rm (_ +oo 8 24) (_ +oo 8 24))))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_mul_sat_get_model_round_trip() {
+    // After SAT, the model must render x = +inf. (+inf * +inf = +inf, exact.)
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.mul RNE (_ +oo 8 24) (_ +oo 8 24))))
+(assert (fp.eq x (_ +oo 8 24)))
+(check-sat)";
+    let (o, model) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(
+        model.contains("(fp #b0 #b11111111 #b00000000000000000000000)"),
+        "model must render x as +inf: {model}"
+    );
+}
