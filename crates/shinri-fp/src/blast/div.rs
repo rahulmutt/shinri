@@ -7,7 +7,10 @@ use crate::rm::RmSel;
 use crate::lzc::lzc;
 
 fn const_n(b: &Blaster, n: usize, v: i128) -> Vec<BitLit> {
-    let u = v & ((1i128 << n) - 1);
+    // Total mask: for n >= 128 the `1 << n` form would overflow i128 (debug panic,
+    // release wrap). Widths here reach 2*sb+2 = 228 for binary128, so guard it.
+    let mask = if n >= 128 { -1i128 } else { (1i128 << n) - 1 };
+    let u = v & mask;
     (0..n).map(|i| if (u >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
 }
 fn zero_extend(b: &Blaster, x: &[BitLit], to: usize) -> Vec<BitLit> {
