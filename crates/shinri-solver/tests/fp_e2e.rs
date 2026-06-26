@@ -203,3 +203,83 @@ fn fp_mul_sat_get_model_round_trip() {
         "model must render x as +inf: {model}"
     );
 }
+
+// ── Slice-2c end-to-end: fp.div SAT/UNSAT + symbolic-RM + divByZero + get-model ──
+
+#[test]
+fn fp_div_inf_by_zero_is_inf_sat() {
+    // SAT: fp.div(RNE, +inf, +zero) = +inf, and x asserted = +inf.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.div RNE (_ +oo 8 24) (_ +zero 8 24))))
+(assert (fp.eq x (_ +oo 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_div_zero_by_zero_is_nan_sat() {
+    // SAT: fp.div(RNE, +zero, +zero) = NaN.
+    let src = "\
+(set-logic QF_FP)
+(assert (fp.isNaN (fp.div RNE (_ +zero 8 24) (_ +zero 8 24))))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_div_zero_by_zero_not_zero_unsat() {
+    // UNSAT: 0/0 is NaN, and NaN is never fp.eq to +zero.
+    let src = "\
+(set-logic QF_FP)
+(assert (fp.eq (fp.div RNE (_ +zero 8 24) (_ +zero 8 24)) (_ +zero 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn fp_div_by_zero_symbolic_finite_sat() {
+    // SAT: a normal y divided by +zero is ±inf (divByZero). Solver picks y normal.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun y () (_ FloatingPoint 8 24))
+(assert (fp.isNormal y))
+(assert (fp.isInfinite (fp.div RNE y (_ +zero 8 24))))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_div_symbolic_rm_sat() {
+    // SAT: ∃ rounding mode rm. fp.eq x (fp.div rm +inf +zero); +inf/+0 = +inf for any rm.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun rm () RoundingMode)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.div rm (_ +oo 8 24) (_ +zero 8 24))))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_div_sat_get_model_round_trip() {
+    // After SAT, the model must render x = +inf. (+inf / +zero = +inf, exact.)
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.div RNE (_ +oo 8 24) (_ +zero 8 24))))
+(assert (fp.eq x (_ +oo 8 24)))
+(check-sat)";
+    let (o, model) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(
+        model.contains("(fp #b0 #b11111111 #b00000000000000000000000)"),
+        "model must render x as +inf: {model}"
+    );
+}
