@@ -399,6 +399,33 @@ pub fn ref_mul(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> I
     round_rational(eb, sb, &prod, mode)
 }
 
+/// Exact-rational golden `fp.div RM a b`. `a`, `b` are W=eb+sb bit patterns.
+/// Result sign is always sign_a XOR sign_b (including specials and zeros).
+pub fn ref_div(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> Integer {
+    let ca = decode(eb, sb, a);
+    let cb = decode(eb, sb, b);
+    use FpClass::*;
+    let sign = ref_is_negative(&ca) ^ ref_is_negative(&cb); // XOR sign
+    let a_zero = matches!(ca, Zero { .. });
+    let b_zero = matches!(cb, Zero { .. });
+    let a_inf = matches!(ca, Inf { .. });
+    let b_inf = matches!(cb, Inf { .. });
+    // 1. NaN propagation, then 0/0 and inf/inf = NaN.
+    if matches!(ca, Nan) || matches!(cb, Nan) { return canonical_nan(eb, sb); }
+    if (a_zero && b_zero) || (a_inf && b_inf) { return canonical_nan(eb, sb); }
+    // 2. Inf result: inf/finite, or finite-nonzero/0 (divByZero). (a_inf && b_inf
+    //    already handled above; here b_zero implies a is finite-nonzero.)
+    if a_inf || b_zero { return inf_pattern(eb, sb, sign); }
+    // 3. Zero result: finite/inf, or 0/finite-nonzero. (a_zero && b_zero handled;
+    //    here a_zero implies b is finite-nonzero.)
+    if b_inf || a_zero { return zero_pattern(eb, sb, sign); }
+    // 4. finite-nonzero / finite-nonzero: exact rational quotient, then round.
+    let ra = class_to_rational(eb, sb, &ca).unwrap();
+    let rb = class_to_rational(eb, sb, &cb).unwrap();
+    let quot = ra / rb;
+    round_rational(eb, sb, &quot, mode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,6 +594,66 @@ mod tests {
                     let r2 = ref_mul(eb, sb, &Integer::from(b), &Integer::from(a), m);
                     assert_eq!(r1, r2, "mul not commutative a={a:#x} b={b:#x} m={m:?}");
                     assert!(r1 < Integer::from(256u64), "out-of-range result {a:#x}*{b:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ref_div_known_float32() {
+        let (eb, sb) = (8u32, 24u32);
+        // 6.0 / 2.0 = 3.0 = 0x40400000
+        assert_eq!(ref_div(eb, sb, &i(0x40C0_0000), &i(0x4000_0000), RoundMode::Rne), i(0x4040_0000));
+        // 1.0 / 2.0 = 0.5 = 0x3F000000
+        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x4000_0000), RoundMode::Rne), i(0x3F00_0000));
+        // -1.0 / 2.0 = -0.5 = 0xBF000000  (sign = XOR)
+        assert_eq!(ref_div(eb, sb, &i(0xBF80_0000), &i(0x4000_0000), RoundMode::Rne), i(0xBF00_0000));
+        // 1.0 / 3.0 = 0x3EAAAAAB (RNE), 0x3EAAAAAA (RTZ)
+        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x4040_0000), RoundMode::Rne), i(0x3EAA_AAAB));
+        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x4040_0000), RoundMode::Rtz), i(0x3EAA_AAAA));
+        // 1.0 / +0 = +inf  (divByZero, sign +)
+        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x0000_0000), RoundMode::Rne), i(0x7F80_0000));
+        // 1.0 / -0 = -inf  (divByZero, sign -)
+        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x8000_0000), RoundMode::Rne), i(0xFF80_0000));
+        // -2.0 / +0 = -inf
+        assert_eq!(ref_div(eb, sb, &i(0xC000_0000), &i(0x0000_0000), RoundMode::Rne), i(0xFF80_0000));
+        // +0 / +0 = canonical NaN
+        assert_eq!(ref_div(eb, sb, &i(0x0000_0000), &i(0x0000_0000), RoundMode::Rne), i(0x7FC0_0000));
+        // +inf / +inf = canonical NaN
+        assert_eq!(ref_div(eb, sb, &i(0x7F80_0000), &i(0x7F80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        // +inf / 2.0 = +inf
+        assert_eq!(ref_div(eb, sb, &i(0x7F80_0000), &i(0x4000_0000), RoundMode::Rne), i(0x7F80_0000));
+        // 2.0 / +inf = +0 ; -2.0 / +inf = -0
+        assert_eq!(ref_div(eb, sb, &i(0x4000_0000), &i(0x7F80_0000), RoundMode::Rne), i(0x0000_0000));
+        assert_eq!(ref_div(eb, sb, &i(0xC000_0000), &i(0x7F80_0000), RoundMode::Rne), i(0x8000_0000));
+        // +0 / 2.0 = +0 ; +0 / -2.0 = -0 (sign XOR)
+        assert_eq!(ref_div(eb, sb, &i(0x0000_0000), &i(0x4000_0000), RoundMode::Rne), i(0x0000_0000));
+        assert_eq!(ref_div(eb, sb, &i(0x0000_0000), &i(0xC000_0000), RoundMode::Rne), i(0x8000_0000));
+        // NaN / 1.0 = canonical NaN
+        assert_eq!(ref_div(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        // overflow: max-normal / 0.5 = +inf. Max normal = 0x7F7FFFFF, 0.5 = 0x3F000000.
+        assert_eq!(ref_div(eb, sb, &i(0x7F7F_FFFF), &i(0x3F00_0000), RoundMode::Rne), i(0x7F80_0000));
+    }
+
+    #[test]
+    fn ref_div_tiny_total_and_canonical() {
+        // Every (a,b,mode) on (3,5) produces a valid 8-bit encoding; NaN inputs and
+        // 0/0, inf/inf produce the canonical NaN (0x7C for (3,5): exp all ones, sig MSB).
+        let (eb, sb) = (3u32, 5u32);
+        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        let nan = canonical_nan(eb, sb);
+        for a in 0u64..256 {
+            for b in 0u64..256 {
+                let ca = decode(eb, sb, &Integer::from(a));
+                let cb = decode(eb, sb, &Integer::from(b));
+                let a_nan = matches!(ca, FpClass::Nan);
+                let b_nan = matches!(cb, FpClass::Nan);
+                for m in modes {
+                    let r = ref_div(eb, sb, &Integer::from(a), &Integer::from(b), m);
+                    assert!(r < Integer::from(256u64), "out-of-range result {a:#x}/{b:#x}");
+                    if a_nan || b_nan {
+                        assert_eq!(r, nan, "NaN input must yield canonical NaN a={a:#x} b={b:#x} m={m:?}");
+                    }
                 }
             }
         }
