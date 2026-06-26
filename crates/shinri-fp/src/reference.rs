@@ -373,6 +373,32 @@ pub fn ref_add(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> I
     round_rational(eb, sb, &sum, mode)
 }
 
+/// Exact-rational golden `fp.mul RM a b`. `a`, `b` are W=eb+sb bit patterns.
+/// Result sign is always sign_a XOR sign_b (including specials and zeros).
+pub fn ref_mul(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> Integer {
+    let ca = decode(eb, sb, a);
+    let cb = decode(eb, sb, b);
+    use FpClass::*;
+    let sign = ref_is_negative(&ca) ^ ref_is_negative(&cb); // XOR sign
+    // 1. NaN propagation.
+    if matches!(ca, Nan) || matches!(cb, Nan) { return canonical_nan(eb, sb); }
+    // 2. 0 * inf = NaN (either order). Must precede the inf arm.
+    let a_zero = matches!(ca, Zero { .. });
+    let b_zero = matches!(cb, Zero { .. });
+    let a_inf = matches!(ca, Inf { .. });
+    let b_inf = matches!(cb, Inf { .. });
+    if (a_zero && b_inf) || (a_inf && b_zero) { return canonical_nan(eb, sb); }
+    // 3. inf * finite-nonzero = signed inf.
+    if a_inf || b_inf { return inf_pattern(eb, sb, sign); }
+    // 4. zero * finite = signed zero.
+    if a_zero || b_zero { return zero_pattern(eb, sb, sign); }
+    // 5. finite * finite: exact rational product, then round.
+    let ra = class_to_rational(eb, sb, &ca).unwrap();
+    let rb = class_to_rational(eb, sb, &cb).unwrap();
+    let prod = ra * rb;
+    round_rational(eb, sb, &prod, mode)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -494,6 +520,53 @@ mod tests {
                     assert_eq!(r1, r2, "add not commutative a={a:#x} b={b:#x} m={m:?}");
                     // result must be a valid 8-bit pattern.
                     assert!(r1 < Integer::from(256u64), "out-of-range result {a:#x}+{b:#x}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ref_mul_known_float32() {
+        let (eb, sb) = (8u32, 24u32);
+        // 1.0 * 1.0 = 1.0
+        assert_eq!(ref_mul(eb, sb, &i(0x3F80_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x3F80_0000));
+        // 2.0 * 3.0 = 6.0 = 0x40C00000
+        assert_eq!(ref_mul(eb, sb, &i(0x4000_0000), &i(0x4040_0000), RoundMode::Rne), i(0x40C0_0000));
+        // 2.0 * -1.0 = -2.0 = 0xC0000000  (sign = XOR)
+        assert_eq!(ref_mul(eb, sb, &i(0x4000_0000), &i(0xBF80_0000), RoundMode::Rne), i(0xC000_0000));
+        // -1.0 * -1.0 = 1.0  (sign XOR cancels)
+        assert_eq!(ref_mul(eb, sb, &i(0xBF80_0000), &i(0xBF80_0000), RoundMode::Rne), i(0x3F80_0000));
+        // +inf * 2.0 = +inf
+        assert_eq!(ref_mul(eb, sb, &i(0x7F80_0000), &i(0x4000_0000), RoundMode::Rne), i(0x7F80_0000));
+        // +inf * -2.0 = -inf
+        assert_eq!(ref_mul(eb, sb, &i(0x7F80_0000), &i(0xC000_0000), RoundMode::Rne), i(0xFF80_0000));
+        // +inf * +0 = canonical NaN
+        assert_eq!(ref_mul(eb, sb, &i(0x7F80_0000), &i(0x0000_0000), RoundMode::Rne), i(0x7FC0_0000));
+        // -inf * +0 = canonical NaN
+        assert_eq!(ref_mul(eb, sb, &i(0xFF80_0000), &i(0x0000_0000), RoundMode::Rne), i(0x7FC0_0000));
+        // NaN * 1.0 = canonical NaN
+        assert_eq!(ref_mul(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        // +0 * +0 = +0 ; +0 * -0 = -0 (sign XOR) ; -2.0 * +0 = -0
+        assert_eq!(ref_mul(eb, sb, &i(0x0000_0000), &i(0x0000_0000), RoundMode::Rne), i(0x0000_0000));
+        assert_eq!(ref_mul(eb, sb, &i(0x0000_0000), &i(0x8000_0000), RoundMode::Rne), i(0x8000_0000));
+        assert_eq!(ref_mul(eb, sb, &i(0xC000_0000), &i(0x0000_0000), RoundMode::Rne), i(0x8000_0000));
+        // overflow: max-normal * 2.0 = +inf. Max normal float32 = 0x7F7FFFFF.
+        assert_eq!(ref_mul(eb, sb, &i(0x7F7F_FFFF), &i(0x4000_0000), RoundMode::Rne), i(0x7F80_0000));
+    }
+
+    #[test]
+    fn ref_mul_tiny_total_and_commutative() {
+        // Every (a,b,mode) on (3,5) produces a valid 8-bit encoding and is
+        // commutative (fp.mul is commutative, NaN canonical too).
+        let (eb, sb) = (3u32, 5u32);
+        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        for a in 0u64..256 {
+            for b in 0u64..256 {
+                for m in modes {
+                    let r1 = ref_mul(eb, sb, &Integer::from(a), &Integer::from(b), m);
+                    let r2 = ref_mul(eb, sb, &Integer::from(b), &Integer::from(a), m);
+                    assert_eq!(r1, r2, "mul not commutative a={a:#x} b={b:#x} m={m:?}");
+                    assert!(r1 < Integer::from(256u64), "out-of-range result {a:#x}*{b:#x}");
                 }
             }
         }
