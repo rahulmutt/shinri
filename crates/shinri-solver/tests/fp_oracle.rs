@@ -466,11 +466,17 @@ fn gen_div_script(rng: &mut Lcg) -> String {
     s
 }
 
+// fp.div instances are ~60-70x slower per iteration than fp.mul: the restoring
+// udivurem over 50-bit significands yields ~2500-level gate circuits, so each z3
+// cross-check runs ~18s. Bound this oracle independently of N_ITERS so a full
+// gated run completes in minutes while still covering both SAT and UNSAT.
+const DIV_ITERS: usize = 40;
+
 #[test]
 fn differential_qf_fp_div() {
     let mut rng = Lcg(0x00D1_F00D_2C3D);
     let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
-    for iter in 0..N_ITERS {
+    for iter in 0..DIV_ITERS {
         let src = gen_div_script(&mut rng);
         let ours = shinri_outcome(&src);
         if ours == SolveOutcome::Unknown {
