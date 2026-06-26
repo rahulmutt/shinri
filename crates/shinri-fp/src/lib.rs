@@ -104,6 +104,12 @@ impl FpBlaster {
                         let yw = self.blast_word(ctx, kids[2]);
                         crate::blast::mul::fp_mul(&mut self.b, &xw, &yw, &rm, eb, sb)
                     }
+                    FpDiv => {
+                        let rm = self.blast_rm(ctx, kids[0]);
+                        let xw = self.blast_word(ctx, kids[1]);
+                        let yw = self.blast_word(ctx, kids[2]);
+                        crate::blast::div::fp_div(&mut self.b, &xw, &yw, &rm, eb, sb)
+                    }
                     other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
                 }
             }
@@ -253,6 +259,24 @@ mod lower_tests {
         let eq = ctx.mk_eq(mul, one).unwrap();
         let lo = lower(&mut ctx, &[eq]);
         assert!(lo.atom_lit.contains_key(&eq), "core = over fp.mul must be surrogated");
+        assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
+    }
+
+    #[test]
+    fn lower_fp_div_eq_atom() {
+        use shinri_core::BuiltinOp;
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let yf = ctx.declare_fun("y", &[], f32);
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let div = ctx.mk_app(Op::Builtin(BuiltinOp::FpDiv), &[rne, x, y]).unwrap();
+        let one = ctx.mk_fp_const(8, 24, Integer::from(0x3F80_0000u64));
+        let eq = ctx.mk_eq(div, one).unwrap();
+        let lo = lower(&mut ctx, &[eq]);
+        assert!(lo.atom_lit.contains_key(&eq), "core = over fp.div must be surrogated");
         assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
     }
 }
