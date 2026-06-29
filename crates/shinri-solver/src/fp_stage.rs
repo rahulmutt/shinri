@@ -147,6 +147,13 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                 && is_rounding_mode_term(ctx, kids[0])
                 && is_supported_fp_word(ctx, kids[1])
         }
+        // fp.min / fp.max: (F, F) -> F. No RM operand; both FP operands supported.
+        TermNode::App { op: Op::Builtin(BuiltinOp::FpMin | BuiltinOp::FpMax), args, .. } => {
+            let kids = ctx.children(*args).to_vec();
+            kids.len() == 2
+                && is_supported_fp_word(ctx, kids[0])
+                && is_supported_fp_word(ctx, kids[1])
+        }
         // Anything else (FpFma, FpRem, ..., Ite over FP, non-nullary UF, etc.)
         // is not in scope for slice 1, 2a, 2b, 2c, or 2c′.
         _ => false,
@@ -204,7 +211,13 @@ fn fp_atom_is_supported(ctx: &Context, atom: TermId) -> bool {
                     && is_supported_fp_word(ctx, k)
             })
         }
-        // Any other op (fp.lt, fp.leq, fp.gt, fp.geq, etc.) is not handled.
+        // fp.lt / fp.leq / fp.gt / fp.geq: two supported FP operands.
+        Op::Builtin(FpLt | FpLeq | FpGt | FpGeq) => {
+            kids.len() == 2
+                && is_supported_fp_word(ctx, kids[0])
+                && is_supported_fp_word(ctx, kids[1])
+        }
+        // Any other op is not handled.
         _ => false,
     }
 }
@@ -315,5 +328,19 @@ mod tests {
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[sqrt]).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
         assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.sqrt is in scope as of slice 2c'");
+    }
+
+    #[test]
+    fn fence_admits_relations_and_minmax() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let y = fp_var(&mut ctx, "y");
+        // relation atom
+        let lt = ctx.mk_app(Op::Builtin(BuiltinOp::FpLt), &[x, y]).unwrap();
+        assert!(fp_atoms_fully_supported(&ctx, &[lt]), "fp.lt admitted");
+        // min/max nested inside fp.eq (word support)
+        let mn = ctx.mk_app(Op::Builtin(BuiltinOp::FpMin), &[x, y]).unwrap();
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::FpEq), &[mn, x]).unwrap();
+        assert!(fp_atoms_fully_supported(&ctx, &[eq]), "fp.min inside fp.eq admitted");
     }
 }

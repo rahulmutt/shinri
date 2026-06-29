@@ -1535,10 +1535,12 @@ mod fp_routing_tests {
     /// SOUNDNESS: fp.lt (a comparison predicate collected by collect_fp_atoms
     /// but not handled by blast_atom) must be Unknown, NOT a panic.
     #[test]
-    fn fp_lt_is_unknown_not_panic() {
+    fn fp_lt_is_solvable_after_admission() {
         let src = "(declare-fun x () Float32) \
                    (assert (fp.lt x x)) (check-sat)";
-        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+        // fp.lt is now admitted through the soundness fence and solvable.
+        // (fp.lt x x) is always unsatisfiable: x is not strictly less than itself.
+        assert_eq!(run_outcome(src), SolveOutcome::Unsat);
     }
 
     /// REGRESSION: fp.isNaN applied to (fp.abs (fp.neg x)) must still be Sat
