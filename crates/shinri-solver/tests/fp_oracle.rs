@@ -588,3 +588,71 @@ fn differential_qf_fp_sqrt() {
     println!("differential_qf_fp_sqrt: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
     assert!(n_sat > 0 && n_unsat > 0, "oracle produced no coverage");
 }
+
+/// Rounding-free QF_FP over two vars, exercising fp.lt/leq/gt/geq and fp.min/max.
+fn gen_rel_script(rng: &mut Lcg) -> String {
+    let mut s = String::from(
+        "(set-logic QF_FP)\n\
+         (declare-fun x () (_ FloatingPoint 8 24))\n\
+         (declare-fun y () (_ FloatingPoint 8 24))\n",
+    );
+    const RELS: &[&str] = &["fp.lt", "fp.leq", "fp.gt", "fp.geq"];
+    let vars = ["x", "y"];
+    let pick_operand = |rng: &mut Lcg| -> String {
+        // 50% a variable, 50% a special constant.
+        if rng.below(2) == 0 {
+            vars[rng.below(2) as usize].to_string()
+        } else {
+            FP32_SPECIALS[rng.below(FP32_SPECIALS.len() as u64) as usize].to_string()
+        }
+    };
+
+    let n_asserts = 1 + rng.below(3) as usize;
+    for _ in 0..n_asserts {
+        let kind = rng.below(2);
+        let atom = if kind == 0 {
+            // relation between two operands
+            let rel = RELS[rng.below(RELS.len() as u64) as usize];
+            let a = pick_operand(rng);
+            let b = pick_operand(rng);
+            format!("({rel} {a} {b})")
+        } else {
+            // min/max folded into an fp.eq so its word output is observable
+            let mm = if rng.below(2) == 0 { "fp.min" } else { "fp.max" };
+            let a = pick_operand(rng);
+            let b = pick_operand(rng);
+            let c = pick_operand(rng);
+            format!("(fp.eq ({mm} {a} {b}) {c})")
+        };
+        if rng.below(2) == 0 {
+            s.push_str(&format!("(assert (not {atom}))\n"));
+        } else {
+            s.push_str(&format!("(assert {atom})\n"));
+        }
+    }
+    s.push_str("(check-sat)\n");
+    s
+}
+
+// The file is gated at module level (`#![cfg(feature = "oracle")]`), so no
+// per-test cfg is needed. `Lcg` is the tuple struct `Lcg(u64)`.
+#[test]
+fn differential_qf_fp_relations() {
+    let mut rng = Lcg(0x002D_5EED_0001);
+    let (mut n_sat, mut n_unsat) = (0usize, 0usize);
+    for iter in 0..N_ITERS {
+        let src = gen_rel_script(&mut rng);
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, &src);
+        let ours = shinri_outcome(&src);
+        match (&ours, &theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_sat += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
+            (o, t) => panic!("QF_FP relations DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
+        }
+    }
+    assert!(n_sat > 0 && n_unsat > 0, "oracle produced no coverage");
+}
