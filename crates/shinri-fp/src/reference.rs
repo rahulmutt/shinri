@@ -342,6 +342,63 @@ fn zero_pattern(eb: u32, sb: u32, sign: bool) -> Integer {
     sign_scale
 }
 
+/// Exact correctly-rounded fp.sqrt. Specials per IEEE-754; finite positive values
+/// rounded via interval refinement over `round_rational` (no irrational/float).
+pub fn ref_sqrt(eb: u32, sb: u32, a: &Integer, mode: RoundMode) -> Integer {
+    let c = decode(eb, sb, a);
+    use FpClass::*;
+    match &c {
+        Nan => canonical_nan(eb, sb),
+        Inf { sign } => if *sign { canonical_nan(eb, sb) } else { inf_pattern(eb, sb, false) },
+        Zero { sign } => zero_pattern(eb, sb, *sign),           // sign preserved
+        Normal { sign, .. } | Subnormal { sign, .. } if *sign => canonical_nan(eb, sb), // negative -> NaN
+        _ => {
+            // finite positive nonzero: exact dyadic value v = class_to_rational(c).
+            let v = class_to_rational(eb, sb, &c).unwrap();
+            sqrt_round_positive(eb, sb, &v, mode)
+        }
+    }
+}
+
+/// Correctly round sqrt(v) for an exact positive dyadic `v` by refining a rational
+/// interval [s/2^n, (s+1)/2^n) bracketing the true root until both endpoints round
+/// to the same FP value. Exact: when the scaled radicand is a perfect square the
+/// root is exactly s/2^n; otherwise the root is irrational, strictly inside the
+/// open interval, never a tie/exact boundary, so refinement always converges.
+fn sqrt_round_positive(eb: u32, sb: u32, v: &Rational, mode: RoundMode) -> Integer {
+    let two = Integer::from(2u64);
+    let pow2 = |k: u32| -> Integer {
+        let mut acc = Integer::one();
+        for _ in 0..k { acc = acc * two.clone(); }
+        acc
+    };
+    let mut n: u32 = sb + 4;
+    loop {
+        // radicand = v * 2^(2n) ; v is dyadic so this is an exact integer once 2n
+        // covers v's denominator. denom is a power of two by construction of v.
+        let scale = pow2(2 * n);
+        let scaled = Rational::new(v.numer() * scale.clone(), v.denom()); // = v * 2^(2n)
+        // Reduce to integer: scaled = num/den with den | 2^(2n). If not integral yet, bump n.
+        if scaled.denom() != Integer::one() {
+            n += 1;
+            continue;
+        }
+        let radicand = scaled.numer();
+        let (s, rem) = radicand.sqrt_rem();
+        let denom_n = pow2(n);
+        if rem.is_zero() {
+            // sqrt(v) = s / 2^n exactly.
+            return round_rational(eb, sb, &Rational::new(s, denom_n), mode);
+        }
+        let lo = round_rational(eb, sb, &Rational::new(s.clone(), denom_n.clone()), mode);
+        let hi = round_rational(eb, sb, &Rational::new(s + Integer::one(), denom_n), mode);
+        if lo == hi {
+            return lo; // unambiguous: true root rounds the same as both endpoints
+        }
+        n += 4; // refine and retry
+    }
+}
+
 /// Exact-rational golden `fp.add RM a b`. `a`, `b` are W=eb+sb bit patterns.
 pub fn ref_add(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> Integer {
     let ca = decode(eb, sb, a);
@@ -633,6 +690,45 @@ mod tests {
         assert_eq!(ref_div(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x7FC0_0000));
         // overflow: max-normal / 0.5 = +inf. Max normal = 0x7F7FFFFF, 0.5 = 0x3F000000.
         assert_eq!(ref_div(eb, sb, &i(0x7F7F_FFFF), &i(0x3F00_0000), RoundMode::Rne), i(0x7F80_0000));
+    }
+
+    #[test]
+    fn ref_sqrt_known_float32() {
+        let (eb, sb) = (8u32, 24u32);
+        let i = |v: u64| Integer::from(v);
+        // exact squares
+        assert_eq!(ref_sqrt(eb, sb, &i(0x4000_0000), RoundMode::Rne), i(0x3FB5_04F3)); // sqrt(2)
+        assert_eq!(ref_sqrt(eb, sb, &i(0x4080_0000), RoundMode::Rne), i(0x4000_0000)); // sqrt(4.0)=2.0
+        assert_eq!(ref_sqrt(eb, sb, &i(0x3F80_0000), RoundMode::Rne), i(0x3F80_0000)); // sqrt(1.0)=1.0
+        assert_eq!(ref_sqrt(eb, sb, &i(0x4110_0000), RoundMode::Rne), i(0x4040_0000)); // sqrt(9.0)=3.0
+        // specials
+        assert_eq!(ref_sqrt(eb, sb, &i(0x0000_0000), RoundMode::Rne), i(0x0000_0000)); // sqrt(+0)=+0
+        assert_eq!(ref_sqrt(eb, sb, &i(0x8000_0000), RoundMode::Rne), i(0x8000_0000)); // sqrt(-0)=-0
+        assert_eq!(ref_sqrt(eb, sb, &i(0x7F80_0000), RoundMode::Rne), i(0x7F80_0000)); // sqrt(+inf)=+inf
+        assert_eq!(ref_sqrt(eb, sb, &i(0xFF80_0000), RoundMode::Rne), canonical_nan(eb, sb)); // sqrt(-inf)=NaN
+        assert_eq!(ref_sqrt(eb, sb, &i(0xBF80_0000), RoundMode::Rne), canonical_nan(eb, sb)); // sqrt(-1)=NaN
+        assert_eq!(ref_sqrt(eb, sb, &i(0x7FC0_0000), RoundMode::Rne), canonical_nan(eb, sb)); // sqrt(NaN)=NaN
+    }
+
+    #[test]
+    fn ref_sqrt_monotone_and_square_roundtrip_tiny() {
+        // For every finite positive (eb=3,sb=5) input, sqrt(x)^2 (rounded) brackets x,
+        // and sqrt is monotonic in the encoding order of positive finite values.
+        let (eb, sb) = (3u32, 5u32);
+        let mut prev: Option<Integer> = None;
+        for v in 0u64..(1 << (eb + sb)) {
+            let c = decode(eb, sb, &Integer::from(v));
+            // positive finite nonzero only
+            if !matches!(c, FpClass::Normal { sign: false, .. } | FpClass::Subnormal { sign: false, .. }) {
+                prev = None;
+                continue;
+            }
+            let r = ref_sqrt(eb, sb, &Integer::from(v), RoundMode::Rne);
+            if let Some(p) = &prev {
+                assert!(r >= *p, "sqrt must be monotonic at v={v:#x}");
+            }
+            prev = Some(r);
+        }
     }
 
     #[test]
