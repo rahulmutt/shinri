@@ -370,6 +370,33 @@ impl Integer {
 }
 
 impl Integer {
+    /// Floor integer square root with remainder: returns `(s, r)` where
+    /// `s = floor(sqrt(self))` and `r = self - s*s`, with `0 <= r <= 2*s`.
+    /// Requires `self >= 0`.
+    pub fn sqrt_rem(&self) -> (Integer, Integer) {
+        debug_assert!(*self >= Integer::zero(), "sqrt_rem of a negative Integer");
+        if self.is_zero() || *self == Integer::one() {
+            return (self.clone(), Integer::zero());
+        }
+        let two = Integer::from(2u64);
+        // Newton's method for isqrt. Start at a guess >= true root (self itself works,
+        // since self >= 2 implies self > sqrt(self)); iterate x_{k+1} = (x_k + self/x_k)/2,
+        // stopping at the first non-decreasing step — that fixed point is floor(sqrt).
+        let mut x = self.clone();
+        loop {
+            let (q, _) = self.div_rem(&x);
+            let (next, _) = (x.clone() + q).div_rem(&two);
+            if next >= x {
+                break;
+            }
+            x = next;
+        }
+        let rem = self.clone() - x.clone() * x.clone();
+        (x, rem)
+    }
+}
+
+impl Integer {
     /// Greatest common divisor. Result is always non-negative; gcd(0,0)=0.
     pub fn gcd(&self, other: &Integer) -> Integer {
         let mut a = self.abs();
@@ -583,5 +610,50 @@ mod tests {
         );
         assert!(Integer::from_str_radix("", 10).is_err());
         assert!(Integer::from_str_radix("12a", 10).is_err());
+    }
+
+    #[test]
+    fn sqrt_rem_small_exact_and_remainder() {
+        let i = |v: u64| Integer::from(v);
+        assert_eq!(i(0).sqrt_rem(),  (i(0), i(0)));
+        assert_eq!(i(1).sqrt_rem(),  (i(1), i(0)));
+        assert_eq!(i(2).sqrt_rem(),  (i(1), i(1)));
+        assert_eq!(i(3).sqrt_rem(),  (i(1), i(2)));
+        assert_eq!(i(4).sqrt_rem(),  (i(2), i(0)));
+        assert_eq!(i(15).sqrt_rem(), (i(3), i(6)));
+        assert_eq!(i(16).sqrt_rem(), (i(4), i(0)));
+        assert_eq!(i(17).sqrt_rem(), (i(4), i(1)));
+        assert_eq!(i(9_999).sqrt_rem(), (i(99), i(198))); // 99^2 = 9801, rem 198
+        assert_eq!(i(10_000).sqrt_rem(), (i(100), i(0)));
+    }
+
+    #[test]
+    fn sqrt_rem_matches_num_bigint_large() {
+        // A spread of large multi-limb values; cross-check by reconstruction:
+        // assert s*s + r == v  and  (s+1)*(s+1) > v.
+        let seeds: [u128; 6] = [
+            123_456_789,
+            9_876_543_210_123,
+            1u128 << 100,
+            (1u128 << 100) + 1,
+            340_282_366_920_938_463_463_374_607_431_768_211_455, // u128::MAX
+            (1u128 << 64) * (1u128 << 63) + 777,
+        ];
+        for v in seeds {
+            let iv = Integer::from_str_radix(&v.to_string(), 10).unwrap();
+            let (s, r) = iv.sqrt_rem();
+            // s*s + r == v
+            assert_eq!(
+                s.clone() * s.clone() + r.clone(),
+                iv.clone(),
+                "s²+r != v for {v}"
+            );
+            // (s+1)^2 > v
+            let s1 = s.clone() + Integer::one();
+            assert!(
+                s1.clone() * s1 > iv,
+                "(s+1)² not > v for {v}"
+            );
+        }
     }
 }
