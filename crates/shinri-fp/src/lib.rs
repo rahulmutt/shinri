@@ -110,6 +110,11 @@ impl FpBlaster {
                         let yw = self.blast_word(ctx, kids[2]);
                         crate::blast::div::fp_div(&mut self.b, &xw, &yw, &rm, eb, sb)
                     }
+                    FpSqrt => {
+                        let rm = self.blast_rm(ctx, kids[0]);
+                        let xw = self.blast_word(ctx, kids[1]);
+                        crate::blast::sqrt::fp_sqrt(&mut self.b, &xw, &rm, eb, sb)
+                    }
                     other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
                 }
             }

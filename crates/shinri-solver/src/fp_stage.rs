@@ -108,14 +108,16 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
 
 /// Positively-enumerated check: is an FP-sorted `word` term one that
 /// `shinri_fp::FpBlaster::blast_word` can handle in slice 1 (FpAbs/FpNeg),
-/// slice 2a (FpAdd/FpSub), slice 2b (FpMul), or slice 2c (FpDiv)?
+/// slice 2a (FpAdd/FpSub), slice 2b (FpMul), slice 2c (FpDiv), or slice 2c′ (FpSqrt)?
 ///
 /// Supported: FP constants, nullary FP variables, FpAbs/FpNeg applied
-/// (recursively) to supported words, and FpAdd/FpSub/FpMul/FpDiv where the RM operand is a
+/// (recursively) to supported words, FpAdd/FpSub/FpMul/FpDiv where the RM operand is a
 /// RoundingMode term (literal const or nullary RM variable) and both FP operands
-/// are recursively supported. EVERYTHING else is NOT supported (any
-/// unknown/future FP op defaults to unsupported). This ensures that adding a new
-/// FP op to the core does not silently route through blast_word and panic.
+/// are recursively supported, and FpSqrt where the RM operand is a RoundingMode
+/// term and the single FP operand is recursively supported. EVERYTHING else is
+/// NOT supported (any unknown/future FP op defaults to unsupported). This ensures
+/// that adding a new FP op to the core does not silently route through blast_word
+/// and panic.
 fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
     match ctx.term_node(t) {
         // FP constant → supported.
@@ -138,8 +140,15 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                 && is_supported_fp_word(ctx, kids[1])
                 && is_supported_fp_word(ctx, kids[2])
         }
-        // Anything else (FpFma, FpSqrt, FpRem, ..., Ite over FP, non-nullary UF, etc.)
-        // is not in scope for slice 1, 2a, 2b, or 2c.
+        // FpSqrt: (RM, F). RM operand must be a RoundingMode term; FP operand supported.
+        TermNode::App { op: Op::Builtin(BuiltinOp::FpSqrt), args, .. } => {
+            let kids = ctx.children(*args).to_vec();
+            kids.len() == 2
+                && is_rounding_mode_term(ctx, kids[0])
+                && is_supported_fp_word(ctx, kids[1])
+        }
+        // Anything else (FpFma, FpRem, ..., Ite over FP, non-nullary UF, etc.)
+        // is not in scope for slice 1, 2a, 2b, 2c, or 2c′.
         _ => false,
     }
 }
@@ -298,13 +307,13 @@ mod tests {
     }
 
     #[test]
-    fn fp_sqrt_word_is_not_supported() {
+    fn fp_sqrt_word_is_supported() {
         let mut ctx = Context::new();
         let x = fp_var(&mut ctx, "x");
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
         let sqrt = ctx.mk_app(Op::Builtin(BuiltinOp::FpSqrt), &[rne, x]).unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[sqrt]).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
-        assert!(!fp_atoms_fully_supported(&ctx, &atoms), "fp.sqrt stays fenced until slice 2c'");
+        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.sqrt is in scope as of slice 2c'");
     }
 }

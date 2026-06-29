@@ -145,6 +145,29 @@ mod tests {
     }
 
     #[test]
+    fn fp_sqrt_float32_specials_and_random() {
+        let (eb, sb) = (8u32, 24u32);
+        let specials = [0x0000_0000u64, 0x8000_0000, 0x7F80_0000, 0xFF80_0000, 0x7FC0_0000,
+                        0x3F80_0000, 0xBF80_0000, 0x4000_0000, 0x0000_0001, 0x8000_0001,
+                        0x7F7F_FFFF, 0x0080_0000];
+        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        let mut state: u64 = 0x5172_7100;
+        let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); state >> 16 };
+        let mut cases: Vec<u64> = specials.to_vec();
+        for _ in 0..200 { cases.push(next() & 0xFFFF_FFFF); }
+        for a in cases {
+            for m in modes {
+                let want = ref_sqrt(eb, sb, &Integer::from(a), m);
+                let mut bl = Blaster::new();
+                let xv = const_bits(&bl, eb, sb, a);
+                let sel = rm::literal(&bl, rmode(m));
+                let word = fp_sqrt(&mut bl, &xv, &sel, eb, sb);
+                assert_eq!(Integer::from(eval_word(bl, &word)), want, "fp.sqrt32 a={a:#x} m={m:?}");
+            }
+        }
+    }
+
+    #[test]
     fn fp_sqrt_tiny_exhaustive_all_modes() {
         let (eb, sb) = (3u32, 5u32);
         let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];

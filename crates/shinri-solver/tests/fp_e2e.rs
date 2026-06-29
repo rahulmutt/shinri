@@ -283,3 +283,57 @@ fn fp_div_sat_get_model_round_trip() {
         "model must render x as +inf: {model}"
     );
 }
+
+// ── Slice-2c′ end-to-end: fp.sqrt SAT/UNSAT + get-model ──────────────────────
+
+#[test]
+fn fp_sqrt_inf_is_inf_sat() {
+    // SAT: fp.sqrt(RNE, +inf) = +inf; x asserted fp.eq to +inf.
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.sqrt RNE (_ +oo 8 24))))
+(assert (fp.eq x (_ +oo 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat); // sqrt(+inf) = +inf
+}
+
+#[test]
+fn fp_sqrt_neg_inf_is_nan_sat() {
+    // SAT: fp.sqrt(RNE, -inf) = NaN.
+    let src = "\
+(set-logic QF_FP)
+(assert (fp.isNaN (fp.sqrt RNE (_ -oo 8 24))))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat); // sqrt(-inf) = NaN
+}
+
+#[test]
+fn fp_sqrt_neg_inf_is_not_zero_unsat() {
+    // UNSAT: sqrt(-inf) = NaN, and NaN is never fp.eq to any non-NaN value.
+    let src = "\
+(set-logic QF_FP)
+(assert (fp.eq (fp.sqrt RNE (_ -oo 8 24)) (_ +zero 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Unsat); // NaN ≠ +zero under fp.eq
+}
+
+#[test]
+fn fp_sqrt_sat_get_model_round_trip() {
+    // After SAT, the model must render x = +inf. (sqrt(+inf) = +inf, exact.)
+    let src = "\
+(set-logic QF_FP)
+(declare-fun x () (_ FloatingPoint 8 24))
+(assert (fp.eq x (fp.sqrt RNE (_ +oo 8 24))))
+(assert (fp.eq x (_ +oo 8 24)))
+(check-sat)";
+    let (o, model) = run(src);
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(
+        model.contains("(fp #b0 #b11111111 #b00000000000000000000000)"),
+        "model must render x as +inf: {model}"
+    );
+}
