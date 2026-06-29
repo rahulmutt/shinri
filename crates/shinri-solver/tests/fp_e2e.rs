@@ -327,3 +327,54 @@ fn fp_sqrt_sat_get_model_round_trip() {
         "model must render x as +inf: {model}"
     );
 }
+
+// ── Slice-2d end-to-end: ordering relations + fp.min/fp.max ───────────────────
+
+#[test]
+fn fp_lt_zero_lt_inf_is_sat() {
+    let (o, _) = run("(assert (fp.lt (_ +zero 8 24) (_ +oo 8 24))) (check-sat)");
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_lt_antisymmetry_is_unsat() {
+    let (o, _) = run(
+        "(declare-fun x () Float32) (declare-fun y () Float32) \
+         (assert (fp.lt x y)) (assert (fp.lt y x)) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn fp_leq_reflexive_fails_only_for_nan() {
+    // (not (fp.leq x x)) is SAT only when x is NaN.
+    let (o, _) = run(
+        "(declare-fun x () Float32) \
+         (assert (not (fp.leq x x))) (assert (fp.isNaN x)) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    let (o2, _) = run(
+        "(declare-fun x () Float32) \
+         (assert (not (fp.leq x x))) (assert (not (fp.isNaN x))) (check-sat)",
+    );
+    assert_eq!(o2, SolveOutcome::Unsat);
+}
+
+#[test]
+fn fp_min_of_one_two_equals_one_sat_with_model() {
+    let (o, model) = run(
+        "(declare-fun x () Float32) \
+         (assert (fp.eq x (fp.min (_ +oo 8 24) (_ +zero 8 24)))) (check-sat) (get-model)",
+    );
+    assert_eq!(o, SolveOutcome::Sat); // min(+oo,+0) = +0, so x fp.eq +0
+    assert!(model.contains("(fp #b"), "model renders x: {model}");
+}
+
+#[test]
+fn fp_max_picks_larger_unsat_when_contradicted() {
+    // max(+0,+oo) = +oo, which is not fp.eq +0  => asserting equality is UNSAT.
+    let (o, _) = run(
+        "(assert (fp.eq (fp.max (_ +zero 8 24) (_ +oo 8 24)) (_ +zero 8 24))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
