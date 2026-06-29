@@ -97,6 +97,70 @@ pub fn ref_fp_eq(a: &FpClass, b: &FpClass) -> bool {
     }
 }
 
+/// Extended order key: -∞ < every finite rational < +∞. NaN has no key.
+/// Derived `Ord` compares by variant order (NegInf < Fin < PosInf), then by the
+/// contained `Rational` for the `Fin` arm.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Ord3 {
+    NegInf,
+    Fin(Rational),
+    PosInf,
+}
+
+fn order_key(eb: u32, sb: u32, c: &FpClass) -> Option<Ord3> {
+    match c {
+        FpClass::Nan => None,
+        FpClass::Inf { sign } => Some(if *sign { Ord3::NegInf } else { Ord3::PosInf }),
+        // Zero / Subnormal / Normal all yield Some(_) from class_to_rational.
+        other => Some(Ord3::Fin(class_to_rational(eb, sb, other).expect("finite -> rational"))),
+    }
+}
+
+/// IEEE `fp.lt`: NaN on either side -> false; +0 == -0; else extended-real order.
+pub fn ref_lt(eb: u32, sb: u32, a: &Integer, b: &Integer) -> bool {
+    let ka = order_key(eb, sb, &decode(eb, sb, a));
+    let kb = order_key(eb, sb, &decode(eb, sb, b));
+    match (ka, kb) {
+        (Some(x), Some(y)) => x < y,
+        _ => false,
+    }
+}
+
+pub fn ref_leq(eb: u32, sb: u32, a: &Integer, b: &Integer) -> bool {
+    ref_lt(eb, sb, a, b) || ref_fp_eq(&decode(eb, sb, a), &decode(eb, sb, b))
+}
+
+pub fn ref_gt(eb: u32, sb: u32, a: &Integer, b: &Integer) -> bool {
+    ref_lt(eb, sb, b, a)
+}
+
+pub fn ref_geq(eb: u32, sb: u32, a: &Integer, b: &Integer) -> bool {
+    ref_lt(eb, sb, b, a) || ref_fp_eq(&decode(eb, sb, a), &decode(eb, sb, b))
+}
+
+/// `fp.min`: NaN passes through to the other operand; both-NaN -> b. The
+/// SMT-LIB-unspecified (+0,-0) case is resolved sign-canonically to -0.
+pub fn ref_min(eb: u32, sb: u32, a: &Integer, b: &Integer) -> Integer {
+    let (ca, cb) = (decode(eb, sb, a), decode(eb, sb, b));
+    if matches!(ca, FpClass::Nan) { return b.clone(); }
+    if matches!(cb, FpClass::Nan) { return a.clone(); }
+    if let (FpClass::Zero { sign: sa }, FpClass::Zero { sign: sbn }) = (&ca, &cb) {
+        if sa != sbn { return zero_pattern(eb, sb, true); } // -0
+    }
+    if ref_lt(eb, sb, a, b) { a.clone() } else { b.clone() }
+}
+
+/// `fp.max`: symmetric to `ref_min`; the (+0,-0) tie resolves to +0.
+pub fn ref_max(eb: u32, sb: u32, a: &Integer, b: &Integer) -> Integer {
+    let (ca, cb) = (decode(eb, sb, a), decode(eb, sb, b));
+    if matches!(ca, FpClass::Nan) { return b.clone(); }
+    if matches!(cb, FpClass::Nan) { return a.clone(); }
+    if let (FpClass::Zero { sign: sa }, FpClass::Zero { sign: sbn }) = (&ca, &cb) {
+        if sa != sbn { return zero_pattern(eb, sb, false); } // +0
+    }
+    if ref_lt(eb, sb, a, b) { b.clone() } else { a.clone() }
+}
+
 /// Theory core `=`: NaN == NaN (the theory has exactly one NaN value), +0 != -0,
 /// otherwise bit-pattern equality. Note: non-canonical NaN payloads all denote
 /// the single NaN value, so any two NaNs are core-equal.
@@ -755,5 +819,75 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod slice2d_tests {
+    use super::*;
+    use shinri_num::Integer;
+
+    // Float32 bit patterns.
+    const P1: u64 = 0x3F80_0000;   // +1.0
+    const N1: u64 = 0xBF80_0000;   // -1.0
+    const P2: u64 = 0x4000_0000;   // +2.0
+    const N2: u64 = 0xC000_0000;   // -2.0
+    const PZ: u64 = 0x0000_0000;   // +0
+    const NZ: u64 = 0x8000_0000;   // -0
+    const PINF: u64 = 0x7F80_0000;
+    const NINF: u64 = 0xFF80_0000;
+    const QNAN: u64 = 0x7FC0_0000;
+    const SUBN: u64 = 0x0000_0001; // smallest +subnormal
+
+    fn i(v: u64) -> Integer { Integer::from(v) }
+
+    #[test]
+    fn ref_lt_matches_extended_order() {
+        let (eb, sb) = (8, 24);
+        let lt = |a, b| ref_lt(eb, sb, &i(a), &i(b));
+        assert!(lt(P1, P2));
+        assert!(!lt(P2, P1));
+        assert!(lt(N1, P1));
+        assert!(lt(N2, N1));        // -2 < -1
+        assert!(!lt(N1, N2));
+        assert!(!lt(PZ, NZ));       // +0 == -0
+        assert!(!lt(NZ, PZ));
+        assert!(lt(NINF, PINF));
+        assert!(lt(NINF, N1));
+        assert!(lt(P1, PINF));
+        assert!(lt(PZ, SUBN));
+        assert!(!lt(QNAN, P1));     // NaN unordered
+        assert!(!lt(P1, QNAN));
+        assert!(!lt(QNAN, QNAN));
+    }
+
+    #[test]
+    fn ref_leq_gt_geq_derive_correctly() {
+        let (eb, sb) = (8, 24);
+        assert!(ref_leq(eb, sb, &i(P1), &i(P1)));    // equal
+        assert!(ref_leq(eb, sb, &i(PZ), &i(NZ)));    // +0 <= -0
+        assert!(!ref_leq(eb, sb, &i(QNAN), &i(P1))); // NaN
+        assert!(ref_gt(eb, sb, &i(P2), &i(P1)));
+        assert!(!ref_gt(eb, sb, &i(P1), &i(P1)));
+        assert!(ref_geq(eb, sb, &i(P1), &i(P1)));
+        assert!(ref_geq(eb, sb, &i(P2), &i(P1)));
+        assert!(!ref_geq(eb, sb, &i(P1), &i(QNAN)));
+    }
+
+    #[test]
+    fn ref_min_max_with_nan_and_zero_tie() {
+        let (eb, sb) = (8, 24);
+        assert_eq!(ref_min(eb, sb, &i(P1), &i(P2)), i(P1));
+        assert_eq!(ref_max(eb, sb, &i(P1), &i(P2)), i(P2));
+        // sign-canonical, order-independent ±0:
+        assert_eq!(ref_min(eb, sb, &i(PZ), &i(NZ)), i(NZ));
+        assert_eq!(ref_min(eb, sb, &i(NZ), &i(PZ)), i(NZ));
+        assert_eq!(ref_max(eb, sb, &i(PZ), &i(NZ)), i(PZ));
+        assert_eq!(ref_max(eb, sb, &i(NZ), &i(PZ)), i(PZ));
+        // NaN passthrough:
+        assert_eq!(ref_min(eb, sb, &i(QNAN), &i(P1)), i(P1));
+        assert_eq!(ref_min(eb, sb, &i(P1), &i(QNAN)), i(P1));
+        assert_eq!(ref_max(eb, sb, &i(QNAN), &i(P2)), i(P2));
+        assert_eq!(ref_min(eb, sb, &i(QNAN), &i(QNAN)), i(QNAN)); // both NaN -> b
     }
 }
