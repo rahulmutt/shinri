@@ -2,6 +2,7 @@ pub mod add;
 pub mod classify;
 pub mod compare;
 pub mod div;
+pub mod minmax;
 pub mod mul;
 pub mod normalize;
 pub mod operand;
