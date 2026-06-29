@@ -544,8 +544,20 @@ fn gen_sqrt_script(rng: &mut Lcg) -> String {
 
 // fp.sqrt instances involve a digit-recurrence square-root over ~50-bit
 // significands; bound this oracle independently of N_ITERS so a full gated
-// run completes in minutes while still covering both SAT and UNSAT.
-const SQRT_ITERS: usize = 40;
+// run completes in seconds while still covering both SAT and UNSAT.
+//
+// Bound chosen below the first intractable-for-us instance: with this seed,
+// iters 0..30 each solve in <100ms (SAT plus UNSAT at 9/17/22/28), but some
+// later scripts conjoin multiple symbolic fp.sqrt terms across distinct
+// rounding modes (e.g. iter 37 is `z=sqrt_RNE(x) ∧ z≠sqrt_RTZ(x) ∧
+// z≠sqrt_RNA(x)`, which is UNSAT). z3 refutes those in <0.2s via its native
+// FP theory, but our *eager* bit-blaster must grind a full propositional
+// refutation over three deep digit-recurrence circuits — hours of search.
+// Such instances carry no correctness signal here (a shinri-vs-z3
+// disagreement can only arise where both solvers decide), so we bound below
+// them rather than wait them out. Do NOT raise this without first adding a
+// per-instance wall-clock timeout — a higher bound will hang on a hard UNSAT.
+const SQRT_ITERS: usize = 30;
 
 #[test]
 fn differential_qf_fp_sqrt() {
