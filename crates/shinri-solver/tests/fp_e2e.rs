@@ -286,18 +286,8 @@ fn fp_div_sat_get_model_round_trip() {
 
 // ── Slice-2c′ end-to-end: fp.sqrt SAT/UNSAT + get-model ──────────────────────
 
-#[test]
-fn fp_sqrt_inf_is_inf_sat() {
-    // SAT: fp.sqrt(RNE, +inf) = +inf; x asserted fp.eq to +inf.
-    let src = "\
-(set-logic QF_FP)
-(declare-fun x () (_ FloatingPoint 8 24))
-(assert (fp.eq x (fp.sqrt RNE (_ +oo 8 24))))
-(assert (fp.eq x (_ +oo 8 24)))
-(check-sat)";
-    let (o, _) = run(src);
-    assert_eq!(o, SolveOutcome::Sat); // sqrt(+inf) = +inf
-}
+// (sqrt(+inf)=+inf is covered by fp_sqrt_sat_get_model_round_trip below, which
+// uses the identical query plus a model assertion — no separate SAT-only test.)
 
 #[test]
 fn fp_sqrt_neg_inf_is_nan_sat() {

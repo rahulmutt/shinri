@@ -711,9 +711,11 @@ mod tests {
     }
 
     #[test]
-    fn ref_sqrt_monotone_and_square_roundtrip_tiny() {
-        // For every finite positive (eb=3,sb=5) input, sqrt(x)^2 (rounded) brackets x,
-        // and sqrt is monotonic in the encoding order of positive finite values.
+    fn ref_sqrt_monotone_tiny() {
+        // sqrt is monotonic over the encoding order of positive finite (eb=3,sb=5)
+        // values: as the input bit-pattern increases through one positive-finite run,
+        // the rounded result never decreases. (Absolute correctness is anchored
+        // separately by ref_sqrt_known_float32 and the datapath bit-equality gates.)
         let (eb, sb) = (3u32, 5u32);
         let mut prev: Option<Integer> = None;
         for v in 0u64..(1 << (eb + sb)) {
