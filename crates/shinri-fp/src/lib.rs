@@ -115,6 +115,16 @@ impl FpBlaster {
                         let xw = self.blast_word(ctx, kids[1]);
                         crate::blast::sqrt::fp_sqrt(&mut self.b, &xw, &rm, eb, sb)
                     }
+                    FpMin => {
+                        let xw = self.blast_word(ctx, kids[0]);
+                        let yw = self.blast_word(ctx, kids[1]);
+                        crate::blast::minmax::fp_min(&mut self.b, &xw, &yw, eb, sb)
+                    }
+                    FpMax => {
+                        let xw = self.blast_word(ctx, kids[0]);
+                        let yw = self.blast_word(ctx, kids[1]);
+                        crate::blast::minmax::fp_max(&mut self.b, &xw, &yw, eb, sb)
+                    }
                     other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
                 }
             }
@@ -152,6 +162,19 @@ impl FpBlaster {
                 let x = self.blast_word(ctx, kids[0]);
                 let y = self.blast_word(ctx, kids[1]);
                 crate::blast::compare::fp_eq(&mut self.b, &x, &y, eb, sb)
+            }
+            Op::Builtin(rel @ (FpLt | FpLeq | FpGt | FpGeq)) => {
+                let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
+                let x = self.blast_word(ctx, kids[0]);
+                let y = self.blast_word(ctx, kids[1]);
+                use crate::blast::compare as cmp;
+                match rel {
+                    FpLt => cmp::fp_lt(&mut self.b, &x, &y, eb, sb),
+                    FpLeq => cmp::fp_leq(&mut self.b, &x, &y, eb, sb),
+                    FpGt => cmp::fp_gt(&mut self.b, &x, &y, eb, sb),
+                    FpGeq => cmp::fp_geq(&mut self.b, &x, &y, eb, sb),
+                    _ => unreachable!(),
+                }
             }
             Op::Builtin(classify @ (FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite
                                     | FpIsNaN | FpIsNegative | FpIsPositive)) => {
@@ -289,7 +312,7 @@ mod lower_tests {
 #[cfg(test)]
 mod blast_tests {
     use super::*;
-    use shinri_core::{Context, Op};
+    use shinri_core::{BuiltinOp, Context, Op};
     use shinri_num::Integer;
 
     #[test]
@@ -316,5 +339,23 @@ mod blast_tests {
         assert!(vb.contains_key(&x));
         assert_eq!(vb[&x].len(), 32);
         assert!(!vb.contains_key(&z), "constants are not exported as variables");
+    }
+
+    #[test]
+    fn blast_dispatch_relations_and_minmax_wired() {
+        let mut ctx = Context::new();
+        let one = ctx.mk_fp_const(8, 24, Integer::from(0x3F80_0000u64));
+        let two = ctx.mk_fp_const(8, 24, Integer::from(0x4000_0000u64));
+        let mut fb = FpBlaster::new();
+        // Each relation atom must dispatch (no `unreachable!`):
+        for rel in [BuiltinOp::FpLt, BuiltinOp::FpLeq, BuiltinOp::FpGt, BuiltinOp::FpGeq] {
+            let a = ctx.mk_app(Op::Builtin(rel), &[one, two]).unwrap();
+            let _lit = fb.blast_atom(&ctx, a); // must not panic
+        }
+        // min/max words must dispatch and yield a 32-bit word:
+        let mn = ctx.mk_app(Op::Builtin(BuiltinOp::FpMin), &[one, two]).unwrap();
+        let mx = ctx.mk_app(Op::Builtin(BuiltinOp::FpMax), &[one, two]).unwrap();
+        assert_eq!(fb.blast_word(&ctx, mn).len(), 32);
+        assert_eq!(fb.blast_word(&ctx, mx).len(), 32);
     }
 }
