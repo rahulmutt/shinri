@@ -1551,6 +1551,16 @@ mod fp_routing_tests {
                    (assert (fp.isNaN (fp.abs (fp.neg x)))) (check-sat)";
         assert_eq!(run_outcome(src), SolveOutcome::Sat);
     }
+
+    /// SOUNDNESS: fp.rem is still NOT admitted through the fence (no blast support),
+    /// so it must fail closed to Unknown — NOT panic at blast time. This replaces the
+    /// canary role that fp_lt_is_unknown_not_panic held before fp.lt was admitted.
+    #[test]
+    fn fp_rem_is_unknown_not_panic() {
+        let src = "(declare-fun x () Float32) (declare-fun y () Float32) \
+                   (assert (fp.eq (fp.rem x y) x)) (check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+    }
 }
 
 #[cfg(test)]

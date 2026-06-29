@@ -361,7 +361,7 @@ fn fp_leq_reflexive_fails_only_for_nan() {
 }
 
 #[test]
-fn fp_min_of_one_two_equals_one_sat_with_model() {
+fn fp_min_of_inf_zero_equals_zero_sat_with_model() {
     let (o, model) = run(
         "(declare-fun x () Float32) \
          (assert (fp.eq x (fp.min (_ +oo 8 24) (_ +zero 8 24)))) (check-sat) (get-model)",
