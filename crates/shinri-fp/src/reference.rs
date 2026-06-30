@@ -636,6 +636,47 @@ pub fn ref_div(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> I
     round_rational(eb, sb, &quot, mode)
 }
 
+/// Exact-rational golden `fp.rem x y` — the IEEE-754 remainder. MODE-INDEPENDENT
+/// and EXACT: r = x − y·n with n = roundTiesToEven(x/y) taken as an exact integer;
+/// |r| ≤ |y|/2, always representable. `x`, `y` are W=eb+sb bit patterns.
+pub fn ref_rem(eb: u32, sb: u32, x: &Integer, y: &Integer) -> Integer {
+    use FpClass::*;
+    let cx = decode(eb, sb, x);
+    let cy = decode(eb, sb, y);
+    // 1. NaN (either) -> NaN ; rem(±inf, _) -> NaN ; rem(_, ±0) -> NaN.
+    if matches!(cx, Nan) || matches!(cy, Nan) { return canonical_nan(eb, sb); }
+    if matches!(cx, Inf { .. }) { return canonical_nan(eb, sb); }
+    if matches!(cy, Zero { .. }) { return canonical_nan(eb, sb); }
+    let sign_x = ref_is_negative(&cx);
+    // 2. rem(x, ±inf) = x (finite x, faithful bits — incl. ±0).
+    if matches!(cy, Inf { .. }) { return x.clone(); }
+    // 3. rem(±0, finite-nonzero) = ±0 (sign of x).
+    if matches!(cx, Zero { .. }) { return zero_pattern(eb, sb, sign_x); }
+    // 4. finite x, finite-nonzero y: exact remainder.
+    let neg1 = Rational::new(Integer::from(-1i64), Integer::one());
+    let zero = Rational::new(Integer::zero(), Integer::one());
+    let two = Integer::from(2u64);
+    let abs = |r: Rational| if r < zero { neg1.clone() * r } else { r };
+    let xm = abs(class_to_rational(eb, sb, &cx).unwrap());
+    let ym = abs(class_to_rational(eb, sb, &cy).unwrap());
+    // q = round-half-even(xm / ym) as a non-negative integer.
+    let qx = xm.clone() / ym.clone();                         // exact Rational, >= 0
+    let qfloor = qx.numer().div_rem(&qx.denom()).0;           // floor (>= 0)
+    let frac = qx - Rational::new(qfloor.clone(), Integer::one());
+    let half = Rational::new(Integer::one(), two.clone());
+    let round_up = if frac > half { true }
+        else if frac < half { false }
+        else { !qfloor.div_rem(&two).1.is_zero() };           // tie -> to even
+    let q = if round_up { qfloor + Integer::one() } else { qfloor };
+    // Signed magnitude-remainder rm = |x| − q·|y| ∈ [−|y|/2, |y|/2].
+    // The true remainder is sign_x · rm (round-half-even is an odd function).
+    let rm = xm - Rational::new(q, Integer::one()) * ym;
+    if rm == zero { return zero_pattern(eb, sb, sign_x); }    // exact multiple -> ±0
+    let result = if sign_x { neg1 * rm } else { rm };
+    // rm is exactly representable, so this re-encode introduces no second rounding.
+    round_rational(eb, sb, &result, RoundMode::Rne)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -944,6 +985,69 @@ mod tests {
         // Carry-renormalize: a value just below 2 rounds up to 2.0 with exp+1.
         // 1.9999998 ~ 0x3FFF_FFFF rounds to 2.0 under RNE.
         assert_eq!(rti(0x3FFF_FFFF, RoundMode::Rne), Integer::from(0x4000_0000u64));
+    }
+
+    #[test]
+    fn ref_rem_known_float32() {
+        let (eb, sb) = (8u32, 24u32);
+        let rem = |x: u64, y: u64| ref_rem(eb, sb, &Integer::from(x), &Integer::from(y));
+        // 5 rem 3: round(5/3)=2, 5-6 = -1.0.
+        assert_eq!(rem(0x40A0_0000, 0x4040_0000), Integer::from(0xBF80_0000u64));
+        // -5 rem 3: -(5 - 3*round(-5/3)) ; round(-5/3)=-2 ; -5+6 = +1.0.
+        assert_eq!(rem(0xC0A0_0000, 0x4040_0000), Integer::from(0x3F80_0000u64));
+        // 7 rem 2: 7/2 = 3.5 tie -> even (4); 7-8 = -1.0.
+        assert_eq!(rem(0x40E0_0000, 0x4000_0000), Integer::from(0xBF80_0000u64));
+        // 5 rem 2: 5/2 = 2.5 tie -> even (2); 5-4 = +1.0.
+        assert_eq!(rem(0x40A0_0000, 0x4000_0000), Integer::from(0x3F80_0000u64));
+        // 3 rem 3 = +0 (exact multiple, sign of x).
+        assert_eq!(rem(0x4040_0000, 0x4040_0000), Integer::from(0u64));
+    }
+
+    #[test]
+    fn ref_rem_specials() {
+        let (eb, sb) = (8u32, 24u32);
+        let rem = |x: u64, y: u64| ref_rem(eb, sb, &Integer::from(x), &Integer::from(y));
+        let nan = canonical_nan(eb, sb);
+        // any NaN -> NaN
+        assert_eq!(rem(0x7FC0_0000, 0x3F80_0000), nan);
+        assert_eq!(rem(0x3F80_0000, 0x7FC0_0000), nan);
+        // rem(inf, y) -> NaN ; rem(x, 0) -> NaN
+        assert_eq!(rem(0x7F80_0000, 0x3F80_0000), nan);
+        assert_eq!(rem(0x3F80_0000, 0x0000_0000), nan);
+        // rem(x, inf) = x (faithful)
+        assert_eq!(rem(0x40A0_0000, 0x7F80_0000), Integer::from(0x40A0_0000u64));
+        // rem(±0, finite-nonzero) = ±0 (sign of x)
+        assert_eq!(rem(0x0000_0000, 0x3F80_0000), Integer::from(0u64));
+        assert_eq!(rem(0x8000_0000, 0x3F80_0000), Integer::from(0x8000_0000u64));
+    }
+
+    #[test]
+    fn ref_rem_tiny_total_and_bounded() {
+        // Every (a,b) on (3,5): the result is a valid 8-bit pattern, and for finite
+        // nonzero a,b the magnitude never exceeds |b|/2 (the IEEE remainder bound).
+        let (eb, sb) = (3u32, 5u32);
+        for a in 0u64..256 {
+            for b in 0u64..256 {
+                let r = ref_rem(eb, sb, &Integer::from(a), &Integer::from(b));
+                assert!(r < Integer::from(256u64), "out-of-range result {a:#x} rem {b:#x}");
+                let (ca, cb) = (decode(eb, sb, &Integer::from(a)), decode(eb, sb, &Integer::from(b)));
+                let finite_nz = |c: &FpClass| matches!(c, FpClass::Normal { .. } | FpClass::Subnormal { .. });
+                if finite_nz(&ca) && finite_nz(&cb) {
+                    let rc = decode(eb, sb, &r);
+                    if let (Some(rv), Some(bv)) =
+                        (class_to_rational(eb, sb, &rc), class_to_rational(eb, sb, &cb)) {
+                        let two = Integer::from(2u64);
+                        let absr = if rv < Rational::new(Integer::zero(), Integer::one())
+                            { Rational::new(Integer::from(-1i64), Integer::one()) * rv } else { rv };
+                        let absb = if bv < Rational::new(Integer::zero(), Integer::one())
+                            { Rational::new(Integer::from(-1i64), Integer::one()) * bv } else { bv };
+                        // 2*|r| <= |b|
+                        assert!(absr * Rational::new(two, Integer::one()) <= absb,
+                                "|rem| > |b|/2 at a={a:#x} b={b:#x}");
+                    }
+                }
+            }
+        }
     }
 }
 
