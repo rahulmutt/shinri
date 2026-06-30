@@ -426,11 +426,14 @@ fn fp_fma_symbolic_rm_sat_get_model() {
 
 #[test]
 fn fp_fma_malformed_is_unknown() {
-    // Fence canary: an fma whose operand is an unsupported FP word (fp.rem is out
-    // of scope) must trip the fence -> Unknown, never SAT/UNSAT.
+    // Fence canary: an fma whose operand is an unsupported FP word must trip the
+    // fence -> Unknown. Trigger = to_fp from a symbolic Real (durably out of scope
+    // for all of v1: the symbolic-Real bridge is deferred past Plan 3). Float-sorted,
+    // so it nests where the 4th fma operand must be a Float.
     let (o, _) = run(
         "(declare-fun x () Float32) (declare-fun y () Float32) (declare-fun w () Float32) \
-         (assert (fp.eq w (fp.fma RNE x y (fp.rem x y)))) (check-sat)",
+         (declare-fun r () Real) \
+         (assert (fp.eq w (fp.fma RNE x y ((_ to_fp 8 24) RNE r)))) (check-sat)",
     );
     assert_eq!(o, SolveOutcome::Unknown);
 }
@@ -483,10 +486,10 @@ fn fp_roundtointegral_symbolic_rm_sat_get_model() {
 #[test]
 fn fp_roundtointegral_malformed_is_unknown() {
     // Fence canary: a roundToIntegral whose operand is an unsupported FP word
-    // (fp.rem is out of scope) must trip the fence → Unknown, never SAT/UNSAT.
+    // (to_fp from a symbolic Real, durably out of scope) must trip the fence -> Unknown.
     let (o, _) = run(
-        "(declare-fun x () Float32) (declare-fun y () Float32) (declare-fun u () Float32) \
-         (assert (fp.eq u (fp.roundToIntegral RNE (fp.rem x y)))) (check-sat)",
+        "(declare-fun x () Float32) (declare-fun u () Float32) (declare-fun r () Real) \
+         (assert (fp.eq u (fp.roundToIntegral RNE ((_ to_fp 8 24) RNE r)))) (check-sat)",
     );
     assert_eq!(o, SolveOutcome::Unknown);
 }
