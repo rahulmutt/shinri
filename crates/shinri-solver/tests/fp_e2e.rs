@@ -517,7 +517,7 @@ fn fp_rem_known_value_sat() {
 }
 
 #[test]
-fn fp_rem_bounded_magnitude_unsat() {
+fn fp_rem_inf_dividend_is_nan_unsat() {
     // DEVIATION FROM BRIEF (two levels): the brief's primary symbolic-x form
     // (`(fp.gt (fp.abs (fp.rem x 2.0)) 2.0)` -> UNSAT) risks the known fp.rem
     // deep-circuit grind under symbolic UNSAT (~276-stage circuit; see brief

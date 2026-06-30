@@ -1,7 +1,12 @@
 # shinri QF_FP — Slice 2g Design: `fp.rem`
 
 **Date:** 2026-06-30
-**Status:** Approved design, pre-implementation
+**Status:** Landed 2026-06-30 — slice 2g complete, **Plan 2 (arithmetic) closed**. `fp.rem`
+admitted through the QF_FP soundness fence: exact-rational golden `ref_rem` (`reference.rs`),
+bit-blasted circuit `blast/rem.rs` (narrow fmod reduction loop + round-to-even correction),
+`blast_word` dispatch + `is_supported_fp_word` fence arm, end-to-end + differential-vs-z3
+tests. Validated: exhaustive `(3,5)` (65536 pairs) + Float32 worst-gap stress + z3 differential
+(0 disagreements) + full-workspace regression, all green.
 **Parent design:** `docs/superpowers/specs/2026-06-24-shinri-qffp-design.md` (architecture)
 **Roadmap:** `docs/superpowers/specs/2026-06-25-shinri-qffp-vertical-slice-design.md` (§3, Plan 2)
 
