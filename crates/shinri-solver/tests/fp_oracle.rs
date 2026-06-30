@@ -502,6 +502,67 @@ fn differential_qf_fp_div() {
     assert!(n_sat > 0 && n_unsat > 0, "oracle produced no coverage");
 }
 
+/// Generate a random QF_FP script with fp.rem (two fp32 vars; no rounding mode —
+/// fp.rem is exact). Builds 1–3 assertions mixing fp.rem with fp.eq/=/fp.isNaN
+/// atoms, some negated, so both SAT and UNSAT witnesses arise.
+fn gen_rem_script(rng: &mut Lcg) -> String {
+    let mut s = String::from(
+        "(set-logic QF_FP)\n\
+         (declare-fun x () (_ FloatingPoint 8 24))\n\
+         (declare-fun y () (_ FloatingPoint 8 24))\n\
+         (declare-fun z () (_ FloatingPoint 8 24))\n",
+    );
+    let n_asserts = 1 + rng.below(3) as usize;
+    for _ in 0..n_asserts {
+        let term = "(fp.rem x y)".to_string();
+        let atom = match rng.below(3) {
+            0 => format!("(fp.eq z {term})"),
+            1 => format!("(= z {term})"),
+            _ => format!("(fp.isNaN {term})"),
+        };
+        if rng.below(2) == 0 {
+            s.push_str(&format!("(assert (not {atom}))\n"));
+        } else {
+            s.push_str(&format!("(assert {atom})\n"));
+        }
+    }
+    s.push_str("(check-sat)\n");
+    s
+}
+
+// fp.rem is the deepest FP datapath: the fmod reduction loop unrolls to ~276
+// stages for Float32, so each symbolic instance is a very deep circuit. Bound the
+// oracle well below the div bound; raise only behind a per-instance wall-clock
+// timeout (a hard symbolic UNSAT can grind for hours in the eager bit-blaster).
+const REM_ITERS: usize = 20;
+
+#[test]
+fn differential_qf_fp_rem() {
+    let mut rng = Lcg(0x00FE_2C0D_3E11);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..REM_ITERS {
+        let src = gen_rem_script(&mut rng);
+        let ours = shinri_outcome(&src);
+        if ours == SolveOutcome::Unknown { n_unknown += 1; continue; }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_sat += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!(
+                "QF_FP rem DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"
+            ),
+        }
+    }
+    println!("differential_qf_fp_rem: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+    assert!(n_sat > 0, "oracle produced no SAT coverage");
+}
+
 /// Generate a random QF_FP script with fp.sqrt over all five rounding modes.
 /// Declares two fp32 variables (x, z) and optionally a symbolic rounding mode
 /// (fp.sqrt is unary — no y operand).  Builds 1–3 assertions mixing fp.sqrt
