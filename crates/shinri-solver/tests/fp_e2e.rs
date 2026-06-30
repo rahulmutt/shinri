@@ -378,3 +378,59 @@ fn fp_max_picks_larger_unsat_when_contradicted() {
     );
     assert_eq!(o, SolveOutcome::Unsat);
 }
+
+// ── Slice-2e end-to-end: fp.roundToIntegral SAT/UNSAT + symbolic-RM + get-model ──
+
+#[test]
+fn fp_roundtointegral_inf_passthrough_sat() {
+    // roundToIntegral(RTP, +oo) = +oo, so fp.isInfinite holds: SAT.
+    let (o, _) = run(
+        "(assert (fp.isInfinite (fp.roundToIntegral RTP (_ +oo 8 24)))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_roundtointegral_nan_is_nan_sat() {
+    let (o, _) = run(
+        "(assert (fp.isNaN (fp.roundToIntegral RNE (_ NaN 8 24)))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_roundtointegral_idempotent_on_integral_unsat() {
+    // For any x, roundToIntegral(RNE, roundToIntegral(RNE, x)) = roundToIntegral(RNE, x)
+    // under STRUCTURAL equality (=, bitwise).  Under fp.eq this would be SAT because
+    // fp.eq(NaN, NaN) = false (IEEE), making (not (fp.eq ...)) satisfiable at x=NaN.
+    // With structural = the two sides have identical bits for every x (including NaN,
+    // since rti(NaN) returns the canonical NaN unchanged), so (not (= ...)) is UNSAT.
+    let (o, _) = run(
+        "(declare-fun x () Float32) \
+         (assert (not (= (fp.roundToIntegral RNE (fp.roundToIntegral RNE x)) \
+                         (fp.roundToIntegral RNE x)))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn fp_roundtointegral_symbolic_rm_sat_get_model() {
+    // z = roundToIntegral(rm, x) with symbolic rm and symbolic x: SAT, model renders.
+    let (o, model) = run(
+        "(declare-fun x () Float32) (declare-fun z () Float32) (declare-fun rm () RoundingMode) \
+         (assert (fp.eq z (fp.roundToIntegral rm x))) (check-sat) (get-model)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(model.contains("(fp #b"), "model renders fp triples: {model}");
+}
+
+#[test]
+fn fp_roundtointegral_malformed_is_unknown() {
+    // Fence canary: a roundToIntegral whose operand is an unsupported FP word
+    // (fp.fma is out of scope) must trip the fence → Unknown, never SAT/UNSAT.
+    let (o, _) = run(
+        "(declare-fun x () Float32) (declare-fun y () Float32) (declare-fun u () Float32) \
+         (assert (fp.eq u (fp.roundToIntegral RNE (fp.fma RNE x y u)))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unknown);
+}
