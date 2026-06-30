@@ -634,6 +634,64 @@ fn gen_rel_script(rng: &mut Lcg) -> String {
     s
 }
 
+/// Random QF_FP with fp.roundToIntegral over all five rounding modes (unary op).
+fn gen_roundint_script(rng: &mut Lcg) -> String {
+    let mut s = String::from(
+        "(set-logic QF_FP)\n\
+         (declare-fun x () (_ FloatingPoint 8 24))\n\
+         (declare-fun z () (_ FloatingPoint 8 24))\n",
+    );
+    let use_sym_rm = rng.below(4) == 0;
+    if use_sym_rm {
+        s.push_str("(declare-fun rm () RoundingMode)\n");
+    }
+    let rm = |rng: &mut Lcg| -> String {
+        if use_sym_rm && rng.below(2) == 0 { "rm".to_string() }
+        else { RMS[rng.below(RMS.len() as u64) as usize].to_string() }
+    };
+    let n_asserts = 1 + rng.below(3) as usize;
+    for _ in 0..n_asserts {
+        let term = format!("(fp.roundToIntegral {} x)", rm(rng));
+        let atom = match rng.below(3) {
+            0 => format!("(fp.eq z {term})"),
+            1 => format!("(= z {term})"),
+            _ => format!("(fp.isNaN {term})"),
+        };
+        if rng.below(2) == 0 { s.push_str(&format!("(assert (not {atom}))\n")); }
+        else { s.push_str(&format!("(assert {atom})\n")); }
+    }
+    s.push_str("(check-sat)\n");
+    s
+}
+
+// fp.roundToIntegral is a shallow circuit (two barrel shifts + an add, no
+// digit-recurrence), so this can run the full N_ITERS unlike div/sqrt.
+const ROUNDINT_ITERS: usize = N_ITERS;
+
+#[test]
+fn differential_qf_fp_roundint() {
+    let mut rng = Lcg(0x00A1_7E2D_4C9F_03);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..ROUNDINT_ITERS {
+        let src = gen_roundint_script(&mut rng);
+        let ours = shinri_outcome(&src);
+        if ours == SolveOutcome::Unknown { n_unknown += 1; continue; }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"]).build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_sat += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!("QF_FP roundToIntegral DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
+        }
+    }
+    println!("differential_qf_fp_roundint: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+    assert!(n_sat > 0 && n_unsat > 0, "oracle produced no coverage");
+}
+
 // The file is gated at module level (`#![cfg(feature = "oracle")]`), so no
 // per-test cfg is needed. `Lcg` is the tuple struct `Lcg(u64)`.
 #[test]
