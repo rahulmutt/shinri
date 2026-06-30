@@ -76,21 +76,8 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
     let sig: Vec<BitLit> = work[3..3 + sbu].to_vec();
     let lsb = sig[0];
 
-    // --- Step 2: increment decision (one-hot mux over modes). ---
-    let grs_any = or3(b, g, r, s);
-    let not_sign = b.not1(ext.sign);
-    let r_or_s_or_lsb = or3(b, r, s, lsb);
-    let inc_rne = b.and2(g, r_or_s_or_lsb);
-    let inc_rna = g;
-    let inc_rtp = b.and2(not_sign, grs_any);
-    let inc_rtn = b.and2(ext.sign, grs_any);
-    let inc_rtz = b.zero();
-    // inc = OR over (sel_i AND inc_i)
-    let mut inc = b.zero();
-    for (sel, val) in rm.sel.iter().zip([inc_rne, inc_rna, inc_rtp, inc_rtn, inc_rtz]) {
-        let t = b.and2(*sel, val);
-        inc = b.or2(inc, t);
-    }
+    // --- Step 2: increment decision (shared with fp.roundToIntegral). ---
+    let inc = rounding_increment(b, ext.sign, g, r, s, lsb, rm);
 
     // --- Step 3: add inc to the sb-bit significand; detect carry-out. ---
     let mut addend: Vec<BitLit> = vec![b.zero(); sbu];
@@ -149,6 +136,28 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
     // sign bit (preserved through overflow).
     out.push(ext.sign);
     out
+}
+
+/// Per-RM "add one ulp?" decision, shared by `round()` and `fp.roundToIntegral`.
+/// `sign` is the result sign; `g`/`r`/`s` are guard/round/sticky; `lsb` is the
+/// significand's least-significant retained bit (for RNE tie-to-even).
+pub fn rounding_increment(
+    b: &mut Blaster, sign: BitLit, g: BitLit, r: BitLit, s: BitLit, lsb: BitLit, rm: &RmSel,
+) -> BitLit {
+    let grs_any = or3(b, g, r, s);
+    let not_sign = b.not1(sign);
+    let r_or_s_or_lsb = or3(b, r, s, lsb);
+    let inc_rne = b.and2(g, r_or_s_or_lsb);
+    let inc_rna = g;
+    let inc_rtp = b.and2(not_sign, grs_any);
+    let inc_rtn = b.and2(sign, grs_any);
+    let inc_rtz = b.zero();
+    let mut inc = b.zero();
+    for (sel, val) in rm.sel.iter().zip([inc_rne, inc_rna, inc_rtp, inc_rtn, inc_rtz]) {
+        let t = b.and2(*sel, val);
+        inc = b.or2(inc, t);
+    }
+    inc
 }
 
 /// Right-shift `x` (LSB→MSB) by `amt` (unsigned LSB→MSB), returning the shifted
