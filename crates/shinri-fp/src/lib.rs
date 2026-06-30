@@ -137,6 +137,11 @@ impl FpBlaster {
                         let zw = self.blast_word(ctx, kids[3]);
                         crate::blast::fma::fp_fma(&mut self.b, &xw, &yw, &zw, &rm, eb, sb)
                     }
+                    FpRem => {
+                        let xw = self.blast_word(ctx, kids[0]);
+                        let yw = self.blast_word(ctx, kids[1]);
+                        crate::blast::rem::fp_rem(&mut self.b, &xw, &yw, eb, sb)
+                    }
                     other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
                 }
             }
@@ -317,6 +322,23 @@ mod lower_tests {
         let eq = ctx.mk_eq(div, one).unwrap();
         let lo = lower(&mut ctx, &[eq]);
         assert!(lo.atom_lit.contains_key(&eq), "core = over fp.div must be surrogated");
+        assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
+    }
+
+    #[test]
+    fn lower_fp_rem_eq_atom() {
+        use shinri_core::BuiltinOp;
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let yf = ctx.declare_fun("y", &[], f32);
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let rem = ctx.mk_app(Op::Builtin(BuiltinOp::FpRem), &[x, y]).unwrap();
+        let one = ctx.mk_fp_const(8, 24, Integer::from(0x3F80_0000u64));
+        let eq = ctx.mk_eq(rem, one).unwrap();
+        let lo = lower(&mut ctx, &[eq]);
+        assert!(lo.atom_lit.contains_key(&eq), "core = over fp.rem must be surrogated");
         assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
     }
 }

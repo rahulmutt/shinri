@@ -1552,13 +1552,26 @@ mod fp_routing_tests {
         assert_eq!(run_outcome(src), SolveOutcome::Sat);
     }
 
-    /// SOUNDNESS: fp.rem is still NOT admitted through the fence (no blast support),
-    /// so it must fail closed to Unknown — NOT panic at blast time. This replaces the
-    /// canary role that fp_lt_is_unknown_not_panic held before fp.lt was admitted.
+    /// SOUNDNESS: fp.rem is now admitted through the fence (slice 2g) and solvable.
+    /// (fp.rem x y) = x whenever y is large enough that the remainder is exactly x
+    /// (e.g. x finite, y = +inf): Sat.
     #[test]
-    fn fp_rem_is_unknown_not_panic() {
+    fn fp_rem_is_solvable_after_admission() {
         let src = "(declare-fun x () Float32) (declare-fun y () Float32) \
                    (assert (fp.eq (fp.rem x y) x)) (check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
+    }
+
+    /// SOUNDNESS: `(_ to_fp eb sb)` from a symbolic Real is durably out of scope for
+    /// all of v1 (the symbolic-Real bridge is deferred past Plan 3), so any FP
+    /// construct nesting it must fail closed to Unknown — NOT panic at blast time.
+    /// This replaces the canary role that fp_rem_is_unknown_not_panic held before
+    /// fp.rem was admitted (slice 2g), which itself replaced fp_lt_is_unknown_not_panic
+    /// before fp.lt was admitted.
+    #[test]
+    fn fp_to_fp_from_real_is_unknown_not_panic() {
+        let src = "(declare-fun x () Float32) (declare-fun r () Real) \
+                   (assert (fp.eq x ((_ to_fp 8 24) RNE r))) (check-sat)";
         assert_eq!(run_outcome(src), SolveOutcome::Unknown);
     }
 }

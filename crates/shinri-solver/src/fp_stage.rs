@@ -109,7 +109,7 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
 /// Positively-enumerated check: is an FP-sorted `word` term one that
 /// `shinri_fp::FpBlaster::blast_word` can handle in slice 1 (FpAbs/FpNeg),
 /// slice 2a (FpAdd/FpSub), slice 2b (FpMul), slice 2c (FpDiv), slice 2c′ (FpSqrt),
-/// slice 2e (FpRoundToIntegral/FpMin/FpMax), or slice 2f (FpFma)?
+/// slice 2e (FpRoundToIntegral/FpMin/FpMax), slice 2f (FpFma), or slice 2g (FpRem)?
 ///
 /// Supported: FP constants, nullary FP variables, FpAbs/FpNeg applied
 /// (recursively) to supported words, FpAdd/FpSub/FpMul/FpDiv where the RM operand is a
@@ -117,7 +117,8 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
 /// are recursively supported, FpSqrt where the RM operand is a RoundingMode
 /// term and the single FP operand is recursively supported, FpRoundToIntegral with
 /// RM and FP operand both recursively supported, FpMin/FpMax with both FP operands
-/// recursively supported, and FpFma with RM and all three FP operands recursively
+/// recursively supported, FpFma with RM and all three FP operands recursively
+/// supported, and FpRem (no RM operand) with both FP operands recursively
 /// supported. EVERYTHING else is NOT supported (any unknown/future FP op defaults to
 /// unsupported). This ensures that adding a new FP op to the core does not silently
 /// route through blast_word and panic.
@@ -168,8 +169,15 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                 && is_supported_fp_word(ctx, kids[2])
                 && is_supported_fp_word(ctx, kids[3])
         }
-        // Anything else (FpRem, Ite over FP, non-nullary UF, etc.)
-        // is not in scope for slice 1, 2a, 2b, 2c, 2c′, 2e, or 2f.
+        // fp.rem: (F, F) -> F. No RM operand; both FP operands supported.
+        TermNode::App { op: Op::Builtin(BuiltinOp::FpRem), args, .. } => {
+            let kids = ctx.children(*args).to_vec();
+            kids.len() == 2
+                && is_supported_fp_word(ctx, kids[0])
+                && is_supported_fp_word(ctx, kids[1])
+        }
+        // Anything else (Ite over FP, non-nullary UF, conversions, etc.) is not in
+        // scope for slices 1–2g.
         _ => false,
     }
 }
@@ -376,6 +384,20 @@ mod tests {
         if let Ok(bad) = bad {
             assert!(!super::is_supported_fp_word(&ctx, bad), "arity-3 fp.fma rejected");
         }
+    }
+
+    #[test]
+    fn fp_rem_word_is_supported() {
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let yf = ctx.declare_fun("y", &[], f32);
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let rem = ctx.mk_app(Op::Builtin(BuiltinOp::FpRem), &[x, y]).unwrap();
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[rem]).unwrap();
+        let atoms = collect_fp_atoms(&ctx, &[isnan]);
+        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.rem is in scope as of slice 2g");
     }
 
     #[test]
