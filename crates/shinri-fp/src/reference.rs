@@ -463,6 +463,45 @@ fn sqrt_round_positive(eb: u32, sb: u32, v: &Rational, mode: RoundMode) -> Integ
     }
 }
 
+/// Exact `fp.roundToIntegral RM x`: round x to the nearest integer-valued float
+/// per `mode`. NaN -> canonical NaN; ±inf and ±0 unchanged; a zero result keeps
+/// the input's sign. The rounded integer is always exactly representable.
+pub fn ref_round_to_integral(eb: u32, sb: u32, bits: &Integer, mode: RoundMode) -> Integer {
+    use FpClass::*;
+    let c = decode(eb, sb, bits);
+    let sign = match &c {
+        Nan => return canonical_nan(eb, sb),
+        Inf { .. } | Zero { .. } => return bits.clone(), // ±inf / ±0 unchanged
+        Normal { sign, .. } | Subnormal { sign, .. } => *sign,
+    };
+    // Exact value, then round its magnitude to an integer with the same tie logic
+    // round_rational uses (reference.rs round_up block).
+    let v = class_to_rational(eb, sb, &c).unwrap();
+    let zero = Rational::new(Integer::zero(), Integer::one());
+    let half = Rational::new(Integer::one(), Integer::from(2u64));
+    let mag = if sign { Rational::new(Integer::from(-1i64), Integer::one()) * v.clone() } else { v };
+    let q = mag.numer().div_rem(&mag.denom()).0; // floor(|value|)
+    let frac = mag - Rational::new(q.clone(), Integer::one());
+    let round_up = match mode {
+        RoundMode::Rtz => false,
+        RoundMode::Rtp => !sign && frac > zero,
+        RoundMode::Rtn => sign && frac > zero,
+        RoundMode::Rne => {
+            if frac > half { true } else if frac < half { false }
+            else { !q.div_rem(&Integer::from(2u64)).1.is_zero() } // tie -> to even
+        }
+        RoundMode::Rna => frac >= half,
+    };
+    let n = if round_up { q + Integer::one() } else { q };
+    if n.is_zero() {
+        return zero_pattern(eb, sb, sign); // sign-preserving ±0
+    }
+    let signed_n = if sign { Rational::new(Integer::from(-1i64), Integer::one()) * Rational::new(n, Integer::one()) }
+                   else { Rational::new(n, Integer::one()) };
+    // n is exactly representable, so this re-encode introduces no second rounding.
+    round_rational(eb, sb, &signed_n, mode)
+}
+
 /// Exact-rational golden `fp.add RM a b`. `a`, `b` are W=eb+sb bit patterns.
 pub fn ref_add(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> Integer {
     let ca = decode(eb, sb, a);
@@ -819,6 +858,42 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ref_round_to_integral_float32_modes() {
+        let (eb, sb) = (8u32, 24u32);
+        let rti = |bits: u64, m| ref_round_to_integral(eb, sb, &Integer::from(bits), m);
+        // Already integral: unchanged in every mode.
+        assert_eq!(rti(0x4000_0000, RoundMode::Rne), Integer::from(0x4000_0000u64)); // 2.0
+        // Half-way ties.
+        assert_eq!(rti(0x3FC0_0000, RoundMode::Rne), Integer::from(0x4000_0000u64)); // 1.5 -> 2 (even)
+        assert_eq!(rti(0x4020_0000, RoundMode::Rne), Integer::from(0x4000_0000u64)); // 2.5 -> 2 (even)
+        assert_eq!(rti(0x3FC0_0000, RoundMode::Rna), Integer::from(0x4000_0000u64)); // 1.5 -> 2 (away)
+        assert_eq!(rti(0x3F00_0000, RoundMode::Rna), Integer::from(0x3F80_0000u64)); // 0.5 -> 1 (away)
+        assert_eq!(rti(0x3F00_0000, RoundMode::Rne), Integer::from(0u64));           // 0.5 -> +0 (even)
+        // Directed modes on 0.5.
+        assert_eq!(rti(0x3F00_0000, RoundMode::Rtp), Integer::from(0x3F80_0000u64)); // 0.5 -> 1 (+inf)
+        assert_eq!(rti(0x3F00_0000, RoundMode::Rtn), Integer::from(0u64));           // 0.5 -> 0 (-inf)
+        assert_eq!(rti(0x3F00_0000, RoundMode::Rtz), Integer::from(0u64));           // 0.5 -> 0 (zero)
+    }
+
+    #[test]
+    fn ref_round_to_integral_specials_and_sign_preserving_zero() {
+        let (eb, sb) = (8u32, 24u32);
+        let rti = |bits: u64, m| ref_round_to_integral(eb, sb, &Integer::from(bits), m);
+        // NaN -> canonical NaN; ±inf unchanged; ±0 unchanged.
+        assert_eq!(rti(0x7FC0_0000, RoundMode::Rne), canonical_nan(eb, sb));
+        assert_eq!(rti(0x7F80_0000, RoundMode::Rne), Integer::from(0x7F80_0000u64)); // +inf
+        assert_eq!(rti(0x8000_0000, RoundMode::Rne), Integer::from(0x8000_0000u64)); // -0 stays -0
+        assert_eq!(rti(0x0000_0000, RoundMode::Rne), Integer::from(0u64));           // +0 stays +0
+        // Sign-preserving zero result: -0.25 RNE -> -0.0 (0xBE80_0000 = -0.25).
+        assert_eq!(rti(0xBE80_0000, RoundMode::Rne), Integer::from(0x8000_0000u64));
+        // Directed toward -inf: -0.5 RTN -> -1.0 (0xBF80_0000).
+        assert_eq!(rti(0xBF00_0000, RoundMode::Rtn), Integer::from(0xBF80_0000u64));
+        // Carry-renormalize: a value just below 2 rounds up to 2.0 with exp+1.
+        // 1.9999998 ~ 0x3FFF_FFFF rounds to 2.0 under RNE.
+        assert_eq!(rti(0x3FFF_FFFF, RoundMode::Rne), Integer::from(0x4000_0000u64));
     }
 }
 
