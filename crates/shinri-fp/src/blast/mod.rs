@@ -7,6 +7,7 @@ pub mod minmax;
 pub mod mul;
 pub mod normalize;
 pub mod operand;
+pub mod rem;
 pub mod roundint;
 pub mod sqrt;
 pub mod structural;
