@@ -115,6 +115,11 @@ impl FpBlaster {
                         let xw = self.blast_word(ctx, kids[1]);
                         crate::blast::sqrt::fp_sqrt(&mut self.b, &xw, &rm, eb, sb)
                     }
+                    FpRoundToIntegral => {
+                        let rm = self.blast_rm(ctx, kids[0]);
+                        let xw = self.blast_word(ctx, kids[1]);
+                        crate::blast::roundint::fp_round_to_integral(&mut self.b, &xw, &rm, eb, sb)
+                    }
                     FpMin => {
                         let xw = self.blast_word(ctx, kids[0]);
                         let yw = self.blast_word(ctx, kids[1]);

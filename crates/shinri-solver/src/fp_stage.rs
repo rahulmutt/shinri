@@ -140,8 +140,9 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                 && is_supported_fp_word(ctx, kids[1])
                 && is_supported_fp_word(ctx, kids[2])
         }
-        // FpSqrt: (RM, F). RM operand must be a RoundingMode term; FP operand supported.
-        TermNode::App { op: Op::Builtin(BuiltinOp::FpSqrt), args, .. } => {
+        // FpSqrt / FpRoundToIntegral: (RM, F). RM operand must be a RoundingMode
+        // term; FP operand supported.
+        TermNode::App { op: Op::Builtin(BuiltinOp::FpSqrt | BuiltinOp::FpRoundToIntegral), args, .. } => {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 2
                 && is_rounding_mode_term(ctx, kids[0])
@@ -328,6 +329,22 @@ mod tests {
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[sqrt]).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
         assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.sqrt is in scope as of slice 2c'");
+    }
+
+    #[test]
+    fn fp_roundtointegral_word_is_supported() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let rti = ctx.mk_app(Op::Builtin(BuiltinOp::FpRoundToIntegral), &[rne, x]).unwrap();
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[rti]).unwrap();
+        let atoms = collect_fp_atoms(&ctx, &[isnan]);
+        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.roundToIntegral is in scope as of slice 2e");
+        // Malformed (missing RM operand) must NOT be admitted.
+        let bad = ctx.mk_app(Op::Builtin(BuiltinOp::FpRoundToIntegral), &[x]);
+        if let Ok(bad) = bad {
+            assert!(!super::is_supported_fp_word(&ctx, bad), "arity-1 roundToIntegral rejected");
+        }
     }
 
     #[test]
