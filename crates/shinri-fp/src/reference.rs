@@ -559,6 +559,56 @@ pub fn ref_mul(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> I
     round_rational(eb, sb, &prod, mode)
 }
 
+/// Exact-rational golden `fp.fma RM x y z` = round(x·y + z) with a SINGLE
+/// rounding. `x`, `y`, `z` are W=eb+sb bit patterns. Product sign = sign_x ⊕
+/// sign_y. The exact real x·y + z is formed at infinite precision and rounded
+/// once via `round_rational`.
+pub fn ref_fma(eb: u32, sb: u32, x: &Integer, y: &Integer, z: &Integer, mode: RoundMode) -> Integer {
+    use FpClass::*;
+    let cx = decode(eb, sb, x);
+    let cy = decode(eb, sb, y);
+    let cz = decode(eb, sb, z);
+    // 1. NaN propagation (any operand).
+    if matches!(cx, Nan) || matches!(cy, Nan) || matches!(cz, Nan) {
+        return canonical_nan(eb, sb);
+    }
+    let prod_sign = ref_is_negative(&cx) ^ ref_is_negative(&cy);
+    let x_zero = matches!(cx, Zero { .. });
+    let y_zero = matches!(cy, Zero { .. });
+    let x_inf = matches!(cx, Inf { .. });
+    let y_inf = matches!(cy, Inf { .. });
+    // 2. Invalid product 0·∞ (either order) -> NaN. Precedes the inf arm.
+    if (x_zero && y_inf) || (x_inf && y_zero) {
+        return canonical_nan(eb, sb);
+    }
+    let prod_inf = x_inf || y_inf;
+    let z_inf = matches!(cz, Inf { .. });
+    let z_sign = ref_is_negative(&cz);
+    // 3. Infinities.
+    if prod_inf {
+        // product is ±∞; ∞ + (∓∞) is invalid.
+        if z_inf && (z_sign != prod_sign) {
+            return canonical_nan(eb, sb);
+        }
+        return inf_pattern(eb, sb, prod_sign);
+    }
+    if z_inf {
+        return inf_pattern(eb, sb, z_sign);
+    }
+    // 4. Finite: exact x·y + z, rounded once.
+    let rx = class_to_rational(eb, sb, &cx).unwrap();
+    let ry = class_to_rational(eb, sb, &cy).unwrap();
+    let rz = class_to_rational(eb, sb, &cz).unwrap();
+    let v = rx * ry + rz;
+    let zero = Rational::new(Integer::zero(), Integer::one());
+    if v == zero {
+        // IEEE exact-zero-sum sign rule (product sign on the left).
+        let neg = (prod_sign && z_sign) || matches!(mode, RoundMode::Rtn);
+        return zero_pattern(eb, sb, neg);
+    }
+    round_rational(eb, sb, &v, mode)
+}
+
 /// Exact-rational golden `fp.div RM a b`. `a`, `b` are W=eb+sb bit patterns.
 /// Result sign is always sign_a XOR sign_b (including specials and zeros).
 pub fn ref_div(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> Integer {
@@ -964,5 +1014,50 @@ mod slice2d_tests {
         assert_eq!(ref_min(eb, sb, &i(P1), &i(QNAN)), i(P1));
         assert_eq!(ref_max(eb, sb, &i(QNAN), &i(P2)), i(P2));
         assert_eq!(ref_min(eb, sb, &i(QNAN), &i(QNAN)), i(QNAN)); // both NaN -> b
+    }
+
+    #[test]
+    fn ref_fma_finite_and_single_rounding() {
+        let (eb, sb) = (8u32, 24u32);
+        let fma = |x: u64, y: u64, z: u64, m| {
+            ref_fma(eb, sb, &Integer::from(x), &Integer::from(y), &Integer::from(z), m)
+        };
+        // 2*3 + 1 = 7.
+        assert_eq!(fma(0x4000_0000, 0x4040_0000, 0x3F80_0000, RoundMode::Rne),
+                   Integer::from(0x40E0_0000u64));
+        // Single-rounding witness: a = 1 + 2^-23, a*a = 1 + 2^-22 + 2^-46.
+        // Fused a*a + (-(1+2^-22)) = 2^-46 exactly (= 0x2880_0000).
+        // The double-rounded mul-then-add would give +0 (round(a*a) = 1+2^-22, then -itself).
+        assert_eq!(fma(0x3F80_0001, 0x3F80_0001, 0xBF80_0002, RoundMode::Rne),
+                   Integer::from(0x2880_0000u64));
+        // Exact-zero sum sign rule: 1*1 + (-1) = 0 -> +0 (RNE) / -0 (RTN).
+        assert_eq!(fma(0x3F80_0000, 0x3F80_0000, 0xBF80_0000, RoundMode::Rne),
+                   Integer::from(0u64));
+        assert_eq!(fma(0x3F80_0000, 0x3F80_0000, 0xBF80_0000, RoundMode::Rtn),
+                   Integer::from(0x8000_0000u64));
+    }
+
+    #[test]
+    fn ref_fma_specials() {
+        let (eb, sb) = (8u32, 24u32);
+        let fma = |x: u64, y: u64, z: u64, m| {
+            ref_fma(eb, sb, &Integer::from(x), &Integer::from(y), &Integer::from(z), m)
+        };
+        let nan = canonical_nan(eb, sb);
+        // Any NaN operand -> canonical NaN.
+        assert_eq!(fma(0x7FC0_0000, 0x3F80_0000, 0x3F80_0000, RoundMode::Rne), nan);
+        // 0 * inf -> NaN (invalid product), regardless of z.
+        assert_eq!(fma(0x0000_0000, 0x7F80_0000, 0x3F80_0000, RoundMode::Rne), nan);
+        // product +inf, z = -inf (opposite sign) -> NaN.
+        assert_eq!(fma(0x7F80_0000, 0x3F80_0000, 0xFF80_0000, RoundMode::Rne), nan);
+        // product +inf, z finite -> +inf.
+        assert_eq!(fma(0x7F80_0000, 0x4000_0000, 0x3F80_0000, RoundMode::Rne),
+                   Integer::from(0x7F80_0000u64));
+        // product finite, z = +inf -> +inf.
+        assert_eq!(fma(0x3F80_0000, 0x3F80_0000, 0x7F80_0000, RoundMode::Rne),
+                   Integer::from(0x7F80_0000u64));
+        // product -inf (neg * pos), z finite -> -inf.
+        assert_eq!(fma(0xFF80_0000, 0x3F80_0000, 0x3F80_0000, RoundMode::Rne),
+                   Integer::from(0xFF80_0000u64));
     }
 }
