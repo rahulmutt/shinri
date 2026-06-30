@@ -379,6 +379,62 @@ fn fp_max_picks_larger_unsat_when_contradicted() {
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
+// ── Slice-2f end-to-end: fp.fma SAT/UNSAT + symbolic-RM + fence canary ──
+
+#[test]
+fn fp_fma_nan_when_zero_times_inf_sat() {
+    // 0 * +inf + x is NaN regardless of x: fp.isNaN holds -> SAT.
+    let (o, _) = run(
+        "(declare-fun x () Float32) \
+         (assert (fp.isNaN (fp.fma RNE (_ +zero 8 24) (_ +oo 8 24) x))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_fma_inf_product_finite_addend_sat() {
+    // (+inf) * x + y, with x = +1.0-ish nonzero and y finite, is +inf.
+    // Use isInfinite over a symbolic-but-constrained query: SAT.
+    let (o, _) = run(
+        "(declare-fun y () Float32) \
+         (assert (fp.isInfinite (fp.fma RTP (_ +oo 8 24) (_ +oo 8 24) y))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat); // +inf * +inf + y = +inf
+}
+
+#[test]
+fn fp_fma_inf_minus_inf_is_nan_sat() {
+    // (+inf)*(+inf) + (-inf) = +inf + (-inf) = NaN.
+    let (o, _) = run(
+        "(assert (fp.isNaN (fp.fma RNE (_ +oo 8 24) (_ +oo 8 24) (_ -oo 8 24)))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_fma_symbolic_rm_sat_get_model() {
+    // w = fma(rm, x, y, z) with symbolic rm and operands: SAT, model renders.
+    let (o, model) = run(
+        "(declare-fun x () Float32) (declare-fun y () Float32) \
+         (declare-fun z () Float32) (declare-fun w () Float32) \
+         (declare-fun rm () RoundingMode) \
+         (assert (fp.eq w (fp.fma rm x y z))) (check-sat) (get-model)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(model.contains("(fp #b"), "model renders fp triples: {model}");
+}
+
+#[test]
+fn fp_fma_malformed_is_unknown() {
+    // Fence canary: an fma whose operand is an unsupported FP word (fp.rem is out
+    // of scope) must trip the fence -> Unknown, never SAT/UNSAT.
+    let (o, _) = run(
+        "(declare-fun x () Float32) (declare-fun y () Float32) (declare-fun w () Float32) \
+         (assert (fp.eq w (fp.fma RNE x y (fp.rem x y)))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unknown);
+}
+
 // ── Slice-2e end-to-end: fp.roundToIntegral SAT/UNSAT + symbolic-RM + get-model ──
 
 #[test]
