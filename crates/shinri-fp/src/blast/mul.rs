@@ -14,8 +14,30 @@ fn zero_extend(b: &Blaster, x: &[BitLit], to: usize) -> Vec<BitLit> {
     let mut out = x.to_vec(); while out.len() < to { out.push(b.zero()); } out
 }
 
-pub fn fp_mul(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, sb: u32) -> Vec<BitLit> {
+/// Exact normalized significand product, shared by `fp.mul` and `fp.fma`.
+/// Returns (prod_n, norm_exp): `prod_n` is the 2·sb-bit product left-shifted so
+/// its leading 1 sits at index 2·sb-1; `norm_exp` (signed, exp_w bits) is the
+/// exponent of that leading bit, so the product value = prod_n · 2^(norm_exp -
+/// (2·sb-1)). No rounding. (Garbage norm_exp when the product is 0 — the caller
+/// special-cases a zero product.)
+pub(crate) fn significand_product(b: &mut Blaster, ox: &Operand, oy: &Operand, eb: u32, sb: u32)
+    -> (Vec<BitLit>, Vec<BitLit>) {
     let ew = exp_w(eb);
+    let pw = 2 * sb as usize;
+    let exp_sum = shinri_bv::blast::arith::bvadd(b, &ox.exp, &oy.exp);
+    let xe = zero_extend(b, &ox.sig, pw);
+    let ye = zero_extend(b, &oy.sig, pw);
+    let prod = shinri_bv::blast::arith::bvmul(b, &xe, &ye);
+    let lz = lzc(b, &prod);
+    let lz_ew = zero_extend(b, &lz, ew);
+    let prod_n = shinri_bv::blast::shift::bvshl(b, &prod, &lz_ew);
+    let corr = const_ew(b, ew, 1i128);
+    let exp_corr = shinri_bv::blast::arith::bvadd(b, &exp_sum, &corr);
+    let norm_exp = shinri_bv::blast::arith::bvsub(b, &exp_corr, &lz_ew);
+    (prod_n, norm_exp)
+}
+
+pub fn fp_mul(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, sb: u32) -> Vec<BitLit> {
     let sbu = sb as usize;
     let pw = 2 * sbu;                 // product width
     let ox = to_operand(b, x, eb, sb);
@@ -24,26 +46,8 @@ pub fn fp_mul(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, 
     // --- Sign: XOR. ---
     let res_sign = b.xor2(ox.sign, oy.sign);
 
-    // --- Exponent: sum of the two unbiased exponents (signed, ew bits). ---
-    let exp_sum = shinri_bv::blast::arith::bvadd(b, &ox.exp, &oy.exp);
-
-    // --- Significand product: zero-extend to 2*sb, bvmul → full 2*sb product. ---
-    let xe = zero_extend(b, &ox.sig, pw);
-    let ye = zero_extend(b, &oy.sig, pw);
-    let prod = shinri_bv::blast::arith::bvmul(b, &xe, &ye);     // pw bits
-
-    // --- Normalize (uniform LZC): left-shift leading 1 to index pw-1. ---
-    let lz = lzc(b, &prod);                                     // count_width(pw) bits
-    let lz_ew = zero_extend(b, &lz, ew);
-    let prod_n = shinri_bv::blast::shift::bvshl(b, &prod, &lz_ew);
-    // norm_exp = exp_sum + 1 - lz.
-    // CORR = 1.  Derivation: sig_val = prod_n >> sb ≈ P * 2^(lz - sb); equating
-    // sig_val * 2^(norm_exp - (sb-1)) to the true product P * 2^(exp_x+exp_y - 2(sb-1))
-    // cancels to norm_exp = exp_x + exp_y + 1 - lz.  The brief's provisional CORR
-    // = sb-1 overcounts by sb-2 (an exponent-only offset confirmed by the exhaustive gate).
-    let corr = const_ew(b, ew, 1i128);
-    let exp_corr = shinri_bv::blast::arith::bvadd(b, &exp_sum, &corr);
-    let norm_exp = shinri_bv::blast::arith::bvsub(b, &exp_corr, &lz_ew);
+    // --- Significand product + normalize (shared with fp.fma). ---
+    let (prod_n, norm_exp) = significand_product(b, &ox, &oy, eb, sb);
 
     // --- Build ExtFp from prod_n. Top sb bits = sig (hidden at index pw-1);
     //     next bit = G, next = R, OR of the rest = S. ---
