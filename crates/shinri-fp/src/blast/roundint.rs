@@ -41,6 +41,9 @@ pub fn fp_round_to_integral(b: &mut Blaster, x: &[BitLit], rm: &RmSel, eb: u32, 
     let inc = rounding_increment(b, ox.sign, g, r, s, lsb, rm);
     let mut addend: Vec<BitLit> = vec![b.zero(); sbu];
     addend[0] = inc;
+    // adder carry-out is always 0 here: f=0 ⇒ inc=0 (no carry); f≥1 ⇒ top f bits of
+    // int_part are 0 ⇒ int_part+1 < 2^sbu. The renormalization carry is captured below
+    // via shifted_back[sbu], not this adder.
     let (int_rounded, _carry) = adder(b, &int_part, &addend, b.zero());
 
     // Shift the rounded integer back left by f to restore the normalized position.
@@ -48,7 +51,9 @@ pub fn fp_round_to_integral(b: &mut Blaster, x: &[BitLit], rm: &RmSel, eb: u32, 
     // higher power of two ⇒ exp+1, significand = leading bit only).
     let mut ir_ext = int_rounded.clone();
     ir_ext.push(b.zero());                                          // sbu+1 bits
-    // Resize f_sat to sbu+1 (truncate high bits / zero-extend); f < 2^(sb+1) always.
+    // Resize f_sat to sbu+1. High bits of f_sat are zero only on the exp≥0 (|x|≥1) path,
+    // which is the only path whose shifted_back result survives (|x|<1 is overridden by the
+    // is_lt1 mux below), so truncating any high bits here is inert.
     let f_shl: Vec<BitLit> = (0..(sbu + 1)).map(|i| if i < ew { f_sat[i] } else { b.zero() }).collect();
     let shifted_back = bvshl(b, &ir_ext, &f_shl);                   // sbu+1 bits
     let overflow = shifted_back[sbu];
@@ -65,8 +70,8 @@ pub fn fp_round_to_integral(b: &mut Blaster, x: &[BitLit], rm: &RmSel, eb: u32, 
     let bias_v = const_n(b, ew, (1i128 << (eb - 1)) - 1);
     let biased = bvadd(b, &exp_out, &bias_v);
     let mut out: Vec<BitLit> = Vec::with_capacity(w);
-    for i in 0..(sbu - 1) { out.push(norm_sig[i]); }                // trailing significand
-    for i in 0..(eb as usize) { out.push(biased[i]); }             // exponent field
+    out.extend_from_slice(&norm_sig[..sbu - 1]);                    // trailing significand
+    out.extend_from_slice(&biased[..eb as usize]);                 // exponent field
     out.push(ox.sign);                                             // sign
 
     // Special cases (low → high priority; NaN wins).
