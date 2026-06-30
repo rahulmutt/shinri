@@ -66,3 +66,14 @@ pub(crate) fn signed_zero_bits(b: &Blaster, eb: u32, sb: u32, sign: BitLit) -> V
     v[(eb + sb) as usize - 1] = sign;
     v
 }
+#[allow(clippy::needless_range_loop)] // index arithmetic bounds are load-bearing
+pub(crate) fn signed_one_bits(b: &Blaster, eb: u32, sb: u32, sign: BitLit) -> Vec<BitLit> {
+    // 1.0: trailing sig 0, biased exponent = bias (2^(eb-1)-1), given sign.
+    let bias: u64 = (1u64 << (eb - 1)) - 1;
+    let mut v: Vec<BitLit> = (0..(eb + sb)).map(|_| b.zero()).collect();
+    for i in 0..(eb as usize) {
+        if (bias >> i) & 1 == 1 { v[(sb as usize - 1) + i] = b.one(); }
+    }
+    v[(eb + sb) as usize - 1] = sign;
+    v
+}
