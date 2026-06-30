@@ -108,16 +108,19 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
 
 /// Positively-enumerated check: is an FP-sorted `word` term one that
 /// `shinri_fp::FpBlaster::blast_word` can handle in slice 1 (FpAbs/FpNeg),
-/// slice 2a (FpAdd/FpSub), slice 2b (FpMul), slice 2c (FpDiv), or slice 2c′ (FpSqrt)?
+/// slice 2a (FpAdd/FpSub), slice 2b (FpMul), slice 2c (FpDiv), slice 2c′ (FpSqrt),
+/// slice 2e (FpRoundToIntegral/FpMin/FpMax), or slice 2f (FpFma)?
 ///
 /// Supported: FP constants, nullary FP variables, FpAbs/FpNeg applied
 /// (recursively) to supported words, FpAdd/FpSub/FpMul/FpDiv where the RM operand is a
 /// RoundingMode term (literal const or nullary RM variable) and both FP operands
-/// are recursively supported, and FpSqrt where the RM operand is a RoundingMode
-/// term and the single FP operand is recursively supported. EVERYTHING else is
-/// NOT supported (any unknown/future FP op defaults to unsupported). This ensures
-/// that adding a new FP op to the core does not silently route through blast_word
-/// and panic.
+/// are recursively supported, FpSqrt where the RM operand is a RoundingMode
+/// term and the single FP operand is recursively supported, FpRoundToIntegral with
+/// RM and FP operand both recursively supported, FpMin/FpMax with both FP operands
+/// recursively supported, and FpFma with RM and all three FP operands recursively
+/// supported. EVERYTHING else is NOT supported (any unknown/future FP op defaults to
+/// unsupported). This ensures that adding a new FP op to the core does not silently
+/// route through blast_word and panic.
 fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
     match ctx.term_node(t) {
         // FP constant → supported.

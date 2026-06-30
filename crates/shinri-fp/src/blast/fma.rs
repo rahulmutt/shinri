@@ -109,6 +109,7 @@ pub fn fp_fma(b: &mut Blaster, x: &[BitLit], y: &[BitLit], z: &[BitLit], rm: &Rm
     // Leading bit at index mw-1; top sb bits = mant_n[mw-sb .. mw].
     let sig: Vec<BitLit> = mant_n[(mw - sbu)..mw].to_vec();
     let g = mant_n[mw - sbu - 1];
+    // mw = 2*sbu+3 ⇒ mw-sbu-2 = sbu+1 >= 2 always, so this index never underflows.
     let r = mant_n[mw - sbu - 2];
     let mut s = b.zero();
     for bit in mant_n.iter().take(mw - sbu - 2) { s = b.or2(s, *bit); }
