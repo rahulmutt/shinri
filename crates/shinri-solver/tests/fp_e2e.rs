@@ -483,10 +483,10 @@ fn fp_roundtointegral_symbolic_rm_sat_get_model() {
 #[test]
 fn fp_roundtointegral_malformed_is_unknown() {
     // Fence canary: a roundToIntegral whose operand is an unsupported FP word
-    // (fp.fma is out of scope) must trip the fence → Unknown, never SAT/UNSAT.
+    // (fp.rem is out of scope) must trip the fence → Unknown, never SAT/UNSAT.
     let (o, _) = run(
         "(declare-fun x () Float32) (declare-fun y () Float32) (declare-fun u () Float32) \
-         (assert (fp.eq u (fp.roundToIntegral RNE (fp.fma RNE x y u)))) (check-sat)",
+         (assert (fp.eq u (fp.roundToIntegral RNE (fp.rem x y)))) (check-sat)",
     );
     assert_eq!(o, SolveOutcome::Unknown);
 }
