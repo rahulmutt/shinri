@@ -603,7 +603,7 @@ pub fn ref_fma(eb: u32, sb: u32, x: &Integer, y: &Integer, z: &Integer, mode: Ro
     let zero = Rational::new(Integer::zero(), Integer::one());
     if v == zero {
         // IEEE exact-zero-sum sign rule (product sign on the left).
-        let neg = (prod_sign && z_sign) || matches!(mode, RoundMode::Rtn);
+        let neg = (prod_sign && z_sign) || ((prod_sign != z_sign) && matches!(mode, RoundMode::Rtn));
         return zero_pattern(eb, sb, neg);
     }
     round_rational(eb, sb, &v, mode)
@@ -1059,5 +1059,26 @@ mod slice2d_tests {
         // product -inf (neg * pos), z finite -> -inf.
         assert_eq!(fma(0xFF80_0000, 0x3F80_0000, 0x3F80_0000, RoundMode::Rne),
                    Integer::from(0xFF80_0000u64));
+    }
+
+    #[test]
+    fn ref_fma_zero_sign_rule() {
+        let (eb, sb) = (8u32, 24u32);
+        let fma = |x: u64, y: u64, z: u64, m| {
+            ref_fma(eb, sb, &Integer::from(x), &Integer::from(y), &Integer::from(z), m)
+        };
+        // Same-sign-positive zeros: + in ALL modes, including RTN (the bug case).
+        assert_eq!(fma(0x0000_0000, 0x3F80_0000, 0x0000_0000, RoundMode::Rtn),
+                   Integer::from(0x0000_0000u64));
+        assert_eq!(fma(0x0000_0000, 0x3F80_0000, 0x0000_0000, RoundMode::Rne),
+                   Integer::from(0x0000_0000u64));
+        // Opposite-sign zeros: + except RTN.
+        assert_eq!(fma(0x0000_0000, 0x3F80_0000, 0x8000_0000, RoundMode::Rne),
+                   Integer::from(0x0000_0000u64));
+        assert_eq!(fma(0x0000_0000, 0x3F80_0000, 0x8000_0000, RoundMode::Rtn),
+                   Integer::from(0x8000_0000u64));
+        // Same-sign-negative zeros: - in ALL modes.
+        assert_eq!(fma(0x8000_0000, 0x3F80_0000, 0x8000_0000, RoundMode::Rne),
+                   Integer::from(0x8000_0000u64));
     }
 }
