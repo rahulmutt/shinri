@@ -493,3 +493,74 @@ fn fp_roundtointegral_malformed_is_unknown() {
     );
     assert_eq!(o, SolveOutcome::Unknown);
 }
+
+// ── Slice-2g end-to-end: fp.rem SAT/UNSAT + get-model + fence canary ──
+
+#[test]
+fn fp_rem_known_value_sat() {
+    // rem(+0, +oo) = +0: rule "rem(x, ±inf) = x" for finite x (here x = +0), per
+    // shinri-fp/src/reference.rs ref_rem. Ground/constant-only query.
+    //
+    // DEVIATION FROM BRIEF: the brief's literal form `(fp #b0 #x82 #b...)` for
+    // "5.0 rem 3.0 = -1.0" does NOT pass this codebase's soundness fence -- the
+    // `(fp #b sign #x exp #b sig)` triple parses as `FpFromBits` (an App node),
+    // which `is_supported_fp_word` does not recognize (only `ConstVal::Float`
+    // literals and nullary FP vars are base cases; see the pre-existing slice-2a
+    // ENCODING NOTE earlier in this file). Confirmed empirically: that form yields
+    // Unknown, not Sat. The only concrete FP values the parser can produce as
+    // `ConstVal::Float` are the five special forms `(_ +oo/-oo/+zero/-zero/NaN eb
+    // sb)`, so the "known value" here is expressed via those instead of 5.0/3.0.
+    let (o, _) = run(
+        "(assert (fp.eq (fp.rem (_ +zero 8 24) (_ +oo 8 24)) (_ +zero 8 24))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_rem_bounded_magnitude_unsat() {
+    // DEVIATION FROM BRIEF (two levels): the brief's primary symbolic-x form
+    // (`(fp.gt (fp.abs (fp.rem x 2.0)) 2.0)` -> UNSAT) risks the known fp.rem
+    // deep-circuit grind under symbolic UNSAT (~276-stage circuit; see brief
+    // NOTE and memory: bit-blasted fp.div/fp.rem-class circuits can run for
+    // minutes to hours). The brief's authorized concrete-x fallback
+    // (`rem(7.0,2.0) = -1.0`, assert `= +1.0` -> Unsat) is ALSO unreachable: it
+    // depends on the same `(fp #b...)` literal-triple encoding used (and
+    // rejected, see fp_rem_known_value_sat above) for the SAT test, which trips
+    // the fence -> Unknown rather than Unsat. Confirmed empirically.
+    //
+    // Resolution: build a ground UNSAT entirely from the five fence-admitted
+    // special-value literals. Per shinri-fp/src/reference.rs ref_rem, rule order
+    // is NaN -> rem(±inf, _) = NaN -> rem(_, ±0) = NaN -> rem(x, ±inf) = x ->
+    // rem(±0, finite-nonzero) = ±0 -> exact remainder. rem(+oo, +0) hits the
+    // `rem(±inf, _) = NaN` rule (checked before y is even examined), so the true
+    // result is NaN, never +0. fp.eq(NaN, _) is always false (IEEE), so
+    // asserting the result equals +0 is UNSAT. Ground/constant-only: folds
+    // instantly, no symbolic search at all -- strictly faster and safer than
+    // either of the brief's two proposed forms.
+    let (o, _) = run(
+        "(assert (fp.eq (fp.rem (_ +oo 8 24) (_ +zero 8 24)) (_ +zero 8 24))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn fp_rem_sat_get_model() {
+    // w = rem(x, y): SAT, model renders fp triples.
+    let (o, model) = run(
+        "(declare-fun x () Float32) (declare-fun y () Float32) (declare-fun w () Float32) \
+         (assert (fp.eq w (fp.rem x y))) (check-sat) (get-model)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(model.contains("(fp #b"), "model renders fp triples: {model}");
+}
+
+#[test]
+fn fp_rem_malformed_is_unknown() {
+    // Slice-2g fence canary: a fp.rem nesting an unsupported FP word (to_fp from a
+    // symbolic Real, durably out of scope) must trip the fence -> Unknown.
+    let (o, _) = run(
+        "(declare-fun x () Float32) (declare-fun u () Float32) (declare-fun r () Real) \
+         (assert (fp.eq u (fp.rem x ((_ to_fp 8 24) RNE r)))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unknown);
+}
