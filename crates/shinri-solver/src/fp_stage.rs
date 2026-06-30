@@ -155,8 +155,18 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                 && is_supported_fp_word(ctx, kids[0])
                 && is_supported_fp_word(ctx, kids[1])
         }
-        // Anything else (FpFma, FpRem, ..., Ite over FP, non-nullary UF, etc.)
-        // is not in scope for slice 1, 2a, 2b, 2c, or 2c′.
+        // FpFma: (RM, F, F, F) -> F. RM operand must be a RoundingMode term;
+        // all three FP operands supported.
+        TermNode::App { op: Op::Builtin(BuiltinOp::FpFma), args, .. } => {
+            let kids = ctx.children(*args).to_vec();
+            kids.len() == 4
+                && is_rounding_mode_term(ctx, kids[0])
+                && is_supported_fp_word(ctx, kids[1])
+                && is_supported_fp_word(ctx, kids[2])
+                && is_supported_fp_word(ctx, kids[3])
+        }
+        // Anything else (FpRem, Ite over FP, non-nullary UF, etc.)
+        // is not in scope for slice 1, 2a, 2b, 2c, 2c′, 2e, or 2f.
         _ => false,
     }
 }
@@ -344,6 +354,24 @@ mod tests {
         let bad = ctx.mk_app(Op::Builtin(BuiltinOp::FpRoundToIntegral), &[x]);
         if let Ok(bad) = bad {
             assert!(!super::is_supported_fp_word(&ctx, bad), "arity-1 roundToIntegral rejected");
+        }
+    }
+
+    #[test]
+    fn fp_fma_word_is_supported() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let y = fp_var(&mut ctx, "y");
+        let z = fp_var(&mut ctx, "z");
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let fma = ctx.mk_app(Op::Builtin(BuiltinOp::FpFma), &[rne, x, y, z]).unwrap();
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[fma]).unwrap();
+        let atoms = collect_fp_atoms(&ctx, &[isnan]);
+        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.fma is in scope as of slice 2f");
+        // Malformed (missing the third FP operand) must NOT be admitted.
+        let bad = ctx.mk_app(Op::Builtin(BuiltinOp::FpFma), &[rne, x, y]);
+        if let Ok(bad) = bad {
+            assert!(!super::is_supported_fp_word(&ctx, bad), "arity-3 fp.fma rejected");
         }
     }
 

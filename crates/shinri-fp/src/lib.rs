@@ -130,6 +130,13 @@ impl FpBlaster {
                         let yw = self.blast_word(ctx, kids[1]);
                         crate::blast::minmax::fp_max(&mut self.b, &xw, &yw, eb, sb)
                     }
+                    FpFma => {
+                        let rm = self.blast_rm(ctx, kids[0]);
+                        let xw = self.blast_word(ctx, kids[1]);
+                        let yw = self.blast_word(ctx, kids[2]);
+                        let zw = self.blast_word(ctx, kids[3]);
+                        crate::blast::fma::fp_fma(&mut self.b, &xw, &yw, &zw, &rm, eb, sb)
+                    }
                     other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
                 }
             }
