@@ -4,6 +4,7 @@
 
 pub mod blast;
 pub mod convert;
+pub mod lower;
 pub mod lzc;
 pub mod model;
 pub mod pack;
