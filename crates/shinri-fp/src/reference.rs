@@ -366,6 +366,23 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
     pack(sign, biased, trailing)
 }
 
+/// Exact-rational golden `((_ to_fp eb_t sb_t) mode x)` for an FP source `x` of
+/// format (eb_s, sb_s). Specials map by table; finite values round the exact
+/// rational into the target under `mode`. Trusted reference for `convert::to_fp_fp`.
+pub fn ref_to_fp_fp(eb_s: u32, sb_s: u32, eb_t: u32, sb_t: u32, x: &Integer, mode: RoundMode)
+    -> Integer {
+    let c = decode(eb_s, sb_s, x);
+    match c {
+        FpClass::Nan => canonical_nan(eb_t, sb_t),
+        FpClass::Inf { sign } => inf_pattern(eb_t, sb_t, sign),
+        FpClass::Zero { sign } => zero_pattern(eb_t, sb_t, sign),
+        _ => {
+            let q = class_to_rational(eb_s, sb_s, &c).unwrap(); // finite: always Some
+            round_rational(eb_t, sb_t, &q, mode)
+        }
+    }
+}
+
 /// Canonical quiet-NaN bit pattern for (eb, sb): exp all ones, sig MSB set, sign 0.
 pub fn canonical_nan(eb: u32, sb: u32) -> Integer {
     let two = Integer::from(2u64);
@@ -1048,6 +1065,48 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn ref_to_fp_fp_widen_and_narrow() {
+        use RoundMode::Rne;
+        // widen 1.0 f32 -> f64 : exact.
+        assert_eq!(
+            ref_to_fp_fp(8, 24, 11, 53, &Integer::from(0x3F80_0000u64), Rne),
+            Integer::from(0x3FF0_0000_0000_0000u64));
+        // narrow 1.0 f64 -> f32 : exact.
+        assert_eq!(
+            ref_to_fp_fp(11, 53, 8, 24, &Integer::from(0x3FF0_0000_0000_0000u64), Rne),
+            Integer::from(0x3F80_0000u64));
+        // narrow 1/3 f64 -> f32 : round to nearest -> 0x3EAA_AAAB.
+        let third_f64 = round_rational(11, 53, &Rational::new(1i128.into(), 3i128.into()), Rne);
+        assert_eq!(
+            ref_to_fp_fp(11, 53, 8, 24, &third_f64, Rne),
+            Integer::from(0x3EAA_AAABu64));
+    }
+
+    #[test]
+    fn ref_to_fp_fp_specials() {
+        use RoundMode::Rne;
+        // NaN f64 -> canonical NaN f32.
+        assert_eq!(
+            ref_to_fp_fp(11, 53, 8, 24, &Integer::from(0x7FF8_0000_0000_0000u64), Rne),
+            canonical_nan(8, 24));
+        // +inf f64 -> +inf f32.
+        assert_eq!(
+            ref_to_fp_fp(11, 53, 8, 24, &Integer::from(0x7FF0_0000_0000_0000u64), Rne),
+            inf_pattern(8, 24, false));
+        // -0 f64 -> -0 f32 (sign preserved).
+        assert_eq!(
+            ref_to_fp_fp(11, 53, 8, 24, &Integer::from(0x8000_0000_0000_0000u64), Rne),
+            zero_pattern(8, 24, true));
+        // overflow: max-normal f32 widened is exact, but a huge f64 narrowed to f16
+        // overflows -> +inf. 2.0^100 in f64 = exponent 1123 biased = 0x4630…; -> f16 inf.
+        let big = round_rational(11, 53, &{
+            let mut acc = Integer::one(); for _ in 0..100 { acc = acc * Integer::from(2u64); }
+            Rational::new(acc, Integer::one())
+        }, Rne);
+        assert_eq!(ref_to_fp_fp(11, 53, 5, 11, &big, Rne), inf_pattern(5, 11, false));
     }
 }
 
