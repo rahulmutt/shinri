@@ -189,16 +189,41 @@ pub fn blast_fp_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
                     let yw = sink.word(ctx, kids[1]);
                     crate::blast::rem::fp_rem(sink.blaster(), &xw, &yw, eb, sb)
                 }
+                FpFromBits => {
+                    // (fp sign exp sig): assemble the FP word from three BV children.
+                    // Pure wiring — LSB-first significand ++ exponent ++ sign. Each
+                    // child is BV-sorted and routes to `blast_bv_word` via the
+                    // sort-dispatched sink (const children → constant bit-lits,
+                    // symbolic → fresh vars). Widths (1, eb, sb-1) are guaranteed by
+                    // the parser's FpFromBits sort check, so the concat is exactly
+                    // eb+sb bits. Requires the unified `Lowerer` sink (the pure-FP
+                    // `FpBlaster` cannot blast BV children — crossing ops are only
+                    // reached via `lower_mixed`/`lower`, both `Lowerer`-backed).
+                    let sign = sink.word(ctx, kids[0]);
+                    let exp = sink.word(ctx, kids[1]);
+                    let sig = sink.word(ctx, kids[2]);
+                    let mut out = sig;
+                    out.extend(exp);
+                    out.extend(sign);
+                    out
+                }
                 ToFp { .. } => {
-                    // Non-BV faces only (fence guarantees this): 2 args (RM, X), X = Float | const Real.
-                    // `eb`/`sb` here are the outer target widths (result sort); source is X's sort.
-                    let rm = blast_rm(sink, ctx, kids[0]);
-                    if let Some(q) = ctx.const_real_value(kids[1]) {
-                        crate::convert::to_fp_real_const(sink.blaster(), &q, eb, sb, &rm)
+                    if kids.len() == 1 {
+                        // 1-arg bitcast: a single BV of width eb+sb reinterpreted as
+                        // the IEEE bit pattern. Same LSB-first layout on both sides,
+                        // so the BV word IS the FP word — passthrough.
+                        sink.word(ctx, kids[0])
                     } else {
-                        let (eb_s, sb_s) = ctx.fp_widths(ctx.sort_of(kids[1])).expect("FP source operand");
-                        let xw = sink.word(ctx, kids[1]);
-                        crate::convert::to_fp_fp(sink.blaster(), &xw, eb_s, sb_s, eb, sb, &rm)
+                        // 2-arg (RM, X), X = Float (FP→FP re-round) | const Real (fold).
+                        // BV / symbolic-Real sources stay fenced (later slices).
+                        let rm = blast_rm(sink, ctx, kids[0]);
+                        if let Some(q) = ctx.const_real_value(kids[1]) {
+                            crate::convert::to_fp_real_const(sink.blaster(), &q, eb, sb, &rm)
+                        } else {
+                            let (eb_s, sb_s) = ctx.fp_widths(ctx.sort_of(kids[1])).expect("FP source operand");
+                            let xw = sink.word(ctx, kids[1]);
+                            crate::convert::to_fp_fp(sink.blaster(), &xw, eb_s, sb_s, eb, sb, &rm)
+                        }
                     }
                 }
                 other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
@@ -317,6 +342,48 @@ mod lower_tests {
     use super::*;
     use shinri_core::{BuiltinOp, Context, Op};
     use shinri_num::Integer;
+    use crate::lower::Lowerer;
+
+    #[test]
+    fn fp_from_bits_wires_children_lsb_first() {
+        let mut ctx = Context::new();
+        let bv1 = ctx.bv_sort(1);
+        let bv8 = ctx.bv_sort(8);
+        let bv23 = ctx.bv_sort(23);
+        let sf = ctx.declare_fun("s", &[], bv1);
+        let ef = ctx.declare_fun("e", &[], bv8);
+        let mf = ctx.declare_fun("m", &[], bv23);
+        let s = ctx.mk_app(Op::Uninterpreted(sf), &[]).unwrap();
+        let e = ctx.mk_app(Op::Uninterpreted(ef), &[]).unwrap();
+        let m = ctx.mk_app(Op::Uninterpreted(mf), &[]).unwrap();
+        let fp = ctx.mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[s, e, m]).unwrap();
+
+        let mut lw = Lowerer::new();
+        let sw = lw.word(&ctx, s);
+        let ew = lw.word(&ctx, e);
+        let mw = lw.word(&ctx, m);
+        let fw = lw.word(&ctx, fp);
+
+        assert_eq!(fw.len(), 32, "FpFromBits result is eb+sb bits");
+        // LSB-first packing: significand (23) ++ exponent (8) ++ sign (1).
+        let expect: Vec<_> = mw.iter().chain(ew.iter()).chain(sw.iter()).copied().collect();
+        assert_eq!(fw, expect, "children wired sig ++ exp ++ sign, LSB-first");
+    }
+
+    #[test]
+    fn to_fp_1arg_bitcast_is_identity() {
+        let mut ctx = Context::new();
+        let bv32 = ctx.bv_sort(32);
+        let bf = ctx.declare_fun("b", &[], bv32);
+        let b = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
+        let cast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b]).unwrap();
+
+        let mut lw = Lowerer::new();
+        let bw = lw.word(&ctx, b);
+        let fw = lw.word(&ctx, cast);
+
+        assert_eq!(fw, bw, "1-arg to_fp reinterprets the same bits verbatim");
+    }
 
     #[test]
     fn wordsink_generic_matches_inherent_fp_isnan() {
