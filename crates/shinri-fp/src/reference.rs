@@ -1103,7 +1103,7 @@ mod tests {
         // overflow: max-normal f32 widened is exact, but a huge f64 narrowed to f16
         // overflows -> +inf. 2.0^100 in f64 = exponent 1123 biased = 0x4630…; -> f16 inf.
         let big = round_rational(11, 53, &{
-            let mut acc = Integer::one(); for _ in 0..100 { acc = acc * Integer::from(2u64); }
+            let mut acc = Integer::one(); for _ in 0..100 { acc *= Integer::from(2u64); }
             Rational::new(acc, Integer::one())
         }, Rne);
         assert_eq!(ref_to_fp_fp(11, 53, 5, 11, &big, Rne), inf_pattern(5, 11, false));
