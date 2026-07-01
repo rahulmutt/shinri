@@ -1,7 +1,7 @@
 # shinri QF_FP — Slice 4b: Mixed BV+FP Fence-Lift Design
 
 **Date:** 2026-07-01
-**Status:** Draft
+**Status:** Landed 2026-07-01 — mixed BV+FP fence lifted; crossing conversions still fenced.
 **Parent:** `2026-06-24-shinri-qffp-design.md` (Plan 4, "QF_BVFP unification")
 **Predecessor:** `2026-07-01-shinri-qffp-slice4a-bvfp-unification-design.md` (slice 4a landed)
 
