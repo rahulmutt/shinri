@@ -54,12 +54,14 @@ pub fn solver_uses_fp(ctx: &Context, assertions: &[TermId]) -> bool {
 /// later slices delete an entry here as each conversion is admitted.
 ///
 /// Crossing set:
-/// - `FpFromBits`, `FpToUbv`, `FpToSbv`, `ToFpUnsigned` — always crossing.
+/// - `FpToUbv`, `FpToSbv`, `ToFpUnsigned` — always crossing.
 /// - `FpToReal` — the permanent Real bridge (v1 non-goal).
-/// - `ToFp` — crossing ONLY in its 1-arg BV bitcast, signed-BV-source, or
-///   symbolic-Real faces. The 3a-supported FP→FP and constant-Real faces are
-///   NOT crossing (a Float-sorted operand, or a Real operand with a known
-///   `const_real_value`).
+/// - `ToFp` — crossing ONLY in its signed-BV-source or symbolic-Real faces.
+///   The 3a-supported FP→FP and constant-Real faces, and the 4c-supported
+///   1-arg BV bitcast face, are NOT crossing.
+///
+/// `FpFromBits` (the `fp` sign/exp/sig constructor from BV words) is also
+/// NOT crossing — admitted in slice 4c alongside the 1-arg `to_fp` bitcast.
 pub fn uses_crossing_conversion(ctx: &Context, assertions: &[TermId]) -> bool {
     let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
     fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
@@ -69,13 +71,12 @@ pub fn uses_crossing_conversion(ctx: &Context, assertions: &[TermId]) -> bool {
         if let TermNode::App { op, args, .. } = ctx.term_node(t) {
             let kids: Vec<TermId> = ctx.children(*args).to_vec();
             let is_crossing = match op {
-                Op::Builtin(BuiltinOp::FpFromBits)
-                | Op::Builtin(BuiltinOp::FpToUbv(_))
+                Op::Builtin(BuiltinOp::FpToUbv(_))
                 | Op::Builtin(BuiltinOp::FpToSbv(_))
                 | Op::Builtin(BuiltinOp::ToFpUnsigned { .. })
                 | Op::Builtin(BuiltinOp::FpToReal) => true,
                 Op::Builtin(BuiltinOp::ToFp { .. }) => match kids.len() {
-                    1 => true, // 1-arg BV bitcast
+                    1 => false, // 1-arg BV bitcast — admitted in slice 4c
                     2 => match ctx.sort_node(ctx.sort_of(kids[1])) {
                         SortNode::BitVec(_) => true, // signed-BV → FP
                         // symbolic Real is crossing; a constant Real is 3a-supported.
@@ -249,18 +250,34 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                 && is_supported_fp_word(ctx, kids[0])
                 && is_supported_fp_word(ctx, kids[1])
         }
-        // to_fp: (RM, X). Non-BV faces only — X is a supported FP word (FP->FP re-round)
-        // or a constant Real (fold). BV operand / 1-arg bitcast / symbolic Real stay
-        // unsupported (Plan 4+ / later Real combination). Fence and folder share
-        // Context::const_real_value so the admit-set is identical (soundness).
+        // to_fp: 1-arg (X) or 2-arg (RM, X). The 1-arg face is the BV bitcast
+        // (slice 4c): a single BV-sorted source. The 2-arg non-BV faces are the
+        // 3a-supported FP->FP re-round (X is a supported FP word) or constant-Real
+        // fold. 2-arg BV-source / symbolic Real stay unsupported (Plan 4+ / later
+        // Real combination). Fence and folder share Context::const_real_value so
+        // the admit-set is identical (soundness).
         TermNode::App { op: Op::Builtin(BuiltinOp::ToFp { .. }), args, .. } => {
             let kids = ctx.children(*args).to_vec();
-            kids.len() == 2
-                && is_rounding_mode_term(ctx, kids[0])
-                && (is_supported_fp_word(ctx, kids[1]) || ctx.const_real_value(kids[1]).is_some())
+            match kids.len() {
+                // 1-arg BV bitcast: single BV-sorted source (slice 4c).
+                1 => matches!(ctx.sort_node(ctx.sort_of(kids[0])), SortNode::BitVec(_)),
+                // 2-arg non-BV faces: FP→FP re-round or constant-Real fold (3a).
+                2 => is_rounding_mode_term(ctx, kids[0])
+                    && (is_supported_fp_word(ctx, kids[1]) || ctx.const_real_value(kids[1]).is_some()),
+                _ => false,
+            }
+        }
+        // fp constructor (fp sign exp sig): three BV-sorted children. The BV
+        // blaster is total, and any still-crossing op nested in a child is caught
+        // by `uses_crossing_conversion` before lowering — so a BV-sort check on
+        // the children suffices (no recursive FP-support call).
+        TermNode::App { op: Op::Builtin(BuiltinOp::FpFromBits), args, .. } => {
+            let kids = ctx.children(*args).to_vec();
+            kids.len() == 3
+                && kids.iter().all(|&k| matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::BitVec(_)))
         }
         // Anything else (Ite over FP, non-nullary UF, BV-crossing conversions, symbolic-Real
-        // to_fp, fp.to_real, etc.) is not in scope for slices 1–3a.
+        // to_fp, fp.to_real, etc.) is not in scope for slices 1–3a/4c.
         _ => false,
     }
 }
@@ -504,6 +521,59 @@ mod tests {
     }
 
     #[test]
+    fn bitcast_ops_are_not_crossing_but_others_still_are() {
+        let mut ctx = Context::new();
+        let bv1 = ctx.bv_sort(1);
+        let bv8 = ctx.bv_sort(8);
+        let bv23 = ctx.bv_sort(23);
+        let bv32 = ctx.bv_sort(32);
+        let mk = |ctx: &mut Context, s| {
+            let f = ctx.declare_fun("v", &[], s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let s = mk(&mut ctx, bv1);
+        let e = mk(&mut ctx, bv8);
+        let m = mk(&mut ctx, bv23);
+        let fp_from_bits = ctx.mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[s, e, m]).unwrap();
+        let b32 = mk(&mut ctx, bv32);
+        let bitcast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32]).unwrap();
+
+        // Newly admitted — NOT crossing.
+        assert!(!super::uses_crossing_conversion(&ctx, &[fp_from_bits]), "FpFromBits admitted");
+        assert!(!super::uses_crossing_conversion(&ctx, &[bitcast]), "1-arg to_fp admitted");
+
+        // Still crossing: fp.to_sbv over an FP var.
+        let x = fp_var(&mut ctx, "x");
+        let rm_s = ctx.rm_sort();
+        let rmf = ctx.declare_fun("rm", &[], rm_s);
+        let rm = ctx.mk_app(Op::Uninterpreted(rmf), &[]).unwrap();
+        let to_sbv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(32)), &[rm, x]).unwrap();
+        assert!(super::uses_crossing_conversion(&ctx, &[to_sbv]), "fp.to_sbv still crossing");
+    }
+
+    #[test]
+    fn is_supported_fp_word_admits_bitcast() {
+        let mut ctx = Context::new();
+        let bv1 = ctx.bv_sort(1);
+        let bv8 = ctx.bv_sort(8);
+        let bv23 = ctx.bv_sort(23);
+        let bv32 = ctx.bv_sort(32);
+        let mk = |ctx: &mut Context, s| {
+            let f = ctx.declare_fun("v", &[], s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let s = mk(&mut ctx, bv1);
+        let e = mk(&mut ctx, bv8);
+        let m = mk(&mut ctx, bv23);
+        let fp_from_bits = ctx.mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[s, e, m]).unwrap();
+        let b32 = mk(&mut ctx, bv32);
+        let bitcast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32]).unwrap();
+
+        assert!(super::is_supported_fp_word(&ctx, fp_from_bits), "FpFromBits word supported");
+        assert!(super::is_supported_fp_word(&ctx, bitcast), "1-arg to_fp word supported");
+    }
+
+    #[test]
     fn crossing_conversions_detected_supported_faces_not() {
         use shinri_num::Rational;
         let mut ctx = Context::new();
@@ -521,9 +591,9 @@ mod tests {
         // to_fp from BV (2-arg, BV source) → crossing.
         let from_bv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
         assert!(uses_crossing_conversion(&ctx, &[from_bv]), "to_fp from BV is crossing");
-        // 1-arg BV bitcast to_fp (width 32 == eb+sb) → crossing.
+        // 1-arg BV bitcast to_fp (width 32 == eb+sb) → NOT crossing (admitted in slice 4c).
         let bitcast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[bv]).unwrap();
-        assert!(uses_crossing_conversion(&ctx, &[bitcast]), "1-arg bitcast to_fp is crossing");
+        assert!(!uses_crossing_conversion(&ctx, &[bitcast]), "1-arg bitcast to_fp admitted (slice 4c)");
         // to_fp_unsigned → crossing.
         let uns = ctx.mk_app(Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
         assert!(uses_crossing_conversion(&ctx, &[uns]), "to_fp_unsigned is crossing");
