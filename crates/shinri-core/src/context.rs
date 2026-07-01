@@ -751,6 +751,25 @@ impl Context {
         }
     }
 
+    /// The exact `Rational` of a **constant** Real term — a numeral (literals and
+    /// parser-folded `(/ lit lit)` both intern as numerals) or a unary `(- c)` of a
+    /// constant Real — or `None` if `t` is symbolic (a Real variable, `(* recip x)`,
+    /// nested arithmetic). SHARED by the FP `to_fp` fence (shinri-solver) and folder
+    /// (shinri-fp) so they admit exactly the same set — a soundness invariant.
+    pub fn const_real_value(&self, t: TermId) -> Option<Rational> {
+        if let Some(r) = self.numeral_value(t) {
+            return Some(r.clone());
+        }
+        if let TermNode::App { op: Op::Builtin(BuiltinOp::Neg), args, .. } = self.term_node(t) {
+            let kids = self.children(*args);
+            if kids.len() == 1 {
+                let inner = self.const_real_value(kids[0])?;
+                return Some(Rational::new(Integer::from(-1i64), Integer::one()) * inner);
+            }
+        }
+        None
+    }
+
     /// Intern a bitvector literal. `value` is reduced mod 2^width into `[0, 2^width)`.
     pub fn mk_bv_const(&mut self, width: u32, value: Integer) -> TermId {
         let reduced = reduce_mod_pow2(&value, width);
@@ -1350,6 +1369,38 @@ mod tests {
         // boundary: eb<2 must error even if bitcast width eb+sb matches (eb=1,sb=1 -> BV2)
         let b2 = ctx.mk_bv_const(2, Integer::zero());
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 1, sb: 1 }), &[b2]).is_err());
+    }
+
+    #[test]
+    fn const_real_value_folds_literals_and_neg() {
+        use shinri_num::Rational;
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        // plain numeral 5/1
+        let five = ctx.mk_numeral(Rational::from_int(5i128.into()), real);
+        assert_eq!(ctx.const_real_value(five), Some(Rational::from_int(5i128.into())));
+        // parser already folds (/ 1 3) to a single numeral; emulate that numeral 1/3
+        let third = ctx.mk_numeral(Rational::new(1i128.into(), 3i128.into()), real);
+        assert_eq!(ctx.const_real_value(third), Some(Rational::new(1i128.into(), 3i128.into())));
+        // unary negation (- 5/2) -> -5/2
+        let fivehalf = ctx.mk_numeral(Rational::new(5i128.into(), 2i128.into()), real);
+        let neg = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[fivehalf]).unwrap();
+        assert_eq!(ctx.const_real_value(neg),
+                   Some(Rational::new((-5i128).into(), 2i128.into())));
+    }
+
+    #[test]
+    fn const_real_value_rejects_symbolic() {
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        // a Real variable is not constant
+        let r = ctx.declare_fun("r", &[], real);
+        let rt = ctx.mk_app(Op::Uninterpreted(r), &[]).unwrap();
+        assert_eq!(ctx.const_real_value(rt), None);
+        // (* recip r) — the shape (/ 1 r) desugars to — is not constant
+        let recip = ctx.mk_numeral(shinri_num::Rational::new(1i128.into(), 2i128.into()), real);
+        let prod = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &[recip, rt]).unwrap();
+        assert_eq!(ctx.const_real_value(prod), None);
     }
 
     // helper local to the test module
