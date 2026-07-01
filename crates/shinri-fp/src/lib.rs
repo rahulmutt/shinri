@@ -272,20 +272,44 @@ pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
     }
 }
 
-/// Blast all `fp_atoms` via the unified `Lowerer` and return a `shinri_bv::Lowered`
-/// (reused so the solver's `replay_bv_cnf` applies unchanged). `atom_lit` is
-/// keyed by the ORIGINAL atom TermId.
-pub fn lower(ctx: &mut Context, fp_atoms: &[TermId]) -> shinri_bv::Lowered {
+/// Blast FP atoms AND BV atoms through ONE unified `Lowerer` (shared `Blaster`
+/// + cache) and return a `shinri_bv::Lowered` (reused so the solver's
+/// `replay_bv_cnf` applies unchanged). `var_bits` carries BOTH theories'
+/// variable words — the solver splits them by sort for model read-back. BV
+/// atoms are rewritten first (matching `shinri_bv::lower`); FP atoms are not
+/// (matching the pre-4b `shinri_fp::lower`). `atom_lit` is keyed by each
+/// ORIGINAL atom TermId. Without a crossing conversion the BV and FP DAGs are
+/// disjoint, so this is two independent blasting problems over one namespace.
+pub fn lower_mixed(
+    ctx: &mut Context,
+    fp_atoms: &[TermId],
+    bv_atoms: &[TermId],
+) -> shinri_bv::Lowered {
     let mut lw = crate::lower::Lowerer::new();
     let mut atom_lit: FxHashMap<TermId, BitLit> = FxHashMap::default();
+    // BV atoms FIRST (rewritten, as the pure-BV path does), keyed by ORIGINAL id.
+    for &original in bv_atoms {
+        let rewritten = shinri_bv::rewrite(ctx, original);
+        let lit = lw.atom(ctx, rewritten);
+        atom_lit.insert(original, lit);
+    }
+    // FP atoms next (no rewrite, as the pure-FP path does).
     for &atom in fp_atoms {
         let lit = lw.atom(ctx, atom);
         atom_lit.insert(atom, lit);
     }
-    // Pure-FP list: bv side is empty; take the FP map into Lowered.var_bits.
-    let (_bv_vars, fp_vars) = lw.var_bits_split(ctx);
-    debug_assert!(_bv_vars.is_empty(), "pure-FP lower produced no BV vars");
-    shinri_bv::Lowered { cnf: lw.b.finish(), atom_lit, var_bits: fp_vars }
+    // One shared cache: union both sort-split var maps into Lowered.var_bits.
+    let (bv_vars, fp_vars) = lw.var_bits_split(ctx);
+    let mut var_bits = bv_vars;
+    var_bits.extend(fp_vars);
+    shinri_bv::Lowered { cnf: lw.b.finish(), atom_lit, var_bits }
+}
+
+/// Pure-FP lowering: `lower_mixed` with no BV atoms. Byte-identical to the
+/// pre-4b pure-FP path — the BV set is empty, so `var_bits` is FP-only and the
+/// blast order (FP atoms, in order) is unchanged.
+pub fn lower(ctx: &mut Context, fp_atoms: &[TermId]) -> shinri_bv::Lowered {
+    lower_mixed(ctx, fp_atoms, &[])
 }
 
 #[cfg(test)]
@@ -433,6 +457,30 @@ mod lower_tests {
         let lo = lower(&mut ctx, &[eq1, eq2]);
         assert!(lo.atom_lit.contains_key(&eq1), "core = over to_fp FP->FP must be surrogated");
         assert!(lo.atom_lit.contains_key(&eq2), "fp.eq over const-Real to_fp must be surrogated");
+    }
+
+    #[test]
+    fn lower_mixed_blasts_bv_and_fp_and_unions_vars() {
+        let mut ctx = Context::new();
+        // BV atom: (= x #x05) over an 8-bit var.
+        let s8 = ctx.bv_sort(8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let five = ctx.mk_bv_const(8, Integer::from(5u64));
+        let bv_eq = ctx.mk_eq(x, five).unwrap();
+        // FP atom: (fp.isNaN y) over a Float32 var.
+        let f32 = ctx.fp_sort(8, 24);
+        let yf = ctx.declare_fun("y", &[], f32);
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[y]).unwrap();
+
+        let l = lower_mixed(&mut ctx, &[isnan], &[bv_eq]);
+        // Both atoms are surrogated.
+        assert!(l.atom_lit.contains_key(&bv_eq), "BV atom surrogated");
+        assert!(l.atom_lit.contains_key(&isnan), "FP atom surrogated");
+        // var_bits holds BOTH the 8-bit BV var and the 32-bit FP var.
+        assert!(l.var_bits.contains_key(&x) && l.var_bits[&x].len() == 8, "BV var word present");
+        assert!(l.var_bits.contains_key(&y) && l.var_bits[&y].len() == 32, "FP var word present");
     }
 }
 
