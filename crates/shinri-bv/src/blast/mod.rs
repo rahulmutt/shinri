@@ -43,6 +43,15 @@ impl Default for Blaster {
     }
 }
 
+/// The one recursion + cache seam shared by BV and FP lowering. Implemented by
+/// the concrete driver (a `Blaster` for pure-BV, or shinri-fp's `Lowerer` for
+/// the unified path). `word` dispatches a child of ANY sort and memoizes it;
+/// `blaster` is the single gate/clause factory + variable namespace.
+pub trait WordSink {
+    fn word(&mut self, ctx: &Context, t: TermId) -> Vec<BitLit>;
+    fn blaster(&mut self) -> &mut Blaster;
+}
+
 impl Blaster {
     pub fn new() -> Blaster {
         // var 0 is the pinned-true constant.
@@ -168,191 +177,7 @@ impl Blaster {
     /// Recursively bit-blast a BitVec-sorted term. Result is memoized in `self.cache`.
     /// Bits are ordered LSB→MSB (index 0 = least significant).
     pub fn blast_word(&mut self, ctx: &Context, t: TermId) -> Vec<BitLit> {
-        if let Some(v) = self.cache.get(&t) {
-            return v.clone();
-        }
-        let node = ctx.term_node(t).clone();
-        let result = match node {
-            TermNode::Const {
-                val: ConstVal::BitVec(_),
-                ..
-            } => {
-                let (width, value_ref) = ctx.bv_const_value(t).unwrap();
-                let mut remaining = value_ref.clone();
-                let two = shinri_num::Integer::from(2u64);
-                (0..width)
-                    .map(|_| {
-                        let (q, r) = remaining.div_rem(&two);
-                        remaining = q;
-                        if r.is_zero() {
-                            self.zero()
-                        } else {
-                            self.one()
-                        }
-                    })
-                    .collect()
-            }
-            TermNode::App {
-                op: Op::Uninterpreted(_),
-                args,
-                sort,
-            } => {
-                let child_ids = ctx.children(args).to_vec();
-                debug_assert!(
-                    child_ids.is_empty(),
-                    "non-nullary uninterpreted BV fn out of scope"
-                );
-                let width = ctx.bv_width(sort).expect("BV-sorted variable has BV sort");
-                (0..width).map(|_| self.fresh()).collect()
-            }
-            TermNode::App {
-                op: Op::Builtin(bv_op),
-                args,
-                ..
-            } => {
-                let child_ids = ctx.children(args).to_vec();
-                match bv_op {
-                    BuiltinOp::BvNot => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        bitwise::bvnot(self, &a)
-                    }
-                    BuiltinOp::BvAnd => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        bitwise::bvand(self, &a, &b)
-                    }
-                    BuiltinOp::BvOr => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        bitwise::bvor(self, &a, &b)
-                    }
-                    BuiltinOp::BvXor => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        bitwise::bvxor(self, &a, &b)
-                    }
-                    BuiltinOp::BvNand => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        bitwise::bvnand(self, &a, &b)
-                    }
-                    BuiltinOp::BvNor => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        bitwise::bvnor(self, &a, &b)
-                    }
-                    BuiltinOp::BvXnor => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        bitwise::bvxnor(self, &a, &b)
-                    }
-                    BuiltinOp::BvNeg => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        arith::bvneg(self, &a)
-                    }
-                    BuiltinOp::BvAdd => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        arith::bvadd(self, &a, &b)
-                    }
-                    BuiltinOp::BvSub => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        arith::bvsub(self, &a, &b)
-                    }
-                    BuiltinOp::BvMul => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        arith::bvmul(self, &a, &b)
-                    }
-                    BuiltinOp::BvUdiv => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        div::bvudiv(self, &a, &b)
-                    }
-                    BuiltinOp::BvUrem => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        div::bvurem(self, &a, &b)
-                    }
-                    BuiltinOp::BvSdiv => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        div::bvsdiv(self, &a, &b)
-                    }
-                    BuiltinOp::BvSrem => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        div::bvsrem(self, &a, &b)
-                    }
-                    BuiltinOp::BvSmod => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        div::bvsmod(self, &a, &b)
-                    }
-                    BuiltinOp::BvShl => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        shift::bvshl(self, &a, &b)
-                    }
-                    BuiltinOp::BvLshr => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        shift::bvlshr(self, &a, &b)
-                    }
-                    BuiltinOp::BvAshr => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        let b = self.blast_word(ctx, child_ids[1]);
-                        shift::bvashr(self, &a, &b)
-                    }
-                    BuiltinOp::BvConcat => {
-                        // SMT-LIB concat(a, b): a is the HIGH bits, b is the LOW bits.
-                        let hi = self.blast_word(ctx, child_ids[0]);
-                        let lo = self.blast_word(ctx, child_ids[1]);
-                        structural::concat(&hi, &lo)
-                    }
-                    BuiltinOp::BvExtract { hi, lo } => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        structural::extract(&a, hi, lo)
-                    }
-                    BuiltinOp::BvZeroExtend(k) => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        structural::zero_extend(&a, k, self)
-                    }
-                    BuiltinOp::BvSignExtend(k) => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        structural::sign_extend(&a, k)
-                    }
-                    BuiltinOp::BvRotateLeft(k) => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        shift::rotate_left(&a, k)
-                    }
-                    BuiltinOp::BvRotateRight(k) => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        shift::rotate_right(&a, k)
-                    }
-                    BuiltinOp::BvRepeat(k) => {
-                        let a = self.blast_word(ctx, child_ids[0]);
-                        structural::repeat(&a, k)
-                    }
-                    // Comparison ops are Bool-sorted — must not reach blast_word.
-                    BuiltinOp::BvUlt
-                    | BuiltinOp::BvUle
-                    | BuiltinOp::BvUgt
-                    | BuiltinOp::BvUge
-                    | BuiltinOp::BvSlt
-                    | BuiltinOp::BvSle
-                    | BuiltinOp::BvSgt
-                    | BuiltinOp::BvSge => {
-                        unreachable!("BV comparison op is Bool-sorted; use blast_atom instead");
-                    }
-                    _ => unreachable!("non-BV builtin reached blast_word"),
-                }
-            }
-            _ => unreachable!("blast_word called on non-BV term"),
-        };
-        self.cache.insert(t, result.clone());
-        result
+        <Self as WordSink>::word(self, ctx, t)
     }
 
     /// Return the bits cached for every BV *variable* term: nullary `Op::Uninterpreted`
@@ -377,52 +202,260 @@ impl Blaster {
     /// Bit-blast a Bool-sorted BV predicate, returning a single `BitLit`.
     /// Handles: `Eq`/`Distinct` over BV operands, and all `BvUlt..BvSge` ops.
     pub fn blast_atom(&mut self, ctx: &Context, t: TermId) -> BitLit {
-        let node = ctx.term_node(t).clone();
-        match node {
-            TermNode::App {
-                op: Op::Builtin(BuiltinOp::Eq),
-                args,
-                ..
-            } => {
-                let child_ids = ctx.children(args).to_vec();
-                let a = self.blast_word(ctx, child_ids[0]);
-                let b = self.blast_word(ctx, child_ids[1]);
-                compare::eq(self, &a, &b)
-            }
-            TermNode::App {
-                op: Op::Builtin(BuiltinOp::Distinct),
-                args,
-                ..
-            } => {
-                let child_ids = ctx.children(args).to_vec();
-                // Assume binary Distinct (n-ary is lowered before this stage).
-                let a = self.blast_word(ctx, child_ids[0]);
-                let b = self.blast_word(ctx, child_ids[1]);
-                let eq_lit = compare::eq(self, &a, &b);
-                self.not1(eq_lit)
-            }
-            TermNode::App {
-                op: Op::Builtin(bv_cmp),
-                args,
-                ..
-            } => {
-                let child_ids = ctx.children(args).to_vec();
-                let a = self.blast_word(ctx, child_ids[0]);
-                let b = self.blast_word(ctx, child_ids[1]);
-                match bv_cmp {
-                    BuiltinOp::BvUlt => compare::ult(self, &a, &b),
-                    BuiltinOp::BvUle => compare::ule(self, &a, &b),
-                    BuiltinOp::BvUgt => compare::ugt(self, &a, &b),
-                    BuiltinOp::BvUge => compare::uge(self, &a, &b),
-                    BuiltinOp::BvSlt => compare::slt(self, &a, &b),
-                    BuiltinOp::BvSle => compare::sle(self, &a, &b),
-                    BuiltinOp::BvSgt => compare::sgt(self, &a, &b),
-                    BuiltinOp::BvSge => compare::sge(self, &a, &b),
-                    _ => panic!("blast_atom called on non-predicate builtin"),
-                }
-            }
-            _ => panic!("blast_atom called on non-predicate term"),
+        blast_bv_atom(self, ctx, t)
+    }
+}
+
+impl WordSink for Blaster {
+    fn word(&mut self, ctx: &Context, t: TermId) -> Vec<BitLit> {
+        if let Some(v) = self.cache.get(&t) {
+            return v.clone();
         }
+        let bits = blast_bv_word(self, ctx, t);
+        self.cache.insert(t, bits.clone());
+        bits
+    }
+    fn blaster(&mut self) -> &mut Blaster {
+        self
+    }
+}
+
+/// BV word dispatch, generic over the sink. Assumes `t` is BV-sorted; callers
+/// (the sink's `word`) pre-classify by sort. Recurses via `sink.word`, mints
+/// gates via `sink.blaster()`. Does NOT touch the cache — the sink's `word` owns
+/// memoization.
+pub fn blast_bv_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec<BitLit> {
+    let node = ctx.term_node(t).clone();
+    match node {
+        TermNode::Const {
+            val: ConstVal::BitVec(_),
+            ..
+        } => {
+            let (width, value_ref) = ctx.bv_const_value(t).unwrap();
+            let mut remaining = value_ref.clone();
+            let two = shinri_num::Integer::from(2u64);
+            (0..width)
+                .map(|_| {
+                    let (q, r) = remaining.div_rem(&two);
+                    remaining = q;
+                    if r.is_zero() {
+                        sink.blaster().zero()
+                    } else {
+                        sink.blaster().one()
+                    }
+                })
+                .collect()
+        }
+        TermNode::App {
+            op: Op::Uninterpreted(_),
+            args,
+            sort,
+        } => {
+            let child_ids = ctx.children(args).to_vec();
+            debug_assert!(
+                child_ids.is_empty(),
+                "non-nullary uninterpreted BV fn out of scope"
+            );
+            let width = ctx.bv_width(sort).expect("BV-sorted variable has BV sort");
+            (0..width).map(|_| sink.blaster().fresh()).collect()
+        }
+        TermNode::App {
+            op: Op::Builtin(bv_op),
+            args,
+            ..
+        } => {
+            let child_ids = ctx.children(args).to_vec();
+            match bv_op {
+                BuiltinOp::BvNot => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    bitwise::bvnot(sink.blaster(), &a)
+                }
+                BuiltinOp::BvAnd => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    bitwise::bvand(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvOr => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    bitwise::bvor(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvXor => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    bitwise::bvxor(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvNand => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    bitwise::bvnand(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvNor => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    bitwise::bvnor(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvXnor => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    bitwise::bvxnor(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvNeg => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    arith::bvneg(sink.blaster(), &a)
+                }
+                BuiltinOp::BvAdd => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    arith::bvadd(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvSub => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    arith::bvsub(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvMul => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    arith::bvmul(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvUdiv => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    div::bvudiv(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvUrem => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    div::bvurem(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvSdiv => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    div::bvsdiv(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvSrem => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    div::bvsrem(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvSmod => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    div::bvsmod(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvShl => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    shift::bvshl(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvLshr => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    shift::bvlshr(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvAshr => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    let b = sink.word(ctx, child_ids[1]);
+                    shift::bvashr(sink.blaster(), &a, &b)
+                }
+                BuiltinOp::BvConcat => {
+                    // SMT-LIB concat(a, b): a is the HIGH bits, b is the LOW bits.
+                    let hi = sink.word(ctx, child_ids[0]);
+                    let lo = sink.word(ctx, child_ids[1]);
+                    structural::concat(&hi, &lo)
+                }
+                BuiltinOp::BvExtract { hi, lo } => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    structural::extract(&a, hi, lo)
+                }
+                BuiltinOp::BvZeroExtend(k) => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    structural::zero_extend(&a, k, sink.blaster())
+                }
+                BuiltinOp::BvSignExtend(k) => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    structural::sign_extend(&a, k)
+                }
+                BuiltinOp::BvRotateLeft(k) => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    shift::rotate_left(&a, k)
+                }
+                BuiltinOp::BvRotateRight(k) => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    shift::rotate_right(&a, k)
+                }
+                BuiltinOp::BvRepeat(k) => {
+                    let a = sink.word(ctx, child_ids[0]);
+                    structural::repeat(&a, k)
+                }
+                // Comparison ops are Bool-sorted — must not reach blast_word.
+                BuiltinOp::BvUlt
+                | BuiltinOp::BvUle
+                | BuiltinOp::BvUgt
+                | BuiltinOp::BvUge
+                | BuiltinOp::BvSlt
+                | BuiltinOp::BvSle
+                | BuiltinOp::BvSgt
+                | BuiltinOp::BvSge => {
+                    unreachable!("BV comparison op is Bool-sorted; use blast_atom instead");
+                }
+                _ => unreachable!("non-BV builtin reached blast_word"),
+            }
+        }
+        _ => unreachable!("blast_word called on non-BV term"),
+    }
+}
+
+/// BV atom (Bool-sorted predicate) dispatch, generic over the sink. Handles
+/// `Eq`/`Distinct` over BV operands and all `BvUlt..BvSge` comparisons. No
+/// cache: callers recurse into words via `sink.word`, which IS memoized.
+pub fn blast_bv_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> BitLit {
+    let node = ctx.term_node(t).clone();
+    match node {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::Eq),
+            args,
+            ..
+        } => {
+            let child_ids = ctx.children(args).to_vec();
+            let a = sink.word(ctx, child_ids[0]);
+            let b = sink.word(ctx, child_ids[1]);
+            compare::eq(sink.blaster(), &a, &b)
+        }
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::Distinct),
+            args,
+            ..
+        } => {
+            let child_ids = ctx.children(args).to_vec();
+            // Assume binary Distinct (n-ary is lowered before this stage).
+            let a = sink.word(ctx, child_ids[0]);
+            let b = sink.word(ctx, child_ids[1]);
+            let eq_lit = compare::eq(sink.blaster(), &a, &b);
+            sink.blaster().not1(eq_lit)
+        }
+        TermNode::App {
+            op: Op::Builtin(bv_cmp),
+            args,
+            ..
+        } => {
+            let child_ids = ctx.children(args).to_vec();
+            let a = sink.word(ctx, child_ids[0]);
+            let b = sink.word(ctx, child_ids[1]);
+            match bv_cmp {
+                BuiltinOp::BvUlt => compare::ult(sink.blaster(), &a, &b),
+                BuiltinOp::BvUle => compare::ule(sink.blaster(), &a, &b),
+                BuiltinOp::BvUgt => compare::ugt(sink.blaster(), &a, &b),
+                BuiltinOp::BvUge => compare::uge(sink.blaster(), &a, &b),
+                BuiltinOp::BvSlt => compare::slt(sink.blaster(), &a, &b),
+                BuiltinOp::BvSle => compare::sle(sink.blaster(), &a, &b),
+                BuiltinOp::BvSgt => compare::sgt(sink.blaster(), &a, &b),
+                BuiltinOp::BvSge => compare::sge(sink.blaster(), &a, &b),
+                _ => panic!("blast_atom called on non-predicate builtin"),
+            }
+        }
+        _ => panic!("blast_atom called on non-predicate term"),
     }
 }
 
@@ -639,6 +672,29 @@ mod tests {
             crate::testkit::solve_value(bl, &bits),
             (3u64 + 200u64) & 0xFF
         );
+    }
+
+    #[test]
+    fn wordsink_generic_matches_inherent_bvadd() {
+        use shinri_core::{BuiltinOp, Context, Op};
+        use shinri_num::Integer;
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(5u64));
+        let add = ctx.mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, c]).unwrap();
+
+        // Inherent method (baseline).
+        let mut b1 = Blaster::new();
+        let bits_inherent = b1.blast_word(&ctx, add);
+        // Generic free function via the trait (Blaster as its own sink).
+        let mut b2 = Blaster::new();
+        let bits_generic = blast_bv_word(&mut b2, &ctx, add);
+
+        assert_eq!(bits_inherent.len(), 8);
+        assert_eq!(bits_inherent.len(), bits_generic.len());
+        assert_eq!(b1.num_vars(), b2.num_vars(), "identical var allocation order");
     }
 
     #[test]
