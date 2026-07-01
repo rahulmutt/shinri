@@ -109,7 +109,8 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
 /// Positively-enumerated check: is an FP-sorted `word` term one that
 /// `shinri_fp::FpBlaster::blast_word` can handle in slice 1 (FpAbs/FpNeg),
 /// slice 2a (FpAdd/FpSub), slice 2b (FpMul), slice 2c (FpDiv), slice 2c′ (FpSqrt),
-/// slice 2e (FpRoundToIntegral/FpMin/FpMax), slice 2f (FpFma), or slice 2g (FpRem)?
+/// slice 2e (FpRoundToIntegral/FpMin/FpMax), slice 2f (FpFma), slice 2g (FpRem),
+/// or slice 3a (non-BV ToFp: FP->FP re-round, const-Real fold)?
 ///
 /// Supported: FP constants, nullary FP variables, FpAbs/FpNeg applied
 /// (recursively) to supported words, FpAdd/FpSub/FpMul/FpDiv where the RM operand is a
@@ -118,17 +119,23 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
 /// term and the single FP operand is recursively supported, FpRoundToIntegral with
 /// RM and FP operand both recursively supported, FpMin/FpMax with both FP operands
 /// recursively supported, FpFma with RM and all three FP operands recursively
-/// supported, and FpRem (no RM operand) with both FP operands recursively
-/// supported. EVERYTHING else is NOT supported (any unknown/future FP op defaults to
-/// unsupported). This ensures that adding a new FP op to the core does not silently
-/// route through blast_word and panic.
+/// supported, FpRem (no RM operand) with both FP operands recursively
+/// supported, and ToFp (RM, X) where X is a recursively supported FP word or a
+/// constant Real. EVERYTHING else is NOT supported (any unknown/future FP op
+/// defaults to unsupported, including ToFp with a symbolic-Real or BV operand).
+/// This ensures that adding a new FP op to the core does not silently route
+/// through blast_word and panic.
 fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
     match ctx.term_node(t) {
         // FP constant → supported.
         TermNode::Const { val: ConstVal::Float(_), .. } => true,
-        // Nullary uninterpreted symbol (FP variable) → supported.
+        // Nullary uninterpreted symbol of Float sort (FP variable) → supported.
+        // The explicit sort check matters now that `is_supported_fp_word` can be
+        // called on a non-FP operand (ToFp's second argument may be Real-sorted);
+        // without it a symbolic Real variable would wrongly pass as "supported".
         TermNode::App { op: Op::Uninterpreted(_), args, .. } => {
-            ctx.children(*args).is_empty()
+            matches!(ctx.sort_node(ctx.sort_of(t)), SortNode::Float(_, _))
+                && ctx.children(*args).is_empty()
         }
         // FpAbs / FpNeg: supported if the single child is supported.
         TermNode::App { op: Op::Builtin(BuiltinOp::FpAbs | BuiltinOp::FpNeg), args, .. } => {
@@ -176,8 +183,18 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                 && is_supported_fp_word(ctx, kids[0])
                 && is_supported_fp_word(ctx, kids[1])
         }
-        // Anything else (Ite over FP, non-nullary UF, conversions, etc.) is not in
-        // scope for slices 1–2g.
+        // to_fp: (RM, X). Non-BV faces only — X is a supported FP word (FP->FP re-round)
+        // or a constant Real (fold). BV operand / 1-arg bitcast / symbolic Real stay
+        // unsupported (Plan 4+ / later Real combination). Fence and folder share
+        // Context::const_real_value so the admit-set is identical (soundness).
+        TermNode::App { op: Op::Builtin(BuiltinOp::ToFp { .. }), args, .. } => {
+            let kids = ctx.children(*args).to_vec();
+            kids.len() == 2
+                && is_rounding_mode_term(ctx, kids[0])
+                && (is_supported_fp_word(ctx, kids[1]) || ctx.const_real_value(kids[1]).is_some())
+        }
+        // Anything else (Ite over FP, non-nullary UF, BV-crossing conversions, symbolic-Real
+        // to_fp, fp.to_real, etc.) is not in scope for slices 1–3a.
         _ => false,
     }
 }
@@ -412,5 +429,34 @@ mod tests {
         let mn = ctx.mk_app(Op::Builtin(BuiltinOp::FpMin), &[x, y]).unwrap();
         let eq = ctx.mk_app(Op::Builtin(BuiltinOp::FpEq), &[mn, x]).unwrap();
         assert!(fp_atoms_fully_supported(&ctx, &[eq]), "fp.min inside fp.eq admitted");
+    }
+
+    #[test]
+    fn to_fp_non_bv_faces_supported_bv_and_symbolic_real_not() {
+        use shinri_num::Rational;
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        // FP->FP widen supported.
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let widen = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x]).unwrap();
+        let isn1 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[widen]).unwrap();
+        assert!(fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn1])),
+                "to_fp FP->FP is in scope as of slice 3a");
+        // const-Real supported.
+        let real = ctx.real_sort();
+        let third = ctx.mk_numeral(Rational::new(1i128.into(), 3i128.into()), real);
+        let conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, third]).unwrap();
+        let isn2 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[conv]).unwrap();
+        assert!(fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn2])),
+                "const-Real to_fp is in scope as of slice 3a");
+        // symbolic-Real to_fp NOT supported (durably fenced).
+        let rf = ctx.declare_fun("r", &[], real);
+        let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
+        let sym = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, r]).unwrap();
+        let isn3 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[sym]).unwrap();
+        assert!(!fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn3])),
+                "symbolic-Real to_fp must stay fenced");
     }
 }

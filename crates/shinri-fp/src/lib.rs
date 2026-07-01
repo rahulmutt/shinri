@@ -143,6 +143,18 @@ impl FpBlaster {
                         let yw = self.blast_word(ctx, kids[1]);
                         crate::blast::rem::fp_rem(&mut self.b, &xw, &yw, eb, sb)
                     }
+                    ToFp { .. } => {
+                        // Non-BV faces only (fence guarantees this): 2 args (RM, X), X = Float | const Real.
+                        // `eb`/`sb` here are the outer target widths (result sort); source is X's sort.
+                        let rm = self.blast_rm(ctx, kids[0]);
+                        if let Some(q) = ctx.const_real_value(kids[1]) {
+                            crate::convert::to_fp_real_const(&mut self.b, &q, eb, sb, &rm)
+                        } else {
+                            let (eb_s, sb_s) = ctx.fp_widths(ctx.sort_of(kids[1])).expect("FP source operand");
+                            let xw = self.blast_word(ctx, kids[1]);
+                            crate::convert::to_fp_fp(&mut self.b, &xw, eb_s, sb_s, eb, sb, &rm)
+                        }
+                    }
                     other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
                 }
             }
@@ -341,6 +353,32 @@ mod lower_tests {
         let lo = lower(&mut ctx, &[eq]);
         assert!(lo.atom_lit.contains_key(&eq), "core = over fp.rem must be surrogated");
         assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
+    }
+
+    #[test]
+    fn lower_to_fp_fp_and_const_real_atoms() {
+        use shinri_core::BuiltinOp;
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let f64 = ctx.fp_sort(11, 53);
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        // FP->FP: widen a Float32 var to Float64.
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let widen = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x]).unwrap();
+        let yf = ctx.declare_fun("y", &[], f64);
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let eq1 = ctx.mk_eq(widen, y).unwrap();
+        // const-Real: to_fp of numeral 1/3 into Float32.
+        let real = ctx.real_sort();
+        let third = ctx.mk_numeral(shinri_core::Rational::new(1i128.into(), 3i128.into()), real);
+        let conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, third]).unwrap();
+        let zf = ctx.declare_fun("z", &[], f32);
+        let z = ctx.mk_app(Op::Uninterpreted(zf), &[]).unwrap();
+        let eq2 = ctx.mk_app(Op::Builtin(BuiltinOp::FpEq), &[conv, z]).unwrap();
+        let lo = lower(&mut ctx, &[eq1, eq2]);
+        assert!(lo.atom_lit.contains_key(&eq1), "core = over to_fp FP->FP must be surrogated");
+        assert!(lo.atom_lit.contains_key(&eq2), "fp.eq over const-Real to_fp must be surrogated");
     }
 }
 
