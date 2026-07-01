@@ -357,7 +357,15 @@ impl Solver {
                 let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
                 // SOUNDNESS FENCE (conservative): any non-BV theory atom present
                 // alongside BV → Unknown.
-                if crate::bv_stage::has_non_bv_theory_atom(&self.ctx, &assertions, &bv_atoms) {
+                // Also fence mixed BV+FP: an FP→BV conversion (fp.to_sbv/fp.to_ubv)
+                // yields a BV-sorted atom whose operand subtree contains FP ops the
+                // BV blaster cannot handle — collect_bv_atoms treats it as a pure-BV
+                // leaf, so without this guard `lower()` would hit blast_word's
+                // `unreachable!` (a user-triggered panic). BVFP unification is a later
+                // plan; symmetric with the FP path's BV fence below.
+                if crate::bv_stage::has_non_bv_theory_atom(&self.ctx, &assertions, &bv_atoms)
+                    || crate::fp_stage::solver_uses_fp(&self.ctx, &assertions)
+                {
                     return SolveOutcome::Unknown;
                 }
                 Some(shinri_bv::lower(&mut self.ctx, &bv_atoms))
