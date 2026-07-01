@@ -564,3 +564,76 @@ fn fp_rem_malformed_is_unknown() {
     );
     assert_eq!(o, SolveOutcome::Unknown);
 }
+
+// ── Slice-3a end-to-end: non-BV to_fp (FP→FP + const-Real) + fence canaries ──
+
+#[test]
+fn to_fp_fp_widen_sat_get_model() {
+    // y (Float64) = widen(x : Float32). SAT; model renders fp triples.
+    let (o, model) = run(
+        "(declare-fun x () Float32) (declare-fun y () Float64) \
+         (assert (fp.eq y ((_ to_fp 11 53) RNE x))) (check-sat) (get-model)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(model.contains("(fp #b"), "model renders fp triples: {model}");
+}
+
+#[test]
+fn to_fp_fp_widen_injective_unsat() {
+    // Widening Float32→Float64 is exact: widen(1.0f32) == 1.0f64. Asserting it
+    // differs (core =) is UNSAT. Ground → constant-folds, fast.
+    let (o, _) = run(
+        "(assert (not (= ((_ to_fp 11 53) RNE (fp #b0 #x7f #b00000000000000000000000)) \
+                         (fp #b0 #b01111111111 #b0000000000000000000000000000000000000000000000000000)))) \
+         (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn to_fp_const_real_known_value_sat() {
+    // to_fp of 1/3 into Float32 (RNE) = 0x3EAA_AAAB; assert fp.eq with z and read model.
+    let (o, model) = run(
+        "(declare-fun z () Float32) \
+         (assert (fp.eq z ((_ to_fp 8 24) RNE (/ 1.0 3.0)))) (check-sat) (get-model)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(model.contains("(fp #b"), "model renders fp triple for z: {model}");
+}
+
+#[test]
+fn to_fp_const_real_reflexive_unsat() {
+    // to_fp(1/3) equals itself under fp.eq (non-NaN); asserting the negation is UNSAT.
+    let (o, _) = run(
+        "(assert (not (fp.eq ((_ to_fp 8 24) RNE (/ 1.0 3.0)) \
+                             ((_ to_fp 8 24) RNE (/ 1.0 3.0))))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn to_fp_bv_crossing_and_symbolic_real_are_unknown() {
+    // Every still-fenced conversion → Unknown (soundness: BV-crossing waits for Plan 4;
+    // symbolic-Real / fp.to_real are the deferred Real bridge).
+    let scripts = [
+        // symbolic-Real to_fp
+        "(declare-fun r () Real) (declare-fun z () Float32) \
+         (assert (fp.eq z ((_ to_fp 8 24) RNE r))) (check-sat)",
+        // bitcast from BV (1-arg to_fp)
+        "(declare-fun b () (_ BitVec 32)) (declare-fun z () Float32) \
+         (assert (fp.eq z ((_ to_fp 8 24) b))) (check-sat)",
+        // signed-int BV → FP (2-arg to_fp with BV operand)
+        "(declare-fun b () (_ BitVec 32)) (declare-fun z () Float32) \
+         (assert (fp.eq z ((_ to_fp 8 24) RNE b))) (check-sat)",
+        // FP → int (fp.to_sbv)
+        "(declare-fun x () Float32) \
+         (assert (= ((_ fp.to_sbv 32) RNE x) (_ bv0 32))) (check-sat)",
+        // fp.to_real
+        "(declare-fun x () Float32) \
+         (assert (= (fp.to_real x) 0.0)) (check-sat)",
+    ];
+    for s in scripts {
+        let (o, _) = run(s);
+        assert_eq!(o, SolveOutcome::Unknown, "must fence to Unknown: {s}");
+    }
+}
