@@ -852,3 +852,70 @@ fn differential_qf_fp_relations() {
     }
     assert!(n_sat > 0 && n_unsat > 0, "oracle produced no coverage");
 }
+
+/// Random QF_FP script exercising the two non-BV to_fp faces: widen/narrow between
+/// Float32 and Float64, and to_fp of a constant Real (a ratio of small integers).
+/// Mixes with fp.eq / = / fp.isNaN atoms, some negated, so SAT and UNSAT both arise.
+fn gen_to_fp_script(rng: &mut Lcg) -> String {
+    let mut s = String::from(
+        "(set-logic QF_FP)\n\
+         (declare-fun x () (_ FloatingPoint 8 24))\n\
+         (declare-fun w () (_ FloatingPoint 11 53))\n\
+         (declare-fun z () (_ FloatingPoint 8 24))\n",
+    );
+    let modes = ["RNE", "RNA", "RTP", "RTN", "RTZ"];
+    let n_asserts = 1 + rng.below(3) as usize;
+    for _ in 0..n_asserts {
+        let rm = modes[rng.below(5) as usize];
+        // pick a conversion term of Float32 sort so it composes with z / fp.isNaN.
+        let term = match rng.below(3) {
+            0 => format!("((_ to_fp 8 24) {rm} w)"),              // narrow Float64→Float32
+            1 => {
+                let num = 1 + rng.below(9);
+                let den = 1 + rng.below(9);
+                format!("((_ to_fp 8 24) {rm} (/ {num}.0 {den}.0))") // const-Real→Float32
+            }
+            _ => format!("((_ to_fp 8 24) {rm} ((_ to_fp 11 53) {rm} x))"), // round-trip via Float64
+        };
+        let atom = match rng.below(3) {
+            0 => format!("(fp.eq z {term})"),
+            1 => format!("(= z {term})"),
+            _ => format!("(fp.isNaN {term})"),
+        };
+        if rng.below(2) == 0 {
+            s.push_str(&format!("(assert (not {atom}))\n"));
+        } else {
+            s.push_str(&format!("(assert {atom})\n"));
+        }
+    }
+    s.push_str("(check-sat)\n");
+    s
+}
+
+const TO_FP_ITERS: usize = 60;
+
+#[test]
+fn differential_qf_fp_to_fp() {
+    let mut rng = Lcg(0x0A_11_3E_5C_07_D1);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..TO_FP_ITERS {
+        let src = gen_to_fp_script(&mut rng);
+        let ours = shinri_outcome(&src);
+        if ours == SolveOutcome::Unknown { n_unknown += 1; continue; }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_sat += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!(
+                "QF_FP to_fp DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
+        }
+    }
+    println!("differential_qf_fp_to_fp: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+    assert!(n_sat > 0 && n_unsat > 0, "oracle produced no SAT/UNSAT coverage");
+}
