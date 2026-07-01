@@ -52,6 +52,22 @@ pub fn decode(eb: u32, sb: u32, bits: &Integer) -> FpClass {
     }
 }
 
+/// Pack a (sign, exponent-field, trailing-significand) triple into the (eb, sb)
+/// bit pattern. Inverse of `decode`'s field extraction: MSB is the sign, then
+/// the eb-bit biased exponent, then the (sb-1)-bit trailing significand.
+/// `packed = sign·2^(eb+sb-1) + exp·2^(sb-1) + sig`.
+pub fn ref_fp_from_bits(eb: u32, sb: u32, sign: u64, exp: &Integer, sig: &Integer) -> Integer {
+    let two = Integer::from(2u64);
+    let pow = |k: u32| {
+        let mut m = Integer::one();
+        for _ in 0..k {
+            m = m * two.clone();
+        }
+        m
+    };
+    Integer::from(sign) * pow(eb + sb - 1) + exp.clone() * pow(sb - 1) + sig.clone()
+}
+
 pub fn ref_is_nan(c: &FpClass) -> bool { matches!(c, FpClass::Nan) }
 pub fn ref_is_inf(c: &FpClass) -> bool { matches!(c, FpClass::Inf { .. }) }
 pub fn ref_is_zero(c: &FpClass) -> bool { matches!(c, FpClass::Zero { .. }) }
@@ -1107,6 +1123,21 @@ mod tests {
             Rational::new(acc, Integer::one())
         }, Rne);
         assert_eq!(ref_to_fp_fp(11, 53, 5, 11, &big, Rne), inf_pattern(5, 11, false));
+    }
+
+    #[test]
+    fn ref_fp_from_bits_packs_one_float32() {
+        // 1.0f32 = sign 0, biased exp 127 (0x7F), trailing sig 0 → 0x3F800000.
+        let packed = ref_fp_from_bits(8, 24, 0, &Integer::from(127u64), &Integer::zero());
+        assert_eq!(packed, Integer::from(0x3F80_0000u64));
+        // Round-trips through decode() to a positive normal.
+        assert_eq!(
+            decode(8, 24, &packed),
+            FpClass::Normal { sign: false, biased_exp: 127, sig: Integer::zero() }
+        );
+        // Sign bit is the MSB: flipping it yields -1.0's pattern (0xBF800000).
+        let neg = ref_fp_from_bits(8, 24, 1, &Integer::from(127u64), &Integer::zero());
+        assert_eq!(neg, Integer::from(0xBF80_0000u64));
     }
 }
 
