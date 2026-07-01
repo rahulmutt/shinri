@@ -50,6 +50,13 @@ impl Default for Blaster {
 pub trait WordSink {
     fn word(&mut self, ctx: &Context, t: TermId) -> Vec<BitLit>;
     fn blaster(&mut self) -> &mut Blaster;
+
+    /// Per-TermId cache of blasted RoundingMode one-hot selectors, keyed by the
+    /// RM operand's `TermId`. Only meaningful for sinks that carry RoundingMode
+    /// operands (i.e. shinri-fp's `FpBlaster`); pure-BV lowering never calls this.
+    fn rm_cache(&mut self) -> &mut FxHashMap<TermId, [BitLit; 5]> {
+        unreachable!("pure BV lowering has no RoundingMode operands")
+    }
 }
 
 impl Blaster {

@@ -13,7 +13,7 @@ pub mod round;
 pub mod unpack;
 
 use rustc_hash::FxHashMap;
-use shinri_bv::{BitLit, Blaster};
+use shinri_bv::{BitLit, Blaster, WordSink};
 use shinri_core::{ConstVal, Context, Op, TermId, TermNode};
 
 /// FP-side blaster: wraps a `shinri_bv::Blaster` (used purely as a gate/clause
@@ -32,199 +32,15 @@ impl FpBlaster {
                     var_bits: FxHashMap::default(), rm_cache: FxHashMap::default() }
     }
 
-    /// Blast a RoundingMode operand to a one-hot selector. Literal modes fold to
-    /// constants; a symbolic RM variable becomes 3 fresh bits (cached per TermId).
-    fn blast_rm(&mut self, ctx: &Context, t: TermId) -> crate::rm::RmSel {
-        if let Some(sel) = self.rm_cache.get(&t) {
-            return crate::rm::RmSel { sel: *sel };
-        }
-        let sel = if let Some(rm) = ctx.rm_const_value(t) {
-            crate::rm::literal(&self.b, rm)
-        } else {
-            // symbolic RoundingMode variable (nullary uninterpreted of RM sort).
-            crate::rm::symbolic(&mut self.b)
-        };
-        self.rm_cache.insert(t, sel.sel);
-        sel
-    }
-
     /// Blast an FP-sorted term to its W=eb+sb bit word (LSB→MSB), memoized.
     /// Slice 1 handles FP constants, nullary FP variables, and FpAbs/FpNeg operator nodes.
     pub fn blast_word(&mut self, ctx: &Context, t: TermId) -> Vec<BitLit> {
-        if let Some(v) = self.cache.get(&t) {
-            return v.clone();
-        }
-        let result = match ctx.term_node(t).clone() {
-            TermNode::Const { val: ConstVal::Float(_), .. } => {
-                let (eb, sb, bits) = ctx.fp_const_value(t).expect("FP const");
-                let w = eb + sb;
-                let two = shinri_num::Integer::from(2u64);
-                let mut remaining = bits.clone();
-                (0..w).map(|_| {
-                    let (q, r) = remaining.div_rem(&two);
-                    remaining = q;
-                    if r.is_zero() { self.b.zero() } else { self.b.one() }
-                }).collect()
-            }
-            TermNode::App { op: Op::Uninterpreted(_), args, sort } => {
-                debug_assert!(ctx.children(args).is_empty(), "non-nullary FP fn out of scope");
-                let (eb, sb) = ctx.fp_widths(sort).expect("FP-sorted variable");
-                let bits: Vec<BitLit> = (0..(eb + sb)).map(|_| self.b.fresh()).collect();
-                self.var_bits.insert(t, bits.clone());
-                bits
-            }
-            TermNode::App { op: Op::Builtin(op), args, sort } => {
-                use shinri_core::BuiltinOp::*;
-                let (eb, sb) = ctx.fp_widths(sort).expect("FP-sorted op result");
-                let kids = ctx.children(args).to_vec();
-                match op {
-                    FpAbs => {
-                        let w = self.blast_word(ctx, kids[0]);
-                        crate::blast::structural::abs(&mut self.b, &w, eb, sb)
-                    }
-                    FpNeg => {
-                        let w = self.blast_word(ctx, kids[0]);
-                        crate::blast::structural::neg(&mut self.b, &w, eb, sb)
-                    }
-                    FpAdd => {
-                        let rm = self.blast_rm(ctx, kids[0]);
-                        let xw = self.blast_word(ctx, kids[1]);
-                        let yw = self.blast_word(ctx, kids[2]);
-                        crate::blast::add::fp_add(&mut self.b, &xw, &yw, &rm, eb, sb)
-                    }
-                    FpSub => {
-                        let rm = self.blast_rm(ctx, kids[0]);
-                        let xw = self.blast_word(ctx, kids[1]);
-                        let yw = self.blast_word(ctx, kids[2]);
-                        let neg_y = crate::blast::structural::neg(&mut self.b, &yw, eb, sb);
-                        crate::blast::add::fp_add(&mut self.b, &xw, &neg_y, &rm, eb, sb)
-                    }
-                    FpMul => {
-                        let rm = self.blast_rm(ctx, kids[0]);
-                        let xw = self.blast_word(ctx, kids[1]);
-                        let yw = self.blast_word(ctx, kids[2]);
-                        crate::blast::mul::fp_mul(&mut self.b, &xw, &yw, &rm, eb, sb)
-                    }
-                    FpDiv => {
-                        let rm = self.blast_rm(ctx, kids[0]);
-                        let xw = self.blast_word(ctx, kids[1]);
-                        let yw = self.blast_word(ctx, kids[2]);
-                        crate::blast::div::fp_div(&mut self.b, &xw, &yw, &rm, eb, sb)
-                    }
-                    FpSqrt => {
-                        let rm = self.blast_rm(ctx, kids[0]);
-                        let xw = self.blast_word(ctx, kids[1]);
-                        crate::blast::sqrt::fp_sqrt(&mut self.b, &xw, &rm, eb, sb)
-                    }
-                    FpRoundToIntegral => {
-                        let rm = self.blast_rm(ctx, kids[0]);
-                        let xw = self.blast_word(ctx, kids[1]);
-                        crate::blast::roundint::fp_round_to_integral(&mut self.b, &xw, &rm, eb, sb)
-                    }
-                    FpMin => {
-                        let xw = self.blast_word(ctx, kids[0]);
-                        let yw = self.blast_word(ctx, kids[1]);
-                        crate::blast::minmax::fp_min(&mut self.b, &xw, &yw, eb, sb)
-                    }
-                    FpMax => {
-                        let xw = self.blast_word(ctx, kids[0]);
-                        let yw = self.blast_word(ctx, kids[1]);
-                        crate::blast::minmax::fp_max(&mut self.b, &xw, &yw, eb, sb)
-                    }
-                    FpFma => {
-                        let rm = self.blast_rm(ctx, kids[0]);
-                        let xw = self.blast_word(ctx, kids[1]);
-                        let yw = self.blast_word(ctx, kids[2]);
-                        let zw = self.blast_word(ctx, kids[3]);
-                        crate::blast::fma::fp_fma(&mut self.b, &xw, &yw, &zw, &rm, eb, sb)
-                    }
-                    FpRem => {
-                        let xw = self.blast_word(ctx, kids[0]);
-                        let yw = self.blast_word(ctx, kids[1]);
-                        crate::blast::rem::fp_rem(&mut self.b, &xw, &yw, eb, sb)
-                    }
-                    ToFp { .. } => {
-                        // Non-BV faces only (fence guarantees this): 2 args (RM, X), X = Float | const Real.
-                        // `eb`/`sb` here are the outer target widths (result sort); source is X's sort.
-                        let rm = self.blast_rm(ctx, kids[0]);
-                        if let Some(q) = ctx.const_real_value(kids[1]) {
-                            crate::convert::to_fp_real_const(&mut self.b, &q, eb, sb, &rm)
-                        } else {
-                            let (eb_s, sb_s) = ctx.fp_widths(ctx.sort_of(kids[1])).expect("FP source operand");
-                            let xw = self.blast_word(ctx, kids[1]);
-                            crate::convert::to_fp_fp(&mut self.b, &xw, eb_s, sb_s, eb, sb, &rm)
-                        }
-                    }
-                    other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
-                }
-            }
-            other => unreachable!("blast_word: unsupported FP word node {other:?} (slice 1)"),
-        };
-        self.cache.insert(t, result.clone());
-        result
+        <Self as WordSink>::word(self, ctx, t)
     }
 
     /// Blast a Bool-sorted FP atom to a single BitLit.
     pub fn blast_atom(&mut self, ctx: &Context, t: TermId) -> BitLit {
-        use shinri_core::BuiltinOp::*;
-        let node = ctx.term_node(t).clone();
-        let TermNode::App { op, args, .. } = node else {
-            unreachable!("FP atom must be an application");
-        };
-        let kids = ctx.children(args).to_vec();
-        match op {
-            Op::Builtin(Eq) => {
-                // core = over Float operands (NaN-aware).
-                let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
-                let x = self.blast_word(ctx, kids[0]);
-                let y = self.blast_word(ctx, kids[1]);
-                crate::blast::compare::core_eq(&mut self.b, &x, &y, eb, sb)
-            }
-            Op::Builtin(Distinct) => {
-                let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
-                let x = self.blast_word(ctx, kids[0]);
-                let y = self.blast_word(ctx, kids[1]);
-                let eq = crate::blast::compare::core_eq(&mut self.b, &x, &y, eb, sb);
-                self.b.not1(eq)
-            }
-            Op::Builtin(FpEq) => {
-                let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
-                let x = self.blast_word(ctx, kids[0]);
-                let y = self.blast_word(ctx, kids[1]);
-                crate::blast::compare::fp_eq(&mut self.b, &x, &y, eb, sb)
-            }
-            Op::Builtin(rel @ (FpLt | FpLeq | FpGt | FpGeq)) => {
-                let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
-                let x = self.blast_word(ctx, kids[0]);
-                let y = self.blast_word(ctx, kids[1]);
-                use crate::blast::compare as cmp;
-                match rel {
-                    FpLt => cmp::fp_lt(&mut self.b, &x, &y, eb, sb),
-                    FpLeq => cmp::fp_leq(&mut self.b, &x, &y, eb, sb),
-                    FpGt => cmp::fp_gt(&mut self.b, &x, &y, eb, sb),
-                    FpGeq => cmp::fp_geq(&mut self.b, &x, &y, eb, sb),
-                    _ => unreachable!(),
-                }
-            }
-            Op::Builtin(classify @ (FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite
-                                    | FpIsNaN | FpIsNegative | FpIsPositive)) => {
-                let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operand");
-                let w = self.blast_word(ctx, kids[0]);
-                let u = crate::unpack::unpack(&mut self.b, &w, eb, sb);
-                use crate::blast::classify as c;
-                match classify {
-                    FpIsNormal => c::is_normal(&mut self.b, &u),
-                    FpIsSubnormal => c::is_subnormal(&mut self.b, &u),
-                    FpIsZero => c::is_zero(&mut self.b, &u),
-                    FpIsInfinite => c::is_inf(&mut self.b, &u),
-                    FpIsNaN => c::is_nan(&mut self.b, &u),
-                    FpIsNegative => c::is_negative(&mut self.b, &u),
-                    FpIsPositive => c::is_positive(&mut self.b, &u),
-                    _ => unreachable!(),
-                }
-            }
-            other => unreachable!("blast_atom: FP atom {other:?} out of slice-1 scope"),
-        }
+        blast_fp_atom(self, ctx, t)
     }
 
     /// Bits cached for every FP *variable* term (for model extraction).
@@ -235,6 +51,224 @@ impl FpBlaster {
 
 impl Default for FpBlaster {
     fn default() -> Self { Self::new() }
+}
+
+impl WordSink for FpBlaster {
+    fn word(&mut self, ctx: &Context, t: TermId) -> Vec<BitLit> {
+        if let Some(v) = self.cache.get(&t) {
+            return v.clone();
+        }
+        let bits = blast_fp_word(self, ctx, t);
+        // Preserve the eager var-word recording that used to live in blast_word's
+        // Uninterpreted arm: fires only on cache-miss, for exactly the FP-sorted
+        // nullary vars (byte-identical var set to the pre-refactor behavior).
+        if let TermNode::App { op: Op::Uninterpreted(_), args, sort } = ctx.term_node(t) {
+            if ctx.children(*args).is_empty() && ctx.fp_widths(*sort).is_some() {
+                self.var_bits.insert(t, bits.clone());
+            }
+        }
+        self.cache.insert(t, bits.clone());
+        bits
+    }
+    fn blaster(&mut self) -> &mut Blaster {
+        &mut self.b
+    }
+    fn rm_cache(&mut self) -> &mut FxHashMap<TermId, [BitLit; 5]> {
+        &mut self.rm_cache
+    }
+}
+
+/// Blast a RoundingMode operand to a one-hot selector. Literal modes fold to
+/// constants; a symbolic RM variable becomes 3 fresh bits (cached per TermId
+/// via the sink's `rm_cache`, so a shared symbolic RM var gets one selector).
+fn blast_rm<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> crate::rm::RmSel {
+    if let Some(sel) = sink.rm_cache().get(&t) {
+        return crate::rm::RmSel { sel: *sel };
+    }
+    let sel = if let Some(rm) = ctx.rm_const_value(t) {
+        crate::rm::literal(sink.blaster(), rm)
+    } else {
+        // symbolic RoundingMode variable (nullary uninterpreted of RM sort).
+        crate::rm::symbolic(sink.blaster())
+    };
+    sink.rm_cache().insert(t, sel.sel);
+    sel
+}
+
+/// FP word dispatch, generic over the sink. Assumes `t` is FP-sorted; callers
+/// (the sink's `word`) pre-classify by sort. Recurses via `sink.word`, mints
+/// gates via `sink.blaster()`. Does NOT touch the word cache or `var_bits` —
+/// the sink's `word` owns memoization and var-bit recording.
+pub fn blast_fp_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec<BitLit> {
+    let node = ctx.term_node(t).clone();
+    match node {
+        TermNode::Const { val: ConstVal::Float(_), .. } => {
+            let (eb, sb, bits) = ctx.fp_const_value(t).expect("FP const");
+            let w = eb + sb;
+            let two = shinri_num::Integer::from(2u64);
+            let mut remaining = bits.clone();
+            (0..w).map(|_| {
+                let (q, r) = remaining.div_rem(&two);
+                remaining = q;
+                if r.is_zero() { sink.blaster().zero() } else { sink.blaster().one() }
+            }).collect()
+        }
+        TermNode::App { op: Op::Uninterpreted(_), args, sort } => {
+            debug_assert!(ctx.children(args).is_empty(), "non-nullary FP fn out of scope");
+            let (eb, sb) = ctx.fp_widths(sort).expect("FP-sorted variable");
+            (0..(eb + sb)).map(|_| sink.blaster().fresh()).collect()
+        }
+        TermNode::App { op: Op::Builtin(op), args, sort } => {
+            use shinri_core::BuiltinOp::*;
+            let (eb, sb) = ctx.fp_widths(sort).expect("FP-sorted op result");
+            let kids = ctx.children(args).to_vec();
+            match op {
+                FpAbs => {
+                    let w = sink.word(ctx, kids[0]);
+                    crate::blast::structural::abs(sink.blaster(), &w, eb, sb)
+                }
+                FpNeg => {
+                    let w = sink.word(ctx, kids[0]);
+                    crate::blast::structural::neg(sink.blaster(), &w, eb, sb)
+                }
+                FpAdd => {
+                    let rm = blast_rm(sink, ctx, kids[0]);
+                    let xw = sink.word(ctx, kids[1]);
+                    let yw = sink.word(ctx, kids[2]);
+                    crate::blast::add::fp_add(sink.blaster(), &xw, &yw, &rm, eb, sb)
+                }
+                FpSub => {
+                    let rm = blast_rm(sink, ctx, kids[0]);
+                    let xw = sink.word(ctx, kids[1]);
+                    let yw = sink.word(ctx, kids[2]);
+                    let neg_y = crate::blast::structural::neg(sink.blaster(), &yw, eb, sb);
+                    crate::blast::add::fp_add(sink.blaster(), &xw, &neg_y, &rm, eb, sb)
+                }
+                FpMul => {
+                    let rm = blast_rm(sink, ctx, kids[0]);
+                    let xw = sink.word(ctx, kids[1]);
+                    let yw = sink.word(ctx, kids[2]);
+                    crate::blast::mul::fp_mul(sink.blaster(), &xw, &yw, &rm, eb, sb)
+                }
+                FpDiv => {
+                    let rm = blast_rm(sink, ctx, kids[0]);
+                    let xw = sink.word(ctx, kids[1]);
+                    let yw = sink.word(ctx, kids[2]);
+                    crate::blast::div::fp_div(sink.blaster(), &xw, &yw, &rm, eb, sb)
+                }
+                FpSqrt => {
+                    let rm = blast_rm(sink, ctx, kids[0]);
+                    let xw = sink.word(ctx, kids[1]);
+                    crate::blast::sqrt::fp_sqrt(sink.blaster(), &xw, &rm, eb, sb)
+                }
+                FpRoundToIntegral => {
+                    let rm = blast_rm(sink, ctx, kids[0]);
+                    let xw = sink.word(ctx, kids[1]);
+                    crate::blast::roundint::fp_round_to_integral(sink.blaster(), &xw, &rm, eb, sb)
+                }
+                FpMin => {
+                    let xw = sink.word(ctx, kids[0]);
+                    let yw = sink.word(ctx, kids[1]);
+                    crate::blast::minmax::fp_min(sink.blaster(), &xw, &yw, eb, sb)
+                }
+                FpMax => {
+                    let xw = sink.word(ctx, kids[0]);
+                    let yw = sink.word(ctx, kids[1]);
+                    crate::blast::minmax::fp_max(sink.blaster(), &xw, &yw, eb, sb)
+                }
+                FpFma => {
+                    let rm = blast_rm(sink, ctx, kids[0]);
+                    let xw = sink.word(ctx, kids[1]);
+                    let yw = sink.word(ctx, kids[2]);
+                    let zw = sink.word(ctx, kids[3]);
+                    crate::blast::fma::fp_fma(sink.blaster(), &xw, &yw, &zw, &rm, eb, sb)
+                }
+                FpRem => {
+                    let xw = sink.word(ctx, kids[0]);
+                    let yw = sink.word(ctx, kids[1]);
+                    crate::blast::rem::fp_rem(sink.blaster(), &xw, &yw, eb, sb)
+                }
+                ToFp { .. } => {
+                    // Non-BV faces only (fence guarantees this): 2 args (RM, X), X = Float | const Real.
+                    // `eb`/`sb` here are the outer target widths (result sort); source is X's sort.
+                    let rm = blast_rm(sink, ctx, kids[0]);
+                    if let Some(q) = ctx.const_real_value(kids[1]) {
+                        crate::convert::to_fp_real_const(sink.blaster(), &q, eb, sb, &rm)
+                    } else {
+                        let (eb_s, sb_s) = ctx.fp_widths(ctx.sort_of(kids[1])).expect("FP source operand");
+                        let xw = sink.word(ctx, kids[1]);
+                        crate::convert::to_fp_fp(sink.blaster(), &xw, eb_s, sb_s, eb, sb, &rm)
+                    }
+                }
+                other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
+            }
+        }
+        other => unreachable!("blast_word: unsupported FP word node {other:?} (slice 1)"),
+    }
+}
+
+/// FP atom (Bool-sorted predicate) dispatch, generic over the sink. No cache:
+/// callers recurse into words via `sink.word`, which IS memoized.
+pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> BitLit {
+    use shinri_core::BuiltinOp::*;
+    let node = ctx.term_node(t).clone();
+    let TermNode::App { op, args, .. } = node else {
+        unreachable!("FP atom must be an application");
+    };
+    let kids = ctx.children(args).to_vec();
+    match op {
+        Op::Builtin(Eq) => {
+            // core = over Float operands (NaN-aware).
+            let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
+            let x = sink.word(ctx, kids[0]);
+            let y = sink.word(ctx, kids[1]);
+            crate::blast::compare::core_eq(sink.blaster(), &x, &y, eb, sb)
+        }
+        Op::Builtin(Distinct) => {
+            let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
+            let x = sink.word(ctx, kids[0]);
+            let y = sink.word(ctx, kids[1]);
+            let eq = crate::blast::compare::core_eq(sink.blaster(), &x, &y, eb, sb);
+            sink.blaster().not1(eq)
+        }
+        Op::Builtin(FpEq) => {
+            let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
+            let x = sink.word(ctx, kids[0]);
+            let y = sink.word(ctx, kids[1]);
+            crate::blast::compare::fp_eq(sink.blaster(), &x, &y, eb, sb)
+        }
+        Op::Builtin(rel @ (FpLt | FpLeq | FpGt | FpGeq)) => {
+            let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
+            let x = sink.word(ctx, kids[0]);
+            let y = sink.word(ctx, kids[1]);
+            use crate::blast::compare as cmp;
+            match rel {
+                FpLt => cmp::fp_lt(sink.blaster(), &x, &y, eb, sb),
+                FpLeq => cmp::fp_leq(sink.blaster(), &x, &y, eb, sb),
+                FpGt => cmp::fp_gt(sink.blaster(), &x, &y, eb, sb),
+                FpGeq => cmp::fp_geq(sink.blaster(), &x, &y, eb, sb),
+                _ => unreachable!(),
+            }
+        }
+        Op::Builtin(classify @ (FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite
+                                | FpIsNaN | FpIsNegative | FpIsPositive)) => {
+            let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operand");
+            let w = sink.word(ctx, kids[0]);
+            let u = crate::unpack::unpack(sink.blaster(), &w, eb, sb);
+            use crate::blast::classify as c;
+            match classify {
+                FpIsNormal => c::is_normal(sink.blaster(), &u),
+                FpIsSubnormal => c::is_subnormal(sink.blaster(), &u),
+                FpIsZero => c::is_zero(sink.blaster(), &u),
+                FpIsInfinite => c::is_inf(sink.blaster(), &u),
+                FpIsNaN => c::is_nan(sink.blaster(), &u),
+                FpIsNegative => c::is_negative(sink.blaster(), &u),
+                FpIsPositive => c::is_positive(sink.blaster(), &u),
+                _ => unreachable!(),
+            }
+        }
+        other => unreachable!("blast_atom: FP atom {other:?} out of slice-1 scope"),
+    }
 }
 
 /// Blast all `fp_atoms` via one FpBlaster and return a `shinri_bv::Lowered`
@@ -256,6 +290,23 @@ mod lower_tests {
     use super::*;
     use shinri_core::{BuiltinOp, Context, Op};
     use shinri_num::Integer;
+
+    #[test]
+    fn wordsink_generic_matches_inherent_fp_isnan() {
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+
+        let mut fb1 = FpBlaster::new();
+        let w_inherent = fb1.blast_word(&ctx, x);
+        let mut fb2 = FpBlaster::new();
+        let w_generic = crate::blast_fp_word(&mut fb2, &ctx, x);
+
+        assert_eq!(w_inherent.len(), 32);
+        assert_eq!(w_inherent.len(), w_generic.len());
+        assert_eq!(fb1.b.num_vars(), fb2.b.num_vars(), "identical var allocation order");
+    }
 
     #[test]
     fn lower_isnan_atom_keys_and_vars() {
