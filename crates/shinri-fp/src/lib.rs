@@ -272,8 +272,8 @@ pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
     }
 }
 
-/// Blast FP atoms AND BV atoms through ONE unified `Lowerer` (shared `Blaster`
-/// + cache) and return a `shinri_bv::Lowered` (reused so the solver's
+/// Blast FP atoms AND BV atoms through ONE unified `Lowerer` (a shared
+/// `Blaster` + cache) and return a `shinri_bv::Lowered` (reused so the solver's
 /// `replay_bv_cnf` applies unchanged). `var_bits` carries BOTH theories'
 /// variable words — the solver splits them by sort for model read-back. BV
 /// atoms are rewritten first (matching `shinri_bv::lower`); FP atoms are not

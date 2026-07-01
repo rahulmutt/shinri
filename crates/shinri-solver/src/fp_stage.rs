@@ -355,8 +355,14 @@ mod tests {
         assert!(!has_non_fp_theory_atom(&ctx, &assertions, &atoms));
     }
 
+    /// Unit test of the FP-ONLY building-block predicate `has_non_fp_theory_atom`:
+    /// given ONLY the FP allow-set, a BV atom is outside it, so the predicate
+    /// reports a foreign atom. NOTE (slice 4b): the SOLVER no longer fences a mixed
+    /// BV+FP query end-to-end — it routes through the BV∪FP union predicate
+    /// `has_non_bvfp_theory_atom` (see `bvfp_union_passes_but_third_theory_fences`).
+    /// This test pins the narrower FP-only predicate that the union delegates to.
     #[test]
-    fn fp_mixed_with_bv_is_fenced() {
+    fn fp_only_fence_predicate_rejects_bv_atom() {
         let mut ctx = Context::new();
         let x = fp_var(&mut ctx, "x");
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
@@ -370,7 +376,7 @@ mod tests {
         let atoms = collect_fp_atoms(&ctx, &assertions);
         assert!(atoms.contains(&isnan));
         assert!(has_non_fp_theory_atom(&ctx, &assertions, &atoms),
-                "BV atom alongside FP must trigger the fence");
+                "FP-only predicate: a BV atom is outside the FP allow-set");
     }
 
     #[test]

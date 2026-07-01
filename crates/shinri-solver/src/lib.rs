@@ -1528,11 +1528,18 @@ mod fp_routing_tests {
         assert_eq!(run_outcome(src), SolveOutcome::Unsat);
     }
 
+    /// SLICE-4B: the mixed BV+FP fence is LIFTED. A query whose atoms are pure-FP
+    /// and pure-BV with NO BV↔FP crossing conversion now lowers as ONE problem and
+    /// returns a real verdict instead of Unknown. Here (fp.isNaN x) is Sat (x = NaN)
+    /// and (bvult b #x01) is Sat (b = 0); the two are independent, so the
+    /// conjunction is Sat. The fence-canary role for BV↔FP CROSSING ops that MUST
+    /// stay Unknown is held by fp_to_fp_from_real_is_unknown_not_panic (below) and,
+    /// end-to-end, by to_fp_bv_crossing_and_symbolic_real_are_unknown (fp_e2e.rs).
     #[test]
-    fn fp_mixed_with_bv_is_unknown() {
+    fn fp_mixed_with_bv_solves_after_fence_lift() {
         let src = "(declare-fun x () Float32) (declare-fun b () (_ BitVec 8)) \
                    (assert (fp.isNaN x)) (assert (bvult b #x01)) (check-sat)";
-        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
     }
 
     // ── Bug-fix regression tests (slice-1 fence for unsupported FP constructs) ──
