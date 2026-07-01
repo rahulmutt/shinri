@@ -643,3 +643,36 @@ fn to_fp_bv_crossing_and_symbolic_real_are_unknown() {
         assert_eq!(o, SolveOutcome::Unknown, "must fence to Unknown: {s}");
     }
 }
+
+// ── Slice-4b: mixed BV+FP (no crossing op) now solves ──────────────────────
+#[test]
+fn mixed_bv_and_fp_sat_with_model() {
+    // A pure-BV constraint AND a pure-FP constraint, no crossing conversion.
+    // x = #x05 (BV8) and y is a NaN (FP32). Independent, jointly satisfiable.
+    let src = "\
+(declare-fun x () (_ BitVec 8))
+(declare-fun y () (_ FloatingPoint 8 24))
+(assert (= x #x05))
+(assert (fp.isNaN y))
+(check-sat)
+(get-model)";
+    let (o, model) = run(src);
+    assert_eq!(o, SolveOutcome::Sat, "mixed BV+FP (no crossing) is SAT");
+    assert!(model.contains("x"), "model surfaces the BV var");
+    assert!(model.contains("y"), "model surfaces the FP var");
+}
+
+#[test]
+fn mixed_bv_and_fp_unsat() {
+    // BV side is self-contradictory; the whole conjunction is UNSAT regardless
+    // of the (satisfiable) FP side — proves the two blast into one instance.
+    let src = "\
+(declare-fun x () (_ BitVec 8))
+(declare-fun y () (_ FloatingPoint 8 24))
+(assert (= x #x05))
+(assert (= x #x06))
+(assert (fp.isNaN y))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Unsat, "contradictory BV side makes the mixed query UNSAT");
+}

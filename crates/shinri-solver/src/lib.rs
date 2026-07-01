@@ -341,31 +341,30 @@ impl Solver {
             };
         }
 
-        // ── BV path ──────────────────────────────────────────────────────────
-        // If the query mentions any BV sort/op, lower the BV atoms to CNF and
-        // replay them into the SAT solver, surrogating each BV atom to a SAT
-        // literal so the existing Tseitin encoder handles the Boolean skeleton.
-        // Mixed BV + other-theory queries are fenced to Unknown.
-        // `lower()` bit-blasts the BV atoms to CNF over a private BitVar
-        // namespace. It needs `&mut self.ctx` and must run BEFORE the SAT solver
-        // clones the context. The resulting CNF is replayed into `sat` below.
         // Non-ABV path: clear any stale array models from a previous QF_ABV solve.
         self.abv_array_models.clear();
 
+        // ── Crossing-conversion fence (slice 4b) ───────────────────────────────
+        // The mixed BV+FP fence is LIFTED (pure-BV and pure-FP atoms may coexist
+        // in one query), but BV↔FP crossing conversions are NOT yet admitted.
+        // to_fp-from-BV / 1-arg bitcast / to_fp_unsigned / fp.to_ubv / fp.to_sbv /
+        // fp.to_real / symbolic-Real to_fp still fence to Unknown, BEFORE any
+        // lowering, so blast_*_word's crossing `unreachable!` arms stay internal
+        // invariants. Each conversion is admitted in its own later slice.
+        let uses_bv = crate::bv_stage::solver_uses_bv(&self.ctx, &assertions);
+        let uses_fp = crate::fp_stage::solver_uses_fp(&self.ctx, &assertions);
+        if uses_fp && crate::fp_stage::uses_crossing_conversion(&self.ctx, &assertions) {
+            return SolveOutcome::Unknown;
+        }
+
+        // ── BV path (pure-BV only) ─────────────────────────────────────────────
+        // A mixed BV+FP query is handled by the unified FP/mixed path below, so
+        // the BV-only path runs only when NO FP is present. Non-BV theory atoms
+        // (arrays/LIA/EUF) alongside BV still fence.
         let lowered_bv: Option<shinri_bv::Lowered> =
-            if crate::bv_stage::solver_uses_bv(&self.ctx, &assertions) {
+            if uses_bv && !uses_fp {
                 let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
-                // SOUNDNESS FENCE (conservative): any non-BV theory atom present
-                // alongside BV → Unknown.
-                // Also fence mixed BV+FP: an FP→BV conversion (fp.to_sbv/fp.to_ubv)
-                // yields a BV-sorted atom whose operand subtree contains FP ops the
-                // BV blaster cannot handle — collect_bv_atoms treats it as a pure-BV
-                // leaf, so without this guard `lower()` would hit blast_word's
-                // `unreachable!` (a user-triggered panic). BVFP unification is a later
-                // plan; symmetric with the FP path's BV fence below.
-                if crate::bv_stage::has_non_bv_theory_atom(&self.ctx, &assertions, &bv_atoms)
-                    || crate::fp_stage::solver_uses_fp(&self.ctx, &assertions)
-                {
+                if crate::bv_stage::has_non_bv_theory_atom(&self.ctx, &assertions, &bv_atoms) {
                     return SolveOutcome::Unknown;
                 }
                 Some(shinri_bv::lower(&mut self.ctx, &bv_atoms))
@@ -373,28 +372,32 @@ impl Solver {
                 None
             };
 
-        // ── FP path (QF_FP, FP-private Blaster) ────────────────────────────────
-        // Pure-FP queries lower their FP atoms to CNF here. A query that ALSO
-        // uses BV (or any non-FP theory atom) is fenced to Unknown — BVFP
-        // unification is a later plan. (If lowered_bv is Some, the BV fence above
-        // already caught FP atoms as non-BV and returned Unknown, so FP only runs
-        // when there is no BV.)
+        // ── FP / mixed path (unified Lowerer over fp_atoms ∪ bv_atoms) ──────────
+        // Slice 4b: lower BOTH the FP atoms and any BV atoms through the one 4a
+        // Lowerer (shared Blaster + cache). Without a crossing op, BV and FP terms
+        // are disjoint DAGs meeting only at the Boolean level, so this is two
+        // independent blasting problems sharing one variable namespace. Pure-FP
+        // takes an empty bv_atoms set and is byte-identical to the pre-4b path.
         let lowered_fp: Option<shinri_bv::Lowered> =
-            if lowered_bv.is_none() && crate::fp_stage::solver_uses_fp(&self.ctx, &assertions) {
+            if uses_fp {
                 let fp_atoms = crate::fp_stage::collect_fp_atoms(&self.ctx, &assertions);
-                if crate::fp_stage::has_non_fp_theory_atom(&self.ctx, &assertions, &fp_atoms) {
+                let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
+                // Third-theory fence: any Bool atom outside (fp_atoms ∪ bv_atoms)
+                // that is not pure Boolean structure (arrays/LIA/EUF) → Unknown.
+                if crate::fp_stage::has_non_bvfp_theory_atom(
+                    &self.ctx, &assertions, &fp_atoms, &bv_atoms,
+                ) {
                     return SolveOutcome::Unknown;
                 }
-                // SOUNDNESS FENCE: positively-enumerated slice-1 support check.
-                // Any FP atom whose word operands contain an out-of-scope op
-                // (fp.add/sub/mul/div/..., FP-sorted ite, non-nullary UF, etc.)
-                // or whose predicate op is unhandled (fp.lt/leq/gt/geq) would
-                // panic at blast_atom/blast_word's unreachable!. Fence those to
-                // Unknown BEFORE lower() is ever called.
+                // Positive-enumeration safety: every FP atom's word must be a
+                // supported FP op (an FP-sorted ite, a not-yet-implemented FP op,
+                // etc. still fence) so blast_fp_word's `unreachable!` arms stay
+                // internal invariants. (BV atoms need no support check — the BV
+                // blaster is total over BV ops once crossing ops are fenced.)
                 if !crate::fp_stage::fp_atoms_fully_supported(&self.ctx, &fp_atoms) {
                     return SolveOutcome::Unknown;
                 }
-                Some(shinri_fp::lower(&mut self.ctx, &fp_atoms))
+                Some(shinri_fp::lower_mixed(&mut self.ctx, &fp_atoms, &bv_atoms))
             } else {
                 None
             };
@@ -437,7 +440,20 @@ impl Solver {
                 // Reuse replay_bv_cnf: it allocates a fresh contiguous var block,
                 // so FP and BV namespaces never collide.
                 let surrogates = self.replay_bv_cnf(&mut sat, lo);
-                self.fp_var_bits = surrogates.var_bits;
+                // Slice 4b: the mixed Lowered carries BOTH BV and FP variable
+                // words in one map; split by sort into the two decode maps.
+                // (Pure-FP: every entry is Float-sorted, so bv_var_bits stays
+                // empty exactly as before. bv_var_bits was cleared by the
+                // lowered_bv `None` arm above, since lowered_bv is None whenever
+                // lowered_fp is Some.)
+                self.fp_var_bits.clear();
+                for (term, vars) in surrogates.var_bits {
+                    if self.ctx.bv_width(self.ctx.sort_of(term)).is_some() {
+                        self.bv_var_bits.insert(term, vars);
+                    } else {
+                        self.fp_var_bits.insert(term, vars);
+                    }
+                }
                 surrogate_map.extend(surrogates.atom_to_lit);
             }
             None => {
