@@ -48,19 +48,23 @@ fn fp_eq_pos_neg_zero_is_sat() {
 
 // ── Slice-2a end-to-end: fp.add / fp.sub SAT/UNSAT + symbolic-RM + get-model ───
 //
-// ENCODING NOTE: The SMT-LIB literal form `(fp #b0 #x7f ...)` is parsed as
-// `FpFromBits` (an App node with BV children). `is_supported_fp_word` does not
-// handle `FpFromBits`, so such scripts trip the soundness fence and return
-// `Unknown` rather than SAT/UNSAT. The indexed special forms `(_ +oo 8 24)`,
-// `(_ -oo 8 24)`, `(_ +zero 8 24)` etc. are parsed as `ConstVal::Float` nodes
-// (via `mk_fp_const`), which ARE in `is_supported_fp_word`, so they pass the
-// fence. All four tests below use these forms instead of `(fp ...)` literals.
+// ENCODING NOTE (historical, slice-2a): at the time these tests were written,
+// the SMT-LIB literal form `(fp #b0 #x7f ...)` parsed as `FpFromBits` (an App
+// node with BV children), which `is_supported_fp_word` did not handle, so such
+// scripts tripped the soundness fence and returned `Unknown` rather than
+// SAT/UNSAT. As of slice 4c, `FpFromBits` (and the 1-arg `to_fp` bitcast) IS
+// admitted and solves end-to-end — see the slice-4c end-to-end block below.
+// The indexed special forms `(_ +oo 8 24)`, `(_ -oo 8 24)`, `(_ +zero 8 24)`
+// etc. are parsed as `ConstVal::Float` nodes (via `mk_fp_const`), which were
+// (and remain) in `is_supported_fp_word`. All four tests below still use
+// these forms instead of `(fp ...)` literals, for consistency with the rest
+// of this slice-2a block.
 
 #[test]
 fn fp_add_inf_plus_inf_is_inf_sat() {
-    // SAT: fp.add(RNE, +inf, +inf) = +inf. Uses (_ +oo 8 24) (ConstVal::Float)
-    // because (fp #b...) literals route through FpFromBits (App w/ BV children),
-    // which is not in is_supported_fp_word → soundness fence → Unknown.
+    // SAT: fp.add(RNE, +inf, +inf) = +inf. Uses (_ +oo 8 24) (ConstVal::Float);
+    // (fp #b...) literals (FpFromBits) also solve as of slice 4c, but this test
+    // predates that and keeps the special-value form for consistency.
     let src = "\
 (set-logic QF_FP)
 (declare-fun x () (_ FloatingPoint 8 24))
@@ -501,15 +505,19 @@ fn fp_rem_known_value_sat() {
     // rem(+0, +oo) = +0: rule "rem(x, ±inf) = x" for finite x (here x = +0), per
     // shinri-fp/src/reference.rs ref_rem. Ground/constant-only query.
     //
-    // DEVIATION FROM BRIEF: the brief's literal form `(fp #b0 #x82 #b...)` for
-    // "5.0 rem 3.0 = -1.0" does NOT pass this codebase's soundness fence -- the
+    // DEVIATION FROM BRIEF (historical, slice-2g): at the time this test was
+    // written, the brief's literal form `(fp #b0 #x82 #b...)` for "5.0 rem 3.0
+    // = -1.0" did NOT pass this codebase's soundness fence -- the
     // `(fp #b sign #x exp #b sig)` triple parses as `FpFromBits` (an App node),
-    // which `is_supported_fp_word` does not recognize (only `ConstVal::Float`
-    // literals and nullary FP vars are base cases; see the pre-existing slice-2a
-    // ENCODING NOTE earlier in this file). Confirmed empirically: that form yields
-    // Unknown, not Sat. The only concrete FP values the parser can produce as
-    // `ConstVal::Float` are the five special forms `(_ +oo/-oo/+zero/-zero/NaN eb
-    // sb)`, so the "known value" here is expressed via those instead of 5.0/3.0.
+    // which `is_supported_fp_word` did not recognize at the time (only
+    // `ConstVal::Float` literals and nullary FP vars were base cases; see the
+    // pre-existing slice-2a ENCODING NOTE earlier in this file). Confirmed
+    // empirically: that form yielded Unknown, not Sat. As of slice 4c,
+    // `FpFromBits` IS admitted and solves end-to-end (see the slice-4c
+    // end-to-end block below), but this test predates that and keeps the
+    // special-value-form workaround for consistency: the "known value" here
+    // is expressed via the five special forms
+    // `(_ +oo/-oo/+zero/-zero/NaN eb sb)` instead of 5.0/3.0.
     let (o, _) = run(
         "(assert (fp.eq (fp.rem (_ +zero 8 24) (_ +oo 8 24)) (_ +zero 8 24))) (check-sat)",
     );
@@ -584,10 +592,13 @@ fn to_fp_fp_widen_reflexive_unsat() {
     // from itself (core = — bitwise, well-defined even when x is NaN, unlike
     // fp.eq) is UNSAT. This drives the real FP→FP widen circuit for a symbolic
     // source and pins the pipeline to a decidable UNSAT verdict.
-    // (The intended "widen(1.0f32) == 1.0f64" literal test is not expressible:
-    //  `(fp #b..)` literal triples parse to the unsupported FpFromBits node — a
-    //  documented slice-2a encoding limitation — so a literal-source to_fp fences
-    //  to Unknown. A symbolic source is the supported way to exercise the circuit.)
+    // (This test predates slice 4c: at the time it was written, the intended
+    //  "widen(1.0f32) == 1.0f64" literal test was not expressible, since
+    //  `(fp #b..)` literal triples parsed to the then-unsupported FpFromBits
+    //  node — a documented slice-2a encoding limitation — so a literal-source
+    //  to_fp fenced to Unknown. As of slice 4c, FpFromBits IS admitted, but a
+    //  symbolic source remains a valid — and arguably stronger — way to
+    //  exercise the widen circuit, so this test is kept as-is.)
     let (o, _) = run(
         "(declare-fun x () Float32) \
          (assert (not (= ((_ to_fp 11 53) RNE x) ((_ to_fp 11 53) RNE x)))) \
@@ -619,15 +630,14 @@ fn to_fp_const_real_reflexive_unsat() {
 
 #[test]
 fn to_fp_bv_crossing_and_symbolic_real_are_unknown() {
-    // Every still-fenced conversion → Unknown (soundness: BV-crossing waits for Plan 4;
-    // symbolic-Real / fp.to_real are the deferred Real bridge).
+    // Remaining still-fenced conversions → Unknown (soundness: BV→FP bitcast
+    // (FpFromBits / 1-arg to_fp) is admitted as of slice 4c — see the slice-4c
+    // end-to-end block above; signed-int 2-arg BV→FP still waits for a later
+    // slice; symbolic-Real / fp.to_real are the deferred Real bridge).
     let scripts = [
         // symbolic-Real to_fp
         "(declare-fun r () Real) (declare-fun z () Float32) \
          (assert (fp.eq z ((_ to_fp 8 24) RNE r))) (check-sat)",
-        // bitcast from BV (1-arg to_fp)
-        "(declare-fun b () (_ BitVec 32)) (declare-fun z () Float32) \
-         (assert (fp.eq z ((_ to_fp 8 24) b))) (check-sat)",
         // signed-int BV → FP (2-arg to_fp with BV operand)
         "(declare-fun b () (_ BitVec 32)) (declare-fun z () Float32) \
          (assert (fp.eq z ((_ to_fp 8 24) RNE b))) (check-sat)",
@@ -675,4 +685,58 @@ fn mixed_bv_and_fp_unsat() {
 (check-sat)";
     let (o, _) = run(src);
     assert_eq!(o, SolveOutcome::Unsat, "contradictory BV side makes the mixed query UNSAT");
+}
+
+// ── Slice-4c end-to-end: BV→FP bitcast (FpFromBits + 1-arg to_fp) ───────────
+#[test]
+fn fp_from_bits_known_value_sat() {
+    // (fp #b0 #b11111111 #b0…0) is +oo. Pins the field layout semantically:
+    // sign=0 (MSB), exp=all-ones, sig=0. A wrong concat order would break this.
+    let src = "\
+(declare-fun z () (_ FloatingPoint 8 24))
+(assert (fp.eq z (fp #b0 #b11111111 #b00000000000000000000000)))
+(assert (fp.isInfinite z))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat, "(fp 0 all-ones 0) is +oo");
+}
+
+#[test]
+fn fp_from_bits_sign_bit_is_msb_unsat() {
+    // Same pattern but sign=1 → -oo, which is fp.eq-distinct from +oo → UNSAT.
+    let src = "\
+(assert (fp.eq (fp #b1 #b11111111 #b00000000000000000000000) (_ +oo 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Unsat, "sign bit is the MSB: (fp 1 …) is -oo, not +oo");
+}
+
+#[test]
+fn fp_from_bits_symbolic_child_sat_with_model() {
+    // Symbolic BV sign feeding an FP atom; get-model surfaces both the BV child
+    // and the resulting FP var.
+    let src = "\
+(declare-fun s () (_ BitVec 1))
+(declare-fun z () (_ FloatingPoint 8 24))
+(assert (fp.eq z (fp s #b11111111 #b00000000000000000000000)))
+(assert (fp.isInfinite z))
+(check-sat)
+(get-model)";
+    let (o, model) = run(src);
+    assert_eq!(o, SolveOutcome::Sat, "∃ sign bit making (fp s all-ones 0) infinite");
+    assert!(model.contains("s"), "model surfaces the symbolic BV child");
+    assert!(model.contains("z"), "model surfaces the FP var");
+}
+
+#[test]
+fn to_fp_1arg_bitcast_known_value_sat() {
+    // 0x7f800000 is the IEEE-754 bit pattern for +oo (float32). The 1-arg
+    // to_fp reinterprets it; isInfinite must hold.
+    let src = "\
+(declare-fun b () (_ BitVec 32))
+(assert (= b #x7f800000))
+(assert (fp.isInfinite ((_ to_fp 8 24) b)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat, "0x7f800000 bitcasts to +oo");
 }
