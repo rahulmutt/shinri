@@ -155,6 +155,23 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
     assertions.iter().any(|&a| walk(ctx, a, &fp_set, &mut visited))
 }
 
+/// Third-theory fence for the lifted mixed BV+FP path (slice 4b). Returns true
+/// if any Bool-sorted atom is NEITHER a collected FP atom NOR a collected BV
+/// atom NOR pure Boolean structure (i.e. an arrays/LIA/EUF atom) — such a query
+/// still fences to `Unknown`. Generalizes `has_non_fp_theory_atom` from the FP
+/// set to the BV∪FP allow-set by delegating to it with the union.
+pub fn has_non_bvfp_theory_atom(
+    ctx: &Context,
+    assertions: &[TermId],
+    fp_atoms: &[TermId],
+    bv_atoms: &[TermId],
+) -> bool {
+    let mut union: Vec<TermId> = Vec::with_capacity(fp_atoms.len() + bv_atoms.len());
+    union.extend_from_slice(fp_atoms);
+    union.extend_from_slice(bv_atoms);
+    has_non_fp_theory_atom(ctx, assertions, &union)
+}
+
 /// Positively-enumerated check: is an FP-sorted `word` term one that
 /// `shinri_fp::FpBlaster::blast_word` can handle in slice 1 (FpAbs/FpNeg),
 /// slice 2a (FpAdd/FpSub), slice 2b (FpMul), slice 2c (FpDiv), slice 2c′ (FpSqrt),
@@ -558,5 +575,37 @@ mod tests {
         let isn4 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[bv_conv]).unwrap();
         assert!(!fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn4])),
                 "BV-operand to_fp must stay fenced (signed-int->FP is Plan 4)");
+    }
+
+    #[test]
+    fn bvfp_union_passes_but_third_theory_fences() {
+        let mut ctx = Context::new();
+        // FP atom.
+        let x = fp_var(&mut ctx, "x");
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
+        // BV atom.
+        let bvs = ctx.bv_sort(8);
+        let bf = ctx.declare_fun("b", &[], bvs);
+        let bvar = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
+        let one = ctx.mk_bv_const(8, Integer::from(1u64));
+        let ult = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[bvar, one]).unwrap();
+
+        let fp_atoms = collect_fp_atoms(&ctx, &[isnan, ult]);
+        let bv_atoms = crate::bv_stage::collect_bv_atoms(&ctx, &[isnan, ult]);
+        // Mixed BV+FP (no crossing op) is NOT fenced by the union predicate.
+        assert!(!has_non_bvfp_theory_atom(&ctx, &[isnan, ult], &fp_atoms, &bv_atoms),
+                "pure-BV + pure-FP atoms are allowed together");
+
+        // Add a Real (arith) atom → fenced.
+        let real = ctx.real_sort();
+        let rf = ctx.declare_fun("r", &[], real);
+        let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
+        let zero = ctx.mk_numeral(shinri_core::Rational::zero(), real);
+        let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[r, zero]).unwrap();
+        let asserts = vec![isnan, ult, gt];
+        let fp2 = collect_fp_atoms(&ctx, &asserts);
+        let bv2 = crate::bv_stage::collect_bv_atoms(&ctx, &asserts);
+        assert!(has_non_bvfp_theory_atom(&ctx, &asserts, &fp2, &bv2),
+                "a Real arith atom alongside BV+FP must fence");
     }
 }
