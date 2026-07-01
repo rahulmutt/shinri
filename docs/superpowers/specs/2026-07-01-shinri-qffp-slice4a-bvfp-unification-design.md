@@ -1,7 +1,7 @@
 # shinri QF_FP — Slice 4a: BVFP Lowering Unification (plumbing) Design
 
 **Date:** 2026-07-01
-**Status:** Approved design, pre-implementation
+**Status:** Landed 2026-07-01 — plumbing merged; mixed fence still closed; 4b (crossing ops) next.
 **Parent:** `2026-06-24-shinri-qffp-design.md` (Plan 4, "QF_BVFP unification")
 **Predecessor:** `2026-06-30-shinri-qffp-slice3a-conversions-design.md` (slice 3a landed)
 

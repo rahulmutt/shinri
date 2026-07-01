@@ -272,7 +272,7 @@ pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
     }
 }
 
-/// Blast all `fp_atoms` via one FpBlaster and return a `shinri_bv::Lowered`
+/// Blast all `fp_atoms` via the unified `Lowerer` and return a `shinri_bv::Lowered`
 /// (reused so the solver's `replay_bv_cnf` applies unchanged). `atom_lit` is
 /// keyed by the ORIGINAL atom TermId.
 pub fn lower(ctx: &mut Context, fp_atoms: &[TermId]) -> shinri_bv::Lowered {
