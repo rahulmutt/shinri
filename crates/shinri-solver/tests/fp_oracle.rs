@@ -919,3 +919,111 @@ fn differential_qf_fp_to_fp() {
     println!("differential_qf_fp_to_fp: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
     assert!(n_sat > 0 && n_unsat > 0, "oracle produced no SAT/UNSAT coverage");
 }
+
+/// One mixed BV+FP script: a BV comparison AND an FP comparison over
+/// independently-declared vars (no crossing conversion — slice 4b's fence
+/// only lifted for non-crossing mixed queries). Both sides are forwarded to
+/// z3 verbatim by `z3_outcome_mixed`.
+fn gen_mixed_script(rng: &mut Lcg) -> String {
+    // Reuse the FP32 special-form constant pool the other generators use.
+    let a = FP32_SPECIALS[rng.below(FP32_SPECIALS.len() as u64) as usize];
+    let b = FP32_SPECIALS[rng.below(FP32_SPECIALS.len() as u64) as usize];
+    // BV side: an 8-bit unsigned comparison against a random constant.
+    let k = (rng.next() & 0xff) as u8;
+    const FP_RELS: &[&str] = &["fp.lt", "fp.leq", "fp.gt", "fp.geq", "fp.eq"];
+    const BV_RELS: &[&str] = &["bvult", "bvule", "bvugt", "bvuge"];
+    let fp_rel = FP_RELS[rng.below(FP_RELS.len() as u64) as usize];
+    let bv_rel = BV_RELS[rng.below(BV_RELS.len() as u64) as usize];
+    format!(
+        "(declare-fun bx () (_ BitVec 8))\n\
+         (declare-fun fa () (_ FloatingPoint 8 24))\n\
+         (declare-fun fb () (_ FloatingPoint 8 24))\n\
+         (assert (= fa {a}))\n\
+         (assert (= fb {b}))\n\
+         (assert (and ({bv_rel} bx #x{k:02x}) ({fp_rel} fa fb)))\n\
+         (check-sat)\n"
+    )
+}
+
+/// Feed a mixed BV+FP script to z3 via easy_smt using `QF_BVFP` (mixed-capable
+/// logic), NOT `QF_FP`. Empirically, z3 4.16.0 rejects `(declare-fun bx ()
+/// (_ BitVec 8))` under `(set-logic QF_FP)` with `(error "unknown sort
+/// 'BitVec'")`, which would silently drop every mixed script into the
+/// "z3 unknown" arm and make the differential test a false pass. `QF_BVFP`
+/// is a real z3 logic and accepts both sorts (confirmed manually: a script
+/// declaring `bx : BitVec 8` and `fa,fb : Float32` under `QF_BVFP` returns a
+/// concrete `sat`, exit code 0, whereas the same script under `QF_FP` errors
+/// before reaching `check-sat`). This is a SIBLING to `z3_outcome_arith` so
+/// the existing pure-FP oracle callers (`differential_qf_fp_add_sub`,
+/// `differential_qf_fp_rounding_free`, etc.) keep using `QF_FP` unchanged.
+fn z3_outcome_mixed(ctx: &mut easy_smt::Context, src: &str) -> easy_smt::Response {
+    ctx.set_logic("QF_BVFP").expect("z3 set-logic failed");
+    for line in src.lines() {
+        let t = line.trim();
+        if t.starts_with("(declare-fun ") || t.starts_with("(assert ") {
+            let sexpr = ctx.atom(t);
+            ctx.raw_send(sexpr).expect("z3 send failed");
+            ctx.raw_recv().expect("z3 ack failed");
+        }
+    }
+    ctx.check().expect("z3 check-sat failed")
+}
+
+#[test]
+fn differential_qf_bvfp_mixed() {
+    let mut rng = Lcg(0xB0FE_1234);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    // Counts iterations where z3 returned a CONCRETE verdict (Sat or Unsat,
+    // not Unknown/error). Guards against the E2 false-pass: if z3 rejected
+    // every mixed script (e.g. wrong logic), this would stay 0 even though
+    // n_sat/n_unsat (computed from OUR outcomes) could still be > 0.
+    let mut n_z3_checked = 0usize;
+    for iter in 0..N_ITERS {
+        let src = gen_mixed_script(&mut rng);
+        let ours = shinri_outcome(&src);
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => unreachable!(),
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_mixed(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => {
+                n_z3_checked += 1;
+            }
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => {
+                n_z3_checked += 1;
+            }
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!(
+                "QF_BVFP MIXED SOUNDNESS DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n\
+                 script:\n{src}"
+            ),
+        }
+    }
+    println!(
+        "differential_qf_bvfp_mixed: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
+         z3_checked={n_z3_checked}"
+    );
+    assert!(
+        n_sat > 0,
+        "expected some SAT results ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
+    );
+    assert!(
+        n_unsat > 0,
+        "expected some UNSAT results ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
+    );
+    assert!(
+        n_z3_checked > 0,
+        "z3 never returned a concrete verdict — differential oracle did no real work"
+    );
+}
