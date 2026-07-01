@@ -1027,3 +1027,75 @@ fn differential_qf_bvfp_mixed() {
         "z3 never returned a concrete verdict — differential oracle did no real work"
     );
 }
+
+/// One BV→FP bitcast script: constrain a 32-bit BV var to a value, bitcast it to
+/// Float32 two ways — `(fp sign exp sig)` slicing the BV, and 1-arg `to_fp` of
+/// the whole BV — and relate the results with a random FP relation. Exercises
+/// both bitcast faces against z3 under QF_BVFP.
+fn gen_bitcast_script(rng: &mut Lcg) -> String {
+    // A concrete 32-bit pattern (favor special-adjacent values for coverage).
+    let hi = (rng.next() & 0xffff) as u32;
+    let lo = (rng.next() & 0xffff) as u32;
+    let word = (hi << 16) | lo;
+    const FP_RELS: &[&str] = &["fp.lt", "fp.leq", "fp.gt", "fp.geq", "fp.eq"];
+    let fp_rel = FP_RELS[rng.below(FP_RELS.len() as u64) as usize];
+    // Slice the 32-bit constant into sign(1) / exp(8) / sig(23) literal fields
+    // so the (fp …) form and the 1-arg to_fp form describe the SAME value.
+    let sign = (word >> 31) & 0x1;
+    let exp = (word >> 23) & 0xff;
+    let sig = word & 0x7f_ffff;
+    format!(
+        "(declare-fun b () (_ BitVec 32))\n\
+         (declare-fun p () (_ FloatingPoint 8 24))\n\
+         (declare-fun q () (_ FloatingPoint 8 24))\n\
+         (assert (= b (_ bv{word} 32)))\n\
+         (assert (= p (fp (_ bv{sign} 1) (_ bv{exp} 8) (_ bv{sig} 23))))\n\
+         (assert (= q ((_ to_fp 8 24) b)))\n\
+         (assert ({fp_rel} p q))\n\
+         (check-sat)\n"
+    )
+}
+
+#[test]
+fn differential_qf_bvfp_bitcast() {
+    let mut rng = Lcg(0x4C_B17_CA5);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    let mut n_z3_checked = 0usize;
+    for iter in 0..N_ITERS {
+        let src = gen_bitcast_script(&mut rng);
+        let ours = shinri_outcome(&src);
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => unreachable!(),
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_mixed(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_z3_checked += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_z3_checked += 1,
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!(
+                "QF_BVFP BITCAST SOUNDNESS DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n\
+                 script:\n{src}"
+            ),
+        }
+    }
+    println!(
+        "differential_qf_bvfp_bitcast: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
+         z3_checked={n_z3_checked}"
+    );
+    assert!(
+        n_sat > 0 && n_unsat > 0,
+        "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
+    );
+    assert!(n_z3_checked > 0, "z3 never returned a concrete verdict — check the logic/harness");
+}
