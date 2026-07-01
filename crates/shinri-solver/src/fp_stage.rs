@@ -458,5 +458,13 @@ mod tests {
         let isn3 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[sym]).unwrap();
         assert!(!fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn3])),
                 "symbolic-Real to_fp must stay fenced");
+        // BV-operand to_fp NOT supported (signed-int→FP, Plan 4+).
+        let bvs = ctx.bv_sort(32);
+        let bvf = ctx.declare_fun("bv", &[], bvs);
+        let bv = ctx.mk_app(Op::Uninterpreted(bvf), &[]).unwrap();
+        let bv_conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
+        let isn4 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[bv_conv]).unwrap();
+        assert!(!fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn4])),
+                "BV-operand to_fp must stay fenced (signed-int->FP is Plan 4)");
     }
 }
