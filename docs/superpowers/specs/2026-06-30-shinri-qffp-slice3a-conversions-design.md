@@ -1,7 +1,15 @@
 # shinri QF_FP — Slice 3a Design: non-BV `to_fp` conversions + symbolic-Real fence
 
 **Date:** 2026-06-30
-**Status:** Approved design, pre-implementation
+**Status:** **Landed** (2026-07-01) — opens Plan 3. All 7 plan tasks implemented, reviewed,
+and verified: exhaustive `(5,11)↔(3,5)` both-directions + f64→f32 circuit gate bit-identical
+vs `ref_to_fp_fp`; z3 differential oracle (sat=51/unsat=9/0-disagreement); full workspace
+regression `EXIT=0` (shinri-fp lib 63/0, fp_e2e 46/0, no canary flipped). Two verified
+soundness corrections beyond the plan text: a sort-gate on the nullary-UF fence arm (a
+symbolic-Real `to_fp` operand would otherwise panic), and a pre-existing BV+FP mixed-fence
+hole (`(= (fp.to_sbv x) bv0)` panicked instead of `Unknown`) fixed at user request. Deferred
+follow-up (non-blocking, per final review): a targeted significand-widen-with-exponent-narrow
+format case (e.g. `(8,24)→(5,24)`) — soundness already holds by the decoupled-axis argument.
 **Scope:** The first slice of **Plan 3 (conversions + Real fence)**. Admits the two
 operand kinds of `to_fp` that stay entirely inside the FP substrate — **FP→FP**
 (re-round) and **constant-Real→FP** (fold) — and refines the slice-1 stand-in fence
