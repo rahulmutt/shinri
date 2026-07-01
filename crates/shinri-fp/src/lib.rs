@@ -276,14 +276,16 @@ pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
 /// (reused so the solver's `replay_bv_cnf` applies unchanged). `atom_lit` is
 /// keyed by the ORIGINAL atom TermId.
 pub fn lower(ctx: &mut Context, fp_atoms: &[TermId]) -> shinri_bv::Lowered {
-    let mut fb = FpBlaster::new();
+    let mut lw = crate::lower::Lowerer::new();
     let mut atom_lit: FxHashMap<TermId, BitLit> = FxHashMap::default();
     for &atom in fp_atoms {
-        let lit = fb.blast_atom(ctx, atom);
+        let lit = lw.atom(ctx, atom);
         atom_lit.insert(atom, lit);
     }
-    let var_bits = fb.exported_var_bits();
-    shinri_bv::Lowered { cnf: fb.b.finish(), atom_lit, var_bits }
+    // Pure-FP list: bv side is empty; take the FP map into Lowered.var_bits.
+    let (_bv_vars, fp_vars) = lw.var_bits_split(ctx);
+    debug_assert!(_bv_vars.is_empty(), "pure-FP lower produced no BV vars");
+    shinri_bv::Lowered { cnf: lw.b.finish(), atom_lit, var_bits: fp_vars }
 }
 
 #[cfg(test)]
