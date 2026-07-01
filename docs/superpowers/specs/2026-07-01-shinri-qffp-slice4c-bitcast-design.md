@@ -9,7 +9,8 @@ pure-BV+pure-FP fence-lift)
 ## 1. Goal & Scope
 
 Admit the first BV↔FP **crossing** conversion: BV→FP bit reinterpretation over
-**symbolic** BV operands. Two faces, both pure bit-wiring — no rounding, no
+BV operands (constant or symbolic alike — see §4). Two faces, both pure
+bit-wiring — no rounding, no
 special-value (NaN/Inf/range) logic. The result FP word *is* the source bits.
 
 **In scope:**
@@ -84,9 +85,15 @@ unchanged.
 - **`is_fp_op`** already lists `FpFromBits` and `ToFp`, so `solver_uses_fp`
   fires unchanged; no change to the top-level dispatch in `lib.rs`.
 
-Const-fold preservation: a `(fp …)` with all-literal BV args continues to fold
-via `mk_fp_const` into a `ConstVal::Float` and blasts through the FP-const arm —
-byte-identical to today. Only symbolic-arg `(fp …)` reaches the new gadget.
+**Literal args are NOT a special case.** Unlike the five indexed special forms
+(`(_ +oo eb sb)` etc.), the `(fp …)` triple does *not* fold to a
+`ConstVal::Float` — the parser builds `FpFromBits` with const-BV children for
+both literal and symbolic args (see fp_e2e.rs:51-57), so today *every* `(fp …)`
+fences to `Unknown`. The gadget therefore handles both uniformly: a const-BV
+child blasts to constant bit-lits through `blast_bv_word`, a symbolic child to
+fresh vars. `(fp #b0 #b0111 #b000)` yields a fully-constant FP word — no
+separate folding path, and previously-`Unknown` literal-triple queries now solve
+(a strict expansion of the admit-set, not a regression).
 
 ## 5. Reference model & validation
 
@@ -131,7 +138,7 @@ byte-identical to today. Only symbolic-arg `(fp …)` reaches the new gadget.
 | Direction | BV→FP only — no FP→BV bitcast op exists in SMT-LIB |
 | Gadget placement | `blast_fp_word` arms; BV children blast through the existing sort-dispatched `Lowerer::word` |
 | BV-child support | None recursive — BV blaster is total; a BV-sort check suffices, nested crossings stay fenced |
-| Const `(fp …)` | Unchanged — folds via `mk_fp_const`; only symbolic args hit the gadget |
+| Literal `(fp …)` | Not special-cased — `FpFromBits` for both literal & symbolic args; const children blast to constant bit-lits (literal triples, `Unknown` today, now solve) |
 | Bit order | LSB-first `sig ++ exp ++ sign`, matching the FP-const packing |
 | Fence edit | Remove `FpFromBits` + `ToFp` `1 =>` from `uses_crossing_conversion`; add the two `is_supported_fp_word` arms |
 | Success criterion | Byte-identical existing verdicts + remaining crossing canaries still `Unknown` + symbolic bitcast solves & agrees with z3 |
