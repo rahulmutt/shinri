@@ -12,7 +12,7 @@ use crate::reference::{field, round_rational, RoundMode};
 use shinri_num::Rational;
 
 /// Sign-extend a signed word `x` (LSB→MSB) to width `to` by replicating its MSB.
-fn sign_extend(b: &Blaster, x: &[BitLit], to: usize) -> Vec<BitLit> {
+fn sign_extend(_b: &Blaster, x: &[BitLit], to: usize) -> Vec<BitLit> {
     let msb = *x.last().unwrap();
     let mut out = x.to_vec();
     while out.len() < to { out.push(msb); }
