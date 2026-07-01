@@ -61,7 +61,7 @@ pub fn ref_fp_from_bits(eb: u32, sb: u32, sign: u64, exp: &Integer, sig: &Intege
     let pow = |k: u32| {
         let mut m = Integer::one();
         for _ in 0..k {
-            m = m * two.clone();
+            m *= two.clone();
         }
         m
     };

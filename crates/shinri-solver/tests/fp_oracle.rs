@@ -1033,7 +1033,7 @@ fn differential_qf_bvfp_mixed() {
 /// the whole BV — and relate the results with a random FP relation. Exercises
 /// both bitcast faces against z3 under QF_BVFP.
 fn gen_bitcast_script(rng: &mut Lcg) -> String {
-    // A concrete 32-bit pattern (favor special-adjacent values for coverage).
+    // A uniform-random 32-bit pattern (full field coverage — observed sat/unsat/z3-checked all > 0).
     let hi = (rng.next() & 0xffff) as u32;
     let lo = (rng.next() & 0xffff) as u32;
     let word = (hi << 16) | lo;

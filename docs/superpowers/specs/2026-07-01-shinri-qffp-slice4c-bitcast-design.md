@@ -1,7 +1,11 @@
 # shinri QF_FP — Slice 4c: BV→FP bitcast (`FpFromBits` + 1-arg `to_fp`)
 
 **Date:** 2026-07-01
-**Status:** Approved design, pre-implementation
+**Status:** Landed — both bitcast faces (`FpFromBits` + 1-arg `to_fp`) admitted as pure
+BV→FP bit-wiring; the 1-arg-bitcast crossing canary repointed and all other crossing faces
+still fenced to `Unknown`. Verified: full workspace green (shinri-fp exhaustive 69/0, fp_e2e
+52/0), full z3 oracle 12/12 zero disagreements (new `differential_qf_bvfp_bitcast`
+z3_checked=200/200), clippy net-new-zero.
 **Plan:** 4 (BV↔FP crossing conversions), first admitted conversion
 **Predecessors:** slice 4a (unified `Lowerer`/`WordSink`), slice 4b (mixed
 pure-BV+pure-FP fence-lift)
