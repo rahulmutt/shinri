@@ -214,17 +214,28 @@ pub fn blast_fp_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
                         // so the BV word IS the FP word — passthrough.
                         sink.word(ctx, kids[0])
                     } else {
-                        // 2-arg (RM, X), X = Float (FP→FP re-round) | const Real (fold).
-                        // BV / symbolic-Real sources stay fenced (later slices).
+                        // 2-arg (RM, X), X = Float (FP→FP re-round) | const Real (fold)
+                        // | BV (signed int→FP, slice 4d). Symbolic-Real stays fenced.
                         let rm = blast_rm(sink, ctx, kids[0]);
                         if let Some(q) = ctx.const_real_value(kids[1]) {
                             crate::convert::to_fp_real_const(sink.blaster(), &q, eb, sb, &rm)
+                        } else if ctx.bv_width(ctx.sort_of(kids[1])).is_some() {
+                            // Signed int→FP: the BV child blasts through the
+                            // sort-dispatched sink (requires the unified Lowerer).
+                            let xw = sink.word(ctx, kids[1]);
+                            crate::convert::to_fp_int(sink.blaster(), &xw, true, eb, sb, &rm)
                         } else {
                             let (eb_s, sb_s) = ctx.fp_widths(ctx.sort_of(kids[1])).expect("FP source operand");
                             let xw = sink.word(ctx, kids[1]);
                             crate::convert::to_fp_fp(sink.blaster(), &xw, eb_s, sb_s, eb, sb, &rm)
                         }
                     }
+                }
+                ToFpUnsigned { .. } => {
+                    // Unsigned int→FP (slice 4d): (RM, bv) — same gadget, no sign step.
+                    let rm = blast_rm(sink, ctx, kids[0]);
+                    let xw = sink.word(ctx, kids[1]);
+                    crate::convert::to_fp_int(sink.blaster(), &xw, false, eb, sb, &rm)
                 }
                 other => unreachable!("blast_word: FP op {other:?} is out of slice-1 scope"),
             }
@@ -383,6 +394,39 @@ mod lower_tests {
         let fw = lw.word(&ctx, cast);
 
         assert_eq!(fw, bw, "1-arg to_fp reinterprets the same bits verbatim");
+    }
+
+    #[test]
+    fn to_fp_2arg_bv_source_blasts_to_fp_width() {
+        // Signed int→FP: routes the BV child through the sort-dispatched sink and
+        // returns an eb+sb word. (Value correctness is pinned by the convert.rs
+        // exhaustive gates and the e2e tests — this drives the dispatch arm.)
+        let mut ctx = Context::new();
+        let bv8 = ctx.bv_sort(8);
+        let bf = ctx.declare_fun("b", &[], bv8);
+        let b = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, b]).unwrap();
+
+        let mut lw = Lowerer::new();
+        let bw = lw.word(&ctx, b);
+        let fw = lw.word(&ctx, conv);
+        assert_eq!(bw.len(), 8, "BV child is 8 bits");
+        assert_eq!(fw.len(), 32, "signed int→FP result is eb+sb bits");
+    }
+
+    #[test]
+    fn to_fp_unsigned_blasts_to_fp_width() {
+        let mut ctx = Context::new();
+        let bv8 = ctx.bv_sort(8);
+        let bf = ctx.declare_fun("b", &[], bv8);
+        let b = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }), &[rne, b]).unwrap();
+
+        let mut lw = Lowerer::new();
+        let fw = lw.word(&ctx, conv);
+        assert_eq!(fw.len(), 32, "unsigned int→FP result is eb+sb bits");
     }
 
     #[test]
