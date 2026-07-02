@@ -581,6 +581,9 @@ impl Solver {
                 // BV model extraction: for each declared BV constant with recorded
                 // SAT vars, read each var's assignment and pack into a ModelVal::BitVec.
                 for (&term, sat_vars) in &self.bv_var_bits {
+                    if self.word_norm.internal.contains(&term) {
+                        continue; // slice 5: internal ite! symbols never reach models
+                    }
                     let width = sat_vars.len() as u32;
                     // Read each bit from the SAT model (LSB→MSB order).
                     // If a var is unassigned (rare — rewrite eliminated it), default to false.
@@ -594,6 +597,9 @@ impl Solver {
                 }
                 // FP model extraction: pack each FP constant's bits into ModelVal::Float.
                 for (&term, sat_vars) in &self.fp_var_bits {
+                    if self.word_norm.internal.contains(&term) {
+                        continue; // slice 5: internal ite! symbols never reach models
+                    }
                     let width = sat_vars.len() as u32;
                     let bits_bool: Vec<bool> = sat_vars
                         .iter()

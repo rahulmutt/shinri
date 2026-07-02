@@ -1024,3 +1024,15 @@ fn rm_ite_steers_rounding_sat_twin() {
     );
     assert_eq!(o, SolveOutcome::Sat); // c = true → RNE → exact 1.0
 }
+
+#[test]
+fn model_never_leaks_ite_internals() {
+    let (o, model) = run(
+        "(declare-const c Bool)(declare-const x Float32)(declare-const y Float32)\
+         (assert (fp.isNaN (ite c x y)))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(!model.contains("ite!"), "internal ite symbols leaked into get-model: {model}");
+    // The user constants still get values.
+    assert!(model.contains("(x "), "user constant x missing from model: {model}");
+}
