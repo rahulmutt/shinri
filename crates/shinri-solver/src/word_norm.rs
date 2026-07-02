@@ -15,7 +15,7 @@
 //! INVARIANTS (load-bearing; see design doc §4):
 //! - A term with no rewritten subterm is returned with its ORIGINAL TermId —
 //!   downstream stages key on TermIds.
-//! - Other sorts (Bool/Int/Real/Array/String) pass through untouched.
+//! - Other sorts (Bool/Int/Real/Array/String) pass through untouched EXCEPT n-ary `=`/`distinct`, which expands for every sort (slice 6); their ites are never eliminated here.
 //! - Fresh names `ite!<n>` are probed against the symbol table so they can
 //!   never alias a user symbol; model filtering keys on the `internal`
 //!   TermId set, never on the name.

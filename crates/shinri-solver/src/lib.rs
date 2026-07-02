@@ -424,7 +424,7 @@ impl Solver {
                 None
             };
 
-        // Lower n-ary distinct to pairwise binary up front (needs &mut ctx).
+        // Lower the assertions (arith =/distinct rewrites, Le/Ge companions; needs &mut ctx).
         // This never sees n-ary =/distinct at all now: word_norm (above) expands every sort to binary (slice 6); the arms below are defense in depth.
         let lowered: Vec<TermId> = assertions.into_iter().map(|a| self.lower(a)).collect();
 
