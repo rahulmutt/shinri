@@ -318,3 +318,29 @@ fn nullary_define_fun_bare_symbol_solves() {
     );
     assert_eq!(out, vec!["unsat"]);
 }
+
+#[test]
+fn string_nary_eq_compound_and_wrapper_not_wrong_sat() {
+    // C1 (slice 6): word_norm expands n-ary String = into (and (= a b) (= b c)),
+    // which the string self-check used to skip (it only walked top-level atoms),
+    // letting a spurious model slip through as SAT. z3 says UNSAT; the fixed
+    // self-check now descends the positive And chain and downgrades to a SOUND
+    // `unknown` (it must NOT answer sat).
+    let out = run_script(
+        "(declare-const s1 String)(declare-const s3 String)\
+         (assert (= (str.++ s3 \"a\") (str.++ s1 \"b\") (str.++ s3 \"b\")))(check-sat)",
+    );
+    assert_ne!(out, vec!["sat"], "C1 soundness: string n-ary = must not be SAT");
+    assert_eq!(out, vec!["unknown"]);
+
+    // Binary-written twin: the same constraint split into two top-level binary
+    // equalities. Each is a bare top-level atom the self-check already caught;
+    // it must reach the same non-SAT verdict (z3: unsat).
+    let twin = run_script(
+        "(declare-const s1 String)(declare-const s3 String)\
+         (assert (= (str.++ s3 \"a\") (str.++ s1 \"b\")))\
+         (assert (= (str.++ s1 \"b\") (str.++ s3 \"b\")))(check-sat)",
+    );
+    assert_ne!(twin, vec!["sat"], "C1 soundness: binary twin must not be SAT");
+    assert_eq!(twin, vec!["unknown"]);
+}

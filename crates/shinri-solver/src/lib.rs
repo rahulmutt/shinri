@@ -757,9 +757,20 @@ impl Solver {
             }
             true
         };
-        for &a in assertions {
-            // Unwrap a single top-level `(not …)`.
+        // Collect and check every atom asserted true at the top level,
+        // descending through POSITIVE `And` chains: the conjuncts of an asserted
+        // `And` are all asserted true, so it is sound to check each. word_norm
+        // wraps expanded n-ary (dis)equalities in `(and …)`, so without this
+        // descent those atoms would be skipped (the C1 self-check bypass). We do
+        // NOT descend `Or`/`Not`: only a single top-level `Not` is unwrapped
+        // once (the atom is then asserted false) and never recursed under.
+        let mut worklist: Vec<TermId> = assertions.to_vec();
+        while let Some(a) = worklist.pop() {
             match self.ctx.term_node(a) {
+                TermNode::App { op: Op::Builtin(BuiltinOp::And), args, .. } => {
+                    let kids = self.ctx.children(*args).to_vec();
+                    worklist.extend(kids);
+                }
                 TermNode::App { op: Op::Builtin(BuiltinOp::Not), args, .. } => {
                     let inner = self.ctx.children(*args)[0];
                     if !check_atom(inner, false) {

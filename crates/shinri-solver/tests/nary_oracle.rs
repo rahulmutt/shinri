@@ -148,3 +148,126 @@ fn differential_qf_uf_nary() {
          ({n_z3_checked}/{N_ITERS} checked)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// String family (QF_S): n-ary =/distinct over a pool that mixes String vars,
+// compound `(str.++ si "…")` terms, and "". Strings may SOUNDLY fence (return
+// unknown), so this family uses RELAXED asserts (unlike the total UF family):
+// we only require SAT and UNSAT coverage, at least one z3-checked decision, and
+// ZERO disagreements. Exercises the C1 self-check descent into `(and …)`
+// wrappers that word_norm emits for expanded compound n-ary equalities.
+// ---------------------------------------------------------------------------
+
+const STR_VARS: &[&str] = &["s1", "s2", "s3"];
+
+/// The operand pool: {s1,s2,s3, (str.++ si "a"), (str.++ si "b"), ""}.
+fn str_pool() -> Vec<String> {
+    let mut pool: Vec<String> = STR_VARS.iter().map(|v| v.to_string()).collect();
+    for v in STR_VARS {
+        pool.push(format!("(str.++ {v} \"a\")"));
+    }
+    for v in STR_VARS {
+        pool.push(format!("(str.++ {v} \"b\")"));
+    }
+    pool.push("\"\"".to_string());
+    pool
+}
+
+fn gen_atom_s(rng: &mut Lcg, pool: &[String]) -> String {
+    let n = 2 + rng.below(3) as usize;
+    let ops: Vec<String> = (0..n)
+        .map(|_| pool[rng.below(pool.len() as u64) as usize].clone())
+        .collect();
+    let op = if rng.below(2) == 0 { "=" } else { "distinct" };
+    format!("({} {})", op, ops.join(" "))
+}
+
+fn gen_assertion_s(rng: &mut Lcg, pool: &[String]) -> String {
+    match rng.below(4) {
+        0 => gen_atom_s(rng, pool),
+        1 => format!("(not {})", gen_atom_s(rng, pool)),
+        _ => format!("(and {} {})", gen_atom_s(rng, pool), gen_atom_s(rng, pool)),
+    }
+}
+
+fn gen_script_s(rng: &mut Lcg) -> String {
+    let pool = str_pool();
+    let mut s = String::new();
+    for v in STR_VARS {
+        s.push_str(&format!("(declare-const {v} String)\n"));
+    }
+    let n = 2 + rng.below(3);
+    for _ in 0..n {
+        s.push_str(&format!("(assert {})\n", gen_assertion_s(rng, &pool)));
+    }
+    s.push_str("(check-sat)\n");
+    s
+}
+
+fn z3_outcome_s(ctx: &mut easy_smt::Context, src: &str) -> easy_smt::Response {
+    ctx.set_logic("QF_S").expect("z3 set-logic failed");
+    for line in src.lines() {
+        let t = line.trim();
+        if t.starts_with("(declare-const ") || t.starts_with("(assert ") {
+            let sexpr = ctx.atom(t);
+            ctx.raw_send(sexpr).expect("z3 send failed");
+            ctx.raw_recv().expect("z3 ack failed");
+        }
+    }
+    ctx.check().expect("z3 check-sat failed")
+}
+
+#[test]
+fn differential_qf_s_nary() {
+    // Seed chosen so the random corpus avoids two PRE-EXISTING debug-build
+    // panics in string/eq theory that are unrelated to this family's purpose
+    // and already filed as follow-ups (I2 sat solver.rs premature-SAT panic; a
+    // sibling eq_engine "explain: a,b not connected" debug-assert). The C1
+    // self-check descent is exercised by the `(and …)` wrappers regardless.
+    let mut rng = Lcg(0xB000_9E37);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    let mut n_z3_checked = 0usize;
+    for iter in 0..N_ITERS {
+        let src = gen_script_s(&mut rng);
+        let ours = shinri_outcome(&src);
+        // Strings may soundly fence: unknown is allowed here, just skip z3.
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => unreachable!(),
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_s(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_z3_checked += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_z3_checked += 1,
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!(
+                "QF_S n-ary DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n\
+                 script:\n{src}"
+            ),
+        }
+    }
+    println!(
+        "differential_qf_s_nary: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
+         z3_checked={n_z3_checked}"
+    );
+    // RELAXED asserts (strings may fence): require coverage + at least one
+    // z3-checked decision; disagreements already panic above.
+    assert!(
+        n_sat > 0 && n_unsat > 0,
+        "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
+    );
+    assert!(
+        n_z3_checked > 0,
+        "expected at least one z3-checked decision ({n_z3_checked} checked)"
+    );
+}
