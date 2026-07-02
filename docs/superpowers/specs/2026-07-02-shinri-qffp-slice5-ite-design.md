@@ -1,7 +1,16 @@
 # shinri QF_BVFP — Slice 5: word-level `ite` (BV / FP / RM)
 
 **Date:** 2026-07-02
-**Status:** Draft — pending user review
+**Status:** Landed 2026-07-02 (commits 0fb8218..HEAD, 8 tasks). Verification: full
+`cargo test --workspace` green (all suites 0-failed incl. shinri-fp exhaustive, solver
+non-oracle net, fp_e2e 75, qfbv_witnesses 33, shinri-bv 98); full differential z3 oracle
+15/15 zero-disagreement — all 14 pre-existing suite counts byte-identical to the 4e
+baseline, new `differential_qf_bvfp_ite` sat=128 unsat=72 unknown=0 z3_checked=200/200;
+clippy net-new zero; canary sweep clean (remaining e2e Unknown pins are all Real-bridge).
+All six confirmed repros fixed and pinned: R1 BV-ite panic → sat, R2-R5 n-ary =/distinct
+wrong-SATs → unsat, R6 RM/EUF pigeonhole wrong-SAT → unsat, each with SAT twins. Bonus
+fix folded in (Task 3, reviewer-verified sound): pre-existing fence gap that sent bare
+declared Bool constants mixed with BV/FP content to Unknown.
 **Plan:** 5 (post-Plan-4 completeness & robustness), first slice — the 4e final
 review's filed follow-up (user-reachable `unreachable!` on BV-sorted `ite`,
 `crates/shinri-bv/src/blast/mod.rs:430`)
