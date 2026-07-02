@@ -34,6 +34,21 @@ script never enters the FP path; the RM (dis)equality falls through to
 unbounded uninterpreted sort. The RM-equality admission this slice already
 needs (§5) is also the fix, so it is pulled into scope.
 
+Plan-time pre-flight (2026-07-02) then confirmed a further **wrong-SAT
+family** in the same seam: **n-ary `=` and n-ary `distinct` over BV and FP
+operands**. Four repros, all `sat` from shinri / `unsat` from z3:
+`(distinct x y z)` over `(_ BitVec 1)`; `(distinct a b c)` over three
+`fp.isZero`-pinned `(_ FloatingPoint 2 2)` vars; `(= x y z) ∧ (distinct x z)`
+over BV8; the same shape over Float32. Cause: `collect_bv_atoms` /
+`collect_fp_atoms` run BEFORE the solver's `lower` pass, which pairwise-expands
+n-ary `distinct` (all sorts) — so the expanded binary atoms are never blasted
+and Tseitin treats them as free Bool leaves (and n-ary `=` is blasted by a
+binary-only arm that silently ignores `kids[2..]`). The comment at the `lower`
+call site ("BV atoms pass through unchanged, so their TermIds are preserved")
+is false precisely for this family. Since the fix is the same
+run-a-rewrite-before-collection mechanism the ite elimination needs, it is
+pulled into this slice's pass.
+
 After this slice, none of those shapes fences, crashes, or lies. This closes
 the last non-Real incompleteness in QF_BV/QF_FP/QF_BVFP; the remaining fence
 is exactly the permanent v1 Real bridge (`fp.to_real`, symbolic-Real `to_fp`).
@@ -107,7 +122,14 @@ at once (pure-BV, mixed BVFP, and any stage that reuses `blast_bv_word` —
 e.g. an eliminated `ite` nested under a QF_ABV BV atom never reaches the
 blaster), and it makes the fence delta nearly zero.
 
-## 4. The elimination pass (`crates/shinri-solver/src/ite_elim.rs`)
+## 4. The normalization pass (`crates/shinri-solver/src/word_norm.rs`)
+
+One pass, two rewrites over word-sorted (BV/Float/RM) shapes: **ite
+elimination** and **n-ary `=`/`distinct` expansion** (adjacent-pair chain for
+`=`, pairwise conjunction for `distinct` — both producing binary atoms that
+the existing binary-only blast arms handle correctly, fixing the §1 wrong-SAT
+family). N-ary `=`/`distinct` over other sorts (Bool/arith/EUF) are left
+untouched — the later `lower` pass keeps handling them as today.
 
 Runs at the **top of `solve()`**, on the snapshot of the assertion stack,
 **before** `uses_fp` detection, atom collection, crossing/fence walks, and
@@ -247,7 +269,9 @@ SAT/UNSAT; RM-sorted ite observable through rounding; a mixed condition
 `get-model` on a SAT instance never mentions `ite!` symbols and evaluates the
 user constants correctly; and the confirmed soundness repro pinned UNSAT:
 `(declare-const r RoundingMode) (assert (distinct r RNE RNA RTP RTN RTZ))`
-plus its SAT twin with one literal dropped (5-ary distinct → `sat`).
+plus its SAT twin with one literal dropped (5-ary distinct → `sat`); and the
+four n-ary `=`/`distinct` repros from §1 pinned to their z3 verdicts, each
+with a SAT twin.
 
 **Differential z3 oracle:** new `differential_qf_bvfp_ite` suite — randomly
 generated nested ites over BV/FP/RM branches with mixed-atom conditions,
@@ -287,6 +311,7 @@ exhaustive suites are multi-minute); clippy net-new zero.
 | Decision | Choice |
 |---|---|
 | Mechanism | Term-level elimination to fresh symbol + defining assertion (approach A) |
+| N-ary `=`/`distinct` over BV/FP/RM | Expanded to binary in the same pass (chain / pairwise) — fixes the confirmed wrong-SAT family |
 | Sorts rewritten | BitVec, Float, RoundingMode only |
 | Conditions | Unrestricted Bool (connectives, nested atoms, shared skeleton vars) |
 | Definition shape | `(ite c (= w x) (= w y))`, top-level, per-check snapshot |
