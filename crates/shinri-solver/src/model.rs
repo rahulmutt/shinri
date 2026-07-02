@@ -127,6 +127,17 @@ pub(crate) fn format_modelval(v: &ModelVal) -> String {
                 format_bin_fixed(&sig, sb - 1),
             )
         }
+        ModelVal::Rm(rm) => {
+            use shinri_core::RoundingMode::*;
+            match rm {
+                Rne => "RNE",
+                Rna => "RNA",
+                Rtp => "RTP",
+                Rtn => "RTN",
+                Rtz => "RTZ",
+            }
+            .to_string()
+        }
     }
 }
 

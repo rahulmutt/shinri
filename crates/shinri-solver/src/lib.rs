@@ -68,6 +68,8 @@ pub struct Solver {
     /// FP model bits stashed after a FP-path solve: each FP variable term →
     /// its CNF-mapped SAT vars (LSB→MSB). Consumed by FP model extraction.
     fp_var_bits: rustc_hash::FxHashMap<TermId, Vec<shinri_core::Var>>,
+    /// RM-variable one-hot selectors, remapped to SAT-solver Lits (slice 6).
+    fp_rm_sels: rustc_hash::FxHashMap<TermId, [shinri_core::Lit; 5]>,
     /// Array models rendered after a QF_ABV SAT result: declared array constant
     /// TermId → pre-rendered SMT-LIB `store`-chain string. Cleared on non-ABV paths.
     abv_array_models: rustc_hash::FxHashMap<TermId, String>,
@@ -97,6 +99,7 @@ impl Solver {
             stage_b: true,
             bv_var_bits: rustc_hash::FxHashMap::default(),
             fp_var_bits: rustc_hash::FxHashMap::default(),
+            fp_rm_sels: rustc_hash::FxHashMap::default(),
             abv_array_models: rustc_hash::FxHashMap::default(),
             word_norm: crate::word_norm::WordNorm::default(),
         }
@@ -393,7 +396,7 @@ impl Solver {
         // are disjoint DAGs meeting only at the Boolean level, so this is two
         // independent blasting problems sharing one variable namespace. Pure-FP
         // takes an empty bv_atoms set and is byte-identical to the pre-4b path.
-        let lowered_fp: Option<shinri_bv::Lowered> =
+        let lowered_fp: Option<shinri_fp::MixedLowered> =
             if uses_fp {
                 let fp_atoms = crate::fp_stage::collect_fp_atoms(&self.ctx, &assertions);
                 let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
@@ -458,9 +461,17 @@ impl Solver {
         }
         match lowered_fp {
             Some(lo) => {
-                // Reuse replay_bv_cnf: it allocates a fresh contiguous var block,
-                // so FP and BV namespaces never collide.
-                let surrogates = self.replay_bv_cnf(&mut sat, lo);
+                let rm_sels = lo.rm_var_sels;
+                let surrogates = self.replay_bv_cnf(&mut sat, lo.words);
+                let base = surrogates.base;
+                self.fp_rm_sels = rm_sels
+                    .into_iter()
+                    .map(|(t, sel)| {
+                        (t, sel.map(|bl| {
+                            shinri_core::Lit::new(shinri_core::Var::new(base + bl.var), bl.pos)
+                        }))
+                    })
+                    .collect();
                 // Slice 4b: the mixed Lowered carries BOTH BV and FP variable
                 // words in one map; split by sort into the two decode maps.
                 // (Pure-FP: every entry is Float-sorted, so bv_var_bits stays
@@ -479,6 +490,7 @@ impl Solver {
             }
             None => {
                 self.fp_var_bits.clear();
+                self.fp_rm_sels.clear();
             }
         }
         let bv_atom_lit: Option<rustc_hash::FxHashMap<TermId, shinri_core::Lit>> =
@@ -611,6 +623,23 @@ impl Solver {
                     if let Some((eb, sb)) = self.ctx.fp_widths(self.ctx.sort_of(term)) {
                         use shinri_theory::types::ModelVal;
                         model.values.insert(term, ModelVal::Float { eb, sb, bits: packed });
+                    }
+                }
+                // RM variables: decode the one-hot selector (slice 6). Internal
+                // word_norm symbols are filtered exactly as in the BV/FP loops.
+                for (&term, sel) in &self.fp_rm_sels {
+                    if self.word_norm.internal.contains(&term) {
+                        continue;
+                    }
+                    let hot = sel.iter().position(|l| {
+                        let b = sat.value_of(l.var()).unwrap_or(false);
+                        if l.is_positive() { b } else { !b }
+                    });
+                    if let Some(i) = hot {
+                        use shinri_core::RoundingMode::*;
+                        let rm = [Rne, Rna, Rtp, Rtn, Rtz][i];
+                        use shinri_theory::types::ModelVal;
+                        model.values.insert(term, ModelVal::Rm(rm));
                     }
                 }
                 // Witness self-check (string path): the word-equation F-split can
@@ -767,6 +796,7 @@ impl Solver {
         crate::bv_stage::BvSurrogates {
             atom_to_lit,
             var_bits,
+            base,
         }
     }
 

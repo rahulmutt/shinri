@@ -118,6 +118,21 @@ impl Lowerer {
         }
         (bv, fp)
     }
+
+    /// RM-variable selectors: nullary uninterpreted RoundingMode-sorted terms
+    /// → their 5-lit one-hot selectors [Rne, Rna, Rtp, Rtn, Rtz]. The RM
+    /// mirror of `var_bits_split` (rm_cache is a separate store — slice 6).
+    pub fn rm_var_sels(&self, ctx: &Context) -> FxHashMap<TermId, [BitLit; 5]> {
+        let mut out = FxHashMap::default();
+        for (&tid, sel) in self.rm_cache.iter() {
+            if let TermNode::App { op: Op::Uninterpreted(_), args, .. } = ctx.term_node(tid) {
+                if ctx.children(*args).is_empty() {
+                    out.insert(tid, *sel);
+                }
+            }
+        }
+        out
+    }
 }
 
 #[cfg(test)]

@@ -1036,3 +1036,15 @@ fn model_never_leaks_ite_internals() {
     // The user constants still get values.
     assert!(model.contains("(x "), "user constant x missing from model: {model}");
 }
+
+#[test]
+fn rm_variable_gets_model_value() {
+    // Slice 6: RM variables were absent from get-model (their one-hot
+    // selectors live in rm_cache, which var_bits_split never visited).
+    let (o, model) = run(
+        "(declare-const r RoundingMode)\
+         (assert (= r RTZ))(check-sat)(get-model)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(model.contains("(r RTZ)"), "RM var missing/wrong in model: {model}");
+}

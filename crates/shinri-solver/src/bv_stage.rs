@@ -20,6 +20,10 @@ use shinri_core::{BuiltinOp, Context, Lit, Op, SortNode, TermId, TermNode, Var};
 pub struct BvSurrogates {
     pub atom_to_lit: FxHashMap<TermId, Lit>,
     pub var_bits: FxHashMap<TermId, Vec<Var>>,
+    /// First SAT `Var` index of this CNF's contiguous var block (slice 6:
+    /// lets callers remap other blaster-namespace `BitLit`s, e.g. RM
+    /// selectors, to SAT `Lit`s without re-deriving the block start).
+    pub base: u32,
 }
 
 /// True if `t`'s sort is a `(_ BitVec n)`.

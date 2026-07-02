@@ -384,11 +384,18 @@ pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
 /// (matching the pre-4b `shinri_fp::lower`). `atom_lit` is keyed by each
 /// ORIGINAL atom TermId. Without a crossing conversion the BV and FP DAGs are
 /// disjoint, so this is two independent blasting problems over one namespace.
+/// `lower_mixed`'s result: the word-level CNF plus the RM-variable one-hot
+/// selectors (slice 6 — model extraction needs them; they are not word bits).
+pub struct MixedLowered {
+    pub words: shinri_bv::Lowered,
+    pub rm_var_sels: FxHashMap<TermId, [BitLit; 5]>,
+}
+
 pub fn lower_mixed(
     ctx: &mut Context,
     fp_atoms: &[TermId],
     bv_atoms: &[TermId],
-) -> shinri_bv::Lowered {
+) -> MixedLowered {
     let mut lw = crate::lower::Lowerer::new();
     let mut atom_lit: FxHashMap<TermId, BitLit> = FxHashMap::default();
     // BV atoms FIRST (rewritten, as the pure-BV path does), keyed by ORIGINAL id.
@@ -406,14 +413,18 @@ pub fn lower_mixed(
     let (bv_vars, fp_vars) = lw.var_bits_split(ctx);
     let mut var_bits = bv_vars;
     var_bits.extend(fp_vars);
-    shinri_bv::Lowered { cnf: lw.b.finish(), atom_lit, var_bits }
+    let rm_var_sels = lw.rm_var_sels(ctx);
+    MixedLowered {
+        words: shinri_bv::Lowered { cnf: lw.b.finish(), atom_lit, var_bits },
+        rm_var_sels,
+    }
 }
 
 /// Pure-FP lowering: `lower_mixed` with no BV atoms. Byte-identical to the
 /// pre-4b pure-FP path — the BV set is empty, so `var_bits` is FP-only and the
 /// blast order (FP atoms, in order) is unchanged.
 pub fn lower(ctx: &mut Context, fp_atoms: &[TermId]) -> shinri_bv::Lowered {
-    lower_mixed(ctx, fp_atoms, &[])
+    lower_mixed(ctx, fp_atoms, &[]).words
 }
 
 #[cfg(test)]
@@ -653,7 +664,7 @@ mod lower_tests {
         let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[y]).unwrap();
 
-        let l = lower_mixed(&mut ctx, &[isnan], &[bv_eq]);
+        let l = lower_mixed(&mut ctx, &[isnan], &[bv_eq]).words;
         // Both atoms are surrogated.
         assert!(l.atom_lit.contains_key(&bv_eq), "BV atom surrogated");
         assert!(l.atom_lit.contains_key(&isnan), "FP atom surrogated");

@@ -123,6 +123,8 @@ pub enum ModelVal {
     /// A floating-point value: `(eb, sb, bits)` where `bits` is the W=eb+sb
     /// unsigned bit pattern, MSB→LSB `[sign | exp | trailing-sig]`.
     Float { eb: u32, sb: u32, bits: shinri_core::Integer },
+    /// A rounding-mode value (slice 6: RM variables get model entries).
+    Rm(shinri_core::RoundingMode),
 }
 
 /// A class-union that occurred, surfaced to consumers via `drain_merges`.
