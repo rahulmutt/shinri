@@ -47,6 +47,19 @@ fn symbolic_bits(b: &mut Blaster) -> (RmSel, [BitLit; 3]) {
     (RmSel { sel: [rne, rna, rtp, rtn, rtz] }, [e0, e1, e2])
 }
 
+/// Equality of two RoundingMode selectors. ONE-HOT PRECONDITION: both inputs
+/// must come from `literal`/`symbolic` (exactly one bit set); under that
+/// invariant the selected indices match iff some position has both bits set.
+/// Wrong for general (non-one-hot) words — do not reuse outside RM.
+pub fn eq(b: &mut Blaster, x: &RmSel, y: &RmSel) -> BitLit {
+    let mut acc = b.zero();
+    for i in 0..5 {
+        let both = b.and2(x.sel[i], y.sel[i]);
+        acc = b.or2(acc, both);
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -100,6 +113,11 @@ mod tests {
         vec![BitLit { var: bl.var, pos: val }]
     }
 
+    /// SAT-check `b`'s accumulated clauses with no extra pinning.
+    fn solve_ok(b: Blaster) -> bool {
+        matches!(solve_with(b, &[]), SolveResult::Sat)
+    }
+
     #[test]
     fn symbolic_is_exactly_one_hot_and_excludes_illegal() {
         // 1) The default (unpinned) symbolic RM yields a one-hot assignment.
@@ -149,5 +167,38 @@ mod tests {
             matches!(solve_with(b, &extra), SolveResult::Unsat { .. }),
             "two selectors cannot be simultaneously true"
         );
+    }
+
+    #[test]
+    fn rm_eq_literal_pairs_exhaustive() {
+        use shinri_core::RoundingMode::*;
+        // 5×5 literal pairs: the reified eq bit must be constant-true iff modes match.
+        for &m1 in &[Rne, Rna, Rtp, Rtn, Rtz] {
+            for &m2 in &[Rne, Rna, Rtp, Rtn, Rtz] {
+                let mut b = Blaster::new();
+                let x = literal(&b, m1);
+                let y = literal(&b, m2);
+                let e = eq(&mut b, &x, &y);
+                // Force e true and solve: SAT iff m1 == m2.
+                b.add_clause(&[e]);
+                let expect_sat = m1 == m2;
+                assert_eq!(solve_ok(b), expect_sat, "rm_eq({m1:?},{m2:?})");
+            }
+        }
+    }
+
+    #[test]
+    fn rm_eq_symbolic_vs_literal_forces_mode() {
+        use shinri_core::RoundingMode::*;
+        // (= r RTZ) with symbolic r: SAT, and asserting also (= r RNE) is UNSAT.
+        let mut b = Blaster::new();
+        let r = symbolic(&mut b);
+        let rtz = literal(&b, Rtz);
+        let rne = literal(&b, Rne);
+        let e1 = eq(&mut b, &r, &rtz);
+        let e2 = eq(&mut b, &r, &rne);
+        b.add_clause(&[e1]);
+        b.add_clause(&[e2]);
+        assert!(!solve_ok(b), "r cannot equal two distinct modes");
     }
 }

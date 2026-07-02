@@ -308,18 +308,33 @@ pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
     let kids = ctx.children(args).to_vec();
     match op {
         Op::Builtin(Eq) => {
-            // core = over Float operands (NaN-aware).
-            let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
-            let x = sink.word(ctx, kids[0]);
-            let y = sink.word(ctx, kids[1]);
-            crate::blast::compare::core_eq(sink.blaster(), &x, &y, eb, sb)
+            if matches!(ctx.sort_node(ctx.sort_of(kids[0])), shinri_core::SortNode::RoundingMode) {
+                // RM equality (slice 5): one-hot selector match. Reachable for
+                // user-written (= r RNE) and for word_norm's RM-ite definitions.
+                let x = blast_rm(sink, ctx, kids[0]);
+                let y = blast_rm(sink, ctx, kids[1]);
+                crate::rm::eq(sink.blaster(), &x, &y)
+            } else {
+                // core = over Float operands (NaN-aware).
+                let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
+                let x = sink.word(ctx, kids[0]);
+                let y = sink.word(ctx, kids[1]);
+                crate::blast::compare::core_eq(sink.blaster(), &x, &y, eb, sb)
+            }
         }
         Op::Builtin(Distinct) => {
-            let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
-            let x = sink.word(ctx, kids[0]);
-            let y = sink.word(ctx, kids[1]);
-            let eq = crate::blast::compare::core_eq(sink.blaster(), &x, &y, eb, sb);
-            sink.blaster().not1(eq)
+            if matches!(ctx.sort_node(ctx.sort_of(kids[0])), shinri_core::SortNode::RoundingMode) {
+                let x = blast_rm(sink, ctx, kids[0]);
+                let y = blast_rm(sink, ctx, kids[1]);
+                let e = crate::rm::eq(sink.blaster(), &x, &y);
+                sink.blaster().not1(e)
+            } else {
+                let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
+                let x = sink.word(ctx, kids[0]);
+                let y = sink.word(ctx, kids[1]);
+                let eq = crate::blast::compare::core_eq(sink.blaster(), &x, &y, eb, sb);
+                sink.blaster().not1(eq)
+            }
         }
         Op::Builtin(FpEq) => {
             let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operands");
