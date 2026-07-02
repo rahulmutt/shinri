@@ -1,12 +1,13 @@
-//! FP conversions (non-BV faces of to_fp): FP→FP re-round + constant-Real fold.
+//! FP conversions: FP→FP re-round, constant-Real fold, BV→FP, and FP→BV
+//! (`fp.to_ubv`/`fp.to_sbv`) via a single shift+sticky register.
 //! FP→FP: unpack → prenormalize → saturate exponent → static significand split →
 //! shared rounder → special mux. const-Real: fold round_rational, one-hot by RM.
 
 use shinri_bv::{BitLit, Blaster};
-use shinri_bv::blast::arith::{bvneg, bvsub};
+use shinri_bv::blast::arith::{bvadd, bvneg, bvsub};
 use crate::blast::operand::{to_operand, canon_nan_bits, inf_pattern_bits, signed_zero_bits};
 use crate::blast::normalize::{const_n, prenormalize};
-use crate::round::{exp_w, round, ExtFp};
+use crate::round::{exp_w, round, rounding_increment, shift_right_sticky, ExtFp};
 use crate::rm::RmSel;
 use crate::reference::{field, round_rational, RoundMode};
 use shinri_num::Rational;
@@ -191,6 +192,100 @@ pub fn to_fp_int(
     out
 }
 
+/// `((_ fp.to_ubv m) rm x)` (`signed_face = false`) and `((_ fp.to_sbv m) rm x)`
+/// (`signed_face = true`): round the real value of `x` to an integer per `rm`,
+/// THEN range-check the rounded integer (SMT-LIB; z3-verified in the slice-4e
+/// spec). Returns `(m-bit word, ok)`: `ok = 0` on NaN/±inf/out-of-range, in
+/// which case the word is FRESH UNCONSTRAINED bits (the SMT-LIB "unspecified
+/// value"; cross-application congruence is the dispatch layer's job, not ours).
+#[allow(clippy::needless_range_loop)] // indices are load-bearing: parallel-indexed words
+pub fn fp_to_int(
+    b: &mut Blaster, x: &[BitLit], eb: u32, sb: u32, m: u32, signed_face: bool, rm: &RmSel,
+) -> (Vec<BitLit>, BitLit) {
+    let mu = m as usize;
+    let sbu = sb as usize;
+    let ew = exp_w(eb);
+    let o = to_operand(b, x, eb, sb);
+
+    // --- 1. shift amount: amt = m - e (signed, width wa). Every in-range case
+    //     has e <= m-1 so amt >= 1; amt <= 0 (e >= m ⇒ |value| >= 2^m) is the
+    //     out-of-range short-circuit. wa holds m and e without wrap (same
+    //     width argument as to_fp_int's clamp). ---
+    let bits_for_m = (64 - (m as u64).leading_zeros()) as usize + 1;
+    let wa = ew.max(bits_for_m) + 1;
+    let e_wide = sign_extend(b, &o.exp, wa);
+    let m_const = const_n(b, wa, m as i128);
+    let amt = bvsub(b, &m_const, &e_wide);
+    let amt_neg = amt[wa - 1];
+    let mut amt_zero = b.one();
+    for &bit in &amt { let nb = b.not1(bit); amt_zero = b.and2(amt_zero, nb); }
+    let oor_high = b.or2(amt_neg, amt_zero);
+    // (amt < 0 reads as huge-unsigned in bvlshr → register drains to 0 with full
+    // sticky; harmless — oor_high overrides everything downstream.)
+
+    // --- 2. fixed-point register R = |value| · 2^P: [P = sb+1 fraction | m+1
+    //     integer] bits. sig placed at the top corresponds to e = m; shifting
+    //     right by amt = m - e aligns exactly, bits below R[0] fold into the
+    //     shift sticky. ---
+    let p = sbu + 1;
+    let wr = (mu + 1) + p;
+    let mut r0 = vec![b.zero(); wr];
+    for i in 0..sbu { r0[wr - sbu + i] = o.sig[i]; }
+    let (r, sticky_shift) = shift_right_sticky(b, &r0, &amt);
+
+    // --- 3. GRS + shared rounding increment on the magnitude. ---
+    let g = r[p - 1];
+    let rd = r[p - 2]; // p = sb+1 >= 3 for every real format
+    let mut s = sticky_shift;
+    for i in 0..(p - 2) { s = b.or2(s, r[i]); }
+    let int_part: Vec<BitLit> = r[p..].to_vec(); // m+1 bits
+    let inc = rounding_increment(b, o.sign, g, rd, s, int_part[0], rm);
+    let mut inc_w = vec![b.zero(); mu + 1];
+    inc_w[0] = inc;
+    let mag = bvadd(b, &int_part, &inc_w); // rounded |result|, m+1 bits (2^m visible)
+
+    // --- 4. range check per face + sign application. ---
+    let mag_top = mag[mu]; // the 2^m bit
+    let mut mag_zero = b.one();
+    for &bit in &mag { let nb = b.not1(bit); mag_zero = b.and2(mag_zero, nb); }
+    let low: Vec<BitLit> = mag[..mu].to_vec();
+    let (fits, res): (BitLit, Vec<BitLit>) = if !signed_face {
+        // ubv: 0 <= mag <= 2^m - 1, and a negative value only if it rounded to 0.
+        let not_top = b.not1(mag_top);
+        let not_sign = b.not1(o.sign);
+        let sign_ok = b.or2(not_sign, mag_zero);
+        (b.and2(not_top, sign_ok), low)
+    } else {
+        // sbv: positive needs mag <= 2^(m-1)-1; negative admits mag = 2^(m-1)
+        // (INT_MIN). Result is the two's-complement of the magnitude when negative.
+        let mag_msb = mag[mu - 1];
+        let not_top = b.not1(mag_top);
+        let not_msb = b.not1(mag_msb);
+        let mut rest_zero = b.one();
+        for i in 0..(mu - 1) { let nb = b.not1(mag[i]); rest_zero = b.and2(rest_zero, nb); }
+        let pos_ok = b.and2(not_top, not_msb);
+        let neg_bound = b.or2(not_msb, rest_zero); // mag <= 2^(m-1)
+        let neg_ok = b.and2(not_top, neg_bound);
+        let fits = b.mux2(o.sign, neg_ok, pos_ok);
+        let neg = bvneg(b, &low);
+        let res: Vec<BitLit> = (0..mu).map(|i| b.mux2(o.sign, neg[i], low[i])).collect();
+        (fits, res)
+    };
+
+    // --- 5. ok + unspecified mux: fresh unconstrained bits on ¬ok. ---
+    let not_nan = b.not1(o.is_nan);
+    let not_inf = b.not1(o.is_inf);
+    let not_oor = b.not1(oor_high);
+    let finite = b.and2(not_nan, not_inf);
+    let in_rng = b.and2(not_oor, fits);
+    let ok = b.and2(finite, in_rng);
+    let out: Vec<BitLit> = (0..mu).map(|i| {
+        let fresh = b.fresh();
+        b.mux2(ok, res[i], fresh)
+    }).collect();
+    (out, ok)
+}
+
 /// `((_ to_fp eb sb) rm q)` for a constant Real `q`: fold `round_rational` under
 /// each mode and one-hot-select by `rm.sel`. Literal RM constant-folds to a single
 /// pattern; symbolic RM stays a 5-way mux over five precomputed literals.
@@ -212,8 +307,10 @@ pub fn to_fp_real_const(b: &mut Blaster, q: &Rational, eb: u32, sb: u32, rm: &Rm
 
 #[cfg(test)]
 mod tests {
-    use crate::convert::{to_fp_fp, to_fp_int, to_fp_real_const};
-    use crate::reference::{ref_to_fp_fp, ref_to_fp_sbv, ref_to_fp_ubv, round_rational, RoundMode};
+    use crate::convert::{fp_to_int, to_fp_fp, to_fp_int, to_fp_real_const};
+    use crate::reference::{
+        ref_to_fp_fp, ref_to_fp_sbv, ref_to_fp_ubv, ref_to_sbv, ref_to_ubv, round_rational, RoundMode,
+    };
     use crate::rm;
     use shinri_bv::{BitLit, Blaster};
     use shinri_core::RoundingMode;
@@ -241,6 +338,28 @@ mod tests {
             if if bl.pos { raw } else { !raw } { v |= 1 << i; }
         }
         v
+    }
+    /// Evaluate a gadget's `(word, ok)` pair in one solve. Own harness (not a
+    /// wrapper over `eval_word`): `eval_word` folds bits into a `u64` and is
+    /// hard-capped at 64 bits, so for `word.len() == 64` appending `ok` as a
+    /// 65th bit would panic. Read `word` into `v` and `ok` separately instead.
+    fn eval_word_and_ok(b: Blaster, word: &[BitLit], ok: BitLit) -> (u64, bool) {
+        let cnf = b.finish();
+        let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..cnf.num_vars { s.new_var(); }
+        for c in &cnf.clauses {
+            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            s.add_clause(&ls);
+        }
+        assert_eq!(s.solve(), SolveResult::Sat);
+        let mut v = 0u64;
+        for (i, bl) in word.iter().enumerate() {
+            let raw = s.value_of(Var::new(bl.var)).unwrap();
+            if if bl.pos { raw } else { !raw } { v |= 1 << i; }
+        }
+        let raw_ok = s.value_of(Var::new(ok.var)).unwrap();
+        let ok_val = if ok.pos { raw_ok } else { !raw_ok };
+        (v, ok_val)
     }
     const MODES: [(RoundingMode, RoundMode); 5] = [
         (RoundingMode::Rne, RoundMode::Rne), (RoundingMode::Rna, RoundMode::Rna),
@@ -398,6 +517,93 @@ mod tests {
                     let got = eval_word(b, &got_w);
                     assert_eq!(Integer::from(got), want,
                         "int64→f32 signed={signed} mode {ref_rm:?} a={a:#x}: got {got:#x} want {want}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fp_to_int_tiny_exhaustive_both_faces() {
+        // Every (3,5) pattern (8 bits), both faces, all five modes, m ∈ {1, 4, 8}:
+        // bit-exact vs golden on Some; circuit ok ≡ golden is_some() on EVERY input.
+        for &(core_rm, ref_rm) in &MODES {
+            for m in [1u32, 4, 8] {
+                for a in 0u64..256 {
+                    for signed in [true, false] {
+                        let want = if signed {
+                            ref_to_sbv(3, 5, m, &Integer::from(a), ref_rm)
+                        } else {
+                            ref_to_ubv(3, 5, m, &Integer::from(a), ref_rm)
+                        };
+                        let mut b = Blaster::new();
+                        let xw = const_bits(&b, 3, 5, a);
+                        let sel = rm::literal(&b, core_rm);
+                        let (got_w, ok_l) = fp_to_int(&mut b, &xw, 3, 5, m, signed, &sel);
+                        let (got, ok) = eval_word_and_ok(b, &got_w, ok_l);
+                        assert_eq!(ok, want.is_some(),
+                            "(3,5)→{}bv{m} mode {ref_rm:?} a={a:#x}: ok={ok} want_some={}",
+                            if signed { "s" } else { "u" }, want.is_some());
+                        if let Some(w) = want {
+                            assert_eq!(Integer::from(got), w,
+                                "(3,5)→{}bv{m} mode {ref_rm:?} a={a:#x}: got {got:#x} want {w}",
+                                if signed { "s" } else { "u" });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fp_to_int_f16_f32_specials_and_random() {
+        // (5,11) and (8,24) sources into m ∈ {8, 32, 64}; seeded specials + PRNG.
+        let mut state = 0xDEAD_BEEF_0123_4567u64;
+        let mut rand = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); state };
+        for (eb, sb) in [(5u32, 11u32), (8, 24)] {
+            let w = eb + sb;
+            // Specials: NaN, ±inf, ±0, ±1, max-finite, min-subnormal, and values
+            // straddling the m-bit range edges (derived via round_rational — exact).
+            let f = |v: i64, d: i64| Rational::new(Integer::from(v), Integer::from(d));
+            let enc = |q: Rational| {
+                let bits = crate::reference::round_rational(eb, sb, &q, RoundMode::Rne);
+                // Integer → u64 via the test-side field helper.
+                let mut v = 0u64;
+                for i in 0..w { if !crate::reference::field(&bits, i, 1).is_zero() { v |= 1 << i; } }
+                v
+            };
+            let mut cases: Vec<u64> = vec![
+                enc(f(1_000_000_000, 1)),        // overflows f16 → +inf; huge for f32
+                enc(f(-1_000_000_000, 1)),
+                1 << (w - 1),                     // -0
+                0,                                // +0
+                1,                                // min subnormal
+                enc(f(1, 1)), enc(f(-1, 1)),
+                enc(f(255, 1)), enc(f(256, 1)), enc(f(511, 2)),      // ubv8 edges
+                enc(f(-128, 1)), enc(f(-129, 1)), enc(f(-257, 2)),   // sbv8 edges
+            ];
+            for _ in 0..120 { cases.push(rand() & ((1u64 << w) - 1)); }
+            for &(core_rm, ref_rm) in &MODES {
+                for m in [8u32, 32, 64] {
+                    for &a in &cases {
+                        for signed in [true, false] {
+                            let want = if signed {
+                                ref_to_sbv(eb, sb, m, &Integer::from(a), ref_rm)
+                            } else {
+                                ref_to_ubv(eb, sb, m, &Integer::from(a), ref_rm)
+                            };
+                            let mut b = Blaster::new();
+                            let xw = const_bits(&b, eb, sb, a);
+                            let sel = rm::literal(&b, core_rm);
+                            let (got_w, ok_l) = fp_to_int(&mut b, &xw, eb, sb, m, signed, &sel);
+                            let (got, ok) = eval_word_and_ok(b, &got_w, ok_l);
+                            assert_eq!(ok, want.is_some(),
+                                "({eb},{sb})→bv{m} signed={signed} mode {ref_rm:?} a={a:#x}");
+                            if let Some(wv) = want {
+                                assert_eq!(Integer::from(got), wv,
+                                    "({eb},{sb})→bv{m} signed={signed} mode {ref_rm:?} a={a:#x}: got {got:#x}");
+                            }
+                        }
+                    }
                 }
             }
         }
