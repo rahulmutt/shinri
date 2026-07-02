@@ -155,6 +155,13 @@ impl Context {
         sym
     }
 
+    /// Look up a symbol by name without interning it. Used by the solver's
+    /// word-normalization pass to mint fresh names that cannot collide with
+    /// user-declared symbols.
+    pub fn lookup_symbol(&self, text: &str) -> Option<SymbolId> {
+        self.symbols.lookup(text)
+    }
+
     /// Build (and intern) `op` applied to `args`, checking well-sortedness.
     pub fn mk_app(&mut self, op: Op, args: &[TermId]) -> Result<TermId, SortError> {
         let result_sort = self.check_app(op, args)?;

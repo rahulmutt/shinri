@@ -24,6 +24,11 @@ impl StringInterner {
     pub fn resolve(&self, id: SymbolId) -> &str {
         &self.texts[id.index()]
     }
+
+    /// Look up already-interned text without interning it.
+    pub fn lookup(&self, text: &str) -> Option<SymbolId> {
+        self.map.get(text).copied()
+    }
 }
 
 #[cfg(test)]
@@ -40,5 +45,13 @@ mod tests {
         assert_ne!(a, b);
         assert_eq!(si.resolve(a), "foo");
         assert_eq!(si.resolve(b), "bar");
+    }
+
+    #[test]
+    fn lookup_finds_interned_and_misses_unknown() {
+        let mut i = StringInterner::default();
+        let id = i.intern("foo");
+        assert_eq!(i.lookup("foo"), Some(id));
+        assert_eq!(i.lookup("bar"), None);
     }
 }
