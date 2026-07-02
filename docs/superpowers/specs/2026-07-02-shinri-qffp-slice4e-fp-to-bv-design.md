@@ -1,7 +1,22 @@
 # shinri QF_FP — Slice 4e: FP→BV (`fp.to_ubv` + `fp.to_sbv`)
 
 **Date:** 2026-07-02
-**Status:** Draft — awaiting user spec review
+**Status:** Landed — both FP→BV faces (`fp.to_ubv` + `fp.to_sbv`) admitted through the
+`fp_to_int` gadget (decode → one right-shift-with-sticky → shared `rounding_increment` →
+round-FIRST-then-range-check → ok-mux over fresh unconstrained bits), with unspecified
+results encoded as an uninterpreted function of `(RM, x)` per `(face, m, eb, sb)` via
+Ackermann-style congruence clauses (`FpToBvApp` registry on the `Lowerer`). First BV-sorted
+FP op: dispatched by a `blast_fp_to_bv` SIBLING of `blast_fp_word` (§6's "blast_fp_word
+gains the two arms" was refined — its preamble asserts an FP-sorted result), and the first
+BV-atom embedded-FP support walk (`bv_atoms_fp_supported`, mutually recursive with
+`is_supported_fp_word`) fences unsupported FP shapes reachable through BV atoms.
+Verification: workspace EXIT=0, all 61 suites 0-failed (shinri-fp exhaustive 84/0 @2615s,
+solver lib 83/0, fp_e2e 62/0 incl 5 new FP→BV e2e, shinri-bv 98/0); full z3 oracle 14/14
+ZERO disagreements (new differential_qf_bvfp_fp_to_bv sat=105 unsat=95 unknown=0
+z3_checked=200/200 incl 1-in-4 congruence probes; all pre-existing counts byte-identical
+to the 4d baseline); 4 canaries repointed (fp_stage.rs ×3, fp_e2e.rs ×1); clippy net-new
+zero after one allow-attribute fold. Remaining fence (permanent v1 Real bridge):
+`fp.to_real` / symbolic-Real `to_fp`. **Plan 4 complete.**
 **Plan:** 4 (BV↔FP crossing conversions), third and FINAL admitted conversion — closes Plan 4
 **Predecessors:** slice 4a (unified `Lowerer`/`WordSink`), slice 4b (mixed fence-lift),
 slice 4c (BV→FP bitcast), slice 4d (int→FP)

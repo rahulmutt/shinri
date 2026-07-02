@@ -251,6 +251,7 @@ pub fn blast_fp_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
 /// prior same-key application: (core_eq(x_i, x_j) ∧ rm_i = rm_j) → res_i = res_j
 /// — core_eq because the trigger is SMT VALUE equality (any-NaN = any-NaN;
 /// blasted FP words are not payload-canonicalized).
+#[allow(clippy::needless_range_loop)] // indices are load-bearing: parallel-indexed words
 pub fn blast_fp_to_bv<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec<BitLit> {
     use shinri_core::BuiltinOp::*;
     let TermNode::App { op, args, .. } = ctx.term_node(t).clone() else {
