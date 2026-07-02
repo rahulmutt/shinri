@@ -1172,3 +1172,81 @@ fn differential_qf_bvfp_int_to_fp() {
     );
     assert!(n_z3_checked > 0, "z3 never returned a concrete verdict — check the logic/harness");
 }
+
+/// FP→BV: a random source bit-pattern (naturally hitting NaN/±inf/subnormal/
+/// out-of-range) pinned via the 1-arg to_fp bitcast, converted under a random
+/// face/width/mode, then related to a random BV constant. One in four scripts
+/// is instead a two-application congruence probe (equal-forced operands,
+/// distinct results) — the encoding must agree with z3's UF-of-(rm,x) reading.
+fn gen_fp_to_bv_script(rng: &mut Lcg) -> String {
+    const MS: &[u32] = &[4, 8, 16];
+    let m = MS[rng.below(MS.len() as u64) as usize];
+    let (eb, sb) = if rng.below(2) == 0 { (5u32, 11u32) } else { (8, 24) };
+    let w = (eb + sb) as usize;
+    let bits = rng.next() & if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+    let face = if rng.below(2) == 0 { "fp.to_ubv" } else { "fp.to_sbv" };
+    const RMS: &[&str] = &["RNE", "RNA", "RTP", "RTN", "RTZ"];
+    let rm = RMS[rng.below(RMS.len() as u64) as usize];
+    if rng.below(4) == 0 {
+        return format!(
+            "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
+             (declare-fun y () (_ FloatingPoint {eb} {sb}))\n\
+             (assert (= x ((_ to_fp {eb} {sb}) #b{bits:0w$b})))\n\
+             (assert (= y x))\n\
+             (assert (distinct ((_ {face} {m}) {rm} x) ((_ {face} {m}) {rm} y)))\n\
+             (check-sat)\n"
+        );
+    }
+    let k = rng.next() & ((1u64 << m) - 1);
+    const RELS: &[&str] = &["=", "bvult", "bvule", "bvugt"];
+    let rel = RELS[rng.below(RELS.len() as u64) as usize];
+    let mw = m as usize;
+    format!(
+        "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
+         (declare-fun a () (_ BitVec {m}))\n\
+         (assert (= x ((_ to_fp {eb} {sb}) #b{bits:0w$b})))\n\
+         (assert (= a ((_ {face} {m}) {rm} x)))\n\
+         (assert ({rel} a #b{k:0mw$b}))\n\
+         (check-sat)\n"
+    )
+}
+
+#[test]
+fn differential_qf_bvfp_fp_to_bv() {
+    let mut rng = Lcg(0x4E_F92A_11);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    let mut n_z3_checked = 0usize;
+    for iter in 0..N_ITERS {
+        let src = gen_fp_to_bv_script(&mut rng);
+        let ours = shinri_outcome(&src);
+        if ours == SolveOutcome::Unknown { n_unknown += 1; continue; }
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => unreachable!(),
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_mixed(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_z3_checked += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_z3_checked += 1,
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!(
+                "QF_BVFP FP→BV SOUNDNESS DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n\
+                 script:\n{src}"
+            ),
+        }
+    }
+    println!(
+        "differential_qf_bvfp_fp_to_bv: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
+         z3_checked={n_z3_checked}"
+    );
+    assert!(n_sat > 0 && n_unsat > 0,
+        "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)");
+    assert!(n_unknown == 0, "no admitted-face script may fence ({n_unknown} unknown)");
+    assert!(n_z3_checked > 0, "z3 never returned a concrete verdict");
+}
