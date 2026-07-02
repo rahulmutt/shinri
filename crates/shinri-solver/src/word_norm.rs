@@ -41,6 +41,14 @@ pub struct WordNorm {
     ctr: u32,
 }
 
+impl WordNorm {
+    /// Original eliminated-ite term → its internal fresh symbol term.
+    /// Used by the solver to answer get-value on eliminated ites (slice 6).
+    pub(crate) fn ite_map(&self) -> &FxHashMap<TermId, TermId> {
+        &self.ite_var
+    }
+}
+
 fn is_word_sort(ctx: &Context, s: SortId) -> bool {
     matches!(
         ctx.sort_node(s),

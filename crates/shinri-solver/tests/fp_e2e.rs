@@ -1048,3 +1048,55 @@ fn rm_variable_gets_model_value() {
     assert_eq!(o, SolveOutcome::Sat);
     assert!(model.contains("(r RTZ)"), "RM var missing/wrong in model: {model}");
 }
+
+/// Like `run`, but also collects every `get-value` response.
+fn run_values(src: &str) -> (SolveOutcome, Vec<String>) {
+    let mut s = Solver::new();
+    let mut p = Parser::new(src);
+    let mut outcome = SolveOutcome::Unknown;
+    let mut values = Vec::new();
+    while let Some(result) = p.next_command(s.ctx_mut()) {
+        let cmd = result.expect("parse");
+        match s.execute(cmd) {
+            CommandResponse::Sat => outcome = SolveOutcome::Sat,
+            CommandResponse::Unsat => outcome = SolveOutcome::Unsat,
+            CommandResponse::Unknown => outcome = SolveOutcome::Unknown,
+            CommandResponse::Values(v) => values.push(v),
+            _ => {}
+        }
+    }
+    (outcome, values)
+}
+
+#[test]
+fn get_value_on_eliminated_ite_returns_value_not_internal_name() {
+    // Slice 6: word_norm eliminates (ite c x #x00) into an internal ite!<n>
+    // definition; get-value on the ORIGINAL ite term must return its value,
+    // never the internal name and never "?".
+    let (o, values) = run_values(
+        "(declare-const c Bool)(declare-const x (_ BitVec 8))\
+         (declare-const z (_ BitVec 8))\
+         (assert c)(assert (= x #x0f))(assert (= z (ite c x #x00)))\
+         (check-sat)(get-value ((ite c x #x00)))",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert_eq!(values.len(), 1);
+    assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
+    assert!(!values[0].contains('?'), "no value produced: {}", values[0]);
+    assert!(values[0].contains("#x0f"), "expected #x0f (c true, x=#x0f): {}", values[0]);
+}
+
+#[test]
+fn get_value_on_eliminated_rm_ite_returns_mode() {
+    // RM-sorted ite through the same eliminated-ite channel (slice-6 review
+    // follow-up): p true forces the ite to RTZ.
+    let (o, values) = run_values(
+        "(declare-const p Bool)(declare-const r RoundingMode)\
+         (assert p)(assert (= r (ite p RTZ RNE)))\
+         (check-sat)(get-value ((ite p RTZ RNE)))",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert_eq!(values.len(), 1);
+    assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
+    assert!(values[0].contains("RTZ"), "expected RTZ: {}", values[0]);
+}

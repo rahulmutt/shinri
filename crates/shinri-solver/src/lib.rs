@@ -76,6 +76,8 @@ pub struct Solver {
     /// Word-level normalization state (slice 5): ite→fresh-symbol memo and
     /// the internal-symbol set excluded from model output.
     word_norm: crate::word_norm::WordNorm,
+    /// Eliminated-ite terms → model values (get-value fallback; slice 6).
+    eliminated_ite_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal>,
 }
 
 impl Default for Solver {
@@ -102,6 +104,7 @@ impl Solver {
             fp_rm_sels: rustc_hash::FxHashMap::default(),
             abv_array_models: rustc_hash::FxHashMap::default(),
             word_norm: crate::word_norm::WordNorm::default(),
+            eliminated_ite_vals: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -243,6 +246,9 @@ impl Solver {
         if let Some(val) = self.last_model.as_ref().and_then(|m| m.get(t)) {
             return Some(crate::model::format_modelval(val));
         }
+        if let Some(val) = self.eliminated_ite_vals.get(&t) {
+            return Some(crate::model::format_modelval(val));
+        }
         // Fall through to ABV array model (for array-sorted terms).
         self.abv_array_models.get(&t).cloned()
     }
@@ -283,6 +289,8 @@ impl Solver {
             NoProof,
             Vmtf,
         >;
+
+        self.eliminated_ite_vals.clear();
 
         let mut assertions = self.assertions.clone();
 
@@ -591,12 +599,14 @@ impl Solver {
                         model.values.insert(term, val.clone());
                     }
                 }
+                // Values of word_norm-internal symbols, keyed by the internal
+                // term — surfaced to users only through the eliminated-ite
+                // remap below, never through get-model (slice 6).
+                let mut internal_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal> =
+                    rustc_hash::FxHashMap::default();
                 // BV model extraction: for each declared BV constant with recorded
                 // SAT vars, read each var's assignment and pack into a ModelVal::BitVec.
                 for (&term, sat_vars) in &self.bv_var_bits {
-                    if self.word_norm.internal.contains(&term) {
-                        continue; // slice 5: internal ite! symbols never reach models
-                    }
                     let width = sat_vars.len() as u32;
                     // Read each bit from the SAT model (LSB→MSB order).
                     // If a var is unassigned (rare — rewrite eliminated it), default to false.
@@ -606,13 +616,15 @@ impl Solver {
                         .collect();
                     let packed = shinri_bv::model::pack(width, &bits);
                     use shinri_theory::types::ModelVal;
-                    model.values.insert(term, ModelVal::BitVec(width, packed));
+                    let val = ModelVal::BitVec(width, packed);
+                    if self.word_norm.internal.contains(&term) {
+                        internal_vals.insert(term, val); // slice 5 filter, slice 6 stash
+                    } else {
+                        model.values.insert(term, val);
+                    }
                 }
                 // FP model extraction: pack each FP constant's bits into ModelVal::Float.
                 for (&term, sat_vars) in &self.fp_var_bits {
-                    if self.word_norm.internal.contains(&term) {
-                        continue; // slice 5: internal ite! symbols never reach models
-                    }
                     let width = sat_vars.len() as u32;
                     let bits_bool: Vec<bool> = sat_vars
                         .iter()
@@ -622,15 +634,17 @@ impl Solver {
                     // recover (eb, sb) from the term's Float sort.
                     if let Some((eb, sb)) = self.ctx.fp_widths(self.ctx.sort_of(term)) {
                         use shinri_theory::types::ModelVal;
-                        model.values.insert(term, ModelVal::Float { eb, sb, bits: packed });
+                        let val = ModelVal::Float { eb, sb, bits: packed };
+                        if self.word_norm.internal.contains(&term) {
+                            internal_vals.insert(term, val); // slice 5 filter, slice 6 stash
+                        } else {
+                            model.values.insert(term, val);
+                        }
                     }
                 }
                 // RM variables: decode the one-hot selector (slice 6). Internal
                 // word_norm symbols are filtered exactly as in the BV/FP loops.
                 for (&term, sel) in &self.fp_rm_sels {
-                    if self.word_norm.internal.contains(&term) {
-                        continue;
-                    }
                     let hot = sel.iter().position(|l| {
                         let b = sat.value_of(l.var()).unwrap_or(false);
                         if l.is_positive() { b } else { !b }
@@ -639,9 +653,24 @@ impl Solver {
                         use shinri_core::RoundingMode::*;
                         let rm = [Rne, Rna, Rtp, Rtn, Rtz][i];
                         use shinri_theory::types::ModelVal;
-                        model.values.insert(term, ModelVal::Rm(rm));
+                        let val = ModelVal::Rm(rm);
+                        if self.word_norm.internal.contains(&term) {
+                            internal_vals.insert(term, val); // slice 5 filter, slice 6 stash
+                        } else {
+                            model.values.insert(term, val);
+                        }
                     }
                 }
+                // Answer get-value on eliminated ites: remap each original ite
+                // term to its internal symbol's value.
+                let mut ite_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal> =
+                    rustc_hash::FxHashMap::default();
+                for (&ite_t, &w) in self.word_norm.ite_map() {
+                    if let Some(v) = internal_vals.get(&w) {
+                        ite_vals.insert(ite_t, v.clone());
+                    }
+                }
+                self.eliminated_ite_vals = ite_vals;
                 // Witness self-check (string path): the word-equation F-split can
                 // dedup-saturate and let SAT conclude SAT with a model the model
                 // builder cannot realise into a satisfying witness (the (B′)
