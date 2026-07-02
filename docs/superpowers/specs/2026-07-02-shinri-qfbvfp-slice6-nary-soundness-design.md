@@ -1,7 +1,28 @@
 # shinri QF_BVFP — Slice 6: n-ary `=` soundness closure + carried minors
 
 **Date:** 2026-07-02
-**Status:** Approved design, pre-implementation
+**Status:** Landed 2026-07-02 (commits 22d75fb..HEAD, 9 tasks incl. controller-run
+pre-flight). Verification: full `cargo test --workspace` green (30 suite results, 0
+failed, incl. shinri-fp 86/86 @2079s); full differential oracle green — all pre-existing
+suite counts byte-identical to the slice-5 baseline, NEW `differential_qf_uf_nary`
+sat=68 unsat=132 unknown=0 z3_checked=200/200 zero disagreements; clippy net-new zero
+(solver=2/fp=22/parser=3/theory=4/str=9 = slice-5 known set); canary sweep clean.
+**Pre-flight corrections to §2 (evidence: slice-6 ledger):** (a) n-ary `=` over
+**String** was a THIRD live wrong-SAT (routes to EUF, same dropping arm; also a
+user-reachable debug-build panic at euf/solver.rs:114) — fixed by the same expansion
+and pinned `unsat`; (b) **Array** n-ary `=` was already CORRECT — arrays over BV route
+to the ABV path whose own `normalize.rs` pre-pass expands n-ary array atoms (spec's
+extensionality-fence assumption was wrong for ABV-routable queries) — pinned as the
+decided pair, and that pass is now dead-but-harmless for n-ary shapes since word_norm
+expands first. All four minors landed: ABV bare-Bool exemption (slice-5 canary flipped
+to decided pair, z3-verified), RM get-model values (one-hot decode channel), get-value
+through eliminated ites (BV/FP/RM, get-model output unchanged), 0-ary define-fun
+bare-symbol expansion (let → macro → fun order).
+**Follow-ups filed (pre-existing-shaped, out of scope):** nested-ite `get-value` on the
+OUTER term still degrades to sound `?` (word_norm's `ite_var` is keyed by the
+child-rewritten term; the query term hash-conses the original child — completeness
+gap, no wrong value, no name leak); the QF_ABV path lacks the eliminated-ite get-value
+channel entirely (same degrade-to-`?`).
 **Plan:** 5 (post-Plan-4 completeness & robustness), second slice — the slice-5 final
 review's filed follow-ups (wrong-SAT Imp#2 + carried minors Min#4/#5/#6 + parser gap)
 **Predecessors:** slice 5 (`word_norm` pass, whose final review filed all of this)
