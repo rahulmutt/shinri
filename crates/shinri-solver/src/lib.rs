@@ -346,12 +346,13 @@ impl Solver {
 
         // ── Crossing-conversion fence (est. slice 4b) ──────────────────────────
         // The mixed BV+FP fence is LIFTED (pure-BV and pure-FP atoms may coexist
-        // in one query), and the BV→FP faces are admitted: bitcast (FpFromBits +
-        // 1-arg to_fp, slice 4c) and int→FP (2-arg to_fp from BV + to_fp_unsigned,
-        // slice 4d). fp.to_ubv / fp.to_sbv / fp.to_real / symbolic-Real to_fp
-        // still fence to Unknown, BEFORE any lowering, so blast_*_word's crossing
-        // `unreachable!` arms stay internal invariants. Each remaining conversion
-        // is admitted in its own later slice.
+        // in one query), and both BV↔FP directions are admitted: BV→FP bitcast
+        // (FpFromBits + 1-arg to_fp, slice 4c), int→FP (2-arg to_fp from BV +
+        // to_fp_unsigned, slice 4d), and FP→BV (fp.to_ubv / fp.to_sbv, slice 4e).
+        // fp.to_real and symbolic-Real to_fp still fence to Unknown, BEFORE any
+        // lowering, so blast_*_word's crossing `unreachable!` arms stay internal
+        // invariants. This is now the PERMANENT crossing set (v1 non-goal: the
+        // Real bridge).
         let uses_bv = crate::bv_stage::solver_uses_bv(&self.ctx, &assertions);
         let uses_fp = crate::fp_stage::solver_uses_fp(&self.ctx, &assertions);
         if uses_fp && crate::fp_stage::uses_crossing_conversion(&self.ctx, &assertions) {
@@ -393,9 +394,14 @@ impl Solver {
                 // Positive-enumeration safety: every FP atom's word must be a
                 // supported FP op (an FP-sorted ite, a not-yet-implemented FP op,
                 // etc. still fence) so blast_fp_word's `unreachable!` arms stay
-                // internal invariants. (BV atoms need no support check — the BV
-                // blaster is total over BV ops once crossing ops are fenced.)
+                // internal invariants.
                 if !crate::fp_stage::fp_atoms_fully_supported(&self.ctx, &fp_atoms) {
+                    return SolveOutcome::Unknown;
+                }
+                // Slice 4e: BV atoms can now embed FP subterms (fp.to_ubv/
+                // fp.to_sbv). Any unsupported FP shape reachable through a BV
+                // atom must fence BEFORE lowering, same argument as above.
+                if !crate::fp_stage::bv_atoms_fp_supported(&self.ctx, &bv_atoms) {
                     return SolveOutcome::Unknown;
                 }
                 Some(shinri_fp::lower_mixed(&mut self.ctx, &fp_atoms, &bv_atoms))
