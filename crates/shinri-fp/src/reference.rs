@@ -382,6 +382,65 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
     pack(sign, biased, trailing)
 }
 
+/// `((_ to_fp eb sb) rm x)` for `x` an m-bit BV read as a SIGNED two's-complement
+/// integer. An integer is an exact rational, so this is a thin wrapper over
+/// `round_rational`: signed value = x - 2^m when the sign bit (bit m-1) is set.
+pub fn ref_to_fp_sbv(eb: u32, sb: u32, m: u32, x: &Integer, mode: RoundMode) -> Integer {
+    let neg = !field(x, m - 1, 1).is_zero();
+    let v = if neg {
+        let two = Integer::from(2u64);
+        let mut pow_m = Integer::one();
+        for _ in 0..m { pow_m *= two.clone(); }
+        x.clone() - pow_m
+    } else {
+        x.clone()
+    };
+    let result = round_rational(eb, sb, &Rational::from_int(v), mode);
+    // RTZ overflow: round toward zero means saturate to max finite, not infinity
+    if mode == RoundMode::Rtz {
+        let c = decode(eb, sb, &result);
+        if matches!(c, FpClass::Inf { sign: _ }) {
+            let sign_bit = if ref_is_negative(&c) { 1 } else { 0 };
+            let max_exp = (1u64 << eb) - 2;
+            let max_sig = {
+                let two = Integer::from(2u64);
+                let mut acc = Integer::one();
+                for _ in 0..(sb - 1) { acc = acc * two.clone(); }
+                acc - Integer::one()
+            };
+            ref_fp_from_bits(eb, sb, sign_bit, &Integer::from(max_exp), &max_sig)
+        } else {
+            result
+        }
+    } else {
+        result
+    }
+}
+
+/// `((_ to_fp_unsigned eb sb) rm x)`: the m-bit pattern read UNSIGNED. `x` is
+/// already the non-negative value; the width `m` is kept for signature symmetry.
+pub fn ref_to_fp_ubv(eb: u32, sb: u32, _m: u32, x: &Integer, mode: RoundMode) -> Integer {
+    let result = round_rational(eb, sb, &Rational::from_int(x.clone()), mode);
+    // RTZ overflow: round toward zero means saturate to max finite, not infinity
+    if mode == RoundMode::Rtz {
+        let c = decode(eb, sb, &result);
+        if matches!(c, FpClass::Inf { .. }) {
+            let max_exp = (1u64 << eb) - 2;
+            let max_sig = {
+                let two = Integer::from(2u64);
+                let mut acc = Integer::one();
+                for _ in 0..(sb - 1) { acc = acc * two.clone(); }
+                acc - Integer::one()
+            };
+            ref_fp_from_bits(eb, sb, 0, &Integer::from(max_exp), &max_sig)
+        } else {
+            result
+        }
+    } else {
+        result
+    }
+}
+
 /// Exact-rational golden `((_ to_fp eb_t sb_t) mode x)` for an FP source `x` of
 /// format (eb_s, sb_s). Specials map by table; finite values round the exact
 /// rational into the target under `mode`. Trusted reference for `convert::to_fp_fp`.
@@ -1138,6 +1197,29 @@ mod tests {
         // Sign bit is the MSB: flipping it yields -1.0's pattern (0xBF800000).
         let neg = ref_fp_from_bits(8, 24, 1, &Integer::from(127u64), &Integer::zero());
         assert_eq!(neg, Integer::from(0xBF80_0000u64));
+    }
+
+    #[test]
+    fn ref_int_to_fp_pins_known_values() {
+        // Signed read: 8-bit 0xFF = -1 → f32 0xBF800000; 0x80 = -128 → 0xC3000000.
+        let f = |v: u64| Integer::from(v);
+        assert_eq!(ref_to_fp_sbv(8, 24, 8, &f(0xFF), RoundMode::Rne), f(0xBF80_0000));
+        assert_eq!(ref_to_fp_sbv(8, 24, 8, &f(0x80), RoundMode::Rne), f(0xC300_0000));
+        // Unsigned read of the same pattern: 255 → 0x437F0000.
+        assert_eq!(ref_to_fp_ubv(8, 24, 8, &f(0xFF), RoundMode::Rne), f(0x437F_0000));
+        // Zero → +0 under every mode (incl. RTN — conversions have no -0 source).
+        for mode in [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz] {
+            assert_eq!(ref_to_fp_sbv(8, 24, 8, &Integer::zero(), mode), Integer::zero());
+            assert_eq!(ref_to_fp_ubv(8, 24, 8, &Integer::zero(), mode), Integer::zero());
+        }
+        // Rounding is real: u32::MAX → f32 is 2^32 under RNE (0x4F800000),
+        // 2^32-256 under RTZ (0x4F7FFFFF).
+        assert_eq!(ref_to_fp_ubv(8, 24, 32, &f(0xFFFF_FFFF), RoundMode::Rne), f(0x4F80_0000));
+        assert_eq!(ref_to_fp_ubv(8, 24, 32, &f(0xFFFF_FFFF), RoundMode::Rtz), f(0x4F7F_FFFF));
+        // Overflow is real: 255 into (3,5) (max finite 15.5) → +oo (0x70) under RNE,
+        // max finite (0x6F) under RTZ.
+        assert_eq!(ref_to_fp_ubv(3, 5, 8, &f(0xFF), RoundMode::Rne), f(0x70));
+        assert_eq!(ref_to_fp_ubv(3, 5, 8, &f(0xFF), RoundMode::Rtz), f(0x6F));
     }
 }
 
