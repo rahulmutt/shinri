@@ -426,6 +426,55 @@ pub fn ref_to_fp_ubv(eb: u32, sb: u32, _m: u32, x: &Integer, mode: RoundMode) ->
     round_rational(eb, sb, &Rational::from_int(x.clone()), mode)
 }
 
+/// Round an exact rational to an INTEGER under `mode` — no FP format involved.
+/// The integer-rounding core shared by the FP→BV goldens (`fp.to_ubv`/`fp.to_sbv`
+/// round the real value of the float to an integer, THEN range-check).
+pub fn round_rational_to_integer(q: &Rational, mode: RoundMode) -> Integer {
+    let zero = Rational::new(Integer::zero(), Integer::one());
+    let half = Rational::new(Integer::one(), Integer::from(2u64));
+    let neg = *q < zero;
+    let mag = if neg { Rational::new(Integer::from(-1i64), Integer::one()) * q.clone() } else { q.clone() };
+    let fl = mag.numer().div_rem(&mag.denom()).0; // floor(mag), mag >= 0
+    let frac = mag - Rational::new(fl.clone(), Integer::one()); // in [0, 1)
+    let round_up = match mode {
+        RoundMode::Rtz => false,
+        RoundMode::Rtp => !neg && frac > zero, // toward +inf: magnitude up only if positive
+        RoundMode::Rtn => neg && frac > zero,  // toward -inf
+        RoundMode::Rne => frac > half
+            || (frac == half && !fl.div_rem(&Integer::from(2u64)).1.is_zero()),
+        RoundMode::Rna => frac >= half,
+    };
+    let n = if round_up { fl + Integer::one() } else { fl };
+    if neg { Integer::zero() - n } else { n }
+}
+
+/// `((_ fp.to_ubv m) rm x)` golden: `None` = SMT-LIB-unspecified (NaN, ±inf, or
+/// the ROUNDED integer outside [0, 2^m-1]); `Some(n)` otherwise.
+pub fn ref_to_ubv(eb: u32, sb: u32, m: u32, bits: &Integer, mode: RoundMode) -> Option<Integer> {
+    let q = class_to_rational(eb, sb, &decode(eb, sb, bits))?; // None on NaN/inf
+    let n = round_rational_to_integer(&q, mode);
+    let two = Integer::from(2u64);
+    let mut hi = Integer::one();
+    for _ in 0..m { hi *= two.clone(); } // 2^m
+    if n < Integer::zero() || n >= hi { return None; }
+    Some(n)
+}
+
+/// `((_ fp.to_sbv m) rm x)` golden: range [-2^(m-1), 2^(m-1)-1]; a negative
+/// in-range value is returned as its two's-complement m-bit PATTERN (n + 2^m)
+/// so callers compare directly against circuit words.
+pub fn ref_to_sbv(eb: u32, sb: u32, m: u32, bits: &Integer, mode: RoundMode) -> Option<Integer> {
+    let q = class_to_rational(eb, sb, &decode(eb, sb, bits))?;
+    let n = round_rational_to_integer(&q, mode);
+    let two = Integer::from(2u64);
+    let mut half = Integer::one();
+    for _ in 0..(m - 1) { half *= two.clone(); } // 2^(m-1)
+    let hi = half.clone() * two.clone();               // 2^m
+    let lo = Integer::zero() - half.clone();
+    if n < lo || n >= half { return None; }
+    Some(if n < Integer::zero() { n + hi } else { n })
+}
+
 /// Exact-rational golden `((_ to_fp eb_t sb_t) mode x)` for an FP source `x` of
 /// format (eb_s, sb_s). Specials map by table; finite values round the exact
 /// rational into the target under `mode`. Trusted reference for `convert::to_fp_fp`.
@@ -1229,6 +1278,85 @@ mod tests {
         for (value, mode, want) in cases {
             let got = round_rational(3, 5, &value, mode);
             assert_eq!(got, Integer::from(want), "value={value:?} mode={mode:?}");
+        }
+    }
+
+    #[test]
+    fn ref_fp_to_bv_round_then_range_check() {
+        use RoundMode::*;
+        let f = |v: i64, d: i64| Rational::new(Integer::from(v), Integer::from(d));
+        let enc = |q: &Rational| round_rational(5, 11, q, Rne); // exact values: mode-free
+        // -0.5: rounded result decides the range check (spec §2 / z3 probes 5).
+        let neg_half = enc(&f(-1, 2));
+        assert_eq!(ref_to_ubv(5, 11, 8, &neg_half, Rne), Some(Integer::zero()), "RNE(-0.5)=0 in range");
+        assert_eq!(ref_to_ubv(5, 11, 8, &neg_half, Rtz), Some(Integer::zero()));
+        assert_eq!(ref_to_ubv(5, 11, 8, &neg_half, Rtp), Some(Integer::zero()));
+        assert_eq!(ref_to_ubv(5, 11, 8, &neg_half, Rtn), None, "RTN(-0.5)=-1 out of range");
+        // 255.5 into ubv8 (z3 probes 6/7).
+        let v255_5 = enc(&f(511, 2));
+        assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rtz), Some(Integer::from(255u64)));
+        assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rtn), Some(Integer::from(255u64)));
+        assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rne), None, "rounds to 256");
+        assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rna), None);
+        assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rtp), None);
+        // NaN / ±inf → None under every mode, both faces. ±inf built via
+        // round_rational overflow: 1e9 ≫ (5,11) max finite 65504 → ±inf under RNE.
+        let nan = canonical_nan(5, 11);
+        let pinf = round_rational(5, 11, &f(1_000_000_000, 1), Rne);
+        let ninf = round_rational(5, 11, &f(-1_000_000_000, 1), Rne);
+        for md in [Rne, Rna, Rtp, Rtn, Rtz] {
+            for bits in [&nan, &pinf, &ninf] {
+                assert_eq!(ref_to_ubv(5, 11, 8, bits, md), None);
+                assert_eq!(ref_to_sbv(5, 11, 8, bits, md), None);
+            }
+        }
+    }
+
+    #[test]
+    fn ref_fp_to_sbv_bounds_and_encoding() {
+        use RoundMode::*;
+        let f = |v: i64, d: i64| Rational::new(Integer::from(v), Integer::from(d));
+        let enc = |q: &Rational| round_rational(5, 11, q, Rne);
+        // INT_MIN = -128 is in range for sbv8 and encodes as 0x80.
+        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(-128, 1)), Rtz), Some(Integer::from(0x80u64)));
+        // -128.5 RTZ truncates to -128 (in range); RTN goes to -129 (out).
+        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(-257, 2)), Rtz), Some(Integer::from(0x80u64)));
+        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(-257, 2)), Rtn), None);
+        // 127.5: RNE→128 out; RTZ→127 in.
+        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(255, 2)), Rne), None);
+        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(255, 2)), Rtz), Some(Integer::from(127u64)));
+        // -1 encodes as 0xFF; -0.0 → 0 (both faces).
+        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(-1, 1)), Rtz), Some(Integer::from(0xFFu64)));
+        let neg_zero = round_rational(5, 11, &f(-1, 100000), Rtp); // tiny negative, RTP → -0
+        assert_eq!(ref_to_ubv(5, 11, 8, &neg_zero, Rtz), Some(Integer::zero()));
+        assert_eq!(ref_to_sbv(5, 11, 8, &neg_zero, Rtz), Some(Integer::zero()));
+        // m=1 degenerate ranges: ubv1 [0,1], sbv1 [-1,0].
+        let one = enc(&f(1, 1));
+        assert_eq!(ref_to_ubv(5, 11, 1, &one, Rtz), Some(Integer::one()));
+        assert_eq!(ref_to_sbv(5, 11, 1, &one, Rtz), None, "1 > sbv1 max 0");
+        assert_eq!(ref_to_sbv(5, 11, 1, &enc(&f(-1, 1)), Rtz), Some(Integer::one()), "-1 = 0b1");
+    }
+
+    #[test]
+    fn round_rational_to_integer_all_modes() {
+        use RoundMode::*;
+        let f = |v: i64, d: i64| Rational::new(Integer::from(v), Integer::from(d));
+        let n = |v: i64| Integer::from(v);
+        // 2.5: RNE tie-to-even → 2; RNA away → 3.
+        assert_eq!(round_rational_to_integer(&f(5, 2), Rne), n(2));
+        assert_eq!(round_rational_to_integer(&f(5, 2), Rna), n(3));
+        // 3.5: RNE tie-to-even → 4.
+        assert_eq!(round_rational_to_integer(&f(7, 2), Rne), n(4));
+        // -2.5: RNE → -2; RNA → -3; RTZ → -2; RTP → -2; RTN → -3.
+        assert_eq!(round_rational_to_integer(&f(-5, 2), Rne), n(-2));
+        assert_eq!(round_rational_to_integer(&f(-5, 2), Rna), n(-3));
+        assert_eq!(round_rational_to_integer(&f(-5, 2), Rtz), n(-2));
+        assert_eq!(round_rational_to_integer(&f(-5, 2), Rtp), n(-2));
+        assert_eq!(round_rational_to_integer(&f(-5, 2), Rtn), n(-3));
+        // Exact integer passes through under every mode.
+        for md in [Rne, Rna, Rtp, Rtn, Rtz] {
+            assert_eq!(round_rational_to_integer(&f(7, 1), md), n(7));
+            assert_eq!(round_rational_to_integer(&f(0, 1), md), n(0));
         }
     }
 }
