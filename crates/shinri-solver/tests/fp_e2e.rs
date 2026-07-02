@@ -631,16 +631,15 @@ fn to_fp_const_real_reflexive_unsat() {
 #[test]
 fn to_fp_bv_crossing_and_symbolic_real_are_unknown() {
     // Remaining still-fenced conversions → Unknown (soundness: BV→FP bitcast
-    // (FpFromBits / 1-arg to_fp) is admitted as of slice 4c — see the slice-4c
-    // end-to-end block above; signed-int 2-arg BV→FP still waits for a later
-    // slice; symbolic-Real / fp.to_real are the deferred Real bridge).
+    // (FpFromBits / 1-arg to_fp) is admitted as of slice 4c, and int→FP
+    // (2-arg to_fp + to_fp_unsigned) is admitted as of slice 4d — see the
+    // slice-4c and slice-4d end-to-end blocks above; the remaining fence is
+    // FP→BV (fp.to_sbv/fp.to_ubv) plus the deferred Real bridge
+    // (symbolic-Real to_fp / fp.to_real).
     let scripts = [
         // symbolic-Real to_fp
         "(declare-fun r () Real) (declare-fun z () Float32) \
          (assert (fp.eq z ((_ to_fp 8 24) RNE r))) (check-sat)",
-        // signed-int BV → FP (2-arg to_fp with BV operand)
-        "(declare-fun b () (_ BitVec 32)) (declare-fun z () Float32) \
-         (assert (fp.eq z ((_ to_fp 8 24) RNE b))) (check-sat)",
         // FP → int (fp.to_sbv)
         "(declare-fun x () Float32) \
          (assert (= ((_ fp.to_sbv 32) RNE x) (_ bv0 32))) (check-sat)",
@@ -739,4 +738,67 @@ fn to_fp_1arg_bitcast_known_value_sat() {
 (check-sat)";
     let (o, _) = run(src);
     assert_eq!(o, SolveOutcome::Sat, "0x7f800000 bitcasts to +oo");
+}
+
+// ── Slice-4d end-to-end: int→FP (to_fp 2-arg BV + to_fp_unsigned) ───────────
+#[test]
+fn to_fp_signed_bv_sat_with_model() {
+    // The only 8-bit signed b with value -1 is 0xFF; -1.0f32 is
+    // (fp #b1 #b01111111 #b0…0). Pins the signed read end-to-end.
+    let src = "\
+(declare-fun b () (_ BitVec 8))
+(assert (fp.eq ((_ to_fp 8 24) RNE b) (fp #b1 #b01111111 #b00000000000000000000000)))
+(check-sat)
+(get-model)";
+    let (o, model) = run(src);
+    assert_eq!(o, SolveOutcome::Sat, "b = 0xFF reads as -1 signed");
+    assert!(model.contains("b"), "model surfaces the BV source var");
+}
+
+#[test]
+fn to_fp_unsigned_never_negative_unsat() {
+    // An unsigned read is ≥ 0, and fp.lt equates ±0 — so strictly-below -0 is
+    // impossible. Distinguishes the unsigned face from the signed one.
+    let src = "\
+(declare-fun b () (_ BitVec 8))
+(assert (fp.lt ((_ to_fp_unsigned 8 24) RNE b) (_ -zero 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Unsat, "unsigned int→FP is never negative");
+}
+
+#[test]
+fn to_fp_signed_bv_negative_sat() {
+    // The signed counterpart of the test above IS satisfiable (any b ≥ 0x80).
+    let src = "\
+(declare-fun b () (_ BitVec 8))
+(assert (fp.lt ((_ to_fp 8 24) RNE b) (_ -zero 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat, "signed int→FP can be negative");
+}
+
+#[test]
+fn to_fp_unsigned_rounding_pin_sat() {
+    // u32::MAX = 4294967295 is not f32-representable; RNE rounds up to 2^32.
+    // The right-hand side goes through the (independent) const-Real face.
+    let src = "\
+(declare-fun b () (_ BitVec 32))
+(assert (= b #xffffffff))
+(assert (fp.eq ((_ to_fp_unsigned 8 24) RNE b) ((_ to_fp 8 24) RNE 4294967296.0)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat, "u32::MAX rounds to 2^32 under RNE");
+}
+
+#[test]
+fn to_fp_zero_is_plus_zero_sat() {
+    // Core = distinguishes ±0: the conversion of integer 0 must be exactly +0.
+    let src = "\
+(declare-fun b () (_ BitVec 8))
+(assert (= b #x00))
+(assert (= ((_ to_fp 8 24) RTN b) (_ +zero 8 24)))
+(check-sat)";
+    let (o, _) = run(src);
+    assert_eq!(o, SolveOutcome::Sat, "int 0 → +0 even under RTN");
 }
