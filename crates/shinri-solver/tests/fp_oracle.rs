@@ -1099,3 +1099,76 @@ fn differential_qf_bvfp_bitcast() {
     );
     assert!(n_z3_checked > 0, "z3 never returned a concrete verdict — check the logic/harness");
 }
+
+/// One int→FP script: a constant BV converted BOTH ways — signed 2-arg `to_fp`
+/// and `to_fp_unsigned` — under a random rounding mode and target format, then
+/// related with a random FP relation. Signed and unsigned reads agree exactly
+/// when the top bit is clear and diverge otherwise, so the relation verdict is
+/// mode-, format- and sign-sensitive. Verdicts are decidable (constant source).
+fn gen_int_to_fp_script(rng: &mut Lcg) -> String {
+    const WIDTHS: &[u32] = &[8, 16, 32];
+    let mw = WIDTHS[rng.below(WIDTHS.len() as u64) as usize];
+    let word = rng.next() & ((1u64 << mw) - 1);
+    // Half Float32, half Float16 — Float16 overflows on large 16/32-bit values
+    // (mode-dependent: RNE→+oo, RTZ→max finite), which is exactly the boundary
+    // we want cross-checked.
+    let (eb, sb) = if rng.below(2) == 0 { (8u32, 24u32) } else { (5, 11) };
+    const FP_RELS: &[&str] = &["fp.lt", "fp.leq", "fp.gt", "fp.geq", "fp.eq"];
+    let rel = FP_RELS[rng.below(FP_RELS.len() as u64) as usize];
+    const RMS: &[&str] = &["RNE", "RNA", "RTP", "RTN", "RTZ"];
+    let rm = RMS[rng.below(RMS.len() as u64) as usize];
+    format!(
+        "(declare-fun b () (_ BitVec {mw}))\n\
+         (declare-fun p () (_ FloatingPoint {eb} {sb}))\n\
+         (declare-fun q () (_ FloatingPoint {eb} {sb}))\n\
+         (assert (= b (_ bv{word} {mw})))\n\
+         (assert (= p ((_ to_fp {eb} {sb}) {rm} b)))\n\
+         (assert (= q ((_ to_fp_unsigned {eb} {sb}) {rm} b)))\n\
+         (assert ({rel} p q))\n\
+         (check-sat)\n"
+    )
+}
+
+#[test]
+fn differential_qf_bvfp_int_to_fp() {
+    let mut rng = Lcg(0x1_2FE_4D4D);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    let mut n_z3_checked = 0usize;
+    for iter in 0..N_ITERS {
+        let src = gen_int_to_fp_script(&mut rng);
+        let ours = shinri_outcome(&src);
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => unreachable!(),
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_mixed(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_z3_checked += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_z3_checked += 1,
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!(
+                "QF_BVFP INT→FP SOUNDNESS DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n\
+                 script:\n{src}"
+            ),
+        }
+    }
+    println!(
+        "differential_qf_bvfp_int_to_fp: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
+         z3_checked={n_z3_checked}"
+    );
+    assert!(
+        n_sat > 0 && n_unsat > 0,
+        "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
+    );
+    assert!(n_z3_checked > 0, "z3 never returned a concrete verdict — check the logic/harness");
+}
