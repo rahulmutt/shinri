@@ -308,3 +308,13 @@ fn array_nary_eq_operand_three_not_dropped_unsat() {
     );
     assert_eq!(out, vec!["unsat"]);
 }
+
+#[test]
+fn nullary_define_fun_bare_symbol_solves() {
+    // Slice 6: bare `one` expands to the macro body end-to-end.
+    let out = run_script(
+        "(define-fun one () Int 1)(declare-const y Int)\
+         (assert (= y one))(assert (= y 2))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}

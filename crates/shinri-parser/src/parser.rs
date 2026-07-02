@@ -500,6 +500,21 @@ impl<'a> Parser<'a> {
             }
             _ => {}
         }
+        // define-fun macro used as a bare symbol: a 0-ary macro expands to its
+        // body (SMT-LIB conformance — slice 6); a non-nullary macro needs
+        // application form. Checked after the builtin literals (true/false/RM
+        // can't be shadowed) and before lookup_fun, honoring the documented
+        // let → macro → fun order (env.rs).
+        if let Some(m) = self.env.lookup_macro(name) {
+            if m.formals.is_empty() {
+                return Ok(m.body);
+            }
+            let n = m.formals.len();
+            return Err(Diagnostic::new(
+                sp,
+                format!("macro {name} expects {n} argument(s)"),
+            ));
+        }
         if let Some(sym) = self.env.lookup_fun(name) {
             return Self::mk(ctx, Op::Uninterpreted(sym), &[], &sp);
         }
@@ -1438,6 +1453,30 @@ mod tests {
         assert!(matches!(cs[1], Ok(Command::Assert(_))));
         assert!(matches!(cs[2], Ok(Command::CheckSat)));
         assert_eq!(cs.len(), 3);
+    }
+
+    #[test]
+    fn nullary_define_fun_expands_as_bare_symbol() {
+        // SMT-LIB: a 0-ary defined fun is used WITHOUT parens. Gap fixed in
+        // slice 6 — resolve_leaf never consulted the macro table.
+        let cs = commands(
+            "(define-fun one () Int 1)\n(declare-fun y () Int)\n(assert (= y one))\n(check-sat)",
+        );
+        assert!(matches!(cs[0], Ok(Command::DeclareFun { .. })));
+        assert!(matches!(cs[1], Ok(Command::Assert(_))));
+        assert!(matches!(cs[2], Ok(Command::CheckSat)));
+        assert_eq!(cs.len(), 3);
+    }
+
+    #[test]
+    fn non_nullary_macro_bare_use_is_an_error() {
+        let cs = commands(
+            "(define-fun dbl ((a Real)) Real (+ a a))\n(declare-fun y () Real)\n(assert (= y dbl))",
+        );
+        assert!(
+            cs.iter().any(|c| c.is_err()),
+            "bare use of a non-nullary macro must be a diagnostic"
+        );
     }
 
     #[test]
