@@ -43,6 +43,19 @@ impl Default for Blaster {
     }
 }
 
+/// One admitted FP→BV application (fp.to_ubv / fp.to_sbv), recorded by the
+/// lowering driver so later same-signature applications can emit congruence
+/// constraints (the SMT-LIB "unspecified value" is an uninterpreted FUNCTION
+/// of (RM, x) — equal arguments must yield equal results even out of range).
+#[derive(Clone)]
+pub struct FpToBvApp {
+    /// (signed_face, m, eb, sb) — applications constrain each other iff equal.
+    pub key: (bool, u32, u32, u32),
+    pub rm: [BitLit; 5],
+    pub operand: Vec<BitLit>,
+    pub result: Vec<BitLit>,
+}
+
 /// The one recursion + cache seam shared by BV and FP lowering. Implemented by
 /// the concrete driver (a `Blaster` for pure-BV, or shinri-fp's `Lowerer` for
 /// the unified path). `word` dispatches a child of ANY sort and memoizes it;
@@ -56,6 +69,13 @@ pub trait WordSink {
     /// operands (i.e. shinri-fp's `FpBlaster`); pure-BV lowering never calls this.
     fn rm_cache(&mut self) -> &mut FxHashMap<TermId, [BitLit; 5]> {
         unreachable!("pure BV lowering has no RoundingMode operands")
+    }
+
+    /// Registry of FP→BV applications for unspecified-value congruence. Only
+    /// meaningful for sinks that lower FP→BV conversions (shinri-fp's Lowerer);
+    /// pure-BV lowering never calls this.
+    fn fp2bv_apps(&mut self) -> &mut Vec<FpToBvApp> {
+        unreachable!("pure BV lowering has no FP→BV conversions")
     }
 }
 

@@ -3,7 +3,7 @@
 pub mod blast;
 pub mod model;
 pub mod rewrite;
-pub use blast::{blast_bv_atom, blast_bv_word, BitLit, Blaster, Cnf, WordSink};
+pub use blast::{blast_bv_atom, blast_bv_word, BitLit, Blaster, Cnf, FpToBvApp, WordSink};
 pub use rewrite::rewrite;
 
 use rustc_hash::FxHashMap;

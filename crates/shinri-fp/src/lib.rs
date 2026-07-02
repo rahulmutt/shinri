@@ -244,6 +244,58 @@ pub fn blast_fp_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
     }
 }
 
+/// BV-sorted FP→BV dispatch: `fp.to_ubv` / `fp.to_sbv` (slice 4e). A sibling of
+/// `blast_fp_word` rather than an arm of it — the result sort is BitVec, and
+/// blast_fp_word's preamble asserts an FP sort. Called from `Lowerer::word`'s
+/// BV branch. Blasts the gadget, then emits congruence clauses against every
+/// prior same-key application: (core_eq(x_i, x_j) ∧ rm_i = rm_j) → res_i = res_j
+/// — core_eq because the trigger is SMT VALUE equality (any-NaN = any-NaN;
+/// blasted FP words are not payload-canonicalized).
+pub fn blast_fp_to_bv<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec<BitLit> {
+    use shinri_core::BuiltinOp::*;
+    let TermNode::App { op, args, .. } = ctx.term_node(t).clone() else {
+        unreachable!("blast_fp_to_bv: FP→BV must be an application");
+    };
+    let (signed_face, m) = match op {
+        Op::Builtin(FpToUbv(m)) => (false, m),
+        Op::Builtin(FpToSbv(m)) => (true, m),
+        other => unreachable!("blast_fp_to_bv: not an FP→BV op: {other:?}"),
+    };
+    let kids = ctx.children(args).to_vec();
+    let rm = blast_rm(sink, ctx, kids[0]);
+    let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[1])).expect("FP operand");
+    let xw = sink.word(ctx, kids[1]);
+    let (word, _ok) = crate::convert::fp_to_int(sink.blaster(), &xw, eb, sb, m, signed_face, &rm);
+    // Congruence vs. every prior application with the same signature. O(k²) in
+    // the per-formula application count — k is tiny; hash-consing already
+    // dedups syntactically identical terms before we get here.
+    let key = (signed_face, m, eb, sb);
+    let prior: Vec<shinri_bv::FpToBvApp> =
+        sink.fp2bv_apps().iter().filter(|a| a.key == key).cloned().collect();
+    for pa in prior {
+        let b = sink.blaster();
+        let x_eq = crate::blast::compare::core_eq(b, &pa.operand, &xw, eb, sb);
+        let mut rm_eq = b.one();
+        for j in 0..5 {
+            let d = b.xor2(pa.rm[j], rm.sel[j]);
+            let nd = b.not1(d);
+            rm_eq = b.and2(rm_eq, nd);
+        }
+        let cond = b.and2(x_eq, rm_eq);
+        let ncond = b.not1(cond);
+        for i in 0..(m as usize) {
+            let d = b.xor2(pa.result[i], word[i]);
+            let nd = b.not1(d);
+            let imp = b.or2(ncond, nd);
+            b.add_clause(&[imp]); // cond → (res_prior[i] ↔ res_new[i])
+        }
+    }
+    sink.fp2bv_apps().push(shinri_bv::FpToBvApp {
+        key, rm: rm.sel, operand: xw, result: word.clone(),
+    });
+    word
+}
+
 /// FP atom (Bool-sorted predicate) dispatch, generic over the sink. No cache:
 /// callers recurse into words via `sink.word`, which IS memoized.
 pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> BitLit {

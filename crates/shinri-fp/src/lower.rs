@@ -2,8 +2,8 @@
 //! sort. See docs/superpowers/specs/2026-07-01-shinri-qffp-slice4a-bvfp-unification-design.md.
 
 use rustc_hash::FxHashMap;
-use shinri_bv::{blast_bv_atom, blast_bv_word, BitLit, Blaster, WordSink};
-use shinri_core::{Context, Op, TermId, TermNode};
+use shinri_bv::{blast_bv_atom, blast_bv_word, BitLit, Blaster, FpToBvApp, WordSink};
+use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 
 pub struct Lowerer {
     pub b: Blaster,
@@ -16,11 +16,18 @@ pub struct Lowerer {
     // roundToIntegral/fma/to_fp) that carry RM operands, so it must override
     // `rm_cache` with a real backing store rather than inherit the default.
     rm_cache: FxHashMap<TermId, [BitLit; 5]>,
+    // FP→BV application registry for unspecified-value congruence (slice 4e).
+    fp2bv_apps: Vec<FpToBvApp>,
 }
 
 impl Lowerer {
     pub fn new() -> Self {
-        Lowerer { b: Blaster::new(), cache: FxHashMap::default(), rm_cache: FxHashMap::default() }
+        Lowerer {
+            b: Blaster::new(),
+            cache: FxHashMap::default(),
+            rm_cache: FxHashMap::default(),
+            fp2bv_apps: Vec::new(),
+        }
     }
     // atom() and var_bits_split() added in Step 3.
 }
@@ -38,10 +45,18 @@ impl WordSink for Lowerer {
         }
         let sort = ctx.sort_of(t);
         let bits = if ctx.bv_width(sort).is_some() {
-            // BV-sorted node. (A BV-sorted FP op — fp.to_ubv/to_sbv — is a
-            // crossing op fenced in 4a, so blast_bv_word's unreachable! arm is
-            // not hit; 4b adds a crossing check before this dispatch.)
-            blast_bv_word(self, ctx, t)
+            // BV-sorted node. fp.to_ubv/to_sbv are the one BV-sorted FP-op
+            // family (admitted in 4e) — route them to the FP dispatch; every
+            // other BV-sorted node goes to the BV blaster. (Still-crossing ops
+            // are fenced before lowering, so blast_bv_word's unreachable! arm
+            // stays an internal invariant.)
+            if matches!(ctx.term_node(t),
+                TermNode::App { op: Op::Builtin(BuiltinOp::FpToUbv(_) | BuiltinOp::FpToSbv(_)), .. })
+            {
+                crate::blast_fp_to_bv(self, ctx, t)
+            } else {
+                blast_bv_word(self, ctx, t)
+            }
         } else if ctx.fp_widths(sort).is_some() {
             // FP-sorted node (incl. future to_fp-from-BV, fenced in 4a).
             crate::blast_fp_word(self, ctx, t)
@@ -56,6 +71,9 @@ impl WordSink for Lowerer {
     }
     fn rm_cache(&mut self) -> &mut FxHashMap<TermId, [BitLit; 5]> {
         &mut self.rm_cache
+    }
+    fn fp2bv_apps(&mut self) -> &mut Vec<FpToBvApp> {
+        &mut self.fp2bv_apps
     }
 }
 
@@ -105,7 +123,74 @@ impl Lowerer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use shinri_core::BuiltinOp;
+    use shinri_core::{BuiltinOp, Op, RoundingMode};
+
+    fn solve_with_units(lw: Lowerer, units: &[(BitLit, bool)]) -> shinri_sat::SolveResult {
+        use shinri_sat::{Lit, NoProof, NoTheory, Solver, SolverConfig, Var, Vmtf};
+        let cnf = lw.b.finish();
+        let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..cnf.num_vars { s.new_var(); }
+        for c in &cnf.clauses {
+            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            s.add_clause(&ls);
+        }
+        for &(bl, want) in units {
+            s.add_clause(&[Lit::new(Var::new(bl.var), bl.pos == want)]);
+        }
+        s.solve()
+    }
+
+    #[test]
+    fn fp_to_bv_congruence_equal_args_force_equal_results() {
+        // Spec §2 probe-2 shape: x = y (SMT value equality) ∧ isNaN x ∧
+        // to_ubv(RNE,x) ≠ to_ubv(RNE,y) must be UNSAT — the two applications are
+        // distinct TermIds, so only the emitted congruence clauses can close it.
+        let mut ctx = Context::new();
+        let f16 = ctx.fp_sort(5, 11);
+        let mk = |ctx: &mut Context, n: &str, s| {
+            let f = ctx.declare_fun(n, &[], s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let x = mk(&mut ctx, "x", f16);
+        let y = mk(&mut ctx, "y", f16);
+        let rne = ctx.mk_rm_const(RoundingMode::Rne);
+        let ux = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x]).unwrap();
+        let uy = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, y]).unwrap();
+        let eq_xy = ctx.mk_eq(x, y).unwrap();
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
+        let eq_uv = ctx.mk_eq(ux, uy).unwrap();
+        let mut lw = Lowerer::new();
+        let l_eq = lw.atom(&ctx, eq_xy);
+        let l_nan = lw.atom(&ctx, isnan);
+        let l_uv = lw.atom(&ctx, eq_uv);
+        let r = solve_with_units(lw, &[(l_eq, true), (l_nan, true), (l_uv, false)]);
+        assert!(matches!(r, shinri_sat::SolveResult::Unsat { .. }), "congruence must bind equal-arg applications");
+    }
+
+    #[test]
+    fn fp_to_bv_unspecified_free_across_modes_and_faces() {
+        // Probe-4 shape: same NaN operand, DIFFERENT rounding modes → results may
+        // differ (SAT). Also different faces (ubv vs sbv) are independent functions.
+        let mut ctx = Context::new();
+        let f16 = ctx.fp_sort(5, 11);
+        let f = ctx.declare_fun("x", &[], f16);
+        let x = ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap();
+        let rne = ctx.mk_rm_const(RoundingMode::Rne);
+        let rtz = ctx.mk_rm_const(RoundingMode::Rtz);
+        let u1 = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x]).unwrap();
+        let u2 = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rtz, x]).unwrap();
+        let s1 = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(8)), &[rne, x]).unwrap();
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
+        let ne_modes = ctx.mk_eq(u1, u2).unwrap();
+        let ne_faces = ctx.mk_eq(u1, s1).unwrap();
+        let mut lw = Lowerer::new();
+        let l_nan = lw.atom(&ctx, isnan);
+        let l_m = lw.atom(&ctx, ne_modes);
+        let l_f = lw.atom(&ctx, ne_faces);
+        let r = solve_with_units(lw, &[(l_nan, true), (l_m, false), (l_f, false)]);
+        assert!(matches!(r, shinri_sat::SolveResult::Sat),
+            "different modes / different faces are unconstrained relative to each other");
+    }
 
     #[test]
     fn mixed_bv_and_fp_atoms_share_one_cache_and_split_vars() {
