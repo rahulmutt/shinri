@@ -54,14 +54,17 @@ pub fn solver_uses_fp(ctx: &Context, assertions: &[TermId]) -> bool {
 /// later slices delete an entry here as each conversion is admitted.
 ///
 /// Crossing set:
-/// - `FpToUbv`, `FpToSbv`, `ToFpUnsigned` — always crossing.
+/// - `FpToUbv`, `FpToSbv` — always crossing (FP→BV, no admitted slice yet).
 /// - `FpToReal` — the permanent Real bridge (v1 non-goal).
-/// - `ToFp` — crossing ONLY in its signed-BV-source or symbolic-Real faces.
-///   The 3a-supported FP→FP and constant-Real faces, and the 4c-supported
-///   1-arg BV bitcast face, are NOT crossing.
+/// - `ToFp` — crossing ONLY in its symbolic-Real face. The 3a-supported
+///   FP→FP and constant-Real faces, the 4c-supported 1-arg BV bitcast face,
+///   and the 4d-supported 2-arg BV-source (signed int→FP) face are NOT
+///   crossing.
 ///
 /// `FpFromBits` (the `fp` sign/exp/sig constructor from BV words) is also
 /// NOT crossing — admitted in slice 4c alongside the 1-arg `to_fp` bitcast.
+/// `ToFpUnsigned` (unsigned int→FP) is also NOT crossing — admitted in
+/// slice 4d alongside the `ToFp` 2-arg BV-source face.
 pub fn uses_crossing_conversion(ctx: &Context, assertions: &[TermId]) -> bool {
     let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
     fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
@@ -73,12 +76,11 @@ pub fn uses_crossing_conversion(ctx: &Context, assertions: &[TermId]) -> bool {
             let is_crossing = match op {
                 Op::Builtin(BuiltinOp::FpToUbv(_))
                 | Op::Builtin(BuiltinOp::FpToSbv(_))
-                | Op::Builtin(BuiltinOp::ToFpUnsigned { .. })
                 | Op::Builtin(BuiltinOp::FpToReal) => true,
                 Op::Builtin(BuiltinOp::ToFp { .. }) => match kids.len() {
                     1 => false, // 1-arg BV bitcast — admitted in slice 4c
                     2 => match ctx.sort_node(ctx.sort_of(kids[1])) {
-                        SortNode::BitVec(_) => true, // signed-BV → FP
+                        SortNode::BitVec(_) => false, // signed int→FP — admitted in slice 4d
                         // symbolic Real is crossing; a constant Real is 3a-supported.
                         SortNode::Real => ctx.const_real_value(kids[1]).is_none(),
                         _ => false, // Float → FP (3a-supported)
@@ -177,7 +179,8 @@ pub fn has_non_bvfp_theory_atom(
 /// `shinri_fp::FpBlaster::blast_word` can handle in slice 1 (FpAbs/FpNeg),
 /// slice 2a (FpAdd/FpSub), slice 2b (FpMul), slice 2c (FpDiv), slice 2c′ (FpSqrt),
 /// slice 2e (FpRoundToIntegral/FpMin/FpMax), slice 2f (FpFma), slice 2g (FpRem),
-/// or slice 3a (non-BV ToFp: FP->FP re-round, const-Real fold)?
+/// slice 3a (non-BV ToFp: FP->FP re-round, const-Real fold), or slice 4d
+/// (int→FP: ToFp 2-arg BV-source / ToFpUnsigned)?
 ///
 /// Supported: FP constants, nullary FP variables, FpAbs/FpNeg applied
 /// (recursively) to supported words, FpAdd/FpSub/FpMul/FpDiv where the RM operand is a
@@ -187,11 +190,12 @@ pub fn has_non_bvfp_theory_atom(
 /// RM and FP operand both recursively supported, FpMin/FpMax with both FP operands
 /// recursively supported, FpFma with RM and all three FP operands recursively
 /// supported, FpRem (no RM operand) with both FP operands recursively
-/// supported, and ToFp (RM, X) where X is a recursively supported FP word or a
-/// constant Real. EVERYTHING else is NOT supported (any unknown/future FP op
-/// defaults to unsupported, including ToFp with a symbolic-Real or BV operand).
-/// This ensures that adding a new FP op to the core does not silently route
-/// through blast_word and panic.
+/// supported, ToFp (RM, X) where X is a recursively supported FP word, a
+/// constant Real, or a BV-sorted term (signed int→FP, slice 4d), and
+/// ToFpUnsigned (RM, BV) (unsigned int→FP, slice 4d). EVERYTHING else is NOT
+/// supported (any unknown/future FP op defaults to unsupported, including
+/// ToFp with a symbolic-Real operand). This ensures that adding a new FP op
+/// to the core does not silently route through blast_word and panic.
 fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
     match ctx.term_node(t) {
         // FP constant → supported.
@@ -251,21 +255,35 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                 && is_supported_fp_word(ctx, kids[1])
         }
         // to_fp: 1-arg (X) or 2-arg (RM, X). The 1-arg face is the BV bitcast
-        // (slice 4c): a single BV-sorted source. The 2-arg non-BV faces are the
-        // 3a-supported FP->FP re-round (X is a supported FP word) or constant-Real
-        // fold. 2-arg BV-source / symbolic Real stay unsupported (Plan 4+ / later
-        // Real combination). Fence and folder share Context::const_real_value so
-        // the admit-set is identical (soundness).
+        // (slice 4c): a single BV-sorted source. The 2-arg faces are the
+        // 3a-supported FP->FP re-round (X is a supported FP word), constant-Real
+        // fold, or the 4d-supported signed int→FP (X is a BV-sorted source).
+        // Symbolic Real stays unsupported (later Real combination). Fence and
+        // folder share Context::const_real_value so the admit-set is identical
+        // (soundness).
         TermNode::App { op: Op::Builtin(BuiltinOp::ToFp { .. }), args, .. } => {
             let kids = ctx.children(*args).to_vec();
             match kids.len() {
                 // 1-arg BV bitcast: single BV-sorted source (slice 4c).
                 1 => matches!(ctx.sort_node(ctx.sort_of(kids[0])), SortNode::BitVec(_)),
-                // 2-arg non-BV faces: FP→FP re-round or constant-Real fold (3a).
+                // 2-arg faces: FP→FP re-round / constant-Real fold (3a), or
+                // signed int→FP from a BV source (4d). BV children need only a
+                // sort check — the BV blaster is total, nested crossings are
+                // caught by `uses_crossing_conversion` (same argument as 4c).
                 2 => is_rounding_mode_term(ctx, kids[0])
-                    && (is_supported_fp_word(ctx, kids[1]) || ctx.const_real_value(kids[1]).is_some()),
+                    && (is_supported_fp_word(ctx, kids[1])
+                        || ctx.const_real_value(kids[1]).is_some()
+                        || matches!(ctx.sort_node(ctx.sort_of(kids[1])), SortNode::BitVec(_))),
                 _ => false,
             }
+        }
+        // to_fp_unsigned: (RM, bv) — unsigned int→FP (slice 4d). BV-sort check
+        // only, per the 4c total-BV-blaster argument.
+        TermNode::App { op: Op::Builtin(BuiltinOp::ToFpUnsigned { .. }), args, .. } => {
+            let kids = ctx.children(*args).to_vec();
+            kids.len() == 2
+                && is_rounding_mode_term(ctx, kids[0])
+                && matches!(ctx.sort_node(ctx.sort_of(kids[1])), SortNode::BitVec(_))
         }
         // fp constructor (fp sign exp sig): three BV-sorted children. The BV
         // blaster is total, and any still-crossing op nested in a child is caught
@@ -276,8 +294,9 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
             kids.len() == 3
                 && kids.iter().all(|&k| matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::BitVec(_)))
         }
-        // Anything else (Ite over FP, non-nullary UF, BV-crossing conversions, symbolic-Real
-        // to_fp, fp.to_real, etc.) is not in scope for slices 1–3a/4c.
+        // Anything else (Ite over FP, non-nullary UF, fp.to_ubv/fp.to_sbv,
+        // symbolic-Real to_fp, fp.to_real, etc.) is not in scope for
+        // slices 1–3a/4c/4d.
         _ => false,
     }
 }
@@ -588,15 +607,15 @@ mod tests {
         // fp.to_sbv (FP→BV) → crossing.
         let sbv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(32)), &[rne, x]).unwrap();
         assert!(uses_crossing_conversion(&ctx, &[sbv]), "fp.to_sbv is crossing");
-        // to_fp from BV (2-arg, BV source) → crossing.
+        // to_fp from BV (2-arg, BV source) → NOT crossing (admitted in slice 4d).
         let from_bv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
-        assert!(uses_crossing_conversion(&ctx, &[from_bv]), "to_fp from BV is crossing");
+        assert!(!uses_crossing_conversion(&ctx, &[from_bv]), "signed int→FP admitted (slice 4d)");
         // 1-arg BV bitcast to_fp (width 32 == eb+sb) → NOT crossing (admitted in slice 4c).
         let bitcast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[bv]).unwrap();
         assert!(!uses_crossing_conversion(&ctx, &[bitcast]), "1-arg bitcast to_fp admitted (slice 4c)");
-        // to_fp_unsigned → crossing.
+        // to_fp_unsigned → NOT crossing (admitted in slice 4d).
         let uns = ctx.mk_app(Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
-        assert!(uses_crossing_conversion(&ctx, &[uns]), "to_fp_unsigned is crossing");
+        assert!(!uses_crossing_conversion(&ctx, &[uns]), "unsigned int→FP admitted (slice 4d)");
 
         // to_fp FP→FP (3a-supported) → NOT crossing.
         let widen = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x]).unwrap();
@@ -617,7 +636,34 @@ mod tests {
     }
 
     #[test]
-    fn to_fp_non_bv_faces_supported_bv_and_symbolic_real_not() {
+    fn int_to_fp_faces_admitted_nested_crossing_still_caught() {
+        let mut ctx = Context::new();
+        let f32s = ctx.fp_sort(8, 24);
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let bvs = ctx.bv_sort(32);
+        let bvf = ctx.declare_fun("bv", &[], bvs);
+        let bv = ctx.mk_app(Op::Uninterpreted(bvf), &[]).unwrap();
+
+        // Both int→FP faces: NOT crossing, supported (slice 4d).
+        let signed = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
+        let unsigned =
+            ctx.mk_app(Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
+        assert!(!uses_crossing_conversion(&ctx, &[signed]), "signed int→FP admitted");
+        assert!(!uses_crossing_conversion(&ctx, &[unsigned]), "unsigned int→FP admitted");
+        assert!(super::is_supported_fp_word(&ctx, signed), "signed int→FP word supported");
+        assert!(super::is_supported_fp_word(&ctx, unsigned), "unsigned int→FP word supported");
+
+        // Safety net: a still-crossing op nested INSIDE the BV child is caught
+        // by the same DAG walk.
+        let xf = ctx.declare_fun("x", &[], f32s);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let ubv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(32)), &[rne, x]).unwrap();
+        let nested = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, ubv]).unwrap();
+        assert!(uses_crossing_conversion(&ctx, &[nested]), "nested fp.to_ubv still crossing");
+    }
+
+    #[test]
+    fn to_fp_faces_supported_symbolic_real_not() {
         use shinri_num::Rational;
         let mut ctx = Context::new();
         let f32 = ctx.fp_sort(8, 24);
@@ -643,14 +689,14 @@ mod tests {
         let isn3 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[sym]).unwrap();
         assert!(!fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn3])),
                 "symbolic-Real to_fp must stay fenced");
-        // BV-operand to_fp NOT supported (signed-int→FP, Plan 4+).
+        // BV-operand to_fp IS supported (signed-int→FP, admitted in slice 4d).
         let bvs = ctx.bv_sort(32);
         let bvf = ctx.declare_fun("bv", &[], bvs);
         let bv = ctx.mk_app(Op::Uninterpreted(bvf), &[]).unwrap();
         let bv_conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
         let isn4 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[bv_conv]).unwrap();
-        assert!(!fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn4])),
-                "BV-operand to_fp must stay fenced (signed-int->FP is Plan 4)");
+        assert!(fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn4])),
+                "BV-operand to_fp (signed int->FP) is in scope as of slice 4d");
     }
 
     #[test]
