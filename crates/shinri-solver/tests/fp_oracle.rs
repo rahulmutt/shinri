@@ -1250,3 +1250,191 @@ fn differential_qf_bvfp_fp_to_bv() {
     assert!(n_unknown == 0, "no admitted-face script may fence ({n_unknown} unknown)");
     assert!(n_z3_checked > 0, "z3 never returned a concrete verdict");
 }
+
+/// BV operand pool for the ite/n-ary oracle: three free bytes plus the two
+/// all-zero/all-one constants, mirroring the brief's `<bv>` pool.
+const BVFP_ITE_BV_OPS: &[&str] = &["u", "v", "w", "#x00", "#xff"];
+
+/// Draw a random `<cond>` for a word-ite: the two atoms directly, the two
+/// cross-sort atoms (`bvult`, `fp.lt`), a conjunction, and a Bool-sorted
+/// `ite` — the last exercises the word_norm ite-elimination pass on a
+/// Bool-typed ite nested inside a BV/FP/RM-typed one.
+fn gen_ite_cond(rng: &mut Lcg) -> String {
+    match rng.below(6) {
+        0 => "p".to_string(),
+        1 => "(not p)".to_string(),
+        2 => "(bvult u v)".to_string(),
+        3 => "(fp.lt x y)".to_string(),
+        4 => "(and p (bvult u v))".to_string(),
+        _ => "(ite p (fp.lt x y) (bvult u v))".to_string(),
+    }
+}
+
+/// Draw a random FP operand: `x`/`y` or one of the FP32 special constants.
+fn gen_ite_fp_operand(rng: &mut Lcg) -> String {
+    if rng.below(2) == 0 {
+        if rng.below(2) == 0 { "x".to_string() } else { "y".to_string() }
+    } else {
+        FP32_SPECIALS[rng.below(FP32_SPECIALS.len() as u64) as usize].to_string()
+    }
+}
+
+/// Draw a random BV operand from `BVFP_ITE_BV_OPS`.
+fn gen_ite_bv_operand(rng: &mut Lcg) -> String {
+    BVFP_ITE_BV_OPS[rng.below(BVFP_ITE_BV_OPS.len() as u64) as usize].to_string()
+}
+
+/// Generate one assertion drawn from the 6 families the slice landed:
+/// word-level ite over FP, word-level ite over BV, n-ary `distinct`, n-ary
+/// `=`, RM equality atoms, and an RM-typed ite feeding a rounded FP op.
+fn gen_ite_assertion(rng: &mut Lcg) -> String {
+    match rng.below(6) {
+        0 => {
+            // (= (ite <cond> <fp> <fp>) <fp>)
+            let cond = gen_ite_cond(rng);
+            let a = gen_ite_fp_operand(rng);
+            let b = gen_ite_fp_operand(rng);
+            let c = gen_ite_fp_operand(rng);
+            format!("(= (ite {cond} {a} {b}) {c})")
+        }
+        1 => {
+            // (bvult (ite <cond> <bv> <bv>) <bv>) or (= (ite <cond> <bv> <bv>) <bv>)
+            let cond = gen_ite_cond(rng);
+            let a = gen_ite_bv_operand(rng);
+            let b = gen_ite_bv_operand(rng);
+            let c = gen_ite_bv_operand(rng);
+            if rng.below(2) == 0 {
+                format!("(bvult (ite {cond} {a} {b}) {c})")
+            } else {
+                format!("(= (ite {cond} {a} {b}) {c})")
+            }
+        }
+        2 => {
+            // (distinct t1 t2 t3), all-BV or all-FP
+            if rng.below(2) == 0 {
+                let (a, b, c) = (
+                    gen_ite_bv_operand(rng),
+                    gen_ite_bv_operand(rng),
+                    gen_ite_bv_operand(rng),
+                );
+                format!("(distinct {a} {b} {c})")
+            } else {
+                let (a, b, c) = (
+                    gen_ite_fp_operand(rng),
+                    gen_ite_fp_operand(rng),
+                    gen_ite_fp_operand(rng),
+                );
+                format!("(distinct {a} {b} {c})")
+            }
+        }
+        3 => {
+            // (= t1 t2 t3), all-BV or all-FP
+            if rng.below(2) == 0 {
+                let (a, b, c) = (
+                    gen_ite_bv_operand(rng),
+                    gen_ite_bv_operand(rng),
+                    gen_ite_bv_operand(rng),
+                );
+                format!("(= {a} {b} {c})")
+            } else {
+                let (a, b, c) = (
+                    gen_ite_fp_operand(rng),
+                    gen_ite_fp_operand(rng),
+                    gen_ite_fp_operand(rng),
+                );
+                format!("(= {a} {b} {c})")
+            }
+        }
+        4 => {
+            // RM atoms: (= r <lit>) or (distinct r <lit> <lit>)
+            if rng.below(2) == 0 {
+                let lit = RMS[rng.below(RMS.len() as u64) as usize];
+                format!("(= r {lit})")
+            } else {
+                let l1 = RMS[rng.below(RMS.len() as u64) as usize];
+                let l2 = RMS[rng.below(RMS.len() as u64) as usize];
+                format!("(distinct r {l1} {l2})")
+            }
+        }
+        _ => {
+            // (fp.eq (fp.add (ite <cond> <RM-literal> <RM-literal>) x y) x)
+            let cond = gen_ite_cond(rng);
+            let l1 = RMS[rng.below(RMS.len() as u64) as usize];
+            let l2 = RMS[rng.below(RMS.len() as u64) as usize];
+            format!("(fp.eq (fp.add (ite {cond} {l1} {l2}) x y) x)")
+        }
+    }
+}
+
+/// Generate a full QF_BVFP script exercising word-level ite over BV/FP/RM,
+/// n-ary `=`/`distinct` expansion, and RM equality atoms — the surface
+/// slice 5 landed (word_norm pass wired first in check_sat, RM equality
+/// blasting, RM→FP routing, model hygiene). Declares `p:Bool`, `x,y:Float32`,
+/// `u,v,w:(_ BitVec 8)`, `r:RoundingMode`, then 1..=3 assertions each drawn
+/// from `gen_ite_assertion`.
+fn gen_ite_script(rng: &mut Lcg) -> String {
+    let mut s = String::from(
+        "(declare-fun p () Bool)\n\
+         (declare-fun x () (_ FloatingPoint 8 24))\n\
+         (declare-fun y () (_ FloatingPoint 8 24))\n\
+         (declare-fun u () (_ BitVec 8))\n\
+         (declare-fun v () (_ BitVec 8))\n\
+         (declare-fun w () (_ BitVec 8))\n\
+         (declare-fun r () RoundingMode)\n",
+    );
+    let n_asserts = 1 + rng.below(3) as usize; // 1..=3
+    for _ in 0..n_asserts {
+        s.push_str(&format!("(assert {})\n", gen_ite_assertion(rng)));
+    }
+    s.push_str("(check-sat)\n");
+    s
+}
+
+#[test]
+fn differential_qf_bvfp_ite() {
+    let mut rng = Lcg(0x17E_1234_ABCD);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    let mut n_z3_checked = 0usize;
+    for iter in 0..N_ITERS {
+        let src = gen_ite_script(&mut rng);
+        let ours = shinri_outcome(&src);
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => unreachable!(),
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_mixed(&mut ctx, &src);
+        match (ours, theirs) {
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_z3_checked += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_z3_checked += 1,
+            (SolveOutcome::Sat, easy_smt::Response::Unknown)
+            | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            (o, t) => panic!(
+                "QF_BVFP ite DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n\
+                 script:\n{src}"
+            ),
+        }
+    }
+    println!(
+        "differential_qf_bvfp_ite: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
+         z3_checked={n_z3_checked}"
+    );
+    assert!(
+        n_sat > 0 && n_unsat > 0,
+        "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
+    );
+    assert!(n_unknown == 0, "unknown must be 0 post-slice ({n_unknown} unknown)");
+    assert!(
+        n_z3_checked == N_ITERS,
+        "expected every iteration z3-checked with zero disagreements \
+         ({n_z3_checked}/{N_ITERS} checked)"
+    );
+}
