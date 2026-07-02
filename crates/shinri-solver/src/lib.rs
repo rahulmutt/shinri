@@ -8,6 +8,7 @@ mod fp_stage;
 mod model;
 mod string_stage;
 mod tseitin;
+mod word_norm;
 
 pub use model::{Model, SolveOutcome};
 
