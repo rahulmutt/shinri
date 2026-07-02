@@ -71,6 +71,11 @@ impl WordNorm {
                 continue; // user (or an earlier check) owns this name
             }
             let sym = ctx.declare_fun(&name, &[], sort);
+            // Reserve the name so a later user `declare-fun`/`declare-const`
+            // naming it is rejected at parse time — otherwise the user's app
+            // hash-conses to `w` and inherits this ite definition (slice 5
+            // final review: wrong-UNSAT via post-mint re-declaration).
+            ctx.reserve_symbol(sym);
             let w = ctx
                 .mk_app(Op::Uninterpreted(sym), &[])
                 .expect("nullary app of a declared symbol is well-sorted");

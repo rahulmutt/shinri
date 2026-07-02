@@ -56,6 +56,22 @@ impl Diagnostic {
     }
 }
 
+/// Reject a user `declare-fun`/`declare-const` that names a solver-internal
+/// (reserved) symbol. Without this, the user's nullary app would hash-cons to
+/// the same TermId as the internal symbol (e.g. word_norm's `ite!<n>`) and
+/// silently inherit its definition — a wrong-UNSAT (slice 5 final review).
+fn reject_reserved(ctx: &Context, name: &str, sp: &Span) -> Result<(), Diagnostic> {
+    if let Some(sym) = ctx.lookup_symbol(name) {
+        if ctx.is_reserved(sym) {
+            return Err(Diagnostic::new(
+                sp.clone(),
+                format!("cannot declare '{name}': name is reserved for solver-internal use"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub struct Parser<'a> {
     #[allow(dead_code)]
     lx: Lexer<'a>,
@@ -952,7 +968,8 @@ impl<'a> Parser<'a> {
                 Command::DeclareSort { name, arity }
             }
             "declare-const" => {
-                let (name, _) = self.expect_symbol()?;
+                let (name, nsp) = self.expect_symbol()?;
+                reject_reserved(ctx, &name, &nsp)?;
                 let result = self.parse_sort(ctx)?;
                 let sym = ctx.declare_fun(&name, &[], result);
                 self.env.add_fun(&name, sym);
@@ -964,7 +981,8 @@ impl<'a> Parser<'a> {
                 }
             }
             "declare-fun" => {
-                let (name, _) = self.expect_symbol()?;
+                let (name, nsp) = self.expect_symbol()?;
+                reject_reserved(ctx, &name, &nsp)?;
                 self.expect_token(&Token::LParen)?;
                 let mut params = Vec::new();
                 while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {

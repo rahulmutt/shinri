@@ -3,7 +3,7 @@ use crate::ids::{BvId, FpId, RatId, SortId, StringId, SymbolId, TermId};
 use crate::sort::SortNode;
 use crate::symbol::StringInterner;
 use crate::term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_num::{Integer, Rational};
 
 /// The single owning arena for all interned sorts (and, after Task 4, terms).
@@ -17,6 +17,12 @@ pub struct Context {
     nums: Vec<Rational>,
     term_interner: FxHashMap<TermKey, TermId>,
     fun_sigs: FxHashMap<SymbolId, (Vec<SortId>, SortId)>,
+    /// Symbols minted by solver-internal passes (e.g. word_norm's `ite!<n>`
+    /// nullary vars). User `declare-fun`/`declare-const` must be rejected when
+    /// it names one of these, otherwise the user's app hash-conses to the same
+    /// TermId as the internal symbol and silently inherits its definition
+    /// (slice 5 final review: wrong-UNSAT via post-mint re-declaration).
+    reserved_syms: FxHashSet<SymbolId>,
     /// BV literal table: index `BvId(i)` -> `(width, value in [0, 2^width))`.
     bvs: Vec<(u32, Integer)>,
     /// FP literal table: (eb, sb, bits) where bits is the W = eb+sb bit pattern,
@@ -47,6 +53,7 @@ impl Context {
             nums: Vec::new(),
             term_interner: FxHashMap::default(),
             fun_sigs: FxHashMap::default(),
+            reserved_syms: FxHashSet::default(),
             bvs: Vec::new(),
             fps: Vec::new(),
             str_lits: Vec::new(),
@@ -160,6 +167,17 @@ impl Context {
     /// user-declared symbols.
     pub fn lookup_symbol(&self, text: &str) -> Option<SymbolId> {
         self.symbols.lookup(text)
+    }
+
+    /// Mark `sym` as solver-internal (reserved). Called by solver passes that
+    /// mint fresh symbols so user declarations naming them can be rejected.
+    pub fn reserve_symbol(&mut self, sym: SymbolId) {
+        self.reserved_syms.insert(sym);
+    }
+
+    /// Whether `sym` was minted by a solver-internal pass (see `reserve_symbol`).
+    pub fn is_reserved(&self, sym: SymbolId) -> bool {
+        self.reserved_syms.contains(&sym)
     }
 
     /// Build (and intern) `op` applied to `args`, checking well-sortedness.
