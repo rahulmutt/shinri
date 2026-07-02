@@ -48,7 +48,7 @@ pub fn solver_uses_fp(ctx: &Context, assertions: &[TermId]) -> bool {
 }
 
 /// True if any subterm is a BV↔FP CROSSING conversion (or the Real bridge) —
-/// the ops slice 4b does NOT yet admit. These must fence to `Unknown` BEFORE
+/// the ops no slice has yet admitted. These must fence to `Unknown` BEFORE
 /// lowering so `blast_bv_word`/`blast_fp_word`'s crossing `unreachable!` arms
 /// stay internal invariants. This is the single authoritative crossing-op list:
 /// later slices delete an entry here as each conversion is admitted.

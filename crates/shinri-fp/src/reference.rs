@@ -379,7 +379,7 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
             let max_sig = {
                 let two = Integer::from(2u64);
                 let mut acc = Integer::one();
-                for _ in 0..(sb - 1) { acc = acc * two.clone(); }
+                for _ in 0..(sb - 1) { acc *= two.clone(); }
                 acc - Integer::one()
             };
             return pack(sign, max_exp_field, max_sig);

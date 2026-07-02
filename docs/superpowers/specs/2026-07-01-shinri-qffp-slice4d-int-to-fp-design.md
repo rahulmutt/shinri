@@ -1,7 +1,17 @@
 # shinri QF_FP — Slice 4d: int→FP (`to_fp` signed-BV + `to_fp_unsigned`)
 
 **Date:** 2026-07-01
-**Status:** Approved design, pre-implementation
+**Status:** Landed — both int→FP faces (`to_fp` 2-arg signed-BV + `to_fp_unsigned`) admitted
+through the `to_fp_int` gadget (sign+magnitude → prenormalize → clamp → static split → shared
+rounder → zero mux). MID-SLICE DISCOVERY: §2's "rounder's existing overflow→±∞/max-finite-by-mode
+path" did not exist — `round()`/`round_rational` overflowed to ±∞ under EVERY mode (latent IEEE-754
+deviation in all prior rounding ops); fixed centrally in both (RNE/RNA→±∞, RTZ→±max_finite,
+RTP→+∞/−max_finite, RTN→+max_finite/−∞), all 10 sign×mode combos hard-pinned on golden and circuit.
+Verification: workspace EXIT=0 (shinri-fp exhaustive 77/0 @2337s, solver lib 81/0, fp_e2e 57/0 incl
+5 new int→FP e2e, shinri-bv 98/0, qfbv 26/0); full z3 oracle 13/13 ZERO disagreements (new
+differential_qf_bvfp_int_to_fp sat=112 unsat=88 z3_checked=200/200; all pre-existing counts
+byte-identical to the 4c baseline); 4 canaries repointed (fp_stage.rs ×3 incl. one the plan missed,
+fp_e2e.rs ×1); remaining fence = fp.to_ubv / fp.to_sbv / fp.to_real / symbolic-Real to_fp.
 **Plan:** 4 (BV↔FP crossing conversions), second admitted conversion
 **Predecessors:** slice 4a (unified `Lowerer`/`WordSink`), slice 4b (mixed
 pure-BV+pure-FP fence-lift), slice 4c (BV→FP bitcast)

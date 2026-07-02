@@ -344,13 +344,14 @@ impl Solver {
         // Non-ABV path: clear any stale array models from a previous QF_ABV solve.
         self.abv_array_models.clear();
 
-        // ── Crossing-conversion fence (slice 4b) ───────────────────────────────
+        // ── Crossing-conversion fence (est. slice 4b) ──────────────────────────
         // The mixed BV+FP fence is LIFTED (pure-BV and pure-FP atoms may coexist
-        // in one query), but BV↔FP crossing conversions are NOT yet admitted.
-        // to_fp-from-BV / 1-arg bitcast / to_fp_unsigned / fp.to_ubv / fp.to_sbv /
-        // fp.to_real / symbolic-Real to_fp still fence to Unknown, BEFORE any
-        // lowering, so blast_*_word's crossing `unreachable!` arms stay internal
-        // invariants. Each conversion is admitted in its own later slice.
+        // in one query), and the BV→FP faces are admitted: bitcast (FpFromBits +
+        // 1-arg to_fp, slice 4c) and int→FP (2-arg to_fp from BV + to_fp_unsigned,
+        // slice 4d). fp.to_ubv / fp.to_sbv / fp.to_real / symbolic-Real to_fp
+        // still fence to Unknown, BEFORE any lowering, so blast_*_word's crossing
+        // `unreachable!` arms stay internal invariants. Each remaining conversion
+        // is admitted in its own later slice.
         let uses_bv = crate::bv_stage::solver_uses_bv(&self.ctx, &assertions);
         let uses_fp = crate::fp_stage::solver_uses_fp(&self.ctx, &assertions);
         if uses_fp && crate::fp_stage::uses_crossing_conversion(&self.ctx, &assertions) {
