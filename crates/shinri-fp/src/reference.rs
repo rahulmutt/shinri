@@ -248,8 +248,12 @@ pub fn class_to_rational(eb: u32, sb: u32, c: &FpClass) -> Option<Rational> {
 }
 
 /// Round an exact real `value` into the (eb, sb) bit pattern under `mode`.
-/// Handles sign of zero from the sign of `value` (0 -> +0). Overflow -> inf,
-/// underflow -> subnormal/zero.
+/// Handles sign of zero from the sign of `value` (0 -> +0). Underflow ->
+/// subnormal/zero. Overflow is mode-dependent (IEEE-754 / SMT-LIB FP):
+/// RNE/RNA -> +-infinity (sign preserved); RTZ -> +-max_finite (sign
+/// preserved); RTP -> +infinity on positive overflow, -max_finite on
+/// negative overflow; RTN -> +max_finite on positive overflow, -infinity on
+/// negative overflow.
 pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> Integer {
     let zero = Rational::new(Integer::zero(), Integer::one());
     let sign = *value < zero; // sign bit
@@ -360,8 +364,26 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
         final_exp += 1;
     }
 
-    // Overflow to infinity.
+    // Overflow: mode-dependent saturation (IEEE-754 / SMT-LIB FP).
+    // RNE, RNA -> +-infinity. RTZ -> +-max_finite. RTP -> +infinity /
+    // -max_finite. RTN -> +max_finite / -infinity.
     if final_exp > emax {
+        let sat_to_max = match mode {
+            RoundMode::Rtz => true,
+            RoundMode::Rtp => sign,
+            RoundMode::Rtn => !sign,
+            RoundMode::Rne | RoundMode::Rna => false,
+        };
+        if sat_to_max {
+            let max_exp_field: u64 = (1u64 << eb) - 2;
+            let max_sig = {
+                let two = Integer::from(2u64);
+                let mut acc = Integer::one();
+                for _ in 0..(sb - 1) { acc = acc * two.clone(); }
+                acc - Integer::one()
+            };
+            return pack(sign, max_exp_field, max_sig);
+        }
         let exp_all_ones: u64 = (1u64 << eb) - 1;
         return pack(sign, exp_all_ones, Integer::zero());
     }
@@ -395,50 +417,13 @@ pub fn ref_to_fp_sbv(eb: u32, sb: u32, m: u32, x: &Integer, mode: RoundMode) -> 
     } else {
         x.clone()
     };
-    let result = round_rational(eb, sb, &Rational::from_int(v), mode);
-    // RTZ overflow: round toward zero means saturate to max finite, not infinity
-    if mode == RoundMode::Rtz {
-        let c = decode(eb, sb, &result);
-        if matches!(c, FpClass::Inf { sign: _ }) {
-            let sign_bit = if ref_is_negative(&c) { 1 } else { 0 };
-            let max_exp = (1u64 << eb) - 2;
-            let max_sig = {
-                let two = Integer::from(2u64);
-                let mut acc = Integer::one();
-                for _ in 0..(sb - 1) { acc = acc * two.clone(); }
-                acc - Integer::one()
-            };
-            ref_fp_from_bits(eb, sb, sign_bit, &Integer::from(max_exp), &max_sig)
-        } else {
-            result
-        }
-    } else {
-        result
-    }
+    round_rational(eb, sb, &Rational::from_int(v), mode)
 }
 
 /// `((_ to_fp_unsigned eb sb) rm x)`: the m-bit pattern read UNSIGNED. `x` is
 /// already the non-negative value; the width `m` is kept for signature symmetry.
 pub fn ref_to_fp_ubv(eb: u32, sb: u32, _m: u32, x: &Integer, mode: RoundMode) -> Integer {
-    let result = round_rational(eb, sb, &Rational::from_int(x.clone()), mode);
-    // RTZ overflow: round toward zero means saturate to max finite, not infinity
-    if mode == RoundMode::Rtz {
-        let c = decode(eb, sb, &result);
-        if matches!(c, FpClass::Inf { .. }) {
-            let max_exp = (1u64 << eb) - 2;
-            let max_sig = {
-                let two = Integer::from(2u64);
-                let mut acc = Integer::one();
-                for _ in 0..(sb - 1) { acc = acc * two.clone(); }
-                acc - Integer::one()
-            };
-            ref_fp_from_bits(eb, sb, 0, &Integer::from(max_exp), &max_sig)
-        } else {
-            result
-        }
-    } else {
-        result
-    }
+    round_rational(eb, sb, &Rational::from_int(x.clone()), mode)
 }
 
 /// Exact-rational golden `((_ to_fp eb_t sb_t) mode x)` for an FP source `x` of
@@ -1220,6 +1205,31 @@ mod tests {
         // max finite (0x6F) under RTZ.
         assert_eq!(ref_to_fp_ubv(3, 5, 8, &f(0xFF), RoundMode::Rne), f(0x70));
         assert_eq!(ref_to_fp_ubv(3, 5, 8, &f(0xFF), RoundMode::Rtz), f(0x6F));
+    }
+
+    #[test]
+    fn round_rational_overflow_saturates_by_mode() {
+        // (3,5): +inf = 0x70, +max_finite = 0x6F, -inf = 0xF0, -max_finite = 0xEF.
+        // 255 overflows (max finite magnitude is 15.5) under every mode.
+        let pos255 = Rational::new(Integer::from(255u64), Integer::one());
+        let neg255 = -pos255.clone();
+        let cases = [
+            // (value, mode, expected pattern)
+            (pos255.clone(), RoundMode::Rne, 0x70u64),
+            (pos255.clone(), RoundMode::Rna, 0x70u64),
+            (pos255.clone(), RoundMode::Rtz, 0x6Fu64),
+            (pos255.clone(), RoundMode::Rtp, 0x70u64),
+            (pos255.clone(), RoundMode::Rtn, 0x6Fu64),
+            (neg255.clone(), RoundMode::Rne, 0xF0u64),
+            (neg255.clone(), RoundMode::Rna, 0xF0u64),
+            (neg255.clone(), RoundMode::Rtz, 0xEFu64),
+            (neg255.clone(), RoundMode::Rtp, 0xEFu64),
+            (neg255.clone(), RoundMode::Rtn, 0xF0u64),
+        ];
+        for (value, mode, want) in cases {
+            let got = round_rational(3, 5, &value, mode);
+            assert_eq!(got, Integer::from(want), "value={value:?} mode={mode:?}");
+        }
     }
 }
 

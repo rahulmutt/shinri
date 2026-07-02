@@ -97,7 +97,9 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
         norm_sig.push(b.mux2(carry, shifted_bit, sum[i]));
     }
 
-    // --- Step 4: overflow to ∞. exp_signed > emax. ---
+    // --- Step 4: overflow. exp_signed > emax. Saturation is mode-dependent
+    // (IEEE-754 / SMT-LIB FP): RNE/RNA -> +-infinity; RTZ -> +-max_finite;
+    // RTP -> +infinity / -max_finite; RTN -> +max_finite / -infinity. ---
     let emax_const = const_i(b, ew, emax);
     // overflow iff final_exp > emax (signed). final_exp - emax > 0 and not negative.
     let over_diff = bvsub(b, &final_exp, &emax_const);
@@ -108,6 +110,15 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
         acc
     };
     let overflow = b.and2(over_pos, over_nonzero);
+    // sat_to_max = Rtz | (Rtp & sign) | (Rtn & !sign). RmSel.sel order is
+    // [Rne, Rna, Rtp, Rtn, Rtz] (indices 0..4).
+    let not_sign = b.not1(ext.sign);
+    let rtp_sat = b.and2(rm.sel[2], ext.sign);
+    let rtn_sat = b.and2(rm.sel[3], not_sign);
+    let sat_to_max = {
+        let t = b.or2(rm.sel[4], rtp_sat);
+        b.or2(t, rtn_sat)
+    };
 
     // --- Step 5: pack sign | biased_exp | trailing. ---
     // biased_exp = final_exp + bias, truncated to eb bits. Subnormal-clamped case:
@@ -120,18 +131,25 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
     let not_hidden = b.not1(hidden);
     let exp_all_ones: Vec<BitLit> = (0..eb as usize).map(|_| b.one()).collect();
     let zero_eb: Vec<BitLit> = (0..eb as usize).map(|_| b.zero()).collect();
+    // max-finite exponent field: all ones except LSB 0 (value 2^eb - 2).
+    let exp_max_finite: Vec<BitLit> = (0..eb as usize).map(|i| if i == 0 { b.zero() } else { b.one() }).collect();
 
     let mut out: Vec<BitLit> = Vec::with_capacity((eb + sb) as usize);
-    // trailing significand sig[0..sb-1]; zeroed on overflow (∞ has sig 0).
+    // trailing significand sig[0..sb-1]; zeroed on infinity-overflow, all ones
+    // on max_finite-overflow.
     #[allow(clippy::needless_range_loop)] // norm_sig[i] — index is the operand, not just a counter
     for i in 0..(sbu - 1) {
-        out.push(b.mux2(overflow, b.zero(), norm_sig[i]));
+        let non_overflow = norm_sig[i];
+        let overflow_bit = b.mux2(sat_to_max, b.one(), b.zero());
+        out.push(b.mux2(overflow, overflow_bit, non_overflow));
     }
     // exponent field eb bits.
     for i in 0..(eb as usize) {
-        // normal: biased[i]; subnormal (not_hidden): 0; overflow: all ones.
+        // normal: biased[i]; subnormal (not_hidden): 0; overflow: all-ones or
+        // max-finite depending on sat_to_max.
         let normal_or_sub = b.mux2(not_hidden, zero_eb[i], biased[i]);
-        out.push(b.mux2(overflow, exp_all_ones[i], normal_or_sub));
+        let overflow_bit = b.mux2(sat_to_max, exp_max_finite[i], exp_all_ones[i]);
+        out.push(b.mux2(overflow, overflow_bit, normal_or_sub));
     }
     // sign bit (preserved through overflow).
     out.push(ext.sign);
@@ -294,6 +312,34 @@ mod tests {
                         "round mismatch pat={pat:#x} value!=grid m={m:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn round_overflow_saturates_by_mode() {
+        // (3,5): +inf=0x70, +max_finite=0x6F, -inf=0xF0, -max_finite=0xEF.
+        // exp = emax+1 = 4 (unbiased) forces overflow; sig all ones (hidden set).
+        let (eb, sb) = (3u32, 5u32);
+        let emax: i64 = (1i64 << (eb - 1)) - 1; // 3
+        let sig = [true; 5]; // all ones, hidden bit (top) set.
+        let cases: [(bool, RoundMode, u64); 10] = [
+            (false, RoundMode::Rne, 0x70),
+            (false, RoundMode::Rna, 0x70),
+            (false, RoundMode::Rtz, 0x6F),
+            (false, RoundMode::Rtp, 0x70),
+            (false, RoundMode::Rtn, 0x6F),
+            (true, RoundMode::Rne, 0xF0),
+            (true, RoundMode::Rna, 0xF0),
+            (true, RoundMode::Rtz, 0xEF),
+            (true, RoundMode::Rtp, 0xEF),
+            (true, RoundMode::Rtn, 0xF0),
+        ];
+        for (sign, m, want) in cases {
+            let mut b = Blaster::new();
+            let ext = build_ext(&b, eb, sb, sign, emax + 1, &sig, false, false, false);
+            let sel = rm::literal(&b, rmode(m));
+            let word = round(&mut b, ext, eb, sb, &sel);
+            assert_eq!(eval_word(b, &word), want, "sign={sign} mode={m:?}");
         }
     }
 
