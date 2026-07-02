@@ -631,18 +631,15 @@ fn to_fp_const_real_reflexive_unsat() {
 #[test]
 fn to_fp_bv_crossing_and_symbolic_real_are_unknown() {
     // Remaining still-fenced conversions → Unknown (soundness: BV→FP bitcast
-    // (FpFromBits / 1-arg to_fp) is admitted as of slice 4c, and int→FP
-    // (2-arg to_fp + to_fp_unsigned) is admitted as of slice 4d — see the
-    // slice-4c and slice-4d end-to-end blocks above; the remaining fence is
-    // FP→BV (fp.to_sbv/fp.to_ubv) plus the deferred Real bridge
-    // (symbolic-Real to_fp / fp.to_real).
+    // (FpFromBits / 1-arg to_fp) is admitted as of slice 4c, int→FP
+    // (2-arg to_fp + to_fp_unsigned) is admitted as of slice 4d, and FP→BV
+    // (fp.to_sbv/fp.to_ubv) is admitted as of slice 4e — see the slice-4c,
+    // slice-4d, and slice-4e end-to-end blocks above; the remaining fence is
+    // only the deferred Real bridge (symbolic-Real to_fp / fp.to_real).
     let scripts = [
         // symbolic-Real to_fp
         "(declare-fun r () Real) (declare-fun z () Float32) \
          (assert (fp.eq z ((_ to_fp 8 24) RNE r))) (check-sat)",
-        // FP → int (fp.to_sbv)
-        "(declare-fun x () Float32) \
-         (assert (= ((_ fp.to_sbv 32) RNE x) (_ bv0 32))) (check-sat)",
         // fp.to_real
         "(declare-fun x () Float32) \
          (assert (= (fp.to_real x) 0.0)) (check-sat)",
@@ -801,4 +798,93 @@ fn to_fp_zero_is_plus_zero_sat() {
 (check-sat)";
     let (o, _) = run(src);
     assert_eq!(o, SolveOutcome::Sat, "int 0 → +0 even under RTN");
+}
+
+// ── Slice-4e: FP→BV (fp.to_ubv / fp.to_sbv) now solves ──────────────────────
+
+#[test]
+fn fp_to_ubv_sat_unsat_with_model() {
+    // 42.0 → ubv8 is specified: equals #x2A (any mode; exact integer).
+    let (o, model) = run(
+        "(declare-fun x () (_ FloatingPoint 5 11)) (declare-fun a () (_ BitVec 8)) \
+         (assert (fp.eq x (fp #b0 #b10100 #b0101000000))) \
+         (assert (= a ((_ fp.to_ubv 8) RTZ x))) (check-sat) (get-model)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(model.contains("x") && model.contains("a"), "model surfaces both vars");
+    let (o2, _) = run(
+        "(declare-fun x () (_ FloatingPoint 5 11)) \
+         (assert (fp.eq x (fp #b0 #b10100 #b0101000000))) \
+         (assert (distinct ((_ fp.to_ubv 8) RTZ x) #x2A)) (check-sat)",
+    );
+    assert_eq!(o2, SolveOutcome::Unsat, "42.0 → ubv8 must be exactly #x2A");
+}
+
+#[test]
+fn fp_to_bv_round_then_range_boundary_trio() {
+    // The z3-probed spec-§2 boundary semantics, pinned end-to-end.
+    let cases = [
+        // -0.5 RNE rounds to 0 → in range → specified 0.
+        ("(assert (distinct ((_ fp.to_ubv 8) RNE (fp #b1 #b01110 #b0000000000)) #x00)) (check-sat)",
+         SolveOutcome::Unsat),
+        // 255.5 RTZ → 255 → specified #xFF.
+        ("(assert (distinct ((_ fp.to_ubv 8) RTZ (fp #b0 #b10110 #b1111111100)) #xFF)) (check-sat)",
+         SolveOutcome::Unsat),
+        // 255.5 RNE → 256 → OUT of range → unspecified: may equal #x07.
+        ("(assert (= ((_ fp.to_ubv 8) RNE (fp #b0 #b10110 #b1111111100)) #x07)) (check-sat)",
+         SolveOutcome::Sat),
+    ];
+    for (s, want) in cases {
+        let (o, _) = run(s);
+        assert_eq!(o, want, "boundary pin: {s}");
+    }
+}
+
+#[test]
+fn fp_to_sbv_int_min_and_unspecified() {
+    // -128.0 → sbv8 = #x80 (INT_MIN in range); NaN → sbv8 unconstrained.
+    let (o, _) = run(
+        "(assert (distinct ((_ fp.to_sbv 8) RTZ (fp #b1 #b10110 #b0000000000)) #x80)) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat, "-128.0 → sbv8 is exactly #x80");
+    let (o2, _) = run(
+        "(assert (= ((_ fp.to_sbv 8) RNE (_ NaN 5 11)) #x11)) (check-sat)",
+    );
+    assert_eq!(o2, SolveOutcome::Sat, "unspecified sbv value is unconstrained (can be 0x11)");
+}
+
+#[test]
+fn fp_to_bv_congruence_e2e() {
+    // Probe-2 shape: equal args force equal results even when unspecified.
+    let (o, _) = run(
+        "(declare-fun x () (_ FloatingPoint 5 11)) (declare-fun y () (_ FloatingPoint 5 11)) \
+         (assert (= x y)) (assert (fp.isNaN x)) \
+         (assert (distinct ((_ fp.to_ubv 8) RNE x) ((_ fp.to_ubv 8) RNE y))) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat, "congruence: equal (rm, x) → equal results");
+    // Probe-1 shape: different unspecified inputs may differ.
+    let (o2, _) = run(
+        "(declare-fun a () (_ BitVec 8)) (declare-fun b () (_ BitVec 8)) \
+         (assert (= a ((_ fp.to_ubv 8) RNE (_ NaN 5 11)))) \
+         (assert (= b ((_ fp.to_ubv 8) RNE (_ +oo 5 11)))) \
+         (assert (distinct a b)) (check-sat)",
+    );
+    assert_eq!(o2, SolveOutcome::Sat, "NaN and +oo results are independent");
+}
+
+#[test]
+fn fp_to_bv_under_bv_atom() {
+    // First legal FP subterm under a BV atom: (bvult (fp.to_ubv …) k).
+    let (o, _) = run(
+        "(declare-fun x () (_ FloatingPoint 5 11)) \
+         (assert (fp.eq x (fp #b0 #b10100 #b0101000000))) \
+         (assert (bvult ((_ fp.to_ubv 8) RTZ x) #x10)) (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat, "42 < 16 is false");
+    let (o2, _) = run(
+        "(declare-fun x () (_ FloatingPoint 5 11)) \
+         (assert (fp.eq x (fp #b0 #b10100 #b0101000000))) \
+         (assert (bvult ((_ fp.to_ubv 8) RTZ x) #x30)) (check-sat)",
+    );
+    assert_eq!(o2, SolveOutcome::Sat, "42 < 48");
 }
