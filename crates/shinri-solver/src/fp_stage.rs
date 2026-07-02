@@ -8,6 +8,10 @@ fn is_fp_sorted(ctx: &Context, t: TermId) -> bool {
     matches!(ctx.sort_node(ctx.sort_of(t)), SortNode::Float(_, _))
 }
 
+fn is_rm_sorted(ctx: &Context, t: TermId) -> bool {
+    matches!(ctx.sort_node(ctx.sort_of(t)), SortNode::RoundingMode)
+}
+
 /// True if `op` is any FP builtin (word op, predicate, classification, or conversion).
 fn is_fp_op(op: &Op) -> bool {
     use BuiltinOp::*;
@@ -30,12 +34,15 @@ fn is_fp_predicate(op: &Op) -> bool {
     ))
 }
 
-/// True if any subterm has a Float sort or an FP builtin op.
+/// True if any subterm has a Float or RoundingMode sort or an FP builtin op.
+/// RoundingMode counts as FP content so RM-only scripts (e.g. `(= r RNE)`)
+/// route here instead of leaking to EUF, which would treat RM as an unbounded
+/// uninterpreted sort (confirmed wrong-SAT, design doc §1).
 pub fn solver_uses_fp(ctx: &Context, assertions: &[TermId]) -> bool {
     let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
     fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
         if !seen.insert(t) { return false; }
-        if is_fp_sorted(ctx, t) { return true; }
+        if is_fp_sorted(ctx, t) || is_rm_sorted(ctx, t) { return true; }
         match ctx.term_node(t) {
             TermNode::App { op, args, .. } => {
                 if is_fp_op(op) { return true; }
@@ -112,7 +119,7 @@ pub fn collect_fp_atoms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
             let is_atom = match op {
                 _ if is_fp_predicate(op) => true,
                 Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct) =>
-                    kids.iter().any(|&k| is_fp_sorted(ctx, k)),
+                    kids.iter().any(|&k| is_fp_sorted(ctx, k) || is_rm_sorted(ctx, k)),
                 _ => false,
             };
             if is_atom && in_set.insert(t) { out.push(t); return; }
@@ -415,12 +422,18 @@ fn fp_atom_is_supported(ctx: &Context, atom: TermId) -> bool {
                 && is_supported_fp_word(ctx, kids[0])
                 && is_supported_fp_word(ctx, kids[1])
         }
-        // core = or distinct over Float-sorted operands.
+        // core = or distinct over Float-sorted operands (all supported words),
+        // or over RoundingMode-sorted operands (slice 5: all RM literals or
+        // nullary RM variables — post-word_norm, no other RM shapes exist).
         Op::Builtin(Eq | Distinct) => {
-            kids.iter().all(|&k| {
-                matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::Float(_, _))
-                    && is_supported_fp_word(ctx, k)
-            })
+            if kids.iter().all(|&k| is_rm_sorted(ctx, k)) {
+                kids.iter().all(|&k| is_rounding_mode_term(ctx, k))
+            } else {
+                kids.iter().all(|&k| {
+                    matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::Float(_, _))
+                        && is_supported_fp_word(ctx, k)
+                })
+            }
         }
         // fp.lt / fp.leq / fp.gt / fp.geq: two supported FP operands.
         Op::Builtin(FpLt | FpLeq | FpGt | FpGeq) => {
@@ -845,5 +858,22 @@ mod tests {
         let ubv_bad = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, ite]).unwrap();
         let atom_bad = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[ubv_bad, c]).unwrap();
         assert!(!bv_atoms_fp_supported(&ctx, &[atom_bad]), "unsupported FP shape under BV atom fences");
+    }
+
+    #[test]
+    fn rm_content_triggers_fp_path_and_collection() {
+        let mut ctx = Context::new();
+        let rms = ctx.rm_sort();
+        let rf = ctx.declare_fun("r", &[], rms);
+        let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[r, rne]).unwrap();
+        // Routing: an RM-only script must enter the FP path (the EUF leak fix).
+        assert!(solver_uses_fp(&ctx, &[atom]), "RM content routes to the FP path");
+        // Collection: the RM equality is an FP atom.
+        let atoms = collect_fp_atoms(&ctx, &[atom]);
+        assert_eq!(atoms, vec![atom]);
+        // Support: RM =/distinct over RM literals/variables is admitted.
+        assert!(fp_atoms_fully_supported(&ctx, &atoms));
     }
 }

@@ -956,3 +956,71 @@ fn fp_nary_eq_chain_unsat() {
     );
     assert_eq!(o, SolveOutcome::Unsat);
 }
+
+// ── Slice 5: RM equality atoms + RM-sorted ite ───────────────────────────────
+
+#[test]
+fn rm_pigeonhole_six_distinct_unsat() {
+    // R6 — answered sat before slice 5: RM equalities leaked to EUF, which
+    // treats RoundingMode as an unbounded uninterpreted sort.
+    let (o, _) = run(
+        "(declare-const r RoundingMode)\
+         (assert (distinct r RNE RNA RTP RTN RTZ))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn rm_pigeonhole_five_distinct_sat_twin() {
+    let (o, _) = run(
+        "(declare-const r RoundingMode)\
+         (assert (distinct r RNE RNA RTP RTN))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat); // r = RTZ
+}
+
+#[test]
+fn rm_eq_two_modes_unsat() {
+    let (o, _) = run(
+        "(declare-const r RoundingMode)\
+         (assert (= r RNE))(assert (= r RTZ))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+// NOTE: the parser's `define-fun` macro expansion only fires for parenthesized
+// calls `(name args...)`, not bare-symbol 0-ary references `name` (SMT-LIB's
+// usual convention for 0-ary functions) — `resolve_leaf` never consults
+// `lookup_macro`. That's a pre-existing parser gap outside this task's scope
+// (fp_stage.rs + this file's RM tests only), so per the brief's fallback we
+// inline the two Float32 `(fp ...)` literals at their use sites: `one` = 1.0
+// (`#b0 #b01111111 #b0…0`) and `tiny` = 2^-24 (`#b0 #b01100111 #b0…0`).
+
+#[test]
+fn rm_ite_steers_rounding_unsat() {
+    // (ite c RNE RTP) over 1.0 + 2^-24 (exact halfway): RNE ties-to-even →
+    // exactly 1.0; RTP → 1.0 + 2^-23 ≠ 1.0. Pinning the sum to 1.0 with
+    // (not c) forces RTP → contradiction. z3-confirmed both verdicts on the
+    // equivalent script before pinning.
+    let (o, _) = run(
+        "(declare-const c Bool)\
+         (assert (fp.eq (fp.add (ite c RNE RTP) \
+             (fp #b0 #b01111111 #b00000000000000000000000) \
+             (fp #b0 #b01100111 #b00000000000000000000000)) \
+             (fp #b0 #b01111111 #b00000000000000000000000)))\
+         (assert (not c))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn rm_ite_steers_rounding_sat_twin() {
+    let (o, _) = run(
+        "(declare-const c Bool)\
+         (assert (fp.eq (fp.add (ite c RNE RTP) \
+             (fp #b0 #b01111111 #b00000000000000000000000) \
+             (fp #b0 #b01100111 #b00000000000000000000000)) \
+             (fp #b0 #b01111111 #b00000000000000000000000)))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat); // c = true → RNE → exact 1.0
+}
