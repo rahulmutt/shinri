@@ -194,13 +194,11 @@ fn abv_select_over_bv_ite_decided_sat_twin() {
 }
 
 #[test]
-fn abv_select_over_bare_bool_ite_is_sound_unknown() {
-    // SOUND FENCE PIN (asymmetric with the BV/FP paths): a bare-Bool ite
-    // condition under the ABV path currently returns Unknown — the ABV fence
-    // lacks the bare-Bool exemption that BV/FP have. z3 decides this SAT.
-    // This is a deliberately-deferred follow-up (slice 5 final review): when the
-    // bare-Bool exemption is ported to the ABV path, this pin is EXPECTED to
-    // flip to a decided `sat`. Until then, Unknown is sound (never wrong).
+fn abv_select_over_bare_bool_ite_decided_sat() {
+    // Slice 6: the bare-Bool fence exemption (fp_stage/bv_stage) is now
+    // ported to the ABV path too — a bare Bool ite condition decides instead
+    // of fencing. Was pinned sound-Unknown from slice 5 until the port.
+    // Cross-checked: z3 → sat.
     let out = run_script(
         "(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\
          (declare-const p Bool)\
@@ -208,7 +206,23 @@ fn abv_select_over_bare_bool_ite_is_sound_unknown() {
          (assert (= (select a (ite p x y)) #x2a))\
          (check-sat)",
     );
-    assert_eq!(out, vec!["unknown"]);
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn abv_select_over_bare_bool_ite_decided_unsat_twin() {
+    // Condition pinned TRUE → ite resolves to x, but (select a x) is forced
+    // to two different values → UNSAT. Cross-checked: z3 → unsat.
+    let out = run_script(
+        "(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\
+         (declare-const p Bool)\
+         (declare-const x (_ BitVec 8))(declare-const y (_ BitVec 8))\
+         (assert p)\
+         (assert (= (select a x) #x00))\
+         (assert (= (select a (ite p x y)) #x2a))\
+         (check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
 }
 
 // ── Slice 6: n-ary `=` over the sorts word_norm previously skipped ──────────

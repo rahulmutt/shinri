@@ -128,6 +128,19 @@ fn walk_fence(ctx: &Context, t: TermId, visited: &mut rustc_hash::FxHashSet<Term
                 // select/store over a non-BV array → out of scope.
                 return true;
             }
+            // A bare declared Bool constant (0-ary uninterpreted symbol,
+            // Bool-sorted) needs NO theory reasoning: it is Tseitin-encoded
+            // as a plain SAT variable regardless of which theories are in
+            // play — skeleton, not a foreign theory atom. Same exemption as
+            // fp_stage::has_non_fp_theory_atom / bv_stage's
+            // has_non_bv_theory_atom (ported in slice 6; closes the pinned
+            // sound-Unknown asymmetry from slice 5).
+            if matches!(op, Op::Uninterpreted(_))
+                && kids.is_empty()
+                && ctx.sort_of(t) == bool_sort
+            {
+                return false;
+            }
             // Any other Bool-sorted application is an out-of-scope theory atom.
             if ctx.sort_of(t) == bool_sort {
                 return true;
