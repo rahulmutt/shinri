@@ -144,6 +144,22 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
                 if is_bool_structure || is_bool_eq {
                     return kids.iter().any(|&k| walk(ctx, k, fp_set, visited));
                 }
+                // A bare declared Bool constant (0-ary uninterpreted symbol,
+                // Bool-sorted) needs NO theory reasoning: a nullary symbol has
+                // no arguments for congruence to act on, so it is Tseitin-
+                // encoded as a plain SAT variable regardless of which theories
+                // are otherwise in play. It is skeleton, not a foreign theory
+                // atom — exempt it from the fence (slice 5: word_norm's
+                // ite-elimination exposes bare condition variables like `c`
+                // here that were previously buried, unreachable, inside a
+                // single opaque FP atom leaf). See bv_stage.rs's identical
+                // exemption in `has_non_bv_theory_atom`.
+                if matches!(op, Op::Uninterpreted(_))
+                    && kids.is_empty()
+                    && ctx.sort_of(t) == ctx.bool_sort()
+                {
+                    return false;
+                }
                 if ctx.sort_of(t) == ctx.bool_sort() {
                     // Bool-sorted, not an FP atom, not Boolean structure → fence.
                     return true;

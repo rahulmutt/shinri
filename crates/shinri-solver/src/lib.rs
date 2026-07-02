@@ -71,6 +71,9 @@ pub struct Solver {
     /// Array models rendered after a QF_ABV SAT result: declared array constant
     /// TermId → pre-rendered SMT-LIB `store`-chain string. Cleared on non-ABV paths.
     abv_array_models: rustc_hash::FxHashMap<TermId, String>,
+    /// Word-level normalization state (slice 5): ite→fresh-symbol memo and
+    /// the internal-symbol set excluded from model output.
+    word_norm: crate::word_norm::WordNorm,
 }
 
 impl Default for Solver {
@@ -95,6 +98,7 @@ impl Solver {
             bv_var_bits: rustc_hash::FxHashMap::default(),
             fp_var_bits: rustc_hash::FxHashMap::default(),
             abv_array_models: rustc_hash::FxHashMap::default(),
+            word_norm: crate::word_norm::WordNorm::default(),
         }
     }
 
@@ -278,6 +282,14 @@ impl Solver {
         >;
 
         let mut assertions = self.assertions.clone();
+
+        // ── Word-level normalization (slice 5) ─────────────────────────────
+        // MUST run before everything else that reads `assertions` (string
+        // routing, ABV, atom collection, fences, Tseitin): eliminates
+        // BV/FP/RM-sorted ite into fresh definitions and expands n-ary
+        // =/distinct over word sorts to binary, so collectors and blast arms
+        // only ever see shapes they handle. See word_norm.rs.
+        assertions = self.word_norm.normalize(&mut self.ctx, &assertions);
 
         // ── String theory routing ─────────────────────────────────────────────
         // If any assertion uses strings (String-sorted subterm or str.* op):
@@ -1562,13 +1574,18 @@ mod fp_routing_tests {
         assert_eq!(run_outcome(src), SolveOutcome::Sat);
     }
 
-    /// SOUNDNESS: fp.isNaN applied to ite (FP-sorted ite is out of scope) must be
-    /// Unknown, NOT a panic.
+    /// SLICE 5 (pin updated): FP-sorted ite is no longer out of scope —
+    /// word_norm eliminates it into a fresh-symbol definition before this
+    /// fence is ever consulted, so the query is now decided rather than
+    /// fenced. `(ite c x x)` is `x` for either value of `c`, so
+    /// `fp.isNaN(x)` is Sat (x can be a NaN bit-pattern). Formerly asserted
+    /// Unknown, back when FP-sorted ite was unsupported and had to fence for
+    /// soundness (no panic).
     #[test]
     fn isnan_of_fp_ite_is_unknown_not_panic() {
         let src = "(declare-fun x () Float32) (declare-fun c () Bool) \
                    (assert (fp.isNaN (ite c x x))) (check-sat)";
-        assert_eq!(run_outcome(src), SolveOutcome::Unknown);
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
     }
 
     /// SOUNDNESS: fp.lt (a comparison predicate collected by collect_fp_atoms

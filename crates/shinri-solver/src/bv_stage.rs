@@ -210,6 +210,23 @@ pub fn has_non_bv_theory_atom(ctx: &Context, assertions: &[TermId], bv_atoms: &[
                 if is_bool_structure || is_bool_eq {
                     return kids.iter().any(|&k| walk(ctx, k, bv_set, visited));
                 }
+                // A bare declared Bool constant (0-ary uninterpreted symbol,
+                // Bool-sorted — e.g. a `declare-const c Bool` used directly or
+                // as an `ite`/`and` condition) needs NO theory reasoning: a
+                // nullary symbol has no arguments for congruence to act on, so
+                // it is Tseitin-encoded as a plain SAT variable regardless of
+                // which theories are otherwise in play (see tseitin.rs's
+                // `Op::Uninterpreted(_) => self.atom(t)` arm, used uniformly).
+                // It is skeleton, not a foreign theory atom — exempt it from
+                // the fence (slice 5: word_norm's ite-elimination exposes bare
+                // condition variables like `c` here that were previously
+                // buried, unreachable, inside a single opaque BV atom leaf).
+                if matches!(op, Op::Uninterpreted(_))
+                    && kids.is_empty()
+                    && ctx.sort_of(t) == ctx.bool_sort()
+                {
+                    return false;
+                }
                 // Any other App node that is Bool-sorted is a candidate atom.
                 // (Non-Bool subterms — e.g. arith terms inside a relation — are
                 // reached only as operands; we only fence on Bool-sorted atoms,

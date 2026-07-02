@@ -888,3 +888,71 @@ fn fp_to_bv_under_bv_atom() {
     );
     assert_eq!(o2, SolveOutcome::Sat, "42 < 48");
 }
+
+// ── Slice 5: FP-sorted ite + the FP n-ary =/distinct wrong-SAT family ───────
+
+#[test]
+fn fp_ite_isnan_of_non_nans_unsat() {
+    let (o, _) = run(
+        "(declare-const c Bool)(declare-const x Float32)(declare-const y Float32)\
+         (assert (not (fp.isNaN x)))(assert (not (fp.isNaN y)))\
+         (assert (fp.isNaN (ite c x y)))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn fp_ite_isnan_sat_twin() {
+    // Drop the y pin: c=false, y=NaN works.
+    let (o, _) = run(
+        "(declare-const c Bool)(declare-const x Float32)(declare-const y Float32)\
+         (assert (not (fp.isNaN x)))\
+         (assert (fp.isNaN (ite c x y)))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_ite_condition_with_fp_atom_unsat() {
+    // Condition is itself an FP atom: (ite (fp.lt a b) a b) is min(a,b);
+    // pinning a<b and result=b contradicts (a,b distinct non-NaN handled via lt).
+    let (o, _) = run(
+        "(declare-const a Float32)(declare-const b Float32)\
+         (assert (fp.lt a b))\
+         (assert (fp.eq (ite (fp.lt a b) a b) b))\
+         (assert (not (fp.eq a b)))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn fp_nary_distinct_three_zeros_unsat() {
+    // R3 — answered sat before slice 5 (wrong-SAT): only ±0 are zero values.
+    let (o, _) = run(
+        "(declare-const a (_ FloatingPoint 2 2))(declare-const b (_ FloatingPoint 2 2))\
+         (declare-const c (_ FloatingPoint 2 2))\
+         (assert (distinct a b c))\
+         (assert (fp.isZero a))(assert (fp.isZero b))(assert (fp.isZero c))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn fp_nary_distinct_two_zeros_sat_twin() {
+    let (o, _) = run(
+        "(declare-const a (_ FloatingPoint 2 2))(declare-const b (_ FloatingPoint 2 2))\
+         (assert (distinct a b))\
+         (assert (fp.isZero a))(assert (fp.isZero b))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn fp_nary_eq_chain_unsat() {
+    // R5 — answered sat before slice 5 (wrong-SAT).
+    let (o, _) = run(
+        "(declare-const a Float32)(declare-const b Float32)(declare-const c Float32)\
+         (assert (= a b c))(assert (distinct a c))(check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unsat);
+}

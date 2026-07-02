@@ -470,3 +470,83 @@ fn sign_extend_positive_sat() {
     );
     assert_eq!(out, vec!["sat"], "sign_extend(8, 0x0f) = 0x000f");
 }
+
+// ── Slice 5: word-level ite + the n-ary =/distinct wrong-SAT family ─────────
+
+#[test]
+fn bv_ite_eq_sat() {
+    // R1 — was a panic at blast/mod.rs:430 before slice 5.
+    let out = run_script(
+        "(declare-const c Bool)(declare-const x (_ BitVec 8))\
+         (declare-const y (_ BitVec 8))(declare-const z (_ BitVec 8))\
+         (assert (= (ite c x y) z))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn bv_ite_pinned_branches_unsat() {
+    // c forces the then-branch; then-branch contradicts the outer equality.
+    let out = run_script(
+        "(declare-const c Bool)(declare-const x (_ BitVec 8))\
+         (declare-const y (_ BitVec 8))\
+         (assert c)(assert (distinct x y))\
+         (assert (= (ite c x y) y))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn bv_ite_shared_skeleton_bool_var_sat_twin() {
+    // Same shape as above minus (assert c): pick c=false, ite = y. SAT.
+    let out = run_script(
+        "(declare-const c Bool)(declare-const x (_ BitVec 8))\
+         (declare-const y (_ BitVec 8))\
+         (assert (distinct x y))\
+         (assert (= (ite c x y) y))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn bv_ite_mixed_condition_unsat() {
+    // Condition is Bool structure over a nested BV atom and a skeleton var.
+    let out = run_script(
+        "(declare-const p Bool)(declare-const a (_ BitVec 8))\
+         (declare-const b (_ BitVec 8))(declare-const x (_ BitVec 8))\
+         (declare-const y (_ BitVec 8))\
+         (assert p)(assert (bvult a b))(assert (distinct x y))\
+         (assert (= (ite (and p (bvult a b)) x y) y))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn bv1_nary_distinct_pigeonhole_unsat() {
+    // R2 — answered sat before slice 5 (wrong-SAT).
+    let out = run_script(
+        "(declare-const x (_ BitVec 1))(declare-const y (_ BitVec 1))\
+         (declare-const z (_ BitVec 1))(assert (distinct x y z))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn bv2_nary_distinct_sat_twin() {
+    let out = run_script(
+        "(declare-const x (_ BitVec 2))(declare-const y (_ BitVec 2))\
+         (declare-const z (_ BitVec 2))(assert (distinct x y z))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn bv_nary_eq_chain_unsat() {
+    // R4 — answered sat before slice 5 (wrong-SAT).
+    let out = run_script(
+        "(declare-const x (_ BitVec 8))(declare-const y (_ BitVec 8))\
+         (declare-const z (_ BitVec 8))\
+         (assert (= x y z))(assert (distinct x z))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
