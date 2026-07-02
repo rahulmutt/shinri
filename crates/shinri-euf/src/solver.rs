@@ -66,6 +66,11 @@ impl TheorySolver for Euf {
             } => {
                 let args_slice = *args;
                 let kids: Vec<shinri_core::TermId> = cx.terms.children(args_slice).to_vec();
+                debug_assert_eq!(
+                    kids.len(),
+                    2,
+                    "Eq atom must be binary (word_norm expands n-ary = for all sorts)"
+                );
                 let a = self.inner.add_term(cx, kids[0]);
                 let b = self.inner.add_term(cx, kids[1]);
                 self.inner.register_eq_atom(v.index() as u32, a, b);

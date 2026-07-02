@@ -139,7 +139,15 @@ impl<'a> Encoder<'a> {
                         self.ite(c, th, el)
                     }
                     BuiltinOp::Eq if self.is_bool(kids[0]) => {
-                        // Bool equality = iff.
+                        // Bool equality = iff. word_norm expands n-ary = for
+                        // ALL sorts (slice 6) before encoding, so only the
+                        // binary form can reach this arm — asserting that here
+                        // keeps the old silent kids[2..] drop from returning.
+                        debug_assert_eq!(
+                            kids.len(),
+                            2,
+                            "n-ary Bool = must be expanded by word_norm"
+                        );
                         let a = self.encode(kids[0]);
                         let b = self.encode(kids[1]);
                         let nx = self.xor2(a, b);

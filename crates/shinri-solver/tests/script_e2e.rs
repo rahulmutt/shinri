@@ -210,3 +210,87 @@ fn abv_select_over_bare_bool_ite_is_sound_unknown() {
     );
     assert_eq!(out, vec!["unknown"]);
 }
+
+// ── Slice 6: n-ary `=` over the sorts word_norm previously skipped ──────────
+// Wrong-SAT before slice 6: tseitin encoded Bool (= p q r) as p↔q (operands
+// 3+ dropped); EUF new_var registered only kids[0],kids[1]. z3-diffed in the
+// slice-5 final review and re-confirmed in the slice-6 pre-flight.
+
+#[test]
+fn bool_nary_eq_third_operand_not_dropped_unsat() {
+    // (= p q r) ∧ p ∧ q ∧ ¬r — answered sat before slice 6. z3: unsat.
+    let out = run_script(
+        "(declare-const p Bool)(declare-const q Bool)(declare-const r Bool)\
+         (assert (= p q r))(assert p)(assert q)(assert (not r))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn bool_nary_eq_sat_twin() {
+    let out = run_script(
+        "(declare-const p Bool)(declare-const q Bool)(declare-const r Bool)\
+         (assert (= p q r))(assert p)(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn uf_nary_eq_transitivity_unsat() {
+    // (= a b d) ∧ (distinct a d) over sort U — answered sat before slice 6.
+    let out = run_script(
+        "(declare-sort U 0)\
+         (declare-const a U)(declare-const b U)(declare-const d U)\
+         (assert (= a b d))(assert (distinct a d))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn uf_nary_eq_sat_twin() {
+    let out = run_script(
+        "(declare-sort U 0)\
+         (declare-const a U)(declare-const b U)(declare-const d U)\
+         (assert (= a b d))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn string_nary_eq_transitivity_unsat() {
+    // Post-expansion this is two binary String equalities + a binary distinct
+    // — the QF_S core's native shape. z3: unsat (pre-flight, Task 1).
+    // Pre-fix behavior: debug-build panic (euf/solver.rs:114 "Eq atom must be binary")
+    // or release-build wrong-sat.
+    let out = run_script(
+        "(declare-const s1 String)(declare-const s2 String)(declare-const s3 String)\
+         (assert (= s1 s2 s3))(assert (distinct s1 s3))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn array_nary_eq_transitivity_decided_unsat() {
+    // Arrays over BV route to the ABV path, whose own normalize pass already
+    // handled n-ary array = correctly; post-slice-6, word_norm pre-expands
+    // instead. Either way the verdict stays DECIDED (z3-diffed: unsat).
+    let out = run_script(
+        "(declare-const a1 (Array (_ BitVec 4) (_ BitVec 4)))\
+         (declare-const a2 (Array (_ BitVec 4) (_ BitVec 4)))\
+         (declare-const a3 (Array (_ BitVec 4) (_ BitVec 4)))\
+         (assert (= a1 a2 a3))(assert (distinct a1 a3))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn array_nary_eq_operand_three_not_dropped_unsat() {
+    // (= a1 a2 a3) ∧ (distinct a2 a3): dropping operand 3 would answer sat.
+    let out = run_script(
+        "(declare-const a1 (Array (_ BitVec 4) (_ BitVec 4)))\
+         (declare-const a2 (Array (_ BitVec 4) (_ BitVec 4)))\
+         (declare-const a3 (Array (_ BitVec 4) (_ BitVec 4)))\
+         (assert (= a1 a2 a3))(assert (distinct a2 a3))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
