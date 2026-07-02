@@ -1,6 +1,10 @@
 //! FP lowering stage: detect QF_FP queries, collect FP atoms, enforce the
-//! mixed-theory fence. Mirrors bv_stage.rs. FP gets its own Blaster (QF_BVFP
-//! unification is a later plan), so BV atoms count as non-FP and trigger the fence.
+//! mixed-theory fence. Mirrors bv_stage.rs. BV and FP terms share one unified
+//! Lowerer/Blaster (slice 4a/4b), so a query can mix BV and FP atoms without
+//! fencing. Assertions arrive already normalized by word_norm (slice 5): no
+//! word-sorted ite, and any n-ary =/distinct over BV/Float/RoundingMode
+//! operands has already been expanded to binary. RoundingMode (RM) content
+//! also routes through here (slice 5).
 
 use shinri_core::{BuiltinOp, ConstVal, Context, Op, SortNode, TermId, TermNode};
 
@@ -323,10 +327,14 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                         && bv_subtree_fp_supported(ctx, k)
                 })
         }
-        // Anything else (Ite over FP, non-nullary UF, symbolic-Real to_fp,
-        // fp.to_real, etc.) is not in scope. Note: fp.to_ubv/fp.to_sbv never
-        // appear here — they are BV-sorted, so they can't BE an FP word; they
-        // are handled by `is_supported_fp_to_bv`/`bv_subtree_fp_supported`.
+        // Anything else (a not-yet-implemented FP op, non-nullary UF,
+        // symbolic-Real to_fp, fp.to_real, etc.) is not in scope. Word-sorted
+        // ite can no longer reach this arm: word_norm (slice 5) eliminates it
+        // into a fresh-symbol definition before atom collection ever runs;
+        // this arm stays as the defensive catch-all for genuinely unsupported
+        // shapes. Note: fp.to_ubv/fp.to_sbv never appear here — they are
+        // BV-sorted, so they can't BE an FP word; they are handled by
+        // `is_supported_fp_to_bv`/`bv_subtree_fp_supported`.
         _ => false,
     }
 }
@@ -362,8 +370,9 @@ fn is_supported_fp_to_bv(ctx: &Context, t: TermId) -> bool {
 /// Walk a BV-sorted subtree hunting embedded FP→BV applications; each must be
 /// fully supported. Mutually recursive with `is_supported_fp_word`: since 4e a
 /// BV subtree can contain FP subtrees (via fp.to_ubv/to_sbv) and vice versa
-/// (via int→FP / bitcast / fp-constructor BV children), so the old "BV blaster
-/// is total" sort-check argument (4c/4d) holds only modulo this walk.
+/// (via int→FP / bitcast / fp-constructor BV children), so the old 4c/4d
+/// argument — that a bare sort check on a BV-sorted subtree is enough to
+/// guarantee it blasts cleanly — holds only modulo this walk.
 fn bv_subtree_fp_supported(ctx: &Context, root: TermId) -> bool {
     let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
     fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
@@ -839,8 +848,11 @@ mod tests {
     #[test]
     fn bv_atoms_embedded_fp_support_walk() {
         // First slice where a BV atom can legally contain FP subterms. A supported
-        // to_ubv under a BV atom passes; an UNSUPPORTED FP shape (FP-sorted ite)
-        // under the to_ubv must fence.
+        // to_ubv under a BV atom passes; an UNSUPPORTED FP shape under the to_ubv
+        // must fence. Post-word_norm (slice 5) a raw FP-sorted ite can no longer
+        // reach this walk via the normal pipeline — word_norm eliminates it
+        // upstream — but this test constructs the shape directly (bypassing
+        // word_norm) to pin the defensive `is_supported_fp_word` catch-all arm.
         let mut ctx = Context::new();
         let f32s = ctx.fp_sort(8, 24);
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
@@ -850,7 +862,9 @@ mod tests {
         let c = ctx.mk_bv_const(8, Integer::from(3u64));
         let atom_ok = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[ubv, c]).unwrap();
         assert!(bv_atoms_fp_supported(&ctx, &[atom_ok]), "supported FP operand under BV atom passes");
-        // FP-sorted ite is not a supported FP word.
+        // Raw FP-sorted ite: unreachable via the normal pipeline post-word_norm,
+        // but is_supported_fp_word must still correctly reject it as a
+        // defense-in-depth invariant.
         let bs = ctx.bool_sort();
         let pf = ctx.declare_fun("p", &[], bs);
         let p = ctx.mk_app(Op::Uninterpreted(pf), &[]).unwrap();

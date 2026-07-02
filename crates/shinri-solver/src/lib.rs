@@ -405,9 +405,11 @@ impl Solver {
                     return SolveOutcome::Unknown;
                 }
                 // Positive-enumeration safety: every FP atom's word must be a
-                // supported FP op (an FP-sorted ite, a not-yet-implemented FP op,
-                // etc. still fence) so blast_fp_word's `unreachable!` arms stay
-                // internal invariants.
+                // supported FP op (a not-yet-implemented FP op, a symbolic-Real
+                // fp.to_real bridge, etc. still fence) so blast_fp_word's
+                // `unreachable!` arms stay internal invariants. Word-sorted ite
+                // is no longer a live example here: word_norm (slice 5)
+                // eliminates it before atom collection ever runs.
                 if !crate::fp_stage::fp_atoms_fully_supported(&self.ctx, &fp_atoms) {
                     return SolveOutcome::Unknown;
                 }
@@ -423,8 +425,11 @@ impl Solver {
             };
 
         // Lower n-ary distinct to pairwise binary up front (needs &mut ctx).
-        // BV atoms pass through unchanged (not arith-sorted), so their TermIds
-        // are preserved and the surrogate keys still match.
+        // This only ever sees non-word n-ary distinct now: word_norm (above)
+        // already expanded any word-sorted (BV/Float/RoundingMode) n-ary
+        // =/distinct before atom collection (slice 5). BV atoms pass through
+        // unchanged (not arith-sorted), so their TermIds are preserved and the
+        // surrogate keys still match.
         let lowered: Vec<TermId> = assertions.into_iter().map(|a| self.lower(a)).collect();
 
         let mut sat_config = SolverConfig::default();
@@ -1588,7 +1593,7 @@ mod fp_routing_tests {
     /// Unknown, back when FP-sorted ite was unsupported and had to fence for
     /// soundness (no panic).
     #[test]
-    fn isnan_of_fp_ite_is_unknown_not_panic() {
+    fn isnan_of_fp_ite_is_sat_not_panic() {
         let src = "(declare-fun x () Float32) (declare-fun c () Bool) \
                    (assert (fp.isNaN (ite c x x))) (check-sat)";
         assert_eq!(run_outcome(src), SolveOutcome::Sat);

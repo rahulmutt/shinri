@@ -427,6 +427,9 @@ pub fn blast_bv_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
                 | BuiltinOp::BvSge => {
                     unreachable!("BV comparison op is Bool-sorted; use blast_atom instead");
                 }
+                // Word-sorted ite cannot reach here: word_norm eliminates it
+                // before any lowering (slice 5). This arm is an internal
+                // invariant for genuinely un-blastable ops.
                 _ => unreachable!("non-BV builtin reached blast_word"),
             }
         }
@@ -456,7 +459,7 @@ pub fn blast_bv_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
             ..
         } => {
             let child_ids = ctx.children(args).to_vec();
-            // Assume binary Distinct (n-ary is lowered before this stage).
+            // Binary only: word_norm expands n-ary =/distinct before collection (slice 5).
             let a = sink.word(ctx, child_ids[0]);
             let b = sink.word(ctx, child_ids[1]);
             let eq_lit = compare::eq(sink.blaster(), &a, &b);

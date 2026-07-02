@@ -29,6 +29,13 @@ pub struct WordNorm {
     /// repeated check-sats and shared subterms reuse one symbol.
     ite_var: FxHashMap<TermId, TermId>,
     /// Every fresh symbol term ever minted — the model-output filter set.
+    /// Only guards the bv/fp `var_bits` model-extraction loops in lib.rs. The
+    /// other two model-insertion sites (the `mb`-based `atom_vars` loop and the
+    /// `mb.iter()` surface-everything loop) do NOT check `internal` — they rely
+    /// instead on the implicit invariant that RM/FP/BV atoms are intercepted by
+    /// Tseitin's surrogate mechanism before ever reaching EUF registration, so
+    /// `mb` (the EUF/theory model) never holds an entry for a fresh `ite!`
+    /// symbol in the first place (verified slice 5).
     pub internal: FxHashSet<TermId>,
     /// Monotone counter for fresh names.
     ctr: u32,
