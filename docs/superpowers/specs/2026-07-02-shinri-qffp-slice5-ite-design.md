@@ -10,7 +10,13 @@ clippy net-new zero; canary sweep clean (remaining e2e Unknown pins are all Real
 All six confirmed repros fixed and pinned: R1 BV-ite panic → sat, R2-R5 n-ary =/distinct
 wrong-SATs → unsat, R6 RM/EUF pigeonhole wrong-SAT → unsat, each with SAT twins. Bonus
 fix folded in (Task 3, reviewer-verified sound): pre-existing fence gap that sent bare
-declared Bool constants mixed with BV/FP content to Unknown.
+declared Bool constants mixed with BV/FP content to Unknown. Final-review fix wave
+(91809d0, re-reviewed clean): user declarations aliasing already-minted `ite!<n>` names
+are rejected at the parser seam (was a wrong-UNSAT hole in incremental use), and the
+ABV×word-ite behavior change is pinned (decided pair + sound-Unknown bare-Bool canary).
+Follow-ups filed (pre-existing, out of scope): n-ary `=` over Bool/uninterpreted sorts
+is still wrong-SAT (tseitin p↔q drops kids[2..]; EUF analogue); ABV bare-Bool exemption
+port; RM model extraction; parser 0-ary define-fun bare-symbol expansion.
 **Plan:** 5 (post-Plan-4 completeness & robustness), first slice — the 4e final
 review's filed follow-up (user-reachable `unreachable!` on BV-sorted `ite`,
 `crates/shinri-bv/src/blast/mod.rs:430`)
