@@ -22,7 +22,7 @@
 //! their pre-blasted surrogate literals and array-eq proxies to fresh SAT vars.
 
 use rustc_hash::FxHashMap;
-use shinri_core::{BuiltinOp, Context, Lit, Op, SortNode, TermId, TermNode, Var};
+use shinri_core::{BuiltinOp, ConstVal, Context, Lit, Op, SortNode, TermId, TermNode, Var};
 
 /// True iff `t`'s sort is `(Array (_ BitVec _) (_ BitVec _))` — both index and
 /// element are bit-vectors. Arrays with an uninterpreted index/element are NOT
@@ -422,11 +422,20 @@ fn encode_skeleton(
                     gate_ite(&mut st.sat, c, th, el)
                 }
                 BuiltinOp::Eq if is_bool(kids[0]) => {
+                    // word_norm expands n-ary =/distinct for ALL sorts (slice 6)
+                    // before this stage, so only the binary form reaches here;
+                    // assert it so the kids[2..] drop can't silently return.
+                    debug_assert_eq!(kids.len(), 2, "n-ary Bool = must be expanded by word_norm");
                     let a = enc(st, proxy_var, kids[0]);
                     let b = enc(st, proxy_var, kids[1]);
                     gate_xor(&mut st.sat, a, b).negate()
                 }
                 BuiltinOp::Distinct if is_bool(kids[0]) => {
+                    debug_assert_eq!(
+                        kids.len(),
+                        2,
+                        "n-ary Bool distinct must be expanded by word_norm"
+                    );
                     let a = enc(st, proxy_var, kids[0]);
                     let b = enc(st, proxy_var, kids[1]);
                     gate_xor(&mut st.sat, a, b)
@@ -436,6 +445,15 @@ fn encode_skeleton(
                 // as a fresh proxy leaf rather than panic.
                 _ => bool_leaf(&mut st.sat, proxy_var, t),
             }
+        }
+        // A Bool literal (`true`/`false`): pin a fresh var to the constant's
+        // value rather than leaking a free proxy var. Encoding these as free
+        // leaves (the old catch-all) let `(ite true …)` / `(or false …)` pick
+        // the wrong branch → wrong-SAT (I4).
+        TermNode::Const { val: ConstVal::Bool(b), .. } => {
+            let v = st.sat.new_var();
+            st.sat.add_clause(&[Lit::new(v, b)]); // force v == b
+            Lit::new(v, true) // literal value == v == b
         }
         // Bool proxy const / uninterpreted Bool leaf.
         _ => bool_leaf(&mut st.sat, proxy_var, t),

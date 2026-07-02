@@ -344,3 +344,54 @@ fn string_nary_eq_compound_and_wrapper_not_wrong_sat() {
     assert_ne!(twin, vec!["sat"], "C1 soundness: binary twin must not be SAT");
     assert_eq!(twin, vec!["unknown"]);
 }
+
+#[test]
+fn abv_ite_true_bool_const_not_wrong_sat() {
+    // I4 (pre-existing): the ABV skeleton encoder used to map Bool CONSTANTS to
+    // free proxy vars, so `(ite true …)` could pick the else branch → wrong SAT.
+    // z3: unsat. Fixed encoder pins the constant, so both repros are UNSAT.
+    let ite_true = run_script(
+        "(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\
+         (declare-const x (_ BitVec 8))(declare-const y (_ BitVec 8))\
+         (assert (ite true (= (select a x) #x01) (= (select a x) #x02)))\
+         (assert (= (select a x) #x02))(check-sat)",
+    );
+    assert_eq!(ite_true, vec!["unsat"]);
+
+    let or_false = run_script(
+        "(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\
+         (declare-const x (_ BitVec 8))\
+         (assert (or false (= (select a x) #x01)))\
+         (assert (= (select a x) #x02))(check-sat)",
+    );
+    assert_eq!(or_false, vec!["unsat"]);
+}
+
+#[test]
+fn abv_bare_bool_plus_uninterpreted_predicate_fences_unknown() {
+    // M1 / Task-5 over-admission pin (a): a bare Bool and an uninterpreted
+    // predicate alongside an array-over-BV constraint fall outside ABV's admitted
+    // fragment. Both today fence to `unknown` (z3: sat — a sound fence, never
+    // wrong-SAT). Pins the fence so a future admission is a deliberate change.
+    let out = run_script(
+        "(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\
+         (declare-const p Bool)(declare-fun P ((_ BitVec 8)) Bool)\
+         (declare-const x (_ BitVec 8))\
+         (assert p)(assert (P x))(assert (= (select a x) #x2a))(check-sat)",
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn abv_bare_bool_plus_arith_fences_unknown() {
+    // M1 / Task-5 over-admission pin (b): a bare Bool plus integer arithmetic
+    // alongside an array-over-BV constraint. Fences to `unknown` (z3: sat — sound
+    // fence).
+    let out = run_script(
+        "(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\
+         (declare-const p Bool)(declare-const i Int)\
+         (declare-const x (_ BitVec 8))\
+         (assert (= (select a (ite p x x)) #x2a))(assert (< i 3))(check-sat)",
+    );
+    assert_eq!(out, vec!["unknown"]);
+}

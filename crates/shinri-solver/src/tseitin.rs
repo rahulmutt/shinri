@@ -154,7 +154,16 @@ impl<'a> Encoder<'a> {
                         nx.negate()
                     }
                     BuiltinOp::Distinct if self.is_bool(kids[0]) => {
-                        // Bool distinct (binary) = xor.
+                        // Bool distinct (binary) = xor. word_norm expands n-ary
+                        // distinct for ALL sorts (slice 6) before encoding, so
+                        // only the binary form can reach this arm — asserting
+                        // that here keeps the old silent kids[2..] drop from
+                        // returning.
+                        debug_assert_eq!(
+                            kids.len(),
+                            2,
+                            "n-ary Bool distinct must be expanded by word_norm"
+                        );
                         let a = self.encode(kids[0]);
                         let b = self.encode(kids[1]);
                         self.xor2(a, b)

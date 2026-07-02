@@ -1100,3 +1100,33 @@ fn get_value_on_eliminated_rm_ite_returns_mode() {
     assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
     assert!(values[0].contains("RTZ"), "expected RTZ: {}", values[0]);
 }
+
+#[test]
+fn pop_clears_eliminated_ite_value_no_stale_get_value() {
+    // I3 (slice 6): pop()/Reset cleared last_model but NOT eliminated_ite_vals
+    // (nor abv_array_models), so after (pop 1) a get-value on the eliminated ite
+    // served a STALE value while other vars correctly returned "?". Assert the
+    // stale value is gone.
+    let (o, values) = run_values(
+        "(declare-const c Bool)(declare-const x (_ BitVec 8))\
+         (push 1)\
+         (assert c)(assert (= x #x0f))\
+         (declare-const z (_ BitVec 8))(assert (= z (ite c x #x00)))\
+         (check-sat)\
+         (get-value ((ite c x #x00)))\
+         (pop 1)\
+         (get-value ((ite c x #x00)))\
+         (get-value (x))",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert_eq!(values.len(), 3);
+    // Before pop: the eliminated ite resolves to #x0f (c true, x=#x0f).
+    assert!(values[0].contains("#x0f"), "pre-pop ite value: {}", values[0]);
+    // After pop: no stale value — the ite must read "?" like the now-unbound x.
+    assert!(
+        !values[1].contains("#x0f") && values[1].contains('?'),
+        "post-pop ite must be '?', not stale #x0f: {}",
+        values[1]
+    );
+    assert!(values[2].contains('?'), "post-pop x must be '?': {}", values[2]);
+}

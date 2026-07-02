@@ -171,6 +171,8 @@ impl Solver {
             }
         }
         self.last_model = None;
+        self.eliminated_ite_vals.clear();
+        self.abv_array_models.clear();
     }
 
     /// Mutable access to the shared term DAG, so the parser can intern terms
@@ -227,6 +229,8 @@ impl Solver {
                 self.assertions.clear();
                 self.scopes.clear();
                 self.last_model = None;
+                self.eliminated_ite_vals.clear();
+                self.abv_array_models.clear();
                 CommandResponse::None
             }
             Command::SetLogic(_)
