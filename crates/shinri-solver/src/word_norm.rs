@@ -7,7 +7,7 @@
 //!    assertion `(ite c (= w x) (= w y))` (Bool-sorted ite — plain Boolean
 //!    structure for every stage). Equisatisfiable and model-preserving for
 //!    user symbols: `w` is functionally determined by (c, x, y).
-//! 2. **n-ary `=`/`distinct` expansion** over the same word sorts: `=` chains
+//! 2. **n-ary `=`/`distinct` expansion** over ALL sorts (slice 6: the old word-sort gate excluded exactly the sorts where tseitin/EUF silently dropped operands 3+ — wrong-SAT): `=` chains
 //!    adjacent pairs, `distinct` expands pairwise, both under `and`. The blast
 //!    arms are binary-only; unexpanded n-ary atoms were the confirmed
 //!    wrong-SAT family (design doc §1).
@@ -134,8 +134,7 @@ impl WordNorm {
                 }
                 w
             }
-            Op::Builtin(BuiltinOp::Eq)
-                if new_kids.len() > 2 && is_word_sort(ctx, ctx.sort_of(new_kids[0])) =>
+            Op::Builtin(BuiltinOp::Eq) if new_kids.len() > 2 =>
             {
                 // (= a b c ...) → (and (= a b) (= b c) ...): adjacent chain.
                 let pairs: Vec<TermId> = new_kids
@@ -148,8 +147,7 @@ impl WordNorm {
                 ctx.mk_app(Op::Builtin(BuiltinOp::And), &pairs)
                     .expect("and well-sorted")
             }
-            Op::Builtin(BuiltinOp::Distinct)
-                if new_kids.len() > 2 && is_word_sort(ctx, ctx.sort_of(new_kids[0])) =>
+            Op::Builtin(BuiltinOp::Distinct) if new_kids.len() > 2 =>
             {
                 // (distinct a b c ...) → conjunction over all pairs i<j.
                 let mut pairs: Vec<TermId> = Vec::new();
@@ -267,7 +265,7 @@ mod tests {
     }
 
     #[test]
-    fn nary_eq_and_distinct_expand_for_word_sorts_only() {
+    fn nary_eq_and_distinct_expand_for_all_sorts() {
         let mut ctx = Context::new();
         let x = bv_var(&mut ctx, "x", 8);
         let y = bv_var(&mut ctx, "y", 8);
@@ -287,7 +285,10 @@ mod tests {
         let dyz = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[y, z]).unwrap();
         let expect_d = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[dxy, dxz, dyz]).unwrap();
         assert_eq!(out[1], expect_d);
-        // Non-word sorts pass through untouched (arith keeps its existing path).
+
+        // Slice 6: NON-word sorts expand too — the expansion is sort-universal
+        // (the wrong-SAT family lived exactly in the sorts the old guard skipped).
+        // Int n-ary distinct:
         let int_s = ctx.int_sort();
         let af = ctx.declare_fun("ai", &[], int_s);
         let a = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
@@ -297,7 +298,22 @@ mod tests {
         let cc = ctx.mk_app(Op::Uninterpreted(cf), &[]).unwrap();
         let di = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, b, cc]).unwrap();
         let out2 = wn.normalize(&mut ctx, &[di]);
-        assert_eq!(out2, vec![di], "Int-sorted n-ary distinct is untouched");
+        let dab = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, b]).unwrap();
+        let dac = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, cc]).unwrap();
+        let dbc = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[b, cc]).unwrap();
+        let expect_di =
+            ctx.mk_app(Op::Builtin(BuiltinOp::And), &[dab, dac, dbc]).unwrap();
+        assert_eq!(out2, vec![expect_di], "Int n-ary distinct expands (slice 6)");
+        // Bool n-ary = (the tseitin p↔q wrong-SAT family):
+        let p = bool_var(&mut ctx, "p");
+        let q = bool_var(&mut ctx, "q");
+        let r = bool_var(&mut ctx, "r");
+        let beq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[p, q, r]).unwrap();
+        let out3 = wn.normalize(&mut ctx, &[beq]);
+        let pq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[p, q]).unwrap();
+        let qr = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[q, r]).unwrap();
+        let expect_beq = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[pq, qr]).unwrap();
+        assert_eq!(out3, vec![expect_beq], "Bool n-ary = expands (slice 6)");
     }
 
     #[test]

@@ -287,7 +287,7 @@ impl Solver {
         // MUST run before everything else that reads `assertions` (string
         // routing, ABV, atom collection, fences, Tseitin): eliminates
         // BV/FP/RM-sorted ite into fresh definitions and expands n-ary
-        // =/distinct over word sorts to binary, so collectors and blast arms
+        // =/distinct over ALL sorts to binary (slice 6), so collectors and blast arms
         // only ever see shapes they handle. See word_norm.rs.
         assertions = self.word_norm.normalize(&mut self.ctx, &assertions);
 
@@ -425,11 +425,7 @@ impl Solver {
             };
 
         // Lower n-ary distinct to pairwise binary up front (needs &mut ctx).
-        // This only ever sees non-word n-ary distinct now: word_norm (above)
-        // already expanded any word-sorted (BV/Float/RoundingMode) n-ary
-        // =/distinct before atom collection (slice 5). BV atoms pass through
-        // unchanged (not arith-sorted), so their TermIds are preserved and the
-        // surrogate keys still match.
+        // This never sees n-ary =/distinct at all now: word_norm (above) expands every sort to binary (slice 6); the arms below are defense in depth.
         let lowered: Vec<TermId> = assertions.into_iter().map(|a| self.lower(a)).collect();
 
         let mut sat_config = SolverConfig::default();
