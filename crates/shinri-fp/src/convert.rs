@@ -42,7 +42,7 @@ pub fn to_fp_fp(
     let bias_t = (1i128 << (eb_t - 1)) - 1;
     let emax_t = bias_t;
     let emin_t = 1 - bias_t;
-    let hi = emax_t + 1;                    // round(): exp > emax_t → overflow → ±inf
+    let hi = emax_t + 1;                    // round(): exp > emax_t → overflow (mode-dep. ±inf/±max-finite)
     let lo = emin_t - (sbt as i128 + 2);    // round(): deep denormalize → ±0
     let wc = ew_s.max(ew_t) + 1;            // wide enough that the compares can't wrap
     let e_wide = sign_extend(b, &e_s, wc);
@@ -137,7 +137,7 @@ pub fn to_fp_int(
     let bias_t = (1i128 << (eb_t - 1)) - 1;
     let emax_t = bias_t;
     let emin_t = 1 - bias_t;
-    let hi = emax_t + 1;                    // round(): exp > emax_t → overflow → ±inf
+    let hi = emax_t + 1;                    // round(): exp > emax_t → overflow (mode-dep. ±inf/±max-finite)
     let lo = emin_t - (sbt as i128 + 2);    // round(): deep denormalize → ±0
     let hi_w = const_n(b, wc, hi);
     let lo_w = const_n(b, wc, lo);
