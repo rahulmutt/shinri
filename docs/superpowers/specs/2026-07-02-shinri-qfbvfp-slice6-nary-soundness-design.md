@@ -9,8 +9,15 @@ sat=68 unsat=132 unknown=0 z3_checked=200/200 zero disagreements; clippy net-new
 (solver=2/fp=22/parser=3/theory=4/str=9 = slice-5 known set); canary sweep clean.
 **Pre-flight corrections to §2 (evidence: slice-6 ledger):** (a) n-ary `=` over
 **String** was a THIRD live wrong-SAT (routes to EUF, same dropping arm; also a
-user-reachable debug-build panic at euf/solver.rs:114) — fixed by the same expansion
-and pinned `unsat`; (b) **Array** n-ary `=` was already CORRECT — arrays over BV route
+user-reachable debug-build panic at euf/solver.rs:114). **Narrowed by the final
+review:** only the **variable-only** n-ary String `=` is fixed by the expansion
+and pinned `unsat`. **Compound-term** cases (operands like `(str.++ si "a")`)
+stayed wrong-SAT until the slice-6 final-review C1 fix: word_norm wraps the
+expansion in `(and …)`, which the string model self-check skipped — now it
+descends positive top-level `And` chains and downgrades to a sound `unknown`
+(z3-verified: repro `(= (str.++ s3 "a") (str.++ s1 "b") (str.++ s3 "b"))` is
+unsat; shinri no longer answers sat). **Negated n-ary String `distinct`** is
+still wrong (filed follow-up I1 below); (b) **Array** n-ary `=` was already CORRECT — arrays over BV route
 to the ABV path whose own `normalize.rs` pre-pass expands n-ary array atoms (spec's
 extensionality-fence assumption was wrong for ABV-routable queries) — pinned as the
 decided pair, and that pass is now dead-but-harmless for n-ary shapes since word_norm
@@ -23,6 +30,22 @@ OUTER term still degrades to sound `?` (word_norm's `ite_var` is keyed by the
 child-rewritten term; the query term hash-conses the original child — completeness
 gap, no wrong value, no name leak); the QF_ABV path lacks the eliminated-ite get-value
 channel entirely (same degrade-to-`?`).
+**Follow-ups filed by the slice-6 FINAL REVIEW (pre-existing-shaped, out of scope):**
+- **C2 — negated arith n-ary `=` wrong-SAT** (pre-existing at base): `lower()`'s
+  binary `Not(Eq)` pure-arith special case (`lib.rs:936`) does not fire on eqs
+  nested under `Not(And(...))` (see §3 CORRECTED note). Repro
+  `(not (= x y z)) ∧ x≤y ∧ x≥y ∧ y≤z ∧ y≥z` → shinri sat, z3 unsat. Candidate
+  fix: eq ↔ (le ∧ ge) linking clauses, or descend `Not(And)` in that special case.
+- **I1 — negated n-ary String `distinct` wrong-UNSAT** (pre-existing string-theory
+  defect): `(not (distinct s1 s2 s2)) ∧ (= s2 s1) ∧ (= s1 (str.++ s3 "ab"))` →
+  shinri unsat, z3 sat.
+- **I2 — debug-build panic** `"returned SAT but a clause is unsatisfied"`
+  (`shinri-sat/src/solver.rs:553`) on the premature-SAT family, e.g.
+  `(not (= s1 s2 s3)) ∧ (= s1 "a")`; TermId-layout-sensitive. A sibling
+  debug-assert `"explain: a,b not connected"` (`shinri-theory/src/eq_engine.rs:366`)
+  fires from the same string/eq premature-SAT family (surfaced by the new
+  `differential_qf_s_nary` corpus; its seed is chosen to skirt both). Debug-only;
+  release builds return a verdict.
 **Plan:** 5 (post-Plan-4 completeness & robustness), second slice — the slice-5 final
 review's filed follow-ups (wrong-SAT Imp#2 + carried minors Min#4/#5/#6 + parser gap)
 **Predecessors:** slice 5 (`word_norm` pass, whose final review filed all of this)
@@ -92,10 +115,15 @@ Interactions, considered:
   per pair — semantically identical output, but term shapes shift, so the
   full-net baseline check applies (§6). `lower()`'s own n-ary arms become
   effectively dead but are left in place as defense in depth.
-- **Not-wrapped forms:** the expansion is a term-level equivalence, so
-  `(not (= a b c))` → `(not (and (= a b) (= b c)))` is correct as-is;
-  `lower()`'s binary `Not(Eq)` pure-arith special case (`lib.rs:936`) still
-  fires on the produced binary atoms.
+- **Not-wrapped forms (CORRECTED — final review):** the expansion
+  `(not (= a b c))` → `(not (and (= a b) (= b c)))` IS equivalence-preserving,
+  but `lower()`'s binary `Not(Eq)` pure-arith special case (`lib.rs:936`) does
+  NOT fire on eqs nested under `Not(And(...))` — it only matches a bare
+  top-level `Not(Eq(_,_))`. So **negated n-ary arith `=` is wrong-SAT**
+  (pre-existing at base, surfaced by the final review; repro
+  `(not (= x y z)) ∧ x≤y ∧ x≥y ∧ y≤z ∧ y≥z` → shinri sat, z3 unsat). Filed as
+  follow-up C2 in the Status block (candidate fix: eq ↔ (le ∧ ge) linking
+  clauses, or descend Not(And) in the pure-arith special case).
 - **Array `=`:** binary array equalities remain extensionality-fenced →
   verdicts unchanged (sound Unknown), no fence lift in this slice.
 
