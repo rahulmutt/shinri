@@ -434,6 +434,24 @@ impl TheorySolver for StrSolver {
                         .terms
                         .mk_app(Op::Builtin(BuiltinOp::StrLen), &[other])
                         .expect("str.len(other) well-sorted");
+                    // Cluster A / #1 (slice 8): a concat whose normal form carries a
+                    // non-empty string constant has structural length ≥ 1 and can
+                    // NEVER equal "", so `other ≠ ""` is trivially satisfiable — the
+                    // empty-length link must NOT conflict it. An arith length axiom can
+                    // never entail `len(concat-with-const)=0` (it would force a var's
+                    // length negative), so any `len_class_zero` hit here would be a
+                    // SPURIOUS unit merge (empty-antecedent conflict) forcing the diseq
+                    // false — the wrong-UNSAT this slice closes. Only the genuinely-
+                    // entailed-zero case (a bare/const-free side EUF-merged to 0 via an
+                    // asserted literal) is a sound conflict, and that path is preserved.
+                    if let Some(nf) = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known, other) {
+                        if nf
+                            .iter()
+                            .any(|&a| cx.terms.string_const_value(a).map_or(false, |s| !s.is_empty()))
+                        {
+                            continue;
+                        }
+                    }
                     if let Some(zero) = len_class_zero(cx.terms, cx.eq, len_other) {
                         let ln = cx.eq.intern(len_other);
                         let zn = cx.eq.intern(zero);

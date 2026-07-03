@@ -609,6 +609,20 @@ fn targeted_diseq_undo_residual_no_panic() {
     );
 }
 
+#[test]
+fn targeted_distinct_over_concat_not_unsat() {
+    // Cluster A / #1 (slice 8): distinct("", s2++"a") drove a unit conflict that
+    // unsoundly forced s2++"a"="" (a concat ending in "a" is never empty). z3: sat.
+    expect_not_unsat(
+        "(set-logic QF_S)\
+         (declare-const s2 String)(declare-const s3 String)\
+         (assert (not (distinct s3 \"\" (str.++ s2 \"a\"))))\
+         (assert (not (= (str.++ s3 \"a\") \"\" s3 s2)))\
+         (assert (distinct s3 (str.++ s2 \"a\")))\
+         (check-sat)",
+    );
+}
+
 // ── Task 19: occurs-check soundness regression (free-monoid emptiness) ───────
 // A bare variable equated to a concat that RE-CONTAINS it, flanked ONLY by other
 // variables, is SAT via emptiness — the occurs-check must NOT report UNSAT. With
