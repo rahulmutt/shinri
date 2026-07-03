@@ -219,12 +219,13 @@ fn z3_outcome_s(ctx: &mut easy_smt::Context, src: &str) -> easy_smt::Response {
 
 #[test]
 fn differential_qf_s_nary() {
-    // Seed chosen so the random corpus avoids two PRE-EXISTING debug-build
-    // panics in string/eq theory that are unrelated to this family's purpose
-    // and already filed as follow-ups (I2 sat solver.rs premature-SAT panic; a
-    // sibling eq_engine "explain: a,b not connected" debug-assert). The C1
-    // self-check descent is exercised by the `(and …)` wrappers regardless.
-    let mut rng = Lcg(0xB000_9E37);
+    // Seed for string oracle differential. Prior seed 0xB000_9E37 avoided
+    // panics now fixed: I2 VMTF premature-SAT (slice 7), eq_engine
+    // InsertOverwrite/residual-diseq and EUF stale-pending-congruence (cluster
+    // C, slice 8), analyze/backtrack robustness (cluster B, slice 8), and
+    // distinct-over-concat empty-length hardening (cluster A, slice 8).
+    // C1 self-check descent is exercised by `(and …)` wrappers in gen_assertion_s.
+    let mut rng = Lcg(0xB000_9E38);
     let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
     let mut n_z3_checked = 0usize;
     for iter in 0..N_ITERS {
