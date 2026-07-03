@@ -447,7 +447,7 @@ impl TheorySolver for StrSolver {
                     if let Some(nf) = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known, other) {
                         if nf
                             .iter()
-                            .any(|&a| cx.terms.string_const_value(a).map_or(false, |s| !s.is_empty()))
+                            .any(|&a| cx.terms.string_const_value(a).is_some_and(|s| !s.is_empty()))
                         {
                             continue;
                         }
