@@ -157,21 +157,39 @@ impl WordNorm {
             }
             Op::Builtin(BuiltinOp::Distinct) if new_kids.len() > 2 =>
             {
-                // (distinct a b c ...) → conjunction over all pairs i<j.
-                let mut pairs: Vec<TermId> = Vec::new();
-                for i in 0..new_kids.len() {
+                // An n-ary distinct with a repeated operand can never hold (a value
+                // cannot differ from itself), so the whole atom is `false`. Fold it
+                // directly rather than emit a self-distinct pair `(distinct x x)` that
+                // the string/EUF theory then mishandles regardless of polarity
+                // (I1 wrong-UNSAT, slice 7).
+                let mut has_dup = false;
+                'outer: for i in 0..new_kids.len() {
                     for j in (i + 1)..new_kids.len() {
-                        pairs.push(
-                            ctx.mk_app(
-                                Op::Builtin(BuiltinOp::Distinct),
-                                &[new_kids[i], new_kids[j]],
-                            )
-                            .expect("binary distinct well-sorted"),
-                        );
+                        if new_kids[i] == new_kids[j] {
+                            has_dup = true;
+                            break 'outer;
+                        }
                     }
                 }
-                ctx.mk_app(Op::Builtin(BuiltinOp::And), &pairs)
-                    .expect("and well-sorted")
+                if has_dup {
+                    ctx.mk_const_bool(false)
+                } else {
+                    // (distinct a b c ...) → conjunction over all pairs i<j.
+                    let mut pairs: Vec<TermId> = Vec::new();
+                    for i in 0..new_kids.len() {
+                        for j in (i + 1)..new_kids.len() {
+                            pairs.push(
+                                ctx.mk_app(
+                                    Op::Builtin(BuiltinOp::Distinct),
+                                    &[new_kids[i], new_kids[j]],
+                                )
+                                .expect("binary distinct well-sorted"),
+                            );
+                        }
+                    }
+                    ctx.mk_app(Op::Builtin(BuiltinOp::And), &pairs)
+                        .expect("and well-sorted")
+                }
             }
             Op::Builtin(BuiltinOp::Not) => {
                 // C2 (slice 7): De Morgan a negated n-ary `=`. word_norm has already
@@ -433,5 +451,29 @@ mod tests {
         let nbc = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[ebc]).unwrap();
         let expect = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[nab, nbc]).unwrap();
         assert_eq!(out, vec![expect]);
+    }
+
+    #[test]
+    fn distinct_with_duplicate_operand_folds_to_false() {
+        use shinri_core::{ConstVal, TermNode};
+        let mut ctx = Context::new();
+        let a = bv_var(&mut ctx, "a", 8);
+        let b = bv_var(&mut ctx, "b", 8);
+        // (distinct a b b) — b repeated ⇒ unsatisfiable-as-true ⇒ false.
+        let d = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, b, b])
+            .unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[d]);
+        // Single assertion rewritten to the `false` constant.
+        assert_eq!(out.len(), 1);
+        assert!(
+            matches!(
+                ctx.term_node(out[0]),
+                TermNode::Const { val: ConstVal::Bool(false), .. }
+            ),
+            "expected false constant, got {:?}",
+            ctx.term_node(out[0])
+        );
     }
 }

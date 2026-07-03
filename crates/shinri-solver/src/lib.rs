@@ -1595,6 +1595,30 @@ mod nary_soundness_tests {
                    (assert (= a b))(assert (= b c))(check-sat)";
         assert_eq!(run_outcome(src), SolveOutcome::Unsat);
     }
+
+    /// I1 (slice 7): `(distinct s1 s2 s2)` has a repeated operand ⇒ false, so
+    /// `(not (distinct s1 s2 s2))` is true and imposes no constraint; with s2=s1
+    /// the query is SAT. Pre-fix shinri wrongly answered UNSAT — the self-distinct
+    /// pair `(distinct s2 s2)` drove a spurious conflict. The fold to `false`
+    /// removes it. z3-verified sat; reaches Sat within the string fuel budget.
+    #[test]
+    fn not_nary_string_distinct_with_dup_is_sat() {
+        let src = "(declare-const s1 String)(declare-const s2 String)\
+                   (assert (not (distinct s1 s2 s2)))\
+                   (assert (= s2 s1))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
+    }
+
+    /// I1 semantic-duplicate: s2=s3 makes `(distinct s1 s2 s3)` false via EUF
+    /// (not syntax), so `(not (distinct s1 s2 s3))` is true → SAT. z3-verified.
+    #[test]
+    fn not_nary_string_distinct_semantic_dup_is_sat() {
+        let src = "(declare-const s1 String)(declare-const s2 String)\
+                   (declare-const s3 String)\
+                   (assert (not (distinct s1 s2 s3)))\
+                   (assert (= s2 s3))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
+    }
 }
 
 #[cfg(test)]
