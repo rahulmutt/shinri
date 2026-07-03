@@ -173,6 +173,40 @@ impl WordNorm {
                 ctx.mk_app(Op::Builtin(BuiltinOp::And), &pairs)
                     .expect("and well-sorted")
             }
+            Op::Builtin(BuiltinOp::Not) => {
+                // C2 (slice 7): De Morgan a negated n-ary `=`. word_norm has already
+                // expanded the Eq child to (and (= a b) (= b c) …) — all binary (the
+                // EUF/tseitin invariant). Rewrite (not (and …)) → (or (not (= a b))
+                // (not (= b c)) …) so lower's binary Not(Eq) arm enforces each arith
+                // pair as (or Lt Gt). Sound for every sort; every Eq stays binary.
+                // Any other Not child falls through unchanged (same as `_ => rebuilt`),
+                // preserving the no-change ⇒ same-TermId invariant.
+                let child_is_nary_eq = matches!(
+                    ctx.term_node(kids[0]).clone(),
+                    TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args: ca, .. }
+                        if ctx.children(ca).len() > 2
+                );
+                if child_is_nary_eq {
+                    if let TermNode::App { op: Op::Builtin(BuiltinOp::And), args: aa, .. } =
+                        ctx.term_node(new_kids[0]).clone()
+                    {
+                        let conjs: Vec<TermId> = ctx.children(aa).to_vec();
+                        let disj: Vec<TermId> = conjs
+                            .iter()
+                            .map(|&c| {
+                                ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[c])
+                                    .expect("not well-sorted")
+                            })
+                            .collect();
+                        ctx.mk_app(Op::Builtin(BuiltinOp::Or), &disj)
+                            .expect("or well-sorted")
+                    } else {
+                        rebuilt
+                    }
+                } else {
+                    rebuilt
+                }
+            }
             _ => rebuilt,
         };
         memo.insert(t, result);
@@ -380,5 +414,24 @@ mod tests {
         let new_sq = ctx.mk_app(Op::Builtin(BuiltinOp::FpSqrt), &[w, x]).unwrap();
         let expect = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[new_sq, x]).unwrap();
         assert_eq!(out[0], expect);
+    }
+
+    #[test]
+    fn not_nary_eq_de_morgans_to_or_of_binary_diseqs() {
+        let mut ctx = Context::new();
+        let a = bv_var(&mut ctx, "a", 8);
+        let b = bv_var(&mut ctx, "b", 8);
+        let c = bv_var(&mut ctx, "c", 8);
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[a, b, c]).unwrap();
+        let not = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[eq]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[not]);
+        // Expected: (or (not (= a b)) (not (= b c))).
+        let eab = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[a, b]).unwrap();
+        let ebc = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[b, c]).unwrap();
+        let nab = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[eab]).unwrap();
+        let nbc = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[ebc]).unwrap();
+        let expect = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[nab, nbc]).unwrap();
+        assert_eq!(out, vec![expect]);
     }
 }

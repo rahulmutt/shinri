@@ -1548,6 +1548,56 @@ fn run_outcome(src: &str) -> SolveOutcome {
 }
 
 #[cfg(test)]
+mod nary_soundness_tests {
+    use super::*;
+
+    /// C2 (slice 7): negated n-ary arith `=` must be sound. x=y=z is forced by the
+    /// four bound constraints, so `(not (= x y z))` is UNSAT. Pre-fix: wrong-SAT.
+    /// z3-verified unsat.
+    #[test]
+    fn not_nary_eq_int_forced_equal_is_unsat() {
+        let src = "(declare-const x Int)(declare-const y Int)(declare-const z Int)\
+                   (assert (not (= x y z)))\
+                   (assert (<= x y))(assert (>= x y))\
+                   (assert (<= y z))(assert (>= y z))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unsat);
+    }
+
+    /// C2 companion: negated n-ary arith `=` that IS satisfiable stays sat (y=z
+    /// forced, x free). z3-verified sat.
+    #[test]
+    fn not_nary_eq_int_satisfiable_is_sat() {
+        let src = "(declare-const x Int)(declare-const y Int)(declare-const z Int)\
+                   (assert (not (= x y z)))\
+                   (assert (<= y z))(assert (>= y z))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
+    }
+
+    /// C2 regression guard — NON-arith (Bool) negated n-ary `=`. The De Morgan fix
+    /// must keep every Eq binary so shinri-euf/tseitin never drops an operand. p=q=r
+    /// forced ⇒ `(not (= p q r))` UNSAT. (A prior broken attempt panicked / dropped
+    /// operands here.) z3-verified unsat.
+    #[test]
+    fn not_nary_eq_bool_forced_equal_is_unsat() {
+        let src = "(declare-const p Bool)(declare-const q Bool)(declare-const r Bool)\
+                   (assert (not (= p q r)))\
+                   (assert (= p q))(assert (= q r))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unsat);
+    }
+
+    /// C2 regression guard — NON-arith (uninterpreted sort) negated n-ary `=`.
+    /// a=b=c forced ⇒ UNSAT; every Eq must reach EUF as a binary atom. z3-verified.
+    #[test]
+    fn not_nary_eq_uf_forced_equal_is_unsat() {
+        let src = "(declare-sort U 0)\
+                   (declare-const a U)(declare-const b U)(declare-const c U)\
+                   (assert (not (= a b c)))\
+                   (assert (= a b))(assert (= b c))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Unsat);
+    }
+}
+
+#[cfg(test)]
 mod string_routing_tests {
     use super::*;
 
