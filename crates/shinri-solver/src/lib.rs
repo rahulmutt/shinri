@@ -1619,6 +1619,58 @@ mod nary_soundness_tests {
                    (assert (= s2 s3))(check-sat)";
         assert_eq!(run_outcome(src), SolveOutcome::Sat);
     }
+
+    /// I2 (slice 7): the premature-SAT string/eq family must NOT panic in debug
+    /// builds. The downstream string self-check (`string_model_satisfies`)
+    /// soundly downgrades these to Unknown; the two debug_asserts on the way
+    /// there must not fire. We assert only that solving returns *some* verdict
+    /// without panicking (release already does; this guards debug).
+    #[test]
+    fn premature_sat_string_family_no_debug_panic_a() {
+        let src = "(declare-const s1 String)(declare-const s2 String)\
+                   (declare-const s3 String)\
+                   (assert (not (= s1 s2 s3)))(assert (= s1 \"a\"))(check-sat)";
+        let out = run_outcome(src);
+        assert!(matches!(
+            out,
+            SolveOutcome::Sat | SolveOutcome::Unsat | SolveOutcome::Unknown
+        ));
+    }
+
+    #[test]
+    fn premature_sat_string_family_no_debug_panic_b() {
+        let src = "(declare-const s1 String)(declare-const s2 String)\
+                   (assert (not (= s1 s2)))(assert (= s1 \"a\"))(assert (= s2 \"a\"))\
+                   (check-sat)";
+        let out = run_outcome(src);
+        assert!(matches!(
+            out,
+            SolveOutcome::Sat | SolveOutcome::Unsat | SolveOutcome::Unknown
+        ));
+    }
+
+    /// I2 (slice 7) — THE reproducing shape. A *high-arity* negated n-ary String
+    /// `=` (arity 5) with a single constant pin. This is the input that actually
+    /// fired the `shinri-sat/src/solver.rs` premature-SAT debug panic ("returned
+    /// SAT but a clause is unsatisfied"): the string theory mints fresh split vars
+    /// and backtracks, and the VMTF branch heuristic used to *lose* a freed,
+    /// never-bumped variable (all never-bumped vars shared stamp 0, so
+    /// `on_unassign` never rewound `search` back over it). `next()` then returned
+    /// `None` while the De Morgan'd `(or (not (= s_i s_{i+1})) …)` clause still had
+    /// unassigned literals, so the solver prematurely concluded "no more decisions"
+    /// and asked the theory, which reported Sat over an unsatisfied input clause.
+    /// The VMTF stamp-ordering fix (crates/shinri-sat/src/heuristic/vmtf.rs) makes
+    /// every never-bumped var recoverable, so branching no longer drops a variable.
+    /// z3-verified: this query is SAT (s2..s5 may differ from s1). Was a debug
+    /// panic pre-fix at arity 5 (arity 2-3, above, never triggered it).
+    #[test]
+    fn premature_sat_string_family_no_debug_panic_high_arity() {
+        let src = "(declare-const s1 String)(declare-const s2 String)\
+                   (declare-const s3 String)(declare-const s4 String)\
+                   (declare-const s5 String)\
+                   (assert (not (= s1 s2 s3 s4 s5)))(assert (= s1 \"a\"))(check-sat)";
+        assert_eq!(run_outcome(src), SolveOutcome::Sat);
+    }
 }
 
 #[cfg(test)]
