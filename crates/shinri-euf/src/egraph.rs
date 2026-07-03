@@ -49,6 +49,14 @@ pub struct EGraph {
     use_list: Vec<Vec<AppId>>,
     lookup: FxHashMap<Signature, AppId>,
     /// Congruence work-queue: pairs of app nodes to merge, with arg pairs.
+    ///
+    /// INVARIANT (slice 8, cluster C): `drain_pending` is the SOLE consumer, and
+    /// it is NOT backtracked on `pop` — it is normally drained to empty each cycle,
+    /// but an early conflict-return can leave stale entries whose arg equalities a
+    /// later `pop` invalidates. `drain_pending` tolerates that only because it
+    /// re-checks arg equality (`eq.find(pa) == eq.find(pb)`) and skips stale
+    /// entries. Any NEW consumer of `pending` MUST apply the same staleness check,
+    /// or reintroduce the "explain: a,b not connected" unsound-merge bug.
     pending: Vec<PendingEntry>,
     undo: shinri_core::UndoLog<Undo>,
     /// Set when an interned term is a function application (vs a plain leaf).
