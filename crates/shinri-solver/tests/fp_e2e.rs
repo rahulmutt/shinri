@@ -1152,3 +1152,24 @@ fn pop_clears_eliminated_ite_value_no_stale_get_value() {
     );
     assert!(values[2].contains('?'), "post-pop x must be '?': {}", values[2]);
 }
+
+#[test]
+fn get_value_on_eliminated_ite_qfabv_returns_value() {
+    // Item 5 (slice 7): the QF_ABV path had no eliminated-ite get-value channel,
+    // so get-value on an eliminated ite in an array query degraded to "?". The
+    // ite (ite c x #x00) is word_norm-eliminated to a BV const before the ABV
+    // stage; c true, x=#x0f → its value is #x0f.
+    let (o, values) = run_values(
+        "(declare-const c Bool)\
+         (declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\
+         (declare-const x (_ BitVec 8))\
+         (assert c)(assert (= x #x0f))\
+         (assert (= (select a #x00) (ite c x #x00)))\
+         (check-sat)(get-value ((ite c x #x00)))",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert_eq!(values.len(), 1);
+    assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
+    assert!(!values[0].contains('?'), "no value produced (item-5 gap): {}", values[0]);
+    assert!(values[0].contains("#x0f"), "expected #x0f: {}", values[0]);
+}

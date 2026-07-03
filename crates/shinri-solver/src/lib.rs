@@ -359,9 +359,35 @@ impl Solver {
                 return SolveOutcome::Unknown;
             }
             let assertions_owned = assertions.clone();
-            let (outcome, array_models) =
-                crate::abv_stage::solve_qfabv_with_models(&mut self.ctx, &assertions_owned);
+            // Harvest the internal eliminated-ite symbols so the ABV stage can
+            // return their BV values (item 5, slice 7).
+            let internal_ite_syms: Vec<TermId> = self
+                .word_norm
+                .ite_map()
+                .values()
+                .chain(self.word_norm.orig_ite_map().values())
+                .copied()
+                .collect();
+            let (outcome, array_models, ite_sym_vals) = crate::abv_stage::solve_qfabv_with_models(
+                &mut self.ctx,
+                &assertions_owned,
+                &internal_ite_syms,
+            );
             self.abv_array_models = array_models;
+            // Remap original ite terms → their internal symbol's value.
+            let mut ite_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal> =
+                rustc_hash::FxHashMap::default();
+            for (&ite_t, &w) in self
+                .word_norm
+                .ite_map()
+                .iter()
+                .chain(self.word_norm.orig_ite_map().iter())
+            {
+                if let Some(v) = ite_sym_vals.get(&w) {
+                    ite_vals.insert(ite_t, v.clone());
+                }
+            }
+            self.eliminated_ite_vals = ite_vals;
             return match outcome {
                 shinri_abv::AbvOutcome::Sat => SolveOutcome::Sat,
                 shinri_abv::AbvOutcome::Unsat => SolveOutcome::Unsat,

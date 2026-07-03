@@ -604,7 +604,7 @@ impl shinri_abv::SatBridge for RealBridge {
 /// Used by unit tests; `lib.rs` uses `solve_qfabv_with_models` directly.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn solve_qfabv(ctx: &mut Context, assertions: &[TermId]) -> shinri_abv::AbvOutcome {
-    solve_qfabv_with_models(ctx, assertions).0
+    solve_qfabv_with_models(ctx, assertions, &[]).0
 }
 
 /// Enumerate every declared array constant (nullary `Op::Uninterpreted` whose
@@ -639,16 +639,25 @@ fn collect_array_consts(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
 }
 
 /// Like `solve_qfabv`, but on SAT additionally builds the array model for every
-/// declared array constant in the assertions, returning the rendered strings.
-/// Returns (`outcome`, `array_models`) where `array_models` maps each declared
-/// array constant `TermId` → its rendered SMT-LIB `store`-chain string.
-/// On non-SAT outcomes the map is empty.
+/// declared array constant in the assertions, returning the rendered strings,
+/// plus the BV values of the given internal eliminated-ite symbol terms (item 5,
+/// slice 7 — the get-value channel for ites eliminated by word-norm before the
+/// ABV stage runs).
+/// Returns (`outcome`, `array_models`, `ite_sym_vals`) where `array_models` maps
+/// each declared array constant `TermId` → its rendered SMT-LIB `store`-chain
+/// string, and `ite_sym_vals` maps each of `internal_ite_syms` → its assigned
+/// `ModelVal::BitVec`. On non-SAT outcomes both maps are empty.
 pub fn solve_qfabv_with_models(
     ctx: &mut Context,
     assertions: &[TermId],
-) -> (shinri_abv::AbvOutcome, FxHashMap<TermId, String>) {
+    internal_ite_syms: &[TermId],
+) -> (
+    shinri_abv::AbvOutcome,
+    FxHashMap<TermId, String>,
+    FxHashMap<TermId, shinri_theory::types::ModelVal>,
+) {
     use shinri_abv::{
-        abstract_arrays, array_model, collect, normalize_array_atoms, refine, render,
+        abstract_arrays, array_model, collect, normalize_array_atoms, refine, render, SatBridge,
     };
     // SOUNDNESS: desugar n-ary + `distinct` array atoms into pairwise binary eqs
     // BEFORE collection/abstraction, so every array atom the pipeline sees is a
@@ -661,7 +670,7 @@ pub fn solve_qfabv_with_models(
     let outcome = refine(ctx, &mut abs, &mut c, &mut bridge);
 
     if outcome != shinri_abv::AbvOutcome::Sat {
-        return (outcome, FxHashMap::default());
+        return (outcome, FxHashMap::default(), FxHashMap::default());
     }
 
     // Build array models while `bridge`, `c`, and `abs` are still live.
@@ -671,7 +680,16 @@ pub fn solve_qfabv_with_models(
         let m = array_model(ctx, &c, &abs, arr, &bridge);
         models.insert(arr, render(&m));
     }
-    (outcome, models)
+    // Extract eliminated-ite internal symbol values while `bridge` is still live
+    // (item 5, slice 7). Mirrors how `array_model` reads index/element values
+    // via `bridge.value_bv`.
+    let mut ite_sym_vals = FxHashMap::default();
+    for &sym in internal_ite_syms {
+        if let Some((width, value)) = bridge.value_bv(ctx, sym) {
+            ite_sym_vals.insert(sym, shinri_theory::types::ModelVal::BitVec(width, value));
+        }
+    }
+    (outcome, models, ite_sym_vals)
 }
 
 /// Test helper: run a QF_ABV query and return the rendered array model string
