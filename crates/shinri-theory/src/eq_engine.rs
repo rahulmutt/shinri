@@ -716,11 +716,27 @@ mod tests {
         eq.pop(0); // back to level 0: undoes the merge(b,a) AND the collision.
 
         assert_ne!(eq.find(a), eq.find(b), "merge(b,a) must be undone");
-        // The ORIGINAL level-0 a≠c record must be restored (not lost to the
-        // collision): merging a and c must still conflict.
-        assert!(
-            eq.merge(a, c, asserted(5)).is_err(),
-            "original a≠c must survive the assert_diseq collision+backtrack (I2)"
+        // The ORIGINAL level-0 a≠c record must be restored (not merely SOME
+        // record — a stale, un-restored b≠c record left behind by the pre-fix
+        // bug would ALSO make this `.is_err()`, just with the WRONG provenance,
+        // so a bare `.is_err()` cannot detect the corruption. Assert the
+        // conflict cites the ORIGINAL endpoints/justification (a, c,
+        // asserted(1)), NOT the collided (b, c, asserted(3)) record).
+        let err = eq
+            .merge(a, c, asserted(5))
+            .expect_err("original a≠c must survive the assert_diseq collision+backtrack (I2)");
+        assert_eq!(
+            err.diseq,
+            asserted(1),
+            "restored record must carry the ORIGINAL justification, not the collided one"
+        );
+        assert_eq!(
+            err.diseq_lhs, a,
+            "restored record must cite the original lhs endpoint"
+        );
+        assert_eq!(
+            err.diseq_rhs, c,
+            "restored record must cite the original rhs endpoint"
         );
     }
 
