@@ -1,43 +1,63 @@
-# Slice 8 design — string-soundness follow-ups (analyze OOB + distinct-over-concat wrong-UNSAT)
+# Slice 8 design — string-soundness follow-ups (analyze/backtrack + explain-not-connected + distinct-over-concat)
 
 Date: 2026-07-03
-Status: DESIGN (awaiting user review)
+Status: DESIGN (revised after writing-plans repro hunt — three clusters)
 Predecessor: slice 7 (`d7089c2..47c8342`, landed 2026-07-03)
 
 ## Goal
 
-Close the two OPEN pre-existing soundness follow-ups filed at the end of slice 7,
-then unblock the string-oracle re-baseline that both of them were holding back.
-Both were confirmed pre-existing at base `d7089c2` (not slice-introduced); the
-widened string oracle surfaced them. Repros live in
-`.superpowers/sdd/task-4b-report.md`.
+Make the string differential oracle run clean at the target re-baseline seed
+`0xB000_9E38` — 0 disagreements AND 0 debug panics — then advance the seed. A
+repro hunt at `0xB000_9E38` (recorded in `.superpowers/sdd/slice8-repro-findings.md`)
+showed the seed is blocked by **three** defect clusters, not the two originally
+filed. All are pre-existing at base `d7089c2` (not slice-introduced); the wider
+seed surfaces them.
 
-- **#2** — `shinri-sat/src/solver.rs:293` `analyze` index-out-of-bounds on some
-  `str.++`/`str.len` shapes. PRIORITIZED: the slice-7 VMTF fix recovers more
-  branching vars, which raises this bug's exposure on wide-seed fuzzing.
-- **#1** — string `distinct`-over-concat wrong-UNSAT. At `Effort::Full`,
-  `distinct("", s2++"a")` drives a unit conflict that unsoundly forces
-  `s2++"a" = ""` (impossible: a concat ending in the constant `"a"` is never
-  empty). BROAD-HIGH risk class.
+- **Cluster A / #1** — string `distinct`-over-concat wrong-UNSAT. At
+  `Effort::Full`, `distinct("", s2++"a")` drives a unit conflict that unsoundly
+  forces `s2++"a" = ""` (impossible: a concat ending in the constant `"a"` is
+  never empty). z3=sat, shinri=unsat. BROAD-HIGH risk class. (First disagreement
+  at seed 9E38 iter 93; matches task-4b §6.)
+- **Cluster B / #2** — `analyze`-family robustness. Manifests in this corpus as a
+  `trail.rs:91` debug-assert `"backtrack above current level"` (analyze produced a
+  backjump level above the current decision level). The originally-filed
+  `solver.rs:293` `seen[v.index()]` OOB is the SAME family (both fired by
+  string-theory `Conflict` literals); line numbers shifted after slice 7. Repro:
+  seed 9E38 iter 1013.
+- **Cluster C / NEW** — RESIDUAL `eq_engine.rs:379` debug-assert
+  `"explain: a,b not connected"` — the SAME assert slice 7's `InsertOverwrite`
+  fix (then at `:366`) was meant to close. It still fires via a SECOND, unguarded
+  diseq-map mutation/undo path. Per task-4b §4 this class is a genuine RELEASE
+  soundness bug (unsound merge + fabricated conflict), not debug-only. Repro:
+  seed 9E38 iter 1524; seed 9E3A iter 672.
 
 Non-goal: no new theory/op admission, no fence lift, no fuzz-seed widening beyond
-the single deferred re-baseline. This slice is soundness repair + re-baseline only.
+the single re-baseline. This slice is soundness repair + re-baseline only.
 
 ## Scope & sequencing
 
-Three units, in this order, each its own commit, each via TDD +
-systematic-debugging:
+Four units, in this order, each its own commit, each via TDD +
+systematic-debugging. Panics (B, C) come before the wrong-verdict (A) and the
+re-baseline, so the debug sweep can progress without aborting:
 
-1. **#2 first** — `analyze` OOB (SAT core). Prioritized, and fixing it stabilizes
-   the differential-oracle fuzzing harness so unit 3's re-baseline sweep cannot
-   crash mid-run.
-2. **#1 second** — string `distinct`-over-concat wrong-UNSAT (shinri-str). Broad;
-   full minimized repro already exists (task-4b §6).
-3. **Re-baseline last** — bump the string oracle seed `0xB000_9E37 → 0xB000_9E38`,
-   regenerate the baseline, verify 0 disagreements. This is the deferred work both
-   bugs were blocking.
+1. **Cluster B first** — `analyze`/backtrack robustness (SAT core). Prioritized;
+   stabilizes the fuzzing harness so later sweeps don't abort on a panic.
+2. **Cluster C second** — finish the slice-7 eq_engine diseq-undo work (the
+   residual explain-not-connected path). shinri-theory.
+3. **Cluster A third** — string `distinct`-over-concat wrong-UNSAT (shinri-str).
+   Broad; minimized repro exists (task-4b §6, and seed 9E38 iter 93).
+4. **Re-baseline last** — bump the string oracle seed `0xB000_9E37 → 0xB000_9E38`,
+   regenerate the baseline, verify 0 disagreements AND 0 panics.
 
-## Unit 1 — #2 `analyze` OOB
+## Unit 1 — Cluster B: `analyze`/backtrack robustness
+
+Observed manifestation: `trail.rs:91` `debug_assert!(level <= self.decision_level(),
+"backtrack above current level")` fires because `analyze` returned a backjump
+level `bt` above the current decision level (solver.rs:574–575, `backtrack_to(bt)`
+after a `TheoryResult::Conflict`). The originally-filed `solver.rs:293`
+`seen[v.index()]` OOB is the same family; whichever assert the repro hits, the
+fix is the same class (analyze consuming a theory conflict whose literals/levels
+are not consistent with the SAT var/level state).
 
 ### Diagnosis surface
 
@@ -68,11 +88,46 @@ OOBs `analyze` in debug. Likely outcome: guard + root-cause together.
 
 ### Pin
 
-A no-OOB / no-panic regression pin over the minimized #2 input in the string
-differential suite. (Verdict-neutral until we know the correct verdict; the pin
-asserts "does not panic / OOB", not a specific sat/unsat.)
+A no-panic / no-OOB regression pin over the cluster-B repro (seed 9E38 iter 1013)
+in the string differential suite. (Verdict-neutral: the pin asserts "does not
+panic / OOB", not a specific sat/unsat — the correct verdict for that input is
+established once A and C also land.)
 
-## Unit 2 — #1 string `distinct`-over-concat wrong-UNSAT
+## Unit 2 — Cluster C: residual `eq_engine.rs:379` explain-not-connected
+
+### Diagnosis surface
+
+Slice 7 added `DiseqUndo::InsertOverwrite` (assert_diseq collision, eq_engine.rs:170)
+and `DiseqUndo::RekeyOverwrite` (merge rekey collision, eq_engine.rs:256), each
+mirrored in `pop` (eq_engine.rs:466–486). The assert at eq_engine.rs:379 still
+fires, so a diseq-map mutation reachable from string-theory merges is STILL not
+exactly reversed on `pop`. Candidate residual paths (to be isolated by the repro):
+- multi-rekey replay ordering: the merge loop (eq_engine.rs:223–263) processes
+  several stale keys; the reverse `pop` replay of `Rekey`/`RekeyOverwrite` may not
+  invert when two rekeys in one merge touch overlapping keys;
+- `merge_congruence` (eq_engine.rs:269) mutating diseqs without the mirrored undo;
+- the early-conflict / self-key branch leaving the map in a state `explain` later
+  looks up with a mismatched canonical key.
+
+### Approach
+
+Systematic-debugging from the in-hand repro (seed 9E38 iter 1524; seed 9E3A iter
+672): instrument the diseq-map mutation + undo log across the failing push/pop,
+find the mutation whose `pop` does not restore the exact pre-mutation entry, and
+fix it by mirroring the proven `InsertOverwrite`/`RekeyOverwrite` undo pattern so
+every mutation is exactly reversible. Blast radius held to the offending branch +
+its `pop` arm (as the slice-7 fixes were).
+
+### Pins
+
+A no-panic pin (debug) over the cluster-C repro in the string differential suite,
+AND — because the class is a release soundness bug — a z3-checked `expect_not_unsat`
+/ verdict pin confirming the repro's release verdict is correct. Plus a
+shinri-theory unit test asserting the specific mutation is restored across
+`push → mutate → pop` (mirroring `assert_diseq_collision_preserves_displaced_diseq_across_backtrack`,
+eq_engine.rs:674).
+
+## Unit 3 — Cluster A / #1: string `distinct`-over-concat wrong-UNSAT
 
 ### Diagnosis surface
 
@@ -123,34 +178,43 @@ Assert `run_outcome != Unsat` under (A) (ideally `Sat`); under (C) assert
 `!= Unsat` (Unknown-or-Sat). Plus a focused unit test that `len(concat-with-const)`
 is never in EUF class 0's conflict path.
 
-## Unit 3 — string-oracle re-baseline
+## Unit 4 — string-oracle re-baseline
 
-With both soundness bugs closed, bump the string differential-oracle seed
-`0xB000_9E37 → 0xB000_9E38`, regenerate the baseline counts, and verify the sweep
-returns 0 disagreements. Record the new baseline file. If unit 2 landed as (C), the
-task-4b-shaped inputs appear as `unknown` in the counts (sound), not `unsat`.
+With clusters A, B, C closed, bump the `differential_qf_s_nary` seed
+(nary_oracle.rs:227) `0xB000_9E37 → 0xB000_9E38`, regenerate the baseline counts,
+and verify the debug sweep returns 0 disagreements AND 0 panics. Update the seed
+comment (nary_oracle.rs:222–226) to drop the now-closed skirt rationale. Record
+the new baseline counts. If Unit 3 landed as (C), the task-4b-shaped inputs appear
+as `unknown` in the counts (sound), not `unsat`.
 
 ## Verification net (per fence-canary memory)
 
 - Pre-flight canary re-grep BEFORE editing: enumerate e2e + unit canaries pinned to
   the current Unknown/wrong verdicts on the touched shapes; net any that flip.
 - `cargo test --workspace` — all suites 0-failed.
-- Oracle sweep — 0 disagreements (including the re-baselined string oracle).
+- Oracle sweep — 0 disagreements AND 0 panics (including the re-baselined string
+  oracle at seed 0xB000_9E38).
 - `clippy` — zero net-new warnings.
-- Both regression pins green.
+- All three regression pins green (clusters A, B, C).
 
 ## Risks
 
-- **#1 breadth:** the complete (A) fix could touch the String↔Arith length seam;
-  the (C) floor bounds this to a sound-Unknown. Mitigated by the decision rule.
-- **#2 diffuseness:** if multiple theory paths can emit unregistered-var literals,
-  the defensive `ensure_vars` guard covers all of them structurally even if the
-  root-cause fix only addresses the one the repro found.
-- **Canary breakage:** touching diseq/length verdicts on string shapes may flip
-  canaries pinned to the old wrong-UNSAT; the pre-flight re-grep front-loads this.
-```
+- **Cluster A breadth:** the complete (A) fix could touch the String↔Arith length
+  seam; the (C) floor bounds this to a sound-Unknown. Mitigated by the decision rule.
+- **Cluster B diffuseness:** if multiple theory paths can hand `analyze` an
+  inconsistent conflict, the defensive guard (`ensure_vars` + level/var
+  `debug_assert`s at the theory-conflict entry) covers them structurally even if
+  the root-cause fix only addresses the one the repro found.
+- **Cluster C is another undo gap:** the residual may be a subtle multi-rekey
+  ordering bug rather than a missing single-site undo; the shinri-theory
+  push/mutate/pop unit test pins the exact invariant so a partial fix can't pass.
+- **Canary breakage:** touching diseq/length verdicts on string shapes, and the
+  eq_engine undo path, may flip canaries pinned to the old wrong-UNSAT / old panic
+  behavior; the pre-flight re-grep front-loads this.
 
-## Open decision (deferred, user away)
+## Settled decisions
 
-Fix depth for #1 was posed as A / A-only / C. Proceeding with **target (A), fall
-back to (C)** (recommended) unless the user redirects.
+- **Scope** (user, this session): fold in cluster C — the slice fixes A, B, C then
+  re-baselines. Recorded in `.superpowers/sdd/slice8-repro-findings.md`.
+- **Cluster A fix depth** (user-approved spec): target (A) SAT-preserving, fall
+  back to (C) sound-Unknown per the decision rule.
