@@ -41,6 +41,16 @@ struct ForestUndo {
 enum DiseqUndo {
     /// A fresh key was inserted; remove it on undo.
     Insert((ENodeId, ENodeId)),
+    /// `assert_diseq` inserted a record at `key` that collided with an
+    /// ALREADY-live record at that same key (both endpoints canonicalize to
+    /// the same rep-pair): the collision overwrote `displaced` without
+    /// removing it, so on undo `displaced` must be re-inserted at `key` to
+    /// restore the exact pre-assert map (mirrors `RekeyOverwrite`'s C1 fix,
+    /// symmetric case for `assert_diseq`'s own collision branch).
+    InsertOverwrite {
+        key: (ENodeId, ENodeId),
+        displaced: DiseqRecord,
+    },
     /// A key was re-keyed (from `old` to `new`) during a merge and `new` did
     /// NOT previously exist; restore `old` (with the moved record) and remove
     /// `new` on undo.
@@ -157,8 +167,11 @@ impl EqualityEngine {
             lhs: a,
             rhs: b,
         };
-        if self.diseqs.insert(key, record).is_none() {
-            self.diseq_undo.record(DiseqUndo::Insert(key));
+        match self.diseqs.insert(key, record) {
+            None => self.diseq_undo.record(DiseqUndo::Insert(key)),
+            Some(displaced) => self
+                .diseq_undo
+                .record(DiseqUndo::InsertOverwrite { key, displaced }),
         }
         Ok(())
     }
@@ -453,6 +466,10 @@ impl EqualityEngine {
             DiseqUndo::Insert(key) => {
                 diseqs.remove(&key);
             }
+            DiseqUndo::InsertOverwrite { key, displaced } => {
+                // Restore the record that assert_diseq's collision overwrote.
+                diseqs.insert(key, displaced);
+            }
             DiseqUndo::Rekey { old, new, rec } => {
                 diseqs.remove(&new);
                 diseqs.insert(old, rec);
@@ -650,6 +667,60 @@ mod tests {
         assert!(
             eq2.merge(a, m, asserted(6)).is_err(),
             "a≠m must survive the collision+backtrack (C1)"
+        );
+    }
+
+    #[test]
+    fn assert_diseq_collision_preserves_displaced_diseq_across_backtrack() {
+        // I2 regression (eq_engine.rs:366 panic root cause): assert_diseq's OWN
+        // collision branch (as opposed to merge's re-key collision, covered by
+        // `rekey_collision_preserves_preexisting_diseq_across_backtrack` / C1)
+        // must not permanently drop a displaced record on backtrack.
+        //
+        // Setup: at level 0, assert_diseq(a, c) stores a record keyed at
+        // pair(find(a), find(c)) = (a, c). Push. Merge b into a's class so a
+        // DIFFERENT diseq — assert_diseq(b, c) — canonicalizes to the SAME key
+        // (a, c) once b's representative becomes a. That insert collides with
+        // the level-0 record and, pre-fix, silently overwrote it with no undo
+        // entry. Pop back to level 0: the ORIGINAL a≠c record must be restored
+        // (merging a's class with c must still conflict), not lost.
+        let mut eq = EqualityEngine::default();
+        let a = eq.intern(term(1));
+        let b = eq.intern(term(2));
+        let c = eq.intern(term(3));
+
+        eq.assert_diseq(a, c, asserted(1)).unwrap();
+
+        eq.push(); // level 1
+        // merge(a, b): both classes have size 1; union-by-size ties keep the
+        // FIRST argument's representative as root (`>=`), so calling
+        // merge(a, b) makes `a` the surviving representative and `b` the
+        // union child — find(b) becomes `a` afterward.
+        eq.merge(a, b, asserted(2)).unwrap();
+        let mut drained = Vec::new();
+        eq.drain_merges(&mut drained);
+        assert_eq!(eq.find(b), eq.find(a), "b must have joined a's class");
+
+        // Now assert a different diseq, b != c, whose representative-pair key
+        // is pair(find(b), find(c)) = pair(a, c) — the SAME key as the level-0
+        // a≠c record. This is the assert_diseq collision (InsertOverwrite).
+        eq.assert_diseq(b, c, asserted(3)).unwrap();
+
+        // Merging a's class with c must conflict RIGHT NOW (the just-asserted
+        // b≠c record is live at key (a,c)).
+        assert!(
+            eq.merge(a, c, asserted(4)).is_err(),
+            "b≠c must be live immediately after the collision"
+        );
+
+        eq.pop(0); // back to level 0: undoes the merge(b,a) AND the collision.
+
+        assert_ne!(eq.find(a), eq.find(b), "merge(b,a) must be undone");
+        // The ORIGINAL level-0 a≠c record must be restored (not lost to the
+        // collision): merging a and c must still conflict.
+        assert!(
+            eq.merge(a, c, asserted(5)).is_err(),
+            "original a≠c must survive the assert_diseq collision+backtrack (I2)"
         );
     }
 

@@ -1703,6 +1703,43 @@ mod nary_soundness_tests {
                    (assert (not (= s1 s2 s3 s4 s5)))(assert (= s1 \"a\"))(check-sat)";
         assert_eq!(run_outcome(src), SolveOutcome::Sat);
     }
+
+    /// I2 (slice 7), second head: guards the eq_engine.rs:366 diseq-undo panic
+    /// (`explain: a,b not connected`). Root cause: `assert_diseq`'s collision
+    /// branch (key already held a live disequality record — both endpoints
+    /// canonicalize to the same rep-pair) silently overwrote the map entry
+    /// WITHOUT recording an undo, so `pop` never restored the displaced
+    /// record. That left a stale/mis-keyed diseq record which a later `merge`
+    /// could unsoundly bridge, fabricating a conflict over two forest-
+    /// disconnected nodes and hitting the debug_assert_eq at eq_engine.rs:366
+    /// (release: silently produced a fabricated conflict clause instead of
+    /// panicking). Fixed by mirroring the existing `RekeyOverwrite` pattern
+    /// with a symmetric `InsertOverwrite` undo variant in `assert_diseq`.
+    ///
+    /// This minimized input (2 vars, 3 assertions) was the smallest repro
+    /// found for the panic. It ALSO independently hits a SEPARATE,
+    /// pre-existing, out-of-scope shinri-str wrong-UNSAT (a
+    /// `distinct("", s2++"a")` length-reasoning bug in the word-equation /
+    /// Nielsen-split machinery, filed for its own slice) that survives this
+    /// eq_engine fix: with the panic fixed, EUF itself produces sound
+    /// conflicts, but the string theory still forces `s2++"a" = ""` (a
+    /// concatenation ending in the constant "a" can never equal the empty
+    /// string) and answers Unsat, whereas z3 says Sat. Therefore this pin
+    /// asserts ONLY that solving does not panic in debug — it does NOT assert
+    /// the verdict is correct. The current (known-wrong) verdict is Unsat;
+    /// that is expected and tracked separately, not a regression of this fix.
+    #[test]
+    fn diseq_undo_collision_no_debug_panic() {
+        let src = "(declare-const s2 String)(declare-const s3 String)\
+                   (assert (not (distinct s3 \"\" (str.++ s2 \"a\"))))\
+                   (assert (not (= (str.++ s3 \"a\") \"\" s3 s2)))\
+                   (assert (distinct s3 (str.++ s2 \"a\")))(check-sat)";
+        let out = run_outcome(src);
+        assert!(matches!(
+            out,
+            SolveOutcome::Sat | SolveOutcome::Unsat | SolveOutcome::Unknown
+        ));
+    }
 }
 
 #[cfg(test)]
