@@ -1,7 +1,72 @@
 # shinri QF_BVFP — Slice 7: negated n-ary soundness + get-value completeness
 
 **Date:** 2026-07-03
-**Status:** Design — not yet implemented.
+**Status:** **Landed 2026-07-03** — commit range `c728429..dca4c66` (9 commits, on `main`, kept local).
+
+<details><summary>Landing summary</summary>
+
+**Scope closed:** C2, I1, I2 (both heads), item-4, item-5 — all five slice-6 follow-ups.
+
+**Per-item resolution:**
+- **C2** (negated n-ary arith `=` wrong-SAT) — `c728429`. The design's approach A ("generalize
+  `lib.rs::lower`'s `Not(Eq)` arm to n-ary") was **architecturally unreachable**: `word_norm`
+  expands every n-ary `=` to `(and …)` *before* `lower` runs, so `lower` never sees an intact
+  n-ary Eq (verified: `lib.rs:307` normalize precedes `lib.rs:444` lower). Implemented instead as a
+  **De Morgan rewrite in `word_norm`'s `Not` arm**: `(not (and (= a b) (= b c) …))` →
+  `(or (not (= a b)) (not (= b c)) …)`. Every Eq stays binary (preserves the EUF binary-Eq
+  invariant — an earlier attempt that skipped expansion under `Not` panicked shinri-euf and was
+  reverted); `lower`'s existing binary `Not(Eq)` arm rewrites each pure-arith pair to `(or Lt Gt)`.
+  Sound for every sort (Bool/UF/String regression pins added).
+- **I1** (negated n-ary String `distinct` wrong-UNSAT) — `8742cc5`. Fold-only (approach A); the
+  semantic-duplicate variant already answered correctly, so **no `shinri-str` change**. `word_norm`
+  folds an n-ary `distinct` with any syntactically-equal operand pair to the `false` constant.
+- **I2** (premature-SAT panics) — **two independent heads, both fixed at the genuine upstream cause
+  (not assert-guarded):**
+  - `sat/solver.rs:553` premature-SAT ← a **VMTF branch-heuristic bug** (`8aba7a9`): all never-bumped
+    vars shared `stamp==0`, so `on_unassign` could drop a freed var from branching. Fixed with
+    strictly-negative creation-ordered stamps (`u64→i64`). (C2's De Morgan rewrite is what *exposes*
+    this at arity ≥5.)
+  - `eq_engine.rs:366` explain-on-unconnected ← an **EUF diseq-map undo bug** (`bda6ad1`,`04df13d`):
+    `assert_diseq`'s key-collision branch overwrote a diseq record without an undo entry, corrupting
+    the map across `pop`. Fixed with a `DiseqUndo::InsertOverwrite` variant mirroring the proven
+    `RekeyOverwrite` fix.
+- **item-4** (nested-ite get-value) — `175b4ef`. `WordNorm.orig_ite` map keyed by the original
+  (pre-rewrite) ite term; consumed in the get-value remap. get-model output unchanged.
+- **item-5** (QF_ABV eliminated-ite get-value) — `82e0cd1`. `solve_qfabv_with_models` → 3-tuple
+  returning internal-ite BV values via the pre-existing `SatBridge::value_bv` (no `shinri-abv`
+  change). Array-model channel unchanged.
+
+**Differential oracles:**
+- NEW `nary_arith_oracle.rs` (`6eba66b`,`dca4c66`, QF_LIA, C2's family):
+  `differential_qf_lia_nary: sat=104 unsat=96 unknown=0 z3_checked=200`, **0 disagreements**, of
+  which **71 are genuine C2 bound-squeeze UNSATs** (independently union-find-verified; permanent
+  `assert!(n_c2_unsat >= 10)` guard). Confirms the C2 De Morgan fix across 71 real cases.
+- `qfs_matches_z3`: 85 sat / 133 unsat / 82 skipped, 84 z3-witnessed, 0 disagreements (unchanged).
+- **String oracle re-baseline (design §4) DEFERRED:** widening `differential_qf_s_nary` past its
+  I2-skirt seed `0xB000_9E37` to `0xB000_9E38` exposes a **separate pre-existing shinri-str
+  wrong-UNSAT** (below), so the seed is left at `0xB000_9E37`.
+
+**Verification (definition of done):**
+- `cargo test --workspace` @ `dca4c66`: **63 suites, 0 failed**, exit 0 (~36 min).
+- `cargo test -p shinri-solver --features oracle`: **19 suites, 0 failed, 0 disagreements**, exit 0.
+- Clippy `--workspace --all-targets`: **0 net-new** — zero warnings in any slice-7-changed file;
+  touched crates (solver=2 / sat=0 / theory=4) match the slice-6 known set.
+- Canary sweep: clean (no test pins a wrong C2/I1 verdict).
+- Debug no-panic pins: `premature_sat_string_family_*` 3/3, `diseq_undo_collision_no_debug_panic` 1/1.
+
+**Filed follow-ups (all PRE-EXISTING at base `d7089c2` — confirmed by worktree; NOT introduced by
+this slice; the widened oracle merely uncovered them):**
+1. **shinri-str `distinct`-over-concat wrong-UNSAT** (BROAD-HIGH, own slice). At `Effort::Full`,
+   `distinct("", s2++"a")` emits a unit conflict forcing `s2++"a"=""` (impossible), yielding
+   wrong-UNSAT. Repro: `(not (distinct s3 "" (str.++ s2 "a")))∧(not (= (str.++ s3 "a") "" s3 s2))∧
+   (distinct s3 (str.++ s2 "a"))` → z3 sat, shinri unsat. This is why the string oracle re-baseline
+   is deferred. Diagnosis: `.superpowers/sdd/task-4b-report.md`.
+2. **`shinri-sat/src/solver.rs:293` `analyze` index-out-of-bounds** on some `str.++`/`str.len`
+   shapes (corrupt literal in conflict analysis); z3 sat. Surfaced by wide-seed oracle sweeps.
+3. **`Evsids` sibling heuristic** — audit for the analogous never-bumped-var drop the VMTF fix closed
+   (no evidence it has it; flagged for coverage).
+
+</details>
 **Plan:** 5 (post-Plan-4 completeness & robustness), third slice — the five follow-ups
 filed by the slice-6 waves.
 **Predecessors:** slice 6 (`22d75fb..2187a41`), whose landing + final review filed all
