@@ -576,6 +576,23 @@ fn expect_not_unsat(src: &str) {
     }
 }
 
+#[test]
+fn targeted_analyze_theory_conflict_no_panic() {
+    // Cluster B (slice 8): a string-theory Conflict drove `analyze` to a bad
+    // backjump level → `trail.rs:91` "backtrack above current level" in debug.
+    // The correct verdict is SAT (z3); at minimum shinri must NOT panic and must
+    // NOT return a wrong UNSAT.
+    expect_not_unsat(
+        "(set-logic QF_S)\
+         (declare-const s1 String)(declare-const s2 String)(declare-const s3 String)\
+         (assert (not (distinct (str.++ s2 \"a\") (str.++ s2 \"a\") s2 (str.++ s1 \"a\"))))\
+         (assert (and (distinct (str.++ s3 \"a\") (str.++ s3 \"b\") (str.++ s2 \"a\")) (= s3 (str.++ s1 \"b\"))))\
+         (assert (not (= (str.++ s3 \"a\") s1 s3)))\
+         (assert (and (distinct (str.++ s3 \"b\") (str.++ s3 \"a\")) (distinct (str.++ s1 \"b\") s2 (str.++ s3 \"a\"))))\
+         (check-sat)",
+    );
+}
+
 // ── Task 19: occurs-check soundness regression (free-monoid emptiness) ───────
 // A bare variable equated to a concat that RE-CONTAINS it, flanked ONLY by other
 // variables, is SAT via emptiness — the occurs-check must NOT report UNSAT. With
