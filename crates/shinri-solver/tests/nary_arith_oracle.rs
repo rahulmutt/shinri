@@ -119,11 +119,16 @@ fn gen_assertion(rng: &mut Lcg) -> String {
     }
 }
 
-fn gen_script(rng: &mut Lcg) -> String {
-    let mut s = String::new();
+fn declare_vars(s: &mut String) {
     for v in INT_VARS {
         s.push_str(&format!("(declare-const {v} Int)\n"));
     }
+}
+
+/// The purely-random script: 2..=4 random assertions over the Int vars.
+fn gen_random_script(rng: &mut Lcg) -> String {
+    let mut s = String::new();
+    declare_vars(&mut s);
     let n = 2 + rng.below(3);
     for _ in 0..n {
         s.push_str(&format!("(assert {})\n", gen_assertion(rng)));
@@ -132,13 +137,73 @@ fn gen_script(rng: &mut Lcg) -> String {
     s
 }
 
+/// Deliberately build C2's *mechanism*: an arity-`k` (k∈{3,4}) negated `=`
+/// over `k` DISTINCT variables, plus adjacent bound-squeeze pairs
+/// `(<= vi vj)`+`(>= vi vj)` that force `v0 = v1 = … = v(k-1)`. The squeeze
+/// makes the negated n-ary `=` UNSAT — and because the vars are distinct and
+/// k≥3, this exercises the n-ary De Morgan lowering, NOT the binary
+/// self-negation special case. z3 must agree UNSAT; if shinri says SAT, the
+/// C2 fix (Task 2's word_norm De Morgan rewrite) has a hole → real bug.
+///
+/// To honour "mix with the random cases", the adjacent squeeze pairs and the
+/// negated-eq atom are emitted in a shuffled order and interleaved with the
+/// (harmless w.r.t. the contradiction) declarations; the UNSAT is driven
+/// solely by the squeeze over the negated-eq's own operands.
+fn gen_c2_script(rng: &mut Lcg) -> String {
+    // Shuffle a,b,c,d (Fisher–Yates) and take the first k as the DISTINCT
+    // operand set of the negated n-ary equality.
+    let mut vars: Vec<&str> = INT_VARS.to_vec();
+    for i in (1..vars.len()).rev() {
+        let j = rng.below((i + 1) as u64) as usize;
+        vars.swap(i, j);
+    }
+    let k = 3 + rng.below(2) as usize; // 3 or 4 → arity ≥ 3
+    let chosen: Vec<&str> = vars[..k].to_vec();
+
+    // Collect the assertions, then shuffle them so the negated-eq atom and the
+    // squeeze pairs are interleaved (not in a fixed positional order).
+    let mut asserts: Vec<String> = Vec::new();
+    asserts.push(format!("(not (= {}))", chosen.join(" ")));
+    for w in chosen.windows(2) {
+        let (x, y) = (w[0], w[1]);
+        asserts.push(format!("(<= {x} {y})"));
+        asserts.push(format!("(>= {x} {y})"));
+    }
+    for i in (1..asserts.len()).rev() {
+        let j = rng.below((i + 1) as u64) as usize;
+        asserts.swap(i, j);
+    }
+
+    let mut s = String::new();
+    declare_vars(&mut s);
+    for a in &asserts {
+        s.push_str(&format!("(assert {a})\n"));
+    }
+    s.push_str("(check-sat)\n");
+    s
+}
+
+/// Returns `(script, is_c2_by_construction)`. Roughly 1/3 of scripts are
+/// deliberate C2 bound-squeeze shapes; the rest are the broad random corpus.
+fn gen_script(rng: &mut Lcg) -> (String, bool) {
+    if rng.below(3) == 0 {
+        (gen_c2_script(rng), true)
+    } else {
+        (gen_random_script(rng), false)
+    }
+}
 #[test]
 fn differential_qf_lia_nary() {
     let mut rng = Lcg(0x51CE7_0001);
     let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
     let mut n_z3_checked = 0usize;
+    // Genuine C2-shape UNSATs: scripts built by `gen_c2_script` (arity-≥3
+    // negated `=` over distinct vars, forced UNSAT by an adjacent bound
+    // squeeze) that shinri AND z3 both confirmed UNSAT. This is the coverage
+    // the reviewer found missing in the first cut.
+    let mut n_c2_unsat = 0usize;
     for iter in 0..N_ITERS {
-        let src = gen_script(&mut rng);
+        let (src, is_c2) = gen_script(&mut rng);
         let ours = shinri_outcome(&src);
         if ours == SolveOutcome::Unknown {
             n_unknown += 1;
@@ -146,7 +211,12 @@ fn differential_qf_lia_nary() {
         }
         match ours {
             SolveOutcome::Sat => n_sat += 1,
-            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unsat => {
+                n_unsat += 1;
+                if is_c2 {
+                    n_c2_unsat += 1;
+                }
+            }
             SolveOutcome::Unknown => unreachable!(),
         }
         let mut ctx = easy_smt::ContextBuilder::new()
@@ -167,7 +237,7 @@ fn differential_qf_lia_nary() {
     }
     println!(
         "differential_qf_lia_nary: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
-         z3_checked={n_z3_checked}"
+         z3_checked={n_z3_checked} c2_unsat={n_c2_unsat}"
     );
     assert!(
         n_sat > 0 && n_unsat > 0,
@@ -178,5 +248,13 @@ fn differential_qf_lia_nary() {
         n_z3_checked == N_ITERS,
         "expected every iteration z3-checked with zero disagreements \
          ({n_z3_checked}/{N_ITERS} checked)"
+    );
+    // Regression guard: the corpus must actually exercise C2's mechanism
+    // (bound-squeeze forcing equality across an arity-≥3 negated `=`), not
+    // just self-negation / positive-eq / arith-clash UNSATs.
+    assert!(
+        n_c2_unsat >= 10,
+        "expected the C2 bound-squeeze shape to be well-covered \
+         ({n_c2_unsat} genuine C2-shape UNSATs, want ≥ 10)"
     );
 }
