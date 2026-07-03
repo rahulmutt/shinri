@@ -280,6 +280,25 @@ impl EGraph {
             if eq.find(na) == eq.find(nb) {
                 continue;
             }
+            // Skip a STALE congruence: one whose argument pairs are no longer all
+            // equal. `pending` is NOT backtracked on `pop` (it is normally drained
+            // to empty each cycle), but when a prior `drain_pending` returned early
+            // on a conflict it left the remaining entries in the queue; a later
+            // `pop` can then invalidate their arg equalities. Draining such an entry
+            // would fabricate an unsound `f(..) = f(..)` congruence merge whose
+            // conflict explanation later calls `eq.explain` over now-disconnected
+            // args (the eq_engine "explain: a,b not connected" panic — cluster C).
+            //
+            // SOUND + COMPLETE: within a single drain-to-fixpoint no arg pair can go
+            // from equal to unequal (merges only add equalities), and a signature
+            // collision only enqueues a congruence when every arg pair is already
+            // equal — so an unequal arg pair here PROVES a backtrack has invalidated
+            // this entry, and the congruence no longer holds. Completeness is kept:
+            // if the args re-merge later, `recanonicalize_use_list` re-detects the
+            // signature collision and re-enqueues the congruence.
+            if pairs.iter().any(|&(pa, pb)| eq.find(pa) != eq.find(pb)) {
+                continue;
+            }
             if let Some(c) = self.do_merge(eq, na, nb, MergeJust::Congruence(pairs)) {
                 return Some(c);
             }
@@ -490,5 +509,72 @@ mod tests {
         let nb = eq.intern(fb);
         assert!(!eq.are_equal(na, nb));
         assert_eq!(g.app_count(), 4); // a, b, f(a), f(b) all recorded as apps
+    }
+
+    #[test]
+    fn stale_pending_congruence_not_drained_after_backtrack() {
+        // Cluster C (slice 8) root cause: `pending` is NOT backtracked on `pop`.
+        // When a prior `drain_pending` returns early on a conflict it leaves the
+        // remaining congruence entries in the queue; a later `pop` can invalidate
+        // their argument equalities. Draining such a STALE entry fabricates an
+        // unsound `f(..) = f(..)` congruence merge whose conflict explanation calls
+        // `eq.explain` over now-disconnected args → the eq_engine
+        // "explain: a,b not connected" panic (and, in release, a fabricated
+        // conflict / unsound merge).
+        //
+        // This reproduces the mechanism directly: enqueue a congruence `na = nb`
+        // justified by `x = y` while x=y holds (level 1), backtrack to level 0 so
+        // x and y are no longer equal (entry now stale), then drive a drain. The
+        // guard must SKIP the stale entry — no panic, no fabricated conflict, and
+        // the pre-existing `na != nb` disequality is left exactly intact.
+        use shinri_core::{Lit, Var};
+        let asserted = |s: u32| EqJust::Asserted(Lit::new(Var::new(s), true));
+
+        let mut eq = EqualityEngine::default();
+        let x = eq.intern(shinri_core::TermId::new(1).unwrap());
+        let y = eq.intern(shinri_core::TermId::new(2).unwrap());
+        let na = eq.intern(shinri_core::TermId::new(3).unwrap());
+        let nb = eq.intern(shinri_core::TermId::new(4).unwrap());
+
+        // Level-0 disequality na ≠ nb (with its ORIGINAL justification asserted(1)).
+        eq.assert_diseq(na, nb, asserted(1)).unwrap();
+
+        let mut g = EGraph::default();
+
+        // Level 1: x = y holds, so a congruence na = nb keyed on the pair (x, y)
+        // is legitimately enqueued.
+        eq.push();
+        eq.merge(x, y, asserted(9)).unwrap();
+        let mut ev = Vec::new();
+        eq.drain_merges(&mut ev);
+        assert!(eq.are_equal(x, y), "x=y must hold at level 1");
+        g.pending.push((na, nb, vec![(x, y)]));
+
+        // Backtrack to level 0: x and y are distinct again, so the queued
+        // congruence entry is now STALE (its only justification no longer holds).
+        eq.pop(0);
+        assert!(!eq.are_equal(x, y), "x=y must be undone after pop");
+
+        // Drive a drain (the no-op merge_eq(x, x) returns immediately, then drains
+        // the pending queue). Pre-fix: `do_merge(na, nb)` conflicts on na≠nb and
+        // `conflict_leaves` calls `eq.explain(x, y)` over the disconnected pair —
+        // PANIC. Post-fix: the stale entry is skipped.
+        let res = g.merge_eq(&mut eq, x, x, asserted(2));
+
+        // Provenance: the stale congruence must NOT have been applied.
+        assert!(res.is_none(), "stale congruence must not fabricate a conflict");
+        assert!(
+            !eq.are_equal(na, nb),
+            "stale congruence must not unsoundly merge na and nb"
+        );
+        // And the ORIGINAL level-0 na≠nb record must be intact (right provenance).
+        let err = eq
+            .merge(na, nb, asserted(5))
+            .expect_err("na≠nb must still be live after the stale-drain");
+        assert_eq!(
+            err.diseq,
+            asserted(1),
+            "diseq map must carry the ORIGINAL justification, uncorrupted"
+        );
     }
 }

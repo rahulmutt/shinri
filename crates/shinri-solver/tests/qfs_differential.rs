@@ -593,6 +593,22 @@ fn targeted_analyze_theory_conflict_no_panic() {
     );
 }
 
+#[test]
+fn targeted_diseq_undo_residual_no_panic() {
+    // Cluster C (slice 8): a second diseq-map mutation not reversed on pop still
+    // reaches the eq_engine "explain: a,b not connected" debug-assert. z3: this
+    // shape is satisfiable; shinri must not panic and must not wrong-UNSAT.
+    expect_not_unsat(
+        "(set-logic QF_S)\
+         (declare-const s1 String)(declare-const s2 String)(declare-const s3 String)\
+         (assert (distinct (str.++ s3 \"b\") (str.++ s3 \"a\")))\
+         (assert (and (= (str.++ s3 \"a\") s2) (= s1 s1 \"\")))\
+         (assert (distinct (str.++ s2 \"a\") (str.++ s2 \"b\")))\
+         (assert (not (distinct (str.++ s2 \"b\") \"\" s3 (str.++ s1 \"a\"))))\
+         (check-sat)",
+    );
+}
+
 // ── Task 19: occurs-check soundness regression (free-monoid emptiness) ───────
 // A bare variable equated to a concat that RE-CONTAINS it, flanked ONLY by other
 // variables, is SAT via emptiness — the occurs-check must NOT report UNSAT. With
