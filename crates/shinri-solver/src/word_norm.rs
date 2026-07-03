@@ -28,6 +28,13 @@ pub struct WordNorm {
     /// ite TermId (post-child-rewrite) → its fresh symbol term. Solver-lifetime:
     /// repeated check-sats and shared subterms reuse one symbol.
     ite_var: FxHashMap<TermId, TermId>,
+    /// Original (child-un-rewritten) eliminated-ite term → its fresh symbol.
+    /// `ite_var` is keyed by the POST-rewrite ite (needed for structural dedup
+    /// during the walk); a nested outer ite's post-rewrite key embeds the inner
+    /// fresh var and never matches the user's original get-value query term.
+    /// This parallel map keyed by the original `t` closes that gap (item 4,
+    /// slice 7). Get-value only; get-model output is unchanged.
+    orig_ite: FxHashMap<TermId, TermId>,
     /// Every fresh symbol term ever minted — the model-output filter set.
     /// Only guards the bv/fp `var_bits` model-extraction loops in lib.rs. The
     /// other two model-insertion sites (the `mb`-based `atom_vars` loop and the
@@ -46,6 +53,12 @@ impl WordNorm {
     /// Used by the solver to answer get-value on eliminated ites (slice 6).
     pub(crate) fn ite_map(&self) -> &FxHashMap<TermId, TermId> {
         &self.ite_var
+    }
+
+    /// Original eliminated-ite term → internal fresh symbol, for get-value on
+    /// nested ites (item 4, slice 7).
+    pub(crate) fn orig_ite_map(&self) -> &FxHashMap<TermId, TermId> {
+        &self.orig_ite
     }
 }
 
@@ -140,6 +153,10 @@ impl WordNorm {
                 if seen_defs.insert(def) {
                     defs.push(def);
                 }
+                // Item 4 (slice 7): also key by the ORIGINAL term so get-value on
+                // a nested outer ite (whose original child was not yet rewritten)
+                // resolves. `t` is this ite's original id; `w` its fresh symbol.
+                self.orig_ite.insert(t, w);
                 w
             }
             Op::Builtin(BuiltinOp::Eq) if new_kids.len() > 2 =>

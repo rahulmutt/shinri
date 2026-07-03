@@ -674,6 +674,12 @@ impl Solver {
                         ite_vals.insert(ite_t, v.clone());
                     }
                 }
+                // Item 4 (slice 7): original-term-keyed entries (nested outer ites).
+                for (&ite_t, &w) in self.word_norm.orig_ite_map() {
+                    if let Some(v) = internal_vals.get(&w) {
+                        ite_vals.insert(ite_t, v.clone());
+                    }
+                }
                 self.eliminated_ite_vals = ite_vals;
                 // Witness self-check (string path): the word-equation F-split can
                 // dedup-saturate and let SAT conclude SAT with a model the model

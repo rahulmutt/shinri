@@ -1069,6 +1069,28 @@ fn run_values(src: &str) -> (SolveOutcome, Vec<String>) {
 }
 
 #[test]
+fn get_value_on_nested_eliminated_ite_returns_value() {
+    // Item 4 (slice 7): the OUTER term of a nested eliminated ite. `ite_var` was
+    // keyed by the child-rewritten ite, so the outer key embedded the inner
+    // fresh var and never matched the user's original nested query term →
+    // get-value degraded to "?". With orig_ite keyed by the original term it
+    // resolves. c,d true → inner (ite d x y)=x=#x0f → outer=#x0f.
+    let (o, values) = run_values(
+        "(declare-const c Bool)(declare-const d Bool)\
+         (declare-const x (_ BitVec 8))(declare-const y (_ BitVec 8))\
+         (declare-const z (_ BitVec 8))\
+         (assert c)(assert d)(assert (= x #x0f))(assert (= y #x07))\
+         (assert (= z (ite c (ite d x y) #x00)))\
+         (check-sat)(get-value ((ite c (ite d x y) #x00)))",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert_eq!(values.len(), 1);
+    assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
+    assert!(!values[0].contains('?'), "no value produced (item-4 gap): {}", values[0]);
+    assert!(values[0].contains("#x0f"), "expected #x0f: {}", values[0]);
+}
+
+#[test]
 fn get_value_on_eliminated_ite_returns_value_not_internal_name() {
     // Slice 6: word_norm eliminates (ite c x #x00) into an internal ite!<n>
     // definition; get-value on the ORIGINAL ite term must return its value,
