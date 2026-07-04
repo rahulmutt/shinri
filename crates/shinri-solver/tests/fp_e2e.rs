@@ -666,26 +666,49 @@ fn to_real_of_constant_contradiction_unsat() {
 }
 
 #[test]
-fn to_real_symbolic_operand_stays_unknown() {
-    // Symbolic fp.to_real operand: the constant arm cannot pin r, so the
-    // const-resolvability gate keeps bridge=false and the query fences to a
-    // SOUND Unknown (NOT a wrong verdict). `fp.isZero x` forces to_real(x)=0,
-    // so `> 1.0` is truly UNSAT — but with a symbolic operand we must not
-    // decide it in slice 9's constant arm; Task 4's symbolic arm will make it
-    // Unsat. This guards the gate: if the gate were dropped, r would be left
-    // unconstrained and this would wrongly return Sat.
+fn to_real_symbolic_iszero_gt_one_unsat() {
+    // Symbolic fp.to_real operand, now DECIDED by the slice-9 Task-4 symbolic
+    // arm (the const-resolvability gate is lifted): `fp.isZero x` forces the
+    // exponent+significand to zero, so the guarded finite row pins to_real(x)=0,
+    // and `> 1.0` is truly UNSAT. (Re-pointed from `stays_unknown`: the gate
+    // that fenced symbolic operands to Unknown is gone.)
     let (o, _) = run("(declare-fun x () Float32) (assert (fp.isZero x)) \
         (assert (> (fp.to_real x) 1.0)) (check-sat)");
-    assert_eq!(o, SolveOutcome::Unknown);
+    assert_eq!(o, SolveOutcome::Unsat);
 }
 
 #[test]
-fn to_real_symbolic_bare_operand_stays_unknown() {
-    // Bare symbolic operand with no binding at all → Unknown (deferred to
-    // the symbolic arm). Previously an inline canary; relocated as a named pin.
+fn to_real_symbolic_eq_zero_sat() {
+    // Bare symbolic operand: `to_real(x) = 0` is now SATISFIABLE via the
+    // symbolic arm (x = ±0 pins to_real(x)=0). (Re-pointed from `stays_unknown`.)
     let (o, _) = run("(declare-fun x () Float32) \
         (assert (= (fp.to_real x) 0.0)) (check-sat)");
-    assert_eq!(o, SolveOutcome::Unknown);
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn to_real_symbolic_f16_range_sat() {
+    // Some normal Float16 x with 2 < to_real(x) < 3 exists (e.g. 2.5).
+    let (o, model) = run("(declare-fun x () Float16) \
+        (assert (fp.isNormal x)) \
+        (assert (> (fp.to_real x) 2.0)) (assert (< (fp.to_real x) 3.0)) (check-sat)");
+    assert_eq!(o, SolveOutcome::Sat, "model: {model}");
+}
+
+#[test]
+fn to_real_symbolic_f16_impossible_unsat() {
+    // A normal positive value cannot be both > 5 and < 4.
+    let (o, _) = run("(declare-fun x () Float16) (assert (fp.isNormal x)) \
+        (assert (> (fp.to_real x) 5.0)) (assert (< (fp.to_real x) 4.0)) (check-sat)");
+    assert_eq!(o, SolveOutcome::Unsat);
+}
+
+#[test]
+fn to_real_matches_classification_f16() {
+    // isZero ⇒ to_real == 0; combined with to_real > 0 ⇒ UNSAT.
+    let (o, _) = run("(declare-fun x () Float16) (assert (fp.isZero x)) \
+        (assert (> (fp.to_real x) 0.0)) (check-sat)");
+    assert_eq!(o, SolveOutcome::Unsat);
 }
 
 // ── Slice-4b: mixed BV+FP (no crossing op) now solves ──────────────────────

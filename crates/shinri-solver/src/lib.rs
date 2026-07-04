@@ -78,12 +78,32 @@ pub struct Solver {
     word_norm: crate::word_norm::WordNorm,
     /// Eliminated-ite terms → model values (get-value fallback; slice 6).
     eliminated_ite_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal>,
-    /// Pre-clone-minted Real-bridge rows (slice 9): for each admitted constant
-    /// `fp.to_real` term, the `(le, ge)` atom pair that pins `r == value`. These
-    /// TermIds MUST be minted BEFORE `self.ctx` is cloned into the Combiner so
-    /// they are in range for `register_atom`; the enc-block emitter only encodes
-    /// and asserts them (no term creation after the clone).
-    pending_bridge: Vec<(TermId, TermId)>,
+    /// Pre-clone-minted Real-bridge rows (slice 9): for each admitted
+    /// `fp.to_real` term, the atoms that pin `r`. All TermIds MUST be minted
+    /// BEFORE `self.ctx` is cloned into the Combiner so they are in range for
+    /// `register_atom`; the enc-block emitter only encodes/asserts/clauses them
+    /// (no term creation after the clone). See `BridgeRow`.
+    pending_bridge: Vec<BridgeRow>,
+    /// Monotone counter for unique fresh Real-channel constant names (slice 9).
+    bridge_name_counter: u64,
+}
+
+/// A pre-minted Real-bridge row (slice 9). All atom TermIds are minted before
+/// the ctx clone; the emitter only encodes and (for guarded/tie rows) clauses
+/// them against the blasted FP bit `Var`s in `self.fp_var_bits`.
+enum BridgeRow {
+    /// Task-3 constant arm: the operand is a known FP constant, so `r == q`
+    /// holds unconditionally via `(<= tr q)` ∧ `(>= tr q)`.
+    Constant { le: TermId, ge: TermId },
+    /// Symbolic arm — an unconditional channel-bit bound `0 <= b_i <= 1`.
+    ChannelBound { bge0: TermId, ble1: TermId },
+    /// Symbolic arm — a significand-channel tie for bit `bit` of operand `x`:
+    /// `sigbit_i → b_i>=1` and `¬sigbit_i → b_i<=0`.
+    ChannelTie { x: TermId, bit: u32, bge1: TermId, ble0: TermId },
+    /// Symbolic arm — a guarded finite row for operand `x`, pattern `(s, e)`:
+    /// under the exponent/sign guard, `tr <= L` ∧ `tr >= L` with
+    /// `L = k + Σ coeffs[i]·b_i`.
+    Finite { x: TermId, s: bool, e: u64, le: TermId, ge: TermId },
 }
 
 impl Default for Solver {
@@ -112,6 +132,7 @@ impl Solver {
             word_norm: crate::word_norm::WordNorm::default(),
             eliminated_ite_vals: rustc_hash::FxHashMap::default(),
             pending_bridge: Vec::new(),
+            bridge_name_counter: 0,
         }
     }
 
@@ -424,29 +445,25 @@ impl Solver {
         // rows for each `fp.to_real` term. `bridge_admissible` already requires
         // `solver_uses_fp` and >=1 admitted `fp.to_real` term.
         //
-        // TASK-3 SCOPE + SOUNDNESS GATE (constant arm only): we admit the bridge
-        // ONLY when EVERY `fp.to_real` operand resolves to a floating-point
-        // constant (a literal, or a variable pinned by a top-level `(= x C)`).
-        // A symbolic operand cannot be pinned by the constant arm yet (deferred),
-        // and admitting it while leaving its bridge row `r` UNCONSTRAINED is a
-        // relaxation that can flip a true Unsat to Sat (e.g. `(fp.eq x 1.5)` with
-        // `(> (fp.to_real x) 2.0)`), which would be UNSOUND. So a query with any
-        // symbolic `fp.to_real` operand keeps `bridge=false` and stays fenced to
-        // a sound Unknown (unchanged from pre-slice-9); it is admitted in Task 4.
+        // SCOPE (Task 3 + Task 4): both constant AND symbolic operands are now
+        // decided. A const-resolvable operand (literal, or pinned by a top-level
+        // `(= x C)`) gets the Task-3 unconditional row; any other (symbolic)
+        // operand gets the Task-4 significand-channel + guarded finite rows. The
+        // all-ones (NaN/±∞) exponent emits no row (Task 5), which is sound
+        // (SMT-LIB leaves to_real(NaN/±∞) unspecified).
         let admissible = crate::fp_stage::bridge_admissible(&self.ctx, &assertions);
         let to_real_terms: Vec<TermId> = if admissible {
             crate::fp_stage::collect_fp_to_real_terms(&self.ctx, &assertions)
         } else {
             Vec::new()
         };
-        let bridge = admissible
-            && to_real_terms.iter().all(|&tr| match self.ctx.term_node(tr) {
-                shinri_core::TermNode::App { args, .. } => {
-                    let x = self.ctx.children(*args)[0];
-                    self.fp_operand_const_bits(x, &assertions).is_some()
-                }
-                _ => false,
-            });
+        // TASK-4: the const-resolvability gate is LIFTED. Every admitted
+        // `fp.to_real` operand is now decided — either by the Task-3 constant
+        // arm (const-resolvable operand → unconditional row) or by the Task-4
+        // symbolic arm (significand channel + guarded finite rows). `admissible`
+        // already guarantees every operand is an eb<=8 `fp.to_real`, so no
+        // operand is left unconstrained.
+        let bridge = admissible;
         if uses_fp && !bridge && crate::fp_stage::uses_crossing_conversion(&self.ctx, &assertions) {
             return SolveOutcome::Unknown;
         }
@@ -474,8 +491,25 @@ impl Solver {
         // takes an empty bv_atoms set and is byte-identical to the pre-4b path.
         let lowered_fp: Option<shinri_fp::MixedLowered> =
             if uses_fp {
-                let fp_atoms = crate::fp_stage::collect_fp_atoms(&self.ctx, &assertions);
+                let mut fp_atoms = crate::fp_stage::collect_fp_atoms(&self.ctx, &assertions);
                 let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
+                // Real-bridge force-blast (slice 9 symbolic arm): a `fp.to_real`
+                // operand may occur ONLY inside `fp.to_real` (in no FP atom), so
+                // it would not otherwise be blasted and `fp_var_bits` would lack
+                // its bits. Append a synthetic `(fp.isNaN x)` per symbolic operand
+                // — never asserted, just blasted — so its full FP word (sign+exp+
+                // significand) lands in `fp_var_bits` for the guarded rows.
+                if bridge {
+                    let symbolic_ops = self.symbolic_to_real_operands(&assertions, &to_real_terms);
+                    for x in symbolic_ops {
+                        if let Ok(a) = self
+                            .ctx
+                            .mk_app(Op::Builtin(shinri_core::BuiltinOp::FpIsNaN), &[x])
+                        {
+                            fp_atoms.push(a);
+                        }
+                    }
+                }
                 // Third-theory fence: any Bool atom outside (fp_atoms ∪ bv_atoms)
                 // that is not pure Boolean structure (arrays/LIA/EUF) → Unknown.
                 if !bridge && crate::fp_stage::has_non_bvfp_theory_atom(
@@ -629,7 +663,7 @@ impl Solver {
             // atom pairs so each admitted constant `fp.to_real` term is pinned to
             // its exact rational value. NO term creation here (all minted pre-clone).
             if bridge {
-                Self::emit_to_real_bridge(&self.pending_bridge, &mut enc);
+                self.emit_to_real_bridge(&mut enc);
             }
             atom_vars = enc.atom_vars.clone();
             refused = enc.refused;
@@ -993,6 +1027,30 @@ impl Solver {
     /// deferred to a later slice-9 task ⇒ emit nothing. ALL terms are minted
     /// here, BEFORE `self.ctx` is cloned into the Combiner, so every bridge
     /// TermId is in range for the Combiner's `register_atom`/`classify`.
+    /// The distinct SYMBOLIC (non-const-resolvable) operands of the admitted
+    /// `fp.to_real` terms — the operands whose FP bits must be force-blasted so
+    /// the symbolic bridge arm can tie its significand channel and guard its
+    /// finite rows against them. Const-resolvable operands use the Task-3 arm and
+    /// need no bits.
+    fn symbolic_to_real_operands(
+        &self,
+        assertions: &[TermId],
+        to_real_terms: &[TermId],
+    ) -> Vec<TermId> {
+        use shinri_core::TermNode;
+        let mut out: Vec<TermId> = Vec::new();
+        for &tr in to_real_terms {
+            let x = match self.ctx.term_node(tr) {
+                TermNode::App { args, .. } => self.ctx.children(*args)[0],
+                _ => continue,
+            };
+            if self.fp_operand_const_bits(x, assertions).is_none() && !out.contains(&x) {
+                out.push(x);
+            }
+        }
+        out
+    }
+
     fn build_to_real_bridge_terms(&mut self, assertions: &[TermId], to_real_terms: &[TermId]) {
         use shinri_core::{BuiltinOp, Op, TermNode};
         let real = self.ctx.real_sort();
@@ -1005,18 +1063,79 @@ impl Solver {
                 Some(w) => w,
                 None => continue,
             };
-            let bits = match self.fp_operand_const_bits(x, assertions) {
-                Some(b) => b,
-                None => continue, // symbolic operand: deferred to a later task
-            };
-            let cls = shinri_fp::reference::decode(eb, sb, &bits);
-            if let Some(q) = shinri_fp::reference::class_to_rational(eb, sb, &cls) {
-                let num = self.ctx.mk_numeral(q, real);
-                let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, num]).unwrap();
-                let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, num]).unwrap();
-                self.pending_bridge.push((le, ge));
+            // Route: const-resolvable operand → Task-3 unconditional arm;
+            // otherwise → Task-4 symbolic arm. Never both for one operand.
+            if let Some(bits) = self.fp_operand_const_bits(x, assertions) {
+                let cls = shinri_fp::reference::decode(eb, sb, &bits);
+                if let Some(q) = shinri_fp::reference::class_to_rational(eb, sb, &cls) {
+                    let num = self.ctx.mk_numeral(q, real);
+                    let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, num]).unwrap();
+                    let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, num]).unwrap();
+                    self.pending_bridge.push(BridgeRow::Constant { le, ge });
+                }
+                // NaN/Inf constant ⇒ class_to_rational is None ⇒ leave tr unconstrained.
+                continue;
             }
-            // NaN/Inf constant ⇒ class_to_rational is None ⇒ leave tr unconstrained.
+            self.build_symbolic_to_real_rows(tr, x, eb, sb);
+        }
+    }
+
+    /// Slice 9 (Task-4 symbolic arm): mint the significand-channel consts + the
+    /// guarded finite rows for a SYMBOLIC `fp.to_real` operand `x` of format
+    /// (eb,sb), where `tr = (fp.to_real x)`. Mints (all before the ctx clone):
+    ///   * `sb-1` fresh Real channel consts `b_i`, unconditionally bounded
+    ///     `0 <= b_i <= 1` and tied bit-for-bit to the blasted significand
+    ///     (`sigbit_i → b_i>=1`, `¬sigbit_i → b_i<=0`) — so `b_i` mirrors the raw
+    ///     significand bit as a Real {0,1};
+    ///   * for each finite (sign `s`, exponent-field `e`) pattern a row
+    ///     `tr == L` (`L = k + Σ coeffs[i]·b_i` from `to_real_finite_row`),
+    ///     guarded by the raw FP sign+exponent bit pattern.
+    /// The all-ones (NaN/±∞) exponent yields `to_real_finite_row = None` and so
+    /// emits no row — sound (SMT-LIB leaves it unspecified); Task 5 handles it.
+    fn build_symbolic_to_real_rows(&mut self, tr: TermId, x: TermId, eb: u32, sb: u32) {
+        use shinri_core::{BuiltinOp, Op};
+        let real = self.ctx.real_sort();
+        let zero = self.ctx.mk_numeral(Rational::zero(), real);
+        let one = self.ctx.mk_numeral(Rational::one(), real);
+        // Channel consts b_0..b_{sb-2} + their unconditional bounds and ties.
+        let mut chan: Vec<TermId> = Vec::with_capacity((sb - 1) as usize);
+        for i in 0..(sb - 1) {
+            let name = format!("!brdg_b_{}_{}", self.bridge_name_counter, i);
+            let sym = self.ctx.declare_fun(&name, &[], real);
+            let b_i = self.ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap();
+            chan.push(b_i);
+            let bge0 = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[b_i, zero]).unwrap();
+            let ble1 = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[b_i, one]).unwrap();
+            self.pending_bridge.push(BridgeRow::ChannelBound { bge0, ble1 });
+            let bge1 = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[b_i, one]).unwrap();
+            let ble0 = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[b_i, zero]).unwrap();
+            self.pending_bridge.push(BridgeRow::ChannelTie { x, bit: i, bge1, ble0 });
+        }
+        self.bridge_name_counter += 1;
+        // Guarded finite rows, one per finite (sign, exponent-field) pattern.
+        for s in [false, true] {
+            for e in 0..(1u64 << eb) {
+                let row = match shinri_fp::bridge::to_real_finite_row(eb, sb, s, e) {
+                    Some(r) => r,        // finite pattern
+                    None => continue,    // all-ones exponent (NaN/±∞): Task 5
+                };
+                // L = k + Σ coeffs[i]·b_i (drop zero coeffs).
+                let mut l = self.ctx.mk_numeral(row.k, real);
+                for (i, c) in row.coeffs.into_iter().enumerate() {
+                    if c.is_zero() {
+                        continue;
+                    }
+                    let cnum = self.ctx.mk_numeral(c, real);
+                    let term = self
+                        .ctx
+                        .mk_app(Op::Builtin(BuiltinOp::Mul), &[cnum, chan[i]])
+                        .unwrap();
+                    l = self.ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[l, term]).unwrap();
+                }
+                let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, l]).unwrap();
+                let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, l]).unwrap();
+                self.pending_bridge.push(BridgeRow::Finite { x, s, e, le, ge });
+            }
         }
     }
 
@@ -1097,12 +1216,62 @@ impl Solver {
     /// Slice 9: encode+assert the pre-minted `(le, ge)` Real-bridge atom pairs.
     /// Pure replay — no term creation (all minted in `build_to_real_bridge_terms`
     /// before the ctx clone), so the Combiner's cloned ctx already contains them.
-    fn emit_to_real_bridge(pending: &[(TermId, TermId)], enc: &mut crate::tseitin::Encoder<'_>) {
-        for &(le, ge) in pending {
-            let ll = enc.encode(le);
-            let lg = enc.encode(ge);
-            enc.assert_top(ll);
-            enc.assert_top(lg);
+    fn emit_to_real_bridge(&self, enc: &mut crate::tseitin::Encoder<'_>) {
+        use shinri_core::Lit;
+        for row in &self.pending_bridge {
+            match *row {
+                // Task-3 constant arm: unconditional `r == q`.
+                BridgeRow::Constant { le, ge } => {
+                    let ll = enc.encode(le);
+                    let lg = enc.encode(ge);
+                    enc.assert_top(ll);
+                    enc.assert_top(lg);
+                }
+                // Symbolic arm (a): channel bit b_i in [0,1], unconditional.
+                BridgeRow::ChannelBound { bge0, ble1 } => {
+                    let l0 = enc.encode(bge0);
+                    let l1 = enc.encode(ble1);
+                    enc.assert_top(l0);
+                    enc.assert_top(l1);
+                }
+                // Symbolic arm (b): tie b_i to significand bit `bit` of x.
+                BridgeRow::ChannelTie { x, bit, bge1, ble0 } => {
+                    let vars = self.fp_var_bits.get(&x).cloned().unwrap();
+                    let sig_lit = Lit::new(vars[bit as usize], true);
+                    let l_ge1 = enc.encode(bge1);
+                    let l_le0 = enc.encode(ble0);
+                    enc.add_clause(&[sig_lit.negate(), l_ge1]); // sigbit_i → b_i>=1
+                    enc.add_clause(&[sig_lit, l_le0]); //  ¬sigbit_i → b_i<=0
+                }
+                // Symbolic arm (c): guarded finite row. guard(s,e) → r<=L ∧ r>=L.
+                BridgeRow::Finite { x, s, e, le, ge } => {
+                    let vars = self.fp_var_bits.get(&x).cloned().unwrap();
+                    // LSB→MSB layout, len eb+sb: significand vars[0..sb-1],
+                    // exponent vars[sb-1 .. sb-1+eb], sign vars[eb+sb-1].
+                    let sb = (vars.len() as u32) - self.ctx.fp_widths(self.ctx.sort_of(x)).unwrap().0;
+                    let eb = vars.len() as u32 - sb;
+                    let exp_lit = |j: u32| Lit::new(vars[(sb - 1 + j) as usize], true);
+                    let sign_lit = Lit::new(vars[(eb + sb - 1) as usize], true);
+                    let ll = enc.encode(le);
+                    let lg = enc.encode(ge);
+                    // Guard literals = FP bits in the polarity matching the
+                    // pattern; the clause carries their NEGATIONS (so the row
+                    // fires only when the guard bits all match).
+                    let mut base: Vec<Lit> = Vec::with_capacity((eb + 1) as usize);
+                    base.push(if s { sign_lit } else { sign_lit.negate() });
+                    for j in 0..eb {
+                        let want1 = (e >> j) & 1 == 1;
+                        base.push(if want1 { exp_lit(j) } else { exp_lit(j).negate() });
+                    }
+                    let neg: Vec<Lit> = base.iter().map(|l| l.negate()).collect();
+                    let mut c1 = neg.clone();
+                    c1.push(ll);
+                    enc.add_clause(&c1);
+                    let mut c2 = neg;
+                    c2.push(lg);
+                    enc.add_clause(&c2);
+                }
+            }
         }
     }
 
