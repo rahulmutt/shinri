@@ -2,12 +2,17 @@
 
 **Date:** 2026-07-04
 **Status:** Implemented (slice 9 landed). `fp.to_real` over Float16/32 (eb≤8) is
-admitted and solved jointly with LRA (constant + symbolic arms + NaN/±∞
-functionality via three distinct per-format consts); symbolic `to_fp` and
+admitted and solved jointly with the resulting Real in the Combiner — mixed with
+LRA **and EUF (QF_UFLRA + bridge)** — via constant + symbolic guarded-linear arms
++ NaN/±∞ functionality (three distinct per-format consts); symbolic `to_fp` and
 `fp.to_real` over eb≥11 stay soundly fenced to `Unknown`. The §0 scope calls
 (mechanism A, `fp.to_real`-only, Float16/32) were carried through as designed.
-z3 differential: 200 constant-source cases, 0 disagreements, 0 Unknown; full
-`cargo test --workspace` green (825 tests).
+z3 differential: 200 constant-source finite/functionality cases + 200
+QF_UFLRA-mixed cases (`differential_qf_fp_to_real_uflra`), 0 disagreements,
+0 Unknown; full `cargo test --workspace` green. **FOLLOW-UP:** the Real-sorted
+recognizer also admits Array/Str-Real bridge operands (structurally the same
+shared-Real case as the validated EUF path) but they lack dedicated differential
+coverage — add an Array/Str+bridge oracle in a later slice.
 **Scope:** First face of the permanent FP↔Reals bridge. Admit `fp.to_real` over
 Float16/32, solved jointly with LRA in one solve, by establishing an
 **eager-blast ⋈ lazy-LRA coexistence seam** that later bridge faces reuse.
