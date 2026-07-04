@@ -1438,3 +1438,105 @@ fn differential_qf_bvfp_ite() {
          ({n_z3_checked}/{N_ITERS} checked)"
     );
 }
+
+/// Constant-source `fp.to_real` oracle (slice 9, Task 6): binds `x` to a random
+/// Float16 literal via the exact `(fp s e sig)` triple, then constrains
+/// `(fp.to_real x)` against a random integer bound via LRA `<=`. Since `x` is
+/// fully constant, both solvers must decide — this is the zero-Unknown gate
+/// on the Real-bridge seam (spec §5/§7): no admitted `fp.to_real` instance may
+/// fence to Unknown once the operand is concrete.
+#[cfg(feature = "oracle")]
+fn gen_to_real_script(rng: &mut Lcg) -> String {
+    let bits = (rng.next() & 0xFFFF) as u16;
+    let s = (bits >> 15) & 1;
+    let e = (bits >> 10) & 0x1F;
+    let sig = bits & 0x3FF;
+    let bound = (rng.next() % 21) as i64 - 10; // integer bound in [-10,10]
+    // SMT-LIB decimals have no sign; negative bounds must use `(- n.0)`.
+    let bound_term = if bound < 0 {
+        format!("(- {}.0)", -bound)
+    } else {
+        format!("{bound}.0")
+    };
+    format!(
+        "(declare-fun x () Float16)\n\
+         (assert (= x (fp #b{s:01b} #b{e:05b} #b{sig:010b})))\n\
+         (assert (<= (fp.to_real x) {bound_term}))\n\
+         (check-sat)\n"
+    )
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+fn differential_qf_fp_to_real() {
+    let mut rng = Lcg(0xB000_0BEE_F001);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..N_ITERS {
+        let s = gen_to_real_script(&mut rng);
+        let ours = shinri_outcome(&s);
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+        }
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => {}
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, &s);
+        assert!(
+            !matches!(
+                (ours, theirs),
+                (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                    | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+            ),
+            "QF_FP fp.to_real DISAGREEMENT (iter {iter}): shinri={ours:?} z3={theirs:?}\n{s}"
+        );
+    }
+    println!("differential_qf_fp_to_real: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+    assert!(n_sat > 0 && n_unsat > 0, "oracle produced no SAT/UNSAT coverage");
+    assert_eq!(
+        n_unknown, 0,
+        "constant-source fp.to_real must never fence ({n_unknown})"
+    );
+}
+
+/// Functionality pin (spec §5/§7): `fp.to_real` must be a genuine function even
+/// over NaN payloads. If `x = y` and both are NaN, then `fp.to_real x = fp.to_real y`
+/// must hold — i.e. asserting the negation must be Unsat. This is a fixed
+/// (non-fuzzed) instance pinned against z3 so neither solver treats `fp.to_real`
+/// as non-functional over the NaN equivalence class.
+#[cfg(feature = "oracle")]
+#[test]
+fn differential_qf_fp_to_real_nan_functionality() {
+    let s = "(declare-fun x () Float16)\n\
+             (declare-fun y () Float16)\n\
+             (assert (fp.isNaN x))\n\
+             (assert (fp.isNaN y))\n\
+             (assert (= x y))\n\
+             (assert (not (= (fp.to_real x) (fp.to_real y))))\n\
+             (check-sat)\n";
+    let ours = shinri_outcome(s);
+    let mut ctx = easy_smt::ContextBuilder::new()
+        .solver("z3", ["-smt2", "-in"])
+        .build()
+        .expect("failed to launch z3 — ensure z3 is on PATH");
+    let theirs = z3_outcome_arith(&mut ctx, s);
+    assert_eq!(
+        ours,
+        SolveOutcome::Unsat,
+        "fp.to_real must be functional over NaN (x=y both NaN ⇒ to_real x = to_real y): \
+         shinri returned {ours:?}\n{s}"
+    );
+    assert!(
+        !matches!(
+            (ours, theirs),
+            (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+        ),
+        "QF_FP fp.to_real NaN-functionality DISAGREEMENT: shinri={ours:?} z3={theirs:?}\n{s}"
+    );
+}
