@@ -665,6 +665,29 @@ fn to_real_of_constant_contradiction_unsat() {
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
+#[test]
+fn to_real_symbolic_operand_stays_unknown() {
+    // Symbolic fp.to_real operand: the constant arm cannot pin r, so the
+    // const-resolvability gate keeps bridge=false and the query fences to a
+    // SOUND Unknown (NOT a wrong verdict). `fp.isZero x` forces to_real(x)=0,
+    // so `> 1.0` is truly UNSAT — but with a symbolic operand we must not
+    // decide it in slice 9's constant arm; Task 4's symbolic arm will make it
+    // Unsat. This guards the gate: if the gate were dropped, r would be left
+    // unconstrained and this would wrongly return Sat.
+    let (o, _) = run("(declare-fun x () Float32) (assert (fp.isZero x)) \
+        (assert (> (fp.to_real x) 1.0)) (check-sat)");
+    assert_eq!(o, SolveOutcome::Unknown);
+}
+
+#[test]
+fn to_real_symbolic_bare_operand_stays_unknown() {
+    // Bare symbolic operand with no binding at all → Unknown (deferred to
+    // the symbolic arm). Previously an inline canary; relocated as a named pin.
+    let (o, _) = run("(declare-fun x () Float32) \
+        (assert (= (fp.to_real x) 0.0)) (check-sat)");
+    assert_eq!(o, SolveOutcome::Unknown);
+}
+
 // ── Slice-4b: mixed BV+FP (no crossing op) now solves ──────────────────────
 #[test]
 fn mixed_bv_and_fp_sat_with_model() {

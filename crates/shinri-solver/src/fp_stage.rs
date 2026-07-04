@@ -341,7 +341,6 @@ fn is_lra_real_atom(ctx: &Context, t: TermId) -> bool {
 /// to sound Unknown). NOT YET WIRED into dispatch — no behavior change.
 /// Used by unit tests only for now; dispatch wiring lands in a later slice-9
 /// task (same convention as `abv_stage::solve_qfabv`).
-#[cfg_attr(not(test), allow(dead_code))]
 pub fn bridge_admissible(ctx: &Context, assertions: &[TermId]) -> bool {
     if !solver_uses_fp(ctx, assertions) { return false; }
     if !only_crossing_is_admitted_to_real(ctx, assertions) { return false; }
