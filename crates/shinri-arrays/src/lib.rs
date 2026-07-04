@@ -95,7 +95,10 @@ impl TheorySolver for Arrays {
                     if !Self::equal(cx, sel, e) {
                         let lemma = cx.terms.mk_eq(sel, e).expect("well-sorted");
                         // ROW-1 is a McCarthy-axiom T-tautology — no guard.
-                        return TCheck::Split { atoms: vec![lemma], guard: None };
+                        return TCheck::Split {
+                            atoms: vec![lemma],
+                            guard: None,
+                        };
                     }
                 } else {
                     // ROW-2: (i = j) ∨ (sel = select(b, j))
@@ -107,7 +110,10 @@ impl TheorySolver for Arrays {
                         let eqij = cx.terms.mk_eq(i, j).expect("well-sorted");
                         let eqsel = cx.terms.mk_eq(sel, selbj).expect("well-sorted");
                         // ROW-2 is a McCarthy-axiom T-tautology — no guard.
-                        return TCheck::Split { atoms: vec![eqij, eqsel], guard: None };
+                        return TCheck::Split {
+                            atoms: vec![eqij, eqsel],
+                            guard: None,
+                        };
                     }
                 }
             }
@@ -217,7 +223,9 @@ mod tests {
         arrays.new_var(&mut cx, shinri_core::Var::new(0), atom);
 
         match arrays.check(&mut cx, Effort::Full) {
-            TCheck::Split { atoms, .. } => assert_eq!(atoms.len(), 2, "ROW-2 split has two disjuncts"),
+            TCheck::Split { atoms, .. } => {
+                assert_eq!(atoms.len(), 2, "ROW-2 split has two disjuncts")
+            }
             other => panic!(
                 "expected 2-atom Split, got {:?}",
                 match other {

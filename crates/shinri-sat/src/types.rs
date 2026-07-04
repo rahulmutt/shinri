@@ -57,7 +57,10 @@ pub enum TheoryResult {
     Sat,
     Conflict(Vec<Lit>),
     Lemma(Vec<Lit>),
-    SplitAtoms { atoms: Vec<TermId>, guard: Option<Lit> },
+    SplitAtoms {
+        atoms: Vec<TermId>,
+        guard: Option<Lit>,
+    },
     /// A theory's fuel budget was exhausted; the result is unknown. The SAT
     /// solver must propagate this to `SolveResult::Unknown` without treating
     /// it as satisfiable (soundness).
@@ -69,7 +72,9 @@ pub enum TheoryResult {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SolveResult {
     Sat,
-    Unsat { core: Vec<Lit> },
+    Unsat {
+        core: Vec<Lit>,
+    },
     /// A theory's fuel budget was exhausted; the result is unknown (neither
     /// sat nor unsat). The top-level solver maps this to `SolveOutcome::Unknown`.
     Unknown,
@@ -114,7 +119,10 @@ mod tests {
     #[test]
     fn split_atoms_holds_term_ids() {
         let t = shinri_core::TermId::new(7).unwrap();
-        let r = TheoryResult::SplitAtoms { atoms: vec![t], guard: None };
+        let r = TheoryResult::SplitAtoms {
+            atoms: vec![t],
+            guard: None,
+        };
         match r {
             TheoryResult::SplitAtoms { atoms, guard } => {
                 assert_eq!(atoms, vec![t]);

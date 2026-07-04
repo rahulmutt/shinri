@@ -123,16 +123,27 @@ fn post_mint_declaration_of_internal_name_is_rejected() {
          (assert (distinct ite!0 x))\
          (check-sat)",
     );
-    assert_eq!(out.len(), 4, "sat / declare-error / aliased-use-error / sat");
+    assert_eq!(
+        out.len(),
+        4,
+        "sat / declare-error / aliased-use-error / sat"
+    );
     assert_eq!(out[0], "sat");
     assert!(
         out[1].contains("reserved for solver-internal use"),
         "declaration of the minted name must be rejected, got {:?}",
         out[1]
     );
-    assert!(out[2].starts_with("(error"), "aliased use is undeclared, got {:?}", out[2]);
+    assert!(
+        out[2].starts_with("(error"),
+        "aliased use is undeclared, got {:?}",
+        out[2]
+    );
     assert_eq!(out[3], "sat", "must NOT be a wrong unsat");
-    assert!(!out.contains(&"unsat".to_string()), "no wrong UNSAT anywhere");
+    assert!(
+        !out.contains(&"unsat".to_string()),
+        "no wrong UNSAT anywhere"
+    );
 }
 
 #[test]
@@ -330,7 +341,11 @@ fn string_nary_eq_compound_and_wrapper_not_wrong_sat() {
         "(declare-const s1 String)(declare-const s3 String)\
          (assert (= (str.++ s3 \"a\") (str.++ s1 \"b\") (str.++ s3 \"b\")))(check-sat)",
     );
-    assert_ne!(out, vec!["sat"], "C1 soundness: string n-ary = must not be SAT");
+    assert_ne!(
+        out,
+        vec!["sat"],
+        "C1 soundness: string n-ary = must not be SAT"
+    );
     assert_eq!(out, vec!["unknown"]);
 
     // Binary-written twin: the same constraint split into two top-level binary
@@ -341,7 +356,11 @@ fn string_nary_eq_compound_and_wrapper_not_wrong_sat() {
          (assert (= (str.++ s3 \"a\") (str.++ s1 \"b\")))\
          (assert (= (str.++ s1 \"b\") (str.++ s3 \"b\")))(check-sat)",
     );
-    assert_ne!(twin, vec!["sat"], "C1 soundness: binary twin must not be SAT");
+    assert_ne!(
+        twin,
+        vec!["sat"],
+        "C1 soundness: binary twin must not be SAT"
+    );
     assert_eq!(twin, vec!["unknown"]);
 }
 

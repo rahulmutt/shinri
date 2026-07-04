@@ -3,20 +3,22 @@
 //! FP→FP: unpack → prenormalize → saturate exponent → static significand split →
 //! shared rounder → special mux. const-Real: fold round_rational, one-hot by RM.
 
-use shinri_bv::{BitLit, Blaster};
-use shinri_bv::blast::arith::{bvadd, bvneg, bvsub};
-use crate::blast::operand::{to_operand, canon_nan_bits, inf_pattern_bits, signed_zero_bits};
 use crate::blast::normalize::{const_n, prenormalize};
-use crate::round::{exp_w, round, rounding_increment, shift_right_sticky, ExtFp};
-use crate::rm::RmSel;
+use crate::blast::operand::{canon_nan_bits, inf_pattern_bits, signed_zero_bits, to_operand};
 use crate::reference::{field, round_rational, RoundMode};
+use crate::rm::RmSel;
+use crate::round::{exp_w, round, rounding_increment, shift_right_sticky, ExtFp};
+use shinri_bv::blast::arith::{bvadd, bvneg, bvsub};
+use shinri_bv::{BitLit, Blaster};
 use shinri_num::Rational;
 
 /// Sign-extend a signed word `x` (LSB→MSB) to width `to` by replicating its MSB.
 fn sign_extend(_b: &Blaster, x: &[BitLit], to: usize) -> Vec<BitLit> {
     let msb = *x.last().unwrap();
     let mut out = x.to_vec();
-    while out.len() < to { out.push(msb); }
+    while out.len() < to {
+        out.push(msb);
+    }
     out
 }
 
@@ -25,8 +27,13 @@ fn sign_extend(_b: &Blaster, x: &[BitLit], to: usize) -> Vec<BitLit> {
 /// into the target width → static significand split → shared rounder → special mux.
 #[allow(clippy::needless_range_loop)] // indices are load-bearing: parallel-indexed words
 pub fn to_fp_fp(
-    b: &mut Blaster, x: &[BitLit],
-    eb_s: u32, sb_s: u32, eb_t: u32, sb_t: u32, rm: &RmSel,
+    b: &mut Blaster,
+    x: &[BitLit],
+    eb_s: u32,
+    sb_s: u32,
+    eb_t: u32,
+    sb_t: u32,
+    rm: &RmSel,
 ) -> Vec<BitLit> {
     let ew_s = exp_w(eb_s);
     let ew_t = exp_w(eb_t);
@@ -43,9 +50,9 @@ pub fn to_fp_fp(
     let bias_t = (1i128 << (eb_t - 1)) - 1;
     let emax_t = bias_t;
     let emin_t = 1 - bias_t;
-    let hi = emax_t + 1;                    // round(): exp > emax_t → overflow (mode-dep. ±inf/±max-finite)
-    let lo = emin_t - (sbt as i128 + 2);    // round(): deep denormalize → ±0
-    let wc = ew_s.max(ew_t) + 1;            // wide enough that the compares can't wrap
+    let hi = emax_t + 1; // round(): exp > emax_t → overflow (mode-dep. ±inf/±max-finite)
+    let lo = emin_t - (sbt as i128 + 2); // round(): deep denormalize → ±0
+    let wc = ew_s.max(ew_t) + 1; // wide enough that the compares can't wrap
     let e_wide = sign_extend(b, &e_s, wc);
     let hi_w = const_n(b, wc, hi);
     let lo_w = const_n(b, wc, lo);
@@ -54,16 +61,20 @@ pub fn to_fp_fp(
     let gt_hi = {
         let pos = b.not1(d_hi[wc - 1]);
         let mut nz = b.zero();
-        for &bit in &d_hi { nz = b.or2(nz, bit); }
+        for &bit in &d_hi {
+            nz = b.or2(nz, bit);
+        }
         b.and2(pos, nz)
     };
     // lt_lo = e_wide < lo (signed): (e_wide - lo) negative.
     let d_lo = bvsub(b, &e_wide, &lo_w);
     let lt_lo = d_lo[wc - 1];
-    let clamped: Vec<BitLit> = (0..wc).map(|i| {
-        let hi_or_x = b.mux2(gt_hi, hi_w[i], e_wide[i]);
-        b.mux2(lt_lo, lo_w[i], hi_or_x)
-    }).collect();
+    let clamped: Vec<BitLit> = (0..wc)
+        .map(|i| {
+            let hi_or_x = b.mux2(gt_hi, hi_w[i], e_wide[i]);
+            b.mux2(lt_lo, lo_w[i], hi_or_x)
+        })
+        .collect();
     let e_t: Vec<BitLit> = clamped[..ew_t].to_vec(); // clamped fits → low ew_t bits exact
 
     // --- significand: static split (sb_s, sb_t are blast-time constants) ---
@@ -80,20 +91,33 @@ pub fn to_fp_fp(
         let g = m_s[drop - 1];
         let r = if drop >= 2 { m_s[drop - 2] } else { b.zero() };
         let mut st = b.zero();
-        for i in 0..drop.saturating_sub(2) { st = b.or2(st, m_s[i]); }
+        for i in 0..drop.saturating_sub(2) {
+            st = b.or2(st, m_s[i]);
+        }
         (s, (g, r, st))
     };
 
-    let ext = ExtFp { sign: ox.sign, exp: e_t, sig: sig_t, grs };
+    let ext = ExtFp {
+        sign: ox.sign,
+        exp: e_t,
+        sig: sig_t,
+        grs,
+    };
     let mut out = round(b, ext, eb_t, sb_t, rm);
 
     // --- special-case mux: source NaN/±inf/±0 override the datapath ---
     let nan = canon_nan_bits(b, eb_t, sb_t);
     let inf = inf_pattern_bits(b, eb_t, sb_t, ox.sign);
     let zero = signed_zero_bits(b, eb_t, sb_t, ox.sign);
-    for i in 0..w { out[i] = b.mux2(ox.is_zero, zero[i], out[i]); }
-    for i in 0..w { out[i] = b.mux2(ox.is_inf, inf[i], out[i]); }
-    for i in 0..w { out[i] = b.mux2(ox.is_nan, nan[i], out[i]); }
+    for i in 0..w {
+        out[i] = b.mux2(ox.is_zero, zero[i], out[i]);
+    }
+    for i in 0..w {
+        out[i] = b.mux2(ox.is_inf, inf[i], out[i]);
+    }
+    for i in 0..w {
+        out[i] = b.mux2(ox.is_nan, nan[i], out[i]);
+    }
     out
 }
 
@@ -105,7 +129,12 @@ pub fn to_fp_fp(
 /// under every mode (matches `round_rational`).
 #[allow(clippy::needless_range_loop)] // indices are load-bearing: parallel-indexed words
 pub fn to_fp_int(
-    b: &mut Blaster, x: &[BitLit], signed: bool, eb_t: u32, sb_t: u32, rm: &RmSel,
+    b: &mut Blaster,
+    x: &[BitLit],
+    signed: bool,
+    eb_t: u32,
+    sb_t: u32,
+    rm: &RmSel,
 ) -> Vec<BitLit> {
     let m = x.len();
     let sbt = sb_t as usize;
@@ -138,8 +167,8 @@ pub fn to_fp_int(
     let bias_t = (1i128 << (eb_t - 1)) - 1;
     let emax_t = bias_t;
     let emin_t = 1 - bias_t;
-    let hi = emax_t + 1;                    // round(): exp > emax_t → overflow (mode-dep. ±inf/±max-finite)
-    let lo = emin_t - (sbt as i128 + 2);    // round(): deep denormalize → ±0
+    let hi = emax_t + 1; // round(): exp > emax_t → overflow (mode-dep. ±inf/±max-finite)
+    let lo = emin_t - (sbt as i128 + 2); // round(): deep denormalize → ±0
     let hi_w = const_n(b, wc, hi);
     let lo_w = const_n(b, wc, lo);
     // gt_hi = e_n > hi (signed): (e_n - hi) positive and nonzero.
@@ -147,16 +176,20 @@ pub fn to_fp_int(
     let gt_hi = {
         let pos = b.not1(d_hi[wc - 1]);
         let mut nz = b.zero();
-        for &bit in &d_hi { nz = b.or2(nz, bit); }
+        for &bit in &d_hi {
+            nz = b.or2(nz, bit);
+        }
         b.and2(pos, nz)
     };
     // lt_lo = e_n < lo (signed): (e_n - lo) negative.
     let d_lo = bvsub(b, &e_n, &lo_w);
     let lt_lo = d_lo[wc - 1];
-    let clamped: Vec<BitLit> = (0..wc).map(|i| {
-        let hi_or_x = b.mux2(gt_hi, hi_w[i], e_n[i]);
-        b.mux2(lt_lo, lo_w[i], hi_or_x)
-    }).collect();
+    let clamped: Vec<BitLit> = (0..wc)
+        .map(|i| {
+            let hi_or_x = b.mux2(gt_hi, hi_w[i], e_n[i]);
+            b.mux2(lt_lo, lo_w[i], hi_or_x)
+        })
+        .collect();
     let e_t: Vec<BitLit> = clamped[..ew_t].to_vec(); // clamped fits → low ew_t bits exact
 
     // --- 4. significand: static split, m in the role of sb_s (same as to_fp_fp). ---
@@ -173,11 +206,18 @@ pub fn to_fp_int(
         let g = m_n[drop - 1];
         let r = if drop >= 2 { m_n[drop - 2] } else { b.zero() };
         let mut st = b.zero();
-        for i in 0..drop.saturating_sub(2) { st = b.or2(st, m_n[i]); }
+        for i in 0..drop.saturating_sub(2) {
+            st = b.or2(st, m_n[i]);
+        }
         (s, (g, r, st))
     };
 
-    let ext = ExtFp { sign, exp: e_t, sig: sig_t, grs };
+    let ext = ExtFp {
+        sign,
+        exp: e_t,
+        sig: sig_t,
+        grs,
+    };
     let mut out = round(b, ext, eb_t, sb_t, rm);
 
     // --- 5. zero mux: x = 0 → +0 (all modes). ---
@@ -188,7 +228,9 @@ pub fn to_fp_int(
     }
     let plus = b.zero();
     let pz = signed_zero_bits(b, eb_t, sb_t, plus);
-    for i in 0..w { out[i] = b.mux2(is_zero, pz[i], out[i]); }
+    for i in 0..w {
+        out[i] = b.mux2(is_zero, pz[i], out[i]);
+    }
     out
 }
 
@@ -200,7 +242,13 @@ pub fn to_fp_int(
 /// value"; cross-application congruence is the dispatch layer's job, not ours).
 #[allow(clippy::needless_range_loop)] // indices are load-bearing: parallel-indexed words
 pub fn fp_to_int(
-    b: &mut Blaster, x: &[BitLit], eb: u32, sb: u32, m: u32, signed_face: bool, rm: &RmSel,
+    b: &mut Blaster,
+    x: &[BitLit],
+    eb: u32,
+    sb: u32,
+    m: u32,
+    signed_face: bool,
+    rm: &RmSel,
 ) -> (Vec<BitLit>, BitLit) {
     let mu = m as usize;
     let sbu = sb as usize;
@@ -218,7 +266,10 @@ pub fn fp_to_int(
     let amt = bvsub(b, &m_const, &e_wide);
     let amt_neg = amt[wa - 1];
     let mut amt_zero = b.one();
-    for &bit in &amt { let nb = b.not1(bit); amt_zero = b.and2(amt_zero, nb); }
+    for &bit in &amt {
+        let nb = b.not1(bit);
+        amt_zero = b.and2(amt_zero, nb);
+    }
     let oor_high = b.or2(amt_neg, amt_zero);
     // (amt < 0 reads as huge-unsigned in bvlshr → register drains to 0 with full
     // sticky; harmless — oor_high overrides everything downstream.)
@@ -230,14 +281,18 @@ pub fn fp_to_int(
     let p = sbu + 1;
     let wr = (mu + 1) + p;
     let mut r0 = vec![b.zero(); wr];
-    for i in 0..sbu { r0[wr - sbu + i] = o.sig[i]; }
+    for i in 0..sbu {
+        r0[wr - sbu + i] = o.sig[i];
+    }
     let (r, sticky_shift) = shift_right_sticky(b, &r0, &amt);
 
     // --- 3. GRS + shared rounding increment on the magnitude. ---
     let g = r[p - 1];
     let rd = r[p - 2]; // p = sb+1 >= 3 for every real format
     let mut s = sticky_shift;
-    for i in 0..(p - 2) { s = b.or2(s, r[i]); }
+    for i in 0..(p - 2) {
+        s = b.or2(s, r[i]);
+    }
     let int_part: Vec<BitLit> = r[p..].to_vec(); // m+1 bits
     let inc = rounding_increment(b, o.sign, g, rd, s, int_part[0], rm);
     let mut inc_w = vec![b.zero(); mu + 1];
@@ -247,7 +302,10 @@ pub fn fp_to_int(
     // --- 4. range check per face + sign application. ---
     let mag_top = mag[mu]; // the 2^m bit
     let mut mag_zero = b.one();
-    for &bit in &mag { let nb = b.not1(bit); mag_zero = b.and2(mag_zero, nb); }
+    for &bit in &mag {
+        let nb = b.not1(bit);
+        mag_zero = b.and2(mag_zero, nb);
+    }
     let low: Vec<BitLit> = mag[..mu].to_vec();
     let (fits, res): (BitLit, Vec<BitLit>) = if !signed_face {
         // ubv: 0 <= mag <= 2^m - 1, and a negative value only if it rounded to 0.
@@ -262,7 +320,10 @@ pub fn fp_to_int(
         let not_top = b.not1(mag_top);
         let not_msb = b.not1(mag_msb);
         let mut rest_zero = b.one();
-        for i in 0..(mu - 1) { let nb = b.not1(mag[i]); rest_zero = b.and2(rest_zero, nb); }
+        for i in 0..(mu - 1) {
+            let nb = b.not1(mag[i]);
+            rest_zero = b.and2(rest_zero, nb);
+        }
         let pos_ok = b.and2(not_top, not_msb);
         let neg_bound = b.or2(not_msb, rest_zero); // mag <= 2^(m-1)
         let neg_ok = b.and2(not_top, neg_bound);
@@ -279,10 +340,12 @@ pub fn fp_to_int(
     let finite = b.and2(not_nan, not_inf);
     let in_rng = b.and2(not_oor, fits);
     let ok = b.and2(finite, in_rng);
-    let out: Vec<BitLit> = (0..mu).map(|i| {
-        let fresh = b.fresh();
-        b.mux2(ok, res[i], fresh)
-    }).collect();
+    let out: Vec<BitLit> = (0..mu)
+        .map(|i| {
+            let fresh = b.fresh();
+            b.mux2(ok, res[i], fresh)
+        })
+        .collect();
     (out, ok)
 }
 
@@ -290,9 +353,21 @@ pub fn fp_to_int(
 /// each mode and one-hot-select by `rm.sel`. Literal RM constant-folds to a single
 /// pattern; symbolic RM stays a 5-way mux over five precomputed literals.
 #[allow(clippy::needless_range_loop)] // indices are load-bearing: parallel-indexed words
-pub fn to_fp_real_const(b: &mut Blaster, q: &Rational, eb: u32, sb: u32, rm: &RmSel) -> Vec<BitLit> {
+pub fn to_fp_real_const(
+    b: &mut Blaster,
+    q: &Rational,
+    eb: u32,
+    sb: u32,
+    rm: &RmSel,
+) -> Vec<BitLit> {
     let w = (eb + sb) as usize;
-    let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+    let modes = [
+        RoundMode::Rne,
+        RoundMode::Rna,
+        RoundMode::Rtp,
+        RoundMode::Rtn,
+        RoundMode::Rtz,
+    ];
     let mut out = vec![b.zero(); w];
     for (m, &mode) in modes.iter().enumerate() {
         let pat = round_rational(eb, sb, q, mode); // Integer bit pattern
@@ -309,7 +384,8 @@ pub fn to_fp_real_const(b: &mut Blaster, q: &Rational, eb: u32, sb: u32, rm: &Rm
 mod tests {
     use crate::convert::{fp_to_int, to_fp_fp, to_fp_int, to_fp_real_const};
     use crate::reference::{
-        ref_to_fp_fp, ref_to_fp_sbv, ref_to_fp_ubv, ref_to_sbv, ref_to_ubv, round_rational, RoundMode,
+        ref_to_fp_fp, ref_to_fp_sbv, ref_to_fp_ubv, ref_to_sbv, ref_to_ubv, round_rational,
+        RoundMode,
     };
     use crate::rm;
     use shinri_bv::{BitLit, Blaster};
@@ -318,24 +394,47 @@ mod tests {
     use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
 
     fn const_bits(b: &Blaster, eb: u32, sb: u32, value: u64) -> Vec<BitLit> {
-        (0..(eb + sb)).map(|i| if (value >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
+        (0..(eb + sb))
+            .map(|i| {
+                if (value >> i) & 1 == 1 {
+                    b.one()
+                } else {
+                    b.zero()
+                }
+            })
+            .collect()
     }
     fn const_bv(b: &Blaster, w: u32, value: u64) -> Vec<BitLit> {
-        (0..w).map(|i| if (value >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
+        (0..w)
+            .map(|i| {
+                if (value >> i) & 1 == 1 {
+                    b.one()
+                } else {
+                    b.zero()
+                }
+            })
+            .collect()
     }
     fn eval_word(b: Blaster, word: &[BitLit]) -> u64 {
         let cnf = b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in &cnf.clauses {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         assert_eq!(s.solve(), SolveResult::Sat);
         let mut v = 0u64;
         for (i, bl) in word.iter().enumerate() {
             let raw = s.value_of(Var::new(bl.var)).unwrap();
-            if if bl.pos { raw } else { !raw } { v |= 1 << i; }
+            if if bl.pos { raw } else { !raw } {
+                v |= 1 << i;
+            }
         }
         v
     }
@@ -346,24 +445,33 @@ mod tests {
     fn eval_word_and_ok(b: Blaster, word: &[BitLit], ok: BitLit) -> (u64, bool) {
         let cnf = b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in &cnf.clauses {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         assert_eq!(s.solve(), SolveResult::Sat);
         let mut v = 0u64;
         for (i, bl) in word.iter().enumerate() {
             let raw = s.value_of(Var::new(bl.var)).unwrap();
-            if if bl.pos { raw } else { !raw } { v |= 1 << i; }
+            if if bl.pos { raw } else { !raw } {
+                v |= 1 << i;
+            }
         }
         let raw_ok = s.value_of(Var::new(ok.var)).unwrap();
         let ok_val = if ok.pos { raw_ok } else { !raw_ok };
         (v, ok_val)
     }
     const MODES: [(RoundingMode, RoundMode); 5] = [
-        (RoundingMode::Rne, RoundMode::Rne), (RoundingMode::Rna, RoundMode::Rna),
-        (RoundingMode::Rtp, RoundMode::Rtp), (RoundingMode::Rtn, RoundMode::Rtn),
+        (RoundingMode::Rne, RoundMode::Rne),
+        (RoundingMode::Rna, RoundMode::Rna),
+        (RoundingMode::Rtp, RoundMode::Rtp),
+        (RoundingMode::Rtn, RoundMode::Rtn),
         (RoundingMode::Rtz, RoundMode::Rtz),
     ];
 
@@ -399,22 +507,33 @@ mod tests {
             0x7FEF_FFFF_FFFF_FFFF, // max normal (overflows f32 -> +inf)
         ];
         let mut state = 0x1234_5678_9ABC_DEF0u64;
-        let mut rand = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); state };
+        let mut rand = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
         for &ref_rm in &[RoundMode::Rne, RoundMode::Rtz, RoundMode::Rtp] {
             let core_rm = match ref_rm {
-                RoundMode::Rne => RoundingMode::Rne, RoundMode::Rtz => RoundingMode::Rtz,
+                RoundMode::Rne => RoundingMode::Rne,
+                RoundMode::Rtz => RoundingMode::Rtz,
                 _ => RoundingMode::Rtp,
             };
             for iter in 0..200 {
-                let a = if iter < cases.len() { cases[iter] } else { rand() };
+                let a = if iter < cases.len() {
+                    cases[iter]
+                } else {
+                    rand()
+                };
                 let want = ref_to_fp_fp(eb_s, sb_s, eb_t, sb_t, &Integer::from(a), ref_rm);
                 let mut b = Blaster::new();
                 let xw = const_bits(&b, eb_s, sb_s, a);
                 let sel = rm::literal(&b, core_rm);
                 let got_w = to_fp_fp(&mut b, &xw, eb_s, sb_s, eb_t, sb_t, &sel);
                 let got = eval_word(b, &got_w);
-                assert_eq!(Integer::from(got), want,
-                    "f64->f32 mode {ref_rm:?} a={a:#x}: got {got:#x} want {want}");
+                assert_eq!(
+                    Integer::from(got),
+                    want,
+                    "f64->f32 mode {ref_rm:?} a={a:#x}: got {got:#x} want {want}"
+                );
             }
         }
     }
@@ -430,7 +549,11 @@ mod tests {
             let sel = rm::literal(&b, core_rm);
             let got_w = to_fp_real_const(&mut b, &q, eb, sb, &sel);
             let got = eval_word(b, &got_w);
-            assert_eq!(Integer::from(got), want, "to_fp 1/3 mode {ref_rm:?}: got {got:#x} want {want}");
+            assert_eq!(
+                Integer::from(got),
+                want,
+                "to_fp 1/3 mode {ref_rm:?}: got {got:#x} want {want}"
+            );
         }
     }
 
@@ -493,17 +616,28 @@ mod tests {
         // the sticky collapse. Seeded specials: 0, ±1, INT_MIN/MAX, u64::MAX,
         // powers of two ± 1 (tie and just-off-tie patterns).
         let cases: &[u64] = &[
-            0, 1, u64::MAX,                       // 0, 1, -1 signed / max unsigned
-            0x8000_0000_0000_0000,                // i64::MIN
-            0x7FFF_FFFF_FFFF_FFFF,                // i64::MAX
-            (1u64 << 25), (1u64 << 25) + 1, (1u64 << 25) - 1, // around the f32 tie boundary
+            0,
+            1,
+            u64::MAX,              // 0, 1, -1 signed / max unsigned
+            0x8000_0000_0000_0000, // i64::MIN
+            0x7FFF_FFFF_FFFF_FFFF, // i64::MAX
+            (1u64 << 25),
+            (1u64 << 25) + 1,
+            (1u64 << 25) - 1, // around the f32 tie boundary
             (1u64 << 63) + 1,
         ];
         let mut state = 0x0DD5_EED5_1234_5678u64;
-        let mut rand = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); state };
+        let mut rand = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
         for &(core_rm, ref_rm) in &MODES {
             for iter in 0..100 {
-                let a = if iter < cases.len() { cases[iter] } else { rand() };
+                let a = if iter < cases.len() {
+                    cases[iter]
+                } else {
+                    rand()
+                };
                 for signed in [true, false] {
                     let want = if signed {
                         ref_to_fp_sbv(8, 24, 64, &Integer::from(a), ref_rm)
@@ -540,13 +674,20 @@ mod tests {
                         let sel = rm::literal(&b, core_rm);
                         let (got_w, ok_l) = fp_to_int(&mut b, &xw, 3, 5, m, signed, &sel);
                         let (got, ok) = eval_word_and_ok(b, &got_w, ok_l);
-                        assert_eq!(ok, want.is_some(),
+                        assert_eq!(
+                            ok,
+                            want.is_some(),
                             "(3,5)→{}bv{m} mode {ref_rm:?} a={a:#x}: ok={ok} want_some={}",
-                            if signed { "s" } else { "u" }, want.is_some());
+                            if signed { "s" } else { "u" },
+                            want.is_some()
+                        );
                         if let Some(w) = want {
-                            assert_eq!(Integer::from(got), w,
+                            assert_eq!(
+                                Integer::from(got),
+                                w,
                                 "(3,5)→{}bv{m} mode {ref_rm:?} a={a:#x}: got {got:#x} want {w}",
-                                if signed { "s" } else { "u" });
+                                if signed { "s" } else { "u" }
+                            );
                         }
                     }
                 }
@@ -558,7 +699,10 @@ mod tests {
     fn fp_to_int_f16_f32_specials_and_random() {
         // (5,11) and (8,24) sources into m ∈ {8, 32, 64}; seeded specials + PRNG.
         let mut state = 0xDEAD_BEEF_0123_4567u64;
-        let mut rand = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); state };
+        let mut rand = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state
+        };
         for (eb, sb) in [(5u32, 11u32), (8, 24)] {
             let w = eb + sb;
             // Specials: NaN, ±inf, ±0, ±1, max-finite, min-subnormal, and values
@@ -568,20 +712,31 @@ mod tests {
                 let bits = crate::reference::round_rational(eb, sb, &q, RoundMode::Rne);
                 // Integer → u64 via the test-side field helper.
                 let mut v = 0u64;
-                for i in 0..w { if !crate::reference::field(&bits, i, 1).is_zero() { v |= 1 << i; } }
+                for i in 0..w {
+                    if !crate::reference::field(&bits, i, 1).is_zero() {
+                        v |= 1 << i;
+                    }
+                }
                 v
             };
             let mut cases: Vec<u64> = vec![
-                enc(f(1_000_000_000, 1)),        // overflows f16 → +inf; huge for f32
+                enc(f(1_000_000_000, 1)), // overflows f16 → +inf; huge for f32
                 enc(f(-1_000_000_000, 1)),
-                1 << (w - 1),                     // -0
-                0,                                // +0
-                1,                                // min subnormal
-                enc(f(1, 1)), enc(f(-1, 1)),
-                enc(f(255, 1)), enc(f(256, 1)), enc(f(511, 2)),      // ubv8 edges
-                enc(f(-128, 1)), enc(f(-129, 1)), enc(f(-257, 2)),   // sbv8 edges
+                1 << (w - 1), // -0
+                0,            // +0
+                1,            // min subnormal
+                enc(f(1, 1)),
+                enc(f(-1, 1)),
+                enc(f(255, 1)),
+                enc(f(256, 1)),
+                enc(f(511, 2)), // ubv8 edges
+                enc(f(-128, 1)),
+                enc(f(-129, 1)),
+                enc(f(-257, 2)), // sbv8 edges
             ];
-            for _ in 0..120 { cases.push(rand() & ((1u64 << w) - 1)); }
+            for _ in 0..120 {
+                cases.push(rand() & ((1u64 << w) - 1));
+            }
             for &(core_rm, ref_rm) in &MODES {
                 for m in [8u32, 32, 64] {
                     for &a in &cases {
@@ -596,8 +751,11 @@ mod tests {
                             let sel = rm::literal(&b, core_rm);
                             let (got_w, ok_l) = fp_to_int(&mut b, &xw, eb, sb, m, signed, &sel);
                             let (got, ok) = eval_word_and_ok(b, &got_w, ok_l);
-                            assert_eq!(ok, want.is_some(),
-                                "({eb},{sb})→bv{m} signed={signed} mode {ref_rm:?} a={a:#x}");
+                            assert_eq!(
+                                ok,
+                                want.is_some(),
+                                "({eb},{sb})→bv{m} signed={signed} mode {ref_rm:?} a={a:#x}"
+                            );
                             if let Some(wv) = want {
                                 assert_eq!(Integer::from(got), wv,
                                     "({eb},{sb})→bv{m} signed={signed} mode {ref_rm:?} a={a:#x}: got {got:#x}");

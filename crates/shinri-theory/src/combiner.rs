@@ -18,7 +18,10 @@ use shinri_sat::{Effort, Theory, TheoryResult};
 enum FinalCheck {
     Sat,
     Conflict(Vec<crate::types::EqLeaf>),
-    Split { atoms: Vec<TermId>, guard: Option<Lit> },
+    Split {
+        atoms: Vec<TermId>,
+        guard: Option<Lit>,
+    },
     /// A sub-theory exhausted its fuel budget; the overall result is unknown.
     Unknown,
 }
@@ -40,7 +43,9 @@ pub struct Combiner<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: Theory
     cert: CertLog,
 }
 
-impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Default for Combiner<E, A, R, S> {
+impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Default
+    for Combiner<E, A, R, S>
+{
     fn default() -> Self {
         Combiner::with_context(Context::new())
     }
@@ -107,7 +112,7 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                 // `(= (str.len x) 1)` routes to EUF as an Int equality), also
                 // notify the String theory so it can track len_terms for axiom
                 // emission and the N-O shared-arith interface.
-                if atom_contains_str_len(&cx.terms, atom) {
+                if atom_contains_str_len(cx.terms, atom) {
                     self.string.new_var(&mut cx, v, atom);
                 }
             }
@@ -127,7 +132,7 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                 // theory so it can track len_terms for axiom emission and the
                 // N-O shared-arith interface. This is required for the String↔Arith
                 // seam to detect contradictions such as `len(x)=1 ∧ x=""`.
-                if atom_contains_str_len(&cx.terms, atom) {
+                if atom_contains_str_len(cx.terms, atom) {
                     self.string.new_var(&mut cx, v, atom);
                 }
             }
@@ -214,7 +219,9 @@ fn atom_contains_str_len(terms: &Context, atom: TermId) -> bool {
     walk(terms, atom, &mut seen)
 }
 
-impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory for Combiner<E, A, R, S> {
+impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory
+    for Combiner<E, A, R, S>
+{
     fn assert(&mut self, lit: Lit) {
         // The SAT layer asserts EVERY trail literal, including auxiliary Tseitin
         // variables minted for Boolean connectives (And/Or/Implies/Xor/Ite/...).
@@ -322,14 +329,14 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory 
         match owner {
             Owner::Euf => {
                 self.euf.new_var(&mut cx, v, atom);
-                if atom_contains_str_len(&cx.terms, atom) {
+                if atom_contains_str_len(cx.terms, atom) {
                     self.string.new_var(&mut cx, v, atom);
                 }
             }
             Owner::Arith => {
                 self.arith.new_var(&mut cx, v, atom);
                 self.euf.register_arith_uf_terms(&mut cx, atom);
-                if atom_contains_str_len(&cx.terms, atom) {
+                if atom_contains_str_len(cx.terms, atom) {
                     self.string.new_var(&mut cx, v, atom);
                 }
             }
@@ -436,8 +443,14 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                 Vec::new()
             } else {
                 let mut s = self.euf.shared_arith_terms(&mut cx);
-                for t in str_lens { if !s.contains(&t) { s.push(t); } }
-                for &t in &s { self.arith.ensure_shared_var(&mut cx, t); }
+                for t in str_lens {
+                    if !s.contains(&t) {
+                        s.push(t);
+                    }
+                }
+                for &t in &s {
+                    self.arith.ensure_shared_var(&mut cx, t);
+                }
                 s
             }
         };
@@ -642,7 +655,10 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                         .expect("(> u v) well-sorted");
                     // MBTC trichotomy `(= u v) ∨ (< u v) ∨ (> u v)` is a tautology
                     // over a totally-ordered arith domain — no guard needed.
-                    return FinalCheck::Split { atoms: vec![eq, lt, gt], guard: None };
+                    return FinalCheck::Split {
+                        atoms: vec![eq, lt, gt],
+                        guard: None,
+                    };
                 }
                 return FinalCheck::Sat;
             }
@@ -1207,7 +1223,8 @@ mod tests {
         let le = ctx
             .mk_app(Op::Builtin(shinri_core::BuiltinOp::Le), &[x, y])
             .unwrap();
-        let mut c: Combiner<Spy, AssertConflicter, NullTheory, NullTheory> = Combiner::with_context(ctx);
+        let mut c: Combiner<Spy, AssertConflicter, NullTheory, NullTheory> =
+            Combiner::with_context(ctx);
         let v = Var::new(0);
         c.register_atom(v, le).unwrap();
         c.assert(Lit::new(v, true));
@@ -1277,7 +1294,10 @@ mod tests {
                 let atom = self
                     .split_atom
                     .expect("split_atom must be set before check");
-                TCheck::Split { atoms: vec![atom], guard: None }
+                TCheck::Split {
+                    atoms: vec![atom],
+                    guard: None,
+                }
             } else {
                 TCheck::Sat
             }
@@ -1300,7 +1320,8 @@ mod tests {
             .mk_app(Op::Builtin(shinri_core::BuiltinOp::Le), &[x, y])
             .unwrap();
 
-        let mut comb: Combiner<NullTheory, ArithSplitter, NullTheory, NullTheory> = Combiner::with_context(ctx);
+        let mut comb: Combiner<NullTheory, ArithSplitter, NullTheory, NullTheory> =
+            Combiner::with_context(ctx);
         comb.arith.split_atom = Some(le);
 
         // First Full check lifts the arith Split into SplitAtoms.
@@ -1423,7 +1444,8 @@ mod tests {
         let vs = ctx.declare_fun("v", &[], int);
         let u = ctx.mk_app(Op::Uninterpreted(us), &[]).unwrap();
         let v = ctx.mk_app(Op::Uninterpreted(vs), &[]).unwrap();
-        let mut c: Combiner<SharedEuf, ModelEqArith, NullTheory, NullTheory> = Combiner::with_context(ctx);
+        let mut c: Combiner<SharedEuf, ModelEqArith, NullTheory, NullTheory> =
+            Combiner::with_context(ctx);
         c.euf.t1 = Some(u);
         c.euf.t2 = Some(v);
         c.arith.t1 = Some(u);
@@ -1467,7 +1489,10 @@ mod tests {
         fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
             if !self.fired {
                 self.fired = true;
-                TCheck::Split { atoms: vec![self.atom.unwrap()], guard: None }
+                TCheck::Split {
+                    atoms: vec![self.atom.unwrap()],
+                    guard: None,
+                }
             } else {
                 TCheck::Sat
             }
@@ -1511,7 +1536,8 @@ mod tests {
             "atom with select must be classified as Owner::Arrays"
         );
 
-        let mut comb: Combiner<NullTheory, NullTheory, ArraySplitter, NullTheory> = Combiner::with_context(ctx);
+        let mut comb: Combiner<NullTheory, NullTheory, ArraySplitter, NullTheory> =
+            Combiner::with_context(ctx);
 
         // Register the arrays atom — routes to euf (for congruence) + arrays (for watching).
         let v = Var::new(0);
@@ -1547,9 +1573,19 @@ mod tests {
     impl TheorySolver for StubStr {
         const THEORY_ID: u16 = 4;
         fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
-        fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> { None }
-        fn propagate(&mut self, _cx: &mut TheoryCtx, _o: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> { None }
-        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck { TCheck::Sat }
+        fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _o: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            TCheck::Sat
+        }
         fn explain(&mut self, _cx: &mut TheoryCtx, _t: u32, _e: &mut Explainer) {}
         fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
         fn push(&mut self) {}
@@ -1561,8 +1597,14 @@ mod tests {
         // Construct a 4-theory combiner; a string equality registers as Owner::String.
         let mut c: Combiner<NullTheory, NullTheory, NullTheory, StubStr> = Combiner::default();
         let str_s = c.context_mut().string_sort();
-        let x = { let s = c.context_mut().declare_fun("x", &[], str_s); c.context_mut().mk_app(Op::Uninterpreted(s), &[]).unwrap() };
-        let y = { let s = c.context_mut().declare_fun("y", &[], str_s); c.context_mut().mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+        let x = {
+            let s = c.context_mut().declare_fun("x", &[], str_s);
+            c.context_mut().mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let y = {
+            let s = c.context_mut().declare_fun("y", &[], str_s);
+            c.context_mut().mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
         let atom = c.context_mut().mk_eq(x, y).unwrap();
         assert!(c.register_atom(Var::new(0), atom).is_ok());
     }

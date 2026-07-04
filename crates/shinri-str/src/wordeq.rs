@@ -17,7 +17,10 @@ pub enum StepResult {
     /// `[len_eq, a_pref, b_pref]`; `guard` is the NEGATION of the triggering
     /// word-equation literal. The learnt clause is `guard ∨ len_eq ∨ a_pref ∨
     /// b_pref` ≡ `eqn → (len_eq ∨ a_pref ∨ b_pref)` — the sound Nielsen lemma.
-    Split { atoms: Vec<TermId>, guard: Lit },
+    Split {
+        atoms: Vec<TermId>,
+        guard: Lit,
+    },
 }
 
 /// Mint a fresh string constant `!strk<N>` and return its term ID.
@@ -26,7 +29,9 @@ pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
     *ctr += 1;
     let str_s = terms.string_sort();
     let sym = terms.declare_fun(&name, &[], str_s);
-    terms.mk_app(Op::Uninterpreted(sym), &[]).expect("well-sorted")
+    terms
+        .mk_app(Op::Uninterpreted(sym), &[])
+        .expect("well-sorted")
 }
 
 /// Build `(str.len t)`.
@@ -73,7 +78,11 @@ pub fn fsplit_atoms(terms: &mut Context, a: TermId, b: TermId, ctr: &mut u32) ->
 /// Returns the two children of an `Eq` atom.
 pub fn sides(terms: &Context, atom: TermId) -> (TermId, TermId) {
     match terms.term_node(atom) {
-        TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::Eq),
+            args,
+            ..
+        } => {
             let ch = terms.children(*args);
             (ch[0], ch[1])
         }
@@ -88,7 +97,11 @@ pub fn sides(terms: &Context, atom: TermId) -> (TermId, TermId) {
 /// string-sorted operands as the first two children.
 pub fn diseq_sides(terms: &Context, atom: TermId) -> (TermId, TermId) {
     match terms.term_node(atom) {
-        TermNode::App { op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct),
+            args,
+            ..
+        } => {
             let ch = terms.children(*args);
             (ch[0], ch[1])
         }
@@ -191,11 +204,8 @@ fn occurs_unsat(
     // … PLUS at least one NON-EMPTY string constant. Only a non-empty constant is
     // necessarily non-empty material; a second variable (or a second occurrence
     // of `single`) can be ε and so does NOT force a length contradiction.
-    rest.iter().any(|&a| {
-        terms
-            .string_const_value(a)
-            .map_or(false, |s| !s.is_empty())
-    })
+    rest.iter()
+        .any(|&a| terms.string_const_value(a).is_some_and(|s| !s.is_empty()))
 }
 
 /// Compare two atoms for definite equality: same TermId, same literal string
@@ -279,12 +289,14 @@ pub fn resolve_equation(
     // occurs-check returns false and the equation falls through to the F-split/Done
     // machinery (which splits or saturates → Unknown — never wrong UNSAT/SAT).
     {
-        if le - i == 1 && terms.string_const_value(lhs[i]).is_none()
+        if le - i == 1
+            && terms.string_const_value(lhs[i]).is_none()
             && occurs_unsat(terms, eq, lhs[i], &rhs[j..re])
         {
             return StepResult::Conflict(just);
         }
-        if re - j == 1 && terms.string_const_value(rhs[j]).is_none()
+        if re - j == 1
+            && terms.string_const_value(rhs[j]).is_none()
             && occurs_unsat(terms, eq, rhs[j], &lhs[i..le])
         {
             return StepResult::Conflict(just);
@@ -349,19 +361,23 @@ pub fn resolve_equation(
             // `s1 ++ "cc" ++ s2 = "bbb"`: 'c' ∉ {b} ⟹ UNSAT). Sound and needs no
             // fresh terms; it catches a class of premature-SAT word equations the
             // F-split fixpoint would otherwise dedup-terminate as (wrongly) SAT.
-            let char_set = |sl: &[TermId], terms: &Context| -> Option<std::collections::BTreeSet<char>> {
-                if !all_const(sl, terms) {
-                    return None;
-                }
-                let mut s = std::collections::BTreeSet::new();
-                for &a in sl {
-                    for c in terms.string_const_value(a).unwrap().chars() {
-                        s.insert(c);
+            let char_set =
+                |sl: &[TermId], terms: &Context| -> Option<std::collections::BTreeSet<char>> {
+                    if !all_const(sl, terms) {
+                        return None;
                     }
-                }
-                Some(s)
-            };
-            let other_const_chars_subset = |fixed: &std::collections::BTreeSet<char>, other: &[TermId], terms: &Context| -> bool {
+                    let mut s = std::collections::BTreeSet::new();
+                    for &a in sl {
+                        for c in terms.string_const_value(a).unwrap().chars() {
+                            s.insert(c);
+                        }
+                    }
+                    Some(s)
+                };
+            let other_const_chars_subset = |fixed: &std::collections::BTreeSet<char>,
+                                            other: &[TermId],
+                                            terms: &Context|
+             -> bool {
                 for &a in other {
                     if let Some(cs) = terms.string_const_value(a) {
                         if cs.chars().any(|c| !fixed.contains(&c)) {
@@ -389,10 +405,10 @@ pub fn resolve_equation(
     // prefix. If after stripping both have remaining characters with different
     // first chars, it is a genuine contradiction in the free monoid.
     if i < le && j < re {
-        if let (Some(a_str), Some(b_str)) =
-            (terms.string_const_value(lhs[i]).map(str::to_owned),
-             terms.string_const_value(rhs[j]).map(str::to_owned))
-        {
+        if let (Some(a_str), Some(b_str)) = (
+            terms.string_const_value(lhs[i]).map(str::to_owned),
+            terms.string_const_value(rhs[j]).map(str::to_owned),
+        ) {
             // Walk character by character to find the first mismatch.
             let mut a_chars = a_str.chars();
             let mut b_chars = b_str.chars();
@@ -416,7 +432,7 @@ pub fn resolve_equation(
         let rest = if i == le { &rhs[j..re] } else { &lhs[i..le] };
         if rest
             .iter()
-            .any(|&a| terms.string_const_value(a).map_or(false, |s| !s.is_empty()))
+            .any(|&a| terms.string_const_value(a).is_some_and(|s| !s.is_empty()))
         {
             return StepResult::Conflict(just);
         }
@@ -445,7 +461,10 @@ pub fn resolve_equation(
             // Extract first character of the constant (guaranteed non-empty above by
             // the `!s.is_empty()` guard in the match arm that produced `vc_pair`).
             let cs = terms.string_const_value(cst).unwrap().to_owned();
-            let ch = cs.chars().next().expect("non-empty constant by construction");
+            let ch = cs
+                .chars()
+                .next()
+                .expect("non-empty constant by construction");
             // Canonical dedup key: order by index to be unordered.
             let key = if var.index() <= cst.index() {
                 (var, cst)
@@ -482,8 +501,8 @@ pub fn resolve_equation(
     // Residual has at least one variable head: emit a generic F-split if not yet emitted.
     if i < le && j < re {
         let (ha, hb) = (lhs[i], rhs[j]);
-        let var_head = terms.string_const_value(ha).is_none()
-            || terms.string_const_value(hb).is_none();
+        let var_head =
+            terms.string_const_value(ha).is_none() || terms.string_const_value(hb).is_none();
         if var_head {
             // Canonical (unordered) key for dedup.
             let key = if ha.index() <= hb.index() {
@@ -498,7 +517,10 @@ pub fn resolve_equation(
                 // lemma. On branches where the equation is false, ¬eqn satisfies
                 // the clause and the head variable is unconstrained — no spurious
                 // UNSAT.
-                return StepResult::Split { atoms, guard: eqn_lit.negate() };
+                return StepResult::Split {
+                    atoms,
+                    guard: eqn_lit.negate(),
+                };
             }
             // Already split this pair; the search is saturated without resolution.
             return StepResult::Saturated;
@@ -510,12 +532,12 @@ pub fn resolve_equation(
 
 #[cfg(test)]
 mod tests {
+    use crate::wordeq::{resolve_equation, StepResult};
+    use crate::StrSolver;
+    use rustc_hash::FxHashSet;
     use shinri_core::{BuiltinOp, Context, Lit, Op, TermNode, Var};
     use shinri_sat::Effort;
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
-    use crate::StrSolver;
-    use rustc_hash::FxHashSet;
-    use crate::wordeq::{resolve_equation, StepResult};
 
     /// A dummy positive equation literal for `resolve_equation` calls whose guard
     /// is not under test.
@@ -542,13 +564,22 @@ mod tests {
         let mut eq = EqualityEngine::default();
         let x = mk_var(&mut ctx, "x_pfx");
         let y = mk_var(&mut ctx, "y_pfx");
-        let ab  = ctx.mk_string_const("ab");
+        let ab = ctx.mk_string_const("ab");
         let abc = ctx.mk_string_const("abc");
-        let lhs = [ab,  x];
+        let lhs = [ab, x];
         let rhs = [abc, y];
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
         assert!(
             matches!(result, StepResult::Done),
             "prefix-of-constant residual must be Done (satisfiable: X = \"c\" ++ Y)"
@@ -572,7 +603,16 @@ mod tests {
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
         // First call: emits F-split (not Conflict).
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
         assert!(
             matches!(result, StepResult::Split { .. } | StepResult::Done),
             "variable-headed residual must NOT be Conflict (X could equal \"b\" ++ ...)"
@@ -598,7 +638,16 @@ mod tests {
         let rhs = [x, a]; // identical slices
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
         assert!(
             matches!(result, StepResult::Done),
             "fully-consumed (trivially equal) sides must be Done"
@@ -618,7 +667,16 @@ mod tests {
         let rhs = [y];
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
         assert!(
             matches!(result, StepResult::Done),
             "empty lhs vs single-variable rhs must be Done (Y could be \"\")"
@@ -640,13 +698,21 @@ mod tests {
         let y = mk(&mut ctx, "y");
         let a = ctx.mk_string_const("a");
         let b = ctx.mk_string_const("b");
-        let l = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, a]).unwrap();
-        let r = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[b, y]).unwrap();
+        let l = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, a])
+            .unwrap();
+        let r = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[b, y])
+            .unwrap();
         let atom = ctx.mk_eq(l, r).unwrap();
         let mut s = StrSolver::default();
         let mut eq = EqualityEngine::default();
         let areg = AtomRegistry::default();
-        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &areg };
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
         s.new_var(&mut cx, shinri_core::Var::new(0), atom);
         s.test_force_eq_true(atom);
         let mut saw_split = false;
@@ -669,7 +735,10 @@ mod tests {
                 TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
-        assert!(saw_split, "a variable-headed word equation must emit a multi-atom F-split");
+        assert!(
+            saw_split,
+            "a variable-headed word equation must emit a multi-atom F-split"
+        );
     }
 
     // ── Task 13: variable-vs-constant head split ─────────────────────────────
@@ -679,13 +748,20 @@ mod tests {
     fn variable_equals_constant_splits_then_sat() {
         let mut ctx = Context::new();
         let str_s = ctx.string_sort();
-        let x = { let s = ctx.declare_fun("x", &[], str_s); ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
         let ab = ctx.mk_string_const("ab");
         let atom = ctx.mk_eq(x, ab).unwrap();
         let mut s = StrSolver::default();
         let mut eq = EqualityEngine::default();
         let areg = AtomRegistry::default();
-        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &areg };
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
         s.new_var(&mut cx, shinri_core::Var::new(0), atom);
         s.test_force_eq_true(atom);
         // Must not conflict; must emit a split (or be Sat).
@@ -698,37 +774,64 @@ mod tests {
                     // The specialized split must contain the empty-branch atom (= x "").
                     // Check that at least one atom is an equality of x with the empty string.
                     let has_empty_branch = atoms.iter().any(|&a| {
-                        if let TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } = cx.terms.term_node(a) {
+                        if let TermNode::App {
+                            op: Op::Builtin(BuiltinOp::Eq),
+                            args,
+                            ..
+                        } = cx.terms.term_node(a)
+                        {
                             let ch = cx.terms.children(*args);
                             let (lhs, rhs) = (ch[0], ch[1]);
                             // Either side equals x and the other equals "".
-                            (lhs == x && cx.terms.string_const_value(rhs).map_or(false, |s| s.is_empty()))
-                                || (rhs == x && cx.terms.string_const_value(lhs).map_or(false, |s| s.is_empty()))
+                            (lhs == x
+                                && cx
+                                    .terms
+                                    .string_const_value(rhs)
+                                    .is_some_and(|s| s.is_empty()))
+                                || (rhs == x
+                                    && cx
+                                        .terms
+                                        .string_const_value(lhs)
+                                        .is_some_and(|s| s.is_empty()))
                         } else {
                             false
                         }
                     });
                     if has_empty_branch {
                         // The specialized var-vs-const split MUST be guarded (sound).
-                        assert!(guard.is_some(), "var-vs-const split with empty branch must carry a guard (¬eqn)");
+                        assert!(
+                            guard.is_some(),
+                            "var-vs-const split with empty branch must carry a guard (¬eqn)"
+                        );
                         let g = guard.unwrap();
                         // test_force_eq_true uses Lit::new(Var::new(0), true) as the
                         // asserting literal; the guard must be its negation.
                         let expected_guard = Lit::new(Var::new(0), true).negate();
-                        assert_eq!(g, expected_guard, "guard must be ¬eqn (negation of the asserting literal)");
+                        assert_eq!(
+                            g, expected_guard,
+                            "guard must be ¬eqn (negation of the asserting literal)"
+                        );
                         saw_guarded_split_with_empty_branch = true;
                         ok = true;
                         break;
                     }
                     // Non-empty-branch splits (e.g. length axioms) may be unguarded tautologies.
                 }
-                TCheck::Sat => { ok = true; break; }
+                TCheck::Sat => {
+                    ok = true;
+                    break;
+                }
                 TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
-        assert!(ok, "x = \"ab\" must reach Sat or emit a split without conflict");
-        assert!(saw_guarded_split_with_empty_branch,
-            "specialized var-vs-const split must emit an empty-branch atom (= x \"\") with a guard");
+        assert!(
+            ok,
+            "x = \"ab\" must reach Sat or emit a split without conflict"
+        );
+        assert!(
+            saw_guarded_split_with_empty_branch,
+            "specialized var-vs-const split must emit an empty-branch atom (= x \"\") with a guard"
+        );
     }
 
     // ── Positive control: conflict still detected ─────────────────────────────
@@ -737,17 +840,28 @@ mod tests {
     fn constant_prefix_mismatch_is_conflict() {
         let mut ctx = Context::new();
         let str_s = ctx.string_sort();
-        let x = { let s = ctx.declare_fun("x", &[], str_s); ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
         let ab = ctx.mk_string_const("ab");
         let ac = ctx.mk_string_const("ac");
-        let l = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[ab, x]).unwrap();
-        let r = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[ac, x]).unwrap();
+        let l = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[ab, x])
+            .unwrap();
+        let r = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[ac, x])
+            .unwrap();
         let atom = ctx.mk_eq(l, r).unwrap();
 
         let mut s = StrSolver::default();
         let mut eq = EqualityEngine::default();
         let areg = AtomRegistry::default();
-        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &areg };
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
         s.new_var(&mut cx, shinri_core::Var::new(0), atom);
         // Simulate the SAT layer asserting the equality true:
         s.test_force_eq_true(atom);
@@ -782,7 +896,16 @@ mod tests {
         let rhs = [w, v, u];
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
         assert!(
             !matches!(result, StepResult::Conflict(_)),
             "v = w++v++u is SAT (w=u=v=\"\"); occurs-check must NOT conflict (got Conflict)"
@@ -801,7 +924,16 @@ mod tests {
         let rhs = [u, v, u];
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
         assert!(
             !matches!(result, StepResult::Conflict(_)),
             "v = u++v++u is SAT (u=\"\"); occurs-check must NOT conflict (got Conflict)"
@@ -819,7 +951,16 @@ mod tests {
         let rhs = [v, v];
         let mut ctr = 0u32;
         let mut emitted = FxHashSet::default();
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, vec![], dummy_eqn_lit(), &mut ctr, &mut emitted);
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
         assert!(
             !matches!(result, StepResult::Conflict(_)),
             "v = v++v is SAT (v=\"\"); occurs-check must NOT conflict (got Conflict)"
@@ -842,11 +983,22 @@ mod tests {
         let mut emitted = FxHashSet::default();
         let lit = dummy_eqn_lit();
         let just = vec![shinri_theory::types::EqLeaf::Asserted(lit)];
-        let result = resolve_equation(&mut ctx, &mut eq, &lhs, &rhs, just, lit, &mut ctr, &mut emitted);
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
         match result {
             StepResult::Conflict(cf) => {
                 assert!(
-                    cf.iter().any(|l| matches!(l, shinri_theory::types::EqLeaf::Asserted(x) if *x == lit)),
+                    cf.iter().any(
+                        |l| matches!(l, shinri_theory::types::EqLeaf::Asserted(x) if *x == lit)
+                    ),
                     "occurs-check conflict must cite the asserting word-equation literal"
                 );
             }
@@ -868,13 +1020,21 @@ mod tests {
         let x = mk(&mut ctx, "x");
         let y = mk(&mut ctx, "y");
         let a = ctx.mk_string_const("a");
-        let ay = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[a, y]).unwrap();
+        let ay = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[a, y])
+            .unwrap();
         let eq_atom = ctx.mk_eq(x, ay).unwrap();
-        let diseq_atom = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, ay]).unwrap();
+        let diseq_atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, ay])
+            .unwrap();
         let mut s = StrSolver::default();
         let mut eqe = EqualityEngine::default();
         let areg = AtomRegistry::default();
-        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eqe, atoms: &areg };
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eqe,
+            atoms: &areg,
+        };
         s.new_var(&mut cx, shinri_core::Var::new(0), eq_atom);
         s.new_var(&mut cx, shinri_core::Var::new(1), diseq_atom);
         // Merge x and (a++y) in the EqualityEngine to model the asserted equality.
@@ -885,12 +1045,18 @@ mod tests {
         let mut conflicted = false;
         for _ in 0..16 {
             match s.check(&mut cx, Effort::Full) {
-                TCheck::Conflict(_) => { conflicted = true; break; }
+                TCheck::Conflict(_) => {
+                    conflicted = true;
+                    break;
+                }
                 TCheck::Split { .. } => continue,
                 TCheck::Sat => break,
                 TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
-        assert!(conflicted, "asserted distinct over equal normal forms is UNSAT");
+        assert!(
+            conflicted,
+            "asserted distinct over equal normal forms is UNSAT"
+        );
     }
 }

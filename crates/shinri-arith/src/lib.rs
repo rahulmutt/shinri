@@ -874,7 +874,10 @@ impl Arith {
                 self.total_cuts += 1;
                 // GMI cut is a theory-valid clause over the integers — a tautology
                 // split, no guard.
-                return TCheck::Split { atoms: vec![cut_atom], guard: None };
+                return TCheck::Split {
+                    atoms: vec![cut_atom],
+                    guard: None,
+                };
             }
         }
         let (floor, ceil) = crate::branch::floor_ceil(&self.value[bv.index()]);
@@ -894,7 +897,10 @@ impl Arith {
             .mk_app(Op::Builtin(BuiltinOp::Ge), &[term, ceil_num])
             .expect("(x >= ceil) well-sorted");
         // Branch `(x ≤ ⌊v⌋) ∨ (x ≥ ⌈v⌉)` is a tautology over the integers — no guard.
-        TCheck::Split { atoms: vec![le, ge], guard: None }
+        TCheck::Split {
+            atoms: vec![le, ge],
+            guard: None,
+        }
     }
 
     /// Derive a GMI cut from `bv`'s row and build a `≤` cut atom term over

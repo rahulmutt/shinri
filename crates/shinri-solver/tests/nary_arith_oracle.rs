@@ -243,7 +243,10 @@ fn differential_qf_lia_nary() {
         n_sat > 0 && n_unsat > 0,
         "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
     );
-    assert!(n_unknown == 0, "unknown must be 0 — QF_LIA is total ({n_unknown} unknown)");
+    assert!(
+        n_unknown == 0,
+        "unknown must be 0 — QF_LIA is total ({n_unknown} unknown)"
+    );
     assert!(
         n_z3_checked == N_ITERS,
         "expected every iteration z3-checked with zero disagreements \

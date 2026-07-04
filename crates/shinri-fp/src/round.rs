@@ -1,30 +1,35 @@
 //! The shared FP rounder: ExtFp → packed word. Bit-identical to round_rational.
 
-use shinri_bv::{BitLit, Blaster};
+use crate::rm::RmSel;
 use shinri_bv::blast::arith::{adder, bvadd, bvsub};
 use shinri_bv::blast::shift::{bvlshr, bvshl};
-use crate::rm::RmSel;
+use shinri_bv::{BitLit, Blaster};
 
 /// Canonical pre-pack intermediate. See the rounder contract in the plan.
 pub struct ExtFp {
     pub sign: BitLit,
-    pub exp: Vec<BitLit>,                 // signed two's complement, width exp_w(eb)
-    pub sig: Vec<BitLit>,                 // sb bits LSB→MSB, hidden bit at index sb-1
-    pub grs: (BitLit, BitLit, BitLit),    // (guard, round, sticky)
+    pub exp: Vec<BitLit>, // signed two's complement, width exp_w(eb)
+    pub sig: Vec<BitLit>, // sb bits LSB→MSB, hidden bit at index sb-1
+    pub grs: (BitLit, BitLit, BitLit), // (guard, round, sticky)
 }
 
 /// Signed exponent width: eb + 6 gives ample headroom for the largest formats
 /// (verified by exhaustive (3,5) + Float32 tests).
-pub fn exp_w(eb: u32) -> usize { eb as usize + 6 }
+pub fn exp_w(eb: u32) -> usize {
+    eb as usize + 6
+}
 
 fn or3(b: &mut Blaster, x: BitLit, y: BitLit, z: BitLit) -> BitLit {
-    let t = b.or2(x, y); b.or2(t, z)
+    let t = b.or2(x, y);
+    b.or2(t, z)
 }
 
 /// Build a constant signed value of width `w` (LSB→MSB) in the Blaster.
 fn const_i(b: &Blaster, w: usize, value: i128) -> Vec<BitLit> {
     let u = (value) & ((1i128 << w) - 1);
-    (0..w).map(|i| if (u >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
+    (0..w)
+        .map(|i| if (u >> i) & 1 == 1 { b.one() } else { b.zero() })
+        .collect()
 }
 
 pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<BitLit> {
@@ -38,17 +43,19 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
     // 3.. = sig (so sig[0] at index 3). Width = sbu + 3.
     let (g0, r0, s0) = ext.grs;
     let mut work: Vec<BitLit> = Vec::with_capacity(sbu + 3);
-    work.push(s0); work.push(r0); work.push(g0);
+    work.push(s0);
+    work.push(r0);
+    work.push(g0);
     work.extend_from_slice(&ext.sig);
 
     // --- Step 1: subnormal denormalize. shift = max(0, emin - exp). ---
     // shift_amt = emin - exp (signed). Compute as a small unsigned, saturated.
     let emin_const = const_i(b, ew, emin);
     let shift_signed = bvsub(b, &emin_const, &ext.exp); // emin - exp
-    // positive iff MSB == 0 and nonzero. We right-shift `work` by `shift_signed`
-    // (treated unsigned; if shift_signed is "negative" i.e. exp > emin, its large
-    // unsigned value saturates the shifter to 0 via the overflow path, which is
-    // what we want only when exp >= emin). Guard: when exp >= emin, force shift 0.
+                                                        // positive iff MSB == 0 and nonzero. We right-shift `work` by `shift_signed`
+                                                        // (treated unsigned; if shift_signed is "negative" i.e. exp > emin, its large
+                                                        // unsigned value saturates the shifter to 0 via the overflow path, which is
+                                                        // what we want only when exp >= emin). Guard: when exp >= emin, force shift 0.
     let exp_ge_emin = {
         // exp - emin >= 0  ⇔  (exp - emin) MSB == 0
         let diff = bvsub(b, &ext.exp, &emin_const);
@@ -63,8 +70,8 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
     let (shifted, shifted_sticky) = shift_right_sticky(b, &work, &shift_word);
     let mut work = shifted;
     work[0] = b.or2(work[0], shifted_sticky); // fold dropped bits into S
-    // After denormalize, the effective exponent is clamped to emin when shifting
-    // occurred. Track the post-step exponent.
+                                              // After denormalize, the effective exponent is clamped to emin when shifting
+                                              // occurred. Track the post-step exponent.
     let exp_after_denorm: Vec<BitLit> = (0..ew)
         .map(|i| b.mux2(exp_ge_emin, ext.exp[i], emin_const[i]))
         .collect();
@@ -87,7 +94,9 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
     // After increment the significand width is sbu; carry means hidden overflowed.
     let one_ew = const_i(b, ew, 1);
     let exp_plus1 = bvadd(b, &exp_after_denorm, &one_ew);
-    let final_exp: Vec<BitLit> = (0..ew).map(|i| b.mux2(carry, exp_plus1[i], exp_after_denorm[i])).collect();
+    let final_exp: Vec<BitLit> = (0..ew)
+        .map(|i| b.mux2(carry, exp_plus1[i], exp_after_denorm[i]))
+        .collect();
     // sig after possible 1-bit normalize: if carry, the new significand is
     // (sum >> 1) with the carry as the new MSB (value 2^(sb-1)). Since sum was
     // all-zero after wrap (2^sb mod 2^sb = 0), shifting gives the hidden bit set.
@@ -106,7 +115,9 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
     let over_pos = b.not1(over_diff[ew - 1]);
     let over_nonzero = {
         let mut acc = b.zero();
-        for &bit in &over_diff { acc = b.or2(acc, bit); }
+        for &bit in &over_diff {
+            acc = b.or2(acc, bit);
+        }
         acc
     };
     let overflow = b.and2(over_pos, over_nonzero);
@@ -132,7 +143,9 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
     let exp_all_ones: Vec<BitLit> = (0..eb as usize).map(|_| b.one()).collect();
     let zero_eb: Vec<BitLit> = (0..eb as usize).map(|_| b.zero()).collect();
     // max-finite exponent field: all ones except LSB 0 (value 2^eb - 2).
-    let exp_max_finite: Vec<BitLit> = (0..eb as usize).map(|i| if i == 0 { b.zero() } else { b.one() }).collect();
+    let exp_max_finite: Vec<BitLit> = (0..eb as usize)
+        .map(|i| if i == 0 { b.zero() } else { b.one() })
+        .collect();
 
     let mut out: Vec<BitLit> = Vec::with_capacity((eb + sb) as usize);
     // trailing significand sig[0..sb-1]; zeroed on infinity-overflow, all ones
@@ -160,7 +173,13 @@ pub fn round(b: &mut Blaster, ext: ExtFp, eb: u32, sb: u32, rm: &RmSel) -> Vec<B
 /// `sign` is the result sign; `g`/`r`/`s` are guard/round/sticky; `lsb` is the
 /// significand's least-significant retained bit (for RNE tie-to-even).
 pub fn rounding_increment(
-    b: &mut Blaster, sign: BitLit, g: BitLit, r: BitLit, s: BitLit, lsb: BitLit, rm: &RmSel,
+    b: &mut Blaster,
+    sign: BitLit,
+    g: BitLit,
+    r: BitLit,
+    s: BitLit,
+    lsb: BitLit,
+    rm: &RmSel,
 ) -> BitLit {
     let grs_any = or3(b, g, r, s);
     let not_sign = b.not1(sign);
@@ -171,7 +190,11 @@ pub fn rounding_increment(
     let inc_rtn = b.and2(sign, grs_any);
     let inc_rtz = b.zero();
     let mut inc = b.zero();
-    for (sel, val) in rm.sel.iter().zip([inc_rne, inc_rna, inc_rtp, inc_rtn, inc_rtz]) {
+    for (sel, val) in rm
+        .sel
+        .iter()
+        .zip([inc_rne, inc_rna, inc_rtp, inc_rtn, inc_rtz])
+    {
         let t = b.and2(*sel, val);
         inc = b.or2(inc, t);
     }
@@ -207,16 +230,23 @@ mod tests {
     fn eval_word(b: Blaster, word: &[BitLit]) -> u64 {
         let cnf = b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in &cnf.clauses {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         assert_eq!(s.solve(), SolveResult::Sat);
         let mut v = 0u64;
         for (i, bl) in word.iter().enumerate() {
             let raw = s.value_of(Var::new(bl.var)).unwrap();
-            if if bl.pos { raw } else { !raw } { v |= 1 << i; }
+            if if bl.pos { raw } else { !raw } {
+                v |= 1 << i;
+            }
         }
         v
     }
@@ -228,21 +258,33 @@ mod tests {
         let zero = Rational::new(Integer::zero(), Integer::one());
         let sign = *value < zero;
         let neg1 = Rational::new(Integer::from(-1i64), Integer::one());
-        let mag = if sign { neg1 * value.clone() } else { value.clone() };
+        let mag = if sign {
+            neg1 * value.clone()
+        } else {
+            value.clone()
+        };
         let two = Rational::new(Integer::from(2u64), Integer::one());
         let half = Rational::new(Integer::one(), Integer::from(2u64));
         // E = floor(log2(mag)); m = mag / 2^E ∈ [1,2)
         let mut e: i64 = 0;
         let mut m = mag.clone();
-        while m >= two { m = m * half.clone(); e += 1; }
-        while m < Rational::new(Integer::one(), Integer::one()) { m = m * two.clone(); e -= 1; }
+        while m >= two {
+            m = m * half.clone();
+            e += 1;
+        }
+        while m < Rational::new(Integer::one(), Integer::one()) {
+            m = m * two.clone();
+            e -= 1;
+        }
         // X = m * 2^(sb-1) ∈ [2^(sb-1), 2^sb): the normalized significand + fraction.
         let mut scale = Integer::one();
-        for _ in 0..(sb - 1) { scale *= Integer::from(2u64); }
+        for _ in 0..(sb - 1) {
+            scale *= Integer::from(2u64);
+        }
         let x = m * Rational::new(scale, Integer::one());
         let isig = x.numer().div_rem(&x.denom()).0; // floor
         let frac = x.clone() - Rational::new(isig.clone(), Integer::one()); // [0,1)
-        // G,R,S from frac.
+                                                                            // G,R,S from frac.
         let f2 = frac * two.clone();
         let g_int = f2.numer().div_rem(&f2.denom()).0;
         let g = !g_int.is_zero();
@@ -256,13 +298,26 @@ mod tests {
         let mut sig = Vec::with_capacity(sb as usize);
         let mut rem = isig.clone();
         let two_i = Integer::from(2u64);
-        for _ in 0..sb { let (q, rr) = rem.div_rem(&two_i); sig.push(!rr.is_zero()); rem = q; }
+        for _ in 0..sb {
+            let (q, rr) = rem.div_rem(&two_i);
+            sig.push(!rr.is_zero());
+            rem = q;
+        }
         (sign, e, sig, g, r, s)
     }
 
     #[allow(clippy::too_many_arguments)] // test helper — bundling into a struct is a larger refactor
-    fn build_ext(b: &Blaster, eb: u32, sb: u32,
-                 sign: bool, exp: i64, sig: &[bool], g: bool, r: bool, s: bool) -> ExtFp {
+    fn build_ext(
+        b: &Blaster,
+        eb: u32,
+        sb: u32,
+        sign: bool,
+        exp: i64,
+        sig: &[bool],
+        g: bool,
+        r: bool,
+        s: bool,
+    ) -> ExtFp {
         let bit = |x: bool| if x { b.one() } else { b.zero() };
         let ew = exp_w(eb);
         // two's-complement exp.
@@ -270,7 +325,12 @@ mod tests {
         let expv: Vec<BitLit> = (0..ew).map(|i| bit((uexp >> i) & 1 == 1)).collect();
         let sigv: Vec<BitLit> = sig.iter().map(|&x| bit(x)).collect();
         let _ = sb;
-        ExtFp { sign: bit(sign), exp: expv, sig: sigv, grs: (bit(g), bit(r), bit(s)) }
+        ExtFp {
+            sign: bit(sign),
+            exp: expv,
+            sig: sigv,
+            grs: (bit(g), bit(r), bit(s)),
+        }
     }
 
     fn rmode(rm: RoundMode) -> shinri_core::RoundingMode {
@@ -286,20 +346,39 @@ mod tests {
     #[test]
     fn round_matches_reference_tiny_exhaustive() {
         let (eb, sb) = (3u32, 5u32);
-        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        let modes = [
+            RoundMode::Rne,
+            RoundMode::Rna,
+            RoundMode::Rtp,
+            RoundMode::Rtn,
+            RoundMode::Rtz,
+        ];
         // Enumerate every value REPRESENTABLE as a starting magnitude by decoding
         // each (3,5) finite pattern to its rational, then re-rounding — plus a set
         // of between-grid rationals to exercise G/R/S. We iterate all 256 patterns
         // and, for finite non-zero ones, also test the midpoint to the next pattern.
-        use crate::reference::{decode, class_to_rational, FpClass};
+        use crate::reference::{class_to_rational, decode, FpClass};
         for pat in 0u64..256 {
             let cls = decode(eb, sb, &Integer::from(pat));
-            if matches!(cls, FpClass::Nan | FpClass::Inf { .. } | FpClass::Zero { .. }) { continue; }
+            if matches!(
+                cls,
+                FpClass::Nan | FpClass::Inf { .. } | FpClass::Zero { .. }
+            ) {
+                continue;
+            }
             let v = class_to_rational(eb, sb, &cls).unwrap();
             // also a value 3/8 of the way to the next ULP up, to force rounding.
-            let ulp_probe = v.clone() + Rational::new(Integer::from(3u64),
-                Integer::from(8u64) * { let mut p = Integer::one();
-                    for _ in 0..(sb - 1) { p *= Integer::from(2u64); } p });
+            let ulp_probe = v.clone()
+                + Rational::new(
+                    Integer::from(3u64),
+                    Integer::from(8u64) * {
+                        let mut p = Integer::one();
+                        for _ in 0..(sb - 1) {
+                            p *= Integer::from(2u64);
+                        }
+                        p
+                    },
+                );
             for value in [v.clone(), ulp_probe.clone()] {
                 for m in modes {
                     let want = round_rational(eb, sb, &value, m);
@@ -308,8 +387,11 @@ mod tests {
                     let ext = build_ext(&b, eb, sb, sg, e, &sig, g, r, s);
                     let sel = rm::literal(&b, rmode(m));
                     let word = round(&mut b, ext, eb, sb, &sel);
-                    assert_eq!(Integer::from(eval_word(b, &word)), want,
-                        "round mismatch pat={pat:#x} value!=grid m={m:?}");
+                    assert_eq!(
+                        Integer::from(eval_word(b, &word)),
+                        want,
+                        "round mismatch pat={pat:#x} value!=grid m={m:?}"
+                    );
                 }
             }
         }
@@ -346,17 +428,35 @@ mod tests {
     #[test]
     fn round_matches_reference_float32_random() {
         let (eb, sb) = (8u32, 24u32);
-        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        let modes = [
+            RoundMode::Rne,
+            RoundMode::Rna,
+            RoundMode::Rtp,
+            RoundMode::Rtn,
+            RoundMode::Rtz,
+        ];
         // deterministic LCG
         let mut state: u64 = 0xD1CE_5EED;
-        let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); state >> 16 };
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state >> 16
+        };
         for _ in 0..400 {
             // random rational n/d with modest magnitude incl. subnormal range.
             let n = (next() % 2_000_000) as i64 - 1_000_000;
-            if n == 0 { continue; }
+            if n == 0 {
+                continue;
+            }
             let d = 1i64 << (next() % 30); // up to 2^29 → reaches subnormals
-            let value = Rational::new(Integer::from(n.unsigned_abs()) *
-                if n < 0 { Integer::from(-1i64) } else { Integer::one() }, Integer::from(d as u64));
+            let value = Rational::new(
+                Integer::from(n.unsigned_abs())
+                    * if n < 0 {
+                        Integer::from(-1i64)
+                    } else {
+                        Integer::one()
+                    },
+                Integer::from(d as u64),
+            );
             for m in modes {
                 let want = round_rational(eb, sb, &value, m);
                 let (sg, e, sig, g, r, s) = decompose(eb, sb, &value);
@@ -364,7 +464,11 @@ mod tests {
                 let ext = build_ext(&b, eb, sb, sg, e, &sig, g, r, s);
                 let sel = rm::literal(&b, rmode(m));
                 let word = round(&mut b, ext, eb, sb, &sel);
-                assert_eq!(Integer::from(eval_word(b, &word)), want, "fp32 round n={n} d={d} m={m:?}");
+                assert_eq!(
+                    Integer::from(eval_word(b, &word)),
+                    want,
+                    "fp32 round n={n} d={d} m={m:?}"
+                );
             }
         }
     }

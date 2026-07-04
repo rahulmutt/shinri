@@ -75,6 +75,13 @@ impl<'a> Encoder<'a> {
         self.sat.add_clause(&[lit]);
     }
 
+    /// Add a raw clause (disjunction of literals) directly to the SAT engine.
+    /// Used by the slice-9 symbolic Real-bridge arm to gate guarded-linear rows
+    /// and significand-channel ties by blasted FP bit literals.
+    pub fn add_clause(&mut self, lits: &[Lit]) -> bool {
+        self.sat.add_clause(lits)
+    }
+
     /// Encode `t` (a Bool-sorted term); return a literal true iff `t` holds.
     pub fn encode(&mut self, t: TermId) -> Lit {
         if let Some(&l) = self.cache.get(&t) {

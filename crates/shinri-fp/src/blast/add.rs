@@ -1,12 +1,21 @@
 //! fp.add datapath: unpack → align → operate → normalize → round → special-case.
 
-use shinri_bv::{BitLit, Blaster};
-use crate::round::{exp_w, round, ExtFp};
-use crate::rm::RmSel;
+use crate::blast::operand::{
+    canon_nan_bits, inf_pattern_bits, signed_zero_bits, to_operand, Operand,
+};
 use crate::lzc::lzc;
-use crate::blast::operand::{to_operand, Operand, canon_nan_bits, inf_pattern_bits, signed_zero_bits};
+use crate::rm::RmSel;
+use crate::round::{exp_w, round, ExtFp};
+use shinri_bv::{BitLit, Blaster};
 
-pub fn fp_add(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, sb: u32) -> Vec<BitLit> {
+pub fn fp_add(
+    b: &mut Blaster,
+    x: &[BitLit],
+    y: &[BitLit],
+    rm: &RmSel,
+    eb: u32,
+    sb: u32,
+) -> Vec<BitLit> {
     let ew = exp_w(eb);
     let sbu = sb as usize;
     let ox = to_operand(b, x, eb, sb);
@@ -23,10 +32,12 @@ pub fn fp_add(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, 
 
     // --- Align lo to hi: right-shift lo.sig by (hi.exp - lo.exp), sticky. ---
     let exp_diff = shinri_bv::blast::arith::bvsub(b, &hi.exp, &lo.exp); // >= 0 since hi>=lo
-    // Extend significands with 3 low GRS columns: [0,0,0, sig...] (width sbu+3).
+                                                                        // Extend significands with 3 low GRS columns: [0,0,0, sig...] (width sbu+3).
     let z = b.zero();
-    let mut hi_ext: Vec<BitLit> = vec![z; 3]; hi_ext.extend_from_slice(&hi.sig);
-    let mut lo_ext: Vec<BitLit> = vec![z; 3]; lo_ext.extend_from_slice(&lo.sig);
+    let mut hi_ext: Vec<BitLit> = vec![z; 3];
+    hi_ext.extend_from_slice(&hi.sig);
+    let mut lo_ext: Vec<BitLit> = vec![z; 3];
+    lo_ext.extend_from_slice(&lo.sig);
     // shift amount truncated to width of lo_ext; large shifts saturate (handled
     // by sticky-collecting shifter).
     let (lo_shifted, lo_sticky) = crate::round::shift_right_sticky(b, &lo_ext, &exp_diff);
@@ -34,11 +45,16 @@ pub fn fp_add(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, 
     lo_aln[0] = b.or2(lo_aln[0], lo_sticky);
 
     // --- Operate: effective add if signs equal, else subtract. ---
-    let same_sign = { let xn = b.xor2(hi.sign, lo.sign); b.not1(xn) };
-    let sum_add = shinri_bv::blast::arith::bvadd(b, &hi_ext, &lo_aln);  // sbu+3 bits
-    // subtract: hi_ext - lo_aln (hi is larger magnitude so result >= 0).
+    let same_sign = {
+        let xn = b.xor2(hi.sign, lo.sign);
+        b.not1(xn)
+    };
+    let sum_add = shinri_bv::blast::arith::bvadd(b, &hi_ext, &lo_aln); // sbu+3 bits
+                                                                       // subtract: hi_ext - lo_aln (hi is larger magnitude so result >= 0).
     let sum_sub = shinri_bv::blast::arith::bvsub(b, &hi_ext, &lo_aln);
-    let mant: Vec<BitLit> = (0..(sbu + 3)).map(|i| b.mux2(same_sign, sum_add[i], sum_sub[i])).collect();
+    let mant: Vec<BitLit> = (0..(sbu + 3))
+        .map(|i| b.mux2(same_sign, sum_add[i], sum_sub[i]))
+        .collect();
     // add can overflow the top by 1 bit (carry into a new MSB). Capture it:
     let add_carry = {
         let (_s, c) = shinri_bv::blast::arith::adder(b, &hi_ext, &lo_aln, b.zero());
@@ -52,7 +68,10 @@ pub fn fp_add(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, 
     // in the special-case mux below.
     let cancel_zero = {
         let mut all_zero = b.one();
-        for &m in &mant { let nm = b.not1(m); all_zero = b.and2(all_zero, nm); }
+        for &m in &mant {
+            let nm = b.not1(m);
+            all_zero = b.and2(all_zero, nm);
+        }
         let no_carry = b.not1(add_carry);
         b.and2(all_zero, no_carry)
     };
@@ -69,7 +88,11 @@ pub fn fp_add(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, 
     // left-shift to put the leading 1 at index sbu+2, exp -= lz.
     let mut mant_a: Vec<BitLit> = Vec::with_capacity(sbu + 3);
     for i in 0..(sbu + 3) {
-        let hb = if i + 1 < sbu + 3 { mant[i + 1] } else { add_carry };
+        let hb = if i + 1 < sbu + 3 {
+            mant[i + 1]
+        } else {
+            add_carry
+        };
         mant_a.push(hb);
     }
     // The right-shift-by-1 drops mant[0] (the old sticky column); merge it back
@@ -79,13 +102,17 @@ pub fn fp_add(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, 
     let one_ew = const_ew(b, ew, 1);
     let exp_a = shinri_bv::blast::arith::bvadd(b, &base_exp, &one_ew);
     // Case B: lz of mant, left shift.
-    let lz = lzc(b, &mant);                       // count_width bits
+    let lz = lzc(b, &mant); // count_width bits
     let lz_ew = zero_extend(b, &lz, ew);
     let mant_b = shinri_bv::blast::shift::bvshl(b, &mant, &lz_ew);
     let exp_b = shinri_bv::blast::arith::bvsub(b, &base_exp, &lz_ew);
     // choose.
-    let mant_n: Vec<BitLit> = (0..(sbu + 3)).map(|i| b.mux2(add_carry, mant_a[i], mant_b[i])).collect();
-    let exp_n: Vec<BitLit> = (0..ew).map(|i| b.mux2(add_carry, exp_a[i], exp_b[i])).collect();
+    let mant_n: Vec<BitLit> = (0..(sbu + 3))
+        .map(|i| b.mux2(add_carry, mant_a[i], mant_b[i]))
+        .collect();
+    let exp_n: Vec<BitLit> = (0..ew)
+        .map(|i| b.mux2(add_carry, exp_a[i], exp_b[i]))
+        .collect();
 
     // --- Build ExtFp: top sb bits of mant_n are the significand; bits [2,1,0]→(G,R,S). ---
     // mant_n layout: [0..3) are GRS columns, [3..) sig. After normalize the leading
@@ -93,7 +120,12 @@ pub fn fp_add(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, 
     // G=mant_n[2], R=mant_n[1], S=mant_n[0].
     let sig_ext: Vec<BitLit> = mant_n[3..3 + sbu].to_vec();
     let grs = (mant_n[2], mant_n[1], mant_n[0]);
-    let ext = ExtFp { sign: res_sign, exp: exp_n, sig: sig_ext, grs };
+    let ext = ExtFp {
+        sign: res_sign,
+        exp: exp_n,
+        sig: sig_ext,
+        grs,
+    };
     let rounded = round(b, ext, eb, sb, rm);
 
     // --- Special-case mux (overrides rounded). ---
@@ -102,7 +134,11 @@ pub fn fp_add(b: &mut Blaster, x: &[BitLit], y: &[BitLit], rm: &RmSel, eb: u32, 
 
 fn bits_equal(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> BitLit {
     let mut acc = b.one();
-    for i in 0..x.len() { let d = b.xor2(x[i], y[i]); let s = b.not1(d); acc = b.and2(acc, s); }
+    for i in 0..x.len() {
+        let d = b.xor2(x[i], y[i]);
+        let s = b.not1(d);
+        acc = b.and2(acc, s);
+    }
     acc
 }
 fn unsigned_ge(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> BitLit {
@@ -115,19 +151,39 @@ fn signed_gt(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> BitLit {
 }
 fn const_ew(b: &Blaster, ew: usize, v: i128) -> Vec<BitLit> {
     let u = v & ((1i128 << ew) - 1);
-    (0..ew).map(|i| if (u >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
+    (0..ew)
+        .map(|i| if (u >> i) & 1 == 1 { b.one() } else { b.zero() })
+        .collect()
 }
 fn zero_extend(b: &Blaster, x: &[BitLit], to: usize) -> Vec<BitLit> {
-    let mut out = x.to_vec(); while out.len() < to { out.push(b.zero()); } out
+    let mut out = x.to_vec();
+    while out.len() < to {
+        out.push(b.zero());
+    }
+    out
 }
-fn select_operands(b: &mut Blaster, x_ge_y: BitLit, ox: &Operand, oy: &Operand, ew: usize, sbu: usize)
-    -> (Operand, Operand) {
-    fn pick(b: &mut Blaster, sel: BitLit, a: &Operand, c: &Operand, ew: usize, sbu: usize) -> Operand {
+fn select_operands(
+    b: &mut Blaster,
+    x_ge_y: BitLit,
+    ox: &Operand,
+    oy: &Operand,
+    ew: usize,
+    sbu: usize,
+) -> (Operand, Operand) {
+    fn pick(
+        b: &mut Blaster,
+        sel: BitLit,
+        a: &Operand,
+        c: &Operand,
+        ew: usize,
+        sbu: usize,
+    ) -> Operand {
         let exp = (0..ew).map(|i| b.mux2(sel, a.exp[i], c.exp[i])).collect();
         let sig = (0..sbu).map(|i| b.mux2(sel, a.sig[i], c.sig[i])).collect();
         Operand {
             sign: b.mux2(sel, a.sign, c.sign),
-            exp, sig,
+            exp,
+            sig,
             is_nan: b.mux2(sel, a.is_nan, c.is_nan),
             is_inf: b.mux2(sel, a.is_inf, c.is_inf),
             is_zero: b.mux2(sel, a.is_zero, c.is_zero),
@@ -140,8 +196,16 @@ fn select_operands(b: &mut Blaster, x_ge_y: BitLit, ox: &Operand, oy: &Operand, 
 
 /// IEEE fp.add special cases override the datapath result.
 #[allow(clippy::too_many_arguments)]
-fn special_case(b: &mut Blaster, normal: &[BitLit], ox: &Operand, oy: &Operand,
-                cancel_zero: BitLit, rm: &RmSel, eb: u32, sb: u32) -> Vec<BitLit> {
+fn special_case(
+    b: &mut Blaster,
+    normal: &[BitLit],
+    ox: &Operand,
+    oy: &Operand,
+    cancel_zero: BitLit,
+    rm: &RmSel,
+    eb: u32,
+    sb: u32,
+) -> Vec<BitLit> {
     let w = (eb + sb) as usize;
     let nan = canon_nan_bits(b, eb, sb);
     // NaN if either input NaN, or (+inf)+(-inf).
@@ -163,9 +227,15 @@ fn special_case(b: &mut Blaster, normal: &[BitLit], ox: &Operand, oy: &Operand,
 
     // Priority: NaN > Inf > cancel_zero > normal.
     let mut out = normal.to_vec();
-    for i in 0..w { out[i] = b.mux2(cancel_zero, zero_bits[i], out[i]); }
-    for i in 0..w { out[i] = b.mux2(any_inf, inf_bits[i], out[i]); }
-    for i in 0..w { out[i] = b.mux2(want_nan, nan[i], out[i]); }
+    for i in 0..w {
+        out[i] = b.mux2(cancel_zero, zero_bits[i], out[i]);
+    }
+    for i in 0..w {
+        out[i] = b.mux2(any_inf, inf_bits[i], out[i]);
+    }
+    for i in 0..w {
+        out[i] = b.mux2(want_nan, nan[i], out[i]);
+    }
     out
 }
 
@@ -178,21 +248,36 @@ mod tests {
     use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
 
     fn const_bits(b: &Blaster, eb: u32, sb: u32, value: u64) -> Vec<BitLit> {
-        (0..(eb + sb)).map(|i| if (value >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
+        (0..(eb + sb))
+            .map(|i| {
+                if (value >> i) & 1 == 1 {
+                    b.one()
+                } else {
+                    b.zero()
+                }
+            })
+            .collect()
     }
     fn eval_word(b: Blaster, word: &[BitLit]) -> u64 {
         let cnf = b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in &cnf.clauses {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         assert_eq!(s.solve(), SolveResult::Sat);
         let mut v = 0u64;
         for (i, bl) in word.iter().enumerate() {
             let raw = s.value_of(Var::new(bl.var)).unwrap();
-            if if bl.pos { raw } else { !raw } { v |= 1 << i; }
+            if if bl.pos { raw } else { !raw } {
+                v |= 1 << i;
+            }
         }
         v
     }
@@ -209,7 +294,13 @@ mod tests {
     #[test]
     fn fp_add_tiny_exhaustive_all_modes() {
         let (eb, sb) = (3u32, 5u32);
-        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        let modes = [
+            RoundMode::Rne,
+            RoundMode::Rna,
+            RoundMode::Rtp,
+            RoundMode::Rtn,
+            RoundMode::Rtz,
+        ];
         for a in 0u64..256 {
             for bb in 0u64..256 {
                 for m in modes {
@@ -219,8 +310,11 @@ mod tests {
                     let yv = const_bits(&bl, eb, sb, bb);
                     let sel = rm::literal(&bl, rmode(m));
                     let word = fp_add(&mut bl, &xv, &yv, &sel, eb, sb);
-                    assert_eq!(Integer::from(eval_word(bl, &word)), want,
-                        "fp.add a={a:#x} b={bb:#x} m={m:?}");
+                    assert_eq!(
+                        Integer::from(eval_word(bl, &word)),
+                        want,
+                        "fp.add a={a:#x} b={bb:#x} m={m:?}"
+                    );
                 }
             }
         }
@@ -229,14 +323,39 @@ mod tests {
     #[test]
     fn fp_add_float32_specials_and_random() {
         let (eb, sb) = (8u32, 24u32);
-        let specials = [0x0000_0000u64, 0x8000_0000, 0x7F80_0000, 0xFF80_0000, 0x7FC0_0000,
-                        0x3F80_0000, 0xBF80_0000, 0x4000_0000, 0x0000_0001, 0x8000_0001];
-        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        let specials = [
+            0x0000_0000u64,
+            0x8000_0000,
+            0x7F80_0000,
+            0xFF80_0000,
+            0x7FC0_0000,
+            0x3F80_0000,
+            0xBF80_0000,
+            0x4000_0000,
+            0x0000_0001,
+            0x8000_0001,
+        ];
+        let modes = [
+            RoundMode::Rne,
+            RoundMode::Rna,
+            RoundMode::Rtp,
+            RoundMode::Rtn,
+            RoundMode::Rtz,
+        ];
         let mut state: u64 = 0xADD_5EED;
-        let mut next = || { state = state.wrapping_mul(6364136223846793005).wrapping_add(1); state >> 16 };
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+            state >> 16
+        };
         let mut cases: Vec<(u64, u64)> = Vec::new();
-        for &s1 in &specials { for &s2 in &specials { cases.push((s1, s2)); } }
-        for _ in 0..200 { cases.push((next() & 0xFFFF_FFFF, next() & 0xFFFF_FFFF)); }
+        for &s1 in &specials {
+            for &s2 in &specials {
+                cases.push((s1, s2));
+            }
+        }
+        for _ in 0..200 {
+            cases.push((next() & 0xFFFF_FFFF, next() & 0xFFFF_FFFF));
+        }
         for (a, bb) in cases {
             for m in modes {
                 let want = ref_add(eb, sb, &Integer::from(a), &Integer::from(bb), m);
@@ -245,8 +364,11 @@ mod tests {
                 let yv = const_bits(&bl, eb, sb, bb);
                 let sel = rm::literal(&bl, rmode(m));
                 let word = fp_add(&mut bl, &xv, &yv, &sel, eb, sb);
-                assert_eq!(Integer::from(eval_word(bl, &word)), want,
-                    "fp.add32 a={a:#x} b={bb:#x} m={m:?}");
+                assert_eq!(
+                    Integer::from(eval_word(bl, &word)),
+                    want,
+                    "fp.add32 a={a:#x} b={bb:#x} m={m:?}"
+                );
             }
         }
     }

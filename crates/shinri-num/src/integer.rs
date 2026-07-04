@@ -615,11 +615,11 @@ mod tests {
     #[test]
     fn sqrt_rem_small_exact_and_remainder() {
         let i = |v: u64| Integer::from(v);
-        assert_eq!(i(0).sqrt_rem(),  (i(0), i(0)));
-        assert_eq!(i(1).sqrt_rem(),  (i(1), i(0)));
-        assert_eq!(i(2).sqrt_rem(),  (i(1), i(1)));
-        assert_eq!(i(3).sqrt_rem(),  (i(1), i(2)));
-        assert_eq!(i(4).sqrt_rem(),  (i(2), i(0)));
+        assert_eq!(i(0).sqrt_rem(), (i(0), i(0)));
+        assert_eq!(i(1).sqrt_rem(), (i(1), i(0)));
+        assert_eq!(i(2).sqrt_rem(), (i(1), i(1)));
+        assert_eq!(i(3).sqrt_rem(), (i(1), i(2)));
+        assert_eq!(i(4).sqrt_rem(), (i(2), i(0)));
         assert_eq!(i(15).sqrt_rem(), (i(3), i(6)));
         assert_eq!(i(16).sqrt_rem(), (i(4), i(0)));
         assert_eq!(i(17).sqrt_rem(), (i(4), i(1)));
@@ -650,10 +650,7 @@ mod tests {
             );
             // (s+1)^2 > v
             let s1 = s.clone() + Integer::one();
-            assert!(
-                s1.clone() * s1 > iv,
-                "(s+1)² not > v for {v}"
-            );
+            assert!(s1.clone() * s1 > iv, "(s+1)² not > v for {v}");
         }
     }
 }

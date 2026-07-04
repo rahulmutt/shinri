@@ -178,7 +178,12 @@ fn linearize(
                     // This is sound: arith simply introduces a fresh problem variable
                     // for it and constraints propagate through the combiner.
                     debug_assert!(
-                        !matches!(op, Op::Builtin(BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Neg)),
+                        !matches!(
+                            op,
+                            Op::Builtin(
+                                BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Neg
+                            )
+                        ),
                         "arithmetic op should have been handled above"
                     );
                     (

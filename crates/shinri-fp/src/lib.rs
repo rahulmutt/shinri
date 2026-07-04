@@ -3,6 +3,7 @@
 //! docs/superpowers/specs/2026-06-25-shinri-qffp-vertical-slice-design.md.
 
 pub mod blast;
+pub mod bridge;
 pub mod convert;
 pub mod lower;
 pub mod lzc;
@@ -29,8 +30,12 @@ pub struct FpBlaster {
 
 impl FpBlaster {
     pub fn new() -> Self {
-        FpBlaster { b: Blaster::new(), cache: FxHashMap::default(),
-                    var_bits: FxHashMap::default(), rm_cache: FxHashMap::default() }
+        FpBlaster {
+            b: Blaster::new(),
+            cache: FxHashMap::default(),
+            var_bits: FxHashMap::default(),
+            rm_cache: FxHashMap::default(),
+        }
     }
 
     /// Blast an FP-sorted term to its W=eb+sb bit word (LSB→MSB), memoized.
@@ -51,7 +56,9 @@ impl FpBlaster {
 }
 
 impl Default for FpBlaster {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WordSink for FpBlaster {
@@ -63,7 +70,12 @@ impl WordSink for FpBlaster {
         // Preserve the eager var-word recording that used to live in blast_word's
         // Uninterpreted arm: fires only on cache-miss, for exactly the FP-sorted
         // nullary vars (byte-identical var set to the pre-refactor behavior).
-        if let TermNode::App { op: Op::Uninterpreted(_), args, sort } = ctx.term_node(t) {
+        if let TermNode::App {
+            op: Op::Uninterpreted(_),
+            args,
+            sort,
+        } = ctx.term_node(t)
+        {
             if ctx.children(*args).is_empty() && ctx.fp_widths(*sort).is_some() {
                 self.var_bits.insert(t, bits.clone());
             }
@@ -103,23 +115,43 @@ fn blast_rm<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> crate::rm::R
 pub fn blast_fp_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec<BitLit> {
     let node = ctx.term_node(t).clone();
     match node {
-        TermNode::Const { val: ConstVal::Float(_), .. } => {
+        TermNode::Const {
+            val: ConstVal::Float(_),
+            ..
+        } => {
             let (eb, sb, bits) = ctx.fp_const_value(t).expect("FP const");
             let w = eb + sb;
             let two = shinri_num::Integer::from(2u64);
             let mut remaining = bits.clone();
-            (0..w).map(|_| {
-                let (q, r) = remaining.div_rem(&two);
-                remaining = q;
-                if r.is_zero() { sink.blaster().zero() } else { sink.blaster().one() }
-            }).collect()
+            (0..w)
+                .map(|_| {
+                    let (q, r) = remaining.div_rem(&two);
+                    remaining = q;
+                    if r.is_zero() {
+                        sink.blaster().zero()
+                    } else {
+                        sink.blaster().one()
+                    }
+                })
+                .collect()
         }
-        TermNode::App { op: Op::Uninterpreted(_), args, sort } => {
-            debug_assert!(ctx.children(args).is_empty(), "non-nullary FP fn out of scope");
+        TermNode::App {
+            op: Op::Uninterpreted(_),
+            args,
+            sort,
+        } => {
+            debug_assert!(
+                ctx.children(args).is_empty(),
+                "non-nullary FP fn out of scope"
+            );
             let (eb, sb) = ctx.fp_widths(sort).expect("FP-sorted variable");
             (0..(eb + sb)).map(|_| sink.blaster().fresh()).collect()
         }
-        TermNode::App { op: Op::Builtin(op), args, sort } => {
+        TermNode::App {
+            op: Op::Builtin(op),
+            args,
+            sort,
+        } => {
             use shinri_core::BuiltinOp::*;
             let (eb, sb) = ctx.fp_widths(sort).expect("FP-sorted op result");
             let kids = ctx.children(args).to_vec();
@@ -225,7 +257,9 @@ pub fn blast_fp_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
                             let xw = sink.word(ctx, kids[1]);
                             crate::convert::to_fp_int(sink.blaster(), &xw, true, eb, sb, &rm)
                         } else {
-                            let (eb_s, sb_s) = ctx.fp_widths(ctx.sort_of(kids[1])).expect("FP source operand");
+                            let (eb_s, sb_s) = ctx
+                                .fp_widths(ctx.sort_of(kids[1]))
+                                .expect("FP source operand");
                             let xw = sink.word(ctx, kids[1]);
                             crate::convert::to_fp_fp(sink.blaster(), &xw, eb_s, sb_s, eb, sb, &rm)
                         }
@@ -271,8 +305,12 @@ pub fn blast_fp_to_bv<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Ve
     // the per-formula application count — k is tiny; hash-consing already
     // dedups syntactically identical terms before we get here.
     let key = (signed_face, m, eb, sb);
-    let prior: Vec<shinri_bv::FpToBvApp> =
-        sink.fp2bv_apps().iter().filter(|a| a.key == key).cloned().collect();
+    let prior: Vec<shinri_bv::FpToBvApp> = sink
+        .fp2bv_apps()
+        .iter()
+        .filter(|a| a.key == key)
+        .cloned()
+        .collect();
     for pa in prior {
         let b = sink.blaster();
         let x_eq = crate::blast::compare::core_eq(b, &pa.operand, &xw, eb, sb);
@@ -292,7 +330,10 @@ pub fn blast_fp_to_bv<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Ve
         }
     }
     sink.fp2bv_apps().push(shinri_bv::FpToBvApp {
-        key, rm: rm.sel, operand: xw, result: word.clone(),
+        key,
+        rm: rm.sel,
+        operand: xw,
+        result: word.clone(),
     });
     word
 }
@@ -308,7 +349,10 @@ pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
     let kids = ctx.children(args).to_vec();
     match op {
         Op::Builtin(Eq) => {
-            if matches!(ctx.sort_node(ctx.sort_of(kids[0])), shinri_core::SortNode::RoundingMode) {
+            if matches!(
+                ctx.sort_node(ctx.sort_of(kids[0])),
+                shinri_core::SortNode::RoundingMode
+            ) {
                 // RM equality (slice 5): one-hot selector match. Reachable for
                 // user-written (= r RNE) and for word_norm's RM-ite definitions.
                 let x = blast_rm(sink, ctx, kids[0]);
@@ -323,7 +367,10 @@ pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
             }
         }
         Op::Builtin(Distinct) => {
-            if matches!(ctx.sort_node(ctx.sort_of(kids[0])), shinri_core::SortNode::RoundingMode) {
+            if matches!(
+                ctx.sort_node(ctx.sort_of(kids[0])),
+                shinri_core::SortNode::RoundingMode
+            ) {
                 let x = blast_rm(sink, ctx, kids[0]);
                 let y = blast_rm(sink, ctx, kids[1]);
                 let e = crate::rm::eq(sink.blaster(), &x, &y);
@@ -355,8 +402,10 @@ pub fn blast_fp_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
                 _ => unreachable!(),
             }
         }
-        Op::Builtin(classify @ (FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite
-                                | FpIsNaN | FpIsNegative | FpIsPositive)) => {
+        Op::Builtin(
+            classify @ (FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite | FpIsNaN
+            | FpIsNegative | FpIsPositive),
+        ) => {
             let (eb, sb) = ctx.fp_widths(ctx.sort_of(kids[0])).expect("Float operand");
             let w = sink.word(ctx, kids[0]);
             let u = crate::unpack::unpack(sink.blaster(), &w, eb, sb);
@@ -391,11 +440,7 @@ pub struct MixedLowered {
     pub rm_var_sels: FxHashMap<TermId, [BitLit; 5]>,
 }
 
-pub fn lower_mixed(
-    ctx: &mut Context,
-    fp_atoms: &[TermId],
-    bv_atoms: &[TermId],
-) -> MixedLowered {
+pub fn lower_mixed(ctx: &mut Context, fp_atoms: &[TermId], bv_atoms: &[TermId]) -> MixedLowered {
     let mut lw = crate::lower::Lowerer::new();
     let mut atom_lit: FxHashMap<TermId, BitLit> = FxHashMap::default();
     // BV atoms FIRST (rewritten, as the pure-BV path does), keyed by ORIGINAL id.
@@ -415,7 +460,11 @@ pub fn lower_mixed(
     var_bits.extend(fp_vars);
     let rm_var_sels = lw.rm_var_sels(ctx);
     MixedLowered {
-        words: shinri_bv::Lowered { cnf: lw.b.finish(), atom_lit, var_bits },
+        words: shinri_bv::Lowered {
+            cnf: lw.b.finish(),
+            atom_lit,
+            var_bits,
+        },
         rm_var_sels,
     }
 }
@@ -430,9 +479,9 @@ pub fn lower(ctx: &mut Context, fp_atoms: &[TermId]) -> shinri_bv::Lowered {
 #[cfg(test)]
 mod lower_tests {
     use super::*;
+    use crate::lower::Lowerer;
     use shinri_core::{BuiltinOp, Context, Op};
     use shinri_num::Integer;
-    use crate::lower::Lowerer;
 
     #[test]
     fn fp_from_bits_wires_children_lsb_first() {
@@ -446,7 +495,9 @@ mod lower_tests {
         let s = ctx.mk_app(Op::Uninterpreted(sf), &[]).unwrap();
         let e = ctx.mk_app(Op::Uninterpreted(ef), &[]).unwrap();
         let m = ctx.mk_app(Op::Uninterpreted(mf), &[]).unwrap();
-        let fp = ctx.mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[s, e, m]).unwrap();
+        let fp = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[s, e, m])
+            .unwrap();
 
         let mut lw = Lowerer::new();
         let sw = lw.word(&ctx, s);
@@ -456,7 +507,12 @@ mod lower_tests {
 
         assert_eq!(fw.len(), 32, "FpFromBits result is eb+sb bits");
         // LSB-first packing: significand (23) ++ exponent (8) ++ sign (1).
-        let expect: Vec<_> = mw.iter().chain(ew.iter()).chain(sw.iter()).copied().collect();
+        let expect: Vec<_> = mw
+            .iter()
+            .chain(ew.iter())
+            .chain(sw.iter())
+            .copied()
+            .collect();
         assert_eq!(fw, expect, "children wired sig ++ exp ++ sign, LSB-first");
     }
 
@@ -466,7 +522,9 @@ mod lower_tests {
         let bv32 = ctx.bv_sort(32);
         let bf = ctx.declare_fun("b", &[], bv32);
         let b = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
-        let cast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b]).unwrap();
+        let cast = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b])
+            .unwrap();
 
         let mut lw = Lowerer::new();
         let bw = lw.word(&ctx, b);
@@ -485,7 +543,9 @@ mod lower_tests {
         let bf = ctx.declare_fun("b", &[], bv8);
         let b = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, b]).unwrap();
+        let conv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, b])
+            .unwrap();
 
         let mut lw = Lowerer::new();
         let bw = lw.word(&ctx, b);
@@ -501,7 +561,12 @@ mod lower_tests {
         let bf = ctx.declare_fun("b", &[], bv8);
         let b = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }), &[rne, b]).unwrap();
+        let conv = ctx
+            .mk_app(
+                Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }),
+                &[rne, b],
+            )
+            .unwrap();
 
         let mut lw = Lowerer::new();
         let fw = lw.word(&ctx, conv);
@@ -522,7 +587,11 @@ mod lower_tests {
 
         assert_eq!(w_inherent.len(), 32);
         assert_eq!(w_inherent.len(), w_generic.len());
-        assert_eq!(fb1.b.num_vars(), fb2.b.num_vars(), "identical var allocation order");
+        assert_eq!(
+            fb1.b.num_vars(),
+            fb2.b.num_vars(),
+            "identical var allocation order"
+        );
     }
 
     #[test]
@@ -534,8 +603,14 @@ mod lower_tests {
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
 
         let lo = lower(&mut ctx, &[isnan]);
-        assert!(lo.atom_lit.contains_key(&isnan), "keyed by original atom TermId");
-        assert!(lo.var_bits.contains_key(&x), "x exported for model extraction");
+        assert!(
+            lo.atom_lit.contains_key(&isnan),
+            "keyed by original atom TermId"
+        );
+        assert!(
+            lo.var_bits.contains_key(&x),
+            "x exported for model extraction"
+        );
         assert_eq!(lo.var_bits[&x].len(), 32);
         assert!(lo.cnf.num_vars >= 1);
     }
@@ -549,7 +624,10 @@ mod lower_tests {
         let pz = ctx.mk_fp_const(8, 24, Integer::zero());
         let eq = ctx.mk_eq(x, pz).unwrap();
         let lo = lower(&mut ctx, &[eq]);
-        assert!(lo.atom_lit.contains_key(&eq), "FP core = must be surrogated");
+        assert!(
+            lo.atom_lit.contains_key(&eq),
+            "FP core = must be surrogated"
+        );
     }
 
     #[test]
@@ -562,12 +640,20 @@ mod lower_tests {
         let yf = ctx.declare_fun("y", &[], f32);
         let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let add = ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y]).unwrap();
+        let add = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y])
+            .unwrap();
         let two = ctx.mk_fp_const(8, 24, Integer::from(0x4000_0000u64));
         let eq = ctx.mk_eq(add, two).unwrap();
         let lo = lower(&mut ctx, &[eq]);
-        assert!(lo.atom_lit.contains_key(&eq), "core = over fp.add must be surrogated");
-        assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
+        assert!(
+            lo.atom_lit.contains_key(&eq),
+            "core = over fp.add must be surrogated"
+        );
+        assert!(
+            lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y),
+            "x,y exported"
+        );
     }
 
     #[test]
@@ -580,12 +666,20 @@ mod lower_tests {
         let yf = ctx.declare_fun("y", &[], f32);
         let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let mul = ctx.mk_app(Op::Builtin(BuiltinOp::FpMul), &[rne, x, y]).unwrap();
+        let mul = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpMul), &[rne, x, y])
+            .unwrap();
         let one = ctx.mk_fp_const(8, 24, Integer::from(0x3F80_0000u64));
         let eq = ctx.mk_eq(mul, one).unwrap();
         let lo = lower(&mut ctx, &[eq]);
-        assert!(lo.atom_lit.contains_key(&eq), "core = over fp.mul must be surrogated");
-        assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
+        assert!(
+            lo.atom_lit.contains_key(&eq),
+            "core = over fp.mul must be surrogated"
+        );
+        assert!(
+            lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y),
+            "x,y exported"
+        );
     }
 
     #[test]
@@ -598,12 +692,20 @@ mod lower_tests {
         let yf = ctx.declare_fun("y", &[], f32);
         let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let div = ctx.mk_app(Op::Builtin(BuiltinOp::FpDiv), &[rne, x, y]).unwrap();
+        let div = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpDiv), &[rne, x, y])
+            .unwrap();
         let one = ctx.mk_fp_const(8, 24, Integer::from(0x3F80_0000u64));
         let eq = ctx.mk_eq(div, one).unwrap();
         let lo = lower(&mut ctx, &[eq]);
-        assert!(lo.atom_lit.contains_key(&eq), "core = over fp.div must be surrogated");
-        assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
+        assert!(
+            lo.atom_lit.contains_key(&eq),
+            "core = over fp.div must be surrogated"
+        );
+        assert!(
+            lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y),
+            "x,y exported"
+        );
     }
 
     #[test]
@@ -619,8 +721,14 @@ mod lower_tests {
         let one = ctx.mk_fp_const(8, 24, Integer::from(0x3F80_0000u64));
         let eq = ctx.mk_eq(rem, one).unwrap();
         let lo = lower(&mut ctx, &[eq]);
-        assert!(lo.atom_lit.contains_key(&eq), "core = over fp.rem must be surrogated");
-        assert!(lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y), "x,y exported");
+        assert!(
+            lo.atom_lit.contains_key(&eq),
+            "core = over fp.rem must be surrogated"
+        );
+        assert!(
+            lo.var_bits.contains_key(&x) && lo.var_bits.contains_key(&y),
+            "x,y exported"
+        );
     }
 
     #[test]
@@ -633,20 +741,35 @@ mod lower_tests {
         // FP->FP: widen a Float32 var to Float64.
         let xf = ctx.declare_fun("x", &[], f32);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
-        let widen = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x]).unwrap();
+        let widen = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x])
+            .unwrap();
         let yf = ctx.declare_fun("y", &[], f64);
         let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
         let eq1 = ctx.mk_eq(widen, y).unwrap();
         // const-Real: to_fp of numeral 1/3 into Float32.
         let real = ctx.real_sort();
         let third = ctx.mk_numeral(shinri_core::Rational::new(1i128.into(), 3i128.into()), real);
-        let conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, third]).unwrap();
+        let conv = ctx
+            .mk_app(
+                Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }),
+                &[rne, third],
+            )
+            .unwrap();
         let zf = ctx.declare_fun("z", &[], f32);
         let z = ctx.mk_app(Op::Uninterpreted(zf), &[]).unwrap();
-        let eq2 = ctx.mk_app(Op::Builtin(BuiltinOp::FpEq), &[conv, z]).unwrap();
+        let eq2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpEq), &[conv, z])
+            .unwrap();
         let lo = lower(&mut ctx, &[eq1, eq2]);
-        assert!(lo.atom_lit.contains_key(&eq1), "core = over to_fp FP->FP must be surrogated");
-        assert!(lo.atom_lit.contains_key(&eq2), "fp.eq over const-Real to_fp must be surrogated");
+        assert!(
+            lo.atom_lit.contains_key(&eq1),
+            "core = over to_fp FP->FP must be surrogated"
+        );
+        assert!(
+            lo.atom_lit.contains_key(&eq2),
+            "fp.eq over const-Real to_fp must be surrogated"
+        );
     }
 
     #[test]
@@ -669,8 +792,14 @@ mod lower_tests {
         assert!(l.atom_lit.contains_key(&bv_eq), "BV atom surrogated");
         assert!(l.atom_lit.contains_key(&isnan), "FP atom surrogated");
         // var_bits holds BOTH the 8-bit BV var and the 32-bit FP var.
-        assert!(l.var_bits.contains_key(&x) && l.var_bits[&x].len() == 8, "BV var word present");
-        assert!(l.var_bits.contains_key(&y) && l.var_bits[&y].len() == 32, "FP var word present");
+        assert!(
+            l.var_bits.contains_key(&x) && l.var_bits[&x].len() == 8,
+            "BV var word present"
+        );
+        assert!(
+            l.var_bits.contains_key(&y) && l.var_bits[&y].len() == 32,
+            "FP var word present"
+        );
     }
 }
 
@@ -703,7 +832,10 @@ mod blast_tests {
         let vb = fb.exported_var_bits();
         assert!(vb.contains_key(&x));
         assert_eq!(vb[&x].len(), 32);
-        assert!(!vb.contains_key(&z), "constants are not exported as variables");
+        assert!(
+            !vb.contains_key(&z),
+            "constants are not exported as variables"
+        );
     }
 
     #[test]
@@ -713,13 +845,22 @@ mod blast_tests {
         let two = ctx.mk_fp_const(8, 24, Integer::from(0x4000_0000u64));
         let mut fb = FpBlaster::new();
         // Each relation atom must dispatch (no `unreachable!`):
-        for rel in [BuiltinOp::FpLt, BuiltinOp::FpLeq, BuiltinOp::FpGt, BuiltinOp::FpGeq] {
+        for rel in [
+            BuiltinOp::FpLt,
+            BuiltinOp::FpLeq,
+            BuiltinOp::FpGt,
+            BuiltinOp::FpGeq,
+        ] {
             let a = ctx.mk_app(Op::Builtin(rel), &[one, two]).unwrap();
             let _lit = fb.blast_atom(&ctx, a); // must not panic
         }
         // min/max words must dispatch and yield a 32-bit word:
-        let mn = ctx.mk_app(Op::Builtin(BuiltinOp::FpMin), &[one, two]).unwrap();
-        let mx = ctx.mk_app(Op::Builtin(BuiltinOp::FpMax), &[one, two]).unwrap();
+        let mn = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpMin), &[one, two])
+            .unwrap();
+        let mx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpMax), &[one, two])
+            .unwrap();
         assert_eq!(fb.blast_word(&ctx, mn).len(), 32);
         assert_eq!(fb.blast_word(&ctx, mx).len(), 32);
     }

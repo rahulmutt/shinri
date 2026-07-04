@@ -98,12 +98,12 @@ pub fn has_unfoldable_substr_or_at(ctx: &Context, t: TermId) -> bool {
                 }
                 _ => true, // not a substr/at op: "foldable" is irrelevant here
             };
-            let self_unfoldable = matches!(
-                op,
-                Op::Builtin(BuiltinOp::StrAt | BuiltinOp::StrSubstr)
-            ) && !foldable;
+            let self_unfoldable =
+                matches!(op, Op::Builtin(BuiltinOp::StrAt | BuiltinOp::StrSubstr)) && !foldable;
             self_unfoldable
-                || children.iter().any(|&c| has_unfoldable_substr_or_at(ctx, c))
+                || children
+                    .iter()
+                    .any(|&c| has_unfoldable_substr_or_at(ctx, c))
         }
         TermNode::Const { .. } => false,
     }
@@ -121,9 +121,7 @@ pub fn contains_substr_or_at(ctx: &Context, t: TermId) -> bool {
                 return true;
             }
             let children = ctx.children(*args).to_vec();
-            children
-                .iter()
-                .any(|&c| contains_substr_or_at(ctx, c))
+            children.iter().any(|&c| contains_substr_or_at(ctx, c))
         }
         TermNode::Const { .. } => false,
     }
@@ -231,7 +229,10 @@ fn encode_substr(
         .expect("l > 0");
 
     let in_range = ctx
-        .mk_app(Op::Builtin(BuiltinOp::And), &[ge_i_zero, lt_i_lens, gt_l_zero])
+        .mk_app(
+            Op::Builtin(BuiltinOp::And),
+            &[ge_i_zero, lt_i_lens, gt_l_zero],
+        )
         .expect("in_range");
 
     // Build min_l_rem = ite(l <= len_s - i, l, len_s - i)
@@ -290,10 +291,8 @@ fn rewrite(ctx: &mut Context, t: TermId, guards: &mut Vec<TermId>) -> TermId {
         TermNode::App { op, args, .. } => {
             // First rewrite all children bottom-up.
             let children: Vec<TermId> = ctx.children(args).to_vec();
-            let new_children: Vec<TermId> = children
-                .iter()
-                .map(|&c| rewrite(ctx, c, guards))
-                .collect();
+            let new_children: Vec<TermId> =
+                children.iter().map(|&c| rewrite(ctx, c, guards)).collect();
 
             match op {
                 Op::Builtin(BuiltinOp::StrSubstr) => {
@@ -315,10 +314,7 @@ fn rewrite(ctx: &mut Context, t: TermId, guards: &mut Vec<TermId>) -> TermId {
                     let s = new_children[0];
                     let i = new_children[1];
                     let int_s = ctx.int_sort();
-                    let one = ctx.mk_numeral(
-                        shinri_core::Rational::from_int(1i128.into()),
-                        int_s,
-                    );
+                    let one = ctx.mk_numeral(shinri_core::Rational::from_int(1i128.into()), int_s);
                     if let Some(v) = eval_substr_const(ctx, s, i, one) {
                         ctx.mk_string_const(&v)
                     } else {
@@ -414,7 +410,9 @@ fn elim_term_ite(
                 let sort = ctx.sort_of(t);
                 let n = next_fresh();
                 let w_sym = ctx.declare_fun(&format!("!ite{n}"), &[], sort);
-                let w = ctx.mk_app(Op::Uninterpreted(w_sym), &[]).expect("fresh ite var");
+                let w = ctx
+                    .mk_app(Op::Uninterpreted(w_sym), &[])
+                    .expect("fresh ite var");
                 let eq_then = ctx.mk_eq(w, then_b).expect("w = then");
                 let eq_else = ctx.mk_eq(w, else_b).expect("w = else");
                 let not_cond = ctx
@@ -435,7 +433,8 @@ fn elim_term_ite(
                     .zip(children.iter())
                     .any(|(nc, oc)| nc != oc);
                 if changed {
-                    ctx.mk_app(op, &new_children).expect("rebuild after ite elim")
+                    ctx.mk_app(op, &new_children)
+                        .expect("rebuild after ite elim")
                 } else {
                     t
                 }
@@ -460,8 +459,14 @@ mod tests {
             let f = ctx.declare_fun("s", &[], str_s);
             ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
         };
-        let i = ctx.mk_numeral(shinri_core::Rational::from_int(1i128.into()), ctx.int_sort());
-        let one = ctx.mk_numeral(shinri_core::Rational::from_int(1i128.into()), ctx.int_sort());
+        let i = ctx.mk_numeral(
+            shinri_core::Rational::from_int(1i128.into()),
+            ctx.int_sort(),
+        );
+        let one = ctx.mk_numeral(
+            shinri_core::Rational::from_int(1i128.into()),
+            ctx.int_sort(),
+        );
         let ss = ctx
             .mk_app(Op::Builtin(BuiltinOp::StrSubstr), &[s, i, one])
             .unwrap();
@@ -486,10 +491,11 @@ mod tests {
             let f = ctx.declare_fun("s_at", &[], str_s);
             ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
         };
-        let i = ctx.mk_numeral(shinri_core::Rational::from_int(0i128.into()), ctx.int_sort());
-        let at = ctx
-            .mk_app(Op::Builtin(BuiltinOp::StrAt), &[s, i])
-            .unwrap();
+        let i = ctx.mk_numeral(
+            shinri_core::Rational::from_int(0i128.into()),
+            ctx.int_sort(),
+        );
+        let at = ctx.mk_app(Op::Builtin(BuiltinOp::StrAt), &[s, i]).unwrap();
         let lit = ctx.mk_string_const("a");
         let atom = ctx.mk_eq(at, lit).unwrap();
         let out = reduce_assertions(&mut ctx, &[atom]);
@@ -510,9 +516,7 @@ mod tests {
             ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
         };
         let zero = ctx.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int);
-        let gt = ctx
-            .mk_app(Op::Builtin(BuiltinOp::Gt), &[x, zero])
-            .unwrap();
+        let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[x, zero]).unwrap();
         let out = reduce_assertions(&mut ctx, &[gt]);
         assert_eq!(out.len(), 1, "non-string query must not get extra guards");
         assert_eq!(out[0], gt, "assertion must be unchanged");

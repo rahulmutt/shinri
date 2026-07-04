@@ -724,7 +724,11 @@ mod tests {
 
         assert_eq!(bits_inherent.len(), 8);
         assert_eq!(bits_inherent.len(), bits_generic.len());
-        assert_eq!(b1.num_vars(), b2.num_vars(), "identical var allocation order");
+        assert_eq!(
+            b1.num_vars(),
+            b2.num_vars(),
+            "identical var allocation order"
+        );
     }
 
     #[test]

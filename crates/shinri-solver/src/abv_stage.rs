@@ -135,9 +135,7 @@ fn walk_fence(ctx: &Context, t: TermId, visited: &mut rustc_hash::FxHashSet<Term
             // fp_stage::has_non_fp_theory_atom / bv_stage's
             // has_non_bv_theory_atom (ported in slice 6; closes the pinned
             // sound-Unknown asymmetry from slice 5).
-            if matches!(op, Op::Uninterpreted(_))
-                && kids.is_empty()
-                && ctx.sort_of(t) == bool_sort
+            if matches!(op, Op::Uninterpreted(_)) && kids.is_empty() && ctx.sort_of(t) == bool_sort
             {
                 return false;
             }
@@ -450,7 +448,10 @@ fn encode_skeleton(
         // value rather than leaking a free proxy var. Encoding these as free
         // leaves (the old catch-all) let `(ite true …)` / `(or false …)` pick
         // the wrong branch → wrong-SAT (I4).
-        TermNode::Const { val: ConstVal::Bool(b), .. } => {
+        TermNode::Const {
+            val: ConstVal::Bool(b),
+            ..
+        } => {
             let v = st.sat.new_var();
             st.sat.add_clause(&[Lit::new(v, b)]); // force v == b
             Lit::new(v, true) // literal value == v == b

@@ -7,8 +7,8 @@ use shinri_bv::{BitLit, Blaster};
 /// consumers as needed. Flags are derived from the exponent/significand fields.
 pub struct Unpacked {
     pub sign: BitLit,
-    pub exp: Vec<BitLit>,   // eb bits, LSB→MSB
-    pub sig: Vec<BitLit>,   // sb-1 bits, LSB→MSB
+    pub exp: Vec<BitLit>, // eb bits, LSB→MSB
+    pub sig: Vec<BitLit>, // sb-1 bits, LSB→MSB
     pub is_nan: BitLit,
     pub is_inf: BitLit,
     pub is_zero: BitLit,
@@ -25,13 +25,18 @@ pub fn unpack(b: &mut Blaster, bits: &[BitLit], eb: u32, sb: u32) -> Unpacked {
     // exp_all_ones = AND of all exp bits ; exp_all_zero = AND of all (NOT exp bits)
     let and_all = |b: &mut Blaster, lits: &[BitLit]| -> BitLit {
         let mut acc = b.one();
-        for &l in lits { acc = b.and2(acc, l); }
+        for &l in lits {
+            acc = b.and2(acc, l);
+        }
         acc
     };
     let nor_all = |b: &mut Blaster, lits: &[BitLit]| -> BitLit {
         // true iff all lits are false
         let mut acc = b.one();
-        for &l in lits { let nl = b.not1(l); acc = b.and2(acc, nl); }
+        for &l in lits {
+            let nl = b.not1(l);
+            acc = b.and2(acc, nl);
+        }
         acc
     };
     let exp_all_ones = and_all(b, &exp);
@@ -43,5 +48,12 @@ pub fn unpack(b: &mut Blaster, bits: &[BitLit], eb: u32, sb: u32) -> Unpacked {
     let is_nan = b.and2(exp_all_ones, sig_nonzero);
     let is_zero = b.and2(exp_all_zero, sig_all_zero);
 
-    Unpacked { sign, exp, sig, is_nan, is_inf, is_zero }
+    Unpacked {
+        sign,
+        exp,
+        sig,
+        is_nan,
+        is_inf,
+        is_zero,
+    }
 }

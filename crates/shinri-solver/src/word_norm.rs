@@ -133,9 +133,7 @@ impl WordNorm {
                 .expect("child-for-child rebuild preserves sorts")
         };
         let result = match op {
-            Op::Builtin(BuiltinOp::Ite)
-                if is_word_sort(ctx, ctx.sort_of(rebuilt)) =>
-            {
+            Op::Builtin(BuiltinOp::Ite) if is_word_sort(ctx, ctx.sort_of(rebuilt)) => {
                 let (c, x, y) = (new_kids[0], new_kids[1], new_kids[2]);
                 let w = if let Some(&w) = self.ite_var.get(&rebuilt) {
                     w
@@ -144,11 +142,14 @@ impl WordNorm {
                     self.ite_var.insert(rebuilt, w);
                     w
                 };
-                let wx = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[w, x])
+                let wx = ctx
+                    .mk_app(Op::Builtin(BuiltinOp::Eq), &[w, x])
                     .expect("(= w then) well-sorted");
-                let wy = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[w, y])
+                let wy = ctx
+                    .mk_app(Op::Builtin(BuiltinOp::Eq), &[w, y])
                     .expect("(= w else) well-sorted");
-                let def = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, wx, wy])
+                let def = ctx
+                    .mk_app(Op::Builtin(BuiltinOp::Ite), &[c, wx, wy])
                     .expect("definition well-sorted");
                 if seen_defs.insert(def) {
                     defs.push(def);
@@ -159,8 +160,7 @@ impl WordNorm {
                 self.orig_ite.insert(t, w);
                 w
             }
-            Op::Builtin(BuiltinOp::Eq) if new_kids.len() > 2 =>
-            {
+            Op::Builtin(BuiltinOp::Eq) if new_kids.len() > 2 => {
                 // (= a b c ...) → (and (= a b) (= b c) ...): adjacent chain.
                 let pairs: Vec<TermId> = new_kids
                     .windows(2)
@@ -172,8 +172,7 @@ impl WordNorm {
                 ctx.mk_app(Op::Builtin(BuiltinOp::And), &pairs)
                     .expect("and well-sorted")
             }
-            Op::Builtin(BuiltinOp::Distinct) if new_kids.len() > 2 =>
-            {
+            Op::Builtin(BuiltinOp::Distinct) if new_kids.len() > 2 => {
                 // An n-ary distinct with a repeated operand can never hold (a value
                 // cannot differ from itself), so the whole atom is `false`. Fold it
                 // directly rather than emit a self-distinct pair `(distinct x x)` that
@@ -222,8 +221,11 @@ impl WordNorm {
                         if ctx.children(ca).len() > 2
                 );
                 if child_is_nary_eq {
-                    if let TermNode::App { op: Op::Builtin(BuiltinOp::And), args: aa, .. } =
-                        ctx.term_node(new_kids[0]).clone()
+                    if let TermNode::App {
+                        op: Op::Builtin(BuiltinOp::And),
+                        args: aa,
+                        ..
+                    } = ctx.term_node(new_kids[0]).clone()
                     {
                         let conjs: Vec<TermId> = ctx.children(aa).to_vec();
                         let disj: Vec<TermId> = conjs
@@ -299,7 +301,9 @@ mod tests {
         // Definition is (ite c (= w x) (= w y)).
         let wx = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[w, x]).unwrap();
         let wy = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[w, y]).unwrap();
-        let expect_def = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, wx, wy]).unwrap();
+        let expect_def = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[c, wx, wy])
+            .unwrap();
         assert_eq!(out[1], expect_def);
     }
 
@@ -315,7 +319,11 @@ mod tests {
         let mut wn = WordNorm::default();
         let out1 = wn.normalize(&mut ctx, &[a1, a2]);
         assert_eq!(wn.internal.len(), 1, "one ite term → one fresh symbol");
-        assert_eq!(out1.len(), 3, "two rewritten atoms + ONE deduped definition");
+        assert_eq!(
+            out1.len(),
+            3,
+            "two rewritten atoms + ONE deduped definition"
+        );
         // Second check-sat: same memoized symbol, definition re-emitted.
         let out2 = wn.normalize(&mut ctx, &[a1]);
         assert_eq!(wn.internal.len(), 1);
@@ -333,7 +341,9 @@ mod tests {
         let y = bv_var(&mut ctx, "y", 4);
         let z = bv_var(&mut ctx, "z", 4);
         let inner = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[d, x, y]).unwrap();
-        let outer = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, inner, z]).unwrap();
+        let outer = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[c, inner, z])
+            .unwrap();
         let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[outer, x]).unwrap();
         let mut wn = WordNorm::default();
         let out = wn.normalize(&mut ctx, &[atom]);
@@ -348,7 +358,9 @@ mod tests {
         let y = bv_var(&mut ctx, "y", 8);
         let z = bv_var(&mut ctx, "z", 8);
         let eq3 = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, y, z]).unwrap();
-        let d3 = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, y, z]).unwrap();
+        let d3 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, y, z])
+            .unwrap();
         let mut wn = WordNorm::default();
         let out = wn.normalize(&mut ctx, &[eq3, d3]);
         // (= x y z) → (and (= x y) (= y z))
@@ -357,10 +369,18 @@ mod tests {
         let expect_eq = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[xy, yz]).unwrap();
         assert_eq!(out[0], expect_eq);
         // (distinct x y z) → (and (distinct x y) (distinct x z) (distinct y z))
-        let dxy = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, y]).unwrap();
-        let dxz = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, z]).unwrap();
-        let dyz = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[y, z]).unwrap();
-        let expect_d = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[dxy, dxz, dyz]).unwrap();
+        let dxy = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, y])
+            .unwrap();
+        let dxz = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, z])
+            .unwrap();
+        let dyz = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[y, z])
+            .unwrap();
+        let expect_d = ctx
+            .mk_app(Op::Builtin(BuiltinOp::And), &[dxy, dxz, dyz])
+            .unwrap();
         assert_eq!(out[1], expect_d);
 
         // Slice 6: NON-word sorts expand too — the expansion is sort-universal
@@ -373,14 +393,27 @@ mod tests {
         let b = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
         let cf = ctx.declare_fun("ci", &[], int_s);
         let cc = ctx.mk_app(Op::Uninterpreted(cf), &[]).unwrap();
-        let di = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, b, cc]).unwrap();
+        let di = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, b, cc])
+            .unwrap();
         let out2 = wn.normalize(&mut ctx, &[di]);
-        let dab = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, b]).unwrap();
-        let dac = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, cc]).unwrap();
-        let dbc = ctx.mk_app(Op::Builtin(BuiltinOp::Distinct), &[b, cc]).unwrap();
-        let expect_di =
-            ctx.mk_app(Op::Builtin(BuiltinOp::And), &[dab, dac, dbc]).unwrap();
-        assert_eq!(out2, vec![expect_di], "Int n-ary distinct expands (slice 6)");
+        let dab = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, b])
+            .unwrap();
+        let dac = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[a, cc])
+            .unwrap();
+        let dbc = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[b, cc])
+            .unwrap();
+        let expect_di = ctx
+            .mk_app(Op::Builtin(BuiltinOp::And), &[dab, dac, dbc])
+            .unwrap();
+        assert_eq!(
+            out2,
+            vec![expect_di],
+            "Int n-ary distinct expands (slice 6)"
+        );
         // Bool n-ary = (the tseitin p↔q wrong-SAT family):
         let p = bool_var(&mut ctx, "p");
         let q = bool_var(&mut ctx, "q");
@@ -432,13 +465,17 @@ mod tests {
         let c = bool_var(&mut ctx, "c");
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
         let rtz = ctx.mk_rm_const(shinri_core::RoundingMode::Rtz);
-        let ite = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, rne, rtz]).unwrap();
+        let ite = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[c, rne, rtz])
+            .unwrap();
         // Embed under an FP op so the ite is in operand position:
         // (fp.sqrt (ite c RNE RTZ) x)
         let f32s = ctx.fp_sort(8, 24);
         let xf = ctx.declare_fun("x", &[], f32s);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
-        let sq = ctx.mk_app(Op::Builtin(BuiltinOp::FpSqrt), &[ite, x]).unwrap();
+        let sq = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpSqrt), &[ite, x])
+            .unwrap();
         let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[sq, x]).unwrap();
         let mut wn = WordNorm::default();
         let out = wn.normalize(&mut ctx, &[atom]);
@@ -447,7 +484,9 @@ mod tests {
         // The rewritten atom's sqrt operand is the fresh RM variable.
         let w = *wn.internal.iter().next().unwrap();
         let new_sq = ctx.mk_app(Op::Builtin(BuiltinOp::FpSqrt), &[w, x]).unwrap();
-        let expect = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[new_sq, x]).unwrap();
+        let expect = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Eq), &[new_sq, x])
+            .unwrap();
         assert_eq!(out[0], expect);
     }
 
@@ -487,7 +526,10 @@ mod tests {
         assert!(
             matches!(
                 ctx.term_node(out[0]),
-                TermNode::Const { val: ConstVal::Bool(false), .. }
+                TermNode::Const {
+                    val: ConstVal::Bool(false),
+                    ..
+                }
             ),
             "expected false constant, got {:?}",
             ctx.term_node(out[0])

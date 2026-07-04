@@ -19,23 +19,63 @@ fn is_rm_sorted(ctx: &Context, t: TermId) -> bool {
 /// True if `op` is any FP builtin (word op, predicate, classification, or conversion).
 fn is_fp_op(op: &Op) -> bool {
     use BuiltinOp::*;
-    matches!(op, Op::Builtin(
-        FpAbs | FpNeg | FpAdd | FpSub | FpMul | FpDiv | FpFma | FpSqrt | FpRem
-        | FpRoundToIntegral | FpMin | FpMax | FpLeq | FpLt | FpGeq | FpGt | FpEq
-        | FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite | FpIsNaN
-        | FpIsNegative | FpIsPositive | FpFromBits
-        | ToFp { .. } | ToFpUnsigned { .. } | FpToUbv(_) | FpToSbv(_) | FpToReal
-    ))
+    matches!(
+        op,
+        Op::Builtin(
+            FpAbs
+                | FpNeg
+                | FpAdd
+                | FpSub
+                | FpMul
+                | FpDiv
+                | FpFma
+                | FpSqrt
+                | FpRem
+                | FpRoundToIntegral
+                | FpMin
+                | FpMax
+                | FpLeq
+                | FpLt
+                | FpGeq
+                | FpGt
+                | FpEq
+                | FpIsNormal
+                | FpIsSubnormal
+                | FpIsZero
+                | FpIsInfinite
+                | FpIsNaN
+                | FpIsNegative
+                | FpIsPositive
+                | FpFromBits
+                | ToFp { .. }
+                | ToFpUnsigned { .. }
+                | FpToUbv(_)
+                | FpToSbv(_)
+                | FpToReal
+        )
+    )
 }
 
 /// FP PREDICATES (Bool-sorted FP atoms): comparisons + classifications.
 fn is_fp_predicate(op: &Op) -> bool {
     use BuiltinOp::*;
-    matches!(op, Op::Builtin(
-        FpLeq | FpLt | FpGeq | FpGt | FpEq
-        | FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite | FpIsNaN
-        | FpIsNegative | FpIsPositive
-    ))
+    matches!(
+        op,
+        Op::Builtin(
+            FpLeq
+                | FpLt
+                | FpGeq
+                | FpGt
+                | FpEq
+                | FpIsNormal
+                | FpIsSubnormal
+                | FpIsZero
+                | FpIsInfinite
+                | FpIsNaN
+                | FpIsNegative
+                | FpIsPositive
+        )
+    )
 }
 
 /// True if any subterm has a Float or RoundingMode sort or an FP builtin op.
@@ -45,12 +85,21 @@ fn is_fp_predicate(op: &Op) -> bool {
 pub fn solver_uses_fp(ctx: &Context, assertions: &[TermId]) -> bool {
     let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
     fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
-        if !seen.insert(t) { return false; }
-        if is_fp_sorted(ctx, t) || is_rm_sorted(ctx, t) { return true; }
+        if !seen.insert(t) {
+            return false;
+        }
+        if is_fp_sorted(ctx, t) || is_rm_sorted(ctx, t) {
+            return true;
+        }
         match ctx.term_node(t) {
             TermNode::App { op, args, .. } => {
-                if is_fp_op(op) { return true; }
-                ctx.children(*args).to_vec().into_iter().any(|c| walk(ctx, c, seen))
+                if is_fp_op(op) {
+                    return true;
+                }
+                ctx.children(*args)
+                    .to_vec()
+                    .into_iter()
+                    .any(|c| walk(ctx, c, seen))
             }
             TermNode::Const { .. } => false,
         }
@@ -85,7 +134,11 @@ pub fn uses_crossing_conversion(ctx: &Context, assertions: &[TermId]) -> bool {
         if let TermNode::App { op, args, .. } = ctx.term_node(t) {
             let kids: Vec<TermId> = ctx.children(*args).to_vec();
             let is_crossing = match op {
-                Op::Builtin(BuiltinOp::FpToReal) => true,
+                // fp.to_real is admitted (slice 9) for eb<=8 (Float16/32); larger
+                // formats stay crossing (Real bridge deferred for eb>8).
+                Op::Builtin(BuiltinOp::FpToReal) => {
+                    !matches!(ctx.fp_widths(ctx.sort_of(kids[0])), Some((eb, _)) if eb <= 8)
+                }
                 Op::Builtin(BuiltinOp::ToFp { .. }) => match kids.len() {
                     1 => false, // 1-arg BV bitcast — admitted in slice 4c
                     2 => match ctx.sort_node(ctx.sort_of(kids[1])) {
@@ -114,46 +167,90 @@ pub fn collect_fp_atoms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
     let mut out: Vec<TermId> = Vec::new();
     let mut in_set: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
     let mut visited: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
-    fn walk(ctx: &Context, t: TermId, out: &mut Vec<TermId>,
-            in_set: &mut rustc_hash::FxHashSet<TermId>,
-            visited: &mut rustc_hash::FxHashSet<TermId>) {
-        if !visited.insert(t) { return; }
+    fn walk(
+        ctx: &Context,
+        t: TermId,
+        out: &mut Vec<TermId>,
+        in_set: &mut rustc_hash::FxHashSet<TermId>,
+        visited: &mut rustc_hash::FxHashSet<TermId>,
+    ) {
+        if !visited.insert(t) {
+            return;
+        }
         if let TermNode::App { op, args, .. } = ctx.term_node(t) {
             let kids: Vec<TermId> = ctx.children(*args).to_vec();
             let is_atom = match op {
                 _ if is_fp_predicate(op) => true,
-                Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct) =>
-                    kids.iter().any(|&k| is_fp_sorted(ctx, k) || is_rm_sorted(ctx, k)),
+                Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct) => kids
+                    .iter()
+                    .any(|&k| is_fp_sorted(ctx, k) || is_rm_sorted(ctx, k)),
                 _ => false,
             };
-            if is_atom && in_set.insert(t) { out.push(t); return; }
-            for k in kids { walk(ctx, k, out, in_set, visited); }
+            if is_atom && in_set.insert(t) {
+                out.push(t);
+                return;
+            }
+            for k in kids {
+                walk(ctx, k, out, in_set, visited);
+            }
         }
     }
-    for &a in assertions { walk(ctx, a, &mut out, &mut in_set, &mut visited); }
+    for &a in assertions {
+        walk(ctx, a, &mut out, &mut in_set, &mut visited);
+    }
     out
 }
 
-/// Mixed-theory fence (conservative). True if any Bool-sorted atom outside the
-/// FP set is not pure Boolean structure — including BV atoms (BVFP waits for
-/// Plan 4) and arith/EUF/array atoms. When true, the caller returns Unknown.
-pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[TermId]) -> bool {
-    let fp_set: rustc_hash::FxHashSet<TermId> = fp_atoms.iter().copied().collect();
+/// Shared walk: collect every Bool-sorted atom that is NEITHER in `allow_set`
+/// NOR pure Boolean structure (Not/And/Or/Implies/Xor/Ite, or Bool-sorted
+/// Eq/Distinct) NOR a bare nullary Bool constant. This is the single walk
+/// factored out of the old `has_non_fp_theory_atom` body so the bool fence
+/// predicate and the `Vec`-returning `non_bvfp_atoms` enumerator (added in
+/// slice 9 for `bridge_admissible`) share one implementation (DRY) instead of
+/// two copies of the same recursion that could drift apart.
+fn foreign_theory_atoms(
+    ctx: &Context,
+    assertions: &[TermId],
+    allow_set: &rustc_hash::FxHashSet<TermId>,
+) -> Vec<TermId> {
     let mut visited: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
-    fn walk(ctx: &Context, t: TermId, fp_set: &rustc_hash::FxHashSet<TermId>,
-            visited: &mut rustc_hash::FxHashSet<TermId>) -> bool {
-        if fp_set.contains(&t) { return false; }
-        if !visited.insert(t) { return false; }
+    let mut out: Vec<TermId> = Vec::new();
+    fn walk(
+        ctx: &Context,
+        t: TermId,
+        allow_set: &rustc_hash::FxHashSet<TermId>,
+        visited: &mut rustc_hash::FxHashSet<TermId>,
+        out: &mut Vec<TermId>,
+    ) {
+        if allow_set.contains(&t) {
+            return;
+        }
+        if !visited.insert(t) {
+            return;
+        }
         match ctx.term_node(t) {
             TermNode::App { op, args, .. } => {
                 let kids: Vec<TermId> = ctx.children(*args).to_vec();
-                let is_bool_structure = matches!(op, Op::Builtin(
-                    BuiltinOp::Not | BuiltinOp::And | BuiltinOp::Or
-                    | BuiltinOp::Implies | BuiltinOp::Xor | BuiltinOp::Ite));
+                let is_bool_structure = matches!(
+                    op,
+                    Op::Builtin(
+                        BuiltinOp::Not
+                            | BuiltinOp::And
+                            | BuiltinOp::Or
+                            | BuiltinOp::Implies
+                            | BuiltinOp::Xor
+                            | BuiltinOp::Ite
+                    )
+                );
                 let is_bool_eq = matches!(op, Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct))
-                    && kids.first().is_some_and(|&k| ctx.sort_of(k) == ctx.bool_sort());
+                    && kids
+                        .first()
+                        .is_some_and(|&k| ctx.sort_of(k) == ctx.bool_sort());
                 if is_bool_structure || is_bool_eq {
-                    return kids.iter().any(|&k| walk(ctx, k, fp_set, visited));
+                    for k in kids {
+                        walk(ctx, k, allow_set, visited, out);
+                    }
+                    return;
                 }
                 // A bare declared Bool constant (0-ary uninterpreted symbol,
                 // Bool-sorted) needs NO theory reasoning: a nullary symbol has
@@ -169,18 +266,33 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
                     && kids.is_empty()
                     && ctx.sort_of(t) == ctx.bool_sort()
                 {
-                    return false;
+                    return;
                 }
                 if ctx.sort_of(t) == ctx.bool_sort() {
-                    // Bool-sorted, not an FP atom, not Boolean structure → fence.
-                    return true;
+                    // Bool-sorted, not in the allow-set, not Boolean structure
+                    // → a foreign theory atom.
+                    out.push(t);
+                    return;
                 }
-                kids.iter().any(|&k| walk(ctx, k, fp_set, visited))
+                for k in kids {
+                    walk(ctx, k, allow_set, visited, out);
+                }
             }
-            TermNode::Const { .. } => false,
+            TermNode::Const { .. } => {}
         }
     }
-    assertions.iter().any(|&a| walk(ctx, a, &fp_set, &mut visited))
+    for &a in assertions {
+        walk(ctx, a, allow_set, &mut visited, &mut out);
+    }
+    out
+}
+
+/// Mixed-theory fence (conservative). True if any Bool-sorted atom outside the
+/// FP set is not pure Boolean structure — including BV atoms (BVFP waits for
+/// Plan 4) and arith/EUF/array atoms. When true, the caller returns Unknown.
+pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[TermId]) -> bool {
+    let fp_set: rustc_hash::FxHashSet<TermId> = fp_atoms.iter().copied().collect();
+    !foreign_theory_atoms(ctx, assertions, &fp_set).is_empty()
 }
 
 /// Third-theory fence for the lifted mixed BV+FP path (slice 4b). Returns true
@@ -198,6 +310,179 @@ pub fn has_non_bvfp_theory_atom(
     union.extend_from_slice(fp_atoms);
     union.extend_from_slice(bv_atoms);
     has_non_fp_theory_atom(ctx, assertions, &union)
+}
+
+/// `Vec`-returning sibling of `has_non_bvfp_theory_atom`: every Bool-sorted
+/// atom NEITHER a collected FP atom NOR a collected BV atom NOR pure Boolean
+/// structure, returned so the caller (`bridge_admissible`) can further classify
+/// each one (e.g. accept pure-LRA-Real atoms) instead of just fencing. Shares
+/// the `foreign_theory_atoms` walk with `has_non_fp_theory_atom` (DRY).
+fn non_bvfp_atoms(
+    ctx: &Context,
+    assertions: &[TermId],
+    fp_atoms: &[TermId],
+    bv_atoms: &[TermId],
+) -> Vec<TermId> {
+    let mut allow: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::with_capacity_and_hasher(
+        fp_atoms.len() + bv_atoms.len(),
+        Default::default(),
+    );
+    allow.extend(fp_atoms.iter().copied());
+    allow.extend(bv_atoms.iter().copied());
+    foreign_theory_atoms(ctx, assertions, &allow)
+}
+
+/// True iff every crossing conversion present is an admitted `fp.to_real`
+/// (operand Float with eb ≤ 8) — i.e. NO symbolic-Real `to_fp`, and no
+/// `fp.to_real` over a too-large format. NOTE: this is vacuously true when NO
+/// crossing conversion is present at all (including when there is no
+/// `fp.to_real` term whatsoever) — callers must NOT treat this alone as
+/// evidence that a `fp.to_real` bridge is in play; see
+/// `has_admitted_to_real_term` in `bridge_admissible` for that.
+fn only_crossing_is_admitted_to_real(ctx: &Context, assertions: &[TermId]) -> bool {
+    let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+    fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
+        if !seen.insert(t) {
+            return true;
+        }
+        if let TermNode::App { op, args, .. } = ctx.term_node(t) {
+            let kids: Vec<TermId> = ctx.children(*args).to_vec();
+            match op {
+                Op::Builtin(BuiltinOp::FpToReal) => {
+                    // admitted iff operand is Float with eb <= 8
+                    match ctx.fp_widths(ctx.sort_of(kids[0])) {
+                        Some((eb, _sb)) if eb <= 8 => {}
+                        _ => return false,
+                    }
+                }
+                // any symbolic-Real to_fp face is NOT admitted here.
+                Op::Builtin(BuiltinOp::ToFp { .. })
+                    if kids.len() == 2
+                        && matches!(ctx.sort_node(ctx.sort_of(kids[1])), SortNode::Real)
+                        && ctx.const_real_value(kids[1]).is_none() =>
+                {
+                    return false;
+                }
+                _ => {}
+            }
+            return kids.into_iter().all(|c| walk(ctx, c, seen));
+        }
+        true
+    }
+    assertions.iter().all(|&a| walk(ctx, a, &mut seen))
+}
+
+/// True iff at least one `fp.to_real` term with an admitted operand (eb ≤ 8)
+/// is actually present. SCOPE-TIGHTENING (slice 9 pre-flight finding):
+/// `only_crossing_is_admitted_to_real` alone is vacuously true when there is
+/// no crossing conversion at all — including when there is no `fp.to_real`
+/// term whatsoever. Combined with "every non-BVFP atom is pure-LRA-Real",
+/// `bridge_admissible` would otherwise wrongly accept an FP+BV query that
+/// merely happens to have a bare-Real LRA atom alongside it but never
+/// actually uses the `fp.to_real` bridge — a shape outside this slice's
+/// intended scope ("fp.to_real freely mixed with LRA"). Requiring at least
+/// one admitted `fp.to_real` term closes that gap; every shape this slice
+/// intends to admit already contains one, so this never rejects an in-scope
+/// query.
+fn has_admitted_to_real_term(ctx: &Context, assertions: &[TermId]) -> bool {
+    let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+    fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
+        if !seen.insert(t) {
+            return false;
+        }
+        if let TermNode::App { op, args, .. } = ctx.term_node(t) {
+            let kids: Vec<TermId> = ctx.children(*args).to_vec();
+            if matches!(op, Op::Builtin(BuiltinOp::FpToReal))
+                && matches!(ctx.fp_widths(ctx.sort_of(kids[0])), Some((eb, _)) if eb <= 8)
+            {
+                return true;
+            }
+            return kids.into_iter().any(|c| walk(ctx, c, seen));
+        }
+        false
+    }
+    assertions.iter().any(|&a| walk(ctx, a, &mut seen))
+}
+
+/// A Bool atom that is an LRA (Real) relation: Le/Lt/Ge/Gt/Eq/Distinct whose
+/// operands are Real-sorted (so it routes to Arith, not Int/EUF/arrays). A
+/// Real-sorted operand may itself be an EUF application (`(f a)` with
+/// `f: Real -> Real`), an array `(select arr i)`, or a Str-Real term: those are
+/// ADMITTED here on purpose. The broadened scope is QF_UFLRA + bridge —
+/// `fp.to_real(x)` may be mixed freely with LRA and with EUF over the resulting
+/// Real. Soundness rests on the Combiner's Nelson–Oppen EUF⋈Arith combination
+/// deciding the shared-Real interface, and is validated empirically by the
+/// `differential_qf_fp_to_real_uflra` z3 oracle (crate `tests/fp_oracle.rs`).
+fn is_lra_real_atom(ctx: &Context, t: TermId) -> bool {
+    if let TermNode::App { op, args, .. } = ctx.term_node(t) {
+        use BuiltinOp::*;
+        if matches!(op, Op::Builtin(Le | Lt | Ge | Gt | Eq | Distinct)) {
+            let kids = ctx.children(*args);
+            return kids
+                .iter()
+                .all(|&k| matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::Real));
+        }
+    }
+    false
+}
+
+/// The exact shape QF_FP slice 9 admits for the fp.to_real bridge: FP present,
+/// only crossing is an admitted fp.to_real, at least one such admitted
+/// fp.to_real term is actually present (scope-tightening: see
+/// `has_admitted_to_real_term`), and every atom outside (fp_atoms ∪ bv_atoms)
+/// is a pure-LRA-Real arith atom. Anything else → false (caller keeps fencing
+/// to sound Unknown). NOT YET WIRED into dispatch — no behavior change.
+/// Used by unit tests only for now; dispatch wiring lands in a later slice-9
+/// task (same convention as `abv_stage::solve_qfabv`).
+pub fn bridge_admissible(ctx: &Context, assertions: &[TermId]) -> bool {
+    if !solver_uses_fp(ctx, assertions) {
+        return false;
+    }
+    if !only_crossing_is_admitted_to_real(ctx, assertions) {
+        return false;
+    }
+    if !has_admitted_to_real_term(ctx, assertions) {
+        return false;
+    }
+    let fp_atoms = collect_fp_atoms(ctx, assertions);
+    let bv_atoms = crate::bv_stage::collect_bv_atoms(ctx, assertions);
+    // Every non-BVFP Bool atom must be a pure-LRA-Real atom. Reuse the existing
+    // atom-walk used by has_non_bvfp_theory_atom (via non_bvfp_atoms) but
+    // accept is_lra_real_atom instead of unconditionally fencing.
+    non_bvfp_atoms(ctx, assertions, &fp_atoms, &bv_atoms)
+        .into_iter()
+        .all(|t| is_lra_real_atom(ctx, t))
+}
+
+/// Collect every distinct `(fp.to_real _)` application term reachable from the
+/// assertions (dedup by TermId). Used by the dispatch to drive the Real-bridge
+/// emitter (slice 9). Order is deterministic (first-seen DAG walk).
+pub fn collect_fp_to_real_terms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
+    let mut out: Vec<TermId> = Vec::new();
+    let mut visited: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+    fn walk(
+        ctx: &Context,
+        t: TermId,
+        out: &mut Vec<TermId>,
+        visited: &mut rustc_hash::FxHashSet<TermId>,
+    ) {
+        if !visited.insert(t) {
+            return;
+        }
+        if let TermNode::App { op, args, .. } = ctx.term_node(t) {
+            if matches!(op, Op::Builtin(BuiltinOp::FpToReal)) {
+                out.push(t);
+            }
+            let kids: Vec<TermId> = ctx.children(*args).to_vec();
+            for k in kids {
+                walk(ctx, k, out, visited);
+            }
+        }
+    }
+    for &a in assertions {
+        walk(ctx, a, &mut out, &mut visited);
+    }
+    out
 }
 
 /// Positively-enumerated check: is an FP-sorted `word` term one that
@@ -224,23 +509,39 @@ pub fn has_non_bvfp_theory_atom(
 fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
     match ctx.term_node(t) {
         // FP constant → supported.
-        TermNode::Const { val: ConstVal::Float(_), .. } => true,
+        TermNode::Const {
+            val: ConstVal::Float(_),
+            ..
+        } => true,
         // Nullary uninterpreted symbol of Float sort (FP variable) → supported.
         // The explicit sort check matters now that `is_supported_fp_word` can be
         // called on a non-FP operand (ToFp's second argument may be Real-sorted);
         // without it a symbolic Real variable would wrongly pass as "supported".
-        TermNode::App { op: Op::Uninterpreted(_), args, .. } => {
+        TermNode::App {
+            op: Op::Uninterpreted(_),
+            args,
+            ..
+        } => {
             matches!(ctx.sort_node(ctx.sort_of(t)), SortNode::Float(_, _))
                 && ctx.children(*args).is_empty()
         }
         // FpAbs / FpNeg: supported if the single child is supported.
-        TermNode::App { op: Op::Builtin(BuiltinOp::FpAbs | BuiltinOp::FpNeg), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::FpAbs | BuiltinOp::FpNeg),
+            args,
+            ..
+        } => {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 1 && is_supported_fp_word(ctx, kids[0])
         }
         // FpAdd / FpSub / FpMul / FpDiv: (RM, F, F). RM operand must be a RoundingMode term
         // (literal const or nullary RM variable); both FP operands supported.
-        TermNode::App { op: Op::Builtin(BuiltinOp::FpAdd | BuiltinOp::FpSub | BuiltinOp::FpMul | BuiltinOp::FpDiv), args, .. } => {
+        TermNode::App {
+            op:
+                Op::Builtin(BuiltinOp::FpAdd | BuiltinOp::FpSub | BuiltinOp::FpMul | BuiltinOp::FpDiv),
+            args,
+            ..
+        } => {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 3
                 && is_rounding_mode_term(ctx, kids[0])
@@ -249,14 +550,22 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
         }
         // FpSqrt / FpRoundToIntegral: (RM, F). RM operand must be a RoundingMode
         // term; FP operand supported.
-        TermNode::App { op: Op::Builtin(BuiltinOp::FpSqrt | BuiltinOp::FpRoundToIntegral), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::FpSqrt | BuiltinOp::FpRoundToIntegral),
+            args,
+            ..
+        } => {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 2
                 && is_rounding_mode_term(ctx, kids[0])
                 && is_supported_fp_word(ctx, kids[1])
         }
         // fp.min / fp.max: (F, F) -> F. No RM operand; both FP operands supported.
-        TermNode::App { op: Op::Builtin(BuiltinOp::FpMin | BuiltinOp::FpMax), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::FpMin | BuiltinOp::FpMax),
+            args,
+            ..
+        } => {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 2
                 && is_supported_fp_word(ctx, kids[0])
@@ -264,7 +573,11 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
         }
         // FpFma: (RM, F, F, F) -> F. RM operand must be a RoundingMode term;
         // all three FP operands supported.
-        TermNode::App { op: Op::Builtin(BuiltinOp::FpFma), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::FpFma),
+            args,
+            ..
+        } => {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 4
                 && is_rounding_mode_term(ctx, kids[0])
@@ -273,7 +586,11 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
                 && is_supported_fp_word(ctx, kids[3])
         }
         // fp.rem: (F, F) -> F. No RM operand; both FP operands supported.
-        TermNode::App { op: Op::Builtin(BuiltinOp::FpRem), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::FpRem),
+            args,
+            ..
+        } => {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 2
                 && is_supported_fp_word(ctx, kids[0])
@@ -286,29 +603,41 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
         // Symbolic Real stays unsupported (later Real combination). Fence and
         // folder share Context::const_real_value so the admit-set is identical
         // (soundness).
-        TermNode::App { op: Op::Builtin(BuiltinOp::ToFp { .. }), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::ToFp { .. }),
+            args,
+            ..
+        } => {
             let kids = ctx.children(*args).to_vec();
             match kids.len() {
                 // 1-arg BV bitcast: single BV-sorted source (slice 4c). Since 4e
                 // the BV source can itself embed FP subterms (fp.to_ubv/to_sbv),
                 // so a sort check alone no longer suffices — walk it too.
-                1 => matches!(ctx.sort_node(ctx.sort_of(kids[0])), SortNode::BitVec(_))
-                    && bv_subtree_fp_supported(ctx, kids[0]),
+                1 => {
+                    matches!(ctx.sort_node(ctx.sort_of(kids[0])), SortNode::BitVec(_))
+                        && bv_subtree_fp_supported(ctx, kids[0])
+                }
                 // 2-arg faces: FP→FP re-round / constant-Real fold (3a), or
                 // signed int→FP from a BV source (4d). BV children need a sort
                 // check AND (since 4e) the embedded-FP walk — nested still-crossing
                 // ops are separately caught by `uses_crossing_conversion`.
-                2 => is_rounding_mode_term(ctx, kids[0])
-                    && (is_supported_fp_word(ctx, kids[1])
-                        || ctx.const_real_value(kids[1]).is_some()
-                        || (matches!(ctx.sort_node(ctx.sort_of(kids[1])), SortNode::BitVec(_))
-                            && bv_subtree_fp_supported(ctx, kids[1]))),
+                2 => {
+                    is_rounding_mode_term(ctx, kids[0])
+                        && (is_supported_fp_word(ctx, kids[1])
+                            || ctx.const_real_value(kids[1]).is_some()
+                            || (matches!(ctx.sort_node(ctx.sort_of(kids[1])), SortNode::BitVec(_))
+                                && bv_subtree_fp_supported(ctx, kids[1])))
+                }
                 _ => false,
             }
         }
         // to_fp_unsigned: (RM, bv) — unsigned int→FP (slice 4d). BV-sort check
         // plus (since 4e) the embedded-FP walk over the BV source.
-        TermNode::App { op: Op::Builtin(BuiltinOp::ToFpUnsigned { .. }), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::ToFpUnsigned { .. }),
+            args,
+            ..
+        } => {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 2
                 && is_rounding_mode_term(ctx, kids[0])
@@ -319,7 +648,11 @@ fn is_supported_fp_word(ctx: &Context, t: TermId) -> bool {
         // a sort check plus (since 4e) the embedded-FP walk, since a BV child can
         // now embed fp.to_ubv/to_sbv; any still-crossing op nested in a child is
         // separately caught by `uses_crossing_conversion` before lowering.
-        TermNode::App { op: Op::Builtin(BuiltinOp::FpFromBits), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::FpFromBits),
+            args,
+            ..
+        } => {
             let kids = ctx.children(*args).to_vec();
             kids.len() == 3
                 && kids.iter().all(|&k| {
@@ -346,8 +679,15 @@ fn is_rounding_mode_term(ctx: &Context, t: TermId) -> bool {
         return false;
     }
     match ctx.term_node(t) {
-        TermNode::Const { val: ConstVal::Rm(_), .. } => true,
-        TermNode::App { op: Op::Uninterpreted(_), args, .. } => ctx.children(*args).is_empty(),
+        TermNode::Const {
+            val: ConstVal::Rm(_),
+            ..
+        } => true,
+        TermNode::App {
+            op: Op::Uninterpreted(_),
+            args,
+            ..
+        } => ctx.children(*args).is_empty(),
         _ => false,
     }
 }
@@ -356,15 +696,16 @@ fn is_rounding_mode_term(ctx: &Context, t: TermId) -> bool {
 /// recursively supported FP operand. Unlike int→FP's BV child (4d), the FP
 /// operand DOES need the recursive check — the FP blaster is not total.
 fn is_supported_fp_to_bv(ctx: &Context, t: TermId) -> bool {
-    let TermNode::App { op: Op::Builtin(BuiltinOp::FpToUbv(_) | BuiltinOp::FpToSbv(_)), args, .. } =
-        ctx.term_node(t)
+    let TermNode::App {
+        op: Op::Builtin(BuiltinOp::FpToUbv(_) | BuiltinOp::FpToSbv(_)),
+        args,
+        ..
+    } = ctx.term_node(t)
     else {
         return false;
     };
     let kids = ctx.children(*args).to_vec();
-    kids.len() == 2
-        && is_rounding_mode_term(ctx, kids[0])
-        && is_supported_fp_word(ctx, kids[1])
+    kids.len() == 2 && is_rounding_mode_term(ctx, kids[0]) && is_supported_fp_word(ctx, kids[1])
 }
 
 /// Walk a BV-sorted subtree hunting embedded FP→BV applications; each must be
@@ -376,14 +717,23 @@ fn is_supported_fp_to_bv(ctx: &Context, t: TermId) -> bool {
 fn bv_subtree_fp_supported(ctx: &Context, root: TermId) -> bool {
     let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
     fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
-        if !seen.insert(t) { return true; }
+        if !seen.insert(t) {
+            return true;
+        }
         if let TermNode::App { op, args, .. } = ctx.term_node(t) {
-            if matches!(op, Op::Builtin(BuiltinOp::FpToUbv(_) | BuiltinOp::FpToSbv(_))) {
+            if matches!(
+                op,
+                Op::Builtin(BuiltinOp::FpToUbv(_) | BuiltinOp::FpToSbv(_))
+            ) {
                 // The FP operand is checked by is_supported_fp_word (which
                 // re-enters this walk for ITS BV children); no further descent.
                 return is_supported_fp_to_bv(ctx, t);
             }
-            return ctx.children(*args).to_vec().into_iter().all(|k| walk(ctx, k, seen));
+            return ctx
+                .children(*args)
+                .to_vec()
+                .into_iter()
+                .all(|k| walk(ctx, k, seen));
         }
         true
     }
@@ -395,8 +745,13 @@ fn bv_subtree_fp_supported(ctx: &Context, root: TermId) -> bool {
 /// the first slice that support-checks the BV side at all.
 pub fn bv_atoms_fp_supported(ctx: &Context, bv_atoms: &[TermId]) -> bool {
     bv_atoms.iter().all(|&a| {
-        let TermNode::App { args, .. } = ctx.term_node(a) else { return true; };
-        ctx.children(*args).to_vec().into_iter().all(|k| bv_subtree_fp_supported(ctx, k))
+        let TermNode::App { args, .. } = ctx.term_node(a) else {
+            return true;
+        };
+        ctx.children(*args)
+            .to_vec()
+            .into_iter()
+            .all(|k| bv_subtree_fp_supported(ctx, k))
     })
 }
 
@@ -421,10 +776,10 @@ fn fp_atom_is_supported(ctx: &Context, atom: TermId) -> bool {
     let kids = ctx.children(*args).to_vec();
     match op {
         // 7 classification predicates: single FP-sorted operand required.
-        Op::Builtin(FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite
-                    | FpIsNaN | FpIsNegative | FpIsPositive) => {
-            kids.len() == 1 && is_supported_fp_word(ctx, kids[0])
-        }
+        Op::Builtin(
+            FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite | FpIsNaN | FpIsNegative
+            | FpIsPositive,
+        ) => kids.len() == 1 && is_supported_fp_word(ctx, kids[0]),
         // fp.eq: two FP-sorted operands.
         Op::Builtin(FpEq) => {
             kids.len() == 2
@@ -499,12 +854,16 @@ mod tests {
         let bf = ctx.declare_fun("b", &[], bvs);
         let bvar = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
         let one = ctx.mk_bv_const(8, Integer::from(1u64));
-        let ult = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[bvar, one]).unwrap();
+        let ult = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[bvar, one])
+            .unwrap();
         let assertions = vec![isnan, ult];
         let atoms = collect_fp_atoms(&ctx, &assertions);
         assert!(atoms.contains(&isnan));
-        assert!(has_non_fp_theory_atom(&ctx, &assertions, &atoms),
-                "FP-only predicate: a BV atom is outside the FP allow-set");
+        assert!(
+            has_non_fp_theory_atom(&ctx, &assertions, &atoms),
+            "FP-only predicate: a BV atom is outside the FP allow-set"
+        );
     }
 
     #[test]
@@ -513,10 +872,15 @@ mod tests {
         let x = fp_var(&mut ctx, "x");
         let y = fp_var(&mut ctx, "y");
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let add = ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y]).unwrap();
+        let add = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y])
+            .unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[add]).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
-        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.add inside a predicate is supported");
+        assert!(
+            fp_atoms_fully_supported(&ctx, &atoms),
+            "fp.add inside a predicate is supported"
+        );
     }
 
     #[test]
@@ -527,11 +891,16 @@ mod tests {
         let rms = ctx.rm_sort();
         let rmf = ctx.declare_fun("rm", &[], rms);
         let rm = ctx.mk_app(Op::Uninterpreted(rmf), &[]).unwrap();
-        let add = ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rm, x, y]).unwrap();
+        let add = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rm, x, y])
+            .unwrap();
         let z = fp_var(&mut ctx, "z");
         let eq = ctx.mk_eq(add, z).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[eq]);
-        assert!(fp_atoms_fully_supported(&ctx, &atoms), "symbolic RM operand is supported");
+        assert!(
+            fp_atoms_fully_supported(&ctx, &atoms),
+            "symbolic RM operand is supported"
+        );
     }
 
     #[test]
@@ -540,10 +909,15 @@ mod tests {
         let x = fp_var(&mut ctx, "x");
         let y = fp_var(&mut ctx, "y");
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let mul = ctx.mk_app(Op::Builtin(BuiltinOp::FpMul), &[rne, x, y]).unwrap();
+        let mul = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpMul), &[rne, x, y])
+            .unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[mul]).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
-        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.mul is in scope as of slice 2b");
+        assert!(
+            fp_atoms_fully_supported(&ctx, &atoms),
+            "fp.mul is in scope as of slice 2b"
+        );
     }
 
     #[test]
@@ -552,10 +926,15 @@ mod tests {
         let x = fp_var(&mut ctx, "x");
         let y = fp_var(&mut ctx, "y");
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let div = ctx.mk_app(Op::Builtin(BuiltinOp::FpDiv), &[rne, x, y]).unwrap();
+        let div = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpDiv), &[rne, x, y])
+            .unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[div]).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
-        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.div is in scope as of slice 2c");
+        assert!(
+            fp_atoms_fully_supported(&ctx, &atoms),
+            "fp.div is in scope as of slice 2c"
+        );
     }
 
     #[test]
@@ -563,10 +942,17 @@ mod tests {
         let mut ctx = Context::new();
         let x = fp_var(&mut ctx, "x");
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let sqrt = ctx.mk_app(Op::Builtin(BuiltinOp::FpSqrt), &[rne, x]).unwrap();
-        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[sqrt]).unwrap();
+        let sqrt = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpSqrt), &[rne, x])
+            .unwrap();
+        let isnan = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[sqrt])
+            .unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
-        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.sqrt is in scope as of slice 2c'");
+        assert!(
+            fp_atoms_fully_supported(&ctx, &atoms),
+            "fp.sqrt is in scope as of slice 2c'"
+        );
     }
 
     #[test]
@@ -574,14 +960,22 @@ mod tests {
         let mut ctx = Context::new();
         let x = fp_var(&mut ctx, "x");
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let rti = ctx.mk_app(Op::Builtin(BuiltinOp::FpRoundToIntegral), &[rne, x]).unwrap();
+        let rti = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpRoundToIntegral), &[rne, x])
+            .unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[rti]).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
-        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.roundToIntegral is in scope as of slice 2e");
+        assert!(
+            fp_atoms_fully_supported(&ctx, &atoms),
+            "fp.roundToIntegral is in scope as of slice 2e"
+        );
         // Malformed (missing RM operand) must NOT be admitted.
         let bad = ctx.mk_app(Op::Builtin(BuiltinOp::FpRoundToIntegral), &[x]);
         if let Ok(bad) = bad {
-            assert!(!super::is_supported_fp_word(&ctx, bad), "arity-1 roundToIntegral rejected");
+            assert!(
+                !super::is_supported_fp_word(&ctx, bad),
+                "arity-1 roundToIntegral rejected"
+            );
         }
     }
 
@@ -592,14 +986,22 @@ mod tests {
         let y = fp_var(&mut ctx, "y");
         let z = fp_var(&mut ctx, "z");
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
-        let fma = ctx.mk_app(Op::Builtin(BuiltinOp::FpFma), &[rne, x, y, z]).unwrap();
+        let fma = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpFma), &[rne, x, y, z])
+            .unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[fma]).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
-        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.fma is in scope as of slice 2f");
+        assert!(
+            fp_atoms_fully_supported(&ctx, &atoms),
+            "fp.fma is in scope as of slice 2f"
+        );
         // Malformed (missing the third FP operand) must NOT be admitted.
         let bad = ctx.mk_app(Op::Builtin(BuiltinOp::FpFma), &[rne, x, y]);
         if let Ok(bad) = bad {
-            assert!(!super::is_supported_fp_word(&ctx, bad), "arity-3 fp.fma rejected");
+            assert!(
+                !super::is_supported_fp_word(&ctx, bad),
+                "arity-3 fp.fma rejected"
+            );
         }
     }
 
@@ -614,7 +1016,10 @@ mod tests {
         let rem = ctx.mk_app(Op::Builtin(BuiltinOp::FpRem), &[x, y]).unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[rem]).unwrap();
         let atoms = collect_fp_atoms(&ctx, &[isnan]);
-        assert!(fp_atoms_fully_supported(&ctx, &atoms), "fp.rem is in scope as of slice 2g");
+        assert!(
+            fp_atoms_fully_supported(&ctx, &atoms),
+            "fp.rem is in scope as of slice 2g"
+        );
     }
 
     #[test]
@@ -628,7 +1033,10 @@ mod tests {
         // min/max nested inside fp.eq (word support)
         let mn = ctx.mk_app(Op::Builtin(BuiltinOp::FpMin), &[x, y]).unwrap();
         let eq = ctx.mk_app(Op::Builtin(BuiltinOp::FpEq), &[mn, x]).unwrap();
-        assert!(fp_atoms_fully_supported(&ctx, &[eq]), "fp.min inside fp.eq admitted");
+        assert!(
+            fp_atoms_fully_supported(&ctx, &[eq]),
+            "fp.min inside fp.eq admitted"
+        );
     }
 
     #[test]
@@ -645,18 +1053,42 @@ mod tests {
         let s = mk(&mut ctx, bv1);
         let e = mk(&mut ctx, bv8);
         let m = mk(&mut ctx, bv23);
-        let fp_from_bits = ctx.mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[s, e, m]).unwrap();
+        let fp_from_bits = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[s, e, m])
+            .unwrap();
         let b32 = mk(&mut ctx, bv32);
-        let bitcast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32]).unwrap();
+        let bitcast = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32])
+            .unwrap();
 
         // Newly admitted — NOT crossing.
-        assert!(!super::uses_crossing_conversion(&ctx, &[fp_from_bits]), "FpFromBits admitted");
-        assert!(!super::uses_crossing_conversion(&ctx, &[bitcast]), "1-arg to_fp admitted");
+        assert!(
+            !super::uses_crossing_conversion(&ctx, &[fp_from_bits]),
+            "FpFromBits admitted"
+        );
+        assert!(
+            !super::uses_crossing_conversion(&ctx, &[bitcast]),
+            "1-arg to_fp admitted"
+        );
 
-        // fp.to_real: crossing forever (v1 Real bridge).
+        // fp.to_real over Float32 (eb=8): admitted (slice 9).
         let x = fp_var(&mut ctx, "x");
         let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
-        assert!(super::uses_crossing_conversion(&ctx, &[toreal]), "fp.to_real still crossing");
+        assert!(
+            !super::uses_crossing_conversion(&ctx, &[toreal]),
+            "fp.to_real over F32 is admitted (slice 9)"
+        );
+        // Float64 (eb=11): STILL crossing — pins the eb<=8 boundary.
+        let f64s = ctx.fp_sort(11, 53);
+        let xf64 = ctx.declare_fun("x64", &[], f64s);
+        let x64 = ctx.mk_app(Op::Uninterpreted(xf64), &[]).unwrap();
+        let toreal64 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x64])
+            .unwrap();
+        assert!(
+            super::uses_crossing_conversion(&ctx, &[toreal64]),
+            "fp.to_real over F64 (eb>8) stays crossing"
+        );
     }
 
     #[test]
@@ -673,12 +1105,22 @@ mod tests {
         let s = mk(&mut ctx, bv1);
         let e = mk(&mut ctx, bv8);
         let m = mk(&mut ctx, bv23);
-        let fp_from_bits = ctx.mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[s, e, m]).unwrap();
+        let fp_from_bits = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[s, e, m])
+            .unwrap();
         let b32 = mk(&mut ctx, bv32);
-        let bitcast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32]).unwrap();
+        let bitcast = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32])
+            .unwrap();
 
-        assert!(super::is_supported_fp_word(&ctx, fp_from_bits), "FpFromBits word supported");
-        assert!(super::is_supported_fp_word(&ctx, bitcast), "1-arg to_fp word supported");
+        assert!(
+            super::is_supported_fp_word(&ctx, fp_from_bits),
+            "FpFromBits word supported"
+        );
+        assert!(
+            super::is_supported_fp_word(&ctx, bitcast),
+            "1-arg to_fp word supported"
+        );
     }
 
     #[test]
@@ -694,34 +1136,78 @@ mod tests {
         let bv = ctx.mk_app(Op::Uninterpreted(bvf), &[]).unwrap();
 
         // fp.to_sbv (FP→BV) → NOT crossing (admitted in slice 4e).
-        let sbv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(32)), &[rne, x]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[sbv]), "fp.to_sbv admitted (slice 4e)");
+        let sbv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToSbv(32)), &[rne, x])
+            .unwrap();
+        assert!(
+            !uses_crossing_conversion(&ctx, &[sbv]),
+            "fp.to_sbv admitted (slice 4e)"
+        );
         // to_fp from BV (2-arg, BV source) → NOT crossing (admitted in slice 4d).
-        let from_bv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[from_bv]), "signed int→FP admitted (slice 4d)");
+        let from_bv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv])
+            .unwrap();
+        assert!(
+            !uses_crossing_conversion(&ctx, &[from_bv]),
+            "signed int→FP admitted (slice 4d)"
+        );
         // 1-arg BV bitcast to_fp (width 32 == eb+sb) → NOT crossing (admitted in slice 4c).
-        let bitcast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[bv]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[bitcast]), "1-arg bitcast to_fp admitted (slice 4c)");
+        let bitcast = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[bv])
+            .unwrap();
+        assert!(
+            !uses_crossing_conversion(&ctx, &[bitcast]),
+            "1-arg bitcast to_fp admitted (slice 4c)"
+        );
         // to_fp_unsigned → NOT crossing (admitted in slice 4d).
-        let uns = ctx.mk_app(Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[uns]), "unsigned int→FP admitted (slice 4d)");
+        let uns = ctx
+            .mk_app(
+                Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }),
+                &[rne, bv],
+            )
+            .unwrap();
+        assert!(
+            !uses_crossing_conversion(&ctx, &[uns]),
+            "unsigned int→FP admitted (slice 4d)"
+        );
 
         // to_fp FP→FP (3a-supported) → NOT crossing.
-        let widen = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[widen]), "FP->FP to_fp is not crossing");
+        let widen = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x])
+            .unwrap();
+        assert!(
+            !uses_crossing_conversion(&ctx, &[widen]),
+            "FP->FP to_fp is not crossing"
+        );
         // to_fp const-Real (3a-supported) → NOT crossing.
         let real = ctx.real_sort();
         let third = ctx.mk_numeral(Rational::new(1i128.into(), 3i128.into()), real);
-        let creal = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, third]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[creal]), "const-Real to_fp is not crossing");
+        let creal = ctx
+            .mk_app(
+                Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }),
+                &[rne, third],
+            )
+            .unwrap();
+        assert!(
+            !uses_crossing_conversion(&ctx, &[creal]),
+            "const-Real to_fp is not crossing"
+        );
         // symbolic-Real to_fp → crossing (durably fenced).
         let rf = ctx.declare_fun("r", &[], real);
         let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
-        let sreal = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, r]).unwrap();
-        assert!(uses_crossing_conversion(&ctx, &[sreal]), "symbolic-Real to_fp is crossing");
+        let sreal = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, r])
+            .unwrap();
+        assert!(
+            uses_crossing_conversion(&ctx, &[sreal]),
+            "symbolic-Real to_fp is crossing"
+        );
         // pure FP predicate → NOT crossing.
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[isnan]), "pure FP is not crossing");
+        assert!(
+            !uses_crossing_conversion(&ctx, &[isnan]),
+            "pure FP is not crossing"
+        );
     }
 
     #[test]
@@ -734,21 +1220,46 @@ mod tests {
         let bv = ctx.mk_app(Op::Uninterpreted(bvf), &[]).unwrap();
 
         // Both int→FP faces: NOT crossing, supported (slice 4d).
-        let signed = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
-        let unsigned =
-            ctx.mk_app(Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[signed]), "signed int→FP admitted");
-        assert!(!uses_crossing_conversion(&ctx, &[unsigned]), "unsigned int→FP admitted");
-        assert!(super::is_supported_fp_word(&ctx, signed), "signed int→FP word supported");
-        assert!(super::is_supported_fp_word(&ctx, unsigned), "unsigned int→FP word supported");
+        let signed = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv])
+            .unwrap();
+        let unsigned = ctx
+            .mk_app(
+                Op::Builtin(BuiltinOp::ToFpUnsigned { eb: 8, sb: 24 }),
+                &[rne, bv],
+            )
+            .unwrap();
+        assert!(
+            !uses_crossing_conversion(&ctx, &[signed]),
+            "signed int→FP admitted"
+        );
+        assert!(
+            !uses_crossing_conversion(&ctx, &[unsigned]),
+            "unsigned int→FP admitted"
+        );
+        assert!(
+            super::is_supported_fp_word(&ctx, signed),
+            "signed int→FP word supported"
+        );
+        assert!(
+            super::is_supported_fp_word(&ctx, unsigned),
+            "unsigned int→FP word supported"
+        );
 
         // Safety net: a still-crossing op nested INSIDE the BV child is caught
         // by the same DAG walk.
         let xf = ctx.declare_fun("x", &[], f32s);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
-        let ubv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(32)), &[rne, x]).unwrap();
-        let nested = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, ubv]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[nested]), "to_fp over fp.to_ubv fully admitted (4d+4e)");
+        let ubv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(32)), &[rne, x])
+            .unwrap();
+        let nested = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, ubv])
+            .unwrap();
+        assert!(
+            !uses_crossing_conversion(&ctx, &[nested]),
+            "to_fp over fp.to_ubv fully admitted (4d+4e)"
+        );
     }
 
     #[test]
@@ -760,32 +1271,57 @@ mod tests {
         // FP->FP widen supported.
         let xf = ctx.declare_fun("x", &[], f32);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
-        let widen = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x]).unwrap();
-        let isn1 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[widen]).unwrap();
-        assert!(fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn1])),
-                "to_fp FP->FP is in scope as of slice 3a");
+        let widen = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x])
+            .unwrap();
+        let isn1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[widen])
+            .unwrap();
+        assert!(
+            fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn1])),
+            "to_fp FP->FP is in scope as of slice 3a"
+        );
         // const-Real supported.
         let real = ctx.real_sort();
         let third = ctx.mk_numeral(Rational::new(1i128.into(), 3i128.into()), real);
-        let conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, third]).unwrap();
-        let isn2 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[conv]).unwrap();
-        assert!(fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn2])),
-                "const-Real to_fp is in scope as of slice 3a");
+        let conv = ctx
+            .mk_app(
+                Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }),
+                &[rne, third],
+            )
+            .unwrap();
+        let isn2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[conv])
+            .unwrap();
+        assert!(
+            fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn2])),
+            "const-Real to_fp is in scope as of slice 3a"
+        );
         // symbolic-Real to_fp NOT supported (durably fenced).
         let rf = ctx.declare_fun("r", &[], real);
         let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
-        let sym = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, r]).unwrap();
+        let sym = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, r])
+            .unwrap();
         let isn3 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[sym]).unwrap();
-        assert!(!fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn3])),
-                "symbolic-Real to_fp must stay fenced");
+        assert!(
+            !fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn3])),
+            "symbolic-Real to_fp must stay fenced"
+        );
         // BV-operand to_fp IS supported (signed-int→FP, admitted in slice 4d).
         let bvs = ctx.bv_sort(32);
         let bvf = ctx.declare_fun("bv", &[], bvs);
         let bv = ctx.mk_app(Op::Uninterpreted(bvf), &[]).unwrap();
-        let bv_conv = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv]).unwrap();
-        let isn4 = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[bv_conv]).unwrap();
-        assert!(fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn4])),
-                "BV-operand to_fp (signed int->FP) is in scope as of slice 4d");
+        let bv_conv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, bv])
+            .unwrap();
+        let isn4 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[bv_conv])
+            .unwrap();
+        assert!(
+            fp_atoms_fully_supported(&ctx, &collect_fp_atoms(&ctx, &[isn4])),
+            "BV-operand to_fp (signed int->FP) is in scope as of slice 4d"
+        );
     }
 
     #[test]
@@ -799,13 +1335,17 @@ mod tests {
         let bf = ctx.declare_fun("b", &[], bvs);
         let bvar = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
         let one = ctx.mk_bv_const(8, Integer::from(1u64));
-        let ult = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[bvar, one]).unwrap();
+        let ult = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[bvar, one])
+            .unwrap();
 
         let fp_atoms = collect_fp_atoms(&ctx, &[isnan, ult]);
         let bv_atoms = crate::bv_stage::collect_bv_atoms(&ctx, &[isnan, ult]);
         // Mixed BV+FP (no crossing op) is NOT fenced by the union predicate.
-        assert!(!has_non_bvfp_theory_atom(&ctx, &[isnan, ult], &fp_atoms, &bv_atoms),
-                "pure-BV + pure-FP atoms are allowed together");
+        assert!(
+            !has_non_bvfp_theory_atom(&ctx, &[isnan, ult], &fp_atoms, &bv_atoms),
+            "pure-BV + pure-FP atoms are allowed together"
+        );
 
         // Add a Real (arith) atom → fenced.
         let real = ctx.real_sort();
@@ -816,33 +1356,67 @@ mod tests {
         let asserts = vec![isnan, ult, gt];
         let fp2 = collect_fp_atoms(&ctx, &asserts);
         let bv2 = crate::bv_stage::collect_bv_atoms(&ctx, &asserts);
-        assert!(has_non_bvfp_theory_atom(&ctx, &asserts, &fp2, &bv2),
-                "a Real arith atom alongside BV+FP must fence");
+        assert!(
+            has_non_bvfp_theory_atom(&ctx, &asserts, &fp2, &bv2),
+            "a Real arith atom alongside BV+FP must fence"
+        );
     }
 
     #[test]
-    fn fp_to_bv_faces_admitted_real_bridge_still_crossing() {
-        // Slice 4e: fp.to_ubv/fp.to_sbv are no longer crossing; the PERMANENT
-        // fence is fp.to_real + symbolic-Real to_fp.
+    fn fp_to_bv_admitted_and_to_real_eb_boundary_crossing() {
+        // Slice 4e: fp.to_ubv/fp.to_sbv are no longer crossing. Slice 9: fp.to_real
+        // over eb<=8 (Float16/32) is admitted (Real bridge); the surviving crossing
+        // fence is fp.to_real over eb>8 (Float64/128) + symbolic-Real to_fp.
         let mut ctx = Context::new();
         let f32s = ctx.fp_sort(8, 24);
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
         let xf = ctx.declare_fun("x", &[], f32s);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
-        let ubv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x]).unwrap();
-        let sbv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(32)), &[rne, x]).unwrap();
-        assert!(!uses_crossing_conversion(&ctx, &[ubv]), "fp.to_ubv admitted (slice 4e)");
-        assert!(!uses_crossing_conversion(&ctx, &[sbv]), "fp.to_sbv admitted (slice 4e)");
-        // fp.to_real: crossing forever (v1 Real bridge).
+        let ubv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x])
+            .unwrap();
+        let sbv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToSbv(32)), &[rne, x])
+            .unwrap();
+        assert!(
+            !uses_crossing_conversion(&ctx, &[ubv]),
+            "fp.to_ubv admitted (slice 4e)"
+        );
+        assert!(
+            !uses_crossing_conversion(&ctx, &[sbv]),
+            "fp.to_sbv admitted (slice 4e)"
+        );
+        // fp.to_real over Float32 (eb=8): admitted (slice 9).
         let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
-        assert!(uses_crossing_conversion(&ctx, &[toreal]), "fp.to_real stays fenced");
+        assert!(
+            !uses_crossing_conversion(&ctx, &[toreal]),
+            "fp.to_real F32 admitted (slice 9)"
+        );
+        // Float64 (eb=11): STILL crossing — pins the eb<=8 boundary.
+        let f64s = ctx.fp_sort(11, 53);
+        let xf64 = ctx.declare_fun("x64", &[], f64s);
+        let x64 = ctx.mk_app(Op::Uninterpreted(xf64), &[]).unwrap();
+        let toreal64 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x64])
+            .unwrap();
+        assert!(
+            uses_crossing_conversion(&ctx, &[toreal64]),
+            "fp.to_real over F64 (eb>8) stays crossing"
+        );
         // Symbolic-Real to_fp nested INSIDE an admitted to_ubv: the DAG walk still nets it.
         let real = ctx.real_sort();
         let rf = ctx.declare_fun("r", &[], real);
         let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
-        let sreal = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, r]).unwrap();
-        let nested = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, sreal]).unwrap();
-        assert!(uses_crossing_conversion(&ctx, &[nested]), "nested symbolic-Real to_fp still crossing");
+        let sreal = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, r])
+            .unwrap();
+        let nested = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, sreal])
+            .unwrap();
+        assert!(
+            uses_crossing_conversion(&ctx, &[nested]),
+            "nested symbolic-Real to_fp still crossing"
+        );
     }
 
     #[test]
@@ -858,10 +1432,17 @@ mod tests {
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
         let xf = ctx.declare_fun("x", &[], f32s);
         let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
-        let ubv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x]).unwrap();
+        let ubv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x])
+            .unwrap();
         let c = ctx.mk_bv_const(8, Integer::from(3u64));
-        let atom_ok = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[ubv, c]).unwrap();
-        assert!(bv_atoms_fp_supported(&ctx, &[atom_ok]), "supported FP operand under BV atom passes");
+        let atom_ok = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[ubv, c])
+            .unwrap();
+        assert!(
+            bv_atoms_fp_supported(&ctx, &[atom_ok]),
+            "supported FP operand under BV atom passes"
+        );
         // Raw FP-sorted ite: unreachable via the normal pipeline post-word_norm,
         // but is_supported_fp_word must still correctly reject it as a
         // defense-in-depth invariant.
@@ -869,9 +1450,16 @@ mod tests {
         let pf = ctx.declare_fun("p", &[], bs);
         let p = ctx.mk_app(Op::Uninterpreted(pf), &[]).unwrap();
         let ite = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[p, x, x]).unwrap();
-        let ubv_bad = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, ite]).unwrap();
-        let atom_bad = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[ubv_bad, c]).unwrap();
-        assert!(!bv_atoms_fp_supported(&ctx, &[atom_bad]), "unsupported FP shape under BV atom fences");
+        let ubv_bad = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, ite])
+            .unwrap();
+        let atom_bad = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[ubv_bad, c])
+            .unwrap();
+        assert!(
+            !bv_atoms_fp_supported(&ctx, &[atom_bad]),
+            "unsupported FP shape under BV atom fences"
+        );
     }
 
     #[test]
@@ -883,11 +1471,154 @@ mod tests {
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
         let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[r, rne]).unwrap();
         // Routing: an RM-only script must enter the FP path (the EUF leak fix).
-        assert!(solver_uses_fp(&ctx, &[atom]), "RM content routes to the FP path");
+        assert!(
+            solver_uses_fp(&ctx, &[atom]),
+            "RM content routes to the FP path"
+        );
         // Collection: the RM equality is an FP atom.
         let atoms = collect_fp_atoms(&ctx, &[atom]);
         assert_eq!(atoms, vec![atom]);
         // Support: RM =/distinct over RM literals/variables is admitted.
         assert!(fp_atoms_fully_supported(&ctx, &atoms));
+    }
+
+    #[test]
+    fn bridge_admissible_accepts_to_real_plus_lra() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        let real = ctx.real_sort();
+        let c = ctx.mk_numeral(
+            shinri_num::Rational::new(Integer::from(1i64), Integer::from(1i64)),
+            real,
+        );
+        let gt = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Gt), &[toreal, c])
+            .unwrap();
+        assert!(
+            super::bridge_admissible(&ctx, &[gt]),
+            "to_real(F32)+LRA is admissible"
+        );
+    }
+
+    #[test]
+    fn bridge_admissible_rejects_symbolic_to_fp() {
+        // symbolic-Real to_fp must NOT be admitted (stays fenced elsewhere).
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let rf = ctx.declare_fun("r", &[], real);
+        let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let z = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, r])
+            .unwrap();
+        assert!(!super::bridge_admissible(&ctx, &[z]));
+    }
+
+    #[test]
+    fn bridge_admissible_rejects_large_format() {
+        let mut ctx = Context::new();
+        let f64 = ctx.fp_sort(11, 53);
+        let xf = ctx.declare_fun("x", &[], f64);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        let real = ctx.real_sort();
+        let c = ctx.mk_numeral(shinri_num::Rational::zero(), real);
+        let eq = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Eq), &[toreal, c])
+            .unwrap();
+        assert!(
+            !super::bridge_admissible(&ctx, &[eq]),
+            "eb>=11 stays fenced"
+        );
+    }
+
+    /// Scope-tightening canary: FP+BV plus a bare-Real LRA atom but ZERO
+    /// fp.to_real terms must NOT be admitted. Without this guard,
+    /// `only_crossing_is_admitted_to_real` is vacuously true (no crossing op to
+    /// reject) and every non-BVFP atom here IS pure-LRA, so `bridge_admissible`
+    /// would wrongly lift the fence on a shape this slice never intended to
+    /// admit (design scope is "fp.to_real freely mixed with LRA", not "any FP
+    /// query with an incidental bare-Real atom").
+    #[test]
+    fn bridge_admissible_requires_a_to_real_term() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
+        let bvs = ctx.bv_sort(8);
+        let bf = ctx.declare_fun("b", &[], bvs);
+        let bvar = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
+        let one = ctx.mk_bv_const(8, Integer::from(1u64));
+        let ult = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvUlt), &[bvar, one])
+            .unwrap();
+        let real = ctx.real_sort();
+        let rf = ctx.declare_fun("r", &[], real);
+        let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
+        let zero = ctx.mk_numeral(shinri_num::Rational::zero(), real);
+        let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[r, zero]).unwrap();
+        let assertions = vec![isnan, ult, gt];
+        assert!(
+            !super::bridge_admissible(&ctx, &assertions),
+            "no fp.to_real term present: bridge is not admissible, fence still governs"
+        );
+    }
+
+    /// Broadened-scope canary: QF_UFLRA + bridge is IN SCOPE, so
+    /// `(= (fp.to_real x) (f a))` with `f: Real -> Real` (a non-nullary
+    /// uninterpreted application, i.e. EUF-structure) — Real-sorted on both
+    /// sides — must be ADMITTED. `is_lra_real_atom` requires only that operands
+    /// be Real-sorted; the EUF `(f a)` routes to the Combiner alongside Arith.
+    /// Soundness rests on the Combiner's Nelson–Oppen EUF⋈Arith combination and
+    /// is validated by the `differential_qf_fp_to_real_uflra` z3 oracle.
+    #[test]
+    fn bridge_admissible_accepts_to_real_with_euf_real_operand() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        let real = ctx.real_sort();
+        let ff = ctx.declare_fun("f", &[real], real);
+        let af = ctx.declare_fun("a", &[], real);
+        let a = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
+        let fa = ctx.mk_app(Op::Uninterpreted(ff), &[a]).unwrap();
+        let eq = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Eq), &[toreal, fa])
+            .unwrap();
+        assert!(
+            super::bridge_admissible(&ctx, &[eq]),
+            "QF_UFLRA + bridge is in scope: EUF-Real operand mixed with fp.to_real is admitted"
+        );
+    }
+
+    /// Positive-case canary paired with the EUF-acceptance above: the pure-arith
+    /// bridge shapes (fp.to_real vs. numeral, and fp.to_real vs. fp.to_real)
+    /// remain admitted under the broadened Real-sorted recognizer.
+    #[test]
+    fn bridge_admissible_still_accepts_to_real_pure_arith_shapes() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let toreal_x = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        let real = ctx.real_sort();
+        let one = ctx.mk_numeral(
+            shinri_num::Rational::new(Integer::from(1i64), Integer::from(1i64)),
+            real,
+        );
+        let gt = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Gt), &[toreal_x, one])
+            .unwrap();
+        assert!(
+            super::bridge_admissible(&ctx, &[gt]),
+            "fp.to_real(x) > 1.0 stays admissible"
+        );
+
+        let y = fp_var(&mut ctx, "y");
+        let toreal_y = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[y]).unwrap();
+        let eq = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Eq), &[toreal_x, toreal_y])
+            .unwrap();
+        assert!(
+            super::bridge_admissible(&ctx, &[eq]),
+            "fp.to_real(x) = fp.to_real(y) (both pure-arith leaves) stays admissible"
+        );
     }
 }

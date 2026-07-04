@@ -177,7 +177,11 @@ fn gen_arith_script(rng: &mut Lcg) -> String {
     };
     let n_asserts = 1 + rng.below(3) as usize;
     for _ in 0..n_asserts {
-        let op = if rng.below(2) == 0 { "fp.add" } else { "fp.sub" };
+        let op = if rng.below(2) == 0 {
+            "fp.add"
+        } else {
+            "fp.sub"
+        };
         let term = format!("({op} {} x y)", rm(rng));
         let atom = match rng.below(3) {
             0 => format!("(fp.eq z {term})"),
@@ -217,9 +221,9 @@ fn differential_qf_fp_add_sub() {
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
             (SolveOutcome::Sat, easy_smt::Response::Unknown)
             | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
-            (o, t) => panic!(
-                "QF_FP add/sub DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"
-            ),
+            (o, t) => {
+                panic!("QF_FP add/sub DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}")
+            }
         }
     }
     println!("differential_qf_fp_add_sub: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
@@ -417,9 +421,7 @@ fn differential_qf_fp_mul() {
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
             (SolveOutcome::Sat, easy_smt::Response::Unknown)
             | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
-            (o, t) => panic!(
-                "QF_FP mul DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"
-            ),
+            (o, t) => panic!("QF_FP mul DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
         }
     }
     println!("differential_qf_fp_mul: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
@@ -493,9 +495,7 @@ fn differential_qf_fp_div() {
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
             (SolveOutcome::Sat, easy_smt::Response::Unknown)
             | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
-            (o, t) => panic!(
-                "QF_FP div DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"
-            ),
+            (o, t) => panic!("QF_FP div DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
         }
     }
     println!("differential_qf_fp_div: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
@@ -543,7 +543,10 @@ fn differential_qf_fp_rem() {
     for iter in 0..REM_ITERS {
         let src = gen_rem_script(&mut rng);
         let ours = shinri_outcome(&src);
-        if ours == SolveOutcome::Unknown { n_unknown += 1; continue; }
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
         let mut ctx = easy_smt::ContextBuilder::new()
             .solver("z3", ["-smt2", "-in"])
             .build()
@@ -554,9 +557,7 @@ fn differential_qf_fp_rem() {
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
             (SolveOutcome::Sat, easy_smt::Response::Unknown)
             | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
-            (o, t) => panic!(
-                "QF_FP rem DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"
-            ),
+            (o, t) => panic!("QF_FP rem DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
         }
     }
     println!("differential_qf_fp_rem: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
@@ -641,9 +642,7 @@ fn differential_qf_fp_sqrt() {
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
             (SolveOutcome::Sat, easy_smt::Response::Unknown)
             | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
-            (o, t) => panic!(
-                "QF_FP sqrt DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"
-            ),
+            (o, t) => panic!("QF_FP sqrt DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
         }
     }
     println!("differential_qf_fp_sqrt: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
@@ -679,7 +678,11 @@ fn gen_rel_script(rng: &mut Lcg) -> String {
             format!("({rel} {a} {b})")
         } else {
             // min/max folded into an fp.eq so its word output is observable
-            let mm = if rng.below(2) == 0 { "fp.min" } else { "fp.max" };
+            let mm = if rng.below(2) == 0 {
+                "fp.min"
+            } else {
+                "fp.max"
+            };
             let a = pick_operand(rng);
             let b = pick_operand(rng);
             let c = pick_operand(rng);
@@ -707,8 +710,11 @@ fn gen_roundint_script(rng: &mut Lcg) -> String {
         s.push_str("(declare-fun rm () RoundingMode)\n");
     }
     let rm = |rng: &mut Lcg| -> String {
-        if use_sym_rm && rng.below(2) == 0 { "rm".to_string() }
-        else { RMS[rng.below(RMS.len() as u64) as usize].to_string() }
+        if use_sym_rm && rng.below(2) == 0 {
+            "rm".to_string()
+        } else {
+            RMS[rng.below(RMS.len() as u64) as usize].to_string()
+        }
     };
     let n_asserts = 1 + rng.below(3) as usize;
     for _ in 0..n_asserts {
@@ -718,8 +724,11 @@ fn gen_roundint_script(rng: &mut Lcg) -> String {
             1 => format!("(= z {term})"),
             _ => format!("(fp.isNaN {term})"),
         };
-        if rng.below(2) == 0 { s.push_str(&format!("(assert (not {atom}))\n")); }
-        else { s.push_str(&format!("(assert {atom})\n")); }
+        if rng.below(2) == 0 {
+            s.push_str(&format!("(assert (not {atom}))\n"));
+        } else {
+            s.push_str(&format!("(assert {atom})\n"));
+        }
     }
     s.push_str("(check-sat)\n");
     s
@@ -736,9 +745,13 @@ fn differential_qf_fp_roundint() {
     for iter in 0..ROUNDINT_ITERS {
         let src = gen_roundint_script(&mut rng);
         let ours = shinri_outcome(&src);
-        if ours == SolveOutcome::Unknown { n_unknown += 1; continue; }
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
         let mut ctx = easy_smt::ContextBuilder::new()
-            .solver("z3", ["-smt2", "-in"]).build()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
             .expect("failed to launch z3 — ensure z3 is on PATH");
         let theirs = z3_outcome_arith(&mut ctx, &src);
         match (ours, theirs) {
@@ -746,7 +759,9 @@ fn differential_qf_fp_roundint() {
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
             (SolveOutcome::Sat, easy_smt::Response::Unknown)
             | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
-            (o, t) => panic!("QF_FP roundToIntegral DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
+            (o, t) => panic!(
+                "QF_FP roundToIntegral DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"
+            ),
         }
     }
     println!("differential_qf_fp_roundint: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
@@ -768,27 +783,46 @@ fn gen_fma_script(rng: &mut Lcg) -> String {
         s.push_str("(declare-fun rm () RoundingMode)\n");
     }
     let rm = |rng: &mut Lcg| -> String {
-        if use_sym_rm && rng.below(2) == 0 { "rm".to_string() }
-        else { RMS[rng.below(RMS.len() as u64) as usize].to_string() }
+        if use_sym_rm && rng.below(2) == 0 {
+            "rm".to_string()
+        } else {
+            RMS[rng.below(RMS.len() as u64) as usize].to_string()
+        }
     };
     const SPECIALS: &[&str] = &[
-        "(_ +zero 8 24)", "(_ -zero 8 24)", "(_ +oo 8 24)", "(_ -oo 8 24)", "(_ NaN 8 24)",
+        "(_ +zero 8 24)",
+        "(_ -zero 8 24)",
+        "(_ +oo 8 24)",
+        "(_ -oo 8 24)",
+        "(_ NaN 8 24)",
     ];
     let vars = ["x", "y", "z"];
     let operand = |rng: &mut Lcg| -> String {
-        if rng.below(2) == 0 { vars[rng.below(3) as usize].to_string() }
-        else { SPECIALS[rng.below(SPECIALS.len() as u64) as usize].to_string() }
+        if rng.below(2) == 0 {
+            vars[rng.below(3) as usize].to_string()
+        } else {
+            SPECIALS[rng.below(SPECIALS.len() as u64) as usize].to_string()
+        }
     };
     let n_asserts = 1 + rng.below(3) as usize;
     for _ in 0..n_asserts {
-        let term = format!("(fp.fma {} {} {} {})", rm(rng), operand(rng), operand(rng), operand(rng));
+        let term = format!(
+            "(fp.fma {} {} {} {})",
+            rm(rng),
+            operand(rng),
+            operand(rng),
+            operand(rng)
+        );
         let atom = match rng.below(3) {
             0 => format!("(fp.eq w {term})"),
             1 => format!("(= w {term})"),
             _ => format!("(fp.isNaN {term})"),
         };
-        if rng.below(2) == 0 { s.push_str(&format!("(assert (not {atom}))\n")); }
-        else { s.push_str(&format!("(assert {atom})\n")); }
+        if rng.below(2) == 0 {
+            s.push_str(&format!("(assert (not {atom}))\n"));
+        } else {
+            s.push_str(&format!("(assert {atom})\n"));
+        }
     }
     s.push_str("(check-sat)\n");
     s
@@ -813,9 +847,13 @@ fn differential_qf_fp_fma() {
     for iter in 0..FMA_ITERS {
         let src = gen_fma_script(&mut rng);
         let ours = shinri_outcome(&src);
-        if ours == SolveOutcome::Unknown { n_unknown += 1; continue; }
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
         let mut ctx = easy_smt::ContextBuilder::new()
-            .solver("z3", ["-smt2", "-in"]).build()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
             .expect("failed to launch z3 — ensure z3 is on PATH");
         let theirs = z3_outcome_arith(&mut ctx, &src);
         match (ours, theirs) {
@@ -847,7 +885,9 @@ fn differential_qf_fp_relations() {
         match (&ours, &theirs) {
             (SolveOutcome::Sat, easy_smt::Response::Sat) => n_sat += 1,
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
-            (o, t) => panic!("QF_FP relations DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
+            (o, t) => {
+                panic!("QF_FP relations DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}")
+            }
         }
     }
     assert!(n_sat > 0 && n_unsat > 0, "oracle produced no coverage");
@@ -869,7 +909,7 @@ fn gen_to_fp_script(rng: &mut Lcg) -> String {
         let rm = modes[rng.below(5) as usize];
         // pick a conversion term of Float32 sort so it composes with z / fp.isNaN.
         let term = match rng.below(3) {
-            0 => format!("((_ to_fp 8 24) {rm} w)"),              // narrow Float64→Float32
+            0 => format!("((_ to_fp 8 24) {rm} w)"), // narrow Float64→Float32
             1 => {
                 let num = 1 + rng.below(9);
                 let den = 1 + rng.below(9);
@@ -901,7 +941,10 @@ fn differential_qf_fp_to_fp() {
     for iter in 0..TO_FP_ITERS {
         let src = gen_to_fp_script(&mut rng);
         let ours = shinri_outcome(&src);
-        if ours == SolveOutcome::Unknown { n_unknown += 1; continue; }
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
         let mut ctx = easy_smt::ContextBuilder::new()
             .solver("z3", ["-smt2", "-in"])
             .build()
@@ -912,12 +955,16 @@ fn differential_qf_fp_to_fp() {
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
             (SolveOutcome::Sat, easy_smt::Response::Unknown)
             | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
-            (o, t) => panic!(
-                "QF_FP to_fp DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}"),
+            (o, t) => {
+                panic!("QF_FP to_fp DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}")
+            }
         }
     }
     println!("differential_qf_fp_to_fp: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
-    assert!(n_sat > 0 && n_unsat > 0, "oracle produced no SAT/UNSAT coverage");
+    assert!(
+        n_sat > 0 && n_unsat > 0,
+        "oracle produced no SAT/UNSAT coverage"
+    );
 }
 
 /// One mixed BV+FP script: a BV comparison AND an FP comparison over
@@ -1097,7 +1144,10 @@ fn differential_qf_bvfp_bitcast() {
         n_sat > 0 && n_unsat > 0,
         "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
     );
-    assert!(n_z3_checked > 0, "z3 never returned a concrete verdict — check the logic/harness");
+    assert!(
+        n_z3_checked > 0,
+        "z3 never returned a concrete verdict — check the logic/harness"
+    );
 }
 
 /// One int→FP script: a constant BV converted BOTH ways — signed 2-arg `to_fp`
@@ -1112,7 +1162,11 @@ fn gen_int_to_fp_script(rng: &mut Lcg) -> String {
     // Half Float32, half Float16 — Float16 overflows on large 16/32-bit values
     // (mode-dependent: RNE→+oo, RTZ→max finite), which is exactly the boundary
     // we want cross-checked.
-    let (eb, sb) = if rng.below(2) == 0 { (8u32, 24u32) } else { (5, 11) };
+    let (eb, sb) = if rng.below(2) == 0 {
+        (8u32, 24u32)
+    } else {
+        (5, 11)
+    };
     const FP_RELS: &[&str] = &["fp.lt", "fp.leq", "fp.gt", "fp.geq", "fp.eq"];
     let rel = FP_RELS[rng.below(FP_RELS.len() as u64) as usize];
     const RMS: &[&str] = &["RNE", "RNA", "RTP", "RTN", "RTZ"];
@@ -1170,7 +1224,10 @@ fn differential_qf_bvfp_int_to_fp() {
         n_sat > 0 && n_unsat > 0,
         "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
     );
-    assert!(n_z3_checked > 0, "z3 never returned a concrete verdict — check the logic/harness");
+    assert!(
+        n_z3_checked > 0,
+        "z3 never returned a concrete verdict — check the logic/harness"
+    );
 }
 
 /// FP→BV: a random source bit-pattern (naturally hitting NaN/±inf/subnormal/
@@ -1181,10 +1238,18 @@ fn differential_qf_bvfp_int_to_fp() {
 fn gen_fp_to_bv_script(rng: &mut Lcg) -> String {
     const MS: &[u32] = &[4, 8, 16];
     let m = MS[rng.below(MS.len() as u64) as usize];
-    let (eb, sb) = if rng.below(2) == 0 { (5u32, 11u32) } else { (8, 24) };
+    let (eb, sb) = if rng.below(2) == 0 {
+        (5u32, 11u32)
+    } else {
+        (8, 24)
+    };
     let w = (eb + sb) as usize;
     let bits = rng.next() & if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
-    let face = if rng.below(2) == 0 { "fp.to_ubv" } else { "fp.to_sbv" };
+    let face = if rng.below(2) == 0 {
+        "fp.to_ubv"
+    } else {
+        "fp.to_sbv"
+    };
     const RMS: &[&str] = &["RNE", "RNA", "RTP", "RTN", "RTZ"];
     let rm = RMS[rng.below(RMS.len() as u64) as usize];
     if rng.below(4) == 0 {
@@ -1219,7 +1284,10 @@ fn differential_qf_bvfp_fp_to_bv() {
     for iter in 0..N_ITERS {
         let src = gen_fp_to_bv_script(&mut rng);
         let ours = shinri_outcome(&src);
-        if ours == SolveOutcome::Unknown { n_unknown += 1; continue; }
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+            continue;
+        }
         match ours {
             SolveOutcome::Sat => n_sat += 1,
             SolveOutcome::Unsat => n_unsat += 1,
@@ -1245,9 +1313,14 @@ fn differential_qf_bvfp_fp_to_bv() {
         "differential_qf_bvfp_fp_to_bv: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
          z3_checked={n_z3_checked}"
     );
-    assert!(n_sat > 0 && n_unsat > 0,
-        "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)");
-    assert!(n_unknown == 0, "no admitted-face script may fence ({n_unknown} unknown)");
+    assert!(
+        n_sat > 0 && n_unsat > 0,
+        "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
+    );
+    assert!(
+        n_unknown == 0,
+        "no admitted-face script may fence ({n_unknown} unknown)"
+    );
     assert!(n_z3_checked > 0, "z3 never returned a concrete verdict");
 }
 
@@ -1273,7 +1346,11 @@ fn gen_ite_cond(rng: &mut Lcg) -> String {
 /// Draw a random FP operand: `x`/`y` or one of the FP32 special constants.
 fn gen_ite_fp_operand(rng: &mut Lcg) -> String {
     if rng.below(2) == 0 {
-        if rng.below(2) == 0 { "x".to_string() } else { "y".to_string() }
+        if rng.below(2) == 0 {
+            "x".to_string()
+        } else {
+            "y".to_string()
+        }
     } else {
         FP32_SPECIALS[rng.below(FP32_SPECIALS.len() as u64) as usize].to_string()
     }
@@ -1431,10 +1508,232 @@ fn differential_qf_bvfp_ite() {
         n_sat > 0 && n_unsat > 0,
         "expected SAT and UNSAT coverage ({n_sat} sat, {n_unsat} unsat, {n_unknown} unknown)"
     );
-    assert!(n_unknown == 0, "unknown must be 0 post-slice ({n_unknown} unknown)");
+    assert!(
+        n_unknown == 0,
+        "unknown must be 0 post-slice ({n_unknown} unknown)"
+    );
     assert!(
         n_z3_checked == N_ITERS,
         "expected every iteration z3-checked with zero disagreements \
          ({n_z3_checked}/{N_ITERS} checked)"
+    );
+}
+
+/// Constant-source `fp.to_real` oracle (slice 9, Task 6): binds `x` to a random
+/// Float16 literal via the exact `(fp s e sig)` triple, then constrains
+/// `(fp.to_real x)` against a random integer bound via LRA `<=`. Since `x` is
+/// fully constant, both solvers must decide — this is the zero-Unknown gate
+/// on the Real-bridge seam (spec §5/§7): no admitted `fp.to_real` instance may
+/// fence to Unknown once the operand is concrete.
+#[cfg(feature = "oracle")]
+fn gen_to_real_script(rng: &mut Lcg) -> String {
+    let bits = (rng.next() & 0xFFFF) as u16;
+    let s = (bits >> 15) & 1;
+    let e = (bits >> 10) & 0x1F;
+    let sig = bits & 0x3FF;
+    let bound = (rng.next() % 21) as i64 - 10; // integer bound in [-10,10]
+                                               // SMT-LIB decimals have no sign; negative bounds must use `(- n.0)`.
+    let bound_term = if bound < 0 {
+        format!("(- {}.0)", -bound)
+    } else {
+        format!("{bound}.0")
+    };
+    format!(
+        "(declare-fun x () Float16)\n\
+         (assert (= x (fp #b{s:01b} #b{e:05b} #b{sig:010b})))\n\
+         (assert (<= (fp.to_real x) {bound_term}))\n\
+         (check-sat)\n"
+    )
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+fn differential_qf_fp_to_real() {
+    let mut rng = Lcg(0xB000_0BEE_F001);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..N_ITERS {
+        let s = gen_to_real_script(&mut rng);
+        let ours = shinri_outcome(&s);
+        if ours == SolveOutcome::Unknown {
+            n_unknown += 1;
+        }
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => {}
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, &s);
+        assert!(
+            !matches!(
+                (ours, theirs),
+                (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                    | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+            ),
+            "QF_FP fp.to_real DISAGREEMENT (iter {iter}): shinri={ours:?} z3={theirs:?}\n{s}"
+        );
+    }
+    println!("differential_qf_fp_to_real: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+    assert!(
+        n_sat > 0 && n_unsat > 0,
+        "oracle produced no SAT/UNSAT coverage"
+    );
+    assert_eq!(
+        n_unknown, 0,
+        "constant-source fp.to_real must never fence ({n_unknown})"
+    );
+}
+
+/// Functionality pin (spec §5/§7): `fp.to_real` must be a genuine function even
+/// over NaN payloads. If `x = y` and both are NaN, then `fp.to_real x = fp.to_real y`
+/// must hold — i.e. asserting the negation must be Unsat. This is a fixed
+/// (non-fuzzed) instance pinned against z3 so neither solver treats `fp.to_real`
+/// as non-functional over the NaN equivalence class.
+#[cfg(feature = "oracle")]
+#[test]
+fn differential_qf_fp_to_real_nan_functionality() {
+    let s = "(declare-fun x () Float16)\n\
+             (declare-fun y () Float16)\n\
+             (assert (fp.isNaN x))\n\
+             (assert (fp.isNaN y))\n\
+             (assert (= x y))\n\
+             (assert (not (= (fp.to_real x) (fp.to_real y))))\n\
+             (check-sat)\n";
+    let ours = shinri_outcome(s);
+    let mut ctx = easy_smt::ContextBuilder::new()
+        .solver("z3", ["-smt2", "-in"])
+        .build()
+        .expect("failed to launch z3 — ensure z3 is on PATH");
+    let theirs = z3_outcome_arith(&mut ctx, s);
+    assert_eq!(
+        ours,
+        SolveOutcome::Unsat,
+        "fp.to_real must be functional over NaN (x=y both NaN ⇒ to_real x = to_real y): \
+         shinri returned {ours:?}\n{s}"
+    );
+    assert!(
+        !matches!(
+            (ours, theirs),
+            (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+        ),
+        "QF_FP fp.to_real NaN-functionality DISAGREEMENT: shinri={ours:?} z3={theirs:?}\n{s}"
+    );
+}
+
+/// QF_UFLRA + bridge differential oracle (slice 9 broadening): the `fp.to_real`
+/// Real-bridge is admitted mixed with EUF over the resulting Real. This fuzzes
+/// DECIDABLE queries that link a constant-source `(fp.to_real x)` to an
+/// uninterpreted `(f a)` (EUF-structure, `f: Real -> Real`) and a random integer
+/// bound, pinning every instance against z3 with ZERO tolerated disagreements.
+///
+/// Because `x` is a concrete Float16 literal and `(= (f a) (fp.to_real x))`
+/// pins `(f a)` to that concrete real, the outer relation `(<op> (f a) bound)`
+/// is fully decidable — both solvers must decide, and must AGREE. A single
+/// disagreement (our Sat vs z3 Unsat, or our Unsat vs z3 Sat) would prove the
+/// broadened QF_UFLRA + bridge scope UNSOUND (the reverted fence necessary).
+///
+/// Soundness rests on the Combiner's Nelson–Oppen EUF⋈Arith combination
+/// deciding the shared-Real interface between the bridged `fp.to_real` value
+/// and the uninterpreted `f`. Coverage here is EUF-over-Real; Array/Str-Real
+/// operands are admitted by the Real-sorted recognizer but not exercised (see
+/// spec §6 FOLLOW-UP note).
+#[cfg(feature = "oracle")]
+fn gen_to_real_uflra_script(rng: &mut Lcg) -> String {
+    let bits = (rng.next() & 0xFFFF) as u16;
+    let s = (bits >> 15) & 1;
+    let e = (bits >> 10) & 0x1F;
+    let sig = bits & 0x3FF;
+    let bound = (rng.next() % 21) as i64 - 10; // integer bound in [-10,10]
+    let bound_term = if bound < 0 {
+        format!("(- {}.0)", -bound)
+    } else {
+        format!("{bound}.0")
+    };
+    // Vary the outer relation so both SAT and UNSAT witnesses arise: `=` yields
+    // mostly UNSAT, the inequalities yield a mix depending on the literal's real
+    // value vs. the bound.
+    let ops = ["<=", "<", ">=", ">", "="];
+    let op = ops[(rng.next() % ops.len() as u64) as usize];
+    format!(
+        "(declare-fun x () Float16)\n\
+         (declare-fun f (Real) Real)\n\
+         (declare-fun a () Real)\n\
+         (assert (= x (fp #b{s:01b} #b{e:05b} #b{sig:010b})))\n\
+         (assert (= (f a) (fp.to_real x)))\n\
+         (assert ({op} (f a) {bound_term}))\n\
+         (check-sat)\n"
+    )
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+fn differential_qf_fp_to_real_uflra() {
+    // Fixed NaN/EUF functionality pin (spec §5/§7 composed with EUF): if x=y and
+    // both NaN, then f(to_real x) = f(to_real y) — asserting the negation is
+    // Unsat. Verifies fp.to_real functionality composes through an uninterpreted
+    // f under the broadened QF_UFLRA + bridge scope.
+    {
+        let s = "(declare-fun x () Float16)\n\
+                 (declare-fun y () Float16)\n\
+                 (declare-fun f (Real) Real)\n\
+                 (assert (fp.isNaN x))\n\
+                 (assert (fp.isNaN y))\n\
+                 (assert (= x y))\n\
+                 (assert (not (= (f (fp.to_real x)) (f (fp.to_real y)))))\n\
+                 (check-sat)\n";
+        let ours = shinri_outcome(s);
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, s);
+        assert_eq!(
+            ours,
+            SolveOutcome::Unsat,
+            "fp.to_real functionality must compose with EUF (x=y both NaN ⇒ \
+             f(to_real x) = f(to_real y)): shinri returned {ours:?}\n{s}"
+        );
+        assert!(
+            !matches!(
+                (ours, theirs),
+                (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                    | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+            ),
+            "QF_UFLRA+bridge NaN/EUF-functionality DISAGREEMENT: shinri={ours:?} z3={theirs:?}\n{s}"
+        );
+    }
+
+    let mut rng = Lcg(0xF13_A5EE_D009_u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..N_ITERS {
+        let s = gen_to_real_uflra_script(&mut rng);
+        let ours = shinri_outcome(&s);
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => n_unknown += 1,
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, &s);
+        assert!(
+            !matches!(
+                (ours, theirs),
+                (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                    | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+            ),
+            "QF_UFLRA+bridge DISAGREEMENT (iter {iter}): shinri={ours:?} z3={theirs:?}\n{s}"
+        );
+    }
+    println!("differential_qf_fp_to_real_uflra: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+    assert!(
+        n_sat > 0 && n_unsat > 0,
+        "QF_UFLRA+bridge oracle produced no SAT/UNSAT coverage (sat={n_sat} unsat={n_unsat})"
     );
 }

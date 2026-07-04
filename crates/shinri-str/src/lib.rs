@@ -8,13 +8,13 @@ mod trail;
 pub mod wordeq;
 pub use fuel::Fuel;
 
-
 use rustc_hash::FxHashSet;
 use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
+#[derive(Default)]
 pub struct StrSolver {
     /// Asserted string equalities: (atom, the literal that asserted it).
     /// The `Lit` is used to build `EqLeaf::Asserted` justifications for conflicts.
@@ -33,28 +33,18 @@ pub struct StrSolver {
     trail: trail::Trail,
 }
 
-impl Default for StrSolver {
-    fn default() -> Self {
-        StrSolver {
-            eq_true: Vec::new(),
-            diseq_true: Vec::new(),
-            len_terms: FxHashSet::default(),
-            str_terms: FxHashSet::default(),
-            emitted_len_axioms: FxHashSet::default(),
-            emitted_splits: FxHashSet::default(),
-            fresh_ctr: 0,
-            fuel: Fuel::default(),
-            trail: trail::Trail::default(),
-        }
-    }
-}
-
 impl TheorySolver for StrSolver {
     const THEORY_ID: u16 = 4;
 
     fn new_var(&mut self, cx: &mut TheoryCtx, _v: Var, atom: TermId) {
         let mut seen = FxHashSet::default();
-        collect::collect(cx.terms, atom, &mut self.len_terms, &mut self.str_terms, &mut seen);
+        collect::collect(
+            cx.terms,
+            atom,
+            &mut self.len_terms,
+            &mut self.str_terms,
+            &mut seen,
+        );
     }
 
     fn assert(&mut self, cx: &mut TheoryCtx, lit: Lit) -> Option<Vec<EqLeaf>> {
@@ -64,8 +54,7 @@ impl TheorySolver for StrSolver {
         let atom = cx.atoms.atom(lit.var());
         if let TermNode::App { op, args, .. } = cx.terms.term_node(atom) {
             let args = cx.terms.children(*args).to_vec();
-            let is_str_eq = !args.is_empty()
-                && cx.terms.sort_of(args[0]) == cx.terms.string_sort();
+            let is_str_eq = !args.is_empty() && cx.terms.sort_of(args[0]) == cx.terms.string_sort();
             if is_str_eq {
                 match op {
                     Op::Builtin(BuiltinOp::Eq) => {
@@ -89,7 +78,11 @@ impl TheorySolver for StrSolver {
         None
     }
 
-    fn propagate(&mut self, _cx: &mut TheoryCtx, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<EqLeaf>> {
+    fn propagate(
+        &mut self,
+        _cx: &mut TheoryCtx,
+        _out: &mut Vec<(Lit, TheoryJust)>,
+    ) -> Option<Vec<EqLeaf>> {
         None
     }
 
@@ -114,9 +107,10 @@ impl TheorySolver for StrSolver {
             // DIFFERENT string literals is UNSAT. Must be caught BEFORE normalization
             // (once the EUF merges l≈r, `normal_form` substitutes both to one
             // representative and the mismatch disappears → wrong SAT, e.g. `(= "a" "b")`).
-            if let (Some(ls), Some(rs)) =
-                (cx.terms.string_const_value(l), cx.terms.string_const_value(r))
-            {
+            if let (Some(ls), Some(rs)) = (
+                cx.terms.string_const_value(l),
+                cx.terms.string_const_value(r),
+            ) {
                 if ls != rs {
                     return TCheck::Conflict(vec![EqLeaf::Asserted(lit)]);
                 }
@@ -160,7 +154,10 @@ impl TheorySolver for StrSolver {
                 let is_concat = |t: TermId| {
                     matches!(
                         cx.terms.term_node(t),
-                        TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
+                        TermNode::App {
+                            op: Op::Builtin(BuiltinOp::StrConcat),
+                            ..
+                        }
                     )
                 };
                 if is_concat(l) || is_concat(r) {
@@ -171,8 +168,14 @@ impl TheorySolver for StrSolver {
                 {
                     continue; // two literals: lengths already pinned constants
                 }
-                let ll = cx.terms.mk_app(Op::Builtin(BuiltinOp::StrLen), &[l]).expect("len l");
-                let lr = cx.terms.mk_app(Op::Builtin(BuiltinOp::StrLen), &[r]).expect("len r");
+                let ll = cx
+                    .terms
+                    .mk_app(Op::Builtin(BuiltinOp::StrLen), &[l])
+                    .expect("len l");
+                let lr = cx
+                    .terms
+                    .mk_app(Op::Builtin(BuiltinOp::StrLen), &[r])
+                    .expect("len r");
                 self.len_terms.insert(ll);
                 self.len_terms.insert(lr);
                 if ll == lr {
@@ -190,8 +193,17 @@ impl TheorySolver for StrSolver {
                         return TCheck::Unknown;
                     }
                     let mut seen = FxHashSet::default();
-                    collect::collect(cx.terms, comp, &mut self.len_terms, &mut self.str_terms, &mut seen);
-                    return TCheck::Split { atoms: vec![comp], guard: Some(lit.negate()) };
+                    collect::collect(
+                        cx.terms,
+                        comp,
+                        &mut self.len_terms,
+                        &mut self.str_terms,
+                        &mut seen,
+                    );
+                    return TCheck::Split {
+                        atoms: vec![comp],
+                        guard: Some(lit.negate()),
+                    };
                 }
             }
         }
@@ -201,18 +213,29 @@ impl TheorySolver for StrSolver {
         // (a bare Int equality would route to EUF, not Arith — see length.rs).
         let lens: Vec<TermId> = self.len_terms.iter().copied().collect();
         for lt in lens {
-            if let Some(axiom) = length::next_axiom(cx.terms, cx.eq, &known, lt, &self.emitted_len_axioms) {
+            if let Some(axiom) =
+                length::next_axiom(cx.terms, cx.eq, &known, lt, &self.emitted_len_axioms)
+            {
                 // Register NEW str.len subterms introduced by this axiom so the
                 // defining-axiom chain over nested concats continues to a fixpoint.
                 let mut seen = FxHashSet::default();
-                collect::collect(cx.terms, axiom, &mut self.len_terms, &mut self.str_terms, &mut seen);
+                collect::collect(
+                    cx.terms,
+                    axiom,
+                    &mut self.len_terms,
+                    &mut self.str_terms,
+                    &mut seen,
+                );
                 // Spend fuel FIRST; only record the axiom as emitted if the split is
                 // actually delivered (tracks only delivered axioms invariant).
                 if !self.fuel.spend() {
                     return TCheck::Unknown;
                 }
                 self.emitted_len_axioms.insert(axiom);
-                return TCheck::Split { atoms: vec![axiom], guard: None };
+                return TCheck::Split {
+                    atoms: vec![axiom],
+                    guard: None,
+                };
             }
         }
 
@@ -289,7 +312,10 @@ impl TheorySolver for StrSolver {
                         cx.terms.string_const_value(a).is_none()
                             && matches!(
                                 cx.terms.term_node(a),
-                                TermNode::App { op: Op::Uninterpreted(_), .. }
+                                TermNode::App {
+                                    op: Op::Uninterpreted(_),
+                                    ..
+                                }
                             )
                     });
                     if all_var {
@@ -379,7 +405,10 @@ impl TheorySolver for StrSolver {
                     // GUARDED split: `guard = ¬eqn`. The learnt clause is
                     // `¬eqn ∨ len_eq ∨ a_pref ∨ b_pref` ≡ `eqn → (…)`, a valid
                     // implication (Nielsen lemma) — NOT the unsound bare disjunction.
-                    return TCheck::Split { atoms, guard: Some(guard) };
+                    return TCheck::Split {
+                        atoms,
+                        guard: Some(guard),
+                    };
                 }
                 crate::wordeq::StepResult::Done => {}
                 // A dedup-saturated variable-headed residual: the SAT layer must
@@ -444,11 +473,14 @@ impl TheorySolver for StrSolver {
                     // false — the wrong-UNSAT this slice closes. Only the genuinely-
                     // entailed-zero case (a bare/const-free side EUF-merged to 0 via an
                     // asserted literal) is a sound conflict, and that path is preserved.
-                    if let Some(nf) = crate::normalize::deep_normal_form(cx.terms, cx.eq, &known, other) {
-                        if nf
-                            .iter()
-                            .any(|&a| cx.terms.string_const_value(a).is_some_and(|s| !s.is_empty()))
-                        {
+                    if let Some(nf) =
+                        crate::normalize::deep_normal_form(cx.terms, cx.eq, &known, other)
+                    {
+                        if nf.iter().any(|&a| {
+                            cx.terms
+                                .string_const_value(a)
+                                .is_some_and(|s| !s.is_empty())
+                        }) {
                             continue;
                         }
                     }
@@ -517,15 +549,15 @@ impl TheorySolver for StrSolver {
                 let l_res = &lhs[i..le];
                 let r_res = &rhs[j..re];
                 let has_nonempty_const = |atoms: &[TermId], terms: &Context| {
-                    atoms.iter().any(|&a| {
-                        terms.string_const_value(a).map_or(false, |s| !s.is_empty())
-                    })
+                    atoms
+                        .iter()
+                        .any(|&a| terms.string_const_value(a).is_some_and(|s| !s.is_empty()))
                 };
                 // Emit only for the genuinely-ambiguous shape: neither residual pins a
                 // non-empty constant, and not both empty (the s=t conflict is Case 2).
-                if !has_nonempty_const(l_res, cx.terms)
-                    && !has_nonempty_const(r_res, cx.terms)
-                    && !(l_res.is_empty() && r_res.is_empty())
+                if !(has_nonempty_const(l_res, cx.terms)
+                    || has_nonempty_const(r_res, cx.terms)
+                    || l_res.is_empty() && r_res.is_empty())
                 {
                     let int_s = cx.terms.int_sort();
                     let one = cx
@@ -618,7 +650,6 @@ impl TheorySolver for StrSolver {
             let ln = cx.eq.intern(l);
             let rn = cx.eq.intern(r);
             if cx.eq.are_equal(ln, rn) {
-                
                 let mut just = vec![EqLeaf::Asserted(lit)];
                 cx.eq.explain(ln, rn, &mut just);
                 return TCheck::Conflict(just);
@@ -648,7 +679,6 @@ impl TheorySolver for StrSolver {
                 _ => return TCheck::Unknown,
             };
             if crate::wordeq::nf_equal(cx.terms, cx.eq, &lhs, &rhs) {
-                
                 // Build conflict: diseq literal + merge antecedents for each pair.
                 let mut just = vec![EqLeaf::Asserted(lit)];
                 crate::wordeq::nf_equal_explain(cx.terms, cx.eq, &lhs, &rhs, &mut just);
@@ -695,13 +725,13 @@ impl TheorySolver for StrSolver {
         // arrangement set is unperturbed for them).
         let has_empty_diseq = self.diseq_true.iter().any(|&(atom, _)| {
             let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
-            cx.terms.string_const_value(l) == Some("")
-                || cx.terms.string_const_value(r) == Some("")
+            cx.terms.string_const_value(l) == Some("") || cx.terms.string_const_value(r) == Some("")
         });
         if has_empty_diseq {
             let int_s = cx.terms.int_sort();
-            let zero =
-                cx.terms.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
+            let zero = cx
+                .terms
+                .mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
             if !out.contains(&zero) {
                 out.push(zero);
             }
@@ -753,7 +783,10 @@ fn len_class_zero(
     // it). `intern` is idempotent, but interning a term never seen by any theory
     // would create a fresh singleton class that can't be equal to anything, so a
     // negative result is still correct.
-    let zero = terms.mk_numeral(shinri_core::Rational::from_int(0i128.into()), terms.int_sort());
+    let zero = terms.mk_numeral(
+        shinri_core::Rational::from_int(0i128.into()),
+        terms.int_sort(),
+    );
     let ln = eq.intern(len_term);
     let zn = eq.intern(zero);
     if eq.are_equal(ln, zn) {
@@ -828,8 +861,10 @@ mod tests {
     use super::*;
     use shinri_core::{BuiltinOp, Context, Op, Var};
     use shinri_sat::Effort;
-    use shinri_theory::{AtomRegistry, EqualityEngine, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
     use shinri_theory::types::ModelVal;
+    use shinri_theory::{
+        AtomRegistry, EqualityEngine, ModelBuilder, TCheck, TheoryCtx, TheorySolver,
+    };
 
     #[test]
     fn collects_len_terms_and_reaches_sat_fixpoint() {
@@ -899,25 +934,39 @@ mod tests {
         // x ++ y = y ++ x : needs several length axioms + a word-equation F-split.
         // A 1-unit fuel budget must run out before resolving → Unknown (sound),
         // never a fabricated verdict or loop.
-        let l = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y]).unwrap();
-        let r = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[y, x]).unwrap();
+        let l = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
+        let r = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[y, x])
+            .unwrap();
         let atom = ctx.mk_eq(l, r).unwrap();
         let mut s = StrSolver::default();
         s.test_set_fuel(1); // tiny budget — exhausts before all axioms/splits
         let mut eq = EqualityEngine::default();
         let areg = AtomRegistry::default();
-        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &areg };
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
         s.new_var(&mut cx, shinri_core::Var::new(0), atom);
         s.test_force_eq_true(atom);
         let mut got_unknown = false;
         for _ in 0..50 {
             match s.check(&mut cx, Effort::Full) {
-                TCheck::Unknown => { got_unknown = true; break; }
+                TCheck::Unknown => {
+                    got_unknown = true;
+                    break;
+                }
                 TCheck::Split { .. } => continue,
                 _ => break,
             }
         }
-        assert!(got_unknown, "tiny fuel must force Unknown, never fabricate a verdict");
+        assert!(
+            got_unknown,
+            "tiny fuel must force Unknown, never fabricate a verdict"
+        );
     }
 
     // With len(x)=2 fixed and no constant constraints, x's model is a uniform
@@ -927,15 +976,25 @@ mod tests {
     fn free_var_model_filled_with_default_char() {
         let mut ctx = Context::new();
         let str_s = ctx.string_sort();
-        let x = { let f = ctx.declare_fun("x", &[], str_s); ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap() };
+        let x = {
+            let f = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
         let lenx = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
         let mut s = StrSolver::default();
         let mut eq = EqualityEngine::default();
         let areg = AtomRegistry::default();
         let mut m = ModelBuilder::default();
         // Seed the model with len(x) = 2 (as arith would).
-        m.assign(lenx, ModelVal::Num(shinri_core::Rational::from_int(2i64.into())));
-        let mut cx = TheoryCtx { terms: &mut ctx, eq: &mut eq, atoms: &areg };
+        m.assign(
+            lenx,
+            ModelVal::Num(shinri_core::Rational::from_int(2i64.into())),
+        );
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
         s.new_var(&mut cx, shinri_core::Var::new(0), lenx);
         s.test_force_str_term(x);
         s.model_with(&mut cx, &mut m);

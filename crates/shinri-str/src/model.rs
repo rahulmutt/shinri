@@ -17,8 +17,8 @@
 //! deep normal form captures all pinned characters, and only truly-free length
 //! is filled uniformly.
 
-use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 use rustc_hash::FxHashMap;
+use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 use shinri_theory::types::ModelVal;
 use shinri_theory::{EqualityEngine, ModelBuilder};
 
@@ -40,10 +40,7 @@ pub fn len_of_in_model(terms: &mut Context, m: &ModelBuilder, t: TermId) -> usiz
             } else {
                 // r is positive; denom = 1 for integer-valued rationals.
                 // numer() returns Integer; use to_i128() -> Option<i128>.
-                r.numer()
-                    .to_i128()
-                    .map(|v| v as usize)
-                    .unwrap_or(0)
+                r.numer().to_i128().map(|v| v as usize).unwrap_or(0)
             }
         }
         _ => 0,
@@ -183,7 +180,9 @@ fn value_of(
         terms.string_const_value(mm).is_some() && mm != t
     });
     let resolved = class_const.or_else(|| {
-        class_member(terms, eq, known, t, |terms, mm| is_concat(terms, mm) && mm != t)
+        class_member(terms, eq, known, t, |terms, mm| {
+            is_concat(terms, mm) && mm != t
+        })
     });
     let out = match resolved {
         Some(rep) => value_of(terms, eq, known, rep, m, memo, in_progress),
@@ -212,7 +211,7 @@ fn free_fill(eq: &mut EqualityEngine, t: TermId, n: usize) -> String {
     // Map the class root index onto a stable distinct character.
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let c = ALPHABET[root.index() % ALPHABET.len()] as char;
-    std::iter::repeat(c).take(n).collect()
+    std::iter::repeat_n(c, n).collect()
 }
 
 /// Value a concat term `c = a0 ++ a1 ++ …`.
@@ -236,9 +235,11 @@ fn value_concat(
     in_progress: &mut rustc_hash::FxHashSet<TermId>,
 ) -> String {
     let kids: Vec<TermId> = match terms.term_node(t) {
-        TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), args, .. } => {
-            terms.children(*args).to_vec()
-        }
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrConcat),
+            args,
+            ..
+        } => terms.children(*args).to_vec(),
         _ => return String::new(),
     };
     // Is the whole concat anchored to a fixed word in its EUF class? Accept either
@@ -361,7 +362,11 @@ fn const_word_of(terms: &Context, t: TermId) -> Option<String> {
         return Some(s.to_owned());
     }
     match terms.term_node(t) {
-        TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrConcat),
+            args,
+            ..
+        } => {
             let kids = terms.children(*args).to_vec();
             let mut out = String::new();
             for k in kids {
@@ -377,16 +382,21 @@ fn const_word_of(terms: &Context, t: TermId) -> Option<String> {
 fn is_concat(terms: &Context, t: TermId) -> bool {
     matches!(
         terms.term_node(t),
-        TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrConcat),
+            ..
+        }
     )
 }
 
 /// Number of direct operands of a concat (0 if not a concat).
 fn concat_arity(terms: &Context, t: TermId) -> usize {
     match terms.term_node(t) {
-        TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), args, .. } => {
-            terms.children(*args).len()
-        }
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrConcat),
+            args,
+            ..
+        } => terms.children(*args).len(),
         _ => 0,
     }
 }
