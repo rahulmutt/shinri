@@ -319,13 +319,26 @@ fn has_admitted_to_real_term(ctx: &Context, assertions: &[TermId]) -> bool {
 }
 
 /// A Bool atom that is a pure LRA (Real) arith relation: Le/Lt/Ge/Gt/Eq/Distinct
-/// whose operands are Real-sorted (so it routes to Arith, not Int/EUF/arrays).
+/// whose operands are Real-sorted (so it routes to Arith, not Int/EUF/arrays)
+/// AND pure-arith (numeral, `fp.to_real`, a bare nullary Real variable, or
+/// +/-/*/neg over such — see `Solver::is_pure_arith`, the single source of
+/// truth shared with the arith-lowering preprocessing pass). A Real-sorted
+/// operand alone is NOT enough: `(= (fp.to_real x) (f a))` with `f: Real->Real`
+/// (EUF) or `(select arr i)` (Arrays) is Real-sorted but is NOT pure arith —
+/// admitting it here would wrongly let `bridge_admissible` skip the
+/// `has_non_bvfp_theory_atom` fence for an out-of-scope EUF/Array/Str-mixed
+/// query (spec §6: FP mixed with a non-LRA lazy theory alongside the bridge
+/// must stay `Unknown`). Requiring `is_pure_arith` on every operand closes
+/// that gap while still admitting every intended bridge shape.
 fn is_lra_real_atom(ctx: &Context, t: TermId) -> bool {
     if let TermNode::App { op, args, .. } = ctx.term_node(t) {
         use BuiltinOp::*;
         if matches!(op, Op::Builtin(Le | Lt | Ge | Gt | Eq | Distinct)) {
             let kids = ctx.children(*args);
-            return kids.iter().all(|&k| matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::Real));
+            return kids.iter().all(|&k| {
+                matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::Real)
+                    && crate::Solver::is_pure_arith(ctx, k)
+            });
         }
     }
     false
@@ -1142,5 +1155,48 @@ mod tests {
         let assertions = vec![isnan, ult, gt];
         assert!(!super::bridge_admissible(&ctx, &assertions),
                 "no fp.to_real term present: bridge is not admissible, fence still governs");
+    }
+
+    /// Final-review fix canary: `is_lra_real_atom` must require each Real
+    /// operand to be pure-arith, not merely Real-sorted. `(= (fp.to_real x)
+    /// (f a))` with `f: Real -> Real` (a non-nullary uninterpreted
+    /// application, i.e. EUF-structure) is Real-sorted on both sides but `(f
+    /// a)` is NOT pure arith, so this atom must NOT be admitted — the query
+    /// must stay fenced (Unknown), per spec §6 (FP mixed with a non-LRA lazy
+    /// theory alongside the bridge stays Unknown).
+    #[test]
+    fn bridge_admissible_rejects_euf_real_operand() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        let real = ctx.real_sort();
+        let ff = ctx.declare_fun("f", &[real], real);
+        let af = ctx.declare_fun("a", &[], real);
+        let a = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
+        let fa = ctx.mk_app(Op::Uninterpreted(ff), &[a]).unwrap();
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[toreal, fa]).unwrap();
+        assert!(!super::bridge_admissible(&ctx, &[eq]),
+                "EUF function application over Real is not pure arith: must stay fenced");
+    }
+
+    /// Positive-case canary paired with the rejection above: the intended
+    /// bridge shapes (fp.to_real vs. numeral, and fp.to_real vs. fp.to_real)
+    /// must still be admitted after tightening `is_lra_real_atom` to require
+    /// `is_pure_arith` — the tightening must not fence any in-scope query.
+    #[test]
+    fn bridge_admissible_still_accepts_to_real_pure_arith_shapes() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let toreal_x = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        let real = ctx.real_sort();
+        let one = ctx.mk_numeral(shinri_num::Rational::new(Integer::from(1i64), Integer::from(1i64)), real);
+        let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[toreal_x, one]).unwrap();
+        assert!(super::bridge_admissible(&ctx, &[gt]), "fp.to_real(x) > 1.0 stays admissible");
+
+        let y = fp_var(&mut ctx, "y");
+        let toreal_y = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[y]).unwrap();
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[toreal_x, toreal_y]).unwrap();
+        assert!(super::bridge_admissible(&ctx, &[eq]),
+                "fp.to_real(x) = fp.to_real(y) (both pure-arith leaves) stays admissible");
     }
 }
