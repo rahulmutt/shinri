@@ -64,6 +64,44 @@ returns `Unknown`, never a wrong SAT/UNSAT.
 
 ---
 
+## 2.0 Pre-flight corrections (source-verified 2026-07-04, before planning)
+
+A source pre-flight (per `shinri-spec-assumed-paths-semantic-preflight`) revised
+the mechanism below — §2/§3 as originally written **overstated** the work:
+
+- **The combined solver already exists.** `check_sat` builds
+  `Sat = Solver::with_theory(cfg, Combiner::with_context(ctx.clone()))` and
+  replays the BV/FP CNF into *that* (lib.rs ~481–533). The Combiner (with Arith)
+  is present in every FP solve; it is simply never *fed* arith atoms because the
+  query fences first. So there is **no "merge blast into the Combiner" work** —
+  the seam is purely **additive**: mint arith vars/atoms and guard clauses.
+- **The bridge Real is the `(fp.to_real x)` term itself.** `normalize_atom`
+  treats an opaque Real leaf (like `str.len`) as a `problem_var`, so
+  `(fp.to_real x)` becomes its own arith variable with no new symbol.
+- **Arith has no guarded-row facility** — atoms are gated purely by the SAT
+  layer. A bridge row is therefore a normal `Le`/`Ge` atom (registered via
+  `Encoder::atom` → `Combiner::register_atom` → `Arith::new_var`) plus a raw
+  **guard clause** `sat.add_clause([¬guard_bit_lits…, atom_lit])`, where the
+  guard bits are the blasted FP bits in `fp_var_bits: FxHashMap<TermId,
+  Vec<Var>>` (LSB→MSB: sig `[0..sb-1]`, exp `[sb-1..sb-1+eb]`, sign `[eb+sb-1]`).
+- **Ordering constraint.** All bridge TermIds must be minted in `self.ctx`
+  **before** the `ctx.clone()` into the Combiner (else out-of-range for
+  `classify`/`normalize`); the guard *clauses* are added later, after replay
+  populates `fp_var_bits`. This two-phase split structures the tasks.
+- **TWO fences to narrow, not one:** `uses_crossing_conversion` (fp_stage.rs:88,
+  `FpToReal => true`) **and** `has_non_bvfp_theory_atom` (fp_stage.rs:140–184,
+  which fences the `(> (fp.to_real x) 1.5)` Real atom). The recognizer admits
+  pure-LRA-Real atoms only in the bridge-admissible case.
+- **Special-constant soundness sharpened.** The three NaN/±∞ constants must be
+  **distinct** unconstrained vars: a single shared const would force
+  `to_real(+∞) = to_real(−∞)` — a wrong-**UNSAT** (both are independently
+  unspecified). Same-class→same-const still gives functionality (no wrong-SAT).
+- **Channel vars must be Real** (0/1-valued Reals), not Int — an Int channel var
+  beside the Real bridge var trips the `lira` gate (`saw_int_arith &&
+  saw_real_arith` → Unknown, lib.rs:603/606).
+- **No parser work** — `(fp.to_real x)` and `(> (fp.to_real x) 1.5)` already
+  parse and sort-check to Real.
+
 ## 2. Why this is the hard slice — the dispatch wall
 
 `shinri-solver::check_sat` dispatches a query to **exactly one** engine:
