@@ -17,7 +17,7 @@ fn pow2(k: i64) -> Rational {
     let mut acc = Integer::one();
     let two = Integer::from(2u64);
     for _ in 0..k.unsigned_abs() {
-        acc = acc * two.clone();
+        acc *= two.clone();
     }
     if k >= 0 {
         Rational::new(acc, Integer::one())
@@ -46,7 +46,7 @@ pub fn to_real_finite_row(eb: u32, sb: u32, sign: bool, e: u64) -> Option<Finite
     } else {
         let mut h = Integer::one();
         for _ in 0..(sb - 1) {
-            h = h * Integer::from(2u64);
+            h *= Integer::from(2u64);
         }
         (pow2(e as i64 - bias - (sb as i64 - 1)), h)
     };
@@ -68,7 +68,7 @@ mod tests {
         let mut acc = Integer::one();
         let two = Integer::from(2u64);
         for _ in 0..k {
-            acc = acc * two.clone();
+            acc *= two.clone();
         }
         acc
     }

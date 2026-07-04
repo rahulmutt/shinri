@@ -87,10 +87,9 @@ pub fn uses_crossing_conversion(ctx: &Context, assertions: &[TermId]) -> bool {
             let is_crossing = match op {
                 // fp.to_real is admitted (slice 9) for eb<=8 (Float16/32); larger
                 // formats stay crossing (Real bridge deferred for eb>8).
-                Op::Builtin(BuiltinOp::FpToReal) => match ctx.fp_widths(ctx.sort_of(kids[0])) {
-                    Some((eb, _)) if eb <= 8 => false,
-                    _ => true,
-                },
+                Op::Builtin(BuiltinOp::FpToReal) => {
+                    !matches!(ctx.fp_widths(ctx.sort_of(kids[0])), Some((eb, _)) if eb <= 8)
+                }
                 Op::Builtin(BuiltinOp::ToFp { .. }) => match kids.len() {
                     1 => false, // 1-arg BV bitcast — admitted in slice 4c
                     2 => match ctx.sort_node(ctx.sort_of(kids[1])) {
@@ -272,14 +271,13 @@ fn only_crossing_is_admitted_to_real(ctx: &Context, assertions: &[TermId]) -> bo
                         _ => return false,
                     }
                 }
-                Op::Builtin(BuiltinOp::ToFp { .. }) => {
-                    // any symbolic-Real to_fp face is NOT admitted here.
+                // any symbolic-Real to_fp face is NOT admitted here.
+                Op::Builtin(BuiltinOp::ToFp { .. })
                     if kids.len() == 2
                         && matches!(ctx.sort_node(ctx.sort_of(kids[1])), SortNode::Real)
-                        && ctx.const_real_value(kids[1]).is_none()
-                    {
-                        return false;
-                    }
+                        && ctx.const_real_value(kids[1]).is_none() =>
+                {
+                    return false;
                 }
                 _ => {}
             }
@@ -1005,9 +1003,10 @@ mod tests {
     }
 
     #[test]
-    fn fp_to_bv_faces_admitted_real_bridge_still_crossing() {
-        // Slice 4e: fp.to_ubv/fp.to_sbv are no longer crossing; the PERMANENT
-        // fence is fp.to_real + symbolic-Real to_fp.
+    fn fp_to_bv_admitted_and_to_real_eb_boundary_crossing() {
+        // Slice 4e: fp.to_ubv/fp.to_sbv are no longer crossing. Slice 9: fp.to_real
+        // over eb<=8 (Float16/32) is admitted (Real bridge); the surviving crossing
+        // fence is fp.to_real over eb>8 (Float64/128) + symbolic-Real to_fp.
         let mut ctx = Context::new();
         let f32s = ctx.fp_sort(8, 24);
         let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);

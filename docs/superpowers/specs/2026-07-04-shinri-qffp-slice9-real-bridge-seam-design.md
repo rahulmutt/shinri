@@ -1,9 +1,13 @@
 # shinri QF_FP slice 9 — the Real-bridge seam (`fp.to_real`)
 
 **Date:** 2026-07-04
-**Status:** Draft design, pre-implementation — **three scope calls made by
-controller best-judgment while the user was away; RE-CONFIRM before planning**
-(see §0).
+**Status:** Implemented (slice 9 landed). `fp.to_real` over Float16/32 (eb≤8) is
+admitted and solved jointly with LRA (constant + symbolic arms + NaN/±∞
+functionality via three distinct per-format consts); symbolic `to_fp` and
+`fp.to_real` over eb≥11 stay soundly fenced to `Unknown`. The §0 scope calls
+(mechanism A, `fp.to_real`-only, Float16/32) were carried through as designed.
+z3 differential: 200 constant-source cases, 0 disagreements, 0 Unknown; full
+`cargo test --workspace` green (825 tests).
 **Scope:** First face of the permanent FP↔Reals bridge. Admit `fp.to_real` over
 Float16/32, solved jointly with LRA in one solve, by establishing an
 **eager-blast ⋈ lazy-LRA coexistence seam** that later bridge faces reuse.
@@ -213,7 +217,10 @@ unspecified (unconstrained), and no wrong SAT is possible.
 
 ## 6. Scope fence — what stays `Unknown` (and stays sound)
 
-The existing `uses_crossing_conversion` fence narrows, it does not vanish:
+The existing `uses_crossing_conversion` fence narrows, it does not vanish.
+**Implemented (slice 9):** `fp.to_real` over Float16/32 (`eb ≤ 8`) is now
+*admitted* (no longer crossing) and decided via the Real bridge. What still
+stays `Unknown`:
 
 - **Symbolic `to_fp(rm, real)`** — still crossing → `Unknown`.
 - **`fp.to_real` on Float64/128** (`eb ≥ 11`) — still crossing → `Unknown`

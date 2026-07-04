@@ -454,10 +454,11 @@ impl Solver {
         // in one query), and both BV↔FP directions are admitted: BV→FP bitcast
         // (FpFromBits + 1-arg to_fp, slice 4c), int→FP (2-arg to_fp from BV +
         // to_fp_unsigned, slice 4d), and FP→BV (fp.to_ubv / fp.to_sbv, slice 4e).
-        // fp.to_real and symbolic-Real to_fp still fence to Unknown, BEFORE any
-        // lowering, so blast_*_word's crossing `unreachable!` arms stay internal
-        // invariants. This is now the PERMANENT crossing set (v1 non-goal: the
-        // Real bridge).
+        // fp.to_real over eb>8 (Float64/128) and symbolic-Real to_fp still fence to
+        // Unknown, BEFORE any lowering, so blast_*_word's crossing `unreachable!`
+        // arms stay internal invariants. fp.to_real over eb<=8 is now admitted (the
+        // slice-9 Real bridge, handled below); the surviving crossing set is the
+        // eb>8 Real bridge + symbolic-Real to_fp.
         let uses_bv = crate::bv_stage::solver_uses_bv(&self.ctx, &assertions);
         let uses_fp = crate::fp_stage::solver_uses_fp(&self.ctx, &assertions);
         // ── Real-bridge seam (slice 9) ─────────────────────────────────────────
@@ -541,8 +542,8 @@ impl Solver {
                     return SolveOutcome::Unknown;
                 }
                 // Positive-enumeration safety: every FP atom's word must be a
-                // supported FP op (a not-yet-implemented FP op, a symbolic-Real
-                // fp.to_real bridge, etc. still fence) so blast_fp_word's
+                // supported FP op (a not-yet-implemented FP op, an eb>8 fp.to_real
+                // whose Real bridge is deferred, etc. still fence) so blast_fp_word's
                 // `unreachable!` arms stay internal invariants. Word-sorted ite
                 // is no longer a live example here: word_norm (slice 5)
                 // eliminates it before atom collection ever runs.
@@ -1174,6 +1175,7 @@ impl Solver {
     ///   * for each finite (sign `s`, exponent-field `e`) pattern a row
     ///     `tr == L` (`L = k + Σ coeffs[i]·b_i` from `to_real_finite_row`),
     ///     guarded by the raw FP sign+exponent bit pattern.
+    ///
     /// The all-ones (NaN/±∞) exponent yields `to_real_finite_row = None` and so
     /// emits no row — sound (SMT-LIB leaves it unspecified); Task 5 handles it.
     fn build_symbolic_to_real_rows(&mut self, tr: TermId, x: TermId, eb: u32, sb: u32) {
@@ -1297,7 +1299,7 @@ impl Solver {
                     let mut acc = Integer::one();
                     let two = Integer::from(2u64);
                     for _ in 0..k {
-                        acc = acc * two.clone();
+                        acc *= two.clone();
                     }
                     acc
                 };
