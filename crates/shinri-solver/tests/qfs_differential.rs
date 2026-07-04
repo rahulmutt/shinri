@@ -576,6 +576,53 @@ fn expect_not_unsat(src: &str) {
     }
 }
 
+#[test]
+fn targeted_analyze_theory_conflict_no_panic() {
+    // Cluster B (slice 8): a string-theory Conflict drove `analyze` to a bad
+    // backjump level → `trail.rs:91` "backtrack above current level" in debug.
+    // The correct verdict is SAT (z3); at minimum shinri must NOT panic and must
+    // NOT return a wrong UNSAT.
+    expect_not_unsat(
+        "(set-logic QF_S)\
+         (declare-const s1 String)(declare-const s2 String)(declare-const s3 String)\
+         (assert (not (distinct (str.++ s2 \"a\") (str.++ s2 \"a\") s2 (str.++ s1 \"a\"))))\
+         (assert (and (distinct (str.++ s3 \"a\") (str.++ s3 \"b\") (str.++ s2 \"a\")) (= s3 (str.++ s1 \"b\"))))\
+         (assert (not (= (str.++ s3 \"a\") s1 s3)))\
+         (assert (and (distinct (str.++ s3 \"b\") (str.++ s3 \"a\")) (distinct (str.++ s1 \"b\") s2 (str.++ s3 \"a\"))))\
+         (check-sat)",
+    );
+}
+
+#[test]
+fn targeted_diseq_undo_residual_no_panic() {
+    // Cluster C (slice 8): a second diseq-map mutation not reversed on pop still
+    // reaches the eq_engine "explain: a,b not connected" debug-assert. z3: this
+    // shape is satisfiable; shinri must not panic and must not wrong-UNSAT.
+    expect_not_unsat(
+        "(set-logic QF_S)\
+         (declare-const s1 String)(declare-const s2 String)(declare-const s3 String)\
+         (assert (distinct (str.++ s3 \"b\") (str.++ s3 \"a\")))\
+         (assert (and (= (str.++ s3 \"a\") s2) (= s1 s1 \"\")))\
+         (assert (distinct (str.++ s2 \"a\") (str.++ s2 \"b\")))\
+         (assert (not (distinct (str.++ s2 \"b\") \"\" s3 (str.++ s1 \"a\"))))\
+         (check-sat)",
+    );
+}
+
+#[test]
+fn targeted_distinct_over_concat_not_unsat() {
+    // Cluster A / #1 (slice 8): distinct("", s2++"a") drove a unit conflict that
+    // unsoundly forced s2++"a"="" (a concat ending in "a" is never empty). z3: sat.
+    expect_not_unsat(
+        "(set-logic QF_S)\
+         (declare-const s2 String)(declare-const s3 String)\
+         (assert (not (distinct s3 \"\" (str.++ s2 \"a\"))))\
+         (assert (not (= (str.++ s3 \"a\") \"\" s3 s2)))\
+         (assert (distinct s3 (str.++ s2 \"a\")))\
+         (check-sat)",
+    );
+}
+
 // ── Task 19: occurs-check soundness regression (free-monoid emptiness) ───────
 // A bare variable equated to a concat that RE-CONTAINS it, flanked ONLY by other
 // variables, is SAT via emptiness — the occurs-check must NOT report UNSAT. With

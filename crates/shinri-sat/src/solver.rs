@@ -244,6 +244,22 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         Ok(())
     }
 
+    /// A theory `Conflict::Lits` is analyzable by 1-UIP only if it is a genuine
+    /// conflict clause: every cited literal is currently assigned **false** at a
+    /// decision level ≤ the current one. `Assignment::unassign` clears a var's
+    /// value but not its stored level, so a theory that hands back a literal it
+    /// failed to retract on backtrack carries a stale level above the current
+    /// decision level; feeding it to `analyze` yields a backjump level
+    /// > `decision_level()` (tripping the `trail.rs:91` assert) or a learnt clause
+    /// built from garbage. Callers must bail to Unknown when this returns false —
+    /// a sound incompleteness, never a wrong verdict.
+    fn theory_conflict_analyzable(&self, conflict_lits: &[Lit]) -> bool {
+        let dl = self.trail.decision_level();
+        conflict_lits.iter().all(|&l| {
+            self.assign.lit_value(l) == LBool::False && self.assign.level(l.var()) <= dl
+        })
+    }
+
     /// The Boolean value of a variable in the current assignment, if assigned.
     pub fn value_of(&self, v: Var) -> Option<bool> {
         match self.assign.value(v) {
@@ -474,11 +490,29 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                     // normal analysis (which resolves multiple top-level lits to
                     // one UIP).
                     let conflict_lits = self.conflict_lits(&conflict);
+                    // Cluster B (slice 8): a theory `Conflict::Lits` must be a
+                    // well-formed conflict clause (every literal currently assigned
+                    // false at a level ≤ the current one). A theory that cites a
+                    // stale literal — unassigned, or carrying a pre-backtrack level
+                    // above the current decision level — would drive `analyze` to a
+                    // backjump level > decision_level() (the `trail.rs:91` assert) or
+                    // a wrong learnt clause. Such a conflict cannot be analyzed
+                    // soundly; bail to Unknown rather than panic or fabricate a
+                    // clause (a sound incompleteness, never a wrong Sat/Unsat).
+                    if matches!(conflict, Conflict::Lits(_))
+                        && !self.theory_conflict_analyzable(&conflict_lits)
+                    {
+                        return SolveResult::Unknown;
+                    }
                     if let Err(()) = self.reduce_to_conflict_level(&conflict_lits) {
                         self.unsat = true;
                         return SolveResult::Unsat { core: vec![] };
                     }
                     let (learnt, bt, chain) = self.analyze(conflict);
+                    debug_assert!(
+                        bt <= self.trail.decision_level(),
+                        "analyze returned a backjump level above the current one"
+                    );
                     self.backtrack_to(bt);
                     let asserting = learnt[0];
                     let r_opt = self.add_learnt(&learnt);
@@ -567,11 +601,22 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // level so 1-UIP has a current-level pivot.
                                     let conflict = Conflict::Lits(lits);
                                     let conflict_lits = self.conflict_lits(&conflict);
+                                    // Cluster B (slice 8): reject a malformed theory
+                                    // conflict (see the propagate() path) — bail to
+                                    // Unknown rather than let `analyze` compute a
+                                    // backjump level above the current one.
+                                    if !self.theory_conflict_analyzable(&conflict_lits) {
+                                        return SolveResult::Unknown;
+                                    }
                                     if let Err(()) = self.reduce_to_conflict_level(&conflict_lits) {
                                         self.unsat = true;
                                         return SolveResult::Unsat { core: vec![] };
                                     }
                                     let (learnt, bt, chain) = self.analyze(conflict);
+                                    debug_assert!(
+                                        bt <= self.trail.decision_level(),
+                                        "analyze returned a backjump level above the current one"
+                                    );
                                     self.backtrack_to(bt);
                                     let asserting = learnt[0];
                                     let r_opt = self.add_learnt(&learnt);
