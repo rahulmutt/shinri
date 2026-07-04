@@ -1016,7 +1016,7 @@ impl Solver {
     /// Returns true if `t` is a "pure arith" term — a linear combination of
     /// nullary uninterpreted constants and numerals. Non-nullary uninterpreted
     /// applications (function calls like `f(x)`) are EUF-structure, not pure arith.
-    pub(crate) fn is_pure_arith(ctx: &shinri_core::Context, t: TermId) -> bool {
+    fn is_pure_arith(ctx: &shinri_core::Context, t: TermId) -> bool {
         use shinri_core::{BuiltinOp, Op, TermNode};
         match ctx.term_node(t) {
             TermNode::Const { .. } => true, // numeral constant

@@ -225,10 +225,29 @@ stays `Unknown`:
 - **Symbolic `to_fp(rm, real)`** — still crossing → `Unknown`.
 - **`fp.to_real` on Float64/128** (`eb ≥ 11`) — still crossing → `Unknown`
   (bounds the `2^eb` blow-up; lifted by B or a smarter encoding later).
-- **FP mixed with a non-LRA lazy theory** (EUF / Arrays / Str / LIA-only
-  quirks) alongside the bridge — out of scope → `Unknown`.
 
-Each fence degrades to sound `Unknown`; none can flip a real Sat↔Unsat.
+**Broadened scope (shipped):** `fp.to_real` (`eb ≤ 8`) is admitted mixed with
+LRA **and with EUF over the resulting Real (QF_UFLRA + bridge)** — e.g.
+`(= (fp.to_real x) (f a))` with `f: Real → Real`. The admissibility recognizer
+`is_lra_real_atom` requires only that relation operands be **Real-sorted**; an
+EUF application `(f a)`, an array `(select arr i)`, or a Str-Real term over Real
+routes to the Combiner alongside Arith. Soundness rests on the Combiner's
+**Nelson–Oppen EUF⋈Arith** combination deciding the shared-Real interface, and
+is validated empirically by the `differential_qf_fp_to_real_uflra` z3 oracle
+(`tests/fp_oracle.rs`): 200 decidable EUF+bridge cases + a NaN/EUF functionality
+pin, **0 disagreements, 0 Unknown**.
+
+- **EUF-over-Real coverage only.** The Real-sorted recognizer also admits
+  **Array-over-Real** (`(select arr i)`) and **Str-Real** operands mixed with
+  the bridge, but the `differential_qf_fp_to_real_uflra` oracle exercises only
+  the EUF case (decidable Array/Str-Real bridge queries are harder to
+  generate). **FOLLOW-UP: add Array/Str+bridge differential coverage.**
+- **FP mixed with a genuinely non-Real-routed theory** (e.g. BV/Int-only lazy
+  atoms) alongside the bridge remains out of the bridge's admitted scope.
+
+Each remaining fence degrades to sound `Unknown`; none can flip a real
+Sat↔Unsat. The broadened EUF⋈bridge scope is empirically z3-differentially
+validated rather than fenced.
 
 ---
 

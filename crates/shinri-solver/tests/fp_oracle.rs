@@ -1540,3 +1540,119 @@ fn differential_qf_fp_to_real_nan_functionality() {
         "QF_FP fp.to_real NaN-functionality DISAGREEMENT: shinri={ours:?} z3={theirs:?}\n{s}"
     );
 }
+
+/// QF_UFLRA + bridge differential oracle (slice 9 broadening): the `fp.to_real`
+/// Real-bridge is admitted mixed with EUF over the resulting Real. This fuzzes
+/// DECIDABLE queries that link a constant-source `(fp.to_real x)` to an
+/// uninterpreted `(f a)` (EUF-structure, `f: Real -> Real`) and a random integer
+/// bound, pinning every instance against z3 with ZERO tolerated disagreements.
+///
+/// Because `x` is a concrete Float16 literal and `(= (f a) (fp.to_real x))`
+/// pins `(f a)` to that concrete real, the outer relation `(<op> (f a) bound)`
+/// is fully decidable — both solvers must decide, and must AGREE. A single
+/// disagreement (our Sat vs z3 Unsat, or our Unsat vs z3 Sat) would prove the
+/// broadened QF_UFLRA + bridge scope UNSOUND (the reverted fence necessary).
+///
+/// Soundness rests on the Combiner's Nelson–Oppen EUF⋈Arith combination
+/// deciding the shared-Real interface between the bridged `fp.to_real` value
+/// and the uninterpreted `f`. Coverage here is EUF-over-Real; Array/Str-Real
+/// operands are admitted by the Real-sorted recognizer but not exercised (see
+/// spec §6 FOLLOW-UP note).
+#[cfg(feature = "oracle")]
+fn gen_to_real_uflra_script(rng: &mut Lcg) -> String {
+    let bits = (rng.next() & 0xFFFF) as u16;
+    let s = (bits >> 15) & 1;
+    let e = (bits >> 10) & 0x1F;
+    let sig = bits & 0x3FF;
+    let bound = (rng.next() % 21) as i64 - 10; // integer bound in [-10,10]
+    let bound_term = if bound < 0 {
+        format!("(- {}.0)", -bound)
+    } else {
+        format!("{bound}.0")
+    };
+    // Vary the outer relation so both SAT and UNSAT witnesses arise: `=` yields
+    // mostly UNSAT, the inequalities yield a mix depending on the literal's real
+    // value vs. the bound.
+    let ops = ["<=", "<", ">=", ">", "="];
+    let op = ops[(rng.next() % ops.len() as u64) as usize];
+    format!(
+        "(declare-fun x () Float16)\n\
+         (declare-fun f (Real) Real)\n\
+         (declare-fun a () Real)\n\
+         (assert (= x (fp #b{s:01b} #b{e:05b} #b{sig:010b})))\n\
+         (assert (= (f a) (fp.to_real x)))\n\
+         (assert ({op} (f a) {bound_term}))\n\
+         (check-sat)\n"
+    )
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+fn differential_qf_fp_to_real_uflra() {
+    // Fixed NaN/EUF functionality pin (spec §5/§7 composed with EUF): if x=y and
+    // both NaN, then f(to_real x) = f(to_real y) — asserting the negation is
+    // Unsat. Verifies fp.to_real functionality composes through an uninterpreted
+    // f under the broadened QF_UFLRA + bridge scope.
+    {
+        let s = "(declare-fun x () Float16)\n\
+                 (declare-fun y () Float16)\n\
+                 (declare-fun f (Real) Real)\n\
+                 (assert (fp.isNaN x))\n\
+                 (assert (fp.isNaN y))\n\
+                 (assert (= x y))\n\
+                 (assert (not (= (f (fp.to_real x)) (f (fp.to_real y)))))\n\
+                 (check-sat)\n";
+        let ours = shinri_outcome(s);
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, s);
+        assert_eq!(
+            ours,
+            SolveOutcome::Unsat,
+            "fp.to_real functionality must compose with EUF (x=y both NaN ⇒ \
+             f(to_real x) = f(to_real y)): shinri returned {ours:?}\n{s}"
+        );
+        assert!(
+            !matches!(
+                (ours, theirs),
+                (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                    | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+            ),
+            "QF_UFLRA+bridge NaN/EUF-functionality DISAGREEMENT: shinri={ours:?} z3={theirs:?}\n{s}"
+        );
+    }
+
+    let mut rng = Lcg(0xF13_A5EE_D009_u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..N_ITERS {
+        let s = gen_to_real_uflra_script(&mut rng);
+        let ours = shinri_outcome(&s);
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => n_unknown += 1,
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_arith(&mut ctx, &s);
+        assert!(
+            !matches!(
+                (ours, theirs),
+                (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                    | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+            ),
+            "QF_UFLRA+bridge DISAGREEMENT (iter {iter}): shinri={ours:?} z3={theirs:?}\n{s}"
+        );
+    }
+    println!(
+        "differential_qf_fp_to_real_uflra: sat={n_sat} unsat={n_unsat} unknown={n_unknown}"
+    );
+    assert!(
+        n_sat > 0 && n_unsat > 0,
+        "QF_UFLRA+bridge oracle produced no SAT/UNSAT coverage (sat={n_sat} unsat={n_unsat})"
+    );
+}

@@ -318,27 +318,21 @@ fn has_admitted_to_real_term(ctx: &Context, assertions: &[TermId]) -> bool {
     assertions.iter().any(|&a| walk(ctx, a, &mut seen))
 }
 
-/// A Bool atom that is a pure LRA (Real) arith relation: Le/Lt/Ge/Gt/Eq/Distinct
-/// whose operands are Real-sorted (so it routes to Arith, not Int/EUF/arrays)
-/// AND pure-arith (numeral, `fp.to_real`, a bare nullary Real variable, or
-/// +/-/*/neg over such — see `Solver::is_pure_arith`, the single source of
-/// truth shared with the arith-lowering preprocessing pass). A Real-sorted
-/// operand alone is NOT enough: `(= (fp.to_real x) (f a))` with `f: Real->Real`
-/// (EUF) or `(select arr i)` (Arrays) is Real-sorted but is NOT pure arith —
-/// admitting it here would wrongly let `bridge_admissible` skip the
-/// `has_non_bvfp_theory_atom` fence for an out-of-scope EUF/Array/Str-mixed
-/// query (spec §6: FP mixed with a non-LRA lazy theory alongside the bridge
-/// must stay `Unknown`). Requiring `is_pure_arith` on every operand closes
-/// that gap while still admitting every intended bridge shape.
+/// A Bool atom that is an LRA (Real) relation: Le/Lt/Ge/Gt/Eq/Distinct whose
+/// operands are Real-sorted (so it routes to Arith, not Int/EUF/arrays). A
+/// Real-sorted operand may itself be an EUF application (`(f a)` with
+/// `f: Real -> Real`), an array `(select arr i)`, or a Str-Real term: those are
+/// ADMITTED here on purpose. The broadened scope is QF_UFLRA + bridge —
+/// `fp.to_real(x)` may be mixed freely with LRA and with EUF over the resulting
+/// Real. Soundness rests on the Combiner's Nelson–Oppen EUF⋈Arith combination
+/// deciding the shared-Real interface, and is validated empirically by the
+/// `differential_qf_fp_to_real_uflra` z3 oracle (crate `tests/fp_oracle.rs`).
 fn is_lra_real_atom(ctx: &Context, t: TermId) -> bool {
     if let TermNode::App { op, args, .. } = ctx.term_node(t) {
         use BuiltinOp::*;
         if matches!(op, Op::Builtin(Le | Lt | Ge | Gt | Eq | Distinct)) {
             let kids = ctx.children(*args);
-            return kids.iter().all(|&k| {
-                matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::Real)
-                    && crate::Solver::is_pure_arith(ctx, k)
-            });
+            return kids.iter().all(|&k| matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::Real));
         }
     }
     false
@@ -1157,15 +1151,15 @@ mod tests {
                 "no fp.to_real term present: bridge is not admissible, fence still governs");
     }
 
-    /// Final-review fix canary: `is_lra_real_atom` must require each Real
-    /// operand to be pure-arith, not merely Real-sorted. `(= (fp.to_real x)
-    /// (f a))` with `f: Real -> Real` (a non-nullary uninterpreted
-    /// application, i.e. EUF-structure) is Real-sorted on both sides but `(f
-    /// a)` is NOT pure arith, so this atom must NOT be admitted — the query
-    /// must stay fenced (Unknown), per spec §6 (FP mixed with a non-LRA lazy
-    /// theory alongside the bridge stays Unknown).
+    /// Broadened-scope canary: QF_UFLRA + bridge is IN SCOPE, so
+    /// `(= (fp.to_real x) (f a))` with `f: Real -> Real` (a non-nullary
+    /// uninterpreted application, i.e. EUF-structure) — Real-sorted on both
+    /// sides — must be ADMITTED. `is_lra_real_atom` requires only that operands
+    /// be Real-sorted; the EUF `(f a)` routes to the Combiner alongside Arith.
+    /// Soundness rests on the Combiner's Nelson–Oppen EUF⋈Arith combination and
+    /// is validated by the `differential_qf_fp_to_real_uflra` z3 oracle.
     #[test]
-    fn bridge_admissible_rejects_euf_real_operand() {
+    fn bridge_admissible_accepts_to_real_with_euf_real_operand() {
         let mut ctx = Context::new();
         let x = fp_var(&mut ctx, "x");
         let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
@@ -1175,14 +1169,13 @@ mod tests {
         let a = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
         let fa = ctx.mk_app(Op::Uninterpreted(ff), &[a]).unwrap();
         let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[toreal, fa]).unwrap();
-        assert!(!super::bridge_admissible(&ctx, &[eq]),
-                "EUF function application over Real is not pure arith: must stay fenced");
+        assert!(super::bridge_admissible(&ctx, &[eq]),
+                "QF_UFLRA + bridge is in scope: EUF-Real operand mixed with fp.to_real is admitted");
     }
 
-    /// Positive-case canary paired with the rejection above: the intended
+    /// Positive-case canary paired with the EUF-acceptance above: the pure-arith
     /// bridge shapes (fp.to_real vs. numeral, and fp.to_real vs. fp.to_real)
-    /// must still be admitted after tightening `is_lra_real_atom` to require
-    /// `is_pure_arith` — the tightening must not fence any in-scope query.
+    /// remain admitted under the broadened Real-sorted recognizer.
     #[test]
     fn bridge_admissible_still_accepts_to_real_pure_arith_shapes() {
         let mut ctx = Context::new();
