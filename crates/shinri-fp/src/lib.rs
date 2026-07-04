@@ -3,6 +3,7 @@
 //! docs/superpowers/specs/2026-06-25-shinri-qffp-vertical-slice-design.md.
 
 pub mod blast;
+pub mod bridge;
 pub mod convert;
 pub mod lower;
 pub mod lzc;
