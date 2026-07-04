@@ -629,25 +629,40 @@ fn to_fp_const_real_reflexive_unsat() {
 }
 
 #[test]
-fn to_fp_bv_crossing_and_symbolic_real_are_unknown() {
-    // Remaining still-fenced conversions → Unknown (soundness: BV→FP bitcast
-    // (FpFromBits / 1-arg to_fp) is admitted as of slice 4c, int→FP
-    // (2-arg to_fp + to_fp_unsigned) is admitted as of slice 4d, and FP→BV
-    // (fp.to_sbv/fp.to_ubv) is admitted as of slice 4e — see the slice-4c,
-    // slice-4d, and slice-4e end-to-end blocks above; the remaining fence is
-    // only the deferred Real bridge (symbolic-Real to_fp / fp.to_real).
+fn symbolic_real_to_fp_is_unknown() {
+    // Symbolic-Real to_fp is the remaining fenced conversion → Unknown
+    // (soundness: BV→FP bitcast (FpFromBits / 1-arg to_fp) is admitted as of
+    // slice 4c, int→FP (2-arg to_fp + to_fp_unsigned) is admitted as of
+    // slice 4d, FP→BV (fp.to_sbv/fp.to_ubv) is admitted as of slice 4e, and
+    // fp.to_real over eb<=8 is admitted via the Real bridge as of slice 9 —
+    // see `to_real_of_constant_*` below). The only surviving crossing fence is
+    // the symbolic-Real to_fp face.
     let scripts = [
         // symbolic-Real to_fp
         "(declare-fun r () Real) (declare-fun z () Float32) \
          (assert (fp.eq z ((_ to_fp 8 24) RNE r))) (check-sat)",
-        // fp.to_real
-        "(declare-fun x () Float32) \
-         (assert (= (fp.to_real x) 0.0)) (check-sat)",
     ];
     for s in scripts {
         let (o, _) = run(s);
         assert_eq!(o, SolveOutcome::Unknown, "must fence to Unknown: {s}");
     }
+}
+
+#[test]
+fn to_real_of_constant_plus_lra_sat() {
+    // 1.5f32 to_real == 3/2; assert it's > 1 and < 2 ⇒ SAT.
+    let (o, _) = run("(declare-fun x () Float32) \
+        (assert (= x (fp #b0 #b01111111 #b10000000000000000000000))) \
+        (assert (> (fp.to_real x) 1.0)) (assert (< (fp.to_real x) 2.0)) (check-sat)");
+    assert_eq!(o, SolveOutcome::Sat);
+}
+
+#[test]
+fn to_real_of_constant_contradiction_unsat() {
+    let (o, _) = run("(declare-fun x () Float32) \
+        (assert (= x (fp #b0 #b01111111 #b10000000000000000000000))) \
+        (assert (> (fp.to_real x) 2.0)) (check-sat)");
+    assert_eq!(o, SolveOutcome::Unsat);
 }
 
 // ── Slice-4b: mixed BV+FP (no crossing op) now solves ──────────────────────

@@ -78,6 +78,12 @@ pub struct Solver {
     word_norm: crate::word_norm::WordNorm,
     /// Eliminated-ite terms → model values (get-value fallback; slice 6).
     eliminated_ite_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal>,
+    /// Pre-clone-minted Real-bridge rows (slice 9): for each admitted constant
+    /// `fp.to_real` term, the `(le, ge)` atom pair that pins `r == value`. These
+    /// TermIds MUST be minted BEFORE `self.ctx` is cloned into the Combiner so
+    /// they are in range for `register_atom`; the enc-block emitter only encodes
+    /// and asserts them (no term creation after the clone).
+    pending_bridge: Vec<(TermId, TermId)>,
 }
 
 impl Default for Solver {
@@ -105,6 +111,7 @@ impl Solver {
             abv_array_models: rustc_hash::FxHashMap::default(),
             word_norm: crate::word_norm::WordNorm::default(),
             eliminated_ite_vals: rustc_hash::FxHashMap::default(),
+            pending_bridge: Vec::new(),
         }
     }
 
@@ -409,7 +416,38 @@ impl Solver {
         // Real bridge).
         let uses_bv = crate::bv_stage::solver_uses_bv(&self.ctx, &assertions);
         let uses_fp = crate::fp_stage::solver_uses_fp(&self.ctx, &assertions);
-        if uses_fp && crate::fp_stage::uses_crossing_conversion(&self.ctx, &assertions) {
+        // ── Real-bridge seam (slice 9) ─────────────────────────────────────────
+        // A `bridge_admissible` query (FP present, only crossing is an admitted
+        // eb<=8 `fp.to_real`, every non-BVFP atom pure-LRA-Real) is decided
+        // JOINTLY with LRA in one combined solve: it SKIPS both the crossing
+        // fence and the third-theory fence below, and instead emits Real-bridge
+        // rows for each `fp.to_real` term. `bridge_admissible` already requires
+        // `solver_uses_fp` and >=1 admitted `fp.to_real` term.
+        //
+        // TASK-3 SCOPE + SOUNDNESS GATE (constant arm only): we admit the bridge
+        // ONLY when EVERY `fp.to_real` operand resolves to a floating-point
+        // constant (a literal, or a variable pinned by a top-level `(= x C)`).
+        // A symbolic operand cannot be pinned by the constant arm yet (deferred),
+        // and admitting it while leaving its bridge row `r` UNCONSTRAINED is a
+        // relaxation that can flip a true Unsat to Sat (e.g. `(fp.eq x 1.5)` with
+        // `(> (fp.to_real x) 2.0)`), which would be UNSOUND. So a query with any
+        // symbolic `fp.to_real` operand keeps `bridge=false` and stays fenced to
+        // a sound Unknown (unchanged from pre-slice-9); it is admitted in Task 4.
+        let admissible = crate::fp_stage::bridge_admissible(&self.ctx, &assertions);
+        let to_real_terms: Vec<TermId> = if admissible {
+            crate::fp_stage::collect_fp_to_real_terms(&self.ctx, &assertions)
+        } else {
+            Vec::new()
+        };
+        let bridge = admissible
+            && to_real_terms.iter().all(|&tr| match self.ctx.term_node(tr) {
+                shinri_core::TermNode::App { args, .. } => {
+                    let x = self.ctx.children(*args)[0];
+                    self.fp_operand_const_bits(x, &assertions).is_some()
+                }
+                _ => false,
+            });
+        if uses_fp && !bridge && crate::fp_stage::uses_crossing_conversion(&self.ctx, &assertions) {
             return SolveOutcome::Unknown;
         }
 
@@ -440,7 +478,7 @@ impl Solver {
                 let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
                 // Third-theory fence: any Bool atom outside (fp_atoms ∪ bv_atoms)
                 // that is not pure Boolean structure (arrays/LIA/EUF) → Unknown.
-                if crate::fp_stage::has_non_bvfp_theory_atom(
+                if !bridge && crate::fp_stage::has_non_bvfp_theory_atom(
                     &self.ctx, &assertions, &fp_atoms, &bv_atoms,
                 ) {
                     return SolveOutcome::Unknown;
@@ -464,6 +502,16 @@ impl Solver {
             } else {
                 None
             };
+
+        // Real-bridge rows (slice 9): mint every bridge atom term BEFORE the
+        // ctx is cloned into the Combiner (below), so they are in range for
+        // `register_atom`/`classify`. Populates `self.pending_bridge`; the
+        // enc-block emitter only encodes+asserts them. `assertions` is still
+        // live here (it is consumed by `lower` on the next line).
+        self.pending_bridge.clear();
+        if bridge {
+            self.build_to_real_bridge_terms(&assertions, &to_real_terms);
+        }
 
         // Lower the assertions (arith =/distinct rewrites, Le/Ge companions; needs &mut ctx).
         // This never sees n-ary =/distinct at all now: word_norm (above) expands every sort to binary (slice 6); the arms below are defense in depth.
@@ -576,6 +624,12 @@ impl Solver {
             // assertions (merges, diseqs) now fire with the full egraph in place.
             for lit in &top_lits {
                 enc.assert_top(*lit);
+            }
+            // Real-bridge rows (slice 9): encode+assert the pre-minted `(le, ge)`
+            // atom pairs so each admitted constant `fp.to_real` term is pinned to
+            // its exact rational value. NO term creation here (all minted pre-clone).
+            if bridge {
+                Self::emit_to_real_bridge(&self.pending_bridge, &mut enc);
             }
             atom_vars = enc.atom_vars.clone();
             refused = enc.refused;
@@ -927,6 +981,129 @@ impl Solver {
     fn is_arith_sorted(&self, t: TermId) -> bool {
         let s = self.ctx.sort_of(t);
         s == self.ctx.real_sort() || s == self.ctx.int_sort()
+    }
+
+    /// Slice 9 (constant arm): mint the Real-bridge atom pairs for every admitted
+    /// `fp.to_real` term whose operand resolves to a floating-point constant —
+    /// either the operand is itself an fp literal, or a variable pinned by a
+    /// top-level structural equality `(= x <fp const>)`. For each such term we
+    /// mint `(le, ge) = ((<= tr q), (>= tr q))` where `q = class_to_rational(v)`,
+    /// pinning `tr == q`. NaN/Inf constants yield no rational ⇒ leave `tr`
+    /// unconstrained (sound). Symbolic operands (no constant binding) are
+    /// deferred to a later slice-9 task ⇒ emit nothing. ALL terms are minted
+    /// here, BEFORE `self.ctx` is cloned into the Combiner, so every bridge
+    /// TermId is in range for the Combiner's `register_atom`/`classify`.
+    fn build_to_real_bridge_terms(&mut self, assertions: &[TermId], to_real_terms: &[TermId]) {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let real = self.ctx.real_sort();
+        for &tr in to_real_terms {
+            let x = match self.ctx.term_node(tr) {
+                TermNode::App { args, .. } => self.ctx.children(*args)[0],
+                _ => continue,
+            };
+            let (eb, sb) = match self.ctx.fp_widths(self.ctx.sort_of(x)) {
+                Some(w) => w,
+                None => continue,
+            };
+            let bits = match self.fp_operand_const_bits(x, assertions) {
+                Some(b) => b,
+                None => continue, // symbolic operand: deferred to a later task
+            };
+            let cls = shinri_fp::reference::decode(eb, sb, &bits);
+            if let Some(q) = shinri_fp::reference::class_to_rational(eb, sb, &cls) {
+                let num = self.ctx.mk_numeral(q, real);
+                let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, num]).unwrap();
+                let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, num]).unwrap();
+                self.pending_bridge.push((le, ge));
+            }
+            // NaN/Inf constant ⇒ class_to_rational is None ⇒ leave tr unconstrained.
+        }
+    }
+
+    /// Resolve the floating-point constant bits of a `fp.to_real` operand `x`, if
+    /// determined: either `x` is itself a constant, or a top-level structural
+    /// equality assertion `(= x <fp const>)` pins it. Only assertions that ARE
+    /// the equality (never a nested occurrence) are consulted, so the pin holds
+    /// unconditionally and is sound. Returns None for a genuinely symbolic
+    /// operand (handled in a later slice-9 task).
+    fn fp_operand_const_bits(&self, x: TermId, assertions: &[TermId]) -> Option<shinri_num::Integer> {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        // Direct constant operand (the brief's constant arm).
+        if let Some(b) = self.const_fp_bits(x) {
+            return Some(b);
+        }
+        // Top-level `(= x <fp const>)` binding (either operand order).
+        for &a in assertions {
+            if let TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } = self.ctx.term_node(a)
+            {
+                let kids = self.ctx.children(*args);
+                if kids.len() == 2 {
+                    let other = if kids[0] == x {
+                        Some(kids[1])
+                    } else if kids[1] == x {
+                        Some(kids[0])
+                    } else {
+                        None
+                    };
+                    if let Some(o) = other {
+                        if let Some(b) = self.const_fp_bits(o) {
+                            return Some(b);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// The IEEE bit pattern of a constant Float term `o`, if it is one: either a
+    /// `ConstVal::Float` literal, or the `(fp <sign> <exp> <sig>)` constructor
+    /// desugared to `FpFromBits` over three BV-constant fields (the shape the
+    /// parser produces for an `(fp #b.. #b.. #b..)` literal). Returns None for a
+    /// non-constant term.
+    fn const_fp_bits(&self, o: TermId) -> Option<shinri_num::Integer> {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        use shinri_num::Integer;
+        if let Some((_, _, b)) = self.ctx.fp_const_value(o) {
+            return Some(b.clone());
+        }
+        if let TermNode::App { op: Op::Builtin(BuiltinOp::FpFromBits), args, .. } =
+            self.ctx.term_node(o)
+        {
+            let kids = self.ctx.children(*args);
+            if kids.len() == 3 {
+                // Fields are (sign, exp, significand), MSB→LSB. Recompose the
+                // full FP word: sign << (w_exp+w_sig) | exp << w_sig | sig.
+                let (_, sign) = self.ctx.bv_const_value(kids[0])?;
+                let (w_exp, exp) = self.ctx.bv_const_value(kids[1])?;
+                let (w_sig, sig) = self.ctx.bv_const_value(kids[2])?;
+                let pow2 = |k: u32| -> Integer {
+                    let mut acc = Integer::one();
+                    let two = Integer::from(2u64);
+                    for _ in 0..k {
+                        acc = acc * two.clone();
+                    }
+                    acc
+                };
+                let bits = sign.clone() * pow2(w_exp + w_sig)
+                    + exp.clone() * pow2(w_sig)
+                    + sig.clone();
+                return Some(bits);
+            }
+        }
+        None
+    }
+
+    /// Slice 9: encode+assert the pre-minted `(le, ge)` Real-bridge atom pairs.
+    /// Pure replay — no term creation (all minted in `build_to_real_bridge_terms`
+    /// before the ctx clone), so the Combiner's cloned ctx already contains them.
+    fn emit_to_real_bridge(pending: &[(TermId, TermId)], enc: &mut crate::tseitin::Encoder<'_>) {
+        for &(le, ge) in pending {
+            let ll = enc.encode(le);
+            let lg = enc.encode(ge);
+            enc.assert_top(ll);
+            enc.assert_top(lg);
+        }
     }
 
     fn lower(&mut self, t: TermId) -> TermId {

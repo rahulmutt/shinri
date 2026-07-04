@@ -85,7 +85,12 @@ pub fn uses_crossing_conversion(ctx: &Context, assertions: &[TermId]) -> bool {
         if let TermNode::App { op, args, .. } = ctx.term_node(t) {
             let kids: Vec<TermId> = ctx.children(*args).to_vec();
             let is_crossing = match op {
-                Op::Builtin(BuiltinOp::FpToReal) => true,
+                // fp.to_real is admitted (slice 9) for eb<=8 (Float16/32); larger
+                // formats stay crossing (Real bridge deferred for eb>8).
+                Op::Builtin(BuiltinOp::FpToReal) => match ctx.fp_widths(ctx.sort_of(kids[0])) {
+                    Some((eb, _)) if eb <= 8 => false,
+                    _ => true,
+                },
                 Op::Builtin(BuiltinOp::ToFp { .. }) => match kids.len() {
                     1 => false, // 1-arg BV bitcast — admitted in slice 4c
                     2 => match ctx.sort_node(ctx.sort_of(kids[1])) {
@@ -349,6 +354,27 @@ pub fn bridge_admissible(ctx: &Context, assertions: &[TermId]) -> bool {
     non_bvfp_atoms(ctx, assertions, &fp_atoms, &bv_atoms)
         .into_iter()
         .all(|t| is_lra_real_atom(ctx, t))
+}
+
+/// Collect every distinct `(fp.to_real _)` application term reachable from the
+/// assertions (dedup by TermId). Used by the dispatch to drive the Real-bridge
+/// emitter (slice 9). Order is deterministic (first-seen DAG walk).
+pub fn collect_fp_to_real_terms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
+    let mut out: Vec<TermId> = Vec::new();
+    let mut visited: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+    fn walk(ctx: &Context, t: TermId, out: &mut Vec<TermId>,
+            visited: &mut rustc_hash::FxHashSet<TermId>) {
+        if !visited.insert(t) { return; }
+        if let TermNode::App { op, args, .. } = ctx.term_node(t) {
+            if matches!(op, Op::Builtin(BuiltinOp::FpToReal)) {
+                out.push(t);
+            }
+            let kids: Vec<TermId> = ctx.children(*args).to_vec();
+            for k in kids { walk(ctx, k, out, visited); }
+        }
+    }
+    for &a in assertions { walk(ctx, a, &mut out, &mut visited); }
+    out
 }
 
 /// Positively-enumerated check: is an FP-sorted `word` term one that
@@ -804,10 +830,18 @@ mod tests {
         assert!(!super::uses_crossing_conversion(&ctx, &[fp_from_bits]), "FpFromBits admitted");
         assert!(!super::uses_crossing_conversion(&ctx, &[bitcast]), "1-arg to_fp admitted");
 
-        // fp.to_real: crossing forever (v1 Real bridge).
+        // fp.to_real over Float32 (eb=8): admitted (slice 9).
         let x = fp_var(&mut ctx, "x");
         let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
-        assert!(super::uses_crossing_conversion(&ctx, &[toreal]), "fp.to_real still crossing");
+        assert!(!super::uses_crossing_conversion(&ctx, &[toreal]),
+                "fp.to_real over F32 is admitted (slice 9)");
+        // Float64 (eb=11): STILL crossing — pins the eb<=8 boundary.
+        let f64s = ctx.fp_sort(11, 53);
+        let xf64 = ctx.declare_fun("x64", &[], f64s);
+        let x64 = ctx.mk_app(Op::Uninterpreted(xf64), &[]).unwrap();
+        let toreal64 = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x64]).unwrap();
+        assert!(super::uses_crossing_conversion(&ctx, &[toreal64]),
+                "fp.to_real over F64 (eb>8) stays crossing");
     }
 
     #[test]
@@ -984,9 +1018,16 @@ mod tests {
         let sbv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(32)), &[rne, x]).unwrap();
         assert!(!uses_crossing_conversion(&ctx, &[ubv]), "fp.to_ubv admitted (slice 4e)");
         assert!(!uses_crossing_conversion(&ctx, &[sbv]), "fp.to_sbv admitted (slice 4e)");
-        // fp.to_real: crossing forever (v1 Real bridge).
+        // fp.to_real over Float32 (eb=8): admitted (slice 9).
         let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
-        assert!(uses_crossing_conversion(&ctx, &[toreal]), "fp.to_real stays fenced");
+        assert!(!uses_crossing_conversion(&ctx, &[toreal]), "fp.to_real F32 admitted (slice 9)");
+        // Float64 (eb=11): STILL crossing — pins the eb<=8 boundary.
+        let f64s = ctx.fp_sort(11, 53);
+        let xf64 = ctx.declare_fun("x64", &[], f64s);
+        let x64 = ctx.mk_app(Op::Uninterpreted(xf64), &[]).unwrap();
+        let toreal64 = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x64]).unwrap();
+        assert!(uses_crossing_conversion(&ctx, &[toreal64]),
+                "fp.to_real over F64 (eb>8) stays crossing");
         // Symbolic-Real to_fp nested INSIDE an admitted to_ubv: the DAG walk still nets it.
         let real = ctx.real_sort();
         let rf = ctx.declare_fun("r", &[], real);
