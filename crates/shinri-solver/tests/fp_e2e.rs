@@ -27,15 +27,16 @@ fn isnan_sat_model_is_a_nan() {
     assert_eq!(o, SolveOutcome::Sat);
     // The model must define x as an (fp ...) triple whose exponent is all ones
     // and significand non-zero. We assert the rendering shape only.
-    assert!(model.contains("(fp #b"), "model must render x as an fp triple: {model}");
+    assert!(
+        model.contains("(fp #b"),
+        "model must render x as an fp triple: {model}"
+    );
 }
 
 #[test]
 fn isnegative_and_isinfinite_sat() {
-    let (o, _) = run(
-        "(declare-fun x () Float32) \
-         (assert (fp.isNegative x)) (assert (fp.isInfinite x)) (check-sat)",
-    );
+    let (o, _) = run("(declare-fun x () Float32) \
+         (assert (fp.isNegative x)) (assert (fp.isInfinite x)) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat); // x = -inf
 }
 
@@ -342,34 +343,26 @@ fn fp_lt_zero_lt_inf_is_sat() {
 
 #[test]
 fn fp_lt_antisymmetry_is_unsat() {
-    let (o, _) = run(
-        "(declare-fun x () Float32) (declare-fun y () Float32) \
-         (assert (fp.lt x y)) (assert (fp.lt y x)) (check-sat)",
-    );
+    let (o, _) = run("(declare-fun x () Float32) (declare-fun y () Float32) \
+         (assert (fp.lt x y)) (assert (fp.lt y x)) (check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
 #[test]
 fn fp_leq_reflexive_fails_only_for_nan() {
     // (not (fp.leq x x)) is SAT only when x is NaN.
-    let (o, _) = run(
-        "(declare-fun x () Float32) \
-         (assert (not (fp.leq x x))) (assert (fp.isNaN x)) (check-sat)",
-    );
+    let (o, _) = run("(declare-fun x () Float32) \
+         (assert (not (fp.leq x x))) (assert (fp.isNaN x)) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat);
-    let (o2, _) = run(
-        "(declare-fun x () Float32) \
-         (assert (not (fp.leq x x))) (assert (not (fp.isNaN x))) (check-sat)",
-    );
+    let (o2, _) = run("(declare-fun x () Float32) \
+         (assert (not (fp.leq x x))) (assert (not (fp.isNaN x))) (check-sat)");
     assert_eq!(o2, SolveOutcome::Unsat);
 }
 
 #[test]
 fn fp_min_of_inf_zero_equals_zero_sat_with_model() {
-    let (o, model) = run(
-        "(declare-fun x () Float32) \
-         (assert (fp.eq x (fp.min (_ +oo 8 24) (_ +zero 8 24)))) (check-sat) (get-model)",
-    );
+    let (o, model) = run("(declare-fun x () Float32) \
+         (assert (fp.eq x (fp.min (_ +oo 8 24) (_ +zero 8 24)))) (check-sat) (get-model)");
     assert_eq!(o, SolveOutcome::Sat); // min(+oo,+0) = +0, so x fp.eq +0
     assert!(model.contains("(fp #b"), "model renders x: {model}");
 }
@@ -377,9 +370,8 @@ fn fp_min_of_inf_zero_equals_zero_sat_with_model() {
 #[test]
 fn fp_max_picks_larger_unsat_when_contradicted() {
     // max(+0,+oo) = +oo, which is not fp.eq +0  => asserting equality is UNSAT.
-    let (o, _) = run(
-        "(assert (fp.eq (fp.max (_ +zero 8 24) (_ +oo 8 24)) (_ +zero 8 24))) (check-sat)",
-    );
+    let (o, _) =
+        run("(assert (fp.eq (fp.max (_ +zero 8 24) (_ +oo 8 24)) (_ +zero 8 24))) (check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
@@ -388,10 +380,8 @@ fn fp_max_picks_larger_unsat_when_contradicted() {
 #[test]
 fn fp_fma_nan_when_zero_times_inf_sat() {
     // 0 * +inf + x is NaN regardless of x: fp.isNaN holds -> SAT.
-    let (o, _) = run(
-        "(declare-fun x () Float32) \
-         (assert (fp.isNaN (fp.fma RNE (_ +zero 8 24) (_ +oo 8 24) x))) (check-sat)",
-    );
+    let (o, _) = run("(declare-fun x () Float32) \
+         (assert (fp.isNaN (fp.fma RNE (_ +zero 8 24) (_ +oo 8 24) x))) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat);
 }
 
@@ -399,33 +389,31 @@ fn fp_fma_nan_when_zero_times_inf_sat() {
 fn fp_fma_inf_product_finite_addend_sat() {
     // (+inf) * x + y, with x = +1.0-ish nonzero and y finite, is +inf.
     // Use isInfinite over a symbolic-but-constrained query: SAT.
-    let (o, _) = run(
-        "(declare-fun y () Float32) \
-         (assert (fp.isInfinite (fp.fma RTP (_ +oo 8 24) (_ +oo 8 24) y))) (check-sat)",
-    );
+    let (o, _) = run("(declare-fun y () Float32) \
+         (assert (fp.isInfinite (fp.fma RTP (_ +oo 8 24) (_ +oo 8 24) y))) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat); // +inf * +inf + y = +inf
 }
 
 #[test]
 fn fp_fma_inf_minus_inf_is_nan_sat() {
     // (+inf)*(+inf) + (-inf) = +inf + (-inf) = NaN.
-    let (o, _) = run(
-        "(assert (fp.isNaN (fp.fma RNE (_ +oo 8 24) (_ +oo 8 24) (_ -oo 8 24)))) (check-sat)",
-    );
+    let (o, _) =
+        run("(assert (fp.isNaN (fp.fma RNE (_ +oo 8 24) (_ +oo 8 24) (_ -oo 8 24)))) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat);
 }
 
 #[test]
 fn fp_fma_symbolic_rm_sat_get_model() {
     // w = fma(rm, x, y, z) with symbolic rm and operands: SAT, model renders.
-    let (o, model) = run(
-        "(declare-fun x () Float32) (declare-fun y () Float32) \
+    let (o, model) = run("(declare-fun x () Float32) (declare-fun y () Float32) \
          (declare-fun z () Float32) (declare-fun w () Float32) \
          (declare-fun rm () RoundingMode) \
-         (assert (fp.eq w (fp.fma rm x y z))) (check-sat) (get-model)",
-    );
+         (assert (fp.eq w (fp.fma rm x y z))) (check-sat) (get-model)");
     assert_eq!(o, SolveOutcome::Sat);
-    assert!(model.contains("(fp #b"), "model renders fp triples: {model}");
+    assert!(
+        model.contains("(fp #b"),
+        "model renders fp triples: {model}"
+    );
 }
 
 #[test]
@@ -447,17 +435,13 @@ fn fp_fma_malformed_is_unknown() {
 #[test]
 fn fp_roundtointegral_inf_passthrough_sat() {
     // roundToIntegral(RTP, +oo) = +oo, so fp.isInfinite holds: SAT.
-    let (o, _) = run(
-        "(assert (fp.isInfinite (fp.roundToIntegral RTP (_ +oo 8 24)))) (check-sat)",
-    );
+    let (o, _) = run("(assert (fp.isInfinite (fp.roundToIntegral RTP (_ +oo 8 24)))) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat);
 }
 
 #[test]
 fn fp_roundtointegral_nan_is_nan_sat() {
-    let (o, _) = run(
-        "(assert (fp.isNaN (fp.roundToIntegral RNE (_ NaN 8 24)))) (check-sat)",
-    );
+    let (o, _) = run("(assert (fp.isNaN (fp.roundToIntegral RNE (_ NaN 8 24)))) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat);
 }
 
@@ -468,11 +452,9 @@ fn fp_roundtointegral_idempotent_on_integral_unsat() {
     // fp.eq(NaN, NaN) = false (IEEE), making (not (fp.eq ...)) satisfiable at x=NaN.
     // With structural = the two sides have identical bits for every x (including NaN,
     // since rti(NaN) returns the canonical NaN unchanged), so (not (= ...)) is UNSAT.
-    let (o, _) = run(
-        "(declare-fun x () Float32) \
+    let (o, _) = run("(declare-fun x () Float32) \
          (assert (not (= (fp.roundToIntegral RNE (fp.roundToIntegral RNE x)) \
-                         (fp.roundToIntegral RNE x)))) (check-sat)",
-    );
+                         (fp.roundToIntegral RNE x)))) (check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
@@ -484,7 +466,10 @@ fn fp_roundtointegral_symbolic_rm_sat_get_model() {
          (assert (fp.eq z (fp.roundToIntegral rm x))) (check-sat) (get-model)",
     );
     assert_eq!(o, SolveOutcome::Sat);
-    assert!(model.contains("(fp #b"), "model renders fp triples: {model}");
+    assert!(
+        model.contains("(fp #b"),
+        "model renders fp triples: {model}"
+    );
 }
 
 #[test]
@@ -518,9 +503,8 @@ fn fp_rem_known_value_sat() {
     // special-value-form workaround for consistency: the "known value" here
     // is expressed via the five special forms
     // `(_ +oo/-oo/+zero/-zero/NaN eb sb)` instead of 5.0/3.0.
-    let (o, _) = run(
-        "(assert (fp.eq (fp.rem (_ +zero 8 24) (_ +oo 8 24)) (_ +zero 8 24))) (check-sat)",
-    );
+    let (o, _) =
+        run("(assert (fp.eq (fp.rem (_ +zero 8 24) (_ +oo 8 24)) (_ +zero 8 24))) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat);
 }
 
@@ -545,9 +529,8 @@ fn fp_rem_inf_dividend_is_nan_unsat() {
     // asserting the result equals +0 is UNSAT. Ground/constant-only: folds
     // instantly, no symbolic search at all -- strictly faster and safer than
     // either of the brief's two proposed forms.
-    let (o, _) = run(
-        "(assert (fp.eq (fp.rem (_ +oo 8 24) (_ +zero 8 24)) (_ +zero 8 24))) (check-sat)",
-    );
+    let (o, _) =
+        run("(assert (fp.eq (fp.rem (_ +oo 8 24) (_ +zero 8 24)) (_ +zero 8 24))) (check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
@@ -559,7 +542,10 @@ fn fp_rem_sat_get_model() {
          (assert (fp.eq w (fp.rem x y))) (check-sat) (get-model)",
     );
     assert_eq!(o, SolveOutcome::Sat);
-    assert!(model.contains("(fp #b"), "model renders fp triples: {model}");
+    assert!(
+        model.contains("(fp #b"),
+        "model renders fp triples: {model}"
+    );
 }
 
 #[test]
@@ -578,12 +564,13 @@ fn fp_rem_malformed_is_unknown() {
 #[test]
 fn to_fp_fp_widen_sat_get_model() {
     // y (Float64) = widen(x : Float32). SAT; model renders fp triples.
-    let (o, model) = run(
-        "(declare-fun x () Float32) (declare-fun y () Float64) \
-         (assert (fp.eq y ((_ to_fp 11 53) RNE x))) (check-sat) (get-model)",
-    );
+    let (o, model) = run("(declare-fun x () Float32) (declare-fun y () Float64) \
+         (assert (fp.eq y ((_ to_fp 11 53) RNE x))) (check-sat) (get-model)");
     assert_eq!(o, SolveOutcome::Sat);
-    assert!(model.contains("(fp #b"), "model renders fp triples: {model}");
+    assert!(
+        model.contains("(fp #b"),
+        "model renders fp triples: {model}"
+    );
 }
 
 #[test]
@@ -599,32 +586,29 @@ fn to_fp_fp_widen_reflexive_unsat() {
     //  to_fp fenced to Unknown. As of slice 4c, FpFromBits IS admitted, but a
     //  symbolic source remains a valid — and arguably stronger — way to
     //  exercise the widen circuit, so this test is kept as-is.)
-    let (o, _) = run(
-        "(declare-fun x () Float32) \
+    let (o, _) = run("(declare-fun x () Float32) \
          (assert (not (= ((_ to_fp 11 53) RNE x) ((_ to_fp 11 53) RNE x)))) \
-         (check-sat)",
-    );
+         (check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
 #[test]
 fn to_fp_const_real_known_value_sat() {
     // to_fp of 1/3 into Float32 (RNE) = 0x3EAA_AAAB; assert fp.eq with z and read model.
-    let (o, model) = run(
-        "(declare-fun z () Float32) \
-         (assert (fp.eq z ((_ to_fp 8 24) RNE (/ 1.0 3.0)))) (check-sat) (get-model)",
-    );
+    let (o, model) = run("(declare-fun z () Float32) \
+         (assert (fp.eq z ((_ to_fp 8 24) RNE (/ 1.0 3.0)))) (check-sat) (get-model)");
     assert_eq!(o, SolveOutcome::Sat);
-    assert!(model.contains("(fp #b"), "model renders fp triple for z: {model}");
+    assert!(
+        model.contains("(fp #b"),
+        "model renders fp triple for z: {model}"
+    );
 }
 
 #[test]
 fn to_fp_const_real_reflexive_unsat() {
     // to_fp(1/3) equals itself under fp.eq (non-NaN); asserting the negation is UNSAT.
-    let (o, _) = run(
-        "(assert (not (fp.eq ((_ to_fp 8 24) RNE (/ 1.0 3.0)) \
-                             ((_ to_fp 8 24) RNE (/ 1.0 3.0))))) (check-sat)",
-    );
+    let (o, _) = run("(assert (not (fp.eq ((_ to_fp 8 24) RNE (/ 1.0 3.0)) \
+                             ((_ to_fp 8 24) RNE (/ 1.0 3.0))))) (check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
@@ -721,7 +705,11 @@ fn to_real_nan_is_functional_unsat() {
     let (o, _) = run("(declare-fun x () Float16) (declare-fun y () Float16) \
         (assert (fp.isNaN x)) (assert (fp.isNaN y)) (assert (= x y)) \
         (assert (not (= (fp.to_real x) (fp.to_real y)))) (check-sat)");
-    assert_eq!(o, SolveOutcome::Unsat, "fp.to_real must be a function over NaN");
+    assert_eq!(
+        o,
+        SolveOutcome::Unsat,
+        "fp.to_real must be a function over NaN"
+    );
 }
 
 #[test]
@@ -732,7 +720,11 @@ fn to_real_pos_neg_inf_may_differ_sat() {
         (assert (fp.isInfinite x)) (assert (fp.isPositive x)) \
         (assert (fp.isInfinite y)) (assert (fp.isNegative y)) \
         (assert (not (= (fp.to_real x) (fp.to_real y)))) (check-sat)");
-    assert_eq!(o, SolveOutcome::Sat, "distinct-const specials must allow inequality");
+    assert_eq!(
+        o,
+        SolveOutcome::Sat,
+        "distinct-const specials must allow inequality"
+    );
 }
 
 #[test]
@@ -742,7 +734,11 @@ fn to_real_const_nan_is_functional_unsat() {
     let (o, _) = run("(declare-fun x () Float16) (declare-fun y () Float16) \
         (assert (= x (_ NaN 5 11))) (assert (= y (_ NaN 5 11))) (assert (= x y)) \
         (assert (not (= (fp.to_real x) (fp.to_real y)))) (check-sat)");
-    assert_eq!(o, SolveOutcome::Unsat, "constant NaN operands must share nan_c");
+    assert_eq!(
+        o,
+        SolveOutcome::Unsat,
+        "constant NaN operands must share nan_c"
+    );
 }
 
 // ── Slice-4b: mixed BV+FP (no crossing op) now solves ──────────────────────
@@ -775,7 +771,11 @@ fn mixed_bv_and_fp_unsat() {
 (assert (fp.isNaN y))
 (check-sat)";
     let (o, _) = run(src);
-    assert_eq!(o, SolveOutcome::Unsat, "contradictory BV side makes the mixed query UNSAT");
+    assert_eq!(
+        o,
+        SolveOutcome::Unsat,
+        "contradictory BV side makes the mixed query UNSAT"
+    );
 }
 
 // ── Slice-4c end-to-end: BV→FP bitcast (FpFromBits + 1-arg to_fp) ───────────
@@ -799,7 +799,11 @@ fn fp_from_bits_sign_bit_is_msb_unsat() {
 (assert (fp.eq (fp #b1 #b11111111 #b00000000000000000000000) (_ +oo 8 24)))
 (check-sat)";
     let (o, _) = run(src);
-    assert_eq!(o, SolveOutcome::Unsat, "sign bit is the MSB: (fp 1 …) is -oo, not +oo");
+    assert_eq!(
+        o,
+        SolveOutcome::Unsat,
+        "sign bit is the MSB: (fp 1 …) is -oo, not +oo"
+    );
 }
 
 #[test]
@@ -814,7 +818,11 @@ fn fp_from_bits_symbolic_child_sat_with_model() {
 (check-sat)
 (get-model)";
     let (o, model) = run(src);
-    assert_eq!(o, SolveOutcome::Sat, "∃ sign bit making (fp s all-ones 0) infinite");
+    assert_eq!(
+        o,
+        SolveOutcome::Sat,
+        "∃ sign bit making (fp s all-ones 0) infinite"
+    );
     assert!(model.contains("s"), "model surfaces the symbolic BV child");
     assert!(model.contains("z"), "model surfaces the FP var");
 }
@@ -906,12 +914,13 @@ fn fp_to_ubv_sat_unsat_with_model() {
          (assert (= a ((_ fp.to_ubv 8) RTZ x))) (check-sat) (get-model)",
     );
     assert_eq!(o, SolveOutcome::Sat);
-    assert!(model.contains("x") && model.contains("a"), "model surfaces both vars");
-    let (o2, _) = run(
-        "(declare-fun x () (_ FloatingPoint 5 11)) \
-         (assert (fp.eq x (fp #b0 #b10100 #b0101000000))) \
-         (assert (distinct ((_ fp.to_ubv 8) RTZ x) #x2A)) (check-sat)",
+    assert!(
+        model.contains("x") && model.contains("a"),
+        "model surfaces both vars"
     );
+    let (o2, _) = run("(declare-fun x () (_ FloatingPoint 5 11)) \
+         (assert (fp.eq x (fp #b0 #b10100 #b0101000000))) \
+         (assert (distinct ((_ fp.to_ubv 8) RTZ x) #x2A)) (check-sat)");
     assert_eq!(o2, SolveOutcome::Unsat, "42.0 → ubv8 must be exactly #x2A");
 }
 
@@ -942,10 +951,12 @@ fn fp_to_sbv_int_min_and_unspecified() {
         "(assert (distinct ((_ fp.to_sbv 8) RTZ (fp #b1 #b10110 #b0000000000)) #x80)) (check-sat)",
     );
     assert_eq!(o, SolveOutcome::Unsat, "-128.0 → sbv8 is exactly #x80");
-    let (o2, _) = run(
-        "(assert (= ((_ fp.to_sbv 8) RNE (_ NaN 5 11)) #x11)) (check-sat)",
+    let (o2, _) = run("(assert (= ((_ fp.to_sbv 8) RNE (_ NaN 5 11)) #x11)) (check-sat)");
+    assert_eq!(
+        o2,
+        SolveOutcome::Sat,
+        "unspecified sbv value is unconstrained (can be 0x11)"
     );
-    assert_eq!(o2, SolveOutcome::Sat, "unspecified sbv value is unconstrained (can be 0x11)");
 }
 
 #[test]
@@ -956,7 +967,11 @@ fn fp_to_bv_congruence_e2e() {
          (assert (= x y)) (assert (fp.isNaN x)) \
          (assert (distinct ((_ fp.to_ubv 8) RNE x) ((_ fp.to_ubv 8) RNE y))) (check-sat)",
     );
-    assert_eq!(o, SolveOutcome::Unsat, "congruence: equal (rm, x) → equal results");
+    assert_eq!(
+        o,
+        SolveOutcome::Unsat,
+        "congruence: equal (rm, x) → equal results"
+    );
     // Probe-1 shape: different unspecified inputs may differ.
     let (o2, _) = run(
         "(declare-fun a () (_ BitVec 8)) (declare-fun b () (_ BitVec 8)) \
@@ -970,17 +985,13 @@ fn fp_to_bv_congruence_e2e() {
 #[test]
 fn fp_to_bv_under_bv_atom() {
     // First legal FP subterm under a BV atom: (bvult (fp.to_ubv …) k).
-    let (o, _) = run(
-        "(declare-fun x () (_ FloatingPoint 5 11)) \
+    let (o, _) = run("(declare-fun x () (_ FloatingPoint 5 11)) \
          (assert (fp.eq x (fp #b0 #b10100 #b0101000000))) \
-         (assert (bvult ((_ fp.to_ubv 8) RTZ x) #x10)) (check-sat)",
-    );
+         (assert (bvult ((_ fp.to_ubv 8) RTZ x) #x10)) (check-sat)");
     assert_eq!(o, SolveOutcome::Unsat, "42 < 16 is false");
-    let (o2, _) = run(
-        "(declare-fun x () (_ FloatingPoint 5 11)) \
+    let (o2, _) = run("(declare-fun x () (_ FloatingPoint 5 11)) \
          (assert (fp.eq x (fp #b0 #b10100 #b0101000000))) \
-         (assert (bvult ((_ fp.to_ubv 8) RTZ x) #x30)) (check-sat)",
-    );
+         (assert (bvult ((_ fp.to_ubv 8) RTZ x) #x30)) (check-sat)");
     assert_eq!(o2, SolveOutcome::Sat, "42 < 48");
 }
 
@@ -1011,12 +1022,10 @@ fn fp_ite_isnan_sat_twin() {
 fn fp_ite_condition_with_fp_atom_unsat() {
     // Condition is itself an FP atom: (ite (fp.lt a b) a b) is min(a,b);
     // pinning a<b and result=b contradicts (a,b distinct non-NaN handled via lt).
-    let (o, _) = run(
-        "(declare-const a Float32)(declare-const b Float32)\
+    let (o, _) = run("(declare-const a Float32)(declare-const b Float32)\
          (assert (fp.lt a b))\
          (assert (fp.eq (ite (fp.lt a b) a b) b))\
-         (assert (not (fp.eq a b)))(check-sat)",
-    );
+         (assert (not (fp.eq a b)))(check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
@@ -1058,28 +1067,22 @@ fn fp_nary_eq_chain_unsat() {
 fn rm_pigeonhole_six_distinct_unsat() {
     // R6 — answered sat before slice 5: RM equalities leaked to EUF, which
     // treats RoundingMode as an unbounded uninterpreted sort.
-    let (o, _) = run(
-        "(declare-const r RoundingMode)\
-         (assert (distinct r RNE RNA RTP RTN RTZ))(check-sat)",
-    );
+    let (o, _) = run("(declare-const r RoundingMode)\
+         (assert (distinct r RNE RNA RTP RTN RTZ))(check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
 #[test]
 fn rm_pigeonhole_five_distinct_sat_twin() {
-    let (o, _) = run(
-        "(declare-const r RoundingMode)\
-         (assert (distinct r RNE RNA RTP RTN))(check-sat)",
-    );
+    let (o, _) = run("(declare-const r RoundingMode)\
+         (assert (distinct r RNE RNA RTP RTN))(check-sat)");
     assert_eq!(o, SolveOutcome::Sat); // r = RTZ
 }
 
 #[test]
 fn rm_eq_two_modes_unsat() {
-    let (o, _) = run(
-        "(declare-const r RoundingMode)\
-         (assert (= r RNE))(assert (= r RTZ))(check-sat)",
-    );
+    let (o, _) = run("(declare-const r RoundingMode)\
+         (assert (= r RNE))(assert (= r RTZ))(check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
@@ -1097,26 +1100,22 @@ fn rm_ite_steers_rounding_unsat() {
     // exactly 1.0; RTP → 1.0 + 2^-23 ≠ 1.0. Pinning the sum to 1.0 with
     // (not c) forces RTP → contradiction. z3-confirmed both verdicts on the
     // equivalent script before pinning.
-    let (o, _) = run(
-        "(declare-const c Bool)\
+    let (o, _) = run("(declare-const c Bool)\
          (assert (fp.eq (fp.add (ite c RNE RTP) \
              (fp #b0 #b01111111 #b00000000000000000000000) \
              (fp #b0 #b01100111 #b00000000000000000000000)) \
              (fp #b0 #b01111111 #b00000000000000000000000)))\
-         (assert (not c))(check-sat)",
-    );
+         (assert (not c))(check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
 #[test]
 fn rm_ite_steers_rounding_sat_twin() {
-    let (o, _) = run(
-        "(declare-const c Bool)\
+    let (o, _) = run("(declare-const c Bool)\
          (assert (fp.eq (fp.add (ite c RNE RTP) \
              (fp #b0 #b01111111 #b00000000000000000000000) \
              (fp #b0 #b01100111 #b00000000000000000000000)) \
-             (fp #b0 #b01111111 #b00000000000000000000000)))(check-sat)",
-    );
+             (fp #b0 #b01111111 #b00000000000000000000000)))(check-sat)");
     assert_eq!(o, SolveOutcome::Sat); // c = true → RNE → exact 1.0
 }
 
@@ -1127,21 +1126,28 @@ fn model_never_leaks_ite_internals() {
          (assert (fp.isNaN (ite c x y)))(check-sat)",
     );
     assert_eq!(o, SolveOutcome::Sat);
-    assert!(!model.contains("ite!"), "internal ite symbols leaked into get-model: {model}");
+    assert!(
+        !model.contains("ite!"),
+        "internal ite symbols leaked into get-model: {model}"
+    );
     // The user constants still get values.
-    assert!(model.contains("(x "), "user constant x missing from model: {model}");
+    assert!(
+        model.contains("(x "),
+        "user constant x missing from model: {model}"
+    );
 }
 
 #[test]
 fn rm_variable_gets_model_value() {
     // Slice 6: RM variables were absent from get-model (their one-hot
     // selectors live in rm_cache, which var_bits_split never visited).
-    let (o, model) = run(
-        "(declare-const r RoundingMode)\
-         (assert (= r RTZ))(check-sat)(get-model)",
-    );
+    let (o, model) = run("(declare-const r RoundingMode)\
+         (assert (= r RTZ))(check-sat)(get-model)");
     assert_eq!(o, SolveOutcome::Sat);
-    assert!(model.contains("(r RTZ)"), "RM var missing/wrong in model: {model}");
+    assert!(
+        model.contains("(r RTZ)"),
+        "RM var missing/wrong in model: {model}"
+    );
 }
 
 /// Like `run`, but also collects every `get-value` response.
@@ -1180,8 +1186,16 @@ fn get_value_on_nested_eliminated_ite_returns_value() {
     );
     assert_eq!(o, SolveOutcome::Sat);
     assert_eq!(values.len(), 1);
-    assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
-    assert!(!values[0].contains('?'), "no value produced (item-4 gap): {}", values[0]);
+    assert!(
+        !values[0].contains("ite!"),
+        "internal name leaked: {}",
+        values[0]
+    );
+    assert!(
+        !values[0].contains('?'),
+        "no value produced (item-4 gap): {}",
+        values[0]
+    );
     assert!(values[0].contains("#x0f"), "expected #x0f: {}", values[0]);
 }
 
@@ -1198,9 +1212,17 @@ fn get_value_on_eliminated_ite_returns_value_not_internal_name() {
     );
     assert_eq!(o, SolveOutcome::Sat);
     assert_eq!(values.len(), 1);
-    assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
+    assert!(
+        !values[0].contains("ite!"),
+        "internal name leaked: {}",
+        values[0]
+    );
     assert!(!values[0].contains('?'), "no value produced: {}", values[0]);
-    assert!(values[0].contains("#x0f"), "expected #x0f (c true, x=#x0f): {}", values[0]);
+    assert!(
+        values[0].contains("#x0f"),
+        "expected #x0f (c true, x=#x0f): {}",
+        values[0]
+    );
 }
 
 #[test]
@@ -1214,7 +1236,11 @@ fn get_value_on_eliminated_rm_ite_returns_mode() {
     );
     assert_eq!(o, SolveOutcome::Sat);
     assert_eq!(values.len(), 1);
-    assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
+    assert!(
+        !values[0].contains("ite!"),
+        "internal name leaked: {}",
+        values[0]
+    );
     assert!(values[0].contains("RTZ"), "expected RTZ: {}", values[0]);
 }
 
@@ -1238,14 +1264,22 @@ fn pop_clears_eliminated_ite_value_no_stale_get_value() {
     assert_eq!(o, SolveOutcome::Sat);
     assert_eq!(values.len(), 3);
     // Before pop: the eliminated ite resolves to #x0f (c true, x=#x0f).
-    assert!(values[0].contains("#x0f"), "pre-pop ite value: {}", values[0]);
+    assert!(
+        values[0].contains("#x0f"),
+        "pre-pop ite value: {}",
+        values[0]
+    );
     // After pop: no stale value — the ite must read "?" like the now-unbound x.
     assert!(
         !values[1].contains("#x0f") && values[1].contains('?'),
         "post-pop ite must be '?', not stale #x0f: {}",
         values[1]
     );
-    assert!(values[2].contains('?'), "post-pop x must be '?': {}", values[2]);
+    assert!(
+        values[2].contains('?'),
+        "post-pop x must be '?': {}",
+        values[2]
+    );
 }
 
 #[test]
@@ -1264,7 +1298,15 @@ fn get_value_on_eliminated_ite_qfabv_returns_value() {
     );
     assert_eq!(o, SolveOutcome::Sat);
     assert_eq!(values.len(), 1);
-    assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
-    assert!(!values[0].contains('?'), "no value produced (item-5 gap): {}", values[0]);
+    assert!(
+        !values[0].contains("ite!"),
+        "internal name leaked: {}",
+        values[0]
+    );
+    assert!(
+        !values[0].contains('?'),
+        "no value produced (item-5 gap): {}",
+        values[0]
+    );
     assert!(values[0].contains("#x0f"), "expected #x0f: {}", values[0]);
 }

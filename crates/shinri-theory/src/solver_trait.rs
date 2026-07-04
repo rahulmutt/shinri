@@ -28,7 +28,10 @@ pub struct TheoryCtx<'a> {
 pub enum TCheck {
     Sat,
     Conflict(Vec<EqLeaf>),
-    Split { atoms: Vec<TermId>, guard: Option<Lit> },
+    Split {
+        atoms: Vec<TermId>,
+        guard: Option<Lit>,
+    },
     /// The theory's fuel budget was exhausted; the result is unknown (neither
     /// sat nor unsat). The solver must propagate this to `SolveOutcome::Unknown`
     /// without treating it as satisfiable.
@@ -184,13 +187,19 @@ mod tests {
             eq: &mut eq,
             atoms: &atoms,
         };
-        assert!(matches!(t.check(&mut cx, Effort::Full), TCheck::Sat), "NullTheory must always return Sat");
+        assert!(
+            matches!(t.check(&mut cx, Effort::Full), TCheck::Sat),
+            "NullTheory must always return Sat"
+        );
     }
 
     #[test]
     fn tcheck_split_carries_atoms() {
         let t = shinri_core::TermId::new(5).unwrap();
-        let c = TCheck::Split { atoms: vec![t], guard: None };
+        let c = TCheck::Split {
+            atoms: vec![t],
+            guard: None,
+        };
         match c {
             TCheck::Split { atoms, guard } => {
                 assert_eq!(atoms, vec![t]);

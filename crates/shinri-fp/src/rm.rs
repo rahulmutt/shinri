@@ -4,15 +4,20 @@ use shinri_bv::{BitLit, Blaster};
 use shinri_core::RoundingMode;
 
 /// One-hot rounding-mode selector, order [Rne, Rna, Rtp, Rtn, Rtz].
-pub struct RmSel { pub sel: [BitLit; 5] }
+pub struct RmSel {
+    pub sel: [BitLit; 5],
+}
 
 /// Constant one-hot for a literal mode.
 pub fn literal(b: &Blaster, rm: RoundingMode) -> RmSel {
     let o = b.one();
     let z = b.zero();
     let idx = match rm {
-        RoundingMode::Rne => 0, RoundingMode::Rna => 1, RoundingMode::Rtp => 2,
-        RoundingMode::Rtn => 3, RoundingMode::Rtz => 4,
+        RoundingMode::Rne => 0,
+        RoundingMode::Rna => 1,
+        RoundingMode::Rtp => 2,
+        RoundingMode::Rtn => 3,
+        RoundingMode::Rtz => 4,
     };
     let mut sel = [z; 5];
     sel[idx] = o;
@@ -38,13 +43,33 @@ fn symbolic_bits(b: &mut Blaster) -> (RmSel, [BitLit; 3]) {
     // exclude codes >= 5: NOT(e2 AND e0) AND NOT(e2 AND e1)
     b.add_clause(&[n2, n0]); // (¬e2 ∨ ¬e0)
     b.add_clause(&[n2, n1]); // (¬e2 ∨ ¬e1)
-    // one-hot decode of the 5 legal codes.
-    let rne = { let t = b.and2(n2, n1); b.and2(t, n0) }; // 000
-    let rna = { let t = b.and2(n2, n1); b.and2(t, e0) }; // 001
-    let rtp = { let t = b.and2(n2, e1); b.and2(t, n0) }; // 010
-    let rtn = { let t = b.and2(n2, e1); b.and2(t, e0) }; // 011
-    let rtz = { let t = b.and2(e2, n1); b.and2(t, n0) }; // 100
-    (RmSel { sel: [rne, rna, rtp, rtn, rtz] }, [e0, e1, e2])
+                             // one-hot decode of the 5 legal codes.
+    let rne = {
+        let t = b.and2(n2, n1);
+        b.and2(t, n0)
+    }; // 000
+    let rna = {
+        let t = b.and2(n2, n1);
+        b.and2(t, e0)
+    }; // 001
+    let rtp = {
+        let t = b.and2(n2, e1);
+        b.and2(t, n0)
+    }; // 010
+    let rtn = {
+        let t = b.and2(n2, e1);
+        b.and2(t, e0)
+    }; // 011
+    let rtz = {
+        let t = b.and2(e2, n1);
+        b.and2(t, n0)
+    }; // 100
+    (
+        RmSel {
+            sel: [rne, rna, rtp, rtn, rtz],
+        },
+        [e0, e1, e2],
+    )
 }
 
 /// Equality of two RoundingMode selectors. ONE-HOT PRECONDITION: both inputs
@@ -68,9 +93,14 @@ mod tests {
     fn eval_sel(b: Blaster, sel: &[BitLit; 5]) -> [bool; 5] {
         let cnf = b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in &cnf.clauses {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         assert_eq!(s.solve(), SolveResult::Sat);
@@ -84,13 +114,19 @@ mod tests {
 
     #[test]
     fn literal_is_one_hot() {
-        for (rm, idx) in [(RoundingMode::Rne, 0), (RoundingMode::Rna, 1),
-                          (RoundingMode::Rtp, 2), (RoundingMode::Rtn, 3),
-                          (RoundingMode::Rtz, 4)] {
+        for (rm, idx) in [
+            (RoundingMode::Rne, 0),
+            (RoundingMode::Rna, 1),
+            (RoundingMode::Rtp, 2),
+            (RoundingMode::Rtn, 3),
+            (RoundingMode::Rtz, 4),
+        ] {
             let b = Blaster::new();
             let s = literal(&b, rm);
             let got = eval_sel(b, &s.sel);
-            for (i, &g) in got.iter().enumerate() { assert_eq!(g, i == idx, "rm={rm:?} bit {i}"); }
+            for (i, &g) in got.iter().enumerate() {
+                assert_eq!(g, i == idx, "rm={rm:?} bit {i}");
+            }
         }
     }
 
@@ -98,9 +134,14 @@ mod tests {
     fn solve_with(b: Blaster, extra: &[Vec<BitLit>]) -> SolveResult {
         let cnf = b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in cnf.clauses.iter().chain(extra.iter()) {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         s.solve()
@@ -110,7 +151,10 @@ mod tests {
     fn pin(bl: BitLit, val: bool) -> Vec<BitLit> {
         // `bl` is a fresh literal (pos == true), so pinning its var to `val`
         // is simply the unit literal with polarity `val`.
-        vec![BitLit { var: bl.var, pos: val }]
+        vec![BitLit {
+            var: bl.var,
+            pos: val,
+        }]
     }
 
     /// SAT-check `b`'s accumulated clauses with no extra pinning.
@@ -124,7 +168,11 @@ mod tests {
         let mut b = Blaster::new();
         let s = symbolic(&mut b);
         let got = eval_sel(b, &s.sel);
-        assert_eq!(got.iter().filter(|x| **x).count(), 1, "symbolic RM must be one-hot");
+        assert_eq!(
+            got.iter().filter(|x| **x).count(),
+            1,
+            "symbolic RM must be one-hot"
+        );
 
         // 2) Each legal code 0..=4 is SAT and decodes to *exactly* its own
         //    selector. We pin (e2,e1,e0) to the code, then require sel[code]=true
@@ -140,7 +188,8 @@ mod tests {
                 extra.push(pin(s.sel[j], j == code as usize));
             }
             assert_eq!(
-                solve_with(b, &extra), SolveResult::Sat,
+                solve_with(b, &extra),
+                SolveResult::Sat,
                 "legal code {code} must decode to selector {code}"
             );
         }

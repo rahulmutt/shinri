@@ -12,7 +12,11 @@ use shinri_theory::EqualityEngine;
 /// which DO route to Arith — is what makes a length equality actually enforced.
 pub fn arith_eq_companions(terms: &mut Context, atom: TermId) -> Option<(TermId, TermId)> {
     let (a, b) = match terms.term_node(atom) {
-        TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } => {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::Eq),
+            args,
+            ..
+        } => {
             let ch = terms.children(*args);
             if ch.len() != 2 {
                 return None;
@@ -102,14 +106,22 @@ fn euf_representative_const(
         let root = eq.find(n);
         let is_str_const = matches!(
             terms.term_node(t),
-            TermNode::Const { val: ConstVal::String(_), .. }
+            TermNode::Const {
+                val: ConstVal::String(_),
+                ..
+            }
         );
         match node_of.get(&root).copied() {
-            None => { node_of.insert(root, t); }
+            None => {
+                node_of.insert(root, t);
+            }
             Some(prev) => {
                 let prev_is_const = matches!(
                     terms.term_node(prev),
-                    TermNode::Const { val: ConstVal::String(_), .. }
+                    TermNode::Const {
+                        val: ConstVal::String(_),
+                        ..
+                    }
                 );
                 if is_str_const && !prev_is_const {
                     node_of.insert(root, t);
@@ -121,7 +133,13 @@ fn euf_representative_const(
     let arg_root = eq.find(arg_n);
     let rep = *node_of.get(&arg_root)?;
     // Only return if it's a string constant (not an opaque variable).
-    if matches!(terms.term_node(rep), TermNode::Const { val: ConstVal::String(_), .. }) {
+    if matches!(
+        terms.term_node(rep),
+        TermNode::Const {
+            val: ConstVal::String(_),
+            ..
+        }
+    ) {
         Some(rep)
     } else {
         None
@@ -171,7 +189,14 @@ pub fn next_axiom(
     // If arg is opaque but its EUF class representative is a string constant
     // (e.g. x = "" was asserted), use the representative instead.
     let effective_arg = match terms.term_node(arg).clone() {
-        TermNode::Const { val: ConstVal::String(_), .. } | TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. } => arg,
+        TermNode::Const {
+            val: ConstVal::String(_),
+            ..
+        }
+        | TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrConcat),
+            ..
+        } => arg,
         _ => {
             // Try to resolve via EUF.
             euf_representative_const(terms, eq, arg, known).unwrap_or(arg)
@@ -207,13 +232,12 @@ pub fn next_axiom(
     None
 }
 
-
 #[cfg(test)]
 mod tests {
+    use crate::StrSolver;
     use shinri_core::{BuiltinOp, Context, Op};
     use shinri_sat::Effort;
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
-    use crate::StrSolver;
 
     #[test]
     fn emits_literal_length_axiom() {
@@ -222,9 +246,7 @@ mod tests {
         let mut ctx = Context::new();
         // Build the string literal "café".
         let lit = ctx.mk_string_const("café");
-        let len_lit = ctx
-            .mk_app(Op::Builtin(BuiltinOp::StrLen), &[lit])
-            .unwrap();
+        let len_lit = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[lit]).unwrap();
         // Wire into solver via an arith atom (>= (str.len "café") 0).
         let int_s = ctx.int_sort();
         let zero = ctx.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
@@ -237,8 +259,12 @@ mod tests {
         // (a bare Int equality would route to EUF, not Arith — see the seam note
         // in `next_axiom`). Expect both to be emitted (char count 4, not byte 5).
         let four = ctx.mk_numeral(shinri_core::Rational::from_int(4i128.into()), int_s);
-        let expected_ge = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[len_lit, four]).unwrap();
-        let expected_le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[len_lit, four]).unwrap();
+        let expected_ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[len_lit, four])
+            .unwrap();
+        let expected_le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[len_lit, four])
+            .unwrap();
         // Sanity: "café" has exactly 4 chars (not 5 bytes).
         assert_eq!("café".chars().count(), 4, "sanity: char count");
         assert_eq!("café".len(), 5, "sanity: byte count");
@@ -294,9 +320,7 @@ mod tests {
         let cc = ctx
             .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
             .unwrap();
-        let len_cc = ctx
-            .mk_app(Op::Builtin(BuiltinOp::StrLen), &[cc])
-            .unwrap();
+        let len_cc = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[cc]).unwrap();
         let zero = ctx.mk_numeral(
             shinri_core::Rational::from_int(0i128.into()),
             ctx.int_sort(),

@@ -250,14 +250,15 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
     /// value but not its stored level, so a theory that hands back a literal it
     /// failed to retract on backtrack carries a stale level above the current
     /// decision level; feeding it to `analyze` yields a backjump level
-    /// > `decision_level()` (tripping the `trail.rs:91` assert) or a learnt clause
-    /// built from garbage. Callers must bail to Unknown when this returns false —
+    /// greater than `decision_level()` (tripping the `trail.rs:91` assert) or a
+    /// learnt clause built from garbage. Callers must bail to Unknown when this
+    /// returns false —
     /// a sound incompleteness, never a wrong verdict.
     fn theory_conflict_analyzable(&self, conflict_lits: &[Lit]) -> bool {
         let dl = self.trail.decision_level();
-        conflict_lits.iter().all(|&l| {
-            self.assign.lit_value(l) == LBool::False && self.assign.level(l.var()) <= dl
-        })
+        conflict_lits
+            .iter()
+            .all(|&l| self.assign.lit_value(l) == LBool::False && self.assign.level(l.var()) <= dl)
     }
 
     /// The Boolean value of a variable in the current assignment, if assigned.
@@ -824,8 +825,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         };
 
         // stack: (children_to_check, next_child_idx, var_to_mark_when_all_done)
-        let mut stack: Vec<(Vec<Lit>, usize, Var)> =
-            vec![(init_kids, 0, start.var())];
+        let mut stack: Vec<(Vec<Lit>, usize, Var)> = vec![(init_kids, 0, start.var())];
 
         loop {
             // Have all children of the top frame been processed?
@@ -903,8 +903,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                     .copied()
                     .filter(|&x| x != l)
                     .filter(|x| {
-                        !self.analyzer.seen[x.var().index()]
-                            && self.assign.level(x.var()) > 0
+                        !self.analyzer.seen[x.var().index()] && self.assign.level(x.var()) > 0
                     })
                     .collect();
                 Some(kids)

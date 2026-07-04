@@ -103,7 +103,7 @@ fn format_fp_triple(eb: u32, sb: u32, bits: &shinri_num::Integer) -> String {
     // low (sb-1) bits = trailing significand; next eb bits = exponent; top bit = sign.
     let mut sig_mod = shinri_num::Integer::one();
     for _ in 0..(sb - 1) {
-        sig_mod = sig_mod * two.clone();
+        sig_mod *= two.clone();
     }
     let sig = bits.div_rem(&sig_mod).1;
     let mut hi = bits.clone();
@@ -112,14 +112,19 @@ fn format_fp_triple(eb: u32, sb: u32, bits: &shinri_num::Integer) -> String {
     }
     let mut exp_mod = shinri_num::Integer::one();
     for _ in 0..eb {
-        exp_mod = exp_mod * two.clone();
+        exp_mod *= two.clone();
     }
     let exp = hi.div_rem(&exp_mod).1;
     let mut sign = hi;
     for _ in 0..eb {
         sign = sign.div_rem(&two).0;
     }
-    format!("(fp #b{} #b{} #b{})", bin(&sign, 1), bin(&exp, eb), bin(&sig, sb - 1))
+    format!(
+        "(fp #b{} #b{} #b{})",
+        bin(&sign, 1),
+        bin(&exp, eb),
+        bin(&sig, sb - 1)
+    )
 }
 
 fn builtin_name(b: BuiltinOp) -> String {
@@ -230,7 +235,10 @@ mod tests {
         let mut ctx = Context::new();
         // Float32 +zero
         let pz = ctx.mk_fp_const(8, 24, Integer::zero());
-        assert_eq!(print_term(&ctx, pz), "(fp #b0 #b00000000 #b00000000000000000000000)");
+        assert_eq!(
+            print_term(&ctx, pz),
+            "(fp #b0 #b00000000 #b00000000000000000000000)"
+        );
         // rounding mode
         let rne = ctx.mk_rm_const(RoundingMode::Rne);
         assert_eq!(print_term(&ctx, rne), "RNE");

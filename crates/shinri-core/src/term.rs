@@ -70,7 +70,10 @@ pub enum BuiltinOp {
     BvSge,
     BvConcat,
     // Bitvectors — indexed (parameters carried in the op)
-    BvExtract { hi: u32, lo: u32 },
+    BvExtract {
+        hi: u32,
+        lo: u32,
+    },
     BvZeroExtend(u32),
     BvSignExtend(u32),
     BvRotateLeft(u32),
@@ -82,23 +85,46 @@ pub enum BuiltinOp {
     StrAt,
     StrSubstr,
     // Floating-point — arithmetic. Rounded ops take a RoundingMode as arg 0.
-    FpAbs, FpNeg,                 // (F) -> F
-    FpAdd, FpSub, FpMul, FpDiv,   // (RM, F, F) -> F
-    FpFma,                        // (RM, F, F, F) -> F
-    FpSqrt, FpRoundToIntegral,    // (RM, F) -> F
-    FpRem, FpMin, FpMax,          // (F, F) -> F
+    FpAbs,
+    FpNeg, // (F) -> F
+    FpAdd,
+    FpSub,
+    FpMul,
+    FpDiv, // (RM, F, F) -> F
+    FpFma, // (RM, F, F, F) -> F
+    FpSqrt,
+    FpRoundToIntegral, // (RM, F) -> F
+    FpRem,
+    FpMin,
+    FpMax, // (F, F) -> F
     // Floating-point — comparisons: (F, F) -> Bool
-    FpLeq, FpLt, FpGeq, FpGt, FpEq,
+    FpLeq,
+    FpLt,
+    FpGeq,
+    FpGt,
+    FpEq,
     // Floating-point — classification: (F) -> Bool
-    FpIsNormal, FpIsSubnormal, FpIsZero, FpIsInfinite, FpIsNaN, FpIsNegative, FpIsPositive,
+    FpIsNormal,
+    FpIsSubnormal,
+    FpIsZero,
+    FpIsInfinite,
+    FpIsNaN,
+    FpIsNegative,
+    FpIsPositive,
     // Floating-point — bit constructor: (BV1, BVeb, BV(sb-1)) -> Float(eb, sb)
     FpFromBits,
     // Floating-point — conversions (indexed; parameters carried in the op).
     /// (_ to_fp eb sb): bitcast from BV(eb+sb) [1 arg], or RM-rounded from
     /// Float / signed-int BV / Real [2 args: (RM, X)].
-    ToFp { eb: u32, sb: u32 },
+    ToFp {
+        eb: u32,
+        sb: u32,
+    },
     /// (_ to_fp_unsigned eb sb): (RM, BV) unsigned-int -> Float(eb, sb).
-    ToFpUnsigned { eb: u32, sb: u32 },
+    ToFpUnsigned {
+        eb: u32,
+        sb: u32,
+    },
     /// (_ fp.to_ubv m): (RM, Float) -> BV(m).
     FpToUbv(u32),
     /// (_ fp.to_sbv m): (RM, Float) -> BV(m).

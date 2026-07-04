@@ -110,16 +110,24 @@ pub(crate) fn format_modelval(v: &ModelVal) -> String {
             // sign = top bit; exp = next eb bits; sig = low sb-1 bits.
             // Extract low (sb-1) bits.
             let mut modulus = shinri_num::Integer::one();
-            for _ in 0..(sb - 1) { modulus = modulus * two.clone(); }
+            for _ in 0..(sb - 1) {
+                modulus *= two.clone();
+            }
             let sig = bits.div_rem(&modulus).1;
             // shift right by (sb-1) to get exp|sign
             let mut hi = bits.clone();
-            for _ in 0..(sb - 1) { hi = hi.div_rem(&two).0; }
+            for _ in 0..(sb - 1) {
+                hi = hi.div_rem(&two).0;
+            }
             let mut exp_mod = shinri_num::Integer::one();
-            for _ in 0..*eb { exp_mod = exp_mod * two.clone(); }
+            for _ in 0..*eb {
+                exp_mod *= two.clone();
+            }
             let exp = hi.div_rem(&exp_mod).1;
             let mut sign = hi.clone();
-            for _ in 0..*eb { sign = sign.div_rem(&two).0; }
+            for _ in 0..*eb {
+                sign = sign.div_rem(&two).0;
+            }
             format!(
                 "(fp #b{} #b{} #b{})",
                 format_bin_fixed(&sign, 1),
@@ -159,19 +167,31 @@ mod tests {
     fn format_float_modelval_as_fp_triple() {
         use shinri_theory::types::ModelVal;
         // Float32 +zero: sign 0, exp 00000000, sig 0*23
-        let pz = ModelVal::Float { eb: 8, sb: 24, bits: shinri_num::Integer::from(0u64) };
+        let pz = ModelVal::Float {
+            eb: 8,
+            sb: 24,
+            bits: shinri_num::Integer::from(0u64),
+        };
         assert_eq!(
             format_modelval(&pz),
             "(fp #b0 #b00000000 #b00000000000000000000000)"
         );
         // Float32 -0: sign bit set (2^31)
-        let nz = ModelVal::Float { eb: 8, sb: 24, bits: shinri_num::Integer::from(1u64 << 31) };
+        let nz = ModelVal::Float {
+            eb: 8,
+            sb: 24,
+            bits: shinri_num::Integer::from(1u64 << 31),
+        };
         assert_eq!(
             format_modelval(&nz),
             "(fp #b1 #b00000000 #b00000000000000000000000)"
         );
         // Float32 +inf = 0x7F800000: sign 0, exp 11111111, sig 0
-        let inf = ModelVal::Float { eb: 8, sb: 24, bits: shinri_num::Integer::from(0x7F80_0000u64) };
+        let inf = ModelVal::Float {
+            eb: 8,
+            sb: 24,
+            bits: shinri_num::Integer::from(0x7F80_0000u64),
+        };
         assert_eq!(
             format_modelval(&inf),
             "(fp #b0 #b11111111 #b00000000000000000000000)"

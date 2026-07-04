@@ -1,14 +1,14 @@
 //! fp.eq and NaN-aware core `=` over two FP bit words.
 
-use shinri_bv::{BitLit, Blaster};
 use crate::unpack::unpack;
+use shinri_bv::{BitLit, Blaster};
 
 /// Bitwise equality of two equal-length words.
 fn bits_eq(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> BitLit {
     debug_assert_eq!(x.len(), y.len());
     let mut acc = b.one();
     for i in 0..x.len() {
-        let xn = b.xor2(x[i], y[i]);   // 1 if differ
+        let xn = b.xor2(x[i], y[i]); // 1 if differ
         let same = b.not1(xn);
         acc = b.and2(acc, same);
     }
@@ -59,11 +59,11 @@ fn ult(b: &mut Blaster, x: &[BitLit], y: &[BitLit]) -> BitLit {
     let mut lt = b.zero();
     for i in 0..x.len() {
         let nx = b.not1(x[i]);
-        let bit_lt = b.and2(nx, y[i]);          // x_i=0, y_i=1
+        let bit_lt = b.and2(nx, y[i]); // x_i=0, y_i=1
         let xn = b.xor2(x[i], y[i]);
         let bit_eq = b.not1(xn);
         let keep = b.and2(bit_eq, lt);
-        lt = b.or2(bit_lt, keep);               // higher bit wins
+        lt = b.or2(bit_lt, keep); // higher bit wins
     }
     lt
 }
@@ -79,8 +79,8 @@ pub fn fp_lt(b: &mut Blaster, x: &[BitLit], y: &[BitLit], eb: u32, sb: u32) -> B
     mag_x.extend_from_slice(&ux.exp);
     let mut mag_y = uy.sig.clone();
     mag_y.extend_from_slice(&uy.exp);
-    let mlt = ult(b, &mag_x, &mag_y);          // |x| < |y|
-    let mgt = ult(b, &mag_y, &mag_x);          // |x| > |y|
+    let mlt = ult(b, &mag_x, &mag_y); // |x| < |y|
+    let mgt = ult(b, &mag_y, &mag_x); // |x| > |y|
 
     let signs_diff = b.xor2(ux.sign, uy.sign);
     let signs_same = b.not1(signs_diff);
@@ -131,33 +131,57 @@ mod tests {
     use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
 
     fn const_bits(b: &Blaster, eb: u32, sb: u32, value: u64) -> Vec<BitLit> {
-        (0..(eb + sb)).map(|i| if (value >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
+        (0..(eb + sb))
+            .map(|i| {
+                if (value >> i) & 1 == 1 {
+                    b.one()
+                } else {
+                    b.zero()
+                }
+            })
+            .collect()
     }
     fn eval_lit(b: Blaster, lit: BitLit) -> bool {
         let cnf = b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in &cnf.clauses {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         assert_eq!(s.solve(), SolveResult::Sat);
         let raw = s.value_of(Var::new(lit.var)).unwrap();
-        if lit.pos { raw } else { !raw }
+        if lit.pos {
+            raw
+        } else {
+            !raw
+        }
     }
     fn eval_word(b: Blaster, word: &[BitLit]) -> u64 {
         let cnf = b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in &cnf.clauses {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         assert_eq!(s.solve(), SolveResult::Sat);
         let mut v = 0u64;
         for (i, bl) in word.iter().enumerate() {
             let raw = s.value_of(Var::new(bl.var)).unwrap();
-            if if bl.pos { raw } else { !raw } { v |= 1 << i; }
+            if if bl.pos { raw } else { !raw } {
+                v |= 1 << i;
+            }
         }
         v
     }
@@ -169,11 +193,17 @@ mod tests {
             let mut b = Blaster::new();
             let bits = const_bits(&b, eb, sb, v);
             let a = abs(&mut b, &bits, eb, sb);
-            assert_eq!(eval_word(b, &a), ref_abs(eb, sb, &Integer::from(v)).to_i128().unwrap() as u64);
+            assert_eq!(
+                eval_word(b, &a),
+                ref_abs(eb, sb, &Integer::from(v)).to_i128().unwrap() as u64
+            );
             let mut b2 = Blaster::new();
             let bits2 = const_bits(&b2, eb, sb, v);
             let n = neg(&mut b2, &bits2, eb, sb);
-            assert_eq!(eval_word(b2, &n), ref_neg(eb, sb, &Integer::from(v)).to_i128().unwrap() as u64);
+            assert_eq!(
+                eval_word(b2, &n),
+                ref_neg(eb, sb, &Integer::from(v)).to_i128().unwrap() as u64
+            );
         }
     }
 
@@ -192,7 +222,10 @@ mod tests {
             let xb = const_bits(&b, eb, sb, x);
             let yb = const_bits(&b, eb, sb, y);
             let lit = fp_eq(&mut b, &xb, &yb, eb, sb);
-            let want = ref_fp_eq(&decode(eb, sb, &Integer::from(x)), &decode(eb, sb, &Integer::from(y)));
+            let want = ref_fp_eq(
+                &decode(eb, sb, &Integer::from(x)),
+                &decode(eb, sb, &Integer::from(y)),
+            );
             assert_eq!(eval_lit(b, lit), want, "fp_eq({x:#x},{y:#x})");
 
             let mut b2 = Blaster::new();
@@ -209,15 +242,26 @@ mod tests {
         use crate::reference::{ref_geq, ref_gt, ref_leq, ref_lt};
         let (eb, sb) = (8, 24);
         let pats = [
-            0x3F80_0000u64, 0xBF80_0000, 0x4000_0000, 0xC000_0000,
-            0x0000_0000, 0x8000_0000, 0x7F80_0000, 0xFF80_0000,
-            0x7FC0_0000, 0xFFC0_0000, 0x0000_0001,
+            0x3F80_0000u64,
+            0xBF80_0000,
+            0x4000_0000,
+            0xC000_0000,
+            0x0000_0000,
+            0x8000_0000,
+            0x7F80_0000,
+            0xFF80_0000,
+            0x7FC0_0000,
+            0xFFC0_0000,
+            0x0000_0001,
         ];
         for &x in &pats {
             for &y in &pats {
                 for (name, blast, reff) in [
-                    ("lt", fp_lt as fn(&mut Blaster, &[BitLit], &[BitLit], u32, u32) -> BitLit,
-                     ref_lt as fn(u32, u32, &Integer, &Integer) -> bool),
+                    (
+                        "lt",
+                        fp_lt as fn(&mut Blaster, &[BitLit], &[BitLit], u32, u32) -> BitLit,
+                        ref_lt as fn(u32, u32, &Integer, &Integer) -> bool,
+                    ),
                     ("leq", fp_leq, ref_leq),
                     ("gt", fp_gt, ref_gt),
                     ("geq", fp_geq, ref_geq),

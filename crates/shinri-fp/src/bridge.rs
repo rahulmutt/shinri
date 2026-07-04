@@ -91,7 +91,11 @@ mod tests {
                         v = v + row.coeffs[i as usize].clone();
                     }
                 }
-                assert_eq!(Some(v), golden, "mismatch eb={eb} sb={sb} s={sign} e={e} sig={sig}");
+                assert_eq!(
+                    Some(v),
+                    golden,
+                    "mismatch eb={eb} sb={sb} s={sign} e={e} sig={sig}"
+                );
             }
         }
     }

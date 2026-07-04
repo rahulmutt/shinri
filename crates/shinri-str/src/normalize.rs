@@ -45,7 +45,10 @@ pub(crate) fn build_node_of(
 /// Representative preference rank: string constant (1) > anything else (0).
 fn rep_rank(terms: &Context, t: TermId) -> u8 {
     match terms.term_node(t) {
-        TermNode::Const { val: ConstVal::String(_), .. } => 1,
+        TermNode::Const {
+            val: ConstVal::String(_),
+            ..
+        } => 1,
         _ => 0,
     }
 }
@@ -161,6 +164,7 @@ pub(crate) const DEEP_NF_ATOM_CAP: usize = 256;
 ///     — a structural cycle: the same concat resurfaced), and
 ///   * the running atom count exceeding `DEEP_NF_ATOM_CAP` (a defensive size fence
 ///     for any growth pattern the cycle set does not catch).
+///
 /// `None` means the caller must NOT draw a disequality conflict / separation lemma
 /// from this side (it cannot be ground-resolved here) and instead yield a SOUND
 /// `Unknown` — never a wrong UNSAT (a spurious same-word conflict) or wrong SAT.
@@ -192,7 +196,10 @@ pub fn deep_normal_form(
             a != t
                 && matches!(
                     terms.term_node(a),
-                    TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
+                    TermNode::App {
+                        op: Op::Builtin(BuiltinOp::StrConcat),
+                        ..
+                    }
                 )
         });
         // Also re-resolve atoms whose class now has a different (concat/const) rep.
@@ -205,7 +212,10 @@ pub fn deep_normal_form(
             if a != t
                 && matches!(
                     terms.term_node(a),
-                    TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), .. }
+                    TermNode::App {
+                        op: Op::Builtin(BuiltinOp::StrConcat),
+                        ..
+                    }
                 )
             {
                 // A concat already expanded once that resurfaced is a
@@ -281,11 +291,11 @@ fn flatten(terms: &Context, t: TermId, out: &mut Vec<TermId>) {
 
 #[cfg(test)]
 mod tests {
+    use shinri_core::Lit;
+    use shinri_core::Var;
     use shinri_core::{BuiltinOp, Context, Op};
     use shinri_theory::types::EqJust;
     use shinri_theory::EqualityEngine;
-    use shinri_core::Lit;
-    use shinri_core::Var;
 
     use crate::normalize::{atoms_equal, normal_form};
 
@@ -369,10 +379,7 @@ mod tests {
             "rep(x) must return the constant \"ab\" (x was merged with \"ab\")"
         );
         // nf[1] should be y (no merge for y)
-        assert_eq!(
-            nf[1], y,
-            "rep(y) should be y (no merge)"
-        );
+        assert_eq!(nf[1], y, "rep(y) should be y (no merge)");
     }
 
     /// atoms_equal returns true iff two terms share an EqualityEngine class.

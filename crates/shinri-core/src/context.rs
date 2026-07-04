@@ -559,8 +559,8 @@ impl Context {
                 Ok(bool_s)
             }
             // ── Floating-point: classification → Bool ─────────────────────────
-            FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite | FpIsNaN
-            | FpIsNegative | FpIsPositive => {
+            FpIsNormal | FpIsSubnormal | FpIsZero | FpIsInfinite | FpIsNaN | FpIsNegative
+            | FpIsPositive => {
                 expect_arity(args, 1)?;
                 self.require_fp(args[0])?;
                 Ok(bool_s)
@@ -607,7 +607,10 @@ impl Context {
                         }
                         Ok(self.fp_sort(eb, sb))
                     }
-                    n => Err(SortError::Arity { expected: 2, found: n }),
+                    n => Err(SortError::Arity {
+                        expected: 2,
+                        found: n,
+                    }),
                 }
             }
             ToFpUnsigned { eb, sb } => {
@@ -785,7 +788,12 @@ impl Context {
         if let Some(r) = self.numeral_value(t) {
             return Some(r.clone());
         }
-        if let TermNode::App { op: Op::Builtin(BuiltinOp::Neg), args, .. } = self.term_node(t) {
+        if let TermNode::App {
+            op: Op::Builtin(BuiltinOp::Neg),
+            args,
+            ..
+        } = self.term_node(t)
+        {
             let kids = self.children(*args);
             if kids.len() == 1 {
                 let inner = self.const_real_value(kids[0])?;
@@ -884,7 +892,10 @@ impl Context {
     /// (eb, sb, bits) of an FP literal term, or None.
     pub fn fp_const_value(&self, t: TermId) -> Option<(u32, u32, &Integer)> {
         match self.term_node(t) {
-            TermNode::Const { val: ConstVal::Float(id), .. } => {
+            TermNode::Const {
+                val: ConstVal::Float(id),
+                ..
+            } => {
                 let (e, s, v) = &self.fps[id.index()];
                 Some((*e, *s, v))
             }
@@ -895,7 +906,10 @@ impl Context {
     /// The rounding mode of an RM constant term, or None.
     pub fn rm_const_value(&self, t: TermId) -> Option<crate::term::RoundingMode> {
         match self.term_node(t) {
-            TermNode::Const { val: ConstVal::Rm(rm), .. } => Some(*rm),
+            TermNode::Const {
+                val: ConstVal::Rm(rm),
+                ..
+            } => Some(*rm),
             _ => None,
         }
     }
@@ -1256,17 +1270,30 @@ mod tests {
         let mut ctx = Context::new();
         let str_s = ctx.string_sort();
         let int_s = ctx.int_sort();
-        let x = { let s = ctx.declare_fun("x", &[], str_s); ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap() };
-        let y = { let s = ctx.declare_fun("y", &[], str_s); ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap() };
-        let i = { let s = ctx.declare_fun("i", &[], int_s); ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap() };
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let y = {
+            let s = ctx.declare_fun("y", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let i = {
+            let s = ctx.declare_fun("i", &[], int_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
 
-        let cc = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y]).unwrap();
+        let cc = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
         assert_eq!(ctx.sort_of(cc), str_s);
         let len = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
         assert_eq!(ctx.sort_of(len), int_s);
         let at = ctx.mk_app(Op::Builtin(BuiltinOp::StrAt), &[x, i]).unwrap();
         assert_eq!(ctx.sort_of(at), str_s);
-        let ss = ctx.mk_app(Op::Builtin(BuiltinOp::StrSubstr), &[x, i, i]).unwrap();
+        let ss = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrSubstr), &[x, i, i])
+            .unwrap();
         assert_eq!(ctx.sort_of(ss), str_s);
 
         // Ill-sorted: str.len on Int must fail.
@@ -1303,7 +1330,10 @@ mod tests {
         let f32 = ctx.fp_sort(8, 24);
         let f32_again = ctx.fp_sort(8, 24);
         let f64 = ctx.fp_sort(11, 53);
-        assert_eq!(f32, f32_again, "equal FP sorts must intern to the same SortId");
+        assert_eq!(
+            f32, f32_again,
+            "equal FP sorts must intern to the same SortId"
+        );
         assert_ne!(f32, f64, "different widths must be different sorts");
         assert_eq!(ctx.fp_widths(f32), Some((8, 24)));
         assert_eq!(ctx.fp_widths(f64), Some((11, 53)));
@@ -1329,7 +1359,9 @@ mod tests {
         let rne = ctx.mk_rm_const(RoundingMode::Rne);
 
         // fp.add : (RM, F, F) -> F
-        let add = ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y]).unwrap();
+        let add = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, y])
+            .unwrap();
         assert_eq!(ctx.sort_of(add), f32);
 
         // fp.neg : (F) -> F ; fp.abs : (F) -> F
@@ -1346,16 +1378,22 @@ mod tests {
         let b1 = ctx.mk_bv_const(1, Integer::zero());
         let b8 = ctx.mk_bv_const(8, Integer::zero());
         let b23 = ctx.mk_bv_const(23, Integer::zero());
-        let ctor = ctx.mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[b1, b8, b23]).unwrap();
+        let ctor = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpFromBits), &[b1, b8, b23])
+            .unwrap();
         assert_eq!(ctx.sort_of(ctor), f32);
 
         // width mismatch on fp.add operands must be a SortError, not a panic
         let f64 = ctx.fp_sort(11, 53);
         let zf = ctx.declare_fun("z", &[], f64);
         let z = ctx.mk_app(Op::Uninterpreted(zf), &[]).unwrap();
-        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, z]).is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rne, x, z])
+            .is_err());
         // missing rounding mode (passing a Float where RM expected) must error
-        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::FpAdd), &[x, x, y]).is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpAdd), &[x, x, y])
+            .is_err());
     }
 
     #[test]
@@ -1371,16 +1409,22 @@ mod tests {
 
         // bitcast: (_ to_fp 8 24) over a BV32 (1 arg, no RM) -> Float(8,24)
         let b32 = ctx.mk_bv_const(32, Integer::zero());
-        let cast = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32]).unwrap();
+        let cast = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b32])
+            .unwrap();
         assert_eq!(ctx.sort_of(cast), f32);
 
         // FP->FP: (_ to_fp 11 53) RM Float32 -> Float64
         let f64 = ctx.fp_sort(11, 53);
-        let widen = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x]).unwrap();
+        let widen = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 11, sb: 53 }), &[rne, x])
+            .unwrap();
         assert_eq!(ctx.sort_of(widen), f64);
 
         // fp.to_sbv 16 : (RM, Float) -> BV16
-        let tosbv = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(16)), &[rne, x]).unwrap();
+        let tosbv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToSbv(16)), &[rne, x])
+            .unwrap();
         assert_eq!(ctx.sort_of(tosbv), ctx.bv_sort(16));
 
         // fp.to_real : (Float) -> Real
@@ -1389,11 +1433,15 @@ mod tests {
 
         // bitcast width mismatch (BV31 into Float(8,24)=32 bits) must error
         let b31 = ctx.mk_bv_const(31, Integer::zero());
-        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b31]).is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[b31])
+            .is_err());
 
         // boundary: eb<2 must error even if bitcast width eb+sb matches (eb=1,sb=1 -> BV2)
         let b2 = ctx.mk_bv_const(2, Integer::zero());
-        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 1, sb: 1 }), &[b2]).is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 1, sb: 1 }), &[b2])
+            .is_err());
     }
 
     #[test]
@@ -1403,15 +1451,25 @@ mod tests {
         let real = ctx.real_sort();
         // plain numeral 5/1
         let five = ctx.mk_numeral(Rational::from_int(5i128.into()), real);
-        assert_eq!(ctx.const_real_value(five), Some(Rational::from_int(5i128.into())));
+        assert_eq!(
+            ctx.const_real_value(five),
+            Some(Rational::from_int(5i128.into()))
+        );
         // parser already folds (/ 1 3) to a single numeral; emulate that numeral 1/3
         let third = ctx.mk_numeral(Rational::new(1i128.into(), 3i128.into()), real);
-        assert_eq!(ctx.const_real_value(third), Some(Rational::new(1i128.into(), 3i128.into())));
+        assert_eq!(
+            ctx.const_real_value(third),
+            Some(Rational::new(1i128.into(), 3i128.into()))
+        );
         // unary negation (- 5/2) -> -5/2
         let fivehalf = ctx.mk_numeral(Rational::new(5i128.into(), 2i128.into()), real);
-        let neg = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[fivehalf]).unwrap();
-        assert_eq!(ctx.const_real_value(neg),
-                   Some(Rational::new((-5i128).into(), 2i128.into())));
+        let neg = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Neg), &[fivehalf])
+            .unwrap();
+        assert_eq!(
+            ctx.const_real_value(neg),
+            Some(Rational::new((-5i128).into(), 2i128.into()))
+        );
     }
 
     #[test]
@@ -1424,7 +1482,9 @@ mod tests {
         assert_eq!(ctx.const_real_value(rt), None);
         // (* recip r) — the shape (/ 1 r) desugars to — is not constant
         let recip = ctx.mk_numeral(shinri_num::Rational::new(1i128.into(), 2i128.into()), real);
-        let prod = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &[recip, rt]).unwrap();
+        let prod = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Mul), &[recip, rt])
+            .unwrap();
         assert_eq!(ctx.const_real_value(prod), None);
     }
 

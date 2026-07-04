@@ -107,17 +107,33 @@ enum BridgeRow {
     ChannelBound { bge0: TermId, ble1: TermId },
     /// Symbolic arm — a significand-channel tie for bit `bit` of operand `x`:
     /// `sigbit_i → b_i>=1` and `¬sigbit_i → b_i<=0`.
-    ChannelTie { x: TermId, bit: u32, bge1: TermId, ble0: TermId },
+    ChannelTie {
+        x: TermId,
+        bit: u32,
+        bge1: TermId,
+        ble0: TermId,
+    },
     /// Symbolic arm — a guarded finite row for operand `x`, pattern `(s, e)`:
     /// under the exponent/sign guard, `tr <= L` ∧ `tr >= L` with
     /// `L = k + Σ coeffs[i]·b_i`.
-    Finite { x: TermId, s: bool, e: u64, le: TermId, ge: TermId },
+    Finite {
+        x: TermId,
+        s: bool,
+        e: u64,
+        le: TermId,
+        ge: TermId,
+    },
     /// Symbolic arm (Task 5) — a NaN/±∞ guarded pin for operand `x`: under the
     /// all-ones-exponent guard selecting class `which`, `tr <= c` ∧ `tr >= c`
     /// where `c` is the shared per-format special const for that class. Emitted
     /// as guard clauses against the blasted FP bits (PosInf/NegInf: one guard;
     /// Nan: one clause per sig bit `j`).
-    Special { x: TermId, which: SpecialKind, le: TermId, ge: TermId },
+    Special {
+        x: TermId,
+        which: SpecialKind,
+        le: TermId,
+        ge: TermId,
+    },
 }
 
 /// Which NaN/±∞ special constant a Task-5 `BridgeRow::Special` pins `tr` to.
@@ -496,16 +512,15 @@ impl Solver {
         // A mixed BV+FP query is handled by the unified FP/mixed path below, so
         // the BV-only path runs only when NO FP is present. Non-BV theory atoms
         // (arrays/LIA/EUF) alongside BV still fence.
-        let lowered_bv: Option<shinri_bv::Lowered> =
-            if uses_bv && !uses_fp {
-                let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
-                if crate::bv_stage::has_non_bv_theory_atom(&self.ctx, &assertions, &bv_atoms) {
-                    return SolveOutcome::Unknown;
-                }
-                Some(shinri_bv::lower(&mut self.ctx, &bv_atoms))
-            } else {
-                None
-            };
+        let lowered_bv: Option<shinri_bv::Lowered> = if uses_bv && !uses_fp {
+            let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
+            if crate::bv_stage::has_non_bv_theory_atom(&self.ctx, &assertions, &bv_atoms) {
+                return SolveOutcome::Unknown;
+            }
+            Some(shinri_bv::lower(&mut self.ctx, &bv_atoms))
+        } else {
+            None
+        };
 
         // ── FP / mixed path (unified Lowerer over fp_atoms ∪ bv_atoms) ──────────
         // Slice 4b: lower BOTH the FP atoms and any BV atoms through the one 4a
@@ -513,53 +528,57 @@ impl Solver {
         // are disjoint DAGs meeting only at the Boolean level, so this is two
         // independent blasting problems sharing one variable namespace. Pure-FP
         // takes an empty bv_atoms set and is byte-identical to the pre-4b path.
-        let lowered_fp: Option<shinri_fp::MixedLowered> =
-            if uses_fp {
-                let mut fp_atoms = crate::fp_stage::collect_fp_atoms(&self.ctx, &assertions);
-                let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
-                // Real-bridge force-blast (slice 9 symbolic arm): a `fp.to_real`
-                // operand may occur ONLY inside `fp.to_real` (in no FP atom), so
-                // it would not otherwise be blasted and `fp_var_bits` would lack
-                // its bits. Append a synthetic `(fp.isNaN x)` per symbolic operand
-                // — never asserted, just blasted — so its full FP word (sign+exp+
-                // significand) lands in `fp_var_bits` for the guarded rows.
-                if bridge {
-                    let symbolic_ops = self.symbolic_to_real_operands(&assertions, &to_real_terms);
-                    for x in symbolic_ops {
-                        if let Ok(a) = self
-                            .ctx
-                            .mk_app(Op::Builtin(shinri_core::BuiltinOp::FpIsNaN), &[x])
-                        {
-                            fp_atoms.push(a);
-                        }
+        let lowered_fp: Option<shinri_fp::MixedLowered> = if uses_fp {
+            let mut fp_atoms = crate::fp_stage::collect_fp_atoms(&self.ctx, &assertions);
+            let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
+            // Real-bridge force-blast (slice 9 symbolic arm): a `fp.to_real`
+            // operand may occur ONLY inside `fp.to_real` (in no FP atom), so
+            // it would not otherwise be blasted and `fp_var_bits` would lack
+            // its bits. Append a synthetic `(fp.isNaN x)` per symbolic operand
+            // — never asserted, just blasted — so its full FP word (sign+exp+
+            // significand) lands in `fp_var_bits` for the guarded rows.
+            if bridge {
+                let symbolic_ops = self.symbolic_to_real_operands(&assertions, &to_real_terms);
+                for x in symbolic_ops {
+                    if let Ok(a) = self
+                        .ctx
+                        .mk_app(Op::Builtin(shinri_core::BuiltinOp::FpIsNaN), &[x])
+                    {
+                        fp_atoms.push(a);
                     }
                 }
-                // Third-theory fence: any Bool atom outside (fp_atoms ∪ bv_atoms)
-                // that is not pure Boolean structure (arrays/LIA/EUF) → Unknown.
-                if !bridge && crate::fp_stage::has_non_bvfp_theory_atom(
-                    &self.ctx, &assertions, &fp_atoms, &bv_atoms,
-                ) {
-                    return SolveOutcome::Unknown;
-                }
-                // Positive-enumeration safety: every FP atom's word must be a
-                // supported FP op (a not-yet-implemented FP op, an eb>8 fp.to_real
-                // whose Real bridge is deferred, etc. still fence) so blast_fp_word's
-                // `unreachable!` arms stay internal invariants. Word-sorted ite
-                // is no longer a live example here: word_norm (slice 5)
-                // eliminates it before atom collection ever runs.
-                if !crate::fp_stage::fp_atoms_fully_supported(&self.ctx, &fp_atoms) {
-                    return SolveOutcome::Unknown;
-                }
-                // Slice 4e: BV atoms can now embed FP subterms (fp.to_ubv/
-                // fp.to_sbv). Any unsupported FP shape reachable through a BV
-                // atom must fence BEFORE lowering, same argument as above.
-                if !crate::fp_stage::bv_atoms_fp_supported(&self.ctx, &bv_atoms) {
-                    return SolveOutcome::Unknown;
-                }
-                Some(shinri_fp::lower_mixed(&mut self.ctx, &fp_atoms, &bv_atoms))
-            } else {
-                None
-            };
+            }
+            // Third-theory fence: any Bool atom outside (fp_atoms ∪ bv_atoms)
+            // that is not pure Boolean structure (arrays/LIA/EUF) → Unknown.
+            if !bridge
+                && crate::fp_stage::has_non_bvfp_theory_atom(
+                    &self.ctx,
+                    &assertions,
+                    &fp_atoms,
+                    &bv_atoms,
+                )
+            {
+                return SolveOutcome::Unknown;
+            }
+            // Positive-enumeration safety: every FP atom's word must be a
+            // supported FP op (a not-yet-implemented FP op, an eb>8 fp.to_real
+            // whose Real bridge is deferred, etc. still fence) so blast_fp_word's
+            // `unreachable!` arms stay internal invariants. Word-sorted ite
+            // is no longer a live example here: word_norm (slice 5)
+            // eliminates it before atom collection ever runs.
+            if !crate::fp_stage::fp_atoms_fully_supported(&self.ctx, &fp_atoms) {
+                return SolveOutcome::Unknown;
+            }
+            // Slice 4e: BV atoms can now embed FP subterms (fp.to_ubv/
+            // fp.to_sbv). Any unsupported FP shape reachable through a BV
+            // atom must fence BEFORE lowering, same argument as above.
+            if !crate::fp_stage::bv_atoms_fp_supported(&self.ctx, &bv_atoms) {
+                return SolveOutcome::Unknown;
+            }
+            Some(shinri_fp::lower_mixed(&mut self.ctx, &fp_atoms, &bv_atoms))
+        } else {
+            None
+        };
 
         // Real-bridge rows (slice 9): mint every bridge atom term BEFORE the
         // ctx is cloned into the Combiner (below), so they are in range for
@@ -585,10 +604,8 @@ impl Solver {
             // `Unknown` instead of hanging.
             sat_config.step_budget = Some(2_000_000);
         }
-        let mut sat: Sat = shinri_sat::Solver::with_theory(
-            sat_config,
-            Combiner::with_context(self.ctx.clone()),
-        );
+        let mut sat: Sat =
+            shinri_sat::Solver::with_theory(sat_config, Combiner::with_context(self.ctx.clone()));
 
         // Replay the BV and FP CNFs into the SAT solver and build merged surrogate maps.
         // On non-BV/FP paths, clear any stale var_bits from a previous solve.
@@ -612,9 +629,12 @@ impl Solver {
                 self.fp_rm_sels = rm_sels
                     .into_iter()
                     .map(|(t, sel)| {
-                        (t, sel.map(|bl| {
-                            shinri_core::Lit::new(shinri_core::Var::new(base + bl.var), bl.pos)
-                        }))
+                        (
+                            t,
+                            sel.map(|bl| {
+                                shinri_core::Lit::new(shinri_core::Var::new(base + bl.var), bl.pos)
+                            }),
+                        )
                     })
                     .collect();
                 // Slice 4b: the mixed Lowered carries BOTH BV and FP variable
@@ -639,7 +659,11 @@ impl Solver {
             }
         }
         let bv_atom_lit: Option<rustc_hash::FxHashMap<TermId, shinri_core::Lit>> =
-            if surrogate_map.is_empty() { None } else { Some(surrogate_map) };
+            if surrogate_map.is_empty() {
+                None
+            } else {
+                Some(surrogate_map)
+            };
         // set_truth_terms MUST be called before any atom encoding (Euf::new_var
         // installs the level-0 ⊤≠⊥ diseq only if truth_terms is already Some,
         // and assert panics if truth terms are unset).
@@ -745,8 +769,10 @@ impl Solver {
                 // Values of word_norm-internal symbols, keyed by the internal
                 // term — surfaced to users only through the eliminated-ite
                 // remap below, never through get-model (slice 6).
-                let mut internal_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal> =
-                    rustc_hash::FxHashMap::default();
+                let mut internal_vals: rustc_hash::FxHashMap<
+                    TermId,
+                    shinri_theory::types::ModelVal,
+                > = rustc_hash::FxHashMap::default();
                 // BV model extraction: for each declared BV constant with recorded
                 // SAT vars, read each var's assignment and pack into a ModelVal::BitVec.
                 for (&term, sat_vars) in &self.bv_var_bits {
@@ -777,7 +803,11 @@ impl Solver {
                     // recover (eb, sb) from the term's Float sort.
                     if let Some((eb, sb)) = self.ctx.fp_widths(self.ctx.sort_of(term)) {
                         use shinri_theory::types::ModelVal;
-                        let val = ModelVal::Float { eb, sb, bits: packed };
+                        let val = ModelVal::Float {
+                            eb,
+                            sb,
+                            bits: packed,
+                        };
                         if self.word_norm.internal.contains(&term) {
                             internal_vals.insert(term, val); // slice 5 filter, slice 6 stash
                         } else {
@@ -790,7 +820,11 @@ impl Solver {
                 for (&term, sel) in &self.fp_rm_sels {
                     let hot = sel.iter().position(|l| {
                         let b = sat.value_of(l.var()).unwrap_or(false);
-                        if l.is_positive() { b } else { !b }
+                        if l.is_positive() {
+                            b
+                        } else {
+                            !b
+                        }
                     });
                     if let Some(i) = hot {
                         use shinri_core::RoundingMode::*;
@@ -829,9 +863,7 @@ impl Solver {
                 // the model is not a genuine witness, so downgrade to a SOUND `Unknown`
                 // rather than report a wrong SAT. Only runs on the string path and
                 // only over fully string-valued atoms (no overhead elsewhere).
-                if on_string_path
-                    && !self.string_model_satisfies(&lowered, &model)
-                {
+                if on_string_path && !self.string_model_satisfies(&lowered, &model) {
                     return SolveOutcome::Unknown;
                 }
                 self.last_model = Some(model);
@@ -846,19 +878,11 @@ impl Solver {
     /// (a missing string value) is SKIPPED (treated as satisfied) — this can only
     /// MISS a violation, never fabricate one, so it never turns a genuine SAT into a
     /// spurious Unknown. Used by the string-path witness self-check.
-    fn string_model_satisfies(
-        &self,
-        assertions: &[TermId],
-        model: &Model,
-    ) -> bool {
+    fn string_model_satisfies(&self, assertions: &[TermId], model: &Model) -> bool {
         use shinri_core::{BuiltinOp, Op, TermNode};
         use shinri_theory::types::ModelVal;
         // Evaluate a String-sorted term to its concrete value under `model`.
-        fn eval_str(
-            ctx: &shinri_core::Context,
-            model: &Model,
-            t: TermId,
-        ) -> Option<String> {
+        fn eval_str(ctx: &shinri_core::Context, model: &Model, t: TermId) -> Option<String> {
             if let Some(s) = ctx.string_const_value(t) {
                 return Some(s.to_owned());
             }
@@ -866,7 +890,11 @@ impl Solver {
                 return Some(s.clone());
             }
             match ctx.term_node(t) {
-                TermNode::App { op: Op::Builtin(BuiltinOp::StrConcat), args, .. } => {
+                TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrConcat),
+                    args,
+                    ..
+                } => {
                     let kids = ctx.children(*args).to_vec();
                     let mut out = String::new();
                     for k in kids {
@@ -916,11 +944,19 @@ impl Solver {
         let mut worklist: Vec<TermId> = assertions.to_vec();
         while let Some(a) = worklist.pop() {
             match self.ctx.term_node(a) {
-                TermNode::App { op: Op::Builtin(BuiltinOp::And), args, .. } => {
+                TermNode::App {
+                    op: Op::Builtin(BuiltinOp::And),
+                    args,
+                    ..
+                } => {
                     let kids = self.ctx.children(*args).to_vec();
                     worklist.extend(kids);
                 }
-                TermNode::App { op: Op::Builtin(BuiltinOp::Not), args, .. } => {
+                TermNode::App {
+                    op: Op::Builtin(BuiltinOp::Not),
+                    args,
+                    ..
+                } => {
                     let inner = self.ctx.children(*args)[0];
                     if !check_atom(inner, false) {
                         return false;
@@ -1102,15 +1138,21 @@ impl Solver {
         let n = self.bridge_name_counter;
         self.bridge_name_counter += 1;
         let pos = {
-            let sym = self.ctx.declare_fun(&format!("!brdg_pinf_{eb}_{sb}_{n}"), &[], real);
+            let sym = self
+                .ctx
+                .declare_fun(&format!("!brdg_pinf_{eb}_{sb}_{n}"), &[], real);
             self.ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
         };
         let neg = {
-            let sym = self.ctx.declare_fun(&format!("!brdg_ninf_{eb}_{sb}_{n}"), &[], real);
+            let sym = self
+                .ctx
+                .declare_fun(&format!("!brdg_ninf_{eb}_{sb}_{n}"), &[], real);
             self.ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
         };
         let nan = {
-            let sym = self.ctx.declare_fun(&format!("!brdg_nan_{eb}_{sb}_{n}"), &[], real);
+            let sym = self
+                .ctx
+                .declare_fun(&format!("!brdg_nan_{eb}_{sb}_{n}"), &[], real);
             self.ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
         };
         let triple = (pos, neg, nan);
@@ -1138,8 +1180,14 @@ impl Solver {
                 match shinri_fp::reference::class_to_rational(eb, sb, &cls) {
                     Some(q) => {
                         let num = self.ctx.mk_numeral(q, real);
-                        let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, num]).unwrap();
-                        let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, num]).unwrap();
+                        let le = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Le), &[tr, num])
+                            .unwrap();
+                        let ge = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, num])
+                            .unwrap();
                         self.pending_bridge.push(BridgeRow::Constant { le, ge });
                     }
                     None => {
@@ -1154,8 +1202,14 @@ impl Solver {
                             FpClass::Inf { sign: false } => pos,
                             _ => unreachable!("class_to_rational None only for NaN/±Inf"),
                         };
-                        let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, c]).unwrap();
-                        let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, c]).unwrap();
+                        let le = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Le), &[tr, c])
+                            .unwrap();
+                        let ge = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, c])
+                            .unwrap();
                         self.pending_bridge.push(BridgeRow::Constant { le, ge });
                     }
                 }
@@ -1190,20 +1244,38 @@ impl Solver {
             let sym = self.ctx.declare_fun(&name, &[], real);
             let b_i = self.ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap();
             chan.push(b_i);
-            let bge0 = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[b_i, zero]).unwrap();
-            let ble1 = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[b_i, one]).unwrap();
-            self.pending_bridge.push(BridgeRow::ChannelBound { bge0, ble1 });
-            let bge1 = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[b_i, one]).unwrap();
-            let ble0 = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[b_i, zero]).unwrap();
-            self.pending_bridge.push(BridgeRow::ChannelTie { x, bit: i, bge1, ble0 });
+            let bge0 = self
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[b_i, zero])
+                .unwrap();
+            let ble1 = self
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[b_i, one])
+                .unwrap();
+            self.pending_bridge
+                .push(BridgeRow::ChannelBound { bge0, ble1 });
+            let bge1 = self
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[b_i, one])
+                .unwrap();
+            let ble0 = self
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[b_i, zero])
+                .unwrap();
+            self.pending_bridge.push(BridgeRow::ChannelTie {
+                x,
+                bit: i,
+                bge1,
+                ble0,
+            });
         }
         self.bridge_name_counter += 1;
         // Guarded finite rows, one per finite (sign, exponent-field) pattern.
         for s in [false, true] {
             for e in 0..(1u64 << eb) {
                 let row = match shinri_fp::bridge::to_real_finite_row(eb, sb, s, e) {
-                    Some(r) => r,        // finite pattern
-                    None => continue,    // all-ones exponent (NaN/±∞): Task 5
+                    Some(r) => r,     // finite pattern
+                    None => continue, // all-ones exponent (NaN/±∞): Task 5
                 };
                 // L = k + Σ coeffs[i]·b_i (drop zero coeffs).
                 let mut l = self.ctx.mk_numeral(row.k, real);
@@ -1216,11 +1288,21 @@ impl Solver {
                         .ctx
                         .mk_app(Op::Builtin(BuiltinOp::Mul), &[cnum, chan[i]])
                         .unwrap();
-                    l = self.ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[l, term]).unwrap();
+                    l = self
+                        .ctx
+                        .mk_app(Op::Builtin(BuiltinOp::Add), &[l, term])
+                        .unwrap();
                 }
-                let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, l]).unwrap();
-                let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, l]).unwrap();
-                self.pending_bridge.push(BridgeRow::Finite { x, s, e, le, ge });
+                let le = self
+                    .ctx
+                    .mk_app(Op::Builtin(BuiltinOp::Le), &[tr, l])
+                    .unwrap();
+                let ge = self
+                    .ctx
+                    .mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, l])
+                    .unwrap();
+                self.pending_bridge
+                    .push(BridgeRow::Finite { x, s, e, le, ge });
             }
         }
         // Task 5: NaN/±∞ (all-ones exponent) rows. Pin `tr` to the shared
@@ -1232,9 +1314,16 @@ impl Solver {
             (SpecialKind::NegInf, neg_c),
             (SpecialKind::Nan, nan_c),
         ] {
-            let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, c]).unwrap();
-            let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, c]).unwrap();
-            self.pending_bridge.push(BridgeRow::Special { x, which, le, ge });
+            let le = self
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[tr, c])
+                .unwrap();
+            let ge = self
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, c])
+                .unwrap();
+            self.pending_bridge
+                .push(BridgeRow::Special { x, which, le, ge });
         }
     }
 
@@ -1244,7 +1333,11 @@ impl Solver {
     /// the equality (never a nested occurrence) are consulted, so the pin holds
     /// unconditionally and is sound. Returns None for a genuinely symbolic
     /// operand (handled in a later slice-9 task).
-    fn fp_operand_const_bits(&self, x: TermId, assertions: &[TermId]) -> Option<shinri_num::Integer> {
+    fn fp_operand_const_bits(
+        &self,
+        x: TermId,
+        assertions: &[TermId],
+    ) -> Option<shinri_num::Integer> {
         use shinri_core::{BuiltinOp, Op, TermNode};
         // Direct constant operand (the brief's constant arm).
         if let Some(b) = self.const_fp_bits(x) {
@@ -1252,7 +1345,11 @@ impl Solver {
         }
         // Top-level `(= x <fp const>)` binding (either operand order).
         for &a in assertions {
-            if let TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } = self.ctx.term_node(a)
+            if let TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } = self.ctx.term_node(a)
             {
                 let kids = self.ctx.children(*args);
                 if kids.len() == 2 {
@@ -1285,8 +1382,11 @@ impl Solver {
         if let Some((_, _, b)) = self.ctx.fp_const_value(o) {
             return Some(b.clone());
         }
-        if let TermNode::App { op: Op::Builtin(BuiltinOp::FpFromBits), args, .. } =
-            self.ctx.term_node(o)
+        if let TermNode::App {
+            op: Op::Builtin(BuiltinOp::FpFromBits),
+            args,
+            ..
+        } = self.ctx.term_node(o)
         {
             let kids = self.ctx.children(*args);
             if kids.len() == 3 {
@@ -1303,9 +1403,8 @@ impl Solver {
                     }
                     acc
                 };
-                let bits = sign.clone() * pow2(w_exp + w_sig)
-                    + exp.clone() * pow2(w_sig)
-                    + sig.clone();
+                let bits =
+                    sign.clone() * pow2(w_exp + w_sig) + exp.clone() * pow2(w_sig) + sig.clone();
                 return Some(bits);
             }
         }
@@ -1347,7 +1446,8 @@ impl Solver {
                     let vars = self.fp_var_bits.get(&x).cloned().unwrap();
                     // LSB→MSB layout, len eb+sb: significand vars[0..sb-1],
                     // exponent vars[sb-1 .. sb-1+eb], sign vars[eb+sb-1].
-                    let sb = (vars.len() as u32) - self.ctx.fp_widths(self.ctx.sort_of(x)).unwrap().0;
+                    let sb =
+                        (vars.len() as u32) - self.ctx.fp_widths(self.ctx.sort_of(x)).unwrap().0;
                     let eb = vars.len() as u32 - sb;
                     let exp_lit = |j: u32| Lit::new(vars[(sb - 1 + j) as usize], true);
                     let sign_lit = Lit::new(vars[(eb + sb - 1) as usize], true);
@@ -1360,7 +1460,11 @@ impl Solver {
                     base.push(if s { sign_lit } else { sign_lit.negate() });
                     for j in 0..eb {
                         let want1 = (e >> j) & 1 == 1;
-                        base.push(if want1 { exp_lit(j) } else { exp_lit(j).negate() });
+                        base.push(if want1 {
+                            exp_lit(j)
+                        } else {
+                            exp_lit(j).negate()
+                        });
                     }
                     let neg: Vec<Lit> = base.iter().map(|l| l.negate()).collect();
                     let mut c1 = neg.clone();

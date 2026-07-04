@@ -145,7 +145,10 @@ impl Gen {
         for k in 0..N_VARS {
             body.push_str(&format!("(declare-fun s{k} () String)\n"));
         }
-        Gen { rng: Lcg(seed), body }
+        Gen {
+            rng: Lcg(seed),
+            body,
+        }
     }
 
     fn var(&mut self) -> String {
@@ -205,8 +208,7 @@ impl Gen {
             2 => self.extract_term(),
             _ => {
                 let n = 2 + self.rng.below(2); // 2 or 3 parts
-                let parts: Vec<String> =
-                    (0..n).map(|_| self.atom_term()).collect();
+                let parts: Vec<String> = (0..n).map(|_| self.atom_term()).collect();
                 format!("(str.++ {})", parts.join(" "))
             }
         }
@@ -255,9 +257,9 @@ impl Gen {
     /// branch-budget / step caps; the oracle skips Unknown as a non-disagreement.
     fn assertion(&mut self) {
         let neg = self.rng.below(4) == 0; // sometimes wrap in (not …)
-        // Occasionally (1 in 5) emit a self-referential occurs-check equation,
-        // independent of the main shape dispatch below, so this soundness class is
-        // exercised by the random corpus going forward.
+                                          // Occasionally (1 in 5) emit a self-referential occurs-check equation,
+                                          // independent of the main shape dispatch below, so this soundness class is
+                                          // exercised by the random corpus going forward.
         if self.rng.below(5) == 0 {
             let atom = self.self_ref_eq();
             let atom = if neg { format!("(not {atom})") } else { atom };
@@ -328,10 +330,7 @@ fn parse_string_values(resp: &str) -> Vec<(String, String)> {
             // read name
             let mut j = i + 1;
             let mut name = String::new();
-            while j < bytes.len()
-                && !bytes[j].is_whitespace()
-                && bytes[j] != '('
-                && bytes[j] != ')'
+            while j < bytes.len() && !bytes[j].is_whitespace() && bytes[j] != '(' && bytes[j] != ')'
             {
                 name.push(bytes[j]);
                 j += 1;
@@ -433,7 +432,10 @@ fn qfs_matches_z3() {
                 // Witness: read shinri's model and verify it satisfies via z3.
                 let get = format!(
                     "{body}(check-sat)\n(get-value ({}))\n",
-                    (0..N_VARS).map(|k| format!("s{k}")).collect::<Vec<_>>().join(" ")
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
                 );
                 let lines = shinri_lines(&get);
                 // lines[0] = "sat", lines[1] = the (get-value …) response.
@@ -464,7 +466,10 @@ fn qfs_matches_z3() {
     // oracle proves nothing.
     assert!(n_sat > 0, "generator produced zero SAT instances");
     assert!(n_unsat > 0, "generator produced zero UNSAT instances");
-    assert!(n_witness > 0, "no witnesses were checked — model path not exercised");
+    assert!(
+        n_witness > 0,
+        "no witnesses were checked — model path not exercised"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -478,7 +483,10 @@ fn expect(src: &str, want: Verdict) {
     // Cross-check with z3 (must agree, since `want` is not Unknown here).
     if want != Verdict::Unknown {
         let z = z3_verdict(src);
-        assert_eq!(z, want, "z3 disagrees with the expected verdict for:\n{src}");
+        assert_eq!(
+            z, want,
+            "z3 disagrees with the expected verdict for:\n{src}"
+        );
     }
 }
 
@@ -500,7 +508,10 @@ fn targeted_x_eq_ab_sat_with_model() {
     assert_eq!(lines.first().map(String::as_str), Some("sat"));
     let model = parse_string_values(lines.get(1).expect("get-value response"));
     assert_eq!(
-        model.iter().find(|(n, _)| n == "x").map(|(_, v)| v.as_str()),
+        model
+            .iter()
+            .find(|(n, _)| n == "x")
+            .map(|(_, v)| v.as_str()),
         Some("ab"),
         "x must be exactly \"ab\", got model {model:?}"
     );
@@ -569,7 +580,11 @@ fn expect_not_unsat(src: &str) {
         "shinri returned WRONG UNSAT for a satisfiable formula:\n{src}"
     );
     let z = z3_verdict(src);
-    assert_ne!(z, Verdict::Unsat, "z3 ground truth is not Unsat for:\n{src}");
+    assert_ne!(
+        z,
+        Verdict::Unsat,
+        "z3 ground truth is not Unsat for:\n{src}"
+    );
     // If shinri decided Sat, z3 must agree it is Sat (no wrong SAT either).
     if got == Verdict::Sat && z != Verdict::Unknown {
         assert_eq!(got, z, "shinri/z3 disagree (shinri Sat):\n{src}");
@@ -670,11 +685,18 @@ fn targeted_disequality_witness_sat() {
     // Pull x and y; they must differ.
     let xv = model.iter().find(|(n, _)| n == "x").map(|(_, v)| v.clone());
     let yv = model.iter().find(|(n, _)| n == "y").map(|(_, v)| v.clone());
-    assert!(xv.is_some() && yv.is_some(), "model must assign x and y: {model:?}");
+    assert!(
+        xv.is_some() && yv.is_some(),
+        "model must assign x and y: {model:?}"
+    );
     assert_ne!(xv, yv, "disequality model must have x ≠ y, got {model:?}");
     // And z3 must agree the model satisfies.
     let w = z3_with_model(body, &model);
-    assert_eq!(w, Verdict::Sat, "disequality witness must satisfy per z3: {model:?}");
+    assert_eq!(
+        w,
+        Verdict::Sat,
+        "disequality witness must satisfy per z3: {model:?}"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -739,7 +761,11 @@ fn fence_bv_plus_string() {
                (declare-fun x () String)(declare-fun b () (_ BitVec 8))\
                (assert (= (str.len x) 1))\
                (assert (= (bvadd b #x01) #x02))(check-sat)";
-    assert_eq!(shinri_verdict(src), Verdict::Unknown, "BV + string must fence to Unknown");
+    assert_eq!(
+        shinri_verdict(src),
+        Verdict::Unknown,
+        "BV + string must fence to Unknown"
+    );
 }
 
 #[test]
@@ -763,5 +789,9 @@ fn fence_uf_over_string() {
     let src = "(set-logic QF_S)\
                (declare-fun x () String)(declare-fun f (String) String)\
                (assert (= (f x) x))(assert (= (str.len x) 1))(check-sat)";
-    assert_eq!(shinri_verdict(src), Verdict::Unknown, "UF-over-string must fence to Unknown");
+    assert_eq!(
+        shinri_verdict(src),
+        Verdict::Unknown,
+        "UF-over-string must fence to Unknown"
+    );
 }

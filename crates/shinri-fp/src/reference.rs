@@ -8,10 +8,21 @@ use shinri_num::Integer;
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum FpClass {
     Nan,
-    Inf { sign: bool },
-    Zero { sign: bool },
-    Subnormal { sign: bool, sig: Integer },
-    Normal { sign: bool, biased_exp: u64, sig: Integer },
+    Inf {
+        sign: bool,
+    },
+    Zero {
+        sign: bool,
+    },
+    Subnormal {
+        sign: bool,
+        sig: Integer,
+    },
+    Normal {
+        sign: bool,
+        biased_exp: u64,
+        sig: Integer,
+    },
 }
 
 /// Extract the bit field `[lo, lo+width)` (LSB index 0) as a non-negative Integer.
@@ -25,7 +36,7 @@ pub fn field(bits: &Integer, lo: u32, width: u32) -> Integer {
     // modulus = 2^width
     let mut modulus = Integer::one();
     for _ in 0..width {
-        modulus = modulus * two.clone();
+        modulus *= two.clone();
     }
     shifted.div_rem(&modulus).1
 }
@@ -34,21 +45,35 @@ pub fn field(bits: &Integer, lo: u32, width: u32) -> Integer {
 pub fn decode(eb: u32, sb: u32, bits: &Integer) -> FpClass {
     let w = eb + sb;
     let sign = !field(bits, w - 1, 1).is_zero();
-    let exp = field(bits, sb - 1, eb);              // eb-bit exponent field
-    let sig = field(bits, 0, sb - 1);               // (sb-1)-bit trailing significand
+    let exp = field(bits, sb - 1, eb); // eb-bit exponent field
+    let sig = field(bits, 0, sb - 1); // (sb-1)-bit trailing significand
     let exp_all_ones = {
         let two = Integer::from(2u64);
         let mut m = Integer::one();
-        for _ in 0..eb { m = m * two.clone(); }
+        for _ in 0..eb {
+            m *= two.clone();
+        }
         m - Integer::one()
     };
     let exp_u = exp.to_i128().unwrap_or(-1);
     if exp == exp_all_ones {
-        if sig.is_zero() { FpClass::Inf { sign } } else { FpClass::Nan }
+        if sig.is_zero() {
+            FpClass::Inf { sign }
+        } else {
+            FpClass::Nan
+        }
     } else if exp.is_zero() {
-        if sig.is_zero() { FpClass::Zero { sign } } else { FpClass::Subnormal { sign, sig } }
+        if sig.is_zero() {
+            FpClass::Zero { sign }
+        } else {
+            FpClass::Subnormal { sign, sig }
+        }
     } else {
-        FpClass::Normal { sign, biased_exp: exp_u as u64, sig }
+        FpClass::Normal {
+            sign,
+            biased_exp: exp_u as u64,
+            sig,
+        }
     }
 }
 
@@ -68,11 +93,21 @@ pub fn ref_fp_from_bits(eb: u32, sb: u32, sign: u64, exp: &Integer, sig: &Intege
     Integer::from(sign) * pow(eb + sb - 1) + exp.clone() * pow(sb - 1) + sig.clone()
 }
 
-pub fn ref_is_nan(c: &FpClass) -> bool { matches!(c, FpClass::Nan) }
-pub fn ref_is_inf(c: &FpClass) -> bool { matches!(c, FpClass::Inf { .. }) }
-pub fn ref_is_zero(c: &FpClass) -> bool { matches!(c, FpClass::Zero { .. }) }
-pub fn ref_is_subnormal(c: &FpClass) -> bool { matches!(c, FpClass::Subnormal { .. }) }
-pub fn ref_is_normal(c: &FpClass) -> bool { matches!(c, FpClass::Normal { .. }) }
+pub fn ref_is_nan(c: &FpClass) -> bool {
+    matches!(c, FpClass::Nan)
+}
+pub fn ref_is_inf(c: &FpClass) -> bool {
+    matches!(c, FpClass::Inf { .. })
+}
+pub fn ref_is_zero(c: &FpClass) -> bool {
+    matches!(c, FpClass::Zero { .. })
+}
+pub fn ref_is_subnormal(c: &FpClass) -> bool {
+    matches!(c, FpClass::Subnormal { .. })
+}
+pub fn ref_is_normal(c: &FpClass) -> bool {
+    matches!(c, FpClass::Normal { .. })
+}
 
 pub fn ref_is_negative(c: &FpClass) -> bool {
     // NaN is neither negative nor positive (per IEEE 754 / SMT-LIB).
@@ -106,8 +141,18 @@ pub fn ref_fp_eq(a: &FpClass, b: &FpClass) -> bool {
         (Nan, _) | (_, Nan) => false,
         (Zero { .. }, Zero { .. }) => true, // +0 == -0
         (Inf { sign: s1 }, Inf { sign: s2 }) => s1 == s2,
-        (Normal { sign: s1, biased_exp: e1, sig: g1 },
-         Normal { sign: s2, biased_exp: e2, sig: g2 }) => s1 == s2 && e1 == e2 && g1 == g2,
+        (
+            Normal {
+                sign: s1,
+                biased_exp: e1,
+                sig: g1,
+            },
+            Normal {
+                sign: s2,
+                biased_exp: e2,
+                sig: g2,
+            },
+        ) => s1 == s2 && e1 == e2 && g1 == g2,
         (Subnormal { sign: s1, sig: g1 }, Subnormal { sign: s2, sig: g2 }) => s1 == s2 && g1 == g2,
         _ => false,
     }
@@ -128,7 +173,9 @@ fn order_key(eb: u32, sb: u32, c: &FpClass) -> Option<Ord3> {
         FpClass::Nan => None,
         FpClass::Inf { sign } => Some(if *sign { Ord3::NegInf } else { Ord3::PosInf }),
         // Zero / Subnormal / Normal all yield Some(_) from class_to_rational.
-        other => Some(Ord3::Fin(class_to_rational(eb, sb, other).expect("finite -> rational"))),
+        other => Some(Ord3::Fin(
+            class_to_rational(eb, sb, other).expect("finite -> rational"),
+        )),
     }
 }
 
@@ -158,23 +205,43 @@ pub fn ref_geq(eb: u32, sb: u32, a: &Integer, b: &Integer) -> bool {
 /// SMT-LIB-unspecified (+0,-0) case is resolved sign-canonically to -0.
 pub fn ref_min(eb: u32, sb: u32, a: &Integer, b: &Integer) -> Integer {
     let (ca, cb) = (decode(eb, sb, a), decode(eb, sb, b));
-    if matches!(ca, FpClass::Nan) { return b.clone(); }
-    if matches!(cb, FpClass::Nan) { return a.clone(); }
-    if let (FpClass::Zero { sign: sa }, FpClass::Zero { sign: sbn }) = (&ca, &cb) {
-        if sa != sbn { return zero_pattern(eb, sb, true); } // -0
+    if matches!(ca, FpClass::Nan) {
+        return b.clone();
     }
-    if ref_lt(eb, sb, a, b) { a.clone() } else { b.clone() }
+    if matches!(cb, FpClass::Nan) {
+        return a.clone();
+    }
+    if let (FpClass::Zero { sign: sa }, FpClass::Zero { sign: sbn }) = (&ca, &cb) {
+        if sa != sbn {
+            return zero_pattern(eb, sb, true);
+        } // -0
+    }
+    if ref_lt(eb, sb, a, b) {
+        a.clone()
+    } else {
+        b.clone()
+    }
 }
 
 /// `fp.max`: symmetric to `ref_min`; the (+0,-0) tie resolves to +0.
 pub fn ref_max(eb: u32, sb: u32, a: &Integer, b: &Integer) -> Integer {
     let (ca, cb) = (decode(eb, sb, a), decode(eb, sb, b));
-    if matches!(ca, FpClass::Nan) { return b.clone(); }
-    if matches!(cb, FpClass::Nan) { return a.clone(); }
-    if let (FpClass::Zero { sign: sa }, FpClass::Zero { sign: sbn }) = (&ca, &cb) {
-        if sa != sbn { return zero_pattern(eb, sb, false); } // +0
+    if matches!(ca, FpClass::Nan) {
+        return b.clone();
     }
-    if ref_lt(eb, sb, a, b) { b.clone() } else { a.clone() }
+    if matches!(cb, FpClass::Nan) {
+        return a.clone();
+    }
+    if let (FpClass::Zero { sign: sa }, FpClass::Zero { sign: sbn }) = (&ca, &cb) {
+        if sa != sbn {
+            return zero_pattern(eb, sb, false);
+        } // +0
+    }
+    if ref_lt(eb, sb, a, b) {
+        b.clone()
+    } else {
+        a.clone()
+    }
 }
 
 /// Theory core `=`: NaN == NaN (the theory has exactly one NaN value), +0 != -0,
@@ -194,23 +261,41 @@ pub fn ref_abs(eb: u32, sb: u32, bits: &Integer) -> Integer {
     let w = eb + sb;
     let two = Integer::from(2u64);
     let mut sign_mask = Integer::one();
-    for _ in 0..(w - 1) { sign_mask = sign_mask * two.clone(); }
+    for _ in 0..(w - 1) {
+        sign_mask *= two.clone();
+    }
     // clear the sign bit: bits AND NOT signbit  ==  bits - (bit*signmask)
-    if field(bits, w - 1, 1).is_zero() { bits.clone() } else { bits.clone() - sign_mask }
+    if field(bits, w - 1, 1).is_zero() {
+        bits.clone()
+    } else {
+        bits.clone() - sign_mask
+    }
 }
 
 pub fn ref_neg(eb: u32, sb: u32, bits: &Integer) -> Integer {
     let w = eb + sb;
     let two = Integer::from(2u64);
     let mut sign_mask = Integer::one();
-    for _ in 0..(w - 1) { sign_mask = sign_mask * two.clone(); }
-    if field(bits, w - 1, 1).is_zero() { bits.clone() + sign_mask } else { bits.clone() - sign_mask }
+    for _ in 0..(w - 1) {
+        sign_mask *= two.clone();
+    }
+    if field(bits, w - 1, 1).is_zero() {
+        bits.clone() + sign_mask
+    } else {
+        bits.clone() - sign_mask
+    }
 }
 
 use shinri_num::Rational;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum RoundMode { Rne, Rna, Rtp, Rtn, Rtz }
+pub enum RoundMode {
+    Rne,
+    Rna,
+    Rtp,
+    Rtn,
+    Rtz,
+}
 
 /// Exact rational value of a finite FP class (None for NaN/Inf).
 /// value = (-1)^sign * significand * 2^(exp - bias - (sb-1)), with the hidden
@@ -221,10 +306,22 @@ pub fn class_to_rational(eb: u32, sb: u32, c: &FpClass) -> Option<Rational> {
         // 2^k as a Rational (k may be negative).
         let mut acc = Integer::one();
         let two = Integer::from(2u64);
-        for _ in 0..k.unsigned_abs() { acc = acc * two.clone(); }
-        if k >= 0 { Rational::new(acc, Integer::one()) } else { Rational::new(Integer::one(), acc) }
+        for _ in 0..k.unsigned_abs() {
+            acc *= two.clone();
+        }
+        if k >= 0 {
+            Rational::new(acc, Integer::one())
+        } else {
+            Rational::new(Integer::one(), acc)
+        }
     };
-    let signed = |r: Rational, sign: bool| if sign { Rational::new(Integer::from(-1i64), Integer::one()) * r } else { r };
+    let signed = |r: Rational, sign: bool| {
+        if sign {
+            Rational::new(Integer::from(-1i64), Integer::one()) * r
+        } else {
+            r
+        }
+    };
     match c {
         FpClass::Nan | FpClass::Inf { .. } => None,
         FpClass::Zero { .. } => Some(Rational::new(Integer::zero(), Integer::one())),
@@ -233,16 +330,25 @@ pub fn class_to_rational(eb: u32, sb: u32, c: &FpClass) -> Option<Rational> {
             let m = Rational::new(sig.clone(), Integer::one());
             Some(signed(m * pow2(1 - bias - (sb as i64 - 1)), *sign))
         }
-        FpClass::Normal { sign, biased_exp, sig } => {
+        FpClass::Normal {
+            sign,
+            biased_exp,
+            sig,
+        } => {
             // mantissa = (2^(sb-1) + sig) ; value = mantissa * 2^(exp - bias - (sb-1))
             let hidden = {
                 let two = Integer::from(2u64);
                 let mut acc = Integer::one();
-                for _ in 0..(sb - 1) { acc = acc * two.clone(); }
+                for _ in 0..(sb - 1) {
+                    acc *= two.clone();
+                }
                 acc
             };
             let mant = Rational::new(hidden + sig.clone(), Integer::one());
-            Some(signed(mant * pow2(*biased_exp as i64 - bias - (sb as i64 - 1)), *sign))
+            Some(signed(
+                mant * pow2(*biased_exp as i64 - bias - (sb as i64 - 1)),
+                *sign,
+            ))
         }
     }
 }
@@ -258,22 +364,32 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
     let zero = Rational::new(Integer::zero(), Integer::one());
     let sign = *value < zero; // sign bit
     let bias = (1i64 << (eb - 1)) - 1;
-    let emax = bias;            // max unbiased exponent for normals
-    let emin = 1 - bias;        // min unbiased exponent for normals
-    // Work with the magnitude.
-    let mag = if sign { Rational::new(Integer::from(-1i64), Integer::one()) * value.clone() } else { value.clone() };
+    let emax = bias; // max unbiased exponent for normals
+    let emin = 1 - bias; // min unbiased exponent for normals
+                         // Work with the magnitude.
+    let mag = if sign {
+        Rational::new(Integer::from(-1i64), Integer::one()) * value.clone()
+    } else {
+        value.clone()
+    };
 
     let pack = |sign: bool, exp_field: u64, sig: Integer| -> Integer {
         let two = Integer::from(2u64);
         let mut sig_scale = Integer::one(); // 2^0 — sig occupies bits [0, sb-1)
         let _ = &mut sig_scale;
         let mut exp_scale = Integer::one();
-        for _ in 0..(sb - 1) { exp_scale = exp_scale * two.clone(); }
+        for _ in 0..(sb - 1) {
+            exp_scale *= two.clone();
+        }
         let mut sign_scale = exp_scale.clone();
-        for _ in 0..eb { sign_scale = sign_scale * two.clone(); }
+        for _ in 0..eb {
+            sign_scale *= two.clone();
+        }
         let mut out = sig; // trailing sig in [0, sb-1)
-        out = out + Integer::from(exp_field) * exp_scale;
-        if sign { out = out + sign_scale; }
+        out += Integer::from(exp_field) * exp_scale;
+        if sign {
+            out += sign_scale;
+        }
         out
     };
 
@@ -291,8 +407,14 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
     let half = Rational::new(Integer::one(), Integer::from(2u64));
     let mut e: i64 = 0;
     let mut m = mag.clone();
-    while m >= two_r { m = m * half.clone(); e += 1; }
-    while m < Rational::new(Integer::one(), Integer::one()) { m = m * two_r.clone(); e -= 1; }
+    while m >= two_r {
+        m = m * half.clone();
+        e += 1;
+    }
+    while m < Rational::new(Integer::one(), Integer::one()) {
+        m = m * two_r.clone();
+        e -= 1;
+    }
     // now 1 <= m < 2, value = m * 2^e
 
     // Step B: choose target precision. Normal if e >= emin, else subnormal at emin.
@@ -313,15 +435,23 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
         let mut acc = Integer::one();
         let two = Integer::from(2u64);
         let k = target_exp.unsigned_abs();
-        for _ in 0..k { acc = acc * two.clone(); }
-        if target_exp >= 0 { Rational::new(Integer::one(), acc) } else { Rational::new(acc, Integer::one()) }
+        for _ in 0..k {
+            acc *= two.clone();
+        }
+        if target_exp >= 0 {
+            Rational::new(Integer::one(), acc)
+        } else {
+            Rational::new(acc, Integer::one())
+        }
     };
     // value / 2^target_exp, then * 2^frac_bits  => m * 2^frac_bits
     let mut scaled = mag.clone() * scale; // = mag / 2^target_exp = m (1 <= m < 2 for normals)
     let pow_frac = {
         let mut acc = Integer::one();
         let two = Integer::from(2u64);
-        for _ in 0..frac_bits.max(0) { acc = acc * two.clone(); }
+        for _ in 0..frac_bits.max(0) {
+            acc *= two.clone();
+        }
         Rational::new(acc, Integer::one())
     };
     scaled = scaled * pow_frac;
@@ -336,9 +466,12 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
         RoundMode::Rtp => !sign && frac > zero, // toward +inf: round magnitude up only if positive
         RoundMode::Rtn => sign && frac > zero,  // toward -inf
         RoundMode::Rne => {
-            if frac > half { true }
-            else if frac < half { false }
-            else { // tie -> to even
+            if frac > half {
+                true
+            } else if frac < half {
+                false
+            } else {
+                // tie -> to even
                 !q.div_rem(&Integer::from(2u64)).1.is_zero()
             }
         }
@@ -354,7 +487,9 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
         // significand has no implicit leading 1; carry into it promotes to normal.
         let mut acc = Integer::one();
         let two = Integer::from(2u64);
-        for _ in 0..frac_bits.max(0) { acc = acc * two.clone(); }
+        for _ in 0..frac_bits.max(0) {
+            acc *= two.clone();
+        }
         acc
     };
     let two_hidden = hidden_pos.clone() * Integer::from(2u64);
@@ -379,7 +514,9 @@ pub fn round_rational(eb: u32, sb: u32, value: &Rational, mode: RoundMode) -> In
             let max_sig = {
                 let two = Integer::from(2u64);
                 let mut acc = Integer::one();
-                for _ in 0..(sb - 1) { acc *= two.clone(); }
+                for _ in 0..(sb - 1) {
+                    acc *= two.clone();
+                }
                 acc - Integer::one()
             };
             return pack(sign, max_exp_field, max_sig);
@@ -412,7 +549,9 @@ pub fn ref_to_fp_sbv(eb: u32, sb: u32, m: u32, x: &Integer, mode: RoundMode) -> 
     let v = if neg {
         let two = Integer::from(2u64);
         let mut pow_m = Integer::one();
-        for _ in 0..m { pow_m *= two.clone(); }
+        for _ in 0..m {
+            pow_m *= two.clone();
+        }
         x.clone() - pow_m
     } else {
         x.clone()
@@ -433,19 +572,28 @@ pub fn round_rational_to_integer(q: &Rational, mode: RoundMode) -> Integer {
     let zero = Rational::new(Integer::zero(), Integer::one());
     let half = Rational::new(Integer::one(), Integer::from(2u64));
     let neg = *q < zero;
-    let mag = if neg { Rational::new(Integer::from(-1i64), Integer::one()) * q.clone() } else { q.clone() };
+    let mag = if neg {
+        Rational::new(Integer::from(-1i64), Integer::one()) * q.clone()
+    } else {
+        q.clone()
+    };
     let fl = mag.numer().div_rem(&mag.denom()).0; // floor(mag), mag >= 0
     let frac = mag - Rational::new(fl.clone(), Integer::one()); // in [0, 1)
     let round_up = match mode {
         RoundMode::Rtz => false,
         RoundMode::Rtp => !neg && frac > zero, // toward +inf: magnitude up only if positive
         RoundMode::Rtn => neg && frac > zero,  // toward -inf
-        RoundMode::Rne => frac > half
-            || (frac == half && !fl.div_rem(&Integer::from(2u64)).1.is_zero()),
+        RoundMode::Rne => {
+            frac > half || (frac == half && !fl.div_rem(&Integer::from(2u64)).1.is_zero())
+        }
         RoundMode::Rna => frac >= half,
     };
     let n = if round_up { fl + Integer::one() } else { fl };
-    if neg { Integer::zero() - n } else { n }
+    if neg {
+        Integer::zero() - n
+    } else {
+        n
+    }
 }
 
 /// `((_ fp.to_ubv m) rm x)` golden: `None` = SMT-LIB-unspecified (NaN, ±inf, or
@@ -455,8 +603,12 @@ pub fn ref_to_ubv(eb: u32, sb: u32, m: u32, bits: &Integer, mode: RoundMode) -> 
     let n = round_rational_to_integer(&q, mode);
     let two = Integer::from(2u64);
     let mut hi = Integer::one();
-    for _ in 0..m { hi *= two.clone(); } // 2^m
-    if n < Integer::zero() || n >= hi { return None; }
+    for _ in 0..m {
+        hi *= two.clone();
+    } // 2^m
+    if n < Integer::zero() || n >= hi {
+        return None;
+    }
     Some(n)
 }
 
@@ -468,18 +620,28 @@ pub fn ref_to_sbv(eb: u32, sb: u32, m: u32, bits: &Integer, mode: RoundMode) -> 
     let n = round_rational_to_integer(&q, mode);
     let two = Integer::from(2u64);
     let mut half = Integer::one();
-    for _ in 0..(m - 1) { half *= two.clone(); } // 2^(m-1)
-    let hi = half.clone() * two.clone();               // 2^m
+    for _ in 0..(m - 1) {
+        half *= two.clone();
+    } // 2^(m-1)
+    let hi = half.clone() * two.clone(); // 2^m
     let lo = Integer::zero() - half.clone();
-    if n < lo || n >= half { return None; }
+    if n < lo || n >= half {
+        return None;
+    }
     Some(if n < Integer::zero() { n + hi } else { n })
 }
 
 /// Exact-rational golden `((_ to_fp eb_t sb_t) mode x)` for an FP source `x` of
 /// format (eb_s, sb_s). Specials map by table; finite values round the exact
 /// rational into the target under `mode`. Trusted reference for `convert::to_fp_fp`.
-pub fn ref_to_fp_fp(eb_s: u32, sb_s: u32, eb_t: u32, sb_t: u32, x: &Integer, mode: RoundMode)
-    -> Integer {
+pub fn ref_to_fp_fp(
+    eb_s: u32,
+    sb_s: u32,
+    eb_t: u32,
+    sb_t: u32,
+    x: &Integer,
+    mode: RoundMode,
+) -> Integer {
     let c = decode(eb_s, sb_s, x);
     match c {
         FpClass::Nan => canonical_nan(eb_t, sb_t),
@@ -497,14 +659,20 @@ pub fn canonical_nan(eb: u32, sb: u32) -> Integer {
     let two = Integer::from(2u64);
     // exp field (all ones) sits at bit offset (sb-1); sig MSB at bit (sb-2).
     let mut exp_scale = Integer::one();
-    for _ in 0..(sb - 1) { exp_scale = exp_scale * two.clone(); }
+    for _ in 0..(sb - 1) {
+        exp_scale *= two.clone();
+    }
     let exp_all_ones = {
         let mut m = Integer::one();
-        for _ in 0..eb { m = m * two.clone(); }
+        for _ in 0..eb {
+            m *= two.clone();
+        }
         m - Integer::one()
     };
     let mut sig_msb = Integer::one();
-    for _ in 0..(sb - 2) { sig_msb = sig_msb * two.clone(); }
+    for _ in 0..(sb - 2) {
+        sig_msb *= two.clone();
+    }
     exp_all_ones * exp_scale + sig_msb
 }
 
@@ -512,23 +680,37 @@ pub fn canonical_nan(eb: u32, sb: u32) -> Integer {
 fn inf_pattern(eb: u32, sb: u32, sign: bool) -> Integer {
     let two = Integer::from(2u64);
     let mut exp_scale = Integer::one();
-    for _ in 0..(sb - 1) { exp_scale = exp_scale * two.clone(); }
-    let exp_all_ones = { let mut m = Integer::one(); for _ in 0..eb { m = m * two.clone(); } m - Integer::one() };
+    for _ in 0..(sb - 1) {
+        exp_scale *= two.clone();
+    }
+    let exp_all_ones = {
+        let mut m = Integer::one();
+        for _ in 0..eb {
+            m *= two.clone();
+        }
+        m - Integer::one()
+    };
     let mut out = exp_all_ones * exp_scale;
     if sign {
         let mut sign_scale = Integer::one();
-        for _ in 0..(eb + sb - 1) { sign_scale = sign_scale * two.clone(); }
-        out = out + sign_scale;
+        for _ in 0..(eb + sb - 1) {
+            sign_scale *= two.clone();
+        }
+        out += sign_scale;
     }
     out
 }
 
 /// Signed-zero bit pattern.
 fn zero_pattern(eb: u32, sb: u32, sign: bool) -> Integer {
-    if !sign { return Integer::zero(); }
+    if !sign {
+        return Integer::zero();
+    }
     let two = Integer::from(2u64);
     let mut sign_scale = Integer::one();
-    for _ in 0..(eb + sb - 1) { sign_scale = sign_scale * two.clone(); }
+    for _ in 0..(eb + sb - 1) {
+        sign_scale *= two.clone();
+    }
     sign_scale
 }
 
@@ -539,8 +721,14 @@ pub fn ref_sqrt(eb: u32, sb: u32, a: &Integer, mode: RoundMode) -> Integer {
     use FpClass::*;
     match &c {
         Nan => canonical_nan(eb, sb),
-        Inf { sign } => if *sign { canonical_nan(eb, sb) } else { inf_pattern(eb, sb, false) },
-        Zero { sign } => zero_pattern(eb, sb, *sign),           // sign preserved
+        Inf { sign } => {
+            if *sign {
+                canonical_nan(eb, sb)
+            } else {
+                inf_pattern(eb, sb, false)
+            }
+        }
+        Zero { sign } => zero_pattern(eb, sb, *sign), // sign preserved
         Normal { sign, .. } | Subnormal { sign, .. } if *sign => canonical_nan(eb, sb), // negative -> NaN
         _ => {
             // finite positive nonzero: exact dyadic value v = class_to_rational(c).
@@ -559,7 +747,9 @@ fn sqrt_round_positive(eb: u32, sb: u32, v: &Rational, mode: RoundMode) -> Integ
     let two = Integer::from(2u64);
     let pow2 = |k: u32| -> Integer {
         let mut acc = Integer::one();
-        for _ in 0..k { acc = acc * two.clone(); }
+        for _ in 0..k {
+            acc *= two.clone();
+        }
         acc
     };
     let mut n: u32 = sb + 4;
@@ -568,7 +758,7 @@ fn sqrt_round_positive(eb: u32, sb: u32, v: &Rational, mode: RoundMode) -> Integ
         // covers v's denominator. denom is a power of two by construction of v.
         let scale = pow2(2 * n);
         let scaled = Rational::new(v.numer() * scale.clone(), v.denom()); // = v * 2^(2n)
-        // Reduce to integer: scaled = num/den with den | 2^(2n). If not integral yet, bump n.
+                                                                          // Reduce to integer: scaled = num/den with den | 2^(2n). If not integral yet, bump n.
         if scaled.denom() != Integer::one() {
             n += 1;
             continue;
@@ -605,7 +795,11 @@ pub fn ref_round_to_integral(eb: u32, sb: u32, bits: &Integer, mode: RoundMode) 
     let v = class_to_rational(eb, sb, &c).unwrap();
     let zero = Rational::new(Integer::zero(), Integer::one());
     let half = Rational::new(Integer::one(), Integer::from(2u64));
-    let mag = if sign { Rational::new(Integer::from(-1i64), Integer::one()) * v.clone() } else { v };
+    let mag = if sign {
+        Rational::new(Integer::from(-1i64), Integer::one()) * v.clone()
+    } else {
+        v
+    };
     let q = mag.numer().div_rem(&mag.denom()).0; // floor(|value|)
     let frac = mag - Rational::new(q.clone(), Integer::one());
     let round_up = match mode {
@@ -613,8 +807,13 @@ pub fn ref_round_to_integral(eb: u32, sb: u32, bits: &Integer, mode: RoundMode) 
         RoundMode::Rtp => !sign && frac > zero,
         RoundMode::Rtn => sign && frac > zero,
         RoundMode::Rne => {
-            if frac > half { true } else if frac < half { false }
-            else { !q.div_rem(&Integer::from(2u64)).1.is_zero() } // tie -> to even
+            if frac > half {
+                true
+            } else if frac < half {
+                false
+            } else {
+                !q.div_rem(&Integer::from(2u64)).1.is_zero()
+            } // tie -> to even
         }
         RoundMode::Rna => frac >= half,
     };
@@ -622,8 +821,11 @@ pub fn ref_round_to_integral(eb: u32, sb: u32, bits: &Integer, mode: RoundMode) 
     if n.is_zero() {
         return zero_pattern(eb, sb, sign); // sign-preserving ±0
     }
-    let signed_n = if sign { Rational::new(Integer::from(-1i64), Integer::one()) * Rational::new(n, Integer::one()) }
-                   else { Rational::new(n, Integer::one()) };
+    let signed_n = if sign {
+        Rational::new(Integer::from(-1i64), Integer::one()) * Rational::new(n, Integer::one())
+    } else {
+        Rational::new(n, Integer::one())
+    };
     // n is exactly representable, so this re-encode introduces no second rounding.
     round_rational(eb, sb, &signed_n, mode)
 }
@@ -634,11 +836,17 @@ pub fn ref_add(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> I
     let cb = decode(eb, sb, b);
     use FpClass::*;
     // 1. NaN propagation.
-    if matches!(ca, Nan) || matches!(cb, Nan) { return canonical_nan(eb, sb); }
+    if matches!(ca, Nan) || matches!(cb, Nan) {
+        return canonical_nan(eb, sb);
+    }
     // 2. Infinities.
     match (&ca, &cb) {
         (Inf { sign: s1 }, Inf { sign: s2 }) => {
-            return if s1 == s2 { inf_pattern(eb, sb, *s1) } else { canonical_nan(eb, sb) };
+            return if s1 == s2 {
+                inf_pattern(eb, sb, *s1)
+            } else {
+                canonical_nan(eb, sb)
+            };
         }
         (Inf { sign }, _) | (_, Inf { sign }) => return inf_pattern(eb, sb, *sign),
         _ => {}
@@ -666,18 +874,26 @@ pub fn ref_mul(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> I
     let cb = decode(eb, sb, b);
     use FpClass::*;
     let sign = ref_is_negative(&ca) ^ ref_is_negative(&cb); // XOR sign
-    // 1. NaN propagation.
-    if matches!(ca, Nan) || matches!(cb, Nan) { return canonical_nan(eb, sb); }
+                                                            // 1. NaN propagation.
+    if matches!(ca, Nan) || matches!(cb, Nan) {
+        return canonical_nan(eb, sb);
+    }
     // 2. 0 * inf = NaN (either order). Must precede the inf arm.
     let a_zero = matches!(ca, Zero { .. });
     let b_zero = matches!(cb, Zero { .. });
     let a_inf = matches!(ca, Inf { .. });
     let b_inf = matches!(cb, Inf { .. });
-    if (a_zero && b_inf) || (a_inf && b_zero) { return canonical_nan(eb, sb); }
+    if (a_zero && b_inf) || (a_inf && b_zero) {
+        return canonical_nan(eb, sb);
+    }
     // 3. inf * finite-nonzero = signed inf.
-    if a_inf || b_inf { return inf_pattern(eb, sb, sign); }
+    if a_inf || b_inf {
+        return inf_pattern(eb, sb, sign);
+    }
     // 4. zero * finite = signed zero.
-    if a_zero || b_zero { return zero_pattern(eb, sb, sign); }
+    if a_zero || b_zero {
+        return zero_pattern(eb, sb, sign);
+    }
     // 5. finite * finite: exact rational product, then round.
     let ra = class_to_rational(eb, sb, &ca).unwrap();
     let rb = class_to_rational(eb, sb, &cb).unwrap();
@@ -689,7 +905,14 @@ pub fn ref_mul(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> I
 /// rounding. `x`, `y`, `z` are W=eb+sb bit patterns. Product sign = sign_x ⊕
 /// sign_y. The exact real x·y + z is formed at infinite precision and rounded
 /// once via `round_rational`.
-pub fn ref_fma(eb: u32, sb: u32, x: &Integer, y: &Integer, z: &Integer, mode: RoundMode) -> Integer {
+pub fn ref_fma(
+    eb: u32,
+    sb: u32,
+    x: &Integer,
+    y: &Integer,
+    z: &Integer,
+    mode: RoundMode,
+) -> Integer {
     use FpClass::*;
     let cx = decode(eb, sb, x);
     let cy = decode(eb, sb, y);
@@ -729,7 +952,8 @@ pub fn ref_fma(eb: u32, sb: u32, x: &Integer, y: &Integer, z: &Integer, mode: Ro
     let zero = Rational::new(Integer::zero(), Integer::one());
     if v == zero {
         // IEEE exact-zero-sum sign rule (product sign on the left).
-        let neg = (prod_sign && z_sign) || ((prod_sign != z_sign) && matches!(mode, RoundMode::Rtn));
+        let neg =
+            (prod_sign && z_sign) || ((prod_sign != z_sign) && matches!(mode, RoundMode::Rtn));
         return zero_pattern(eb, sb, neg);
     }
     round_rational(eb, sb, &v, mode)
@@ -747,14 +971,22 @@ pub fn ref_div(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> I
     let a_inf = matches!(ca, Inf { .. });
     let b_inf = matches!(cb, Inf { .. });
     // 1. NaN propagation, then 0/0 and inf/inf = NaN.
-    if matches!(ca, Nan) || matches!(cb, Nan) { return canonical_nan(eb, sb); }
-    if (a_zero && b_zero) || (a_inf && b_inf) { return canonical_nan(eb, sb); }
+    if matches!(ca, Nan) || matches!(cb, Nan) {
+        return canonical_nan(eb, sb);
+    }
+    if (a_zero && b_zero) || (a_inf && b_inf) {
+        return canonical_nan(eb, sb);
+    }
     // 2. Inf result: inf/finite, or finite-nonzero/0 (divByZero). (a_inf && b_inf
     //    already handled above; here b_zero implies a is finite-nonzero.)
-    if a_inf || b_zero { return inf_pattern(eb, sb, sign); }
+    if a_inf || b_zero {
+        return inf_pattern(eb, sb, sign);
+    }
     // 3. Zero result: finite/inf, or 0/finite-nonzero. (a_zero && b_zero handled;
     //    here a_zero implies b is finite-nonzero.)
-    if b_inf || a_zero { return zero_pattern(eb, sb, sign); }
+    if b_inf || a_zero {
+        return zero_pattern(eb, sb, sign);
+    }
     // 4. finite-nonzero / finite-nonzero: exact rational quotient, then round.
     let ra = class_to_rational(eb, sb, &ca).unwrap();
     let rb = class_to_rational(eb, sb, &cb).unwrap();
@@ -770,14 +1002,24 @@ pub fn ref_rem(eb: u32, sb: u32, x: &Integer, y: &Integer) -> Integer {
     let cx = decode(eb, sb, x);
     let cy = decode(eb, sb, y);
     // 1. NaN (either) -> NaN ; rem(±inf, _) -> NaN ; rem(_, ±0) -> NaN.
-    if matches!(cx, Nan) || matches!(cy, Nan) { return canonical_nan(eb, sb); }
-    if matches!(cx, Inf { .. }) { return canonical_nan(eb, sb); }
-    if matches!(cy, Zero { .. }) { return canonical_nan(eb, sb); }
+    if matches!(cx, Nan) || matches!(cy, Nan) {
+        return canonical_nan(eb, sb);
+    }
+    if matches!(cx, Inf { .. }) {
+        return canonical_nan(eb, sb);
+    }
+    if matches!(cy, Zero { .. }) {
+        return canonical_nan(eb, sb);
+    }
     let sign_x = ref_is_negative(&cx);
     // 2. rem(x, ±inf) = x (finite x, faithful bits — incl. ±0).
-    if matches!(cy, Inf { .. }) { return x.clone(); }
+    if matches!(cy, Inf { .. }) {
+        return x.clone();
+    }
     // 3. rem(±0, finite-nonzero) = ±0 (sign of x).
-    if matches!(cx, Zero { .. }) { return zero_pattern(eb, sb, sign_x); }
+    if matches!(cx, Zero { .. }) {
+        return zero_pattern(eb, sb, sign_x);
+    }
     // 4. finite x, finite-nonzero y: exact remainder.
     let neg1 = Rational::new(Integer::from(-1i64), Integer::one());
     let zero = Rational::new(Integer::zero(), Integer::one());
@@ -786,18 +1028,28 @@ pub fn ref_rem(eb: u32, sb: u32, x: &Integer, y: &Integer) -> Integer {
     let xm = abs(class_to_rational(eb, sb, &cx).unwrap());
     let ym = abs(class_to_rational(eb, sb, &cy).unwrap());
     // q = round-half-even(xm / ym) as a non-negative integer.
-    let qx = xm.clone() / ym.clone();                         // exact Rational, >= 0
-    let qfloor = qx.numer().div_rem(&qx.denom()).0;           // floor (>= 0)
+    let qx = xm.clone() / ym.clone(); // exact Rational, >= 0
+    let qfloor = qx.numer().div_rem(&qx.denom()).0; // floor (>= 0)
     let frac = qx - Rational::new(qfloor.clone(), Integer::one());
     let half = Rational::new(Integer::one(), two.clone());
-    let round_up = if frac > half { true }
-        else if frac < half { false }
-        else { !qfloor.div_rem(&two).1.is_zero() };           // tie -> to even
-    let q = if round_up { qfloor + Integer::one() } else { qfloor };
+    let round_up = if frac > half {
+        true
+    } else if frac < half {
+        false
+    } else {
+        !qfloor.div_rem(&two).1.is_zero()
+    }; // tie -> to even
+    let q = if round_up {
+        qfloor + Integer::one()
+    } else {
+        qfloor
+    };
     // Signed magnitude-remainder rm = |x| − q·|y| ∈ [−|y|/2, |y|/2].
     // The true remainder is sign_x · rm (round-half-even is an odd function).
     let rm = xm - Rational::new(q, Integer::one()) * ym;
-    if rm == zero { return zero_pattern(eb, sb, sign_x); }    // exact multiple -> ±0
+    if rm == zero {
+        return zero_pattern(eb, sb, sign_x);
+    } // exact multiple -> ±0
     let result = if sign_x { neg1 * rm } else { rm };
     // rm is exactly representable, so this re-encode introduces no second rounding.
     round_rational(eb, sb, &result, RoundMode::Rne)
@@ -808,7 +1060,9 @@ mod tests {
     use super::*;
 
     // Float32 (eb=8, sb=24) reference encodings.
-    fn i(v: u64) -> Integer { Integer::from(v) }
+    fn i(v: u64) -> Integer {
+        Integer::from(v)
+    }
 
     #[test]
     fn decode_and_classify_float32() {
@@ -827,7 +1081,7 @@ mod tests {
         // NaN = 0x7FC00000 (and any non-zero sig with exp all ones)
         assert!(ref_is_nan(&decode(eb, sb, &i(0x7FC0_0000))));
         assert!(ref_is_nan(&decode(eb, sb, &i(0x7F80_0001)))); // sNaN payload
-        // 1.0 = 0x3F800000 is normal, positive
+                                                               // 1.0 = 0x3F800000 is normal, positive
         let one = decode(eb, sb, &i(0x3F80_0000));
         assert!(ref_is_normal(&one));
         assert!(ref_is_positive(&one));
@@ -865,23 +1119,51 @@ mod tests {
         use shinri_num::Rational;
         let (eb, sb) = (8u32, 24u32);
         fn rat(n: i64, d: i64) -> Rational {
-            Rational::new(Integer::from(n.unsigned_abs()) * if n < 0 { Integer::from(-1i64) } else { Integer::one() },
-                          Integer::from(d as u64))
+            Rational::new(
+                Integer::from(n.unsigned_abs())
+                    * if n < 0 {
+                        Integer::from(-1i64)
+                    } else {
+                        Integer::one()
+                    },
+                Integer::from(d as u64),
+            )
         }
         // 1.0 -> 0x3F800000
-        assert_eq!(round_rational(eb, sb, &rat(1, 1), RoundMode::Rne), Integer::from(0x3F80_0000u64));
+        assert_eq!(
+            round_rational(eb, sb, &rat(1, 1), RoundMode::Rne),
+            Integer::from(0x3F80_0000u64)
+        );
         // 2.0 -> 0x40000000
-        assert_eq!(round_rational(eb, sb, &rat(2, 1), RoundMode::Rne), Integer::from(0x4000_0000u64));
+        assert_eq!(
+            round_rational(eb, sb, &rat(2, 1), RoundMode::Rne),
+            Integer::from(0x4000_0000u64)
+        );
         // 0.5 -> 0x3F000000
-        assert_eq!(round_rational(eb, sb, &rat(1, 2), RoundMode::Rne), Integer::from(0x3F00_0000u64));
+        assert_eq!(
+            round_rational(eb, sb, &rat(1, 2), RoundMode::Rne),
+            Integer::from(0x3F00_0000u64)
+        );
         // -1.0 -> 0xBF800000
-        assert_eq!(round_rational(eb, sb, &rat(-1, 1), RoundMode::Rne), Integer::from(0xBF80_0000u64));
+        assert_eq!(
+            round_rational(eb, sb, &rat(-1, 1), RoundMode::Rne),
+            Integer::from(0xBF80_0000u64)
+        );
         // 0.1 (not representable) RNE -> 0x3DCCCCCD
-        assert_eq!(round_rational(eb, sb, &rat(1, 10), RoundMode::Rne), Integer::from(0x3DCC_CCCDu64));
+        assert_eq!(
+            round_rational(eb, sb, &rat(1, 10), RoundMode::Rne),
+            Integer::from(0x3DCC_CCCDu64)
+        );
         // 0.1 RTZ -> 0x3DCCCCCC (truncates toward zero)
-        assert_eq!(round_rational(eb, sb, &rat(1, 10), RoundMode::Rtz), Integer::from(0x3DCC_CCCCu64));
+        assert_eq!(
+            round_rational(eb, sb, &rat(1, 10), RoundMode::Rtz),
+            Integer::from(0x3DCC_CCCCu64)
+        );
         // exact zero -> +0
-        assert_eq!(round_rational(eb, sb, &rat(0, 1), RoundMode::Rne), Integer::from(0u64));
+        assert_eq!(
+            round_rational(eb, sb, &rat(0, 1), RoundMode::Rne),
+            Integer::from(0u64)
+        );
     }
 
     #[test]
@@ -890,23 +1172,53 @@ mod tests {
         let (eb, sb) = (8u32, 24u32);
         let i = |v: u64| Integer::from(v);
         // 1.0 + 1.0 = 2.0
-        assert_eq!(ref_add(eb, sb, &i(0x3F80_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x4000_0000));
+        assert_eq!(
+            ref_add(eb, sb, &i(0x3F80_0000), &i(0x3F80_0000), RoundMode::Rne),
+            i(0x4000_0000)
+        );
         // 1.0 + 2.0 = 3.0 = 0x40400000
-        assert_eq!(ref_add(eb, sb, &i(0x3F80_0000), &i(0x4000_0000), RoundMode::Rne), i(0x4040_0000));
+        assert_eq!(
+            ref_add(eb, sb, &i(0x3F80_0000), &i(0x4000_0000), RoundMode::Rne),
+            i(0x4040_0000)
+        );
         // +inf + 1.0 = +inf
-        assert_eq!(ref_add(eb, sb, &i(0x7F80_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x7F80_0000));
+        assert_eq!(
+            ref_add(eb, sb, &i(0x7F80_0000), &i(0x3F80_0000), RoundMode::Rne),
+            i(0x7F80_0000)
+        );
         // +inf + -inf = canonical NaN (0x7FC00000)
-        assert_eq!(ref_add(eb, sb, &i(0x7F80_0000), &i(0xFF80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        assert_eq!(
+            ref_add(eb, sb, &i(0x7F80_0000), &i(0xFF80_0000), RoundMode::Rne),
+            i(0x7FC0_0000)
+        );
         // NaN + 1.0 = canonical NaN
-        assert_eq!(ref_add(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        assert_eq!(
+            ref_add(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne),
+            i(0x7FC0_0000)
+        );
         // 1.0 + (-1.0) = +0 under RNE, -0 under RTN
-        assert_eq!(ref_add(eb, sb, &i(0x3F80_0000), &i(0xBF80_0000), RoundMode::Rne), i(0x0000_0000));
-        assert_eq!(ref_add(eb, sb, &i(0x3F80_0000), &i(0xBF80_0000), RoundMode::Rtn), i(0x8000_0000));
+        assert_eq!(
+            ref_add(eb, sb, &i(0x3F80_0000), &i(0xBF80_0000), RoundMode::Rne),
+            i(0x0000_0000)
+        );
+        assert_eq!(
+            ref_add(eb, sb, &i(0x3F80_0000), &i(0xBF80_0000), RoundMode::Rtn),
+            i(0x8000_0000)
+        );
         // (-0) + (-0) = -0
-        assert_eq!(ref_add(eb, sb, &i(0x8000_0000), &i(0x8000_0000), RoundMode::Rne), i(0x8000_0000));
+        assert_eq!(
+            ref_add(eb, sb, &i(0x8000_0000), &i(0x8000_0000), RoundMode::Rne),
+            i(0x8000_0000)
+        );
         // (+0) + (-0) = +0 (RNE), -0 (RTN)
-        assert_eq!(ref_add(eb, sb, &i(0x0000_0000), &i(0x8000_0000), RoundMode::Rne), i(0x0000_0000));
-        assert_eq!(ref_add(eb, sb, &i(0x0000_0000), &i(0x8000_0000), RoundMode::Rtn), i(0x8000_0000));
+        assert_eq!(
+            ref_add(eb, sb, &i(0x0000_0000), &i(0x8000_0000), RoundMode::Rne),
+            i(0x0000_0000)
+        );
+        assert_eq!(
+            ref_add(eb, sb, &i(0x0000_0000), &i(0x8000_0000), RoundMode::Rtn),
+            i(0x8000_0000)
+        );
     }
 
     #[test]
@@ -914,7 +1226,13 @@ mod tests {
         // Every (a,b,mode) on (3,5) produces a well-formed encoding (round-trips
         // through decode without panic) and is commutative for finite, non-zero sums.
         let (eb, sb) = (3u32, 5u32);
-        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        let modes = [
+            RoundMode::Rne,
+            RoundMode::Rna,
+            RoundMode::Rtp,
+            RoundMode::Rtn,
+            RoundMode::Rtz,
+        ];
         for a in 0u64..256 {
             for b in 0u64..256 {
                 for m in modes {
@@ -923,7 +1241,10 @@ mod tests {
                     // commutativity holds for fp.add in all these cases (NaN canonical too).
                     assert_eq!(r1, r2, "add not commutative a={a:#x} b={b:#x} m={m:?}");
                     // result must be a valid 8-bit pattern.
-                    assert!(r1 < Integer::from(256u64), "out-of-range result {a:#x}+{b:#x}");
+                    assert!(
+                        r1 < Integer::from(256u64),
+                        "out-of-range result {a:#x}+{b:#x}"
+                    );
                 }
             }
         }
@@ -933,29 +1254,68 @@ mod tests {
     fn ref_mul_known_float32() {
         let (eb, sb) = (8u32, 24u32);
         // 1.0 * 1.0 = 1.0
-        assert_eq!(ref_mul(eb, sb, &i(0x3F80_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x3F80_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x3F80_0000), &i(0x3F80_0000), RoundMode::Rne),
+            i(0x3F80_0000)
+        );
         // 2.0 * 3.0 = 6.0 = 0x40C00000
-        assert_eq!(ref_mul(eb, sb, &i(0x4000_0000), &i(0x4040_0000), RoundMode::Rne), i(0x40C0_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x4000_0000), &i(0x4040_0000), RoundMode::Rne),
+            i(0x40C0_0000)
+        );
         // 2.0 * -1.0 = -2.0 = 0xC0000000  (sign = XOR)
-        assert_eq!(ref_mul(eb, sb, &i(0x4000_0000), &i(0xBF80_0000), RoundMode::Rne), i(0xC000_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x4000_0000), &i(0xBF80_0000), RoundMode::Rne),
+            i(0xC000_0000)
+        );
         // -1.0 * -1.0 = 1.0  (sign XOR cancels)
-        assert_eq!(ref_mul(eb, sb, &i(0xBF80_0000), &i(0xBF80_0000), RoundMode::Rne), i(0x3F80_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0xBF80_0000), &i(0xBF80_0000), RoundMode::Rne),
+            i(0x3F80_0000)
+        );
         // +inf * 2.0 = +inf
-        assert_eq!(ref_mul(eb, sb, &i(0x7F80_0000), &i(0x4000_0000), RoundMode::Rne), i(0x7F80_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x7F80_0000), &i(0x4000_0000), RoundMode::Rne),
+            i(0x7F80_0000)
+        );
         // +inf * -2.0 = -inf
-        assert_eq!(ref_mul(eb, sb, &i(0x7F80_0000), &i(0xC000_0000), RoundMode::Rne), i(0xFF80_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x7F80_0000), &i(0xC000_0000), RoundMode::Rne),
+            i(0xFF80_0000)
+        );
         // +inf * +0 = canonical NaN
-        assert_eq!(ref_mul(eb, sb, &i(0x7F80_0000), &i(0x0000_0000), RoundMode::Rne), i(0x7FC0_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x7F80_0000), &i(0x0000_0000), RoundMode::Rne),
+            i(0x7FC0_0000)
+        );
         // -inf * +0 = canonical NaN
-        assert_eq!(ref_mul(eb, sb, &i(0xFF80_0000), &i(0x0000_0000), RoundMode::Rne), i(0x7FC0_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0xFF80_0000), &i(0x0000_0000), RoundMode::Rne),
+            i(0x7FC0_0000)
+        );
         // NaN * 1.0 = canonical NaN
-        assert_eq!(ref_mul(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne),
+            i(0x7FC0_0000)
+        );
         // +0 * +0 = +0 ; +0 * -0 = -0 (sign XOR) ; -2.0 * +0 = -0
-        assert_eq!(ref_mul(eb, sb, &i(0x0000_0000), &i(0x0000_0000), RoundMode::Rne), i(0x0000_0000));
-        assert_eq!(ref_mul(eb, sb, &i(0x0000_0000), &i(0x8000_0000), RoundMode::Rne), i(0x8000_0000));
-        assert_eq!(ref_mul(eb, sb, &i(0xC000_0000), &i(0x0000_0000), RoundMode::Rne), i(0x8000_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x0000_0000), &i(0x0000_0000), RoundMode::Rne),
+            i(0x0000_0000)
+        );
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x0000_0000), &i(0x8000_0000), RoundMode::Rne),
+            i(0x8000_0000)
+        );
+        assert_eq!(
+            ref_mul(eb, sb, &i(0xC000_0000), &i(0x0000_0000), RoundMode::Rne),
+            i(0x8000_0000)
+        );
         // overflow: max-normal * 2.0 = +inf. Max normal float32 = 0x7F7FFFFF.
-        assert_eq!(ref_mul(eb, sb, &i(0x7F7F_FFFF), &i(0x4000_0000), RoundMode::Rne), i(0x7F80_0000));
+        assert_eq!(
+            ref_mul(eb, sb, &i(0x7F7F_FFFF), &i(0x4000_0000), RoundMode::Rne),
+            i(0x7F80_0000)
+        );
     }
 
     #[test]
@@ -963,14 +1323,23 @@ mod tests {
         // Every (a,b,mode) on (3,5) produces a valid 8-bit encoding and is
         // commutative (fp.mul is commutative, NaN canonical too).
         let (eb, sb) = (3u32, 5u32);
-        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        let modes = [
+            RoundMode::Rne,
+            RoundMode::Rna,
+            RoundMode::Rtp,
+            RoundMode::Rtn,
+            RoundMode::Rtz,
+        ];
         for a in 0u64..256 {
             for b in 0u64..256 {
                 for m in modes {
                     let r1 = ref_mul(eb, sb, &Integer::from(a), &Integer::from(b), m);
                     let r2 = ref_mul(eb, sb, &Integer::from(b), &Integer::from(a), m);
                     assert_eq!(r1, r2, "mul not commutative a={a:#x} b={b:#x} m={m:?}");
-                    assert!(r1 < Integer::from(256u64), "out-of-range result {a:#x}*{b:#x}");
+                    assert!(
+                        r1 < Integer::from(256u64),
+                        "out-of-range result {a:#x}*{b:#x}"
+                    );
                 }
             }
         }
@@ -980,36 +1349,87 @@ mod tests {
     fn ref_div_known_float32() {
         let (eb, sb) = (8u32, 24u32);
         // 6.0 / 2.0 = 3.0 = 0x40400000
-        assert_eq!(ref_div(eb, sb, &i(0x40C0_0000), &i(0x4000_0000), RoundMode::Rne), i(0x4040_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x40C0_0000), &i(0x4000_0000), RoundMode::Rne),
+            i(0x4040_0000)
+        );
         // 1.0 / 2.0 = 0.5 = 0x3F000000
-        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x4000_0000), RoundMode::Rne), i(0x3F00_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x3F80_0000), &i(0x4000_0000), RoundMode::Rne),
+            i(0x3F00_0000)
+        );
         // -1.0 / 2.0 = -0.5 = 0xBF000000  (sign = XOR)
-        assert_eq!(ref_div(eb, sb, &i(0xBF80_0000), &i(0x4000_0000), RoundMode::Rne), i(0xBF00_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0xBF80_0000), &i(0x4000_0000), RoundMode::Rne),
+            i(0xBF00_0000)
+        );
         // 1.0 / 3.0 = 0x3EAAAAAB (RNE), 0x3EAAAAAA (RTZ)
-        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x4040_0000), RoundMode::Rne), i(0x3EAA_AAAB));
-        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x4040_0000), RoundMode::Rtz), i(0x3EAA_AAAA));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x3F80_0000), &i(0x4040_0000), RoundMode::Rne),
+            i(0x3EAA_AAAB)
+        );
+        assert_eq!(
+            ref_div(eb, sb, &i(0x3F80_0000), &i(0x4040_0000), RoundMode::Rtz),
+            i(0x3EAA_AAAA)
+        );
         // 1.0 / +0 = +inf  (divByZero, sign +)
-        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x0000_0000), RoundMode::Rne), i(0x7F80_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x3F80_0000), &i(0x0000_0000), RoundMode::Rne),
+            i(0x7F80_0000)
+        );
         // 1.0 / -0 = -inf  (divByZero, sign -)
-        assert_eq!(ref_div(eb, sb, &i(0x3F80_0000), &i(0x8000_0000), RoundMode::Rne), i(0xFF80_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x3F80_0000), &i(0x8000_0000), RoundMode::Rne),
+            i(0xFF80_0000)
+        );
         // -2.0 / +0 = -inf
-        assert_eq!(ref_div(eb, sb, &i(0xC000_0000), &i(0x0000_0000), RoundMode::Rne), i(0xFF80_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0xC000_0000), &i(0x0000_0000), RoundMode::Rne),
+            i(0xFF80_0000)
+        );
         // +0 / +0 = canonical NaN
-        assert_eq!(ref_div(eb, sb, &i(0x0000_0000), &i(0x0000_0000), RoundMode::Rne), i(0x7FC0_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x0000_0000), &i(0x0000_0000), RoundMode::Rne),
+            i(0x7FC0_0000)
+        );
         // +inf / +inf = canonical NaN
-        assert_eq!(ref_div(eb, sb, &i(0x7F80_0000), &i(0x7F80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x7F80_0000), &i(0x7F80_0000), RoundMode::Rne),
+            i(0x7FC0_0000)
+        );
         // +inf / 2.0 = +inf
-        assert_eq!(ref_div(eb, sb, &i(0x7F80_0000), &i(0x4000_0000), RoundMode::Rne), i(0x7F80_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x7F80_0000), &i(0x4000_0000), RoundMode::Rne),
+            i(0x7F80_0000)
+        );
         // 2.0 / +inf = +0 ; -2.0 / +inf = -0
-        assert_eq!(ref_div(eb, sb, &i(0x4000_0000), &i(0x7F80_0000), RoundMode::Rne), i(0x0000_0000));
-        assert_eq!(ref_div(eb, sb, &i(0xC000_0000), &i(0x7F80_0000), RoundMode::Rne), i(0x8000_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x4000_0000), &i(0x7F80_0000), RoundMode::Rne),
+            i(0x0000_0000)
+        );
+        assert_eq!(
+            ref_div(eb, sb, &i(0xC000_0000), &i(0x7F80_0000), RoundMode::Rne),
+            i(0x8000_0000)
+        );
         // +0 / 2.0 = +0 ; +0 / -2.0 = -0 (sign XOR)
-        assert_eq!(ref_div(eb, sb, &i(0x0000_0000), &i(0x4000_0000), RoundMode::Rne), i(0x0000_0000));
-        assert_eq!(ref_div(eb, sb, &i(0x0000_0000), &i(0xC000_0000), RoundMode::Rne), i(0x8000_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x0000_0000), &i(0x4000_0000), RoundMode::Rne),
+            i(0x0000_0000)
+        );
+        assert_eq!(
+            ref_div(eb, sb, &i(0x0000_0000), &i(0xC000_0000), RoundMode::Rne),
+            i(0x8000_0000)
+        );
         // NaN / 1.0 = canonical NaN
-        assert_eq!(ref_div(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne), i(0x7FC0_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x7FC0_0000), &i(0x3F80_0000), RoundMode::Rne),
+            i(0x7FC0_0000)
+        );
         // overflow: max-normal / 0.5 = +inf. Max normal = 0x7F7FFFFF, 0.5 = 0x3F000000.
-        assert_eq!(ref_div(eb, sb, &i(0x7F7F_FFFF), &i(0x3F00_0000), RoundMode::Rne), i(0x7F80_0000));
+        assert_eq!(
+            ref_div(eb, sb, &i(0x7F7F_FFFF), &i(0x3F00_0000), RoundMode::Rne),
+            i(0x7F80_0000)
+        );
     }
 
     #[test]
@@ -1017,17 +1437,47 @@ mod tests {
         let (eb, sb) = (8u32, 24u32);
         let i = |v: u64| Integer::from(v);
         // exact squares
-        assert_eq!(ref_sqrt(eb, sb, &i(0x4000_0000), RoundMode::Rne), i(0x3FB5_04F3)); // sqrt(2)
-        assert_eq!(ref_sqrt(eb, sb, &i(0x4080_0000), RoundMode::Rne), i(0x4000_0000)); // sqrt(4.0)=2.0
-        assert_eq!(ref_sqrt(eb, sb, &i(0x3F80_0000), RoundMode::Rne), i(0x3F80_0000)); // sqrt(1.0)=1.0
-        assert_eq!(ref_sqrt(eb, sb, &i(0x4110_0000), RoundMode::Rne), i(0x4040_0000)); // sqrt(9.0)=3.0
-        // specials
-        assert_eq!(ref_sqrt(eb, sb, &i(0x0000_0000), RoundMode::Rne), i(0x0000_0000)); // sqrt(+0)=+0
-        assert_eq!(ref_sqrt(eb, sb, &i(0x8000_0000), RoundMode::Rne), i(0x8000_0000)); // sqrt(-0)=-0
-        assert_eq!(ref_sqrt(eb, sb, &i(0x7F80_0000), RoundMode::Rne), i(0x7F80_0000)); // sqrt(+inf)=+inf
-        assert_eq!(ref_sqrt(eb, sb, &i(0xFF80_0000), RoundMode::Rne), canonical_nan(eb, sb)); // sqrt(-inf)=NaN
-        assert_eq!(ref_sqrt(eb, sb, &i(0xBF80_0000), RoundMode::Rne), canonical_nan(eb, sb)); // sqrt(-1)=NaN
-        assert_eq!(ref_sqrt(eb, sb, &i(0x7FC0_0000), RoundMode::Rne), canonical_nan(eb, sb)); // sqrt(NaN)=NaN
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0x4000_0000), RoundMode::Rne),
+            i(0x3FB5_04F3)
+        ); // sqrt(2)
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0x4080_0000), RoundMode::Rne),
+            i(0x4000_0000)
+        ); // sqrt(4.0)=2.0
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0x3F80_0000), RoundMode::Rne),
+            i(0x3F80_0000)
+        ); // sqrt(1.0)=1.0
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0x4110_0000), RoundMode::Rne),
+            i(0x4040_0000)
+        ); // sqrt(9.0)=3.0
+           // specials
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0x0000_0000), RoundMode::Rne),
+            i(0x0000_0000)
+        ); // sqrt(+0)=+0
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0x8000_0000), RoundMode::Rne),
+            i(0x8000_0000)
+        ); // sqrt(-0)=-0
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0x7F80_0000), RoundMode::Rne),
+            i(0x7F80_0000)
+        ); // sqrt(+inf)=+inf
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0xFF80_0000), RoundMode::Rne),
+            canonical_nan(eb, sb)
+        ); // sqrt(-inf)=NaN
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0xBF80_0000), RoundMode::Rne),
+            canonical_nan(eb, sb)
+        ); // sqrt(-1)=NaN
+        assert_eq!(
+            ref_sqrt(eb, sb, &i(0x7FC0_0000), RoundMode::Rne),
+            canonical_nan(eb, sb)
+        ); // sqrt(NaN)=NaN
     }
 
     #[test]
@@ -1041,7 +1491,10 @@ mod tests {
         for v in 0u64..(1 << (eb + sb)) {
             let c = decode(eb, sb, &Integer::from(v));
             // positive finite nonzero only
-            if !matches!(c, FpClass::Normal { sign: false, .. } | FpClass::Subnormal { sign: false, .. }) {
+            if !matches!(
+                c,
+                FpClass::Normal { sign: false, .. } | FpClass::Subnormal { sign: false, .. }
+            ) {
                 prev = None;
                 continue;
             }
@@ -1058,7 +1511,13 @@ mod tests {
         // Every (a,b,mode) on (3,5) produces a valid 8-bit encoding; NaN inputs and
         // 0/0, inf/inf produce the canonical NaN (0x7C for (3,5): exp all ones, sig MSB).
         let (eb, sb) = (3u32, 5u32);
-        let modes = [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz];
+        let modes = [
+            RoundMode::Rne,
+            RoundMode::Rna,
+            RoundMode::Rtp,
+            RoundMode::Rtn,
+            RoundMode::Rtz,
+        ];
         let nan = canonical_nan(eb, sb);
         for a in 0u64..256 {
             for b in 0u64..256 {
@@ -1068,9 +1527,15 @@ mod tests {
                 let b_nan = matches!(cb, FpClass::Nan);
                 for m in modes {
                     let r = ref_div(eb, sb, &Integer::from(a), &Integer::from(b), m);
-                    assert!(r < Integer::from(256u64), "out-of-range result {a:#x}/{b:#x}");
+                    assert!(
+                        r < Integer::from(256u64),
+                        "out-of-range result {a:#x}/{b:#x}"
+                    );
                     if a_nan || b_nan {
-                        assert_eq!(r, nan, "NaN input must yield canonical NaN a={a:#x} b={b:#x} m={m:?}");
+                        assert_eq!(
+                            r, nan,
+                            "NaN input must yield canonical NaN a={a:#x} b={b:#x} m={m:?}"
+                        );
                     }
                 }
             }
@@ -1082,17 +1547,35 @@ mod tests {
         let (eb, sb) = (8u32, 24u32);
         let rti = |bits: u64, m| ref_round_to_integral(eb, sb, &Integer::from(bits), m);
         // Already integral: unchanged in every mode.
-        assert_eq!(rti(0x4000_0000, RoundMode::Rne), Integer::from(0x4000_0000u64)); // 2.0
-        // Half-way ties.
-        assert_eq!(rti(0x3FC0_0000, RoundMode::Rne), Integer::from(0x4000_0000u64)); // 1.5 -> 2 (even)
-        assert_eq!(rti(0x4020_0000, RoundMode::Rne), Integer::from(0x4000_0000u64)); // 2.5 -> 2 (even)
-        assert_eq!(rti(0x3FC0_0000, RoundMode::Rna), Integer::from(0x4000_0000u64)); // 1.5 -> 2 (away)
-        assert_eq!(rti(0x3F00_0000, RoundMode::Rna), Integer::from(0x3F80_0000u64)); // 0.5 -> 1 (away)
-        assert_eq!(rti(0x3F00_0000, RoundMode::Rne), Integer::from(0u64));           // 0.5 -> +0 (even)
-        // Directed modes on 0.5.
-        assert_eq!(rti(0x3F00_0000, RoundMode::Rtp), Integer::from(0x3F80_0000u64)); // 0.5 -> 1 (+inf)
-        assert_eq!(rti(0x3F00_0000, RoundMode::Rtn), Integer::from(0u64));           // 0.5 -> 0 (-inf)
-        assert_eq!(rti(0x3F00_0000, RoundMode::Rtz), Integer::from(0u64));           // 0.5 -> 0 (zero)
+        assert_eq!(
+            rti(0x4000_0000, RoundMode::Rne),
+            Integer::from(0x4000_0000u64)
+        ); // 2.0
+           // Half-way ties.
+        assert_eq!(
+            rti(0x3FC0_0000, RoundMode::Rne),
+            Integer::from(0x4000_0000u64)
+        ); // 1.5 -> 2 (even)
+        assert_eq!(
+            rti(0x4020_0000, RoundMode::Rne),
+            Integer::from(0x4000_0000u64)
+        ); // 2.5 -> 2 (even)
+        assert_eq!(
+            rti(0x3FC0_0000, RoundMode::Rna),
+            Integer::from(0x4000_0000u64)
+        ); // 1.5 -> 2 (away)
+        assert_eq!(
+            rti(0x3F00_0000, RoundMode::Rna),
+            Integer::from(0x3F80_0000u64)
+        ); // 0.5 -> 1 (away)
+        assert_eq!(rti(0x3F00_0000, RoundMode::Rne), Integer::from(0u64)); // 0.5 -> +0 (even)
+                                                                           // Directed modes on 0.5.
+        assert_eq!(
+            rti(0x3F00_0000, RoundMode::Rtp),
+            Integer::from(0x3F80_0000u64)
+        ); // 0.5 -> 1 (+inf)
+        assert_eq!(rti(0x3F00_0000, RoundMode::Rtn), Integer::from(0u64)); // 0.5 -> 0 (-inf)
+        assert_eq!(rti(0x3F00_0000, RoundMode::Rtz), Integer::from(0u64)); // 0.5 -> 0 (zero)
     }
 
     #[test]
@@ -1101,16 +1584,31 @@ mod tests {
         let rti = |bits: u64, m| ref_round_to_integral(eb, sb, &Integer::from(bits), m);
         // NaN -> canonical NaN; ±inf unchanged; ±0 unchanged.
         assert_eq!(rti(0x7FC0_0000, RoundMode::Rne), canonical_nan(eb, sb));
-        assert_eq!(rti(0x7F80_0000, RoundMode::Rne), Integer::from(0x7F80_0000u64)); // +inf
-        assert_eq!(rti(0x8000_0000, RoundMode::Rne), Integer::from(0x8000_0000u64)); // -0 stays -0
-        assert_eq!(rti(0x0000_0000, RoundMode::Rne), Integer::from(0u64));           // +0 stays +0
-        // Sign-preserving zero result: -0.25 RNE -> -0.0 (0xBE80_0000 = -0.25).
-        assert_eq!(rti(0xBE80_0000, RoundMode::Rne), Integer::from(0x8000_0000u64));
+        assert_eq!(
+            rti(0x7F80_0000, RoundMode::Rne),
+            Integer::from(0x7F80_0000u64)
+        ); // +inf
+        assert_eq!(
+            rti(0x8000_0000, RoundMode::Rne),
+            Integer::from(0x8000_0000u64)
+        ); // -0 stays -0
+        assert_eq!(rti(0x0000_0000, RoundMode::Rne), Integer::from(0u64)); // +0 stays +0
+                                                                           // Sign-preserving zero result: -0.25 RNE -> -0.0 (0xBE80_0000 = -0.25).
+        assert_eq!(
+            rti(0xBE80_0000, RoundMode::Rne),
+            Integer::from(0x8000_0000u64)
+        );
         // Directed toward -inf: -0.5 RTN -> -1.0 (0xBF80_0000).
-        assert_eq!(rti(0xBF00_0000, RoundMode::Rtn), Integer::from(0xBF80_0000u64));
+        assert_eq!(
+            rti(0xBF00_0000, RoundMode::Rtn),
+            Integer::from(0xBF80_0000u64)
+        );
         // Carry-renormalize: a value just below 2 rounds up to 2.0 with exp+1.
         // 1.9999998 ~ 0x3FFF_FFFF rounds to 2.0 under RNE.
-        assert_eq!(rti(0x3FFF_FFFF, RoundMode::Rne), Integer::from(0x4000_0000u64));
+        assert_eq!(
+            rti(0x3FFF_FFFF, RoundMode::Rne),
+            Integer::from(0x4000_0000u64)
+        );
     }
 
     #[test]
@@ -1155,21 +1653,38 @@ mod tests {
         for a in 0u64..256 {
             for b in 0u64..256 {
                 let r = ref_rem(eb, sb, &Integer::from(a), &Integer::from(b));
-                assert!(r < Integer::from(256u64), "out-of-range result {a:#x} rem {b:#x}");
-                let (ca, cb) = (decode(eb, sb, &Integer::from(a)), decode(eb, sb, &Integer::from(b)));
-                let finite_nz = |c: &FpClass| matches!(c, FpClass::Normal { .. } | FpClass::Subnormal { .. });
+                assert!(
+                    r < Integer::from(256u64),
+                    "out-of-range result {a:#x} rem {b:#x}"
+                );
+                let (ca, cb) = (
+                    decode(eb, sb, &Integer::from(a)),
+                    decode(eb, sb, &Integer::from(b)),
+                );
+                let finite_nz =
+                    |c: &FpClass| matches!(c, FpClass::Normal { .. } | FpClass::Subnormal { .. });
                 if finite_nz(&ca) && finite_nz(&cb) {
                     let rc = decode(eb, sb, &r);
-                    if let (Some(rv), Some(bv)) =
-                        (class_to_rational(eb, sb, &rc), class_to_rational(eb, sb, &cb)) {
+                    if let (Some(rv), Some(bv)) = (
+                        class_to_rational(eb, sb, &rc),
+                        class_to_rational(eb, sb, &cb),
+                    ) {
                         let two = Integer::from(2u64);
-                        let absr = if rv < Rational::new(Integer::zero(), Integer::one())
-                            { Rational::new(Integer::from(-1i64), Integer::one()) * rv } else { rv };
-                        let absb = if bv < Rational::new(Integer::zero(), Integer::one())
-                            { Rational::new(Integer::from(-1i64), Integer::one()) * bv } else { bv };
+                        let absr = if rv < Rational::new(Integer::zero(), Integer::one()) {
+                            Rational::new(Integer::from(-1i64), Integer::one()) * rv
+                        } else {
+                            rv
+                        };
+                        let absb = if bv < Rational::new(Integer::zero(), Integer::one()) {
+                            Rational::new(Integer::from(-1i64), Integer::one()) * bv
+                        } else {
+                            bv
+                        };
                         // 2*|r| <= |b|
-                        assert!(absr * Rational::new(two, Integer::one()) <= absb,
-                                "|rem| > |b|/2 at a={a:#x} b={b:#x}");
+                        assert!(
+                            absr * Rational::new(two, Integer::one()) <= absb,
+                            "|rem| > |b|/2 at a={a:#x} b={b:#x}"
+                        );
                     }
                 }
             }
@@ -1182,16 +1697,19 @@ mod tests {
         // widen 1.0 f32 -> f64 : exact.
         assert_eq!(
             ref_to_fp_fp(8, 24, 11, 53, &Integer::from(0x3F80_0000u64), Rne),
-            Integer::from(0x3FF0_0000_0000_0000u64));
+            Integer::from(0x3FF0_0000_0000_0000u64)
+        );
         // narrow 1.0 f64 -> f32 : exact.
         assert_eq!(
             ref_to_fp_fp(11, 53, 8, 24, &Integer::from(0x3FF0_0000_0000_0000u64), Rne),
-            Integer::from(0x3F80_0000u64));
+            Integer::from(0x3F80_0000u64)
+        );
         // narrow 1/3 f64 -> f32 : round to nearest -> 0x3EAA_AAAB.
         let third_f64 = round_rational(11, 53, &Rational::new(1i128.into(), 3i128.into()), Rne);
         assert_eq!(
             ref_to_fp_fp(11, 53, 8, 24, &third_f64, Rne),
-            Integer::from(0x3EAA_AAABu64));
+            Integer::from(0x3EAA_AAABu64)
+        );
     }
 
     #[test]
@@ -1200,22 +1718,36 @@ mod tests {
         // NaN f64 -> canonical NaN f32.
         assert_eq!(
             ref_to_fp_fp(11, 53, 8, 24, &Integer::from(0x7FF8_0000_0000_0000u64), Rne),
-            canonical_nan(8, 24));
+            canonical_nan(8, 24)
+        );
         // +inf f64 -> +inf f32.
         assert_eq!(
             ref_to_fp_fp(11, 53, 8, 24, &Integer::from(0x7FF0_0000_0000_0000u64), Rne),
-            inf_pattern(8, 24, false));
+            inf_pattern(8, 24, false)
+        );
         // -0 f64 -> -0 f32 (sign preserved).
         assert_eq!(
             ref_to_fp_fp(11, 53, 8, 24, &Integer::from(0x8000_0000_0000_0000u64), Rne),
-            zero_pattern(8, 24, true));
+            zero_pattern(8, 24, true)
+        );
         // overflow: max-normal f32 widened is exact, but a huge f64 narrowed to f16
         // overflows -> +inf. 2.0^100 in f64 = exponent 1123 biased = 0x4630…; -> f16 inf.
-        let big = round_rational(11, 53, &{
-            let mut acc = Integer::one(); for _ in 0..100 { acc *= Integer::from(2u64); }
-            Rational::new(acc, Integer::one())
-        }, Rne);
-        assert_eq!(ref_to_fp_fp(11, 53, 5, 11, &big, Rne), inf_pattern(5, 11, false));
+        let big = round_rational(
+            11,
+            53,
+            &{
+                let mut acc = Integer::one();
+                for _ in 0..100 {
+                    acc *= Integer::from(2u64);
+                }
+                Rational::new(acc, Integer::one())
+            },
+            Rne,
+        );
+        assert_eq!(
+            ref_to_fp_fp(11, 53, 5, 11, &big, Rne),
+            inf_pattern(5, 11, false)
+        );
     }
 
     #[test]
@@ -1226,7 +1758,11 @@ mod tests {
         // Round-trips through decode() to a positive normal.
         assert_eq!(
             decode(8, 24, &packed),
-            FpClass::Normal { sign: false, biased_exp: 127, sig: Integer::zero() }
+            FpClass::Normal {
+                sign: false,
+                biased_exp: 127,
+                sig: Integer::zero()
+            }
         );
         // Sign bit is the MSB: flipping it yields -1.0's pattern (0xBF800000).
         let neg = ref_fp_from_bits(8, 24, 1, &Integer::from(127u64), &Integer::zero());
@@ -1237,19 +1773,46 @@ mod tests {
     fn ref_int_to_fp_pins_known_values() {
         // Signed read: 8-bit 0xFF = -1 → f32 0xBF800000; 0x80 = -128 → 0xC3000000.
         let f = |v: u64| Integer::from(v);
-        assert_eq!(ref_to_fp_sbv(8, 24, 8, &f(0xFF), RoundMode::Rne), f(0xBF80_0000));
-        assert_eq!(ref_to_fp_sbv(8, 24, 8, &f(0x80), RoundMode::Rne), f(0xC300_0000));
+        assert_eq!(
+            ref_to_fp_sbv(8, 24, 8, &f(0xFF), RoundMode::Rne),
+            f(0xBF80_0000)
+        );
+        assert_eq!(
+            ref_to_fp_sbv(8, 24, 8, &f(0x80), RoundMode::Rne),
+            f(0xC300_0000)
+        );
         // Unsigned read of the same pattern: 255 → 0x437F0000.
-        assert_eq!(ref_to_fp_ubv(8, 24, 8, &f(0xFF), RoundMode::Rne), f(0x437F_0000));
+        assert_eq!(
+            ref_to_fp_ubv(8, 24, 8, &f(0xFF), RoundMode::Rne),
+            f(0x437F_0000)
+        );
         // Zero → +0 under every mode (incl. RTN — conversions have no -0 source).
-        for mode in [RoundMode::Rne, RoundMode::Rna, RoundMode::Rtp, RoundMode::Rtn, RoundMode::Rtz] {
-            assert_eq!(ref_to_fp_sbv(8, 24, 8, &Integer::zero(), mode), Integer::zero());
-            assert_eq!(ref_to_fp_ubv(8, 24, 8, &Integer::zero(), mode), Integer::zero());
+        for mode in [
+            RoundMode::Rne,
+            RoundMode::Rna,
+            RoundMode::Rtp,
+            RoundMode::Rtn,
+            RoundMode::Rtz,
+        ] {
+            assert_eq!(
+                ref_to_fp_sbv(8, 24, 8, &Integer::zero(), mode),
+                Integer::zero()
+            );
+            assert_eq!(
+                ref_to_fp_ubv(8, 24, 8, &Integer::zero(), mode),
+                Integer::zero()
+            );
         }
         // Rounding is real: u32::MAX → f32 is 2^32 under RNE (0x4F800000),
         // 2^32-256 under RTZ (0x4F7FFFFF).
-        assert_eq!(ref_to_fp_ubv(8, 24, 32, &f(0xFFFF_FFFF), RoundMode::Rne), f(0x4F80_0000));
-        assert_eq!(ref_to_fp_ubv(8, 24, 32, &f(0xFFFF_FFFF), RoundMode::Rtz), f(0x4F7F_FFFF));
+        assert_eq!(
+            ref_to_fp_ubv(8, 24, 32, &f(0xFFFF_FFFF), RoundMode::Rne),
+            f(0x4F80_0000)
+        );
+        assert_eq!(
+            ref_to_fp_ubv(8, 24, 32, &f(0xFFFF_FFFF), RoundMode::Rtz),
+            f(0x4F7F_FFFF)
+        );
         // Overflow is real: 255 into (3,5) (max finite 15.5) → +oo (0x70) under RNE,
         // max finite (0x6F) under RTZ.
         assert_eq!(ref_to_fp_ubv(3, 5, 8, &f(0xFF), RoundMode::Rne), f(0x70));
@@ -1286,16 +1849,30 @@ mod tests {
         use RoundMode::*;
         let f = |v: i64, d: i64| Rational::new(Integer::from(v), Integer::from(d));
         let enc = |q: &Rational| round_rational(5, 11, q, Rne); // exact values: mode-free
-        // -0.5: rounded result decides the range check (spec §2 / z3 probes 5).
+                                                                // -0.5: rounded result decides the range check (spec §2 / z3 probes 5).
         let neg_half = enc(&f(-1, 2));
-        assert_eq!(ref_to_ubv(5, 11, 8, &neg_half, Rne), Some(Integer::zero()), "RNE(-0.5)=0 in range");
+        assert_eq!(
+            ref_to_ubv(5, 11, 8, &neg_half, Rne),
+            Some(Integer::zero()),
+            "RNE(-0.5)=0 in range"
+        );
         assert_eq!(ref_to_ubv(5, 11, 8, &neg_half, Rtz), Some(Integer::zero()));
         assert_eq!(ref_to_ubv(5, 11, 8, &neg_half, Rtp), Some(Integer::zero()));
-        assert_eq!(ref_to_ubv(5, 11, 8, &neg_half, Rtn), None, "RTN(-0.5)=-1 out of range");
+        assert_eq!(
+            ref_to_ubv(5, 11, 8, &neg_half, Rtn),
+            None,
+            "RTN(-0.5)=-1 out of range"
+        );
         // 255.5 into ubv8 (z3 probes 6/7).
         let v255_5 = enc(&f(511, 2));
-        assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rtz), Some(Integer::from(255u64)));
-        assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rtn), Some(Integer::from(255u64)));
+        assert_eq!(
+            ref_to_ubv(5, 11, 8, &v255_5, Rtz),
+            Some(Integer::from(255u64))
+        );
+        assert_eq!(
+            ref_to_ubv(5, 11, 8, &v255_5, Rtn),
+            Some(Integer::from(255u64))
+        );
         assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rne), None, "rounds to 256");
         assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rna), None);
         assert_eq!(ref_to_ubv(5, 11, 8, &v255_5, Rtp), None);
@@ -1318,15 +1895,27 @@ mod tests {
         let f = |v: i64, d: i64| Rational::new(Integer::from(v), Integer::from(d));
         let enc = |q: &Rational| round_rational(5, 11, q, Rne);
         // INT_MIN = -128 is in range for sbv8 and encodes as 0x80.
-        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(-128, 1)), Rtz), Some(Integer::from(0x80u64)));
+        assert_eq!(
+            ref_to_sbv(5, 11, 8, &enc(&f(-128, 1)), Rtz),
+            Some(Integer::from(0x80u64))
+        );
         // -128.5 RTZ truncates to -128 (in range); RTN goes to -129 (out).
-        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(-257, 2)), Rtz), Some(Integer::from(0x80u64)));
+        assert_eq!(
+            ref_to_sbv(5, 11, 8, &enc(&f(-257, 2)), Rtz),
+            Some(Integer::from(0x80u64))
+        );
         assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(-257, 2)), Rtn), None);
         // 127.5: RNE→128 out; RTZ→127 in.
         assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(255, 2)), Rne), None);
-        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(255, 2)), Rtz), Some(Integer::from(127u64)));
+        assert_eq!(
+            ref_to_sbv(5, 11, 8, &enc(&f(255, 2)), Rtz),
+            Some(Integer::from(127u64))
+        );
         // -1 encodes as 0xFF; -0.0 → 0 (both faces).
-        assert_eq!(ref_to_sbv(5, 11, 8, &enc(&f(-1, 1)), Rtz), Some(Integer::from(0xFFu64)));
+        assert_eq!(
+            ref_to_sbv(5, 11, 8, &enc(&f(-1, 1)), Rtz),
+            Some(Integer::from(0xFFu64))
+        );
         let neg_zero = round_rational(5, 11, &f(-1, 100000), Rtp); // tiny negative, RTP → -0
         assert_eq!(ref_to_ubv(5, 11, 8, &neg_zero, Rtz), Some(Integer::zero()));
         assert_eq!(ref_to_sbv(5, 11, 8, &neg_zero, Rtz), Some(Integer::zero()));
@@ -1334,7 +1923,11 @@ mod tests {
         let one = enc(&f(1, 1));
         assert_eq!(ref_to_ubv(5, 11, 1, &one, Rtz), Some(Integer::one()));
         assert_eq!(ref_to_sbv(5, 11, 1, &one, Rtz), None, "1 > sbv1 max 0");
-        assert_eq!(ref_to_sbv(5, 11, 1, &enc(&f(-1, 1)), Rtz), Some(Integer::one()), "-1 = 0b1");
+        assert_eq!(
+            ref_to_sbv(5, 11, 1, &enc(&f(-1, 1)), Rtz),
+            Some(Integer::one()),
+            "-1 = 0b1"
+        );
     }
 
     #[test]
@@ -1367,18 +1960,20 @@ mod slice2d_tests {
     use shinri_num::Integer;
 
     // Float32 bit patterns.
-    const P1: u64 = 0x3F80_0000;   // +1.0
-    const N1: u64 = 0xBF80_0000;   // -1.0
-    const P2: u64 = 0x4000_0000;   // +2.0
-    const N2: u64 = 0xC000_0000;   // -2.0
-    const PZ: u64 = 0x0000_0000;   // +0
-    const NZ: u64 = 0x8000_0000;   // -0
+    const P1: u64 = 0x3F80_0000; // +1.0
+    const N1: u64 = 0xBF80_0000; // -1.0
+    const P2: u64 = 0x4000_0000; // +2.0
+    const N2: u64 = 0xC000_0000; // -2.0
+    const PZ: u64 = 0x0000_0000; // +0
+    const NZ: u64 = 0x8000_0000; // -0
     const PINF: u64 = 0x7F80_0000;
     const NINF: u64 = 0xFF80_0000;
     const QNAN: u64 = 0x7FC0_0000;
     const SUBN: u64 = 0x0000_0001; // smallest +subnormal
 
-    fn i(v: u64) -> Integer { Integer::from(v) }
+    fn i(v: u64) -> Integer {
+        Integer::from(v)
+    }
 
     #[test]
     fn ref_lt_matches_extended_order() {
@@ -1387,15 +1982,15 @@ mod slice2d_tests {
         assert!(lt(P1, P2));
         assert!(!lt(P2, P1));
         assert!(lt(N1, P1));
-        assert!(lt(N2, N1));        // -2 < -1
+        assert!(lt(N2, N1)); // -2 < -1
         assert!(!lt(N1, N2));
-        assert!(!lt(PZ, NZ));       // +0 == -0
+        assert!(!lt(PZ, NZ)); // +0 == -0
         assert!(!lt(NZ, PZ));
         assert!(lt(NINF, PINF));
         assert!(lt(NINF, N1));
         assert!(lt(P1, PINF));
         assert!(lt(PZ, SUBN));
-        assert!(!lt(QNAN, P1));     // NaN unordered
+        assert!(!lt(QNAN, P1)); // NaN unordered
         assert!(!lt(P1, QNAN));
         assert!(!lt(QNAN, QNAN));
     }
@@ -1403,8 +1998,8 @@ mod slice2d_tests {
     #[test]
     fn ref_leq_gt_geq_derive_correctly() {
         let (eb, sb) = (8, 24);
-        assert!(ref_leq(eb, sb, &i(P1), &i(P1)));    // equal
-        assert!(ref_leq(eb, sb, &i(PZ), &i(NZ)));    // +0 <= -0
+        assert!(ref_leq(eb, sb, &i(P1), &i(P1))); // equal
+        assert!(ref_leq(eb, sb, &i(PZ), &i(NZ))); // +0 <= -0
         assert!(!ref_leq(eb, sb, &i(QNAN), &i(P1))); // NaN
         assert!(ref_gt(eb, sb, &i(P2), &i(P1)));
         assert!(!ref_gt(eb, sb, &i(P1), &i(P1)));
@@ -1434,65 +2029,119 @@ mod slice2d_tests {
     fn ref_fma_finite_and_single_rounding() {
         let (eb, sb) = (8u32, 24u32);
         let fma = |x: u64, y: u64, z: u64, m| {
-            ref_fma(eb, sb, &Integer::from(x), &Integer::from(y), &Integer::from(z), m)
+            ref_fma(
+                eb,
+                sb,
+                &Integer::from(x),
+                &Integer::from(y),
+                &Integer::from(z),
+                m,
+            )
         };
         // 2*3 + 1 = 7.
-        assert_eq!(fma(0x4000_0000, 0x4040_0000, 0x3F80_0000, RoundMode::Rne),
-                   Integer::from(0x40E0_0000u64));
+        assert_eq!(
+            fma(0x4000_0000, 0x4040_0000, 0x3F80_0000, RoundMode::Rne),
+            Integer::from(0x40E0_0000u64)
+        );
         // Single-rounding witness: a = 1 + 2^-23, a*a = 1 + 2^-22 + 2^-46.
         // Fused a*a + (-(1+2^-22)) = 2^-46 exactly (= 0x2880_0000).
         // The double-rounded mul-then-add would give +0 (round(a*a) = 1+2^-22, then -itself).
-        assert_eq!(fma(0x3F80_0001, 0x3F80_0001, 0xBF80_0002, RoundMode::Rne),
-                   Integer::from(0x2880_0000u64));
+        assert_eq!(
+            fma(0x3F80_0001, 0x3F80_0001, 0xBF80_0002, RoundMode::Rne),
+            Integer::from(0x2880_0000u64)
+        );
         // Exact-zero sum sign rule: 1*1 + (-1) = 0 -> +0 (RNE) / -0 (RTN).
-        assert_eq!(fma(0x3F80_0000, 0x3F80_0000, 0xBF80_0000, RoundMode::Rne),
-                   Integer::from(0u64));
-        assert_eq!(fma(0x3F80_0000, 0x3F80_0000, 0xBF80_0000, RoundMode::Rtn),
-                   Integer::from(0x8000_0000u64));
+        assert_eq!(
+            fma(0x3F80_0000, 0x3F80_0000, 0xBF80_0000, RoundMode::Rne),
+            Integer::from(0u64)
+        );
+        assert_eq!(
+            fma(0x3F80_0000, 0x3F80_0000, 0xBF80_0000, RoundMode::Rtn),
+            Integer::from(0x8000_0000u64)
+        );
     }
 
     #[test]
     fn ref_fma_specials() {
         let (eb, sb) = (8u32, 24u32);
         let fma = |x: u64, y: u64, z: u64, m| {
-            ref_fma(eb, sb, &Integer::from(x), &Integer::from(y), &Integer::from(z), m)
+            ref_fma(
+                eb,
+                sb,
+                &Integer::from(x),
+                &Integer::from(y),
+                &Integer::from(z),
+                m,
+            )
         };
         let nan = canonical_nan(eb, sb);
         // Any NaN operand -> canonical NaN.
-        assert_eq!(fma(0x7FC0_0000, 0x3F80_0000, 0x3F80_0000, RoundMode::Rne), nan);
+        assert_eq!(
+            fma(0x7FC0_0000, 0x3F80_0000, 0x3F80_0000, RoundMode::Rne),
+            nan
+        );
         // 0 * inf -> NaN (invalid product), regardless of z.
-        assert_eq!(fma(0x0000_0000, 0x7F80_0000, 0x3F80_0000, RoundMode::Rne), nan);
+        assert_eq!(
+            fma(0x0000_0000, 0x7F80_0000, 0x3F80_0000, RoundMode::Rne),
+            nan
+        );
         // product +inf, z = -inf (opposite sign) -> NaN.
-        assert_eq!(fma(0x7F80_0000, 0x3F80_0000, 0xFF80_0000, RoundMode::Rne), nan);
+        assert_eq!(
+            fma(0x7F80_0000, 0x3F80_0000, 0xFF80_0000, RoundMode::Rne),
+            nan
+        );
         // product +inf, z finite -> +inf.
-        assert_eq!(fma(0x7F80_0000, 0x4000_0000, 0x3F80_0000, RoundMode::Rne),
-                   Integer::from(0x7F80_0000u64));
+        assert_eq!(
+            fma(0x7F80_0000, 0x4000_0000, 0x3F80_0000, RoundMode::Rne),
+            Integer::from(0x7F80_0000u64)
+        );
         // product finite, z = +inf -> +inf.
-        assert_eq!(fma(0x3F80_0000, 0x3F80_0000, 0x7F80_0000, RoundMode::Rne),
-                   Integer::from(0x7F80_0000u64));
+        assert_eq!(
+            fma(0x3F80_0000, 0x3F80_0000, 0x7F80_0000, RoundMode::Rne),
+            Integer::from(0x7F80_0000u64)
+        );
         // product -inf (neg * pos), z finite -> -inf.
-        assert_eq!(fma(0xFF80_0000, 0x3F80_0000, 0x3F80_0000, RoundMode::Rne),
-                   Integer::from(0xFF80_0000u64));
+        assert_eq!(
+            fma(0xFF80_0000, 0x3F80_0000, 0x3F80_0000, RoundMode::Rne),
+            Integer::from(0xFF80_0000u64)
+        );
     }
 
     #[test]
     fn ref_fma_zero_sign_rule() {
         let (eb, sb) = (8u32, 24u32);
         let fma = |x: u64, y: u64, z: u64, m| {
-            ref_fma(eb, sb, &Integer::from(x), &Integer::from(y), &Integer::from(z), m)
+            ref_fma(
+                eb,
+                sb,
+                &Integer::from(x),
+                &Integer::from(y),
+                &Integer::from(z),
+                m,
+            )
         };
         // Same-sign-positive zeros: + in ALL modes, including RTN (the bug case).
-        assert_eq!(fma(0x0000_0000, 0x3F80_0000, 0x0000_0000, RoundMode::Rtn),
-                   Integer::from(0x0000_0000u64));
-        assert_eq!(fma(0x0000_0000, 0x3F80_0000, 0x0000_0000, RoundMode::Rne),
-                   Integer::from(0x0000_0000u64));
+        assert_eq!(
+            fma(0x0000_0000, 0x3F80_0000, 0x0000_0000, RoundMode::Rtn),
+            Integer::from(0x0000_0000u64)
+        );
+        assert_eq!(
+            fma(0x0000_0000, 0x3F80_0000, 0x0000_0000, RoundMode::Rne),
+            Integer::from(0x0000_0000u64)
+        );
         // Opposite-sign zeros: + except RTN.
-        assert_eq!(fma(0x0000_0000, 0x3F80_0000, 0x8000_0000, RoundMode::Rne),
-                   Integer::from(0x0000_0000u64));
-        assert_eq!(fma(0x0000_0000, 0x3F80_0000, 0x8000_0000, RoundMode::Rtn),
-                   Integer::from(0x8000_0000u64));
+        assert_eq!(
+            fma(0x0000_0000, 0x3F80_0000, 0x8000_0000, RoundMode::Rne),
+            Integer::from(0x0000_0000u64)
+        );
+        assert_eq!(
+            fma(0x0000_0000, 0x3F80_0000, 0x8000_0000, RoundMode::Rtn),
+            Integer::from(0x8000_0000u64)
+        );
         // Same-sign-negative zeros: - in ALL modes.
-        assert_eq!(fma(0x8000_0000, 0x3F80_0000, 0x8000_0000, RoundMode::Rne),
-                   Integer::from(0x8000_0000u64));
+        assert_eq!(
+            fma(0x8000_0000, 0x3F80_0000, 0x8000_0000, RoundMode::Rne),
+            Integer::from(0x8000_0000u64)
+        );
     }
 }

@@ -372,7 +372,11 @@ impl EqualityEngine {
         if a == b {
             return;
         }
-        let key = if a.index() <= b.index() { (a, b) } else { (b, a) };
+        let key = if a.index() <= b.index() {
+            (a, b)
+        } else {
+            (b, a)
+        };
         if !visited.insert(key) {
             return; // already expanded this pair — avoid re-expansion / cycles
         }
@@ -692,10 +696,10 @@ mod tests {
         eq.assert_diseq(a, c, asserted(1)).unwrap();
 
         eq.push(); // level 1
-        // merge(a, b): both classes have size 1; union-by-size ties keep the
-        // FIRST argument's representative as root (`>=`), so calling
-        // merge(a, b) makes `a` the surviving representative and `b` the
-        // union child — find(b) becomes `a` afterward.
+                   // merge(a, b): both classes have size 1; union-by-size ties keep the
+                   // FIRST argument's representative as root (`>=`), so calling
+                   // merge(a, b) makes `a` the surviving representative and `b` the
+                   // union child — find(b) becomes `a` afterward.
         eq.merge(a, b, asserted(2)).unwrap();
         let mut drained = Vec::new();
         eq.drain_merges(&mut drained);

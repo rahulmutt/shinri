@@ -97,9 +97,7 @@ fn is_bv_sort(ctx: &Context, t: TermId) -> bool {
 /// `(Array String String)`, `(Array String T)`, `(Array T String)` all return true.
 fn array_involves_string(ctx: &Context, sort_id: shinri_core::SortId) -> bool {
     match ctx.sort_node(sort_id) {
-        SortNode::Array(i, e) => {
-            *i == ctx.string_sort() || *e == ctx.string_sort()
-        }
+        SortNode::Array(i, e) => *i == ctx.string_sort() || *e == ctx.string_sort(),
         _ => false,
     }
 }
@@ -109,7 +107,12 @@ fn array_involves_string(ctx: &Context, sort_id: shinri_core::SortId) -> bool {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Walk `t` and all its subterms once; call `f` on each; early-exit if `f` returns true.
-fn walk_any(ctx: &Context, t: TermId, seen: &mut FxHashSet<TermId>, f: &mut impl FnMut(&Context, TermId) -> bool) -> bool {
+fn walk_any(
+    ctx: &Context,
+    t: TermId,
+    seen: &mut FxHashSet<TermId>,
+    f: &mut impl FnMut(&Context, TermId) -> bool,
+) -> bool {
     if !seen.insert(t) {
         return false;
     }
@@ -186,7 +189,10 @@ fn walk_fence(ctx: &Context, t: TermId, seen: &mut FxHashSet<TermId>) -> bool {
 
             // ── Fence condition 3: arrays over String ─────────────────────────
             // `select`/`store` whose array operand involves a String sort.
-            if matches!(op, Op::Builtin(BuiltinOp::Select) | Op::Builtin(BuiltinOp::Store)) {
+            if matches!(
+                op,
+                Op::Builtin(BuiltinOp::Select) | Op::Builtin(BuiltinOp::Store)
+            ) {
                 if let Some(&arr) = kids.first() {
                     if array_involves_string(ctx, ctx.sort_of(arr)) {
                         return true;
@@ -259,7 +265,9 @@ mod tests {
         let mut ctx = Context::new();
         let x = str_var(&mut ctx, "x");
         let y = str_var(&mut ctx, "y");
-        let cc = ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y]).unwrap();
+        let cc = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
         let a = ctx.mk_string_const("a");
         let eq = ctx.mk_eq(cc, a).unwrap();
         assert!(uses_strings(&ctx, &[eq]));
@@ -301,7 +309,9 @@ mod tests {
         let x = str_var(&mut ctx, "x");
         let len = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
         let zero = ctx.mk_numeral(shinri_core::Rational::zero(), ctx.int_sort());
-        let ge = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[len, zero]).unwrap();
+        let ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[len, zero])
+            .unwrap();
         assert!(uses_strings(&ctx, &[ge]));
         assert!(!fenced(&ctx, &[ge]));
     }

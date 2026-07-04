@@ -50,9 +50,13 @@ impl WordSink for Lowerer {
             // other BV-sorted node goes to the BV blaster. (Still-crossing ops
             // are fenced before lowering, so blast_bv_word's unreachable! arm
             // stays an internal invariant.)
-            if matches!(ctx.term_node(t),
-                TermNode::App { op: Op::Builtin(BuiltinOp::FpToUbv(_) | BuiltinOp::FpToSbv(_)), .. })
-            {
+            if matches!(
+                ctx.term_node(t),
+                TermNode::App {
+                    op: Op::Builtin(BuiltinOp::FpToUbv(_) | BuiltinOp::FpToSbv(_)),
+                    ..
+                }
+            ) {
                 crate::blast_fp_to_bv(self, ctx, t)
             } else {
                 blast_bv_word(self, ctx, t)
@@ -101,11 +105,19 @@ impl Lowerer {
     pub fn var_bits_split(
         &self,
         ctx: &Context,
-    ) -> (FxHashMap<TermId, Vec<BitLit>>, FxHashMap<TermId, Vec<BitLit>>) {
+    ) -> (
+        FxHashMap<TermId, Vec<BitLit>>,
+        FxHashMap<TermId, Vec<BitLit>>,
+    ) {
         let mut bv = FxHashMap::default();
         let mut fp = FxHashMap::default();
         for (&tid, bits) in self.cache.iter() {
-            if let TermNode::App { op: Op::Uninterpreted(_), args, sort } = ctx.term_node(tid) {
+            if let TermNode::App {
+                op: Op::Uninterpreted(_),
+                args,
+                sort,
+            } = ctx.term_node(tid)
+            {
                 if !ctx.children(*args).is_empty() {
                     continue;
                 }
@@ -125,7 +137,12 @@ impl Lowerer {
     pub fn rm_var_sels(&self, ctx: &Context) -> FxHashMap<TermId, [BitLit; 5]> {
         let mut out = FxHashMap::default();
         for (&tid, sel) in self.rm_cache.iter() {
-            if let TermNode::App { op: Op::Uninterpreted(_), args, .. } = ctx.term_node(tid) {
+            if let TermNode::App {
+                op: Op::Uninterpreted(_),
+                args,
+                ..
+            } = ctx.term_node(tid)
+            {
                 if ctx.children(*args).is_empty() {
                     out.insert(tid, *sel);
                 }
@@ -144,9 +161,14 @@ mod tests {
         use shinri_sat::{Lit, NoProof, NoTheory, Solver, SolverConfig, Var, Vmtf};
         let cnf = lw.b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in &cnf.clauses {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         for &(bl, want) in units {
@@ -169,8 +191,12 @@ mod tests {
         let x = mk(&mut ctx, "x", f16);
         let y = mk(&mut ctx, "y", f16);
         let rne = ctx.mk_rm_const(RoundingMode::Rne);
-        let ux = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x]).unwrap();
-        let uy = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, y]).unwrap();
+        let ux = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x])
+            .unwrap();
+        let uy = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, y])
+            .unwrap();
         let eq_xy = ctx.mk_eq(x, y).unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
         let eq_uv = ctx.mk_eq(ux, uy).unwrap();
@@ -179,7 +205,10 @@ mod tests {
         let l_nan = lw.atom(&ctx, isnan);
         let l_uv = lw.atom(&ctx, eq_uv);
         let r = solve_with_units(lw, &[(l_eq, true), (l_nan, true), (l_uv, false)]);
-        assert!(matches!(r, shinri_sat::SolveResult::Unsat { .. }), "congruence must bind equal-arg applications");
+        assert!(
+            matches!(r, shinri_sat::SolveResult::Unsat { .. }),
+            "congruence must bind equal-arg applications"
+        );
     }
 
     #[test]
@@ -192,9 +221,15 @@ mod tests {
         let x = ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap();
         let rne = ctx.mk_rm_const(RoundingMode::Rne);
         let rtz = ctx.mk_rm_const(RoundingMode::Rtz);
-        let u1 = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x]).unwrap();
-        let u2 = ctx.mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rtz, x]).unwrap();
-        let s1 = ctx.mk_app(Op::Builtin(BuiltinOp::FpToSbv(8)), &[rne, x]).unwrap();
+        let u1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rne, x])
+            .unwrap();
+        let u2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rtz, x])
+            .unwrap();
+        let s1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToSbv(8)), &[rne, x])
+            .unwrap();
         let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
         let ne_modes = ctx.mk_eq(u1, u2).unwrap();
         let ne_faces = ctx.mk_eq(u1, s1).unwrap();
@@ -203,8 +238,10 @@ mod tests {
         let l_m = lw.atom(&ctx, ne_modes);
         let l_f = lw.atom(&ctx, ne_faces);
         let r = solve_with_units(lw, &[(l_nan, true), (l_m, false), (l_f, false)]);
-        assert!(matches!(r, shinri_sat::SolveResult::Sat),
-            "different modes / different faces are unconstrained relative to each other");
+        assert!(
+            matches!(r, shinri_sat::SolveResult::Sat),
+            "different modes / different faces are unconstrained relative to each other"
+        );
     }
 
     #[test]
@@ -229,8 +266,17 @@ mod tests {
         let _l_fp = lw.atom(&ctx, isnan);
 
         let (bv_vars, fp_vars) = lw.var_bits_split(&ctx);
-        assert!(bv_vars.contains_key(&x) && bv_vars[&x].len() == 8, "x is an 8-bit BV var");
-        assert!(fp_vars.contains_key(&y) && fp_vars[&y].len() == 32, "y is a 32-bit FP var");
-        assert!(!bv_vars.contains_key(&y) && !fp_vars.contains_key(&x), "no sort cross-contamination");
+        assert!(
+            bv_vars.contains_key(&x) && bv_vars[&x].len() == 8,
+            "x is an 8-bit BV var"
+        );
+        assert!(
+            fp_vars.contains_key(&y) && fp_vars[&y].len() == 32,
+            "y is a 32-bit FP var"
+        );
+        assert!(
+            !bv_vars.contains_key(&y) && !fp_vars.contains_key(&x),
+            "no sort cross-contamination"
+        );
     }
 }

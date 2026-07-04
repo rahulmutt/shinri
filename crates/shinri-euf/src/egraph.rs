@@ -570,7 +570,10 @@ mod tests {
         let res = g.merge_eq(&mut eq, x, x, asserted(2));
 
         // Provenance: the stale congruence must NOT have been applied.
-        assert!(res.is_none(), "stale congruence must not fabricate a conflict");
+        assert!(
+            res.is_none(),
+            "stale congruence must not fabricate a conflict"
+        );
         assert!(
             !eq.are_equal(na, nb),
             "stale congruence must not unsoundly merge na and nb"

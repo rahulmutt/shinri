@@ -6,7 +6,9 @@ use shinri_bv::{BitLit, Blaster};
 /// since lzc of an 8-bit word ranges 0..=8).
 pub fn count_width(n: usize) -> usize {
     let mut w = 1usize;
-    while (1usize << w) <= n { w += 1; }
+    while (1usize << w) <= n {
+        w += 1;
+    }
     w
 }
 
@@ -22,8 +24,8 @@ pub fn lzc(b: &mut Blaster, bits: &[BitLit]) -> Vec<BitLit> {
     for i in (0..n).rev() {
         let is_zero = b.not1(bits[i]);
         let inc = b.and2(still_zero, is_zero); // add 1 this position?
-        // count += inc  (inline ripple-add: inc is bit 0 of a cw-bit addend, rest zero)
-        // addend = [inc, 0, 0, ...] with carry-in = 0
+                                               // count += inc  (inline ripple-add: inc is bit 0 of a cw-bit addend, rest zero)
+                                               // addend = [inc, 0, 0, ...] with carry-in = 0
         let cin = b.zero();
         let (s0, c0) = b.full_adder(count[0], inc, cin);
         count[0] = s0;
@@ -44,21 +46,36 @@ mod tests {
     use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
 
     fn const_bits(b: &Blaster, width: usize, value: u64) -> Vec<BitLit> {
-        (0..width).map(|i| if (value >> i) & 1 == 1 { b.one() } else { b.zero() }).collect()
+        (0..width)
+            .map(|i| {
+                if (value >> i) & 1 == 1 {
+                    b.one()
+                } else {
+                    b.zero()
+                }
+            })
+            .collect()
     }
     fn eval_word(b: Blaster, word: &[BitLit]) -> u64 {
         let cnf = b.finish();
         let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
-        for _ in 0..cnf.num_vars { s.new_var(); }
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
         for c in &cnf.clauses {
-            let ls: Vec<Lit> = c.iter().map(|bl| Lit::new(Var::new(bl.var), bl.pos)).collect();
+            let ls: Vec<Lit> = c
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
             s.add_clause(&ls);
         }
         assert_eq!(s.solve(), SolveResult::Sat);
         let mut v = 0u64;
         for (i, bl) in word.iter().enumerate() {
             let raw = s.value_of(Var::new(bl.var)).unwrap();
-            if if bl.pos { raw } else { !raw } { v |= 1 << i; }
+            if if bl.pos { raw } else { !raw } {
+                v |= 1 << i;
+            }
         }
         v
     }
@@ -67,7 +84,9 @@ mod tests {
         // count zero bits from MSB (index width-1) downward until first 1.
         let mut c = 0u64;
         for i in (0..width).rev() {
-            if (value >> i) & 1 == 1 { break; }
+            if (value >> i) & 1 == 1 {
+                break;
+            }
             c += 1;
         }
         c

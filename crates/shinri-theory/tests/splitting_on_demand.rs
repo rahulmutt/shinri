@@ -113,8 +113,11 @@ fn split_once_then_sat_end_to_end() {
     // Build a Solver whose theory is a real Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory>.
     // Combiner::default() uses Context::new() internally; no atoms are registered
     // here, so assert/propagate are no-ops for the single real var `a`.
-    let mut s: Solver<Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory>, NoProof, Vmtf> =
-        Solver::new(SolverConfig::default());
+    let mut s: Solver<
+        Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory>,
+        NoProof,
+        Vmtf,
+    > = Solver::new(SolverConfig::default());
 
     // Mint one real var and force it true with a unit clause. This ensures the
     // solver reaches `pick_branch() == None` (all vars assigned) and enters the
