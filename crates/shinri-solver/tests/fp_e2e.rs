@@ -715,6 +715,36 @@ fn to_real_matches_classification_f16() {
     assert_eq!(o, SolveOutcome::Unsat);
 }
 
+#[test]
+fn to_real_nan_is_functional_unsat() {
+    // x=y, both NaN, but to_real(x) != to_real(y) ⇒ UNSAT (functionality).
+    let (o, _) = run("(declare-fun x () Float16) (declare-fun y () Float16) \
+        (assert (fp.isNaN x)) (assert (fp.isNaN y)) (assert (= x y)) \
+        (assert (not (= (fp.to_real x) (fp.to_real y)))) (check-sat)");
+    assert_eq!(o, SolveOutcome::Unsat, "fp.to_real must be a function over NaN");
+}
+
+#[test]
+fn to_real_pos_neg_inf_may_differ_sat() {
+    // +inf and -inf are distinct values; their unspecified reals may differ ⇒ SAT.
+    // Also a guard against over-sharing: FAILS (Unsat) if pos_inf_c == neg_inf_c.
+    let (o, _) = run("(declare-fun x () Float16) (declare-fun y () Float16) \
+        (assert (fp.isInfinite x)) (assert (fp.isPositive x)) \
+        (assert (fp.isInfinite y)) (assert (fp.isNegative y)) \
+        (assert (not (= (fp.to_real x) (fp.to_real y)))) (check-sat)");
+    assert_eq!(o, SolveOutcome::Sat, "distinct-const specials must allow inequality");
+}
+
+#[test]
+fn to_real_const_nan_is_functional_unsat() {
+    // Two CONSTANT-NaN operands proven equal must make their to_reals equal
+    // (constant-arm functionality): shared nan_c ⇒ to_real(x)=to_real(y) ⇒ UNSAT.
+    let (o, _) = run("(declare-fun x () Float16) (declare-fun y () Float16) \
+        (assert (= x (_ NaN 5 11))) (assert (= y (_ NaN 5 11))) (assert (= x y)) \
+        (assert (not (= (fp.to_real x) (fp.to_real y)))) (check-sat)");
+    assert_eq!(o, SolveOutcome::Unsat, "constant NaN operands must share nan_c");
+}
+
 // ── Slice-4b: mixed BV+FP (no crossing op) now solves ──────────────────────
 #[test]
 fn mixed_bv_and_fp_sat_with_model() {

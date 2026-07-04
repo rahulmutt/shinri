@@ -86,6 +86,14 @@ pub struct Solver {
     pending_bridge: Vec<BridgeRow>,
     /// Monotone counter for unique fresh Real-channel constant names (slice 9).
     bridge_name_counter: u64,
+    /// Slice-9 Task-5: per-format (eb,sb) → the THREE distinct unconstrained
+    /// Real special consts `(pos_inf_c, neg_inf_c, nan_c)`, minted once per
+    /// format and SHARED across every `fp.to_real` term of that format (both the
+    /// symbolic and the constant arm). Same class → same const gives
+    /// functionality; three distinct consts keep the classes independent (no
+    /// wrong-UNSAT). Minted pre-clone; cleared each solve alongside
+    /// `pending_bridge`.
+    special_reals: rustc_hash::FxHashMap<(u32, u32), (TermId, TermId, TermId)>,
 }
 
 /// A pre-minted Real-bridge row (slice 9). All atom TermIds are minted before
@@ -104,6 +112,20 @@ enum BridgeRow {
     /// under the exponent/sign guard, `tr <= L` ∧ `tr >= L` with
     /// `L = k + Σ coeffs[i]·b_i`.
     Finite { x: TermId, s: bool, e: u64, le: TermId, ge: TermId },
+    /// Symbolic arm (Task 5) — a NaN/±∞ guarded pin for operand `x`: under the
+    /// all-ones-exponent guard selecting class `which`, `tr <= c` ∧ `tr >= c`
+    /// where `c` is the shared per-format special const for that class. Emitted
+    /// as guard clauses against the blasted FP bits (PosInf/NegInf: one guard;
+    /// Nan: one clause per sig bit `j`).
+    Special { x: TermId, which: SpecialKind, le: TermId, ge: TermId },
+}
+
+/// Which NaN/±∞ special constant a Task-5 `BridgeRow::Special` pins `tr` to.
+#[derive(Clone, Copy)]
+enum SpecialKind {
+    PosInf,
+    NegInf,
+    Nan,
 }
 
 impl Default for Solver {
@@ -133,6 +155,7 @@ impl Solver {
             eliminated_ite_vals: rustc_hash::FxHashMap::default(),
             pending_bridge: Vec::new(),
             bridge_name_counter: 0,
+            special_reals: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -543,6 +566,7 @@ impl Solver {
         // enc-block emitter only encodes+asserts them. `assertions` is still
         // live here (it is consumed by `lower` on the next line).
         self.pending_bridge.clear();
+        self.special_reals.clear();
         if bridge {
             self.build_to_real_bridge_terms(&assertions, &to_real_terms);
         }
@@ -1002,6 +1026,17 @@ impl Solver {
                     Op::Uninterpreted(_) if children.is_empty() => true,
                     // Non-nullary uninterpreted = function application (EUF).
                     Op::Uninterpreted(_) => false,
+                    // Slice-9 Real bridge: `fp.to_real(x)` is a Real-sorted
+                    // bridge variable, pinned by the bridge to (in)equalities
+                    // over its blasted FP bits. Arith owns it as an opaque Real
+                    // LEAF (its FP child is not arith — do NOT recurse), so a
+                    // disequality/distinct over two `fp.to_real` terms lowers to
+                    // Lt/Gt for Arith. Without this the diseq would route to EUF,
+                    // where the bridge's arith-side equality (e.g. both pinned to
+                    // the shared nan_c) cannot refute it → wrong-SAT. `fp.to_real`
+                    // only reaches `lower` when the bridge is active (eb<=8), so
+                    // it is always pinned here.
+                    Op::Builtin(BuiltinOp::FpToReal) => true,
                     // Linear arithmetic ops: all children must be pure arith too.
                     Op::Builtin(
                         BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Neg,
@@ -1051,6 +1086,37 @@ impl Solver {
         out
     }
 
+    /// Slice-9 Task-5: the three DISTINCT unconstrained Real special consts
+    /// `(pos_inf_c, neg_inf_c, nan_c)` for format `(eb,sb)`, minted once and
+    /// memoized on `self`, SHARED across every `fp.to_real` term of that format
+    /// (both arms consult this). Each is a fresh nullary Real symbol; the three
+    /// MUST be distinct terms (a single shared const would force
+    /// `to_real(+∞)=to_real(−∞)` — a wrong-UNSAT). Minted here, pre-clone.
+    fn special_reals_for(&mut self, eb: u32, sb: u32) -> (TermId, TermId, TermId) {
+        use shinri_core::Op;
+        if let Some(&t) = self.special_reals.get(&(eb, sb)) {
+            return t;
+        }
+        let real = self.ctx.real_sort();
+        let n = self.bridge_name_counter;
+        self.bridge_name_counter += 1;
+        let pos = {
+            let sym = self.ctx.declare_fun(&format!("!brdg_pinf_{eb}_{sb}_{n}"), &[], real);
+            self.ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
+        };
+        let neg = {
+            let sym = self.ctx.declare_fun(&format!("!brdg_ninf_{eb}_{sb}_{n}"), &[], real);
+            self.ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
+        };
+        let nan = {
+            let sym = self.ctx.declare_fun(&format!("!brdg_nan_{eb}_{sb}_{n}"), &[], real);
+            self.ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
+        };
+        let triple = (pos, neg, nan);
+        self.special_reals.insert((eb, sb), triple);
+        triple
+    }
+
     fn build_to_real_bridge_terms(&mut self, assertions: &[TermId], to_real_terms: &[TermId]) {
         use shinri_core::{BuiltinOp, Op, TermNode};
         let real = self.ctx.real_sort();
@@ -1066,14 +1132,32 @@ impl Solver {
             // Route: const-resolvable operand → Task-3 unconditional arm;
             // otherwise → Task-4 symbolic arm. Never both for one operand.
             if let Some(bits) = self.fp_operand_const_bits(x, assertions) {
+                use shinri_fp::reference::FpClass;
                 let cls = shinri_fp::reference::decode(eb, sb, &bits);
-                if let Some(q) = shinri_fp::reference::class_to_rational(eb, sb, &cls) {
-                    let num = self.ctx.mk_numeral(q, real);
-                    let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, num]).unwrap();
-                    let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, num]).unwrap();
-                    self.pending_bridge.push(BridgeRow::Constant { le, ge });
+                match shinri_fp::reference::class_to_rational(eb, sb, &cls) {
+                    Some(q) => {
+                        let num = self.ctx.mk_numeral(q, real);
+                        let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, num]).unwrap();
+                        let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, num]).unwrap();
+                        self.pending_bridge.push(BridgeRow::Constant { le, ge });
+                    }
+                    None => {
+                        // Task 5: a const-resolvable NaN/±∞ operand. Pin `tr`
+                        // UNCONDITIONALLY to the SAME shared per-format special
+                        // const (by class) the symbolic arm uses — do NOT leave
+                        // it unconstrained (that was the functionality hole).
+                        let (pos, neg, nan) = self.special_reals_for(eb, sb);
+                        let c = match cls {
+                            FpClass::Nan => nan,
+                            FpClass::Inf { sign: true } => neg,
+                            FpClass::Inf { sign: false } => pos,
+                            _ => unreachable!("class_to_rational None only for NaN/±Inf"),
+                        };
+                        let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, c]).unwrap();
+                        let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, c]).unwrap();
+                        self.pending_bridge.push(BridgeRow::Constant { le, ge });
+                    }
                 }
-                // NaN/Inf constant ⇒ class_to_rational is None ⇒ leave tr unconstrained.
                 continue;
             }
             self.build_symbolic_to_real_rows(tr, x, eb, sb);
@@ -1136,6 +1220,19 @@ impl Solver {
                 let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, l]).unwrap();
                 self.pending_bridge.push(BridgeRow::Finite { x, s, e, le, ge });
             }
+        }
+        // Task 5: NaN/±∞ (all-ones exponent) rows. Pin `tr` to the shared
+        // per-format special const of the fired class under the all-ones guard.
+        // One (le,ge) pin pair per class; the emitter builds the guard clauses.
+        let (pos_c, neg_c, nan_c) = self.special_reals_for(eb, sb);
+        for (which, c) in [
+            (SpecialKind::PosInf, pos_c),
+            (SpecialKind::NegInf, neg_c),
+            (SpecialKind::Nan, nan_c),
+        ] {
+            let le = self.ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[tr, c]).unwrap();
+            let ge = self.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tr, c]).unwrap();
+            self.pending_bridge.push(BridgeRow::Special { x, which, le, ge });
         }
     }
 
@@ -1270,6 +1367,59 @@ impl Solver {
                     let mut c2 = neg;
                     c2.push(lg);
                     enc.add_clause(&c2);
+                }
+                // Task 5: NaN/±∞ guarded special-const pin. `¬guard ∨ atom`.
+                // The `¬exp_j` disjunction is false exactly when the exponent is
+                // all-ones; the sig disjunction / `¬sig_j` selects inf vs nan;
+                // the sign literal selects ±∞. Exactly one class fires, and each
+                // fires to a distinct unconstrained const ⇒ functional (same
+                // class → same const) yet independent across classes.
+                BridgeRow::Special { x, which, le, ge } => {
+                    let vars = self.fp_var_bits.get(&x).cloned().unwrap();
+                    // LSB→MSB: significand vars[0..sb-1], exponent
+                    // vars[sb-1 .. sb-1+eb], sign vars[eb+sb-1].
+                    let (eb, sb) = self.ctx.fp_widths(self.ctx.sort_of(x)).unwrap();
+                    let sign_lit = Lit::new(vars[(eb + sb - 1) as usize], true);
+                    // ¬(exp all-ones) = ∨_j ¬exp_j.
+                    let neg_exp: Vec<Lit> = (0..eb)
+                        .map(|j| Lit::new(vars[(sb - 1 + j) as usize], true).negate())
+                        .collect();
+                    let ll = enc.encode(le);
+                    let lg = enc.encode(ge);
+                    match which {
+                        // ±∞: exp all-ones ∧ all sig 0 ∧ sign=(0 for +, 1 for −).
+                        // ¬guard = neg_exp ∨ (∨_i sig_i) ∨ sign-selector.
+                        SpecialKind::PosInf | SpecialKind::NegInf => {
+                            let mut base = neg_exp.clone();
+                            for i in 0..(sb - 1) {
+                                base.push(Lit::new(vars[i as usize], true));
+                            }
+                            base.push(match which {
+                                SpecialKind::PosInf => sign_lit, // ¬(sign=0)
+                                _ => sign_lit.negate(),          // ¬(sign=1)
+                            });
+                            let mut c1 = base.clone();
+                            c1.push(ll);
+                            enc.add_clause(&c1);
+                            let mut c2 = base;
+                            c2.push(lg);
+                            enc.add_clause(&c2);
+                        }
+                        // NaN: exp all-ones ∧ sig bit j set → tr=nan_c, one
+                        // clause per j. ¬guard_j = neg_exp ∨ ¬sig_j.
+                        SpecialKind::Nan => {
+                            for j in 0..(sb - 1) {
+                                let mut base = neg_exp.clone();
+                                base.push(Lit::new(vars[j as usize], true).negate());
+                                let mut c1 = base.clone();
+                                c1.push(ll);
+                                enc.add_clause(&c1);
+                                let mut c2 = base;
+                                c2.push(lg);
+                                enc.add_clause(&c2);
+                            }
+                        }
+                    }
                 }
             }
         }
