@@ -134,16 +134,29 @@ pub fn collect_fp_atoms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
     out
 }
 
-/// Mixed-theory fence (conservative). True if any Bool-sorted atom outside the
-/// FP set is not pure Boolean structure — including BV atoms (BVFP waits for
-/// Plan 4) and arith/EUF/array atoms. When true, the caller returns Unknown.
-pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[TermId]) -> bool {
-    let fp_set: rustc_hash::FxHashSet<TermId> = fp_atoms.iter().copied().collect();
+/// Shared walk: collect every Bool-sorted atom that is NEITHER in `allow_set`
+/// NOR pure Boolean structure (Not/And/Or/Implies/Xor/Ite, or Bool-sorted
+/// Eq/Distinct) NOR a bare nullary Bool constant. This is the single walk
+/// factored out of the old `has_non_fp_theory_atom` body so the bool fence
+/// predicate and the `Vec`-returning `non_bvfp_atoms` enumerator (added in
+/// slice 9 for `bridge_admissible`) share one implementation (DRY) instead of
+/// two copies of the same recursion that could drift apart.
+fn foreign_theory_atoms(
+    ctx: &Context,
+    assertions: &[TermId],
+    allow_set: &rustc_hash::FxHashSet<TermId>,
+) -> Vec<TermId> {
     let mut visited: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
-    fn walk(ctx: &Context, t: TermId, fp_set: &rustc_hash::FxHashSet<TermId>,
-            visited: &mut rustc_hash::FxHashSet<TermId>) -> bool {
-        if fp_set.contains(&t) { return false; }
-        if !visited.insert(t) { return false; }
+    let mut out: Vec<TermId> = Vec::new();
+    fn walk(
+        ctx: &Context,
+        t: TermId,
+        allow_set: &rustc_hash::FxHashSet<TermId>,
+        visited: &mut rustc_hash::FxHashSet<TermId>,
+        out: &mut Vec<TermId>,
+    ) {
+        if allow_set.contains(&t) { return; }
+        if !visited.insert(t) { return; }
         match ctx.term_node(t) {
             TermNode::App { op, args, .. } => {
                 let kids: Vec<TermId> = ctx.children(*args).to_vec();
@@ -153,7 +166,8 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
                 let is_bool_eq = matches!(op, Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct))
                     && kids.first().is_some_and(|&k| ctx.sort_of(k) == ctx.bool_sort());
                 if is_bool_structure || is_bool_eq {
-                    return kids.iter().any(|&k| walk(ctx, k, fp_set, visited));
+                    for k in kids { walk(ctx, k, allow_set, visited, out); }
+                    return;
                 }
                 // A bare declared Bool constant (0-ary uninterpreted symbol,
                 // Bool-sorted) needs NO theory reasoning: a nullary symbol has
@@ -169,18 +183,29 @@ pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[
                     && kids.is_empty()
                     && ctx.sort_of(t) == ctx.bool_sort()
                 {
-                    return false;
+                    return;
                 }
                 if ctx.sort_of(t) == ctx.bool_sort() {
-                    // Bool-sorted, not an FP atom, not Boolean structure → fence.
-                    return true;
+                    // Bool-sorted, not in the allow-set, not Boolean structure
+                    // → a foreign theory atom.
+                    out.push(t);
+                    return;
                 }
-                kids.iter().any(|&k| walk(ctx, k, fp_set, visited))
+                for k in kids { walk(ctx, k, allow_set, visited, out); }
             }
-            TermNode::Const { .. } => false,
+            TermNode::Const { .. } => {}
         }
     }
-    assertions.iter().any(|&a| walk(ctx, a, &fp_set, &mut visited))
+    for &a in assertions { walk(ctx, a, allow_set, &mut visited, &mut out); }
+    out
+}
+
+/// Mixed-theory fence (conservative). True if any Bool-sorted atom outside the
+/// FP set is not pure Boolean structure — including BV atoms (BVFP waits for
+/// Plan 4) and arith/EUF/array atoms. When true, the caller returns Unknown.
+pub fn has_non_fp_theory_atom(ctx: &Context, assertions: &[TermId], fp_atoms: &[TermId]) -> bool {
+    let fp_set: rustc_hash::FxHashSet<TermId> = fp_atoms.iter().copied().collect();
+    !foreign_theory_atoms(ctx, assertions, &fp_set).is_empty()
 }
 
 /// Third-theory fence for the lifted mixed BV+FP path (slice 4b). Returns true
@@ -198,6 +223,132 @@ pub fn has_non_bvfp_theory_atom(
     union.extend_from_slice(fp_atoms);
     union.extend_from_slice(bv_atoms);
     has_non_fp_theory_atom(ctx, assertions, &union)
+}
+
+/// `Vec`-returning sibling of `has_non_bvfp_theory_atom`: every Bool-sorted
+/// atom NEITHER a collected FP atom NOR a collected BV atom NOR pure Boolean
+/// structure, returned so the caller (`bridge_admissible`) can further classify
+/// each one (e.g. accept pure-LRA-Real atoms) instead of just fencing. Shares
+/// the `foreign_theory_atoms` walk with `has_non_fp_theory_atom` (DRY).
+fn non_bvfp_atoms(
+    ctx: &Context,
+    assertions: &[TermId],
+    fp_atoms: &[TermId],
+    bv_atoms: &[TermId],
+) -> Vec<TermId> {
+    let mut allow: rustc_hash::FxHashSet<TermId> =
+        rustc_hash::FxHashSet::with_capacity_and_hasher(
+            fp_atoms.len() + bv_atoms.len(),
+            Default::default(),
+        );
+    allow.extend(fp_atoms.iter().copied());
+    allow.extend(bv_atoms.iter().copied());
+    foreign_theory_atoms(ctx, assertions, &allow)
+}
+
+/// True iff every crossing conversion present is an admitted `fp.to_real`
+/// (operand Float with eb ≤ 8) — i.e. NO symbolic-Real `to_fp`, and no
+/// `fp.to_real` over a too-large format. NOTE: this is vacuously true when NO
+/// crossing conversion is present at all (including when there is no
+/// `fp.to_real` term whatsoever) — callers must NOT treat this alone as
+/// evidence that a `fp.to_real` bridge is in play; see
+/// `has_admitted_to_real_term` in `bridge_admissible` for that.
+fn only_crossing_is_admitted_to_real(ctx: &Context, assertions: &[TermId]) -> bool {
+    let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+    fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
+        if !seen.insert(t) { return true; }
+        if let TermNode::App { op, args, .. } = ctx.term_node(t) {
+            let kids: Vec<TermId> = ctx.children(*args).to_vec();
+            match op {
+                Op::Builtin(BuiltinOp::FpToReal) => {
+                    // admitted iff operand is Float with eb <= 8
+                    match ctx.fp_widths(ctx.sort_of(kids[0])) {
+                        Some((eb, _sb)) if eb <= 8 => {}
+                        _ => return false,
+                    }
+                }
+                Op::Builtin(BuiltinOp::ToFp { .. }) => {
+                    // any symbolic-Real to_fp face is NOT admitted here.
+                    if kids.len() == 2
+                        && matches!(ctx.sort_node(ctx.sort_of(kids[1])), SortNode::Real)
+                        && ctx.const_real_value(kids[1]).is_none()
+                    {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+            return kids.into_iter().all(|c| walk(ctx, c, seen));
+        }
+        true
+    }
+    assertions.iter().all(|&a| walk(ctx, a, &mut seen))
+}
+
+/// True iff at least one `fp.to_real` term with an admitted operand (eb ≤ 8)
+/// is actually present. SCOPE-TIGHTENING (slice 9 pre-flight finding):
+/// `only_crossing_is_admitted_to_real` alone is vacuously true when there is
+/// no crossing conversion at all — including when there is no `fp.to_real`
+/// term whatsoever. Combined with "every non-BVFP atom is pure-LRA-Real",
+/// `bridge_admissible` would otherwise wrongly accept an FP+BV query that
+/// merely happens to have a bare-Real LRA atom alongside it but never
+/// actually uses the `fp.to_real` bridge — a shape outside this slice's
+/// intended scope ("fp.to_real freely mixed with LRA"). Requiring at least
+/// one admitted `fp.to_real` term closes that gap; every shape this slice
+/// intends to admit already contains one, so this never rejects an in-scope
+/// query.
+fn has_admitted_to_real_term(ctx: &Context, assertions: &[TermId]) -> bool {
+    let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+    fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
+        if !seen.insert(t) { return false; }
+        if let TermNode::App { op, args, .. } = ctx.term_node(t) {
+            let kids: Vec<TermId> = ctx.children(*args).to_vec();
+            if matches!(op, Op::Builtin(BuiltinOp::FpToReal))
+                && matches!(ctx.fp_widths(ctx.sort_of(kids[0])), Some((eb, _)) if eb <= 8)
+            {
+                return true;
+            }
+            return kids.into_iter().any(|c| walk(ctx, c, seen));
+        }
+        false
+    }
+    assertions.iter().any(|&a| walk(ctx, a, &mut seen))
+}
+
+/// A Bool atom that is a pure LRA (Real) arith relation: Le/Lt/Ge/Gt/Eq/Distinct
+/// whose operands are Real-sorted (so it routes to Arith, not Int/EUF/arrays).
+fn is_lra_real_atom(ctx: &Context, t: TermId) -> bool {
+    if let TermNode::App { op, args, .. } = ctx.term_node(t) {
+        use BuiltinOp::*;
+        if matches!(op, Op::Builtin(Le | Lt | Ge | Gt | Eq | Distinct)) {
+            let kids = ctx.children(*args);
+            return kids.iter().all(|&k| matches!(ctx.sort_node(ctx.sort_of(k)), SortNode::Real));
+        }
+    }
+    false
+}
+
+/// The exact shape QF_FP slice 9 admits for the fp.to_real bridge: FP present,
+/// only crossing is an admitted fp.to_real, at least one such admitted
+/// fp.to_real term is actually present (scope-tightening: see
+/// `has_admitted_to_real_term`), and every atom outside (fp_atoms ∪ bv_atoms)
+/// is a pure-LRA-Real arith atom. Anything else → false (caller keeps fencing
+/// to sound Unknown). NOT YET WIRED into dispatch — no behavior change.
+/// Used by unit tests only for now; dispatch wiring lands in a later slice-9
+/// task (same convention as `abv_stage::solve_qfabv`).
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn bridge_admissible(ctx: &Context, assertions: &[TermId]) -> bool {
+    if !solver_uses_fp(ctx, assertions) { return false; }
+    if !only_crossing_is_admitted_to_real(ctx, assertions) { return false; }
+    if !has_admitted_to_real_term(ctx, assertions) { return false; }
+    let fp_atoms = collect_fp_atoms(ctx, assertions);
+    let bv_atoms = crate::bv_stage::collect_bv_atoms(ctx, assertions);
+    // Every non-BVFP Bool atom must be a pure-LRA-Real atom. Reuse the existing
+    // atom-walk used by has_non_bvfp_theory_atom (via non_bvfp_atoms) but
+    // accept is_lra_real_atom instead of unconditionally fencing.
+    non_bvfp_atoms(ctx, assertions, &fp_atoms, &bv_atoms)
+        .into_iter()
+        .all(|t| is_lra_real_atom(ctx, t))
 }
 
 /// Positively-enumerated check: is an FP-sorted `word` term one that
@@ -889,5 +1040,68 @@ mod tests {
         assert_eq!(atoms, vec![atom]);
         // Support: RM =/distinct over RM literals/variables is admitted.
         assert!(fp_atoms_fully_supported(&ctx, &atoms));
+    }
+
+    #[test]
+    fn bridge_admissible_accepts_to_real_plus_lra() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        let real = ctx.real_sort();
+        let c = ctx.mk_numeral(shinri_num::Rational::new(Integer::from(1i64), Integer::from(1i64)), real);
+        let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[toreal, c]).unwrap();
+        assert!(super::bridge_admissible(&ctx, &[gt]), "to_real(F32)+LRA is admissible");
+    }
+
+    #[test]
+    fn bridge_admissible_rejects_symbolic_to_fp() {
+        // symbolic-Real to_fp must NOT be admitted (stays fenced elsewhere).
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let rf = ctx.declare_fun("r", &[], real);
+        let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
+        let rne = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let z = ctx.mk_app(Op::Builtin(BuiltinOp::ToFp { eb: 8, sb: 24 }), &[rne, r]).unwrap();
+        assert!(!super::bridge_admissible(&ctx, &[z]));
+    }
+
+    #[test]
+    fn bridge_admissible_rejects_large_format() {
+        let mut ctx = Context::new();
+        let f64 = ctx.fp_sort(11, 53);
+        let xf = ctx.declare_fun("x", &[], f64);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let toreal = ctx.mk_app(Op::Builtin(BuiltinOp::FpToReal), &[x]).unwrap();
+        let real = ctx.real_sort();
+        let c = ctx.mk_numeral(shinri_num::Rational::zero(), real);
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[toreal, c]).unwrap();
+        assert!(!super::bridge_admissible(&ctx, &[eq]), "eb>=11 stays fenced");
+    }
+
+    /// Scope-tightening canary: FP+BV plus a bare-Real LRA atom but ZERO
+    /// fp.to_real terms must NOT be admitted. Without this guard,
+    /// `only_crossing_is_admitted_to_real` is vacuously true (no crossing op to
+    /// reject) and every non-BVFP atom here IS pure-LRA, so `bridge_admissible`
+    /// would wrongly lift the fence on a shape this slice never intended to
+    /// admit (design scope is "fp.to_real freely mixed with LRA", not "any FP
+    /// query with an incidental bare-Real atom").
+    #[test]
+    fn bridge_admissible_requires_a_to_real_term() {
+        let mut ctx = Context::new();
+        let x = fp_var(&mut ctx, "x");
+        let isnan = ctx.mk_app(Op::Builtin(BuiltinOp::FpIsNaN), &[x]).unwrap();
+        let bvs = ctx.bv_sort(8);
+        let bf = ctx.declare_fun("b", &[], bvs);
+        let bvar = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
+        let one = ctx.mk_bv_const(8, Integer::from(1u64));
+        let ult = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[bvar, one]).unwrap();
+        let real = ctx.real_sort();
+        let rf = ctx.declare_fun("r", &[], real);
+        let r = ctx.mk_app(Op::Uninterpreted(rf), &[]).unwrap();
+        let zero = ctx.mk_numeral(shinri_num::Rational::zero(), real);
+        let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[r, zero]).unwrap();
+        let assertions = vec![isnan, ult, gt];
+        assert!(!super::bridge_admissible(&ctx, &assertions),
+                "no fp.to_real term present: bridge is not admissible, fence still governs");
     }
 }
