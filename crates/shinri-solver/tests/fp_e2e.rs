@@ -681,7 +681,11 @@ fn to_real_symbolic_iszero_gt_one_unsat() {
 fn to_real_symbolic_eq_zero_sat() {
     // Bare symbolic operand: `to_real(x) = 0` is now SATISFIABLE via the
     // symbolic arm (x = ±0 pins to_real(x)=0). (Re-pointed from `stays_unknown`.)
-    let (o, _) = run("(declare-fun x () Float32) \
+    // Float16 (not Float32): a fully-free operand enumerates all finite rows, so
+    // Float16 (~62 rows) covers the same symbolic path as Float32 (~510 rows) at
+    // a fraction of the runtime; Float32 row-generation is exhaustively unit-
+    // tested in shinri-fp `bridge.rs`.
+    let (o, _) = run("(declare-fun x () Float16) \
         (assert (= (fp.to_real x) 0.0)) (check-sat)");
     assert_eq!(o, SolveOutcome::Sat);
 }
