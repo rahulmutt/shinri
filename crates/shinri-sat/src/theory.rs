@@ -37,6 +37,16 @@ pub trait Theory: Default {
     fn var_for_atom(&self, _atom: TermId) -> Option<Var> {
         None
     }
+
+    /// Debug-only retraction audit (slice 11): append every literal this theory
+    /// could currently cite in a `Conflict::Lits` justification, each with a
+    /// static provenance label. After every backtrack the solver asserts each
+    /// returned lit is still True-assigned at a level ≤ the current one — a
+    /// stale entry means state failed to retract on pop (the cluster-B class),
+    /// caught at the pop that leaks instead of the later conflict that trips
+    /// over it. Default: nothing cited (pure-SAT / stub theories).
+    #[cfg(debug_assertions)]
+    fn cited_lits(&self, _out: &mut Vec<(Lit, &'static str)>) {}
 }
 
 /// The zero-cost default theory: a ZST whose methods compile to nothing.

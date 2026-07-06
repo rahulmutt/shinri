@@ -379,6 +379,16 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory
 
     fn pop(&mut self, n: usize) {
         let target = self.level - n;
+        // Slice 11 (cluster-B root cause): a conflict stashed by `assert` is
+        // expanded against CURRENT state at the next `propagate()`. If a
+        // backtrack lands between the two, the stashed leaves refer to state
+        // this pop is about to rewind — expanding them later resolves through
+        // the post-pop proof forest and fabricates a malformed (or worse,
+        // unsound-but-plausible) conflict citing retracted literals. Drop it:
+        // if the inconsistency still holds at the lower level, the theory
+        // re-derives it at the next propagate()/check() (same rationale as the
+        // merge-queue drain below).
+        self.pending_conflict = None;
         // Discard any pending congruence-merge notifications before popping. A merge
         // notification is a transient signal for the N-O exchange to react to in the
         // SAME `drive_final_check` round; an early return from that loop (an arith
@@ -398,6 +408,22 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory
         self.arrays.pop(target);
         self.string.pop(target);
         self.level = target;
+    }
+
+    #[cfg(debug_assertions)]
+    fn cited_lits(&self, out: &mut Vec<(Lit, &'static str)>) {
+        // The assert→propagate conflict bridge: leaves stashed here are expanded
+        // against CURRENT state at the next propagate(), so any Asserted lit it
+        // holds must satisfy the retraction invariant too (the cluster-B class).
+        if let Some(leaves) = &self.pending_conflict {
+            for leaf in leaves {
+                if let crate::types::EqLeaf::Asserted(l) = leaf {
+                    out.push((*l, "combiner.pending_conflict"));
+                }
+            }
+        }
+        self.eq.debug_cited_lits(out);
+        self.string.cited_lits(out);
     }
 }
 

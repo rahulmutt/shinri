@@ -3,7 +3,7 @@
 //! equality truth for all theories (spec §4).
 
 use crate::types::{ENodeId, EqConflict, EqJust, EqLeaf};
-use shinri_core::{TermId, UndoLog};
+use shinri_core::{Lit, TermId, UndoLog};
 
 /// One e-node: its union-find parent and class size (for union-by-size).
 struct ENode {
@@ -502,6 +502,27 @@ impl EqualityEngine {
         self.cong_undo.pop_to(level, |len_before| {
             cong_pairs.truncate(len_before); // truncate arena to its pre-insert length
         });
+    }
+
+    /// Debug-only (slice 11): every `Asserted` literal live in the proof forest
+    /// or the diseq map — the shared-engine provenances a conflict justification
+    /// can cite. Swept by the SAT solver's post-pop retraction audit. Live
+    /// forest edges only (`fparent[n] != n`); `Definitional` labels (e.g. the
+    /// level-0 ⊤≠⊥ diseq) carry no literal and are skipped.
+    #[cfg(debug_assertions)]
+    pub fn debug_cited_lits(&self, out: &mut Vec<(Lit, &'static str)>) {
+        for (n, p) in self.fparent.iter().enumerate() {
+            if p.index() != n {
+                if let EqJust::Asserted(l) = self.flabel[n] {
+                    out.push((l, "eq.forest"));
+                }
+            }
+        }
+        for rec in self.diseqs.values() {
+            if let EqJust::Asserted(l) = rec.just {
+                out.push((l, "eq.diseq"));
+            }
+        }
     }
 }
 

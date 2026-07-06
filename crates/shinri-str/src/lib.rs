@@ -711,6 +711,12 @@ impl TheorySolver for StrSolver {
         }
     }
 
+    #[cfg(debug_assertions)]
+    fn cited_lits(&self, out: &mut Vec<(Lit, &'static str)>) {
+        out.extend(self.eq_true.iter().map(|&(_, l)| (l, "str.eq_true")));
+        out.extend(self.diseq_true.iter().map(|&(_, l)| (l, "str.diseq_true")));
+    }
+
     fn shared_arith_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
         let mut out: Vec<TermId> = self.len_terms.iter().copied().collect();
         // Empty-length link, robust (arith-entailed) direction: if any disequality

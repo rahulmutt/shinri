@@ -213,6 +213,30 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         });
         if from > level {
             self.theory.pop((from - level) as usize);
+            #[cfg(debug_assertions)]
+            self.debug_check_retraction();
+        }
+    }
+
+    /// Slice 11: post-pop retraction audit. Panics (debug builds only) when the
+    /// theory still holds a conflict-justification literal the backtrack just
+    /// retracted — localizing a retraction leak to the pop that caused it.
+    #[cfg(debug_assertions)]
+    fn debug_check_retraction(&self) {
+        let dl = self.trail.decision_level();
+        let mut cited: Vec<(Lit, &'static str)> = Vec::new();
+        self.theory.cited_lits(&mut cited);
+        for (l, provenance) in cited {
+            assert!(
+                l.var().index() < self.assign.num_vars()
+                    && self.assign.lit_value(l) == LBool::True
+                    && self.assign.level(l.var()) <= dl,
+                "retraction audit: {provenance} holds stale lit (var {}) after pop \
+                 (value {:?}, stored level {}, current dl {dl})",
+                l.var().index(),
+                self.assign.lit_value(l),
+                self.assign.level(l.var()),
+            );
         }
     }
 
@@ -1484,6 +1508,44 @@ mod tests {
              bare disjunction, forbidding the model on every branch. got {:?}",
             res
         );
+    }
+
+    /// Slice 11: the retraction audit must fire when a theory still cites a
+    /// retracted literal after a pop. StaleCiter always "holds" x1-true; the
+    /// UNSAT 2-SAT instance forces a backtrack while x1 is unassigned → panic.
+    #[derive(Default)]
+    struct StaleCiter;
+    impl Theory for StaleCiter {
+        fn assert(&mut self, _lit: Lit) {}
+        fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+            None
+        }
+        fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+        fn check(&mut self, _e: Effort) -> TheoryResult {
+            TheoryResult::Sat
+        }
+        fn push(&mut self) {}
+        fn pop(&mut self, _n: usize) {}
+        fn new_var(&mut self, _v: Var) {}
+        #[cfg(debug_assertions)]
+        fn cited_lits(&self, out: &mut Vec<(Lit, &'static str)>) {
+            out.push((Lit::new(Var::new(1), true), "test.stale"));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "retraction audit")]
+    fn retraction_audit_catches_stale_citation() {
+        let mut s: Solver<StaleCiter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..2 {
+            s.new_var();
+        }
+        // UNSAT 2-SAT: forces decide → conflict → backtrack with x1 unassigned.
+        s.add_clause(&[lit(0, true), lit(1, true)]);
+        s.add_clause(&[lit(0, true), lit(1, false)]);
+        s.add_clause(&[lit(0, false), lit(1, true)]);
+        s.add_clause(&[lit(0, false), lit(1, false)]);
+        let _ = s.solve();
     }
 }
 

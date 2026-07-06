@@ -143,6 +143,12 @@ pub trait TheorySolver: Default {
     ) -> Vec<(TermId, TermId)> {
         Vec::new()
     }
+
+    /// Debug-only retraction audit (slice 11): append every literal this theory
+    /// could currently cite in a conflict justification (see
+    /// `shinri_sat::Theory::cited_lits`). Default: nothing cited.
+    #[cfg(debug_assertions)]
+    fn cited_lits(&self, _out: &mut Vec<(shinri_core::Lit, &'static str)>) {}
 }
 
 #[cfg(test)]
