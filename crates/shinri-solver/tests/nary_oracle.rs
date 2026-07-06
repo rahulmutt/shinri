@@ -39,6 +39,11 @@ fn shinri_outcome(src: &str) -> SolveOutcome {
             _ => {}
         }
     }
+    assert_eq!(
+        solver.theory_guard_bailouts(),
+        0,
+        "theory guard bailout — a conflict cited retracted state (retraction regression):\n{src}"
+    );
     outcome
 }
 

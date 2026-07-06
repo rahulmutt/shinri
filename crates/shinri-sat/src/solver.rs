@@ -33,6 +33,7 @@ pub struct Solver<T: Theory, P: ProofSink + Default, H: BranchHeuristic> {
     pub(crate) theory_silent: bool,
     pub(crate) stats_minimized: u64,
     pub(crate) stats_deleted: u64,
+    pub(crate) theory_guard_bailouts: u64,
 }
 
 impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
@@ -56,6 +57,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
             stats_deleted: 0,
             input_clauses: Vec::new(),
             scopes: Vec::new(),
+            theory_guard_bailouts: 0,
         }
     }
 
@@ -89,6 +91,13 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
     #[inline]
     pub fn is_unsat(&self) -> bool {
         self.unsat
+    }
+
+    /// How many theory conflicts the cluster-B guard rejected as malformed
+    /// (each a sound Unknown bail). Post-slice-11 this must be 0 on the
+    /// differential corpus — a nonzero value is a retraction regression.
+    pub fn theory_guard_bailouts(&self) -> u64 {
+        self.theory_guard_bailouts
     }
 
     /// Add an input clause (records it for push/pop, then installs it).
@@ -213,6 +222,30 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         });
         if from > level {
             self.theory.pop((from - level) as usize);
+            #[cfg(debug_assertions)]
+            self.debug_check_retraction();
+        }
+    }
+
+    /// Slice 11: post-pop retraction audit. Panics (debug builds only) when the
+    /// theory still holds a conflict-justification literal the backtrack just
+    /// retracted — localizing a retraction leak to the pop that caused it.
+    #[cfg(debug_assertions)]
+    fn debug_check_retraction(&self) {
+        let dl = self.trail.decision_level();
+        let mut cited: Vec<(Lit, &'static str)> = Vec::new();
+        self.theory.cited_lits(&mut cited);
+        for (l, provenance) in cited {
+            assert!(
+                l.var().index() < self.assign.num_vars()
+                    && self.assign.lit_value(l) == LBool::True
+                    && self.assign.level(l.var()) <= dl,
+                "retraction audit: {provenance} holds stale lit (var {}) after pop \
+                 (value {:?}, stored level {}, current dl {dl})",
+                l.var().index(),
+                self.assign.lit_value(l),
+                self.assign.level(l.var()),
+            );
         }
     }
 
@@ -254,11 +287,17 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
     /// learnt clause built from garbage. Callers must bail to Unknown when this
     /// returns false —
     /// a sound incompleteness, never a wrong verdict.
+    /// An out-of-range var (a theory conflict citing a var never allocated by
+    /// the SAT solver) is definitionally unanalyzable and rides the same bail.
+    /// The dl==0 conflict arms return Unsat before this guard runs, so guard
+    /// and counter never see level-0 theory conflicts.
     fn theory_conflict_analyzable(&self, conflict_lits: &[Lit]) -> bool {
         let dl = self.trail.decision_level();
-        conflict_lits
-            .iter()
-            .all(|&l| self.assign.lit_value(l) == LBool::False && self.assign.level(l.var()) <= dl)
+        conflict_lits.iter().all(|&l| {
+            l.var().index() < self.assign.num_vars()
+                && self.assign.lit_value(l) == LBool::False
+                && self.assign.level(l.var()) <= dl
+        })
     }
 
     /// The Boolean value of a variable in the current assignment, if assigned.
@@ -300,6 +339,15 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
 
         // Seed with the conflict clause's literals.
         let mut reason_lits = self.conflict_lits(&conflict);
+        // Both theory-conflict call sites run theory_conflict_analyzable first,
+        // so every cited var is in range here (slice 11); stored-clause
+        // conflicts only ever contain solver-allocated vars.
+        debug_assert!(
+            reason_lits
+                .iter()
+                .all(|l| l.var().index() < self.assign.num_vars()),
+            "analyze: conflict cites an unregistered var"
+        );
         // If the conflict itself is a stored clause, record it in the chain.
         if let Conflict::Clause(r) = &conflict {
             chain.push(self.db.clause_id(*r));
@@ -503,6 +551,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                     if matches!(conflict, Conflict::Lits(_))
                         && !self.theory_conflict_analyzable(&conflict_lits)
                     {
+                        self.theory_guard_bailouts += 1;
                         return SolveResult::Unknown;
                     }
                     if let Err(()) = self.reduce_to_conflict_level(&conflict_lits) {
@@ -607,6 +656,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // Unknown rather than let `analyze` compute a
                                     // backjump level above the current one.
                                     if !self.theory_conflict_analyzable(&conflict_lits) {
+                                        self.theory_guard_bailouts += 1;
                                         return SolveResult::Unknown;
                                     }
                                     if let Err(()) = self.reduce_to_conflict_level(&conflict_lits) {
@@ -1484,6 +1534,125 @@ mod tests {
              bare disjunction, forbidding the model on every branch. got {:?}",
             res
         );
+    }
+
+    /// Slice 11: the retraction audit must fire when a theory still cites a
+    /// retracted literal after a pop. StaleCiter always "holds" x1-true; the
+    /// UNSAT 2-SAT instance forces a backtrack while x1 is unassigned → panic.
+    #[derive(Default)]
+    struct StaleCiter;
+    impl Theory for StaleCiter {
+        fn assert(&mut self, _lit: Lit) {}
+        fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+            None
+        }
+        fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+        fn check(&mut self, _e: Effort) -> TheoryResult {
+            TheoryResult::Sat
+        }
+        fn push(&mut self) {}
+        fn pop(&mut self, _n: usize) {}
+        fn new_var(&mut self, _v: Var) {}
+        #[cfg(debug_assertions)]
+        fn cited_lits(&self, out: &mut Vec<(Lit, &'static str)>) {
+            out.push((Lit::new(Var::new(1), true), "test.stale"));
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "retraction audit")]
+    fn retraction_audit_catches_stale_citation() {
+        let mut s: Solver<StaleCiter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..2 {
+            s.new_var();
+        }
+        // UNSAT 2-SAT: forces decide → conflict → backtrack with x1 unassigned.
+        s.add_clause(&[lit(0, true), lit(1, true)]);
+        s.add_clause(&[lit(0, true), lit(1, false)]);
+        s.add_clause(&[lit(0, false), lit(1, true)]);
+        s.add_clause(&[lit(0, false), lit(1, false)]);
+        let _ = s.solve();
+    }
+
+    /// Slice 11: a malformed theory conflict must bail to a sound Unknown via
+    /// the cluster-B guard AND increment the counter. Citing BOTH polarities
+    /// of x1 guarantees malformation whatever the assignment: exactly one of
+    /// the two lits is True at Full-check time (every var is assigned there),
+    /// and a well-formed conflict clause has every cited lit False — the same
+    /// shape as the real pending_conflict bail (a True-valued cited lit).
+    #[derive(Default)]
+    struct MalformedConflict {
+        fired: bool,
+    }
+    impl Theory for MalformedConflict {
+        fn assert(&mut self, _lit: Lit) {}
+        fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+            None
+        }
+        fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+        fn check(&mut self, _e: Effort) -> TheoryResult {
+            if self.fired {
+                return TheoryResult::Sat;
+            }
+            self.fired = true;
+            TheoryResult::Conflict(vec![
+                Lit::new(Var::new(1), true),
+                Lit::new(Var::new(1), false),
+            ])
+        }
+        fn push(&mut self) {}
+        fn pop(&mut self, _n: usize) {}
+        fn new_var(&mut self, _v: Var) {}
+    }
+
+    #[test]
+    fn malformed_theory_conflict_bails_unknown_and_counts() {
+        let mut s: Solver<MalformedConflict, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..3 {
+            s.new_var();
+        }
+        // No unit clauses → the solver must DECIDE (dl > 0) before the Full
+        // check, so the dl==0 top-level-Unsat arm is not taken.
+        s.add_clause(&[lit(0, true), lit(2, true)]);
+        assert_eq!(s.solve(), SolveResult::Unknown);
+        assert_eq!(s.theory_guard_bailouts(), 1);
+    }
+
+    /// Slice 11 (slice-8 follow-up #2): a theory conflict citing a var NEVER
+    /// registered with the SAT solver must bail to a sound Unknown via the
+    /// guard's bounds check — not panic on an out-of-range assignment index.
+    #[derive(Default)]
+    struct UnregisteredVarConflict {
+        fired: bool,
+    }
+    impl Theory for UnregisteredVarConflict {
+        fn assert(&mut self, _lit: Lit) {}
+        fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+            None
+        }
+        fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+        fn check(&mut self, _e: Effort) -> TheoryResult {
+            if self.fired {
+                return TheoryResult::Sat;
+            }
+            self.fired = true;
+            TheoryResult::Conflict(vec![Lit::new(Var::new(10_000), false)])
+        }
+        fn push(&mut self) {}
+        fn pop(&mut self, _n: usize) {}
+        fn new_var(&mut self, _v: Var) {}
+    }
+
+    #[test]
+    fn unregistered_var_theory_conflict_bails_unknown() {
+        let mut s: Solver<UnregisteredVarConflict, NoProof, Vmtf> =
+            Solver::new(SolverConfig::default());
+        for _ in 0..3 {
+            s.new_var();
+        }
+        s.add_clause(&[lit(0, true), lit(2, true)]);
+        assert_eq!(s.solve(), SolveResult::Unknown);
+        assert_eq!(s.theory_guard_bailouts(), 1);
     }
 }
 
