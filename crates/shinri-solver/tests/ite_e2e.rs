@@ -11,6 +11,26 @@
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, SolveOutcome, Solver};
 
+/// Like `run`, but returns (outcome, get-model string, get-value responses).
+fn run_full(src: &str) -> (SolveOutcome, String, Vec<String>) {
+    let mut s = Solver::new();
+    let mut p = Parser::new(src);
+    let mut outcome = SolveOutcome::Unknown;
+    let mut values = Vec::new();
+    while let Some(result) = p.next_command(s.ctx_mut()) {
+        let cmd = result.expect("parse");
+        match s.execute(cmd) {
+            CommandResponse::Sat => outcome = SolveOutcome::Sat,
+            CommandResponse::Unsat => outcome = SolveOutcome::Unsat,
+            CommandResponse::Unknown => outcome = SolveOutcome::Unknown,
+            CommandResponse::Values(v) => values.push(v),
+            _ => {}
+        }
+    }
+    let model = s.get_model_string();
+    (outcome, model, values)
+}
+
 /// Drive a full SMT-LIB script; return the last check-sat outcome.
 fn run(src: &str) -> SolveOutcome {
     let mut s = Solver::new();
@@ -151,4 +171,38 @@ fn string_sorted_ite_stays_unsat() {
                  (assert (= (ite b \"aa\" \"bb\") \"cc\"))\
                  (check-sat)");
     assert_eq!(o, SolveOutcome::Unsat);
+}
+
+/// Slice 10 model channel: get-value on an eliminated Int-sorted ite must
+/// answer from the EUF/arith model. b is forced true, so the ite is 2.
+#[test]
+fn get_value_on_eliminated_int_ite_returns_branch_value() {
+    let (o, _model, values) = run_full(
+        "(declare-fun b () Bool)(declare-fun y () Int)\
+         (assert b)\
+         (assert (= y (ite b 2 0)))\
+         (check-sat)(get-value ((ite b 2 0)))",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert_eq!(values.len(), 1);
+    assert!(!values[0].contains("ite!"), "internal name leaked: {}", values[0]);
+    assert!(!values[0].contains('?'), "no value produced: {}", values[0]);
+    assert!(values[0].contains('2'), "expected branch value 2: {}", values[0]);
+}
+
+/// Slice 10 model channel: get-model must NOT leak internal ite! symbols
+/// even though they now live in the EUF/arith model.
+#[test]
+fn get_model_does_not_leak_arith_ite_symbols() {
+    let (o, model, _values) = run_full(
+        "(declare-fun b () Bool)(declare-fun y () Int)\
+         (assert b)\
+         (assert (= y (ite b 2 0)))\
+         (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Sat);
+    assert!(
+        !model.contains("ite!"),
+        "internal symbol leaked into get-model: {model}"
+    );
 }
