@@ -38,13 +38,17 @@ pub struct WordNorm {
     /// slice 7). Get-value only; get-model output is unchanged.
     orig_ite: FxHashMap<TermId, TermId>,
     /// Every fresh symbol term ever minted — the model-output filter set.
-    /// Only guards the bv/fp `var_bits` model-extraction loops in lib.rs. The
-    /// other two model-insertion sites (the `mb`-based `atom_vars` loop and the
-    /// `mb.iter()` surface-everything loop) do NOT check `internal` — they rely
-    /// instead on the implicit invariant that RM/FP/BV atoms are intercepted by
-    /// Tseitin's surrogate mechanism before ever reaching EUF registration, so
-    /// `mb` (the EUF/theory model) never holds an entry for a fresh `ite!`
-    /// symbol in the first place (verified slice 5).
+    /// ALL model-surfacing loops in lib.rs check `internal`: the bv/fp/rm
+    /// `var_bits` model-extraction loops (slice 5/6) and the two `mb`-based
+    /// loops (the `atom_vars` loop and the `mb.iter()` surface-everything
+    /// loop). Through slice 9, the `mb`-based loops didn't need the check —
+    /// RM/FP/BV atoms were intercepted by Tseitin's surrogate mechanism
+    /// before reaching EUF registration, so `mb` (the EUF/theory model)
+    /// never held an entry for a fresh `ite!` symbol. Slice 10 broadened ite
+    /// elimination to Int/Real/uninterpreted-sort ites, which register their
+    /// `ite!` symbols with EUF/arith as ordinary terms — so `mb` now DOES
+    /// hold entries for them, and both `mb`-based loops filter on `internal`
+    /// too (see the `internal_vals` extraction in lib.rs).
     pub internal: FxHashSet<TermId>,
     /// Monotone counter for fresh names.
     ctr: u32,
@@ -432,19 +436,6 @@ mod tests {
         let qr = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[q, r]).unwrap();
         let expect_beq = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[pq, qr]).unwrap();
         assert_eq!(out3, vec![expect_beq], "Bool n-ary = expands (slice 6)");
-    }
-
-    #[test]
-    fn bool_and_nonword_ite_pass_through() {
-        let mut ctx = Context::new();
-        let c = bool_var(&mut ctx, "c");
-        let p = bool_var(&mut ctx, "p");
-        let q = bool_var(&mut ctx, "q");
-        let bool_ite = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, p, q]).unwrap();
-        let mut wn = WordNorm::default();
-        let out = wn.normalize(&mut ctx, &[bool_ite]);
-        assert_eq!(out, vec![bool_ite]);
-        assert!(wn.internal.is_empty());
     }
 
     #[test]
