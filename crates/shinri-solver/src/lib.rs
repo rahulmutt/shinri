@@ -750,9 +750,23 @@ impl Solver {
             SolveResult::Sat => {
                 let mb = sat.theory_mut().build_model();
                 let mut model = Model::default();
+                // Values of word_norm-internal symbols, keyed by the internal
+                // term — surfaced to users only through the eliminated-ite
+                // remap below, never through get-model (slice 6; slice 10
+                // extends the filter to the EUF/arith model loops, since
+                // eliminated Int/Real/U-sort ites register their ite! symbols
+                // with EUF/arith and therefore appear in `mb`).
+                let mut internal_vals: rustc_hash::FxHashMap<
+                    TermId,
+                    shinri_theory::types::ModelVal,
+                > = rustc_hash::FxHashMap::default();
                 for (_v, term) in &atom_vars {
                     if let Some(val) = mb.get(*term) {
-                        model.values.insert(*term, val.clone());
+                        if self.word_norm.internal.contains(term) {
+                            internal_vals.insert(*term, val.clone());
+                        } else {
+                            model.values.insert(*term, val.clone());
+                        }
                     }
                 }
                 // Also surface values for all terms assigned by the theories.
@@ -763,16 +777,13 @@ impl Solver {
                 // `display_term` index out of bounds.
                 for (term, val) in mb.iter() {
                     if self.ctx.contains_term(term) {
-                        model.values.insert(term, val.clone());
+                        if self.word_norm.internal.contains(&term) {
+                            internal_vals.insert(term, val.clone());
+                        } else {
+                            model.values.insert(term, val.clone());
+                        }
                     }
                 }
-                // Values of word_norm-internal symbols, keyed by the internal
-                // term — surfaced to users only through the eliminated-ite
-                // remap below, never through get-model (slice 6).
-                let mut internal_vals: rustc_hash::FxHashMap<
-                    TermId,
-                    shinri_theory::types::ModelVal,
-                > = rustc_hash::FxHashMap::default();
                 // BV model extraction: for each declared BV constant with recorded
                 // SAT vars, read each var's assignment and pack into a ModelVal::BitVec.
                 for (&term, sat_vars) in &self.bv_var_bits {

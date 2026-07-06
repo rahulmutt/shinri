@@ -2,8 +2,9 @@
 //! collection, fences, and Tseitin, so every downstream consumer sees only
 //! shapes the blasters already handle:
 //!
-//! 1. **ite elimination**: `(ite c x y)` with BitVec/Float/RoundingMode-sorted
-//!    branches becomes a fresh nullary symbol `w` plus one appended defining
+//! 1. **ite elimination**: `(ite c x y)` with any non-Bool, non-String sort
+//!    (BitVec/Float/RoundingMode — slice 5; Int/Real/uninterpreted/Array —
+//!    slice 10) becomes a fresh nullary symbol `w` plus one appended defining
 //!    assertion `(ite c (= w x) (= w y))` (Bool-sorted ite — plain Boolean
 //!    structure for every stage). Equisatisfiable and model-preserving for
 //!    user symbols: `w` is functionally determined by (c, x, y).
@@ -15,7 +16,8 @@
 //! INVARIANTS (load-bearing; see design doc §4):
 //! - A term with no rewritten subterm is returned with its ORIGINAL TermId —
 //!   downstream stages key on TermIds.
-//! - Other sorts (Bool/Int/Real/Array/String) pass through untouched EXCEPT n-ary `=`/`distinct`, which expands for every sort (slice 6); their ites are never eliminated here.
+//! - Only Bool and String ites pass through untouched (see exclusions above);
+//!   n-ary `=`/`distinct` still expands for every sort (slice 6).
 //! - Fresh names `ite!<n>` are probed against the symbol table so they can
 //!   never alias a user symbol; model filtering keys on the `internal`
 //!   TermId set, never on the name.
@@ -36,13 +38,17 @@ pub struct WordNorm {
     /// slice 7). Get-value only; get-model output is unchanged.
     orig_ite: FxHashMap<TermId, TermId>,
     /// Every fresh symbol term ever minted — the model-output filter set.
-    /// Only guards the bv/fp `var_bits` model-extraction loops in lib.rs. The
-    /// other two model-insertion sites (the `mb`-based `atom_vars` loop and the
-    /// `mb.iter()` surface-everything loop) do NOT check `internal` — they rely
-    /// instead on the implicit invariant that RM/FP/BV atoms are intercepted by
-    /// Tseitin's surrogate mechanism before ever reaching EUF registration, so
-    /// `mb` (the EUF/theory model) never holds an entry for a fresh `ite!`
-    /// symbol in the first place (verified slice 5).
+    /// ALL model-surfacing loops in lib.rs check `internal`: the bv/fp/rm
+    /// `var_bits` model-extraction loops (slice 5/6) and the two `mb`-based
+    /// loops (the `atom_vars` loop and the `mb.iter()` surface-everything
+    /// loop). Through slice 9, the `mb`-based loops didn't need the check —
+    /// RM/FP/BV atoms were intercepted by Tseitin's surrogate mechanism
+    /// before reaching EUF registration, so `mb` (the EUF/theory model)
+    /// never held an entry for a fresh `ite!` symbol. Slice 10 broadened ite
+    /// elimination to Int/Real/uninterpreted-sort ites, which register their
+    /// `ite!` symbols with EUF/arith as ordinary terms — so `mb` now DOES
+    /// hold entries for them, and both `mb`-based loops filter on `internal`
+    /// too (see the `internal_vals` extraction in lib.rs).
     pub internal: FxHashSet<TermId>,
     /// Monotone counter for fresh names.
     ctr: u32,
@@ -62,11 +68,17 @@ impl WordNorm {
     }
 }
 
-fn is_word_sort(ctx: &Context, s: SortId) -> bool {
-    matches!(
-        ctx.sort_node(s),
-        SortNode::BitVec(_) | SortNode::Float(_, _) | SortNode::RoundingMode
-    )
+/// Sorts whose ites word_norm ELIMINATES (fresh symbol + defining assertion).
+/// Slice 5 covered the word sorts (BitVec/Float/RoundingMode) so the blasters
+/// never see term-level ite. Slice 10 broadens to Int/Real/uninterpreted/
+/// Array: those ites previously fell through to EUF as OPAQUE applications,
+/// silently unlinking the condition from the branches — wrong-SAT on every
+/// non-string path (design §1). Exclusions: Bool ite is plain Boolean
+/// structure (Tseitin handles it); String ite is handled by the string path's
+/// own reduce_assertions elimination (design §1.1 item 2) and is left
+/// untouched to avoid disturbing a working, semi-decidable path.
+fn eliminates_ite_sort(ctx: &Context, s: SortId) -> bool {
+    !matches!(ctx.sort_node(s), SortNode::Bool | SortNode::String)
 }
 
 impl WordNorm {
@@ -133,7 +145,7 @@ impl WordNorm {
                 .expect("child-for-child rebuild preserves sorts")
         };
         let result = match op {
-            Op::Builtin(BuiltinOp::Ite) if is_word_sort(ctx, ctx.sort_of(rebuilt)) => {
+            Op::Builtin(BuiltinOp::Ite) if eliminates_ite_sort(ctx, ctx.sort_of(rebuilt)) => {
                 let (c, x, y) = (new_kids[0], new_kids[1], new_kids[2]);
                 let w = if let Some(&w) = self.ite_var.get(&rebuilt) {
                     w
@@ -427,19 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn bool_and_nonword_ite_pass_through() {
-        let mut ctx = Context::new();
-        let c = bool_var(&mut ctx, "c");
-        let p = bool_var(&mut ctx, "p");
-        let q = bool_var(&mut ctx, "q");
-        let bool_ite = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, p, q]).unwrap();
-        let mut wn = WordNorm::default();
-        let out = wn.normalize(&mut ctx, &[bool_ite]);
-        assert_eq!(out, vec![bool_ite]);
-        assert!(wn.internal.is_empty());
-    }
-
-    #[test]
     fn fresh_name_skips_user_declared_collision() {
         let mut ctx = Context::new();
         // User squats on the first fresh name.
@@ -507,6 +506,144 @@ mod tests {
         let nbc = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[ebc]).unwrap();
         let expect = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[nab, nbc]).unwrap();
         assert_eq!(out, vec![expect]);
+    }
+
+    fn real_var(ctx: &mut Context, name: &str) -> shinri_core::TermId {
+        let s = ctx.real_sort();
+        let f = ctx.declare_fun(name, &[], s);
+        ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+    }
+
+    /// Slice 10: Real-sorted ite is eliminated exactly like a word ite —
+    /// rewritten atom (= w z) + appended definition (ite c (= w x) (= w y)).
+    #[test]
+    fn real_ite_becomes_fresh_var_plus_definition() {
+        let mut ctx = Context::new();
+        let c = bool_var(&mut ctx, "c");
+        let x = real_var(&mut ctx, "x");
+        let y = real_var(&mut ctx, "y");
+        let z = real_var(&mut ctx, "z");
+        let ite = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, x, y]).unwrap();
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[ite, z]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[atom]);
+        assert_eq!(out.len(), 2, "rewritten atom + definition");
+        assert_eq!(wn.internal.len(), 1);
+        let w = *wn.internal.iter().next().unwrap();
+        let expect_atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[w, z]).unwrap();
+        assert_eq!(out[0], expect_atom);
+    }
+
+    /// Slice 10: Int-sorted ite nested under arithmetic is eliminated.
+    #[test]
+    fn int_ite_under_plus_is_eliminated() {
+        let mut ctx = Context::new();
+        let c = bool_var(&mut ctx, "c");
+        let int = ctx.int_sort();
+        let xf = ctx.declare_fun("x", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let yf = ctx.declare_fun("y", &[], int);
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let ite = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, x, y]).unwrap();
+        let sum = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[ite, x]).unwrap();
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[sum, y]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[atom]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(wn.internal.len(), 1);
+    }
+
+    /// Slice 10: uninterpreted-sort ite is eliminated.
+    #[test]
+    fn usort_ite_is_eliminated() {
+        let mut ctx = Context::new();
+        let c = bool_var(&mut ctx, "c");
+        let u = ctx.declare_sort("U");
+        let af = ctx.declare_fun("a", &[], u);
+        let a = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
+        let bf = ctx.declare_fun("b2", &[], u);
+        let b = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
+        let ite = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, a, b]).unwrap();
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[ite, a]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[atom]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(wn.internal.len(), 1);
+    }
+
+    /// Slice 10: Array-sorted ite is eliminated (fixes the ABV-path wrong-SAT).
+    #[test]
+    fn array_ite_is_eliminated() {
+        let mut ctx = Context::new();
+        let c = bool_var(&mut ctx, "c");
+        let idx = ctx.bv_sort(8);
+        let elem = ctx.bv_sort(8);
+        let arr = ctx.array_sort(idx, elem);
+        let af = ctx.declare_fun("a1", &[], arr);
+        let a1 = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
+        let bf = ctx.declare_fun("a2", &[], arr);
+        let a2 = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
+        let ite = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[c, a1, a2])
+            .unwrap();
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[ite, a1]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[atom]);
+        assert_eq!(out.len(), 2);
+        assert_eq!(wn.internal.len(), 1);
+    }
+
+    /// Slice 10: a Real ite shared by two atoms mints ONE symbol + ONE deduped
+    /// definition (same contract as shared_ite_and_repeated_calls_reuse_one_symbol).
+    #[test]
+    fn shared_real_ite_reuses_one_symbol() {
+        let mut ctx = Context::new();
+        let c = bool_var(&mut ctx, "c");
+        let x = real_var(&mut ctx, "x");
+        let y = real_var(&mut ctx, "y");
+        let ite = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, x, y]).unwrap();
+        let a1 = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[ite, x]).unwrap();
+        let a2 = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[ite, y]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[a1, a2]);
+        assert_eq!(wn.internal.len(), 1, "one ite term → one fresh symbol");
+        assert_eq!(out.len(), 3, "two rewritten atoms + ONE deduped definition");
+    }
+
+    /// Slice 10 exclusion: String-sorted ite passes through UNTOUCHED (the
+    /// string path's own reduce handles it — design §1.1 item 2). Original
+    /// TermId must be preserved (no-change ⇒ same-TermId invariant).
+    #[test]
+    fn string_ite_passes_through_untouched() {
+        let mut ctx = Context::new();
+        let c = bool_var(&mut ctx, "c");
+        let strs = ctx.string_sort();
+        let af = ctx.declare_fun("s1", &[], strs);
+        let s1 = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
+        let bf = ctx.declare_fun("s2", &[], strs);
+        let s2 = ctx.mk_app(Op::Uninterpreted(bf), &[]).unwrap();
+        let ite = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[c, s1, s2])
+            .unwrap();
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[ite, s1]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[atom]);
+        assert_eq!(out, vec![atom], "String ite must not be rewritten");
+        assert!(wn.internal.is_empty());
+    }
+
+    /// Slice 10 exclusion: Bool-sorted ite passes through UNTOUCHED.
+    #[test]
+    fn bool_ite_passes_through_untouched() {
+        let mut ctx = Context::new();
+        let c = bool_var(&mut ctx, "c");
+        let p = bool_var(&mut ctx, "p");
+        let q = bool_var(&mut ctx, "q");
+        let ite = ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[c, p, q]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[ite]);
+        assert_eq!(out, vec![ite], "Bool ite must not be rewritten");
+        assert!(wn.internal.is_empty());
     }
 
     #[test]

@@ -137,7 +137,14 @@ fn shinri_outcome(src: &str) -> SolveOutcome {
 /// forwards every `(declare-fun …)` and `(assert …)` line verbatim, making it
 /// suitable for scripts that declare x, y, z, and optionally an `rm` variable.
 fn z3_outcome_arith(ctx: &mut easy_smt::Context, src: &str) -> easy_smt::Response {
-    ctx.set_logic("QF_FP").expect("z3 set-logic failed");
+    z3_outcome_logic(ctx, "QF_FP", src)
+}
+
+/// Like `z3_outcome_arith` but with an explicit logic — the slice-10 bridge
+/// families declare (Array Int Real) / String symbols, which z3 rejects under
+/// QF_FP; they run under ALL.
+fn z3_outcome_logic(ctx: &mut easy_smt::Context, logic: &str, src: &str) -> easy_smt::Response {
+    ctx.set_logic(logic).expect("z3 set-logic failed");
     for line in src.lines() {
         let t = line.trim();
         if t.starts_with("(declare-fun ") || t.starts_with("(assert ") {
@@ -1736,4 +1743,141 @@ fn differential_qf_fp_to_real_uflra() {
         n_sat > 0 && n_unsat > 0,
         "QF_UFLRA+bridge oracle produced no SAT/UNSAT coverage (sat={n_sat} unsat={n_unsat})"
     );
+}
+
+/// Slice-10 §3: Array-Real operand mixed with the fp.to_real bridge. The
+/// recognizer admits these shapes but the combined solve does not decide
+/// Real-valued arrays (design §1) — expected all-Unknown today. Contract:
+/// ZERO disagreements; Unknowns tolerated and counted; NO coverage assertion
+/// (the fp_e2e canaries carry the exact Unknown pins), so this oracle keeps
+/// guarding the seam unchanged when a later slice lifts the fence.
+#[cfg(feature = "oracle")]
+fn gen_to_real_array_script(rng: &mut Lcg) -> String {
+    let bits = (rng.next() & 0xFFFF) as u16;
+    let s = (bits >> 15) & 1;
+    let e = (bits >> 10) & 0x1F;
+    let sig = bits & 0x3FF;
+    let bound = (rng.next() % 21) as i64 - 10;
+    let bound_term = if bound < 0 {
+        format!("(- {}.0)", -bound)
+    } else {
+        format!("{bound}.0")
+    };
+    let ops = ["<=", "<", ">=", ">", "="];
+    let op = ops[(rng.next() % ops.len() as u64) as usize];
+    // Half the corpus reads through a store at a random index.
+    let sel = if rng.next() % 2 == 0 {
+        "(select arr i)".to_string()
+    } else {
+        let k = rng.next() % 4;
+        format!("(select (store arr {k} {bound_term}) i)")
+    };
+    format!(
+        "(declare-fun x () Float16)\n\
+         (declare-fun arr () (Array Int Real))\n\
+         (declare-fun i () Int)\n\
+         (assert (= x (fp #b{s:01b} #b{e:05b} #b{sig:010b})))\n\
+         (assert (= {sel} (fp.to_real x)))\n\
+         (assert ({op} {sel} {bound_term}))\n\
+         (check-sat)\n"
+    )
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+fn differential_qf_fp_to_real_array() {
+    let mut rng = Lcg(0xA88A_5EED_0A10);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..N_ITERS {
+        let s = gen_to_real_array_script(&mut rng);
+        let ours = shinri_outcome(&s);
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => n_unknown += 1,
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_logic(&mut ctx, "ALL", &s);
+        assert!(
+            !matches!(
+                (ours, theirs),
+                (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                    | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+            ),
+            "Array+bridge DISAGREEMENT (iter {iter}): shinri={ours:?} z3={theirs:?}\n{s}"
+        );
+    }
+    println!("differential_qf_fp_to_real_array: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+}
+
+/// Slice-10 §3: String-Real EUF operand mixed with the bridge, using
+/// SUPPORTED string ops only (eq/distinct over literals, str.len —
+/// design §1.1 item 5; prefixof/suffixof/contains are unimplemented and
+/// would panic the parse-strict harness). Fenced upstream today
+/// (string_stage::fenced condition 1) — expected all-Unknown. Same contract
+/// as the array family.
+#[cfg(feature = "oracle")]
+fn gen_to_real_str_script(rng: &mut Lcg) -> String {
+    let bits = (rng.next() & 0xFFFF) as u16;
+    let s_bit = (bits >> 15) & 1;
+    let e = (bits >> 10) & 0x1F;
+    let sig = bits & 0x3FF;
+    let bound = (rng.next() % 21) as i64 - 10;
+    let bound_term = if bound < 0 {
+        format!("(- {}.0)", -bound)
+    } else {
+        format!("{bound}.0")
+    };
+    let ops = ["<=", "<", ">=", ">", "="];
+    let op = ops[(rng.next() % ops.len() as u64) as usize];
+    let lits = ["\"a\"", "\"ab\"", "\"\"", "\"ba\""];
+    let lit = lits[(rng.next() % lits.len() as u64) as usize];
+    let str_atom = match rng.next() % 3 {
+        0 => format!("(= s {lit})"),
+        1 => format!("(distinct s {lit})"),
+        _ => format!("(= (str.len s) {})", rng.next() % 4),
+    };
+    format!(
+        "(declare-fun x () Float16)\n\
+         (declare-fun g (String) Real)\n\
+         (declare-fun s () String)\n\
+         (assert (= x (fp #b{s_bit:01b} #b{e:05b} #b{sig:010b})))\n\
+         (assert (= (g s) (fp.to_real x)))\n\
+         (assert ({op} (g s) {bound_term}))\n\
+         (assert {str_atom})\n\
+         (check-sat)\n"
+    )
+}
+
+#[cfg(feature = "oracle")]
+#[test]
+fn differential_qf_fp_to_real_str() {
+    let mut rng = Lcg(0xA88A_5EED_0B20);
+    let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    for iter in 0..N_ITERS {
+        let s = gen_to_real_str_script(&mut rng);
+        let ours = shinri_outcome(&s);
+        match ours {
+            SolveOutcome::Sat => n_sat += 1,
+            SolveOutcome::Unsat => n_unsat += 1,
+            SolveOutcome::Unknown => n_unknown += 1,
+        }
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .expect("failed to launch z3 — ensure z3 is on PATH");
+        let theirs = z3_outcome_logic(&mut ctx, "ALL", &s);
+        assert!(
+            !matches!(
+                (ours, theirs),
+                (SolveOutcome::Sat, easy_smt::Response::Unsat)
+                    | (SolveOutcome::Unsat, easy_smt::Response::Sat)
+            ),
+            "Str+bridge DISAGREEMENT (iter {iter}): shinri={ours:?} z3={theirs:?}\n{s}"
+        );
+    }
+    println!("differential_qf_fp_to_real_str: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
 }
