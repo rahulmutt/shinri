@@ -1357,18 +1357,14 @@ fn str_real_euf_bridge_operand_fences_unknown() {
     assert_eq!(o, SolveOutcome::Unknown);
 }
 
-/// Str-eq-conditioned Real ite + bridge: after slice-10 elimination the
-/// str-eq atom still fails is_lra_real_atom, so bridge_admissible rejects →
-/// sound Unknown (design §1.1 item 3). x = 1.0 and the ite ∈ {2.5, 0.25}, so
-/// a future deciding slice must flip this to Unsat.
+/// Str-eq-conditioned Real ite + bridge: slice-10 elimination rewrites the
+/// Real ite into a fresh symbol `w` plus the defining assertion
+/// `(ite (= s "a") (= w 2.5) (= w 0.25))` — an Ite-op atom that fails
+/// is_lra_real_atom, so bridge_admissible rejects → sound Unknown (design
+/// §1.1 item 3). x = 1.0 and the ite ∈ {2.5, 0.25}, so a future deciding
+/// slice must flip this to Unsat.
 #[test]
 fn str_eq_ite_bridge_fences_unknown() {
-    // The word-norm ite-elimination pass rewrites the Real-sorted defining
-    // ite into a fresh symbol `w` plus a defining assertion
-    // `(ite (= s "a") (= w 2.5) (= w 0.25))`. That defining assertion is
-    // itself an Ite-op atom, which fails `is_lra_real_atom` — so
-    // `bridge_admissible` rejects it and the query correctly fences to a
-    // sound Unknown rather than crossing the bridge.
     let (o, _) = run("(declare-fun x () Float16)\
          (declare-fun s () String)\
          (assert (= x (fp #b0 #b01111 #b0000000000)))\
