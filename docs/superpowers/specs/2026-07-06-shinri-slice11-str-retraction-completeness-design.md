@@ -1,7 +1,16 @@
 # Slice 11 design — str retraction completeness + analyze OOB hardening
 
 Date: 2026-07-06
-Status: DESIGN — approved in brainstorm, not yet implemented.
+Status: IMPLEMENTED (slice 11 landed). Root cause: Combiner::pending_conflict
+survived pop (assert→propagate bridge) — cleared in pop; debug retraction
+audit added (shinri-sat sweep over str stores + shared-engine forest/diseqs +
+pending_conflict); guard hardened with bounds check + bailout counter
+(harness-asserted 0). Sweep: sat=13/unsat=179/unknown=8, z3_checked=192,
+0 disagreements. RESIDUE (risk §5.3, new follow-up): the canonical slice-8
+cluster-B input remains a sound fuel-Unknown — shinri-str's word-equation
+search does not converge on it even at 100× fuel; decisive-SAT there needs
+wordeq-completeness work, out of slice-11 scope. The decisive-verdict
+acceptance is carried by targeted_pending_conflict_pop_decides_sat instead.
 Predecessor: slice 10 (`61dfad9..c4885f9`, PR #3, landed 2026-07-06)
 
 ## Goal
@@ -91,8 +100,7 @@ Acceptance (not mechanism) is what the design pins:
 - checker clean across the full string-oracle fuzz sweep;
 - the guard counter (§2.4) is 0 across the corpus (subject to the
   documented-residue exception in risk §5.3);
-- the repro input flips `Unknown` → decisive verdict agreeing with z3, and
-  is pinned as a named e2e regression test.
+- the **iter-93 guard-bail input** flips Unknown → decisive SAT (z3-agreed), pinned as `targeted_pending_conflict_pop_decides_sat`; the canonical slice-8 pin remains a documented sound fuel-Unknown (see Status).
 
 ### 2.3 `analyze` / guard OOB hardening
 

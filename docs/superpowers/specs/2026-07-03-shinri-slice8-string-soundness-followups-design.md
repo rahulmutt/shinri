@@ -1,7 +1,11 @@
 # Slice 8 design — string-soundness follow-ups (analyze/backtrack + explain-not-connected + distinct-over-concat)
 
 Date: 2026-07-03
-Status: DESIGN (revised after writing-plans repro hunt — three clusters)
+Status: IMPLEMENTED (slice 8 landed 2026-07-03). Both open follow-ups retired
+by slice 11: #1 root-caused (Combiner::pending_conflict not cleared on pop —
+NOT a shinri-str retraction failure; fixed + debug retraction audit) with a
+wordeq-completeness residue follow-up on the canonical cluster-B input; #2
+closed (guard bounds check; analyze debug-assert).
 Predecessor: slice 7 (`d7089c2..47c8342`, landed 2026-07-03)
 
 ## Goal
