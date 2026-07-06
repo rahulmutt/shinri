@@ -3,7 +3,9 @@
 //! equality truth for all theories (spec §4).
 
 use crate::types::{ENodeId, EqConflict, EqJust, EqLeaf};
-use shinri_core::{Lit, TermId, UndoLog};
+#[cfg(debug_assertions)]
+use shinri_core::Lit;
+use shinri_core::{TermId, UndoLog};
 
 /// One e-node: its union-find parent and class size (for union-by-size).
 struct ENode {

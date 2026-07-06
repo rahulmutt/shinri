@@ -289,6 +289,8 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
     /// a sound incompleteness, never a wrong verdict.
     /// An out-of-range var (a theory conflict citing a var never allocated by
     /// the SAT solver) is definitionally unanalyzable and rides the same bail.
+    /// The dl==0 conflict arms return Unsat before this guard runs, so guard
+    /// and counter never see level-0 theory conflicts.
     fn theory_conflict_analyzable(&self, conflict_lits: &[Lit]) -> bool {
         let dl = self.trail.decision_level();
         conflict_lits.iter().all(|&l| {

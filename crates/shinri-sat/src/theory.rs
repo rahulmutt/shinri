@@ -44,7 +44,9 @@ pub trait Theory: Default {
     /// returned lit is still True-assigned at a level ≤ the current one — a
     /// stale entry means state failed to retract on pop (the cluster-B class),
     /// caught at the pop that leaks instead of the later conflict that trips
-    /// over it. Default: nothing cited (pure-SAT / stub theories).
+    /// over it. Coverage is best-effort per theory: a theory may sweep only
+    /// the stores implemented so far (see the Combiner impl for what is and
+    /// isn't swept). Default: nothing cited (pure-SAT / stub theories).
     #[cfg(debug_assertions)]
     fn cited_lits(&self, _out: &mut Vec<(Lit, &'static str)>) {}
 }

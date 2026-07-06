@@ -385,9 +385,15 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory
         // this pop is about to rewind — expanding them later resolves through
         // the post-pop proof forest and fabricates a malformed (or worse,
         // unsound-but-plausible) conflict citing retracted literals. Drop it:
-        // if the inconsistency still holds at the lower level, the theory
-        // re-derives it at the next propagate()/check() (same rationale as the
-        // merge-queue drain below).
+        // sound for in-solve backtracks: the assert that triggered the stash
+        // is itself unwound by this pop, and enqueue re-asserts it if it
+        // returns, re-deriving the conflict (same rationale as the
+        // merge-queue drain below). NOT covered: the raw SAT-API user-scope
+        // push/pop seam — a dl-0 conflicting assert's only trace can be this
+        // stash (the eq engine records nothing on the Err path), so dropping
+        // it there is a latent wrong-SAT hazard; the shipped pipeline never
+        // reaches that seam (fresh solver per check_sat). See slice-11
+        // follow-up.
         self.pending_conflict = None;
         // Discard any pending congruence-merge notifications before popping. A merge
         // notification is a transient signal for the N-O exchange to react to in the
@@ -424,6 +430,9 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory
         }
         self.eq.debug_cited_lits(out);
         self.string.cited_lits(out);
+        // Not yet swept: arith bound/antecedent stores and EqJust::Interface
+        // justifications (they also feed conflicts) — an arith-side retraction
+        // leak would pass silently. Slice-11 follow-up.
     }
 }
 
