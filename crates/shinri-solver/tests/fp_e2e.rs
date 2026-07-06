@@ -1310,3 +1310,71 @@ fn get_value_on_eliminated_ite_qfabv_returns_value() {
     );
     assert!(values[0].contains("#x0f"), "expected #x0f: {}", values[0]);
 }
+
+// ── Slice-10 §3 canary pins: Array/Str × fp.to_real bridge fences ──────────
+// These pin the CURRENT sound-Unknown behavior at the bridge seam (slice-10
+// design §1/§1.1). They are FLIP-MARKERS: a future slice that decides
+// Array-Real or Str-Real bridge operands must consciously repoint them to
+// Sat/Unsat. Companion coverage: the unknown-tolerant differential families
+// in fp_oracle.rs (differential_qf_fp_to_real_array / _str).
+
+/// Array-Real operand + bridge: bridge_admissible ACCEPTS this shape, but the
+/// downstream combined solve does not decide Real-valued arrays → Unknown.
+#[test]
+fn array_real_bridge_operand_fences_unknown() {
+    let (o, _) = run(
+        "(declare-fun x () Float16)\
+         (declare-fun arr () (Array Int Real))\
+         (declare-fun i () Int)\
+         (assert (= x (fp #b0 #b01111 #b0000000000)))\
+         (assert (= (select arr i) (fp.to_real x)))\
+         (assert (> (select arr i) 0.5))\
+         (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unknown);
+}
+
+/// Pure (Array Int Real), no FP at all: Real-valued arrays are broadly
+/// undecided today (this is why the bridge case above fences, not the bridge).
+#[test]
+fn pure_array_real_fences_unknown() {
+    let (o, _) = run(
+        "(declare-fun arr () (Array Int Real))\
+         (assert (= (select (store arr 0 2.5) 0) 1.0))\
+         (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unknown);
+}
+
+/// Str-Real EUF operand + bridge: fenced UPSTREAM by string_stage::fenced
+/// (uninterpreted function with a String argument), before the bridge
+/// recognizer ever runs.
+#[test]
+fn str_real_euf_bridge_operand_fences_unknown() {
+    let (o, _) = run(
+        "(declare-fun x () Float16)\
+         (declare-fun g (String) Real)\
+         (declare-fun s () String)\
+         (assert (= x (fp #b0 #b01111 #b0000000000)))\
+         (assert (= (g s) (fp.to_real x)))\
+         (assert (> (g s) 0.5))\
+         (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unknown);
+}
+
+/// Str-eq-conditioned Real ite + bridge: after slice-10 elimination the
+/// str-eq atom still fails is_lra_real_atom, so bridge_admissible rejects →
+/// sound Unknown (design §1.1 item 3). x = 1.0 and the ite ∈ {2.5, 0.25}, so
+/// a future deciding slice must flip this to Unsat.
+#[test]
+fn str_eq_ite_bridge_fences_unknown() {
+    let (o, _) = run(
+        "(declare-fun x () Float16)\
+         (declare-fun s () String)\
+         (assert (= x (fp #b0 #b01111 #b0000000000)))\
+         (assert (= (ite (= s \"a\") 2.5 0.25) (fp.to_real x)))\
+         (check-sat)",
+    );
+    assert_eq!(o, SolveOutcome::Unknown);
+}
