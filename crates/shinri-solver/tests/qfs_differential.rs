@@ -595,8 +595,11 @@ fn expect_not_unsat(src: &str) {
 fn targeted_analyze_theory_conflict_no_panic() {
     // Cluster B (slice 8): a string-theory Conflict drove `analyze` to a bad
     // backjump level → `trail.rs:91` "backtrack above current level" in debug.
-    // The correct verdict is SAT (z3); at minimum shinri must NOT panic and must
-    // NOT return a wrong UNSAT.
+    // Slice 11 root-caused it: Combiner::pending_conflict survived a pop and was
+    // served stale (now cleared in pop; the debug retraction audit pins the
+    // invariant). z3 says SAT; shinri's verdict on THIS input remains a sound
+    // fuel-Unknown (the string search does not converge even at 100× fuel — the
+    // wordeq-completeness follow-up), so the pin stays not-unsat rather than Sat.
     expect_not_unsat(
         "(set-logic QF_S)\
          (declare-const s1 String)(declare-const s2 String)(declare-const s3 String)\
@@ -605,6 +608,25 @@ fn targeted_analyze_theory_conflict_no_panic() {
          (assert (not (= (str.++ s3 \"a\") s1 s3)))\
          (assert (and (distinct (str.++ s3 \"b\") (str.++ s3 \"a\")) (distinct (str.++ s1 \"b\") s2 (str.++ s3 \"a\"))))\
          (check-sat)",
+    );
+}
+
+#[test]
+fn targeted_pending_conflict_pop_decides_sat() {
+    // Slice 11: this input guard-bailed to Unknown before the pending_conflict
+    // pop-clear (Combiner::pop) — the stashed conflict survived a backtrack and
+    // was served stale, citing a True-valued lit. With retraction fixed it
+    // DECIDES. Keep decisive: a regression back to Unknown means a retraction
+    // leak reappeared (the debug audit and guard counter will say where).
+    expect(
+        "(set-logic QF_S)\
+         (declare-const s1 String)(declare-const s2 String)(declare-const s3 String)\
+         (assert (not (distinct s3 \"\" (str.++ s2 \"a\"))))\
+         (assert (not (= s2 s1)))\
+         (assert (not (= (str.++ s3 \"a\") \"\" s3 (str.++ s1 \"a\"))))\
+         (assert (distinct s3 s2 (str.++ s2 \"a\") (str.++ s3 \"a\")))\
+         (check-sat)",
+        Verdict::Sat,
     );
 }
 
