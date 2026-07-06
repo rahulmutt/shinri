@@ -66,9 +66,10 @@ A `#[cfg(debug_assertions)]` audit hook on the `TheorySolver` trait:
 
 - `cited_lits() -> Vec<Lit>` (default impl: empty) — every literal the theory
   could currently cite in a conflict justification.
-- Implemented by `StrSolver` (the `eq_true`/`diseq_true` stores) and by the
-  shared `EqualityEngine` (its `Asserted` proof-forest tags — the second
-  provenance).
+- Implemented by `StrSolver` (the `eq_true`/`diseq_true` stores). The shared
+  `EqualityEngine` is not a `TheorySolver`; it exposes an equivalent
+  debug-only accessor over its `Asserted` proof-forest tags — the second
+  provenance — swept by the same audit.
 - The CDCL(T) backtrack path, immediately after dispatching theory pops,
   sweeps all cited lits and **panics with provenance** (which store, which
   atom, stored level vs current decision level) on any entry that is not
@@ -88,7 +89,8 @@ exact pop that leaks. Diagnose with the systematic-debugging discipline; fix
 Acceptance (not mechanism) is what the design pins:
 
 - checker clean across the full string-oracle fuzz sweep;
-- the guard counter (§2.4) is 0 across the corpus;
+- the guard counter (§2.4) is 0 across the corpus (subject to the
+  documented-residue exception in risk §5.3);
 - the repro input flips `Unknown` → decisive verdict agreeing with z3, and
   is pinned as a named e2e regression test.
 
