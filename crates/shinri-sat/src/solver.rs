@@ -1605,8 +1605,7 @@ mod tests {
 
     #[test]
     fn malformed_theory_conflict_bails_unknown_and_counts() {
-        let mut s: Solver<MalformedConflict, NoProof, Vmtf> =
-            Solver::new(SolverConfig::default());
+        let mut s: Solver<MalformedConflict, NoProof, Vmtf> = Solver::new(SolverConfig::default());
         for _ in 0..3 {
             s.new_var();
         }
