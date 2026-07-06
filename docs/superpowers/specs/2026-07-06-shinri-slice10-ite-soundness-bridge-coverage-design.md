@@ -39,10 +39,11 @@ validated EUF path)" and they merely lack coverage. Probing corrected this:
   all are `Unknown`: Real-valued arrays are broadly undecided today. Sound,
   but the "structurally the same as the validated EUF path" claim does not
   hold end-to-end.
-- **🚨 Wrong-SAT found — core, not bridge.** Hunting the Str∩bridge
-  intersection: `(= (ite (str.prefixof "a" s) 2.5 0.25) (fp.to_real 1.0))` →
-  shinri **sat**, z3 **unsat**. Reduction shows the bug predates slice 9 and
-  has nothing to do with FP or strings:
+- **🚨 Wrong-SAT found — core, not bridge.** Hunting bridge intersections
+  surfaced ite-shaped disagreements; reduction shows the bug predates slice 9
+  and has nothing to do with FP or strings (every reproducer below fully
+  parses — per-command `success` verified; see §1.1 for probe-harness
+  corrections):
   - pure QF_LRA `(= (ite b 2.5 0.25) 1.0)` → shinri sat, z3 unsat
   - pure QF_LIA `(= (ite b 2 0) 1)` → shinri sat, z3 unsat
   - nested `(= (+ (ite b 2 0) 1) 2)` → shinri sat, z3 unsat
@@ -54,13 +55,51 @@ validated EUF path)" and they merely lack coverage. Probing corrected this:
     the EUF-opaque misroute.
 - **Correct today:** Bool-sorted ite (plain Boolean structure), word-sorted
   ite (BitVec/Float/RoundingMode — slice 5 `word_norm`), String-sorted ite
-  (`(= (ite b "aa" "bb") "cc")` → unsat, agrees with z3).
+  (`(= (ite b "aa" "bb") "cc")` → unsat, agrees with z3), and — notably —
+  arith ite **on the string path** (see §1.1).
 - **No existing oracle fuzzes ite** over the affected sorts; no unit or e2e
   test pins the wrong verdicts (that absence is the bug's survival story).
 
 Consequence for scope: the originally-planned oracle would mostly measure
 sound Unknowns, while the one live unsoundness at its intersection is this
 core ite bug — hence the two-phase slice.
+
+## 1.1 Plan-time pre-flight corrections (probed 2026-07-06, before planning)
+
+Re-probing with FULL per-command CLI output (the shinri CLI prints
+`(error …)` for a failed command and **continues**, so `tail -1` probing
+silently drops failed asserts from `check-sat`) corrected three §1/§3/§6
+claims and resolved two plan-time decisions:
+
+1. **All `str.prefixof`/`str.suffixof`/`str.contains` findings were probe
+   artifacts.** Those three operators are **unimplemented** (parser:
+   `unknown operator`); the assert errors out, is dropped, and `check-sat`
+   runs on the remainder. There is no "string-predicate polarity" soundness
+   hole, and no str-conditioned ite shape using them can even parse. Every §1
+   core reproducer re-verified clean (all commands `success`; wrong-SATs are
+   real).
+2. **The string path already handles arith ite correctly — mechanically.**
+   `shinri-str/src/reduce.rs` (`reduce_assertions`, ~line 353) eliminates
+   every non-Boolean ite on the string path into a fresh variable + Bool-ite
+   defining assertion (built for its own substr guards). Probes:
+   `(= (ite (= s "a") 2.5 0.25) 1.0)` → unsat (correct). The §1 wrong-SAT is
+   therefore **path-dependent**: every non-string dispatch path. word_norm
+   broadening makes elimination uniform and upstream; the string path's own
+   reduce-introduced ites are minted after word_norm runs and remain
+   self-eliminated (unaffected).
+3. **The §3 string∩bridge canary shape is pinned to `Unknown`, decided now.**
+   `(= (ite (= s "a") 2.5 0.25) (fp.to_real x))` → `Unknown` today (the
+   str-eq atom fails `is_lra_real_atom`, so `bridge_admissible` rejects →
+   sound fence), and stays `Unknown` post-fix for the same reason. Probed.
+4. **§2 ABV fallback resolved: NOT needed.** The hand-desugared
+   post-elimination forms are decided correctly on every affected path — LRA
+   `unsat`, U-sort `unsat`, **ABV `unsat`** (`(ite b (= w a1) (= w a2))` +
+   selects on `w`), all agreeing with z3. The elimination gate covers Array
+   sorts with no fence.
+5. **Phase-2 str oracle family must use supported ops only**: string
+   equality/disequality, concat, `str.len` arithmetic — not
+   prefixof/suffixof/contains (unimplemented, would panic the parse-strict
+   test harness).
 
 ## 2. Phase 1 — broaden the `word_norm` ite-elimination gate
 
@@ -103,14 +142,11 @@ arith/EUF `ite!` symbols WILL appear in `mb`. Required follow-through:
 - `get-model` must NOT leak `ite!` symbols: the `mb`-based model-surfacing
   loops gain the `internal` filter the `var_bits` loops already have.
 
-### ABV fallback (decided at plan time, not mid-implementation)
+### ABV fallback — RESOLVED (plan-time probe, §1.1 item 4)
 
-If the plan-time probe shows the ABV controller mishandles the eliminated
-form (`(ite c (= w a1) (= w a2))` + selects on fresh `w`), the fallback for
-Array sorts only is a **fence** (array-sorted ite present on the ABV path →
-sound `Unknown`). Strictly better than today's wrong-SAT; the elimination gate
-then covers Int/Real/U-sorts only and the fence carries a canary marking the
-deferred capability.
+The ABV controller decides the eliminated form correctly
+(`(ite b (= w a1) (= w a2))` + selects on fresh `w` → `unsat`, agreeing with
+z3). No fence needed; the elimination gate covers Array sorts.
 
 ## 3. Phase 2 — Array/Str+bridge coverage & slice-9 spec truth-up
 
@@ -120,16 +156,18 @@ deferred capability.
   - Str-Real EUF operand + bridge (`(= (g s) (fp.to_real x))`,
     `g : String → Real`) → `Unknown` (string-stage fence); pin it.
   - Pure `(Array Int Real)` select/store (no FP) → `Unknown`; pin it.
-  - Str-conditioned Real ite + bridge (the discovery shape) → post-fix verdict
-    is `unsat` if strings+FP coexist on the string path, else sound `Unknown`;
-    plan-time probe decides which, then pin the observed sound verdict.
+  - Str-eq-conditioned Real ite + bridge
+    (`(= (ite (= s "a") 2.5 0.25) (fp.to_real x))`) → `Unknown` (probed;
+    §1.1 item 3 — bridge recognizer rejects the str-eq atom, today and
+    post-fix); pin it.
 - **Differential oracle families** (fp_oracle.rs, `oracle` feature, following
   `differential_qf_fp_to_real_uflra`'s structure):
   - `differential_qf_fp_to_real_array`: fuzzed select/store over
     `(Array Int Real)` linked to a constant-source `(fp.to_real x)` and a
     random bound, z3-pinned.
   - `differential_qf_fp_to_real_str`: fuzzed `g : String → Real` applications
-    + simple str atoms (prefixof/contains over literals) linked likewise.
+    + simple str atoms (equality/disequality over literals, concat,
+    `str.len` — supported ops only, §1.1 item 5) linked likewise.
   - Contract for BOTH: **zero SAT/UNSAT disagreements; Unknowns tolerated**
     (report counts). Unlike the UFLRA oracle there is NO 0-unknown assertion
     and NO sat>0/unsat>0 coverage assertion — today these families are
@@ -175,11 +213,12 @@ unchanged); the slice-5/6/7 ite tests are the guard.
 
 - **`mb` model-leak invariant flip (§2 model channel)** — the one deliberate
   invariant change; owned by the get-model/get-value tests.
-- **ABV eliminated-form handling** — plan-time probe + §2 fence fallback.
-- **String-path interaction**: `str.prefixof`-conditioned Real ites now become
-  Bool structure + arith equalities on the string path; the slice-8-validated
-  Str⋈Arith seam handles str-linked arith atoms, but the combined shape gets
-  its own e2e pins (SAT- and UNSAT-expected) rather than trust.
+- **ABV eliminated-form handling** — RESOLVED sound by probe (§1.1 item 4).
+- **String-path interaction**: word_norm now eliminates user arith ites
+  BEFORE the string path's own `reduce_assertions` elimination (which keeps
+  handling its self-introduced substr-guard ites, minted post-word_norm).
+  Probed sound (§1.1 item 2), and the combined shape gets its own e2e pins
+  (SAT- and UNSAT-expected) rather than trust.
 - **Fresh-symbol volume**: one symbol + one defining assertion per distinct
   ite — same cost profile slice 5 already accepted for words; no new
   mechanism.
