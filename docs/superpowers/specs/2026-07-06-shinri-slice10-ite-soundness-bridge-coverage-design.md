@@ -1,7 +1,10 @@
 # Slice 10 design — non-word ite soundness + Array/Str bridge coverage
 
 Date: 2026-07-06
-Status: DESIGN (user-approved; pre-flight probes source-verified 2026-07-06)
+Status: IMPLEMENTED (slice 10 landed). word_norm eliminates ite over every
+sort except Bool/String (wrong-SAT closed on LRA/LIA/UF/ABV paths, z3
+differential-validated 3×200 @ 0 unknown); arith/EUF ite! model channel
+filtered; Array/Str×bridge fences pinned + unknown-tolerant oracles added.
 Predecessor: slice 9 (`6555879..055d61f`, PR #2, landed 2026-07-05)
 
 ## Goal

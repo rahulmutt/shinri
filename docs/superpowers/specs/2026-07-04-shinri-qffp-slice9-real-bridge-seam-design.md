@@ -9,10 +9,15 @@ LRA **and EUF (QF_UFLRA + bridge)** — via constant + symbolic guarded-linear a
 (mechanism A, `fp.to_real`-only, Float16/32) were carried through as designed.
 z3 differential: 200 constant-source finite/functionality cases + 200
 QF_UFLRA-mixed cases (`differential_qf_fp_to_real_uflra`), 0 disagreements,
-0 Unknown; full `cargo test --workspace` green. **FOLLOW-UP:** the Real-sorted
-recognizer also admits Array/Str-Real bridge operands (structurally the same
-shared-Real case as the validated EUF path) but they lack dedicated differential
-coverage — add an Array/Str+bridge oracle in a later slice.
+0 Unknown; full `cargo test --workspace` green. **FOLLOW-UP (closed by slice
+10):** the Real-sorted recognizer admits Array-Real bridge operands but the
+combined solve does not decide Real-valued arrays (sound Unknown), and Str-Real
+EUF operands are fenced upstream by the string stage — the original
+"structurally the same as the validated EUF path" assumption did not hold
+end-to-end. Slice 10 pinned these fences (fp_e2e canaries) and added
+unknown-tolerant z3 differential families (differential_qf_fp_to_real_array
+/_str), and separately found+fixed a pre-existing non-string-path wrong-SAT for
+ite over Int/Real/uninterpreted/Array sorts (see the slice-10 design doc).
 **Scope:** First face of the permanent FP↔Reals bridge. Admit `fp.to_real` over
 Float16/32, solved jointly with LRA in one solve, by establishing an
 **eager-blast ⋈ lazy-LRA coexistence seam** that later bridge faces reuse.
