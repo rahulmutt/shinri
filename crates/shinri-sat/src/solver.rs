@@ -287,11 +287,15 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
     /// learnt clause built from garbage. Callers must bail to Unknown when this
     /// returns false —
     /// a sound incompleteness, never a wrong verdict.
+    /// An out-of-range var (a theory conflict citing a var never allocated by
+    /// the SAT solver) is definitionally unanalyzable and rides the same bail.
     fn theory_conflict_analyzable(&self, conflict_lits: &[Lit]) -> bool {
         let dl = self.trail.decision_level();
-        conflict_lits
-            .iter()
-            .all(|&l| self.assign.lit_value(l) == LBool::False && self.assign.level(l.var()) <= dl)
+        conflict_lits.iter().all(|&l| {
+            l.var().index() < self.assign.num_vars()
+                && self.assign.lit_value(l) == LBool::False
+                && self.assign.level(l.var()) <= dl
+        })
     }
 
     /// The Boolean value of a variable in the current assignment, if assigned.
@@ -333,6 +337,15 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
 
         // Seed with the conflict clause's literals.
         let mut reason_lits = self.conflict_lits(&conflict);
+        // Both theory-conflict call sites run theory_conflict_analyzable first,
+        // so every cited var is in range here (slice 11); stored-clause
+        // conflicts only ever contain solver-allocated vars.
+        debug_assert!(
+            reason_lits
+                .iter()
+                .all(|l| l.var().index() < self.assign.num_vars()),
+            "analyze: conflict cites an unregistered var"
+        );
         // If the conflict itself is a stored clause, record it in the chain.
         if let Conflict::Clause(r) = &conflict {
             chain.push(self.db.clause_id(*r));
@@ -1599,6 +1612,43 @@ mod tests {
         }
         // No unit clauses → the solver must DECIDE (dl > 0) before the Full
         // check, so the dl==0 top-level-Unsat arm is not taken.
+        s.add_clause(&[lit(0, true), lit(2, true)]);
+        assert_eq!(s.solve(), SolveResult::Unknown);
+        assert_eq!(s.theory_guard_bailouts(), 1);
+    }
+
+    /// Slice 11 (slice-8 follow-up #2): a theory conflict citing a var NEVER
+    /// registered with the SAT solver must bail to a sound Unknown via the
+    /// guard's bounds check — not panic on an out-of-range assignment index.
+    #[derive(Default)]
+    struct UnregisteredVarConflict {
+        fired: bool,
+    }
+    impl Theory for UnregisteredVarConflict {
+        fn assert(&mut self, _lit: Lit) {}
+        fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+            None
+        }
+        fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+        fn check(&mut self, _e: Effort) -> TheoryResult {
+            if self.fired {
+                return TheoryResult::Sat;
+            }
+            self.fired = true;
+            TheoryResult::Conflict(vec![Lit::new(Var::new(10_000), false)])
+        }
+        fn push(&mut self) {}
+        fn pop(&mut self, _n: usize) {}
+        fn new_var(&mut self, _v: Var) {}
+    }
+
+    #[test]
+    fn unregistered_var_theory_conflict_bails_unknown() {
+        let mut s: Solver<UnregisteredVarConflict, NoProof, Vmtf> =
+            Solver::new(SolverConfig::default());
+        for _ in 0..3 {
+            s.new_var();
+        }
         s.add_clause(&[lit(0, true), lit(2, true)]);
         assert_eq!(s.solve(), SolveResult::Unknown);
         assert_eq!(s.theory_guard_bailouts(), 1);
