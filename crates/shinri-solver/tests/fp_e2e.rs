@@ -1322,15 +1322,13 @@ fn get_value_on_eliminated_ite_qfabv_returns_value() {
 /// downstream combined solve does not decide Real-valued arrays → Unknown.
 #[test]
 fn array_real_bridge_operand_fences_unknown() {
-    let (o, _) = run(
-        "(declare-fun x () Float16)\
+    let (o, _) = run("(declare-fun x () Float16)\
          (declare-fun arr () (Array Int Real))\
          (declare-fun i () Int)\
          (assert (= x (fp #b0 #b01111 #b0000000000)))\
          (assert (= (select arr i) (fp.to_real x)))\
          (assert (> (select arr i) 0.5))\
-         (check-sat)",
-    );
+         (check-sat)");
     assert_eq!(o, SolveOutcome::Unknown);
 }
 
@@ -1338,11 +1336,9 @@ fn array_real_bridge_operand_fences_unknown() {
 /// undecided today (this is why the bridge case above fences, not the bridge).
 #[test]
 fn pure_array_real_fences_unknown() {
-    let (o, _) = run(
-        "(declare-fun arr () (Array Int Real))\
+    let (o, _) = run("(declare-fun arr () (Array Int Real))\
          (assert (= (select (store arr 0 2.5) 0) 1.0))\
-         (check-sat)",
-    );
+         (check-sat)");
     assert_eq!(o, SolveOutcome::Unknown);
 }
 
@@ -1351,15 +1347,13 @@ fn pure_array_real_fences_unknown() {
 /// recognizer ever runs.
 #[test]
 fn str_real_euf_bridge_operand_fences_unknown() {
-    let (o, _) = run(
-        "(declare-fun x () Float16)\
+    let (o, _) = run("(declare-fun x () Float16)\
          (declare-fun g (String) Real)\
          (declare-fun s () String)\
          (assert (= x (fp #b0 #b01111 #b0000000000)))\
          (assert (= (g s) (fp.to_real x)))\
          (assert (> (g s) 0.5))\
-         (check-sat)",
-    );
+         (check-sat)");
     assert_eq!(o, SolveOutcome::Unknown);
 }
 
@@ -1369,12 +1363,10 @@ fn str_real_euf_bridge_operand_fences_unknown() {
 /// a future deciding slice must flip this to Unsat.
 #[test]
 fn str_eq_ite_bridge_fences_unknown() {
-    let (o, _) = run(
-        "(declare-fun x () Float16)\
+    let (o, _) = run("(declare-fun x () Float16)\
          (declare-fun s () String)\
          (assert (= x (fp #b0 #b01111 #b0000000000)))\
          (assert (= (ite (= s \"a\") 2.5 0.25) (fp.to_real x)))\
-         (check-sat)",
-    );
+         (check-sat)");
     assert_eq!(o, SolveOutcome::Unknown);
 }
