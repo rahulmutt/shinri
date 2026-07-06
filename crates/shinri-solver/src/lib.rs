@@ -94,6 +94,9 @@ pub struct Solver {
     /// wrong-UNSAT). Minted pre-clone; cleared each solve alongside
     /// `pending_bridge`.
     special_reals: rustc_hash::FxHashMap<(u32, u32), (TermId, TermId, TermId)>,
+    /// Cumulative cluster-B guard bailouts across this solver's check-sats
+    /// (slice 11); see `shinri_sat::Solver::theory_guard_bailouts`.
+    theory_guard_bailouts: u64,
 }
 
 /// A pre-minted Real-bridge row (slice 9). All atom TermIds are minted before
@@ -172,6 +175,7 @@ impl Solver {
             pending_bridge: Vec::new(),
             bridge_name_counter: 0,
             special_reals: rustc_hash::FxHashMap::default(),
+            theory_guard_bailouts: 0,
         }
     }
 
@@ -189,6 +193,12 @@ impl Solver {
     }
     pub fn int_sort(&self) -> SortId {
         self.ctx.int_sort()
+    }
+    /// Cumulative cluster-B guard bailouts across this solver's check-sats
+    /// (see `shinri_sat::Solver::theory_guard_bailouts`). Test-visible alarm:
+    /// differential harnesses assert this stays 0.
+    pub fn theory_guard_bailouts(&self) -> u64 {
+        self.theory_guard_bailouts
     }
     pub fn array_sort(
         &mut self,
@@ -744,7 +754,9 @@ impl Solver {
             return SolveOutcome::Unknown;
         }
 
-        match sat.solve() {
+        let solve_result = sat.solve();
+        self.theory_guard_bailouts += sat.theory_guard_bailouts();
+        match solve_result {
             SolveResult::Unknown => SolveOutcome::Unknown,
             SolveResult::Unsat { .. } => SolveOutcome::Unsat,
             SolveResult::Sat => {

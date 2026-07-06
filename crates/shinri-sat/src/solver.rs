@@ -33,6 +33,7 @@ pub struct Solver<T: Theory, P: ProofSink + Default, H: BranchHeuristic> {
     pub(crate) theory_silent: bool,
     pub(crate) stats_minimized: u64,
     pub(crate) stats_deleted: u64,
+    pub(crate) theory_guard_bailouts: u64,
 }
 
 impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
@@ -56,6 +57,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
             stats_deleted: 0,
             input_clauses: Vec::new(),
             scopes: Vec::new(),
+            theory_guard_bailouts: 0,
         }
     }
 
@@ -89,6 +91,13 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
     #[inline]
     pub fn is_unsat(&self) -> bool {
         self.unsat
+    }
+
+    /// How many theory conflicts the cluster-B guard rejected as malformed
+    /// (each a sound Unknown bail). Post-slice-11 this must be 0 on the
+    /// differential corpus — a nonzero value is a retraction regression.
+    pub fn theory_guard_bailouts(&self) -> u64 {
+        self.theory_guard_bailouts
     }
 
     /// Add an input clause (records it for push/pop, then installs it).
@@ -527,6 +536,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                     if matches!(conflict, Conflict::Lits(_))
                         && !self.theory_conflict_analyzable(&conflict_lits)
                     {
+                        self.theory_guard_bailouts += 1;
                         return SolveResult::Unknown;
                     }
                     if let Err(()) = self.reduce_to_conflict_level(&conflict_lits) {
@@ -631,6 +641,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // Unknown rather than let `analyze` compute a
                                     // backjump level above the current one.
                                     if !self.theory_conflict_analyzable(&conflict_lits) {
+                                        self.theory_guard_bailouts += 1;
                                         return SolveResult::Unknown;
                                     }
                                     if let Err(()) = self.reduce_to_conflict_level(&conflict_lits) {
@@ -1546,6 +1557,51 @@ mod tests {
         s.add_clause(&[lit(0, false), lit(1, true)]);
         s.add_clause(&[lit(0, false), lit(1, false)]);
         let _ = s.solve();
+    }
+
+    /// Slice 11: a malformed theory conflict must bail to a sound Unknown via
+    /// the cluster-B guard AND increment the counter. Citing BOTH polarities
+    /// of x1 guarantees malformation whatever the assignment: exactly one of
+    /// the two lits is True at Full-check time (every var is assigned there),
+    /// and a well-formed conflict clause has every cited lit False — the same
+    /// shape as the real pending_conflict bail (a True-valued cited lit).
+    #[derive(Default)]
+    struct MalformedConflict {
+        fired: bool,
+    }
+    impl Theory for MalformedConflict {
+        fn assert(&mut self, _lit: Lit) {}
+        fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+            None
+        }
+        fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+        fn check(&mut self, _e: Effort) -> TheoryResult {
+            if self.fired {
+                return TheoryResult::Sat;
+            }
+            self.fired = true;
+            TheoryResult::Conflict(vec![
+                Lit::new(Var::new(1), true),
+                Lit::new(Var::new(1), false),
+            ])
+        }
+        fn push(&mut self) {}
+        fn pop(&mut self, _n: usize) {}
+        fn new_var(&mut self, _v: Var) {}
+    }
+
+    #[test]
+    fn malformed_theory_conflict_bails_unknown_and_counts() {
+        let mut s: Solver<MalformedConflict, NoProof, Vmtf> =
+            Solver::new(SolverConfig::default());
+        for _ in 0..3 {
+            s.new_var();
+        }
+        // No unit clauses → the solver must DECIDE (dl > 0) before the Full
+        // check, so the dl==0 top-level-Unsat arm is not taken.
+        s.add_clause(&[lit(0, true), lit(2, true)]);
+        assert_eq!(s.solve(), SolveResult::Unknown);
+        assert_eq!(s.theory_guard_bailouts(), 1);
     }
 }
 

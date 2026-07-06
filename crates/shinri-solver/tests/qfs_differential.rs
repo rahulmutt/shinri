@@ -70,6 +70,11 @@ fn shinri_lines(src: &str) -> Vec<String> {
             Err(diag) => out.push(format!("(error \"{}\")", diag.message)),
         }
     }
+    assert_eq!(
+        solver.theory_guard_bailouts(),
+        0,
+        "theory guard bailout — a conflict cited retracted state (retraction regression):\n{src}"
+    );
     out
 }
 
