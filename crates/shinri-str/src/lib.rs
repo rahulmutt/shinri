@@ -3,6 +3,7 @@ mod fuel;
 mod length;
 pub mod model;
 pub mod normalize;
+pub mod predicates;
 pub mod reduce;
 mod trail;
 pub mod wordeq;
