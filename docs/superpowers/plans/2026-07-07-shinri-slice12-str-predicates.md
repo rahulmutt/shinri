@@ -43,7 +43,11 @@ Expected (design-time check, re-verify): only `crates/shinri-solver/tests/fp_ora
 
 Append under this step a bullet per hit with verdict `SAFE` (comment/unrelated) or `PIN` (test that pins current behavior — must be updated in the task that flips it). If any `PIN` is found, add a note to the affected task before starting it.
 
-- Findings: _(fill in at execution time)_
+- Findings (executed 2026-07-07, worktree @ def9800):
+  - `crates/shinri-solver/tests/fp_oracle.rs:1818` — doc comment "prefixof/suffixof/contains are unimplemented and" — **SAFE** (comment only; truth-up scheduled in Task 9 Step 4).
+  - `crates/shinri-parser/src/parser.rs:640` — generic `unknown operator {head}` diagnostic — **SAFE** (generic fallback; hunt 1 confirms no test pins these three op names to that error).
+  - Hunt 3 (`StrPrefixOf|StrSuffixOf|StrContains`): zero hits — variants do not exist yet, no stale references.
+  - **No PIN findings.** No task notes needed; expected failure mode when ops stop being parse errors is confined to the above.
 
 - [ ] **Step 3: Commit**
 
