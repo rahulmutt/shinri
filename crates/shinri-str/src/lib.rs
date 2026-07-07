@@ -274,11 +274,13 @@ impl TheorySolver for StrSolver {
             // `eq_true` may hold a `Distinct` asserted FALSE (¬distinct ≡ eq).
             let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
             // Single-level normal forms for the CONFLICT/SPLIT path (NOT deep: deep
-            // expansion substitutes merge-derived constants, and resolve's ground
-            // conflicts cite only the word-equation literal — not the EUF merge
-            // antecedents — so a branch-local contradiction would be reported as a
-            // GLOBAL conflict (unsound). Model reconstruction uses the deep view in
-            // model.rs).
+            // expansion substitutes merge-derived material whose antecedents the
+            // ground resolver does not cite, so a branch-local contradiction would
+            // be reported as a GLOBAL conflict — unsound). To stay within that
+            // single-level regime, `resolve_equation` refuses to F-split / char-peel
+            // an UNFLATTENED concat class representative (it Saturates instead — the
+            // opaque-concat split is the F1 divergence that yielded a spurious
+            // UNSAT). Model reconstruction uses the deep view in model.rs.
             let lhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, l);
             let rhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, r);
 
@@ -391,7 +393,11 @@ impl TheorySolver for StrSolver {
             }
 
             // Build the EqLeaf justification from the asserted equality literal.
-            // This feeds `expand_conflict` so the conflict clause cites the right input literal.
+            // This feeds `expand_conflict` so the conflict clause cites the right
+            // input literal. `resolve_equation` never derives a ground conflict from
+            // a variable it substituted by a concat class representative (it
+            // Saturates on a concat residual head instead — see wordeq.rs), so no
+            // extra merge-antecedent citation is needed here.
             let just = vec![EqLeaf::Asserted(lit)];
             match crate::wordeq::resolve_equation(
                 cx.terms,

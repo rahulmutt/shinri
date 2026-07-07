@@ -224,13 +224,97 @@ pub(crate) fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: T
 
 /// Resolve one word equation between two normal forms.
 ///
+/// A single-level `normal_form` can leave a CONCAT atom in a word — an unflattened
+/// concat CLASS REPRESENTATIVE that a merge substituted for a variable (e.g.
+/// `rep(s1) = !sfx ++ "cb"` after `s1 = !sfx ++ "cb"`). This wrapper:
+///
+/// 1. Structurally FLATTENS those concat atoms (`X ++ Y` denotes `[X, Y]` — a
+///    sound identity needing no antecedent) so the head/tail strip and F-split
+///    operate on the real word rather than treating the opaque concat as a fresh
+///    variable head. Without this, the opaque-concat head is re-split with a fresh
+///    minted concat every round — the F1 divergence whose Nielsen clause, guarded
+///    only by `¬eqn`, drove a spurious UNSAT.
+/// 2. If a concat atom WAS flattened and the inner resolver reports a CONFLICT,
+///    downgrades it to `Saturated` (→ a sound Unknown / witness-checked SAT). Such
+///    a conflict is derived from constant/structure surfaced by the merge-driven
+///    substitution, yet `resolve_inner` cites only the word-equation literal — an
+///    under-cited (unsound) global exclusion. Suppressing exactly these conflicts
+///    keeps the single-level regime sound WITHOUT threading merge antecedents (a
+///    citation that over-approximates and trips the SAT conflict-analyzability
+///    guard). Purely structural conflicts on words that had NO concat atom are
+///    unaffected — every b10bd27 constant-length exemplar still Conflicts.
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_equation(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    lhs: &[TermId],
+    rhs: &[TermId],
+    just: Vec<EqLeaf>,
+    eqn_lit: Lit,
+    fresh_ctr: &mut u32,
+    emitted: &mut FxHashSet<(TermId, TermId)>,
+) -> StepResult {
+    let is_concat = |t: TermId| {
+        matches!(
+            terms.term_node(t),
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrConcat),
+                ..
+            }
+        )
+    };
+    let had_concat_atom = lhs.iter().chain(rhs.iter()).copied().any(is_concat);
+    if !had_concat_atom {
+        return resolve_inner(terms, eq, lhs, rhs, just, eqn_lit, fresh_ctr, emitted);
+    }
+    let lhs_flat = flatten_concat_atoms(terms, lhs);
+    let rhs_flat = flatten_concat_atoms(terms, rhs);
+    match resolve_inner(
+        terms, eq, &lhs_flat, &rhs_flat, just, eqn_lit, fresh_ctr, emitted,
+    ) {
+        // A conflict off a flattened concat rep would be under-cited → Saturate.
+        StepResult::Conflict(_) => StepResult::Saturated,
+        other => other,
+    }
+}
+
+/// Structural flatten: expand every `str.++` atom of `word` into its operands
+/// (recursively). `X ++ Y` denotes the sequence `[X, Y]` by definition, so this
+/// is sound and needs no equality antecedent.
+fn flatten_concat_atoms(terms: &Context, word: &[TermId]) -> Vec<TermId> {
+    fn go(terms: &Context, t: TermId, out: &mut Vec<TermId>) {
+        match terms.term_node(t) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrConcat),
+                args,
+                ..
+            } => {
+                let kids: Vec<TermId> = terms.children(*args).to_vec();
+                for k in kids {
+                    go(terms, k, out);
+                }
+            }
+            _ => out.push(t),
+        }
+    }
+    let mut out = Vec::with_capacity(word.len());
+    for &a in word {
+        go(terms, a, &mut out);
+    }
+    out
+}
+
+/// Inner resolver over ALREADY-FLATTENED words (no concat atoms among the heads
+/// except any the caller deliberately left). See [`resolve_equation`] for the
+/// flattening/conflict-suppression wrapper.
+///
 /// - Strips equal leading and trailing atoms (sound cancellation in free monoid).
 /// - If both sides are fully consumed after stripping → Done (trivially satisfied).
 /// - If both sides have constant heads whose first characters differ → Conflict.
 /// - If one side is empty and the other still contains a non-empty constant → Conflict.
 /// - If the residual has a variable head and the pair has not been split yet →
 ///   emits an F-split (three-disjunct length-aware alignment).
-/// - If the pair was already split (dedup) → Done (wait for SAT to case-split).
+/// - If the pair was already split (dedup) → Saturated (wait for SAT to case-split).
 ///
 /// `fresh_ctr` is used to mint fresh string variables for the split remainders.
 /// `emitted` deduplicates splits to prevent re-emitting the same pair (termination).
@@ -238,12 +322,8 @@ pub(crate) fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: T
 /// F-split it may emit is GUARDED with `eqn_lit.negate()` so the learnt clause is
 /// the valid implication `eqn → (len_eq ∨ a_pref ∨ b_pref)`, never the unsound
 /// bare disjunction.
-// The `eqn_lit` guard arg pushes this to 8 params; all are load-bearing
-// (context, equality engine, both word sides, conflict justification, guard
-// literal, fresh counter, dedup set) — grouping them into a struct would only
-// obscure the data flow at the single call site.
 #[allow(clippy::too_many_arguments)]
-pub fn resolve_equation(
+fn resolve_inner(
     terms: &mut Context,
     eq: &mut EqualityEngine,
     lhs: &[TermId],

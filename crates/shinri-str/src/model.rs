@@ -179,13 +179,35 @@ fn value_of(
     let class_const = class_member(terms, eq, known, t, |terms, mm| {
         terms.string_const_value(mm).is_some() && mm != t
     });
-    let resolved = class_const.or_else(|| {
-        class_member(terms, eq, known, t, |terms, mm| {
-            is_concat(terms, mm) && mm != t
-        })
+    let class_concat = class_member(terms, eq, known, t, |terms, mm| {
+        is_concat(terms, mm) && mm != t
     });
-    let out = match resolved {
-        Some(rep) => value_of(terms, eq, known, rep, m, memo, in_progress),
+    let out = match class_const.or(class_concat) {
+        Some(rep) => {
+            let v = value_of(terms, eq, known, rep, m, memo, in_progress);
+            // Length-consistency guard for a variable resolved through a class
+            // CONCAT (never a constant — a class constant IS the value). A concat
+            // member may be a MINTED word-equation F-split remainder (e.g.
+            // `s0 = s2 ++ !k`); in a cyclic merge (`s0 ≈ s2++!k`, `s2 ≈ s0++"cc"`)
+            // the recursive value picks up the WRONG word length, producing a
+            // witness that violates both the arith length model and the input word
+            // equation `s2 = s0 ++ "cc"` (the F2 wrong-model class newly exercised
+            // by the 7.5 length link's changed length trajectory). A genuine free
+            // variable must take its arith-pinned length: if the concat-resolved
+            // word's length disagrees with `t`'s class length, discard it for a
+            // free fill of the correct length (a correct concat resolution matches
+            // the length and is kept unchanged).
+            if class_const.is_none() {
+                let n = class_len_in_model(terms, eq, known, m, t);
+                if v.chars().count() != n {
+                    free_fill(eq, t, n)
+                } else {
+                    v
+                }
+            } else {
+                v
+            }
+        }
         None => {
             let n = len_of_in_model(terms, m, t);
             free_fill(eq, t, n)
