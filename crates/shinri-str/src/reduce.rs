@@ -143,6 +143,9 @@ fn contains_string_op(ctx: &Context, t: TermId) -> bool {
                         | BuiltinOp::StrSubstr
                         | BuiltinOp::StrConcat
                         | BuiltinOp::StrLen
+                        | BuiltinOp::StrPrefixOf
+                        | BuiltinOp::StrSuffixOf
+                        | BuiltinOp::StrContains
                 )
             ) {
                 return true;

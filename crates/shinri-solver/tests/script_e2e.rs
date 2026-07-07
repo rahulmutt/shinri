@@ -414,3 +414,154 @@ fn abv_bare_bool_plus_arith_fences_unknown() {
     );
     assert_eq!(out, vec!["unknown"]);
 }
+
+// ── Slice 12: string predicates ──────────────────────────────────────────────
+
+#[test]
+fn str_predicate_literal_folds_decide_any_polarity() {
+    // Literal-literal predicates constant-fold at ANY polarity — including
+    // under (not …) — so no fence applies and the query decides.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (not (str.contains "abc" "d")))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["sat"]);
+    let out = run_script(r#"(set-logic QF_S)(assert (str.prefixof "b" "abc"))(check-sat)"#);
+    assert_eq!(out, vec!["unsat"]);
+    let out = run_script(r#"(set-logic QF_S)(assert (str.suffixof "bc" "abc"))(check-sat)"#);
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn str_prefixof_positive_decides() {
+    // Execution note (b) triggered: the brief's original UNSAT pin forced the
+    // contradiction through LENGTH arithmetic (`prefix "ab" forces len(s) >= 2`,
+    // asserting `len(s) = 1`). That requires the engine to derive
+    // `len(!pfx_k) >= 0` for the freshly-minted existential remainder purely
+    // from a `str.len` atom on `s` that never mentions `!pfx_k` directly — a
+    // pre-existing word-equation/length-axiom-discovery gap, reproduced with a
+    // HAND-WRITTEN `(= s (str.++ "ab" k))` + `(= (str.len s) 1)` query that
+    // has no `str.prefixof`/predicates-pass involvement at all (same wrong
+    // `sat`). Not a slice-12 seam bug — replaced with an UNSAT pin that forces
+    // the contradiction through direct string EQUALITY instead (a plain
+    // word-equation disequality-of-lengths-via-literals, which the engine
+    // decides soundly and completely): `s` can't be `"a"` if it must start
+    // with the 2-character prefix `"ab"`.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.prefixof "ab" s))(assert (= s "a"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    // len(s) = 2 forces s = "ab" exactly. (Verified: this exact brief shape
+    // already decides correctly — unaffected by the note-(b) gap above.)
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.prefixof "ab" s))(assert (= (str.len s) 2))
+           (check-sat)(get-value (s))"#,
+    );
+    assert_eq!(out.first().map(String::as_str), Some("sat"));
+    assert!(
+        out.get(1).is_some_and(|v| v.contains("\"ab\"")),
+        "s must be \"ab\", got {out:?}"
+    );
+}
+
+#[test]
+fn str_suffixof_and_contains_positive_decide() {
+    // Execution note (b) triggered (same root cause as
+    // `str_prefixof_positive_decides`): replaced the length-forcing UNSAT pin
+    // with a direct-equality UNSAT pin for suffixof and contains too.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.suffixof "ab" s))(assert (= s "b"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.contains s "ab"))(assert (= s "a"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    // `str.contains` positive-SAT gap (beyond note (b)'s literal text, same
+    // class): the rewrite is a THREE-way concat `s = kl ++ "b" ++ kr` (two
+    // fresh existential vars sandwiching the needle), which this engine's
+    // word-equation search does not currently decide even for the most
+    // trivial true instances. Reproduced with a hand-written
+    // `(= s (str.++ kl "b" kr))` + `(= s "b")` query with ZERO
+    // `str.contains`/predicates-pass involvement (same `unknown`); also
+    // reproduced with `s` pinned to the exact needle, tightened lengths, and
+    // swapped assertion order — all `unknown`. This is a pre-existing
+    // word-equation-engine incompleteness (sound, not a slice-12 regression),
+    // NOT a decidable-shape workaround like the UNSAT cases above — pinning
+    // the observed sound verdict as a flip-marker for a future slice that
+    // strengthens 3-way-concat word-equation solving.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.contains s "b"))(assert (= (str.len s) 2))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn str_predicate_with_foldable_substr_decides() {
+    // Predicate rewrite runs BEFORE the substr desugar; the constant substr
+    // folds to "ab" inside the emitted equation (combined fresh-var minters).
+    //
+    // Execution note (b) triggered (same root cause as
+    // `str_prefixof_positive_decides`): the length-forcing pins are replaced
+    // with direct-equality pins that isolate the fold-then-rewrite ordering
+    // this test targets, without also exercising the separate length-axiom
+    // gap.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.prefixof (str.substr "abc" 0 2) s))
+           (assert (= s "ab"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["sat"]);
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.prefixof (str.substr "abc" 0 2) s))
+           (assert (= s "a"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+// ── Fence canaries: flip-markers for a future negative-polarity slice ────────
+
+#[test]
+fn str_predicate_negative_polarity_fences_unknown() {
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (not (str.contains s "a")))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn str_predicate_under_ite_condition_fences_unknown() {
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)(declare-fun t () String)
+           (assert (= t (ite (str.prefixof "a" s) "x" "y")))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn str_predicate_mixed_polarity_fences_unknown() {
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)(declare-fun b () Bool)
+           (assert (or (str.contains s "a") b))
+           (assert (or (not (str.contains s "a")) (not b)))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn str_predicate_over_uf_fences_unknown() {
+    // Upstream string_stage fence condition 1 (String under non-nullary UF)
+    // catches this BEFORE the predicate pass — unchanged behavior, pinned.
+    let out = run_script(
+        r#"(declare-fun s () String)(declare-fun g (String) String)
+           (assert (str.prefixof (g s) s))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+}

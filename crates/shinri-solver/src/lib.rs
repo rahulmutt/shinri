@@ -403,6 +403,18 @@ impl Solver {
             if crate::string_stage::fenced(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
+            // ── Slice 12: string predicates (prefixof/suffixof/contains) ──────
+            // 1. Constant-fold literal-literal predicate atoms (any polarity).
+            // 2. Fence any surviving predicate occurrence that is not
+            //    positive-only (negative / mixed / non-monotone context) →
+            //    sound Unknown (canary-pinned; flip-markers for a future
+            //    negative-polarity slice).
+            // 3. (Below, after the substr fence) rewrite positive-only atoms
+            //    to existential concat equations the wordeq engine owns.
+            assertions = shinri_str::predicates::fold_str_predicates(&mut self.ctx, &assertions);
+            if shinri_str::predicates::has_unrewritable_str_predicate(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
             // Soundness fence for the substr/str.at seam: a `str.substr`/`str.at`
             // over a NON-constant base (or non-numeral index/length) reduces to the
             // generic `pre++mid++post` + length-guard encoding, which the String↔Arith
@@ -419,7 +431,9 @@ impl Solver {
             {
                 return SolveOutcome::Unknown;
             }
-            // Not fenced: desugar str.at / str.substr before the Combiner.
+            // Not fenced: rewrite positive-only predicate atoms to existential
+            // concat equations before desugaring str.at / str.substr.
+            assertions = shinri_str::predicates::rewrite_str_predicates(&mut self.ctx, &assertions);
             assertions = shinri_str::reduce::reduce_assertions(&mut self.ctx, &assertions);
             on_string_path = true;
         }
