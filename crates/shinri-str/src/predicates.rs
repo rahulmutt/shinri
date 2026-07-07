@@ -175,6 +175,96 @@ fn collect_polarities(
     }
 }
 
+fn fresh_str_var(ctx: &mut Context, name: &str) -> TermId {
+    let str_s = ctx.string_sort();
+    let sym = ctx.declare_fun(name, &[], str_s);
+    ctx.mk_app(Op::Uninterpreted(sym), &[])
+        .expect("fresh string var")
+}
+
+/// Stage 3: rewrite every remaining (positive-only — the caller must have
+/// fenced otherwise via [`has_unrewritable_str_predicate`]) predicate atom to
+/// its existential concat decomposition:
+///
+/// - `(str.prefixof p s)` → `(= s (str.++ p k))`
+/// - `(str.suffixof p s)` → `(= s (str.++ k p))`
+/// - `(str.contains s sub)` → `(= s (str.++ k1 sub k2))`
+///
+/// Equisatisfiable for positive occurrences: the equation implies the
+/// predicate, and any model of the predicate extends to the fresh vars.
+/// Memoized on the atom's TermId so a repeated atom reuses one fresh-var set.
+pub fn rewrite_str_predicates(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId> {
+    let mut memo: FxHashMap<TermId, TermId> = FxHashMap::default();
+    assertions
+        .iter()
+        .map(|&a| rewrite_pred(ctx, a, &mut memo))
+        .collect()
+}
+
+fn rewrite_pred(
+    ctx: &mut Context,
+    t: TermId,
+    memo: &mut FxHashMap<TermId, TermId>,
+) -> TermId {
+    if let Some(&r) = memo.get(&t) {
+        return r;
+    }
+    let result = match ctx.term_node(t).clone() {
+        TermNode::Const { .. } => t,
+        TermNode::App { op, args, .. } => {
+            let children: Vec<TermId> = ctx.children(args).to_vec();
+            let new_children: Vec<TermId> = children
+                .iter()
+                .map(|&c| rewrite_pred(ctx, c, memo))
+                .collect();
+            match op {
+                Op::Builtin(BuiltinOp::StrPrefixOf) => {
+                    let (p, s) = (new_children[0], new_children[1]);
+                    let n = crate::reduce::next_fresh();
+                    let k = fresh_str_var(ctx, &format!("!pfx{n}"));
+                    let cat = ctx
+                        .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[p, k])
+                        .expect("p ++ k");
+                    ctx.mk_eq(s, cat).expect("s = p ++ k")
+                }
+                Op::Builtin(BuiltinOp::StrSuffixOf) => {
+                    let (p, s) = (new_children[0], new_children[1]);
+                    let n = crate::reduce::next_fresh();
+                    let k = fresh_str_var(ctx, &format!("!sfx{n}"));
+                    let cat = ctx
+                        .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[k, p])
+                        .expect("k ++ p");
+                    ctx.mk_eq(s, cat).expect("s = k ++ p")
+                }
+                Op::Builtin(BuiltinOp::StrContains) => {
+                    let (s, sub) = (new_children[0], new_children[1]);
+                    let n = crate::reduce::next_fresh();
+                    let kl = fresh_str_var(ctx, &format!("!ctnl{n}"));
+                    let kr = fresh_str_var(ctx, &format!("!ctnr{n}"));
+                    let cat = ctx
+                        .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[kl, sub, kr])
+                        .expect("kl ++ sub ++ kr");
+                    ctx.mk_eq(s, cat).expect("s = kl ++ sub ++ kr")
+                }
+                _ => {
+                    let changed = new_children
+                        .iter()
+                        .zip(children.iter())
+                        .any(|(nc, oc)| nc != oc);
+                    if changed {
+                        ctx.mk_app(op, &new_children)
+                            .expect("rewrite: well-sorted rebuild")
+                    } else {
+                        t
+                    }
+                }
+            }
+        }
+    };
+    memo.insert(t, result);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +365,70 @@ mod tests {
         // Double negation is positive again: NOT fenced.
         let not_not_p = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[not_p]).unwrap();
         assert!(!has_unrewritable_str_predicate(&ctx, &[not_not_p]));
+    }
+
+    /// Destructure `(= lhs (str.++ …))` and return (lhs, concat kids).
+    fn eq_concat_parts(ctx: &Context, t: TermId) -> (TermId, Vec<TermId>) {
+        let shinri_core::TermNode::App { op, args, .. } = ctx.term_node(t) else {
+            panic!("expected eq app");
+        };
+        assert!(matches!(op, Op::Builtin(BuiltinOp::Eq)));
+        let kids: Vec<TermId> = ctx.children(*args).to_vec();
+        let shinri_core::TermNode::App { op: cop, args: cargs, .. } = ctx.term_node(kids[1])
+        else {
+            panic!("expected concat rhs");
+        };
+        assert!(matches!(cop, Op::Builtin(BuiltinOp::StrConcat)));
+        (kids[0], ctx.children(*cargs).to_vec())
+    }
+
+    #[test]
+    fn rewrites_positive_predicates_to_concat_equations() {
+        let mut ctx = Context::new();
+        let p = ctx.mk_string_const("ab");
+        let s = str_var(&mut ctx, "s");
+
+        // prefixof(p, s) → (= s (str.++ p k))
+        let pf = pred(&mut ctx, BuiltinOp::StrPrefixOf, p, s);
+        let out = rewrite_str_predicates(&mut ctx, &[pf]);
+        let (lhs, kids) = eq_concat_parts(&ctx, out[0]);
+        assert_eq!(lhs, s);
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[0], p, "needle must lead in prefixof decomposition");
+
+        // suffixof(p, s) → (= s (str.++ k p))
+        let sf = pred(&mut ctx, BuiltinOp::StrSuffixOf, p, s);
+        let out = rewrite_str_predicates(&mut ctx, &[sf]);
+        let (lhs, kids) = eq_concat_parts(&ctx, out[0]);
+        assert_eq!(lhs, s);
+        assert_eq!(kids.len(), 2);
+        assert_eq!(kids[1], p, "needle must trail in suffixof decomposition");
+
+        // contains(s, sub) → (= s (str.++ k1 sub k2))
+        let ct = pred(&mut ctx, BuiltinOp::StrContains, s, p);
+        let out = rewrite_str_predicates(&mut ctx, &[ct]);
+        let (lhs, kids) = eq_concat_parts(&ctx, out[0]);
+        assert_eq!(lhs, s);
+        assert_eq!(kids.len(), 3);
+        assert_eq!(kids[1], p, "needle must be the middle of contains");
+    }
+
+    #[test]
+    fn rewrite_dedups_repeated_atom() {
+        let mut ctx = Context::new();
+        let p = ctx.mk_string_const("a");
+        let s = str_var(&mut ctx, "s");
+        let x = bool_var(&mut ctx, "x");
+        let pf = pred(&mut ctx, BuiltinOp::StrPrefixOf, p, s);
+        let or1 = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[pf, x]).unwrap();
+        // Same atom in two assertions → SAME equation term (one fresh var set).
+        let out = rewrite_str_predicates(&mut ctx, &[pf, or1]);
+        let (_, kids0) = eq_concat_parts(&ctx, out[0]);
+        let shinri_core::TermNode::App { args, .. } = ctx.term_node(out[1]) else {
+            panic!("or app");
+        };
+        let or_kids: Vec<TermId> = ctx.children(*args).to_vec();
+        let (_, kids1) = eq_concat_parts(&ctx, or_kids[0]);
+        assert_eq!(kids0[1], kids1[1], "repeated atom must reuse its fresh var");
     }
 }
