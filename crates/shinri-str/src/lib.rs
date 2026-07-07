@@ -28,6 +28,14 @@ pub struct StrSolver {
     /// Monotone (never cleared on backtrack); prevents re-emitting the same
     /// split after dedup (termination guarantee).
     emitted_splits: FxHashSet<(TermId, TermId)>,
+    /// String-equality atoms MINTED by the word-equation search itself (the
+    /// F-split `a = b++z` / char-peel `v = h++z` / `v = ""` disjuncts), as
+    /// opposed to equalities present in the reduced INPUT assertions. These carry
+    /// fresh skolem remainders and are re-minted every round, so the per-concat
+    /// length link is deliberately NOT emitted for them (see the length-link loop
+    /// and the historical unsound-conflict note there). Monotone: recorded at the
+    /// moment a split is emitted, before the disjunct can be asserted back.
+    minted_eqs: FxHashSet<TermId>,
     /// Counter for fresh string skolem variables minted by F-split.
     fresh_ctr: u32,
     fuel: Fuel,
@@ -130,24 +138,36 @@ impl TheorySolver for StrSolver {
             return TCheck::Conflict(just);
         }
 
-        // Per-equation length lemma, RESTRICTED to ATOM equalities (neither side a
-        // concat): `l = r → len(l) = len(r)`, emitted via arith Ge/Le companions
-        // guarded by ¬eq. Required so e.g. `s1 = s2` forces `len(s1) = len(s2)` in
-        // arith (string equality merges s1≈s2 in EUF, but str.len is not an EUF
-        // congruence function here, so arith would otherwise assign inconsistent
-        // lengths → a non-satisfying model). SAFE for atom equalities (no fresh
-        // concat skolems, so it does not feed the unbounded String↔Arith MBTC).
-        // NOT emitted for concat equalities: there the word-equation F-split mints
-        // fresh `str.len(skolem)` terms every round, so a per-concat length lemma
-        // both floods the seam AND (interacting with the length-defining axioms over
-        // those skolems) produced an unsound conflict — so concat length
-        // contradictions are caught DIRECTLY in `resolve_equation` by the
-        // constant-length bound check (a fully-constant side shorter than the other
-        // side's minimum constant length is UNSAT — e.g. `s2++"ba" = "b"`), which
-        // needs no fresh terms. A concat-vs-variable-bound length mismatch that
-        // depends on an arith-only bound (e.g. `s2++"c"++"bc" = (str.at s0 2)`, where
-        // the str.at result is length-bounded only in arith) is left to the bounded
-        // fuel/round/pivot caps, which yield a SOUND `Unknown`.
+        // Per-equation length lemma: `l = r → len(l) = len(r)`, emitted via arith
+        // Ge/Le companions guarded by ¬eq. Required so e.g. `s1 = s2` forces
+        // `len(s1) = len(s2)` in arith (string equality merges s1≈s2 in EUF, but
+        // str.len is not an EUF congruence function here, so arith would otherwise
+        // assign inconsistent lengths → a non-satisfying model). SAFE for atom
+        // equalities (no fresh concat skolems, so it does not feed the unbounded
+        // String↔Arith MBTC).
+        //
+        // Emitted for a CONCAT-sided equality ONLY when the equality is an INPUT
+        // assertion (its atom is NOT in `minted_eqs`) — Task 7.5. This closes the
+        // wrong-SAT on e.g. `s = "ab"++k ∧ len(s)=1`: without the link `len(s)`
+        // floats free in arith (an opaque-var length gets no defining axiom, and
+        // the var-headed word equation solves trivially), so arith SATs `len(s)=1`
+        // while `len("ab"++k) ≥ 2`. Emitting `len(s)=len("ab"++k)` feeds the
+        // existing length-defining fixpoint (`len("ab"++k)=len("ab")+len(k)=2+len(k)
+        // ≥ 2`) → arith UNSAT.
+        //
+        // NOT emitted for a concat-sided equality that the word-equation search
+        // MINTED (`minted_eqs`): those are the F-split disjuncts `a = b++z` / char-
+        // peel `v = h++z`, re-minted with a FRESH skolem `z` every round. A per-
+        // concat length link over them both floods the seam (unbounded fresh
+        // `str.len(skolem)` terms) AND, interacting with the length-defining axioms
+        // over those skolems, produced the historically-documented unsound conflict.
+        // Restricting to input equalities keeps emission FINITE (a fixed set of
+        // input equations, companions deduped via `emitted_len_axioms`) and mints NO
+        // fresh skolems (a concat's parts already exist; their `str.len` terms feed
+        // the existing axiom fixpoint) — so neither the flood nor the skolem
+        // interaction can arise. Concat length contradictions that need no fresh
+        // terms are still ALSO caught directly in `resolve_equation` by the
+        // constant-length bound check (e.g. `s2++"ba" = "b"`).
         {
             let eqs: Vec<(TermId, Lit)> = self.eq_true.clone();
             for (atom, lit) in eqs {
@@ -161,7 +181,9 @@ impl TheorySolver for StrSolver {
                         }
                     )
                 };
-                if is_concat(l) || is_concat(r) {
+                // Concat side is allowed for INPUT equalities only; skip a concat
+                // equality minted by the word-equation search (fresh skolems).
+                if (is_concat(l) || is_concat(r)) && self.minted_eqs.contains(&atom) {
                     continue;
                 }
                 if cx.terms.string_const_value(l).is_some()
@@ -396,6 +418,15 @@ impl TheorySolver for StrSolver {
                             &mut self.str_terms,
                             &mut seen,
                         );
+                        // Mark every minted disjunct (`a = b++z`, `v = h++z`,
+                        // `v = ""`) so that once the SAT layer asserts it back into
+                        // `eq_true`, the per-concat length link above skips it — it
+                        // carries a fresh skolem and must not feed the length seam
+                        // (Task 7.5). Recorded HERE, at emission, i.e. strictly
+                        // before the disjunct can be asserted (assertion happens
+                        // between check rounds), so the guard is always in place by
+                        // the time the atom appears in `eq_true`.
+                        self.minted_eqs.insert(split_atom);
                     }
                     // Spend one unit of fuel before emitting a word-equation split.
                     // If the budget is exhausted, signal Unknown (sound). The
@@ -925,6 +956,76 @@ mod tests {
         assert!(
             matches!(s.check(&mut cx, Effort::Full), TCheck::Sat),
             "fixpoint after all axioms emitted"
+        );
+    }
+
+    // Task 7.5: an INPUT (assertion-time) equality `s = "ab" ++ k` must emit the
+    // guarded length link `len(s) = len("ab"++k)` (via its Ge/Le arith
+    // companions), so arith can derive `len(s) = 2 + len(k) >= 2` and contradict
+    // an asserted `len(s) = 1`. Before the fix the concat side was unconditionally
+    // skipped and the link was never emitted → the variable-headed word equation
+    // solved trivially and the query was wrongly SAT.
+    #[test]
+    fn input_var_equals_concat_emits_length_link() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mk = |c: &mut Context, n: &str| {
+            let s = c.declare_fun(n, &[], str_s);
+            c.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let s = mk(&mut ctx, "s");
+        let k = mk(&mut ctx, "k");
+        let ab = ctx.mk_string_const("ab");
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[ab, k])
+            .unwrap();
+        let atom = ctx.mk_eq(s, concat).unwrap();
+        let len_s = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[s]).unwrap();
+        let len_c = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrLen), &[concat])
+            .unwrap();
+        // The expected companions of `(= len_s len_c)`.
+        let expected_ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[len_s, len_c])
+            .unwrap();
+        let expected_le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[len_s, len_c])
+            .unwrap();
+
+        let mut solver = StrSolver::default();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        solver.new_var(&mut cx, Var::new(0), atom);
+        solver.test_force_eq_true(atom);
+        let (mut saw_ge, mut saw_le) = (false, false);
+        for _ in 0..64 {
+            match solver.check(&mut cx, Effort::Full) {
+                TCheck::Split { atoms, guard } => {
+                    for a in atoms {
+                        if a == expected_ge {
+                            saw_ge = true;
+                            // Non-tautological len link must be guarded by ¬eqn.
+                            assert!(guard.is_some(), "length link must be guarded (¬eqn)");
+                        }
+                        if a == expected_le {
+                            saw_le = true;
+                            assert!(guard.is_some(), "length link must be guarded (¬eqn)");
+                        }
+                    }
+                }
+                TCheck::Sat => break,
+                TCheck::Conflict(_) => panic!("s = \"ab\"++k is satisfiable in isolation"),
+                TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
+            }
+        }
+        assert!(
+            saw_ge && saw_le,
+            "input `s = \"ab\"++k` must emit the len(s)=len(\"ab\"++k) Ge/Le companions"
         );
     }
 

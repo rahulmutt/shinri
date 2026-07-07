@@ -433,20 +433,59 @@ fn str_predicate_literal_folds_decide_any_polarity() {
 }
 
 #[test]
+fn str_input_var_concat_length_decides() {
+    // Task 7.5 regression: the predicate-free root shape. An input `var = concat`
+    // equality now emits the guarded length link `len(s) = len("ab"++k)`, so
+    // `len(s) = 2 + len(k) >= 2` contradicts the asserted `len(s) = 1` → UNSAT
+    // (z3: unsat). Before Task 7.5 this was a wrong `sat` (len(s) floated free in
+    // arith and the var-headed word equation solved trivially).
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)(declare-fun k () String)
+           (assert (= s (str.++ "ab" k)))(assert (= (str.len s) 1))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    // Concat on the LEFT side decides identically (order-independent link).
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)(declare-fun k () String)
+           (assert (= (str.++ "ab" k) s))(assert (= (str.len s) 1))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    // No-spurious-UNSAT control: `len(s) = 3` is satisfiable (witness
+    // s = "ab" ++ any 1-char k). The new length link must NOT over-constrain it
+    // to UNSAT. The engine returns a SOUND `unknown` here (the var-headed word
+    // equation's witness synthesis is a pre-existing incompleteness, unrelated to
+    // this fix) — the load-bearing assertion is simply that it is NOT `unsat`.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)(declare-fun k () String)
+           (assert (= s (str.++ "ab" k)))(assert (= (str.len s) 3))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+    assert_ne!(
+        out,
+        vec!["unsat"],
+        "must not over-constrain to spurious UNSAT"
+    );
+}
+
+#[test]
 fn str_prefixof_positive_decides() {
-    // Execution note (b) triggered: the brief's original UNSAT pin forced the
-    // contradiction through LENGTH arithmetic (`prefix "ab" forces len(s) >= 2`,
-    // asserting `len(s) = 1`). That requires the engine to derive
-    // `len(!pfx_k) >= 0` for the freshly-minted existential remainder purely
-    // from a `str.len` atom on `s` that never mentions `!pfx_k` directly — a
-    // pre-existing word-equation/length-axiom-discovery gap, reproduced with a
-    // HAND-WRITTEN `(= s (str.++ "ab" k))` + `(= (str.len s) 1)` query that
-    // has no `str.prefixof`/predicates-pass involvement at all (same wrong
-    // `sat`). Not a slice-12 seam bug — replaced with an UNSAT pin that forces
-    // the contradiction through direct string EQUALITY instead (a plain
-    // word-equation disequality-of-lengths-via-literals, which the engine
-    // decides soundly and completely): `s` can't be `"a"` if it must start
-    // with the 2-character prefix `"ab"`.
+    // LENGTH-based UNSAT pin (restored by Task 7.5): `str.prefixof "ab" s`
+    // rewrites to `s = "ab" ++ !pfx{n}`, so `len(s) = 2 + len(!pfx{n}) >= 2`;
+    // asserting `len(s) = 1` is UNSAT. Task 7 had to REPLACE this with a
+    // direct-equality pin because the input `var = concat` equality got no
+    // length link (`len(s)` floated free in arith, the var-headed word equation
+    // solved trivially → wrong `sat`). Task 7.5's guarded input-concat length
+    // link (`len(s) = len("ab"++!pfx{n})`) feeds the length-defining fixpoint and
+    // restores the sound UNSAT. Reproduced originally with a hand-written
+    // `(= s (str.++ "ab" k))` + `(= (str.len s) 1)` query (no predicates pass),
+    // now also decided UNSAT — pinned as `str_input_var_concat_length_decides`.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.prefixof "ab" s))(assert (= (str.len s) 1))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    // Direct-equality UNSAT pin (Task 7, KEPT as an additional case): `s` can't
+    // be `"a"` if it must start with the 2-character prefix `"ab"`.
     let out = run_script(
         r#"(set-logic QF_S)(declare-fun s () String)
            (assert (str.prefixof "ab" s))(assert (= s "a"))(check-sat)"#,
@@ -468,9 +507,22 @@ fn str_prefixof_positive_decides() {
 
 #[test]
 fn str_suffixof_and_contains_positive_decide() {
-    // Execution note (b) triggered (same root cause as
-    // `str_prefixof_positive_decides`): replaced the length-forcing UNSAT pin
-    // with a direct-equality UNSAT pin for suffixof and contains too.
+    // LENGTH-based UNSAT pins (restored by Task 7.5, same root cause and fix as
+    // `str_prefixof_positive_decides`): `str.suffixof "ab" s` rewrites to
+    // `s = !sfx{n} ++ "ab"` and `str.contains s "ab"` to `s = !ctnl ++ "ab" ++
+    // !ctnr` — both force `len(s) >= 2`, so `len(s) = 1` is UNSAT once the input
+    // `var = concat` length link is emitted.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.suffixof "ab" s))(assert (= (str.len s) 1))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.contains s "ab"))(assert (= (str.len s) 1))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    // Direct-equality UNSAT pins (Task 7, KEPT as additional cases).
     let out = run_script(
         r#"(set-logic QF_S)(declare-fun s () String)
            (assert (str.suffixof "ab" s))(assert (= s "b"))(check-sat)"#,
@@ -481,24 +533,18 @@ fn str_suffixof_and_contains_positive_decide() {
            (assert (str.contains s "ab"))(assert (= s "a"))(check-sat)"#,
     );
     assert_eq!(out, vec!["unsat"]);
-    // `str.contains` positive-SAT gap (beyond note (b)'s literal text, same
-    // class): the rewrite is a THREE-way concat `s = kl ++ "b" ++ kr` (two
-    // fresh existential vars sandwiching the needle), which this engine's
-    // word-equation search does not currently decide even for the most
-    // trivial true instances. Reproduced with a hand-written
-    // `(= s (str.++ kl "b" kr))` + `(= s "b")` query with ZERO
-    // `str.contains`/predicates-pass involvement (same `unknown`); also
-    // reproduced with `s` pinned to the exact needle, tightened lengths, and
-    // swapped assertion order — all `unknown`. This is a pre-existing
-    // word-equation-engine incompleteness (sound, not a slice-12 regression),
-    // NOT a decidable-shape workaround like the UNSAT cases above — pinning
-    // the observed sound verdict as a flip-marker for a future slice that
-    // strengthens 3-way-concat word-equation solving.
+    // Flip-marker (Task 7 pinned `unknown`; Task 7.5 FLIPPED it to `sat`):
+    // `str.contains s "b"` is the THREE-way concat `s = kl ++ "b" ++ kr`, and
+    // with `len(s) = 2` the query is SAT (witness e.g. s = "bb"). Task 7 could
+    // only observe `unknown` because the 3-way concat never linked its length;
+    // Task 7.5's input-concat length link now lets arith find `len(kl)+1+len(kr)
+    // = 2` with a concrete solution, so the engine decides the (correct) `sat`.
+    // A strict improvement (unknown → sound decision), not a wrong-SAT: z3 agrees.
     let out = run_script(
         r#"(set-logic QF_S)(declare-fun s () String)
            (assert (str.contains s "b"))(assert (= (str.len s) 2))(check-sat)"#,
     );
-    assert_eq!(out, vec!["unknown"]);
+    assert_eq!(out, vec!["sat"]);
 }
 
 #[test]
@@ -506,17 +552,23 @@ fn str_predicate_with_foldable_substr_decides() {
     // Predicate rewrite runs BEFORE the substr desugar; the constant substr
     // folds to "ab" inside the emitted equation (combined fresh-var minters).
     //
-    // Execution note (b) triggered (same root cause as
-    // `str_prefixof_positive_decides`): the length-forcing pins are replaced
-    // with direct-equality pins that isolate the fold-then-rewrite ordering
-    // this test targets, without also exercising the separate length-axiom
-    // gap.
+    // The fold produces `str.prefixof "ab" s`, i.e. `s = "ab" ++ !pfx{n}`.
     let out = run_script(
         r#"(set-logic QF_S)(declare-fun s () String)
            (assert (str.prefixof (str.substr "abc" 0 2) s))
            (assert (= s "ab"))(check-sat)"#,
     );
     assert_eq!(out, vec!["sat"]);
+    // LENGTH-based UNSAT pin (restored by Task 7.5): the folded 2-char prefix
+    // forces `len(s) >= 2`, contradicting `len(s) = 1`. This exercises the
+    // fold-then-rewrite ordering AND the input-concat length link together.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.prefixof (str.substr "abc" 0 2) s))
+           (assert (= (str.len s) 1))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    // Direct-equality UNSAT pin (Task 7, KEPT as an additional case).
     let out = run_script(
         r#"(set-logic QF_S)(declare-fun s () String)
            (assert (str.prefixof (str.substr "abc" 0 2) s))
