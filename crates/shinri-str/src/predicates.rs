@@ -15,7 +15,7 @@
 //! `starts_with`/`ends_with`/`contains` coincide with code-point
 //! prefix/suffix/substring.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 
 fn is_str_predicate(op: &Op) -> bool {
@@ -88,6 +88,93 @@ fn fold_term(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>)
     result
 }
 
+#[derive(Clone, Copy, Default)]
+struct Polarity {
+    pos: bool,
+    neg: bool,
+}
+
+/// Stage 2: polarity fence. True iff any string-predicate atom (surviving
+/// stage-1 folding) has a reachable NEGATIVE occurrence — i.e. is not
+/// positive-only. Positive-only atoms are safe for the stage-3 existential
+/// rewrite; everything else must fence the query to a sound `Unknown`.
+///
+/// Polarity descent: `and`/`or` preserve; `not` flips; `=>` flips every
+/// antecedent (all args but the last). ANY other enclosing structure —
+/// `xor`, `=`/`distinct` over Bool, `ite` in any position, uninterpreted
+/// applications, or a predicate nested inside another predicate's args —
+/// marks descendants both-polarity. Unrecognized structure therefore fails
+/// SOUND (fence), never unsound (wrong-side rewrite).
+pub fn has_unrewritable_str_predicate(ctx: &Context, assertions: &[TermId]) -> bool {
+    let mut map: FxHashMap<TermId, Polarity> = FxHashMap::default();
+    let mut seen: FxHashSet<(TermId, bool, bool)> = FxHashSet::default();
+    for &a in assertions {
+        collect_polarities(ctx, a, true, false, &mut map, &mut seen);
+    }
+    map.values().any(|p| p.neg)
+}
+
+fn collect_polarities(
+    ctx: &Context,
+    t: TermId,
+    pos: bool,
+    both: bool,
+    map: &mut FxHashMap<TermId, Polarity>,
+    seen: &mut FxHashSet<(TermId, bool, bool)>,
+) {
+    if !seen.insert((t, pos, both)) {
+        return;
+    }
+    match ctx.term_node(t) {
+        TermNode::Const { .. } => {}
+        TermNode::App { op, args, .. } => {
+            let kids: Vec<TermId> = ctx.children(*args).to_vec();
+            if is_str_predicate(op) {
+                let e = map.entry(t).or_default();
+                if both {
+                    e.pos = true;
+                    e.neg = true;
+                } else if pos {
+                    e.pos = true;
+                } else {
+                    e.neg = true;
+                }
+                // A predicate nested inside THIS predicate's String args can
+                // only sit in a Bool position (an ite condition) — treat it
+                // as non-monotone.
+                for &k in &kids {
+                    collect_polarities(ctx, k, true, true, map, seen);
+                }
+                return;
+            }
+            match op {
+                Op::Builtin(BuiltinOp::And | BuiltinOp::Or) => {
+                    for &k in &kids {
+                        collect_polarities(ctx, k, pos, both, map, seen);
+                    }
+                }
+                Op::Builtin(BuiltinOp::Not) => {
+                    collect_polarities(ctx, kids[0], !pos, both, map, seen);
+                }
+                Op::Builtin(BuiltinOp::Implies) => {
+                    // n-ary right-assoc: all but the last arg are antecedents.
+                    let (last, ants) = kids.split_last().expect("=> has args");
+                    for &k in ants {
+                        collect_polarities(ctx, k, !pos, both, map, seen);
+                    }
+                    collect_polarities(ctx, *last, pos, both, map, seen);
+                }
+                // Everything else is a non-monotone context for anything below.
+                _ => {
+                    for &k in &kids {
+                        collect_polarities(ctx, k, true, true, map, seen);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +224,56 @@ mod tests {
         let want_not = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[f]).unwrap();
         assert_eq!(out[0], want_not);
         assert_eq!(out[1], sym, "symbolic predicate must keep its TermId");
+    }
+
+    fn bool_var(ctx: &mut Context, name: &str) -> TermId {
+        let b = ctx.bool_sort();
+        let f = ctx.declare_fun(name, &[], b);
+        ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+    }
+
+    #[test]
+    fn polarity_fence_classification() {
+        let mut ctx = Context::new();
+        let lit = ctx.mk_string_const("a");
+        let s = str_var(&mut ctx, "s");
+        let x = bool_var(&mut ctx, "x");
+        let p = pred(&mut ctx, BuiltinOp::StrPrefixOf, lit, s);
+
+        // Positive-only shapes: NOT fenced.
+        let or_px = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[p, x]).unwrap();
+        let and_px = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[p, x]).unwrap();
+        let imp_xp = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Implies), &[x, p])
+            .unwrap();
+        assert!(!has_unrewritable_str_predicate(&ctx, &[p]));
+        assert!(!has_unrewritable_str_predicate(&ctx, &[or_px, and_px, imp_xp]));
+
+        // Negative / non-monotone shapes: fenced.
+        let not_p = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[p]).unwrap();
+        let imp_px = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Implies), &[p, x])
+            .unwrap();
+        let xor_px = ctx.mk_app(Op::Builtin(BuiltinOp::Xor), &[p, x]).unwrap();
+        let eq_px = ctx.mk_eq(p, x).unwrap(); // Bool-eq: non-monotone
+        let a_lit = ctx.mk_string_const("a");
+        let b_lit = ctx.mk_string_const("b");
+        let ite_p = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[p, a_lit, b_lit])
+            .unwrap(); // predicate as ite condition
+        let eq_ite = ctx.mk_eq(ite_p, s).unwrap();
+        for bad in [not_p, imp_px, xor_px, eq_px, eq_ite] {
+            assert!(
+                has_unrewritable_str_predicate(&ctx, &[bad]),
+                "shape must fence"
+            );
+        }
+
+        // Mixed polarity across assertions: fenced.
+        assert!(has_unrewritable_str_predicate(&ctx, &[or_px, not_p]));
+
+        // Double negation is positive again: NOT fenced.
+        let not_not_p = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[not_p]).unwrap();
+        assert!(!has_unrewritable_str_predicate(&ctx, &[not_not_p]));
     }
 }
