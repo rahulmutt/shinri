@@ -189,6 +189,10 @@ fn builtin_name(b: BuiltinOp) -> String {
         StrLen => "str.len".to_owned(),
         StrAt => "str.at".to_owned(),
         StrSubstr => "str.substr".to_owned(),
+        // String predicates — SMT-LIB names (slice 12)
+        StrPrefixOf => "str.prefixof".to_owned(),
+        StrSuffixOf => "str.suffixof".to_owned(),
+        StrContains => "str.contains".to_owned(),
         // Floating-point ops — SMT-LIB names
         FpAbs => "fp.abs".to_owned(),
         FpNeg => "fp.neg".to_owned(),
