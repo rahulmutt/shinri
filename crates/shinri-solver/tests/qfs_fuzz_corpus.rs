@@ -21,6 +21,7 @@
 //!   3. DEDUP minimized repros by a canonical shape (vars renamed in order of
 //!      appearance, literals collapsed to a length-tag) so the printed corpus is
 //!      one entry per distinct mechanism.
+//!
 //! The printed corpus — counts by class + the minimized shapes — is the artifact.
 //!
 //! ## WARNING

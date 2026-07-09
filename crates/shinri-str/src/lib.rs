@@ -892,11 +892,11 @@ impl TheorySolver for StrSolver {
                 // `no_minted_active`: it declines only when THIS residual actually used a
                 // branch-local (input-disjunct OR minted-skolem) merge (ce5/ce6), not
                 // whenever any unrelated conditional (dis)equality happens to be active.
-                if !diseq_minted
-                    && !sep_reads_minted
-                    && !(has_nonempty_const(l_res, cx.terms)
-                        || has_nonempty_const(r_res, cx.terms)
-                        || l_res.is_empty() && r_res.is_empty())
+                if !(diseq_minted
+                    || sep_reads_minted
+                    || has_nonempty_const(l_res, cx.terms)
+                    || has_nonempty_const(r_res, cx.terms)
+                    || l_res.is_empty() && r_res.is_empty())
                 {
                     let int_s = cx.terms.int_sort();
                     let one = cx
