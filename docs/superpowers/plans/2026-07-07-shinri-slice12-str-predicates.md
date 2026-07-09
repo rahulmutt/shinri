@@ -1,12 +1,26 @@
 # Slice 12 — String Predicates (prefixof / suffixof / contains) Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** Admit `str.prefixof`, `str.suffixof`, `str.contains` with the polarity-aware posture from the approved spec (`docs/superpowers/specs/2026-07-07-shinri-slice12-str-predicates-design.md`): constant-fold literal cases at any polarity, decide positive-only occurrences via existential concat decomposition, fence everything else to sound Unknown.
 
 **Architecture:** Three new `BuiltinOp` variants flow parser → core sort rules → a new `shinri-str::predicates` pre-pass module (fold / polarity fence / positive rewrite) wired into the solver's string-path seam at `crates/shinri-solver/src/lib.rs:402-425`, ahead of the existing substr desugar. No new theory-atom or retraction machinery. New z3 differential oracle family + always-on e2e pins.
 
 **Tech Stack:** Rust workspace (toolchain pinned 1.96.0), z3 on PATH for `oracle`-feature tests only.
+
+> **COMPLETED 2026-07-09 (with a scope divergence).** Tasks 1–9 landed. During the
+> oracle/differential phase a container OOM interrupted the session; on recovery, a
+> differential fuzzer (added as `tests/qfs_fuzz_corpus.rs`) revealed that the
+> predicate rewrite (predicates → word equations) surfaced a **pre-existing
+> word-equation resolver unsoundness** (present on `main`, independent of this
+> slice). Per user direction this was root-caused and fixed as part of the slice:
+> dl0-gated merge-derived length lemmas + a complete 3-valued model gate +
+> antecedent-precise citation, verified across 3 adversarial review rounds and ~24k
+> differential fuzz iterations (0 wrong verdicts). The OOM cause (uncapped fuzz
+> harness) was fixed with an `RLIMIT_AS` self-cap. See the spec Status line and
+> `.superpowers/sdd/task-E1-report.md` for the full diagnosis, design, and
+> validation. Net acceptance: workspace suite green, full oracle sweep 0
+> disagreements, clean-cache clippy 0 warnings.
 
 ## Global Constraints
 
@@ -29,7 +43,7 @@
 **Interfaces:**
 - Produces: a recorded list of every test/canary that could break when the three ops stop being parse errors. Later tasks consult it before flipping behavior.
 
-- [ ] **Step 1: Run the hunt greps**
+- [x] **Step 1: Run the hunt greps**
 
 ```bash
 grep -rn "prefixof\|suffixof\|str\.contains" /workspace/crates --include="*.rs" | grep -v target
@@ -39,7 +53,7 @@ grep -rn "StrPrefixOf\|StrSuffixOf\|StrContains" /workspace/crates --include="*.
 
 Expected (design-time check, re-verify): only `crates/shinri-solver/tests/fp_oracle.rs:1818` (a comment saying the ops are unimplemented — truth-up in Task 9) and the parser's generic `unknown operator` diagnostic at `crates/shinri-parser/src/parser.rs:640` (no test pins these three op names to that error).
 
-- [ ] **Step 2: Record findings in this file**
+- [x] **Step 2: Record findings in this file**
 
 Append under this step a bullet per hit with verdict `SAFE` (comment/unrelated) or `PIN` (test that pins current behavior — must be updated in the task that flips it). If any `PIN` is found, add a note to the affected task before starting it.
 
@@ -49,7 +63,7 @@ Append under this step a bullet per hit with verdict `SAFE` (comment/unrelated) 
   - Hunt 3 (`StrPrefixOf|StrSuffixOf|StrContains`): zero hits — variants do not exist yet, no stale references.
   - **No PIN findings.** No task notes needed; expected failure mode when ops stop being parse errors is confined to the above.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add docs/superpowers/plans/2026-07-07-shinri-slice12-str-predicates.md
@@ -68,7 +82,7 @@ git commit -m "docs(plan): slice-12 canary hunt findings recorded (slice 12)"
 **Interfaces:**
 - Produces: `BuiltinOp::StrPrefixOf`, `BuiltinOp::StrSuffixOf`, `BuiltinOp::StrContains` — arity 2, both args String-sorted, result Bool. All later tasks consume these variant names exactly.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 In the `tests` module of `crates/shinri-core/src/context.rs`, next to the existing string-ops sort test:
 
@@ -100,12 +114,12 @@ fn string_predicate_sorts() {
 
 Note: if `Rational`/`mk_numeral` paths differ inside the core crate's own test module (no `shinri_core::` prefix — use `crate::Rational`), match the imports of the neighboring test at `context.rs:1285`.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p shinri-core string_predicate_sorts`
 Expected: COMPILE FAIL — `StrPrefixOf` not found in `BuiltinOp`.
 
-- [ ] **Step 3: Add the variants**
+- [x] **Step 3: Add the variants**
 
 In `crates/shinri-core/src/term.rs`, extend the String block:
 
@@ -134,17 +148,17 @@ In `crates/shinri-core/src/context.rs`, after the `StrSubstr` sort-rule arm (lin
             }
 ```
 
-- [ ] **Step 4: Fix exhaustive-match fallout across the workspace**
+- [x] **Step 4: Fix exhaustive-match fallout across the workspace**
 
 Run: `cargo build --workspace`
 Every non-exhaustive `match` on `BuiltinOp` will fail to compile — that is the desired discovery mechanism. Known site: `crates/shinri-parser/src/print.rs` `op_name` (handled properly in Task 3; to keep this task compiling, add the three arms there now with their final values — see Task 3 Step 3 for the exact lines). For any other site the compiler surfaces, route the three variants alongside the existing `StrConcat`/`StrLen`/`StrAt`/`StrSubstr` handling of that site and note it in the commit message.
 
-- [ ] **Step 5: Run test to verify it passes**
+- [x] **Step 5: Run test to verify it passes**
 
 Run: `cargo test -p shinri-core string_predicate_sorts`
 Expected: PASS
 
-- [ ] **Step 6: Commit**
+- [x] **Step 6: Commit**
 
 ```bash
 git add -A crates
@@ -164,7 +178,7 @@ git commit -m "feat(core): StrPrefixOf/StrSuffixOf/StrContains BuiltinOps — St
 - Consumes: the three `BuiltinOp` variants from Task 2.
 - Produces: `"str.prefixof"`/`"str.suffixof"`/`"str.contains"` parse to those variants and print back to the same names.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 In the parser's test module, following the style of `parses_strings_str_at` (`parser.rs:1745` — reuse its parse helper):
 
@@ -195,12 +209,12 @@ fn string_predicate_wrong_sort_rejected() {
 
 Fill both bodies from the neighboring tests' exact scaffolding (the parse helper and diagnostic-assertion patterns already in the module) — the assertions to make are stated in the comments above.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p shinri-parser parses_string_predicates string_predicate_wrong_sort_rejected`
 Expected: FAIL — `unknown operator str.prefixof` diagnostic (the mapping doesn't exist yet).
 
-- [ ] **Step 3: Add parser mapping + printer arms**
+- [x] **Step 3: Add parser mapping + printer arms**
 
 `crates/shinri-parser/src/parser.rs`, in the op-name match after `"str.substr" => StrSubstr,`:
 
@@ -220,12 +234,12 @@ Expected: FAIL — `unknown operator str.prefixof` diagnostic (the mapping doesn
 
 (If Task 2 Step 4 already added these print arms to get the workspace compiling, verify they match exactly.)
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p shinri-parser parses_string_predicates string_predicate_wrong_sort_rejected`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/shinri-parser
@@ -245,7 +259,7 @@ git commit -m "feat(parser): parse + print str.prefixof/str.suffixof/str.contain
 - Consumes: `BuiltinOp` variants (Task 2); `Context::{string_const_value, mk_const_bool, term_node, children, mk_app}`.
 - Produces: `pub fn fold_str_predicates(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId>` — every predicate app whose two args are string literals is replaced by `mk_const_bool(..)`; all other structure preserved (unchanged subtrees keep their `TermId`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `crates/shinri-str/src/predicates.rs`:
 
@@ -399,12 +413,12 @@ Also add to `crates/shinri-str/src/lib.rs` module list (after `pub mod normalize
 pub mod predicates;
 ```
 
-- [ ] **Step 2: Run tests to verify current state**
+- [x] **Step 2: Run tests to verify current state**
 
 Run: `cargo test -p shinri-str predicates::`
 Expected: PASS (the module is written complete in Step 1 — the "failing" phase here was Task 2/3 making the variants exist; verify both tests green and, if either fails, fix before committing).
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add crates/shinri-str
@@ -423,7 +437,7 @@ git commit -m "feat(str): predicates module — constant folder for prefixof/suf
 - Consumes: `is_str_predicate` (Task 4).
 - Produces: `pub fn has_unrewritable_str_predicate(ctx: &Context, assertions: &[TermId]) -> bool` — true iff any predicate atom has a reachable negative occurrence. The solver seam (Task 7) calls it AFTER folding.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the `tests` module in `predicates.rs`:
 
@@ -482,12 +496,12 @@ Append to the `tests` module in `predicates.rs`:
 
 (If `BuiltinOp::Xor` does not exist in this codebase, drop the `xor_px` case and rely on Bool-eq — check `term.rs` first.)
 
-- [ ] **Step 2: Run test to verify it fails**
+- [x] **Step 2: Run test to verify it fails**
 
 Run: `cargo test -p shinri-str polarity_fence_classification`
 Expected: COMPILE FAIL — `has_unrewritable_str_predicate` not defined.
 
-- [ ] **Step 3: Implement the classifier**
+- [x] **Step 3: Implement the classifier**
 
 Add to `predicates.rs` (above the tests module):
 
@@ -580,12 +594,12 @@ fn collect_polarities(
 }
 ```
 
-- [ ] **Step 4: Run test to verify it passes**
+- [x] **Step 4: Run test to verify it passes**
 
 Run: `cargo test -p shinri-str polarity_fence_classification`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/shinri-str
@@ -605,7 +619,7 @@ git commit -m "feat(str): polarity classifier + has_unrewritable_str_predicate f
 - Consumes: `crate::reduce::next_fresh()` (made `pub(crate)`), `Context::{declare_fun, mk_app, mk_eq, string_sort}`.
 - Produces: `pub fn rewrite_str_predicates(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId>` — every remaining predicate app (caller guarantees positive-only via Task 5's fence) is replaced by its existential concat equation. Fresh vars named `!pfx{n}` / `!sfx{n}` / `!ctnl{n}`+`!ctnr{n}` (the `!` prefix marks internal, matching `!pre{n}`/`!mid{n}`/`!post{n}`).
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to the `tests` module in `predicates.rs`:
 
@@ -676,12 +690,12 @@ Append to the `tests` module in `predicates.rs`:
     }
 ```
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p shinri-str rewrites_positive_predicates rewrite_dedups_repeated_atom`
 Expected: COMPILE FAIL — `rewrite_str_predicates` not defined.
 
-- [ ] **Step 3: Implement the rewrite**
+- [x] **Step 3: Implement the rewrite**
 
 In `crates/shinri-str/src/reduce.rs:70`, change `fn next_fresh()` to `pub(crate) fn next_fresh()`.
 
@@ -779,12 +793,12 @@ fn rewrite_pred(
 }
 ```
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p shinri-str predicates::`
 Expected: PASS (all predicates-module tests).
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/shinri-str
@@ -805,7 +819,7 @@ git commit -m "feat(str): rewrite_str_predicates — positive-occurrence existen
 - Consumes: `shinri_str::predicates::{fold_str_predicates, has_unrewritable_str_predicate, rewrite_str_predicates}` (Tasks 4-6).
 - Produces: end-to-end behavior — folded/positive predicates decide; negative/mixed/non-monotone fence to `unknown`.
 
-- [ ] **Step 1: Write the failing e2e tests**
+- [x] **Step 1: Write the failing e2e tests**
 
 Append to `crates/shinri-solver/tests/script_e2e.rs` (reuse the file's `run_script` helper; match its existing set-logic conventions — if neighboring string tests omit `(set-logic …)`, omit it here too):
 
@@ -929,12 +943,12 @@ fn str_predicate_over_uf_fences_unknown() {
 
 Execution notes: (a) if `(set-logic QF_S)` handling rejects `Bool`/mixed declarations in any of these, match whatever set-logic string the file's existing mixed tests use (or omit the command); (b) if `str_prefixof_positive_decides`'s SAT case returns `unknown` (word-equation fuel), that is a sound-but-incomplete result — replace the length pin with a shape that decides (e.g. drop the `get-value` and assert plain `sat` on `(assert (str.prefixof "a" s))(assert (= s "ab"))`) and record the weaker pin + reason in the test comment.
 
-- [ ] **Step 2: Run tests to verify they fail**
+- [x] **Step 2: Run tests to verify they fail**
 
 Run: `cargo test -p shinri-solver --test script_e2e str_predicate str_prefixof str_suffixof`
 Expected: FAIL — parse errors surface as `(error "unknown operator str.prefixof")`-shaped output… actually the parser now accepts the ops (Task 3), so expected failures are wrong VERDICTS: the un-wired solver misroutes predicate atoms (EUF-opaque Bool atoms) — most tests fail on verdict mismatch. Either failure mode is acceptable evidence; record which one you saw.
 
-- [ ] **Step 3: Wire the seam**
+- [x] **Step 3: Wire the seam**
 
 In `crates/shinri-solver/src/lib.rs`, inside the `uses_strings` block (after the `string_stage::fenced` check at line ~403, before the substr fence at ~416):
 
@@ -977,14 +991,14 @@ In `crates/shinri-solver/src/string_stage.rs` `is_string_op` (line 39), extend t
 
 In `crates/shinri-str/src/reduce.rs` `contains_string_op` (line 139), extend the same way (add the three variants to the `matches!`).
 
-- [ ] **Step 4: Run tests to verify they pass**
+- [x] **Step 4: Run tests to verify they pass**
 
 Run: `cargo test -p shinri-solver --test script_e2e str_predicate str_prefixof str_suffixof`
 Expected: PASS (subject to the Step-1 execution notes).
 Then the string-adjacent net: `cargo test -p shinri-solver --test script_e2e` and `cargo test -p shinri-str`
 Expected: PASS, no regressions.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add crates/shinri-solver crates/shinri-str
@@ -1002,7 +1016,7 @@ git commit -m "feat(solver): wire string-predicate fold/fence/rewrite into strin
 - Consumes: the file's existing `Lcg`, `Gen`, `shinri_verdict`, `z3_verdict`, `parse_string_values`, `z3_with_model`, `Verdict`.
 - Produces: a permanent z3-differential family for the predicate fragment — 0 disagreements, Unknowns tolerated + counted, `sat>0 ∧ unsat>0` asserted.
 
-- [ ] **Step 1: Add the generator + test**
+- [x] **Step 1: Add the generator + test**
 
 Add to `impl Gen` (after `self_ref_eq`):
 
@@ -1124,18 +1138,18 @@ fn qfs_predicates_matches_z3() {
 }
 ```
 
-- [ ] **Step 2: Run the family**
+- [x] **Step 2: Run the family**
 
 Run: `cargo test -p shinri-solver --features oracle --test qfs_differential qfs_predicates_matches_z3 -- --nocapture` (background if slow; z3 must be on PATH)
 Expected: PASS, printed counts. Record the counts in the Task 9 docs truth-up. If `n_sat`/`n_unsat`/`n_witness` assertions fail, tune the generator mix (e.g. bias `hay` toward vars, keep 1 predicate + 1 length atom) — do NOT weaken the disagreement assertion.
 
-- [ ] **Step 3: Verify the existing family is untouched**
+- [x] **Step 3: Verify the existing family is untouched**
 
 Run: `git diff --stat crates/shinri-solver/tests/qfs_differential.rs` — confirm `qfs_matches_z3` and its generator methods (`assertion`, `finish`, `gen_body`) have no changes; only additions.
 Then: `cargo test -p shinri-solver --features oracle --test qfs_differential qfs_matches_z3 -- --nocapture`
 Expected: PASS with its historical count profile (this family's stream is untouched).
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/shinri-solver/tests/qfs_differential.rs
@@ -1155,7 +1169,7 @@ git commit -m "test(solver): qfs_predicates_matches_z3 differential family — p
 - Consumes: everything landed in Tasks 1-8.
 - Produces: green full net + truthful docs; slice ready for finishing-a-development-branch.
 
-- [ ] **Step 1: Format + full workspace test (background, controller-run)**
+- [x] **Step 1: Format + full workspace test (background, controller-run)**
 
 ```bash
 cargo fmt --all
@@ -1163,14 +1177,14 @@ cargo test --workspace
 ```
 Expected: fmt makes no or trivial diffs (commit any); workspace suite green. Run the suite in the background; do NOT dispatch cargo subagents while it runs.
 
-- [ ] **Step 2: Full oracle sweep (background; long — fp family alone ~915 s)**
+- [x] **Step 2: Full oracle sweep (background; long — fp family alone ~915 s)**
 
 ```bash
 cargo test -p shinri-solver --features oracle -- --nocapture
 ```
 Expected: 0 disagreements everywhere; `qfs_matches_z3` count profile unchanged; new family counts recorded.
 
-- [ ] **Step 3: Clean-cache clippy**
+- [x] **Step 3: Clean-cache clippy**
 
 ```bash
 cargo clean
@@ -1178,20 +1192,20 @@ cargo clippy --workspace --all-targets -- -D warnings
 ```
 Expected: zero warnings. (Clean cache is mandatory — warm-cache clippy false-passes here. Never `clippy --fix`; it deadlocks in this environment.)
 
-- [ ] **Step 4: Docs truth-up**
+- [x] **Step 4: Docs truth-up**
 
 - Spec Status line → `Status: IMPLEMENTED (slice 12 landed). <one-line summary: decisive counts from the new family, e.g. "predicate family sat=X/unsat=Y/unknown=Z @ 200 iters, 0 disagreements">` plus any residue (e.g. low decisive rate on `contains`) filed as an explicit follow-up line.
 - `fp_oracle.rs:1818`: reword — the three predicates are now implemented; that str family stays equality/concat/len-only as a deliberate scope choice (slice-12 spec non-goal), not because the ops are unimplemented.
 - Check off all boxes in this plan.
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```bash
 git add -A
 git commit -m "docs: slice-12 spec/ledger truth-up — predicate family counts, fp_oracle comment refresh (slice 12)"
 ```
 
-- [ ] **Step 6:** Use superpowers:finishing-a-development-branch (branch → PR → merge per house flow).
+- [x] **Step 6:** Use superpowers:finishing-a-development-branch (branch → PR → merge per house flow).
 
 ---
 

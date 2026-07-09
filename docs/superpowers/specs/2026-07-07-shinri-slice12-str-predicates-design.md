@@ -1,7 +1,21 @@
 # Slice 12 design — string predicates (prefixof / suffixof / contains)
 
 Date: 2026-07-07
-Status: APPROVED, pre-implementation
+Status: IMPLEMENTED (slice 12 landed 2026-07-09). Predicates parse / sort-check /
+print, constant-fold at any polarity, fence negative/mixed/non-monotone to sound
+Unknown, and decide positive occurrences via existential concat rewrite.
+`qfs_predicates_matches_z3` = 33 sat / 68 unsat / 97 unknown @ 200 iters, 0
+disagreements; `qfs_matches_z3` unchanged (90/136/74, 0 disagreements). The
+predicate rewrite (predicates → word equations) surfaced a PRE-EXISTING
+word-equation resolver unsoundness (present on `main`); implementation additionally
+root-caused and fixed it — dl0-gated merge-derived length lemmas + a complete
+3-valued model gate + antecedent-precise citation — verified across 3 independent
+adversarial review rounds and ~24k differential fuzz iterations (0 wrong verdicts).
+A permanent differential fuzzer (`tests/qfs_fuzz_corpus.rs`) and `script_e2e`
+regression pins guard the fix. Residual (completeness, NOT soundness): sound
+`unknown` on multi-variable disjunctive word-equation shapes the deliberately
+incomplete word-equation+length theory cannot decide — deciding them needs a
+complete procedure (out of slice-12 scope, follow-up).
 Predecessor: slice 11 (PR #4, landed 2026-07-06, merge `d5a1599`)
 
 ## Goal

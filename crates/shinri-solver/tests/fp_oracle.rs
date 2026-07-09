@@ -1814,9 +1814,10 @@ fn differential_qf_fp_to_real_array() {
 }
 
 /// Slice-10 §3: String-Real EUF operand mixed with the bridge, using
-/// SUPPORTED string ops only (eq/distinct over literals, str.len —
-/// design §1.1 item 5; prefixof/suffixof/contains are unimplemented and
-/// would panic the parse-strict harness). Fenced upstream today
+/// eq/distinct over literals + str.len only (design §1.1 item 5). As of slice 12
+/// prefixof/suffixof/contains ARE implemented, but this family deliberately keeps
+/// to equality/concat/len — exercising the predicates here is a non-goal of this
+/// FP-bridge family, not a missing feature. Fenced upstream today
 /// (string_stage::fenced condition 1) — expected all-Unknown. Same contract
 /// as the array family.
 #[cfg(feature = "oracle")]
