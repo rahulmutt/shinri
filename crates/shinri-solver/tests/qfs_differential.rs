@@ -557,12 +557,13 @@ fn qfs_matches_z3() {
 const PRED_N_ITERS: usize = 200;
 
 // Upper bound on tolerated theory-guard bailouts in this family. Currently
-// exactly 1 instance in the 200-iter stream bails out; we bound at
-// PRED_N_ITERS/10 (= 20) — comfortably above the known count of 1, yet tight
-// enough that a future retraction-leak EXPLOSION (many bailouts) trips the
-// assertion instead of being silently masked by the tolerance. A bailout is
-// ALWAYS sound (the engine bails a suspect conflict to `unknown`, never a
-// wrong verdict), so tolerating a bounded number costs no soundness.
+// 2 instances in the 200-iter stream bail out (both the same tolerated
+// slice-11 retraction-leak trajectory); we bound at PRED_N_ITERS/10 (= 20) —
+// comfortably above the observed count, yet tight enough that a future
+// retraction-leak EXPLOSION (many bailouts) trips the assertion instead of
+// being silently masked by the tolerance. A bailout is ALWAYS sound (the
+// engine bails a suspect conflict to `unknown`, never a wrong verdict), so
+// tolerating a bounded number costs no soundness.
 const PRED_MAX_GUARD_BAILOUTS: usize = PRED_N_ITERS / 10;
 
 #[test]

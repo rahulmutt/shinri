@@ -52,8 +52,10 @@ fn cap_address_space() {
         rlim_max: bytes as libc::rlim_t,
     };
     // SAFETY: RLIMIT_AS is a valid resource; `&lim` is a valid rlimit pointer.
-    // Lowering only the soft limit within the inherited hard limit always
-    // succeeds; ignore the (unreachable) error path.
+    // We set both soft and hard to `bytes`; when the inherited hard limit is
+    // unlimited (the normal case here) this lowers both and succeeds. If the
+    // inherited hard limit were already below `bytes`, raising it would fail —
+    // ignored, and benign for a test harness. The error path is not acted on.
     unsafe {
         libc::setrlimit(libc::RLIMIT_AS, &lim);
     }

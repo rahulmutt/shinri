@@ -685,9 +685,8 @@ fn str_var_eq_concat_length_link_model_is_self_consistent() {
     assert_eq!(out.first().map(String::as_str), Some("sat"));
     let vals = &out[1];
     // Extract the quoted string values for s0 and s2 and check s2 == s0 ++ "cc".
-    let pieces: Vec<&str> = vals.split('"').collect();
-    // (get-value ((s0 "..") (s1 "..") (s2 ".."))) → quoted values at odd indices.
-    // Robustly: find the value following each symbol name.
+    // (get-value ((s0 "..") (s1 "..") (s2 ".."))) → find the value following each
+    // symbol name.
     let val_after = |sym: &str| -> String {
         let at = vals.find(sym).expect("symbol present");
         let rest = &vals[at + sym.len()..];
@@ -695,7 +694,6 @@ fn str_var_eq_concat_length_link_model_is_self_consistent() {
         let q2 = rest[q1 + 1..].find('"').expect("close quote");
         rest[q1 + 1..q1 + 1 + q2].to_string()
     };
-    let _ = pieces;
     let s0v = val_after("s0");
     let s2v = val_after("s2");
     assert_eq!(
