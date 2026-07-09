@@ -44,10 +44,8 @@ fn fold_term(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>)
         TermNode::Const { .. } => t,
         TermNode::App { op, args, .. } => {
             let children: Vec<TermId> = ctx.children(args).to_vec();
-            let new_children: Vec<TermId> = children
-                .iter()
-                .map(|&c| fold_term(ctx, c, memo))
-                .collect();
+            let new_children: Vec<TermId> =
+                children.iter().map(|&c| fold_term(ctx, c, memo)).collect();
             let folded = if is_str_predicate(&op) {
                 let a = ctx.string_const_value(new_children[0]).map(str::to_owned);
                 let b = ctx.string_const_value(new_children[1]).map(str::to_owned);
@@ -201,11 +199,7 @@ pub fn rewrite_str_predicates(ctx: &mut Context, assertions: &[TermId]) -> Vec<T
         .collect()
 }
 
-fn rewrite_pred(
-    ctx: &mut Context,
-    t: TermId,
-    memo: &mut FxHashMap<TermId, TermId>,
-) -> TermId {
+fn rewrite_pred(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -> TermId {
     if let Some(&r) = memo.get(&t) {
         return r;
     }
@@ -337,7 +331,10 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::Implies), &[x, p])
             .unwrap();
         assert!(!has_unrewritable_str_predicate(&ctx, &[p]));
-        assert!(!has_unrewritable_str_predicate(&ctx, &[or_px, and_px, imp_xp]));
+        assert!(!has_unrewritable_str_predicate(
+            &ctx,
+            &[or_px, and_px, imp_xp]
+        ));
 
         // Negative / non-monotone shapes: fenced.
         let not_p = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[p]).unwrap();
@@ -374,7 +371,11 @@ mod tests {
         };
         assert!(matches!(op, Op::Builtin(BuiltinOp::Eq)));
         let kids: Vec<TermId> = ctx.children(*args).to_vec();
-        let shinri_core::TermNode::App { op: cop, args: cargs, .. } = ctx.term_node(kids[1])
+        let shinri_core::TermNode::App {
+            op: cop,
+            args: cargs,
+            ..
+        } = ctx.term_node(kids[1])
         else {
             panic!("expected concat rhs");
         };

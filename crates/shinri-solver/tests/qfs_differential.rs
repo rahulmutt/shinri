@@ -646,8 +646,14 @@ fn qfs_predicates_matches_z3() {
          {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
     );
     assert!(n_sat > 0, "predicate family produced zero SAT instances");
-    assert!(n_unsat > 0, "predicate family produced zero UNSAT instances");
-    assert!(n_witness > 0, "no witnesses checked — model path not exercised");
+    assert!(
+        n_unsat > 0,
+        "predicate family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
     // Tolerance must not silently mask a retraction-leak explosion.
     assert!(
         n_guard_bailout <= PRED_MAX_GUARD_BAILOUTS,

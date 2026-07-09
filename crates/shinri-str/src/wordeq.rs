@@ -403,10 +403,16 @@ fn resolve_inner(
                 }
             })
         };
-        if le - i == 1 && terms.string_const_value(lhs[i]).is_none() && !occurs_in(eq, lhs[i], &rhs[j..re]) {
+        if le - i == 1
+            && terms.string_const_value(lhs[i]).is_none()
+            && !occurs_in(eq, lhs[i], &rhs[j..re])
+        {
             return StepResult::Done;
         }
-        if re - j == 1 && terms.string_const_value(rhs[j]).is_none() && !occurs_in(eq, rhs[j], &lhs[i..le]) {
+        if re - j == 1
+            && terms.string_const_value(rhs[j]).is_none()
+            && !occurs_in(eq, rhs[j], &lhs[i..le])
+        {
             return StepResult::Done;
         }
     }

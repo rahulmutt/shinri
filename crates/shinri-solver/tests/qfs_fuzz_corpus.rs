@@ -260,7 +260,11 @@ impl Gen {
             }
             3 => {
                 let op = ["=", "<=", ">="][self.rng.below(3) as usize];
-                format!("({op} (str.len {}) (str.len {}))", self.len_arg(), self.len_arg())
+                format!(
+                    "({op} (str.len {}) (str.len {}))",
+                    self.len_arg(),
+                    self.len_arg()
+                )
             }
             4 | 5 => self.predicate(),
             6 => self.self_ref(),
@@ -294,7 +298,8 @@ fn parse_string_values(resp: &str) -> Vec<(String, String)> {
         if bytes[i] == '(' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_alphabetic() {
             let mut j = i + 1;
             let mut name = String::new();
-            while j < bytes.len() && !bytes[j].is_whitespace() && bytes[j] != '(' && bytes[j] != ')' {
+            while j < bytes.len() && !bytes[j].is_whitespace() && bytes[j] != '(' && bytes[j] != ')'
+            {
                 name.push(bytes[j]);
                 j += 1;
             }
@@ -356,7 +361,10 @@ fn classify(inst: &Instance) -> Option<Class> {
         let get = format!(
             "{}(check-sat)\n(get-value ({}))\n",
             inst.body(),
-            (0..N_VARS).map(|k| format!("s{k}")).collect::<Vec<_>>().join(" ")
+            (0..N_VARS)
+                .map(|k| format!("s{k}"))
+                .collect::<Vec<_>>()
+                .join(" ")
         );
         let lines = shinri_lines(&get);
         if let Some(resp) = lines.get(1) {
@@ -471,7 +479,10 @@ fn e1_enumerate_wrong_verdicts() {
     let mut seen_shapes: BTreeSet<String> = BTreeSet::new();
 
     for it in 0..n_iters {
-        let inst = Gen { rng: Lcg(rng.next()) }.instance();
+        let inst = Gen {
+            rng: Lcg(rng.next()),
+        }
+        .instance();
         if let Some(class) = classify(&inst) {
             let mini = minimize(&inst, class);
             let sh = shape(&mini);
