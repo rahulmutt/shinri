@@ -40,7 +40,13 @@ fn is_string_op(op: &Op) -> bool {
     matches!(
         op,
         Op::Builtin(
-            BuiltinOp::StrConcat | BuiltinOp::StrLen | BuiltinOp::StrAt | BuiltinOp::StrSubstr
+            BuiltinOp::StrConcat
+                | BuiltinOp::StrLen
+                | BuiltinOp::StrAt
+                | BuiltinOp::StrSubstr
+                | BuiltinOp::StrPrefixOf
+                | BuiltinOp::StrSuffixOf
+                | BuiltinOp::StrContains
         )
     )
 }

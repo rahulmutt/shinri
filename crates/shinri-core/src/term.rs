@@ -84,6 +84,12 @@ pub enum BuiltinOp {
     StrLen,
     StrAt,
     StrSubstr,
+    // String predicates (slice 12): String × String → Bool.
+    // Arg order per SMT-LIB: prefixof/suffixof take the NEEDLE first;
+    // contains takes the HAYSTACK first.
+    StrPrefixOf,
+    StrSuffixOf,
+    StrContains,
     // Floating-point — arithmetic. Rounded ops take a RoundingMode as arg 0.
     FpAbs,
     FpNeg, // (F) -> F

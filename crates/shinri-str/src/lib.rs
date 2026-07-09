@@ -3,16 +3,17 @@ mod fuel;
 mod length;
 pub mod model;
 pub mod normalize;
+pub mod predicates;
 pub mod reduce;
 mod trail;
 pub mod wordeq;
 pub use fuel::Fuel;
 
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
-use shinri_theory::types::EqLeaf;
-use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
+use shinri_theory::types::{ENodeId, EqLeaf};
+use shinri_theory::{EqualityEngine, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
 #[derive(Default)]
 pub struct StrSolver {
@@ -20,6 +21,18 @@ pub struct StrSolver {
     /// The `Lit` is used to build `EqLeaf::Asserted` justifications for conflicts.
     eq_true: Vec<(TermId, Lit)>,
     diseq_true: Vec<(TermId, Lit)>,
+    /// SAT decision level at which each `eq_true` / `diseq_true` entry was asserted
+    /// (parallel, index-for-index; truncated together on `pop`). Level 0 ⟹ the
+    /// (dis)equality is UNCONDITIONALLY entailed (a top-level fact); level > 0 ⟹ it
+    /// is only CONDITIONALLY active (selected inside a disjunction at a decision).
+    /// Used by `check` to gate MERGE-DERIVED length lemmas (E1): those lemmas read
+    /// the live EUF class map / deep normal forms, so their content is only valid
+    /// given the currently-active merges. Emitted GLOBALLY (guard `¬eq` or, for the
+    /// `next_axiom` defining axiom, guard `None`), such a lemma is unsound on a
+    /// backtracked branch unless every contributing merge is unconditional. We emit
+    /// them only when NO conditional string (dis)equality is active.
+    eq_levels: Vec<u32>,
+    diseq_levels: Vec<u32>,
     len_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
     emitted_len_axioms: FxHashSet<TermId>,
@@ -27,6 +40,14 @@ pub struct StrSolver {
     /// Monotone (never cleared on backtrack); prevents re-emitting the same
     /// split after dedup (termination guarantee).
     emitted_splits: FxHashSet<(TermId, TermId)>,
+    /// String-equality atoms MINTED by the word-equation search itself (the
+    /// F-split `a = b++z` / char-peel `v = h++z` / `v = ""` disjuncts), as
+    /// opposed to equalities present in the reduced INPUT assertions. These carry
+    /// fresh skolem remainders and are re-minted every round, so the per-concat
+    /// length link is deliberately NOT emitted for them (see the length-link loop
+    /// and the historical unsound-conflict note there). Monotone: recorded at the
+    /// moment a split is emitted, before the disjunct can be asserted back.
+    minted_eqs: FxHashSet<TermId>,
     /// Counter for fresh string skolem variables minted by F-split.
     fresh_ctr: u32,
     fuel: Fuel,
@@ -52,26 +73,31 @@ impl TheorySolver for StrSolver {
         // Gate on the operands being String-sorted so non-string equalities
         // (e.g. integer or bitvector) cannot pollute eq_true/diseq_true.
         let atom = cx.atoms.atom(lit.var());
+        // Decision level at which this literal is being asserted (E1 gate): the
+        // number of open trail scopes. Recorded parallel to eq_true/diseq_true so
+        // `check` can tell a top-level (dl0) equality from a conditional (dl>0) one.
+        let lvl = self.trail.level();
         if let TermNode::App { op, args, .. } = cx.terms.term_node(atom) {
             let args = cx.terms.children(*args).to_vec();
             let is_str_eq = !args.is_empty() && cx.terms.sort_of(args[0]) == cx.terms.string_sort();
             if is_str_eq {
-                match op {
-                    Op::Builtin(BuiltinOp::Eq) => {
-                        if lit.is_positive() {
-                            self.eq_true.push((atom, lit));
-                        } else {
-                            self.diseq_true.push((atom, lit));
-                        }
+                // Direction: `Eq` positive / `Distinct` negative ⟹ equality; the
+                // opposite polarities ⟹ disequality.
+                let is_eq = match op {
+                    Op::Builtin(BuiltinOp::Eq) => Some(lit.is_positive()),
+                    Op::Builtin(BuiltinOp::Distinct) => Some(!lit.is_positive()),
+                    _ => None,
+                };
+                match is_eq {
+                    Some(true) => {
+                        self.eq_true.push((atom, lit));
+                        self.eq_levels.push(lvl);
                     }
-                    Op::Builtin(BuiltinOp::Distinct) => {
-                        if lit.is_positive() {
-                            self.diseq_true.push((atom, lit));
-                        } else {
-                            self.eq_true.push((atom, lit));
-                        }
+                    Some(false) => {
+                        self.diseq_true.push((atom, lit));
+                        self.diseq_levels.push(lvl);
                     }
-                    _ => {}
+                    None => {}
                 }
             }
         }
@@ -89,6 +115,148 @@ impl TheorySolver for StrSolver {
     fn check(&mut self, cx: &mut TheoryCtx, effort: Effort) -> TCheck {
         if effort != Effort::Full {
             return TCheck::Sat;
+        }
+
+        // E1 iterations 2/3 — MERGE-DERIVED length lemmas & same-word conflicts must not
+        // be emitted GLOBALLY (guard=None, or a conflict/split cited only by the trigger)
+        // when their content reads a BRANCH-LOCAL merge — a merge some (dis)equality
+        // asserted at decision level > 0 produced (a decided INPUT disjunct OR the word-
+        // equation search's own minted F-split/char-peel). Over such a merge the global
+        // clause survives backtracking and over-constrains the sibling branch → the
+        // wrong-UNSAT class (ce1..ce8, all also wrong at base). iter-2 gated this with
+        // COARSE flags (skip whenever ANY conditional (dis)equality was active anywhere);
+        // iter-3 makes every gate ANTECEDENT-PRECISE via the `lit_lvl` / `cond_roots` /
+        // per-lemma `eq.explain` infrastructure below, so an UNRELATED conditional
+        // (dis)equality no longer forfeits a decidable verdict. The post-solve model gate
+        // (Fix B) remains the backstop; the per-equation length LINK stays unconditional
+        // (`¬eq ∨ len(l)=len(r)` over the equality's OWN sides is a pure tautology).
+
+        // ── E1 (iter 3) ANTECEDENT-PRECISE gating ────────────────────────────────
+        // The coarse flags above skip a merge-derived GLOBAL lemma whenever ANY
+        // conditional (dis)equality is active anywhere — even when the SPECIFIC merges
+        // that lemma's content reads are all dl0 and only an UNRELATED equality is
+        // conditional. That needlessly forfeits decidable verdicts. The precise test:
+        // a global lemma is unconditionally valid iff every antecedent its content
+        // actually depends on (the triggering (dis)equality, plus each EUF merge that
+        // `normal_form`/`deep_normal_form`/`same()` traverses to substitute a term by
+        // its class representative) is recorded at decision level 0.
+        //
+        // `lit_lvl` maps each currently-asserted string (dis)equality literal to the
+        // decision level it was asserted at (0 = top-level / unconditional). A merge's
+        // antecedents are the `EqLeaf::Asserted` proof-forest leaves `eq.explain`
+        // returns; a merge is "dl0-entailed" iff every such leaf is a level-0 literal
+        // (an `Interface` leaf is cross-theory — its level is unknown here, so it is
+        // treated conservatively as conditional).
+        let mut lit_lvl: FxHashMap<Lit, u32> = FxHashMap::default();
+        let mut minted_lits: FxHashSet<Lit> = FxHashSet::default();
+        for (i, &(atom, l)) in self.eq_true.iter().enumerate() {
+            lit_lvl.insert(l, *self.eq_levels.get(i).unwrap_or(&u32::MAX));
+            if self.minted_eqs.contains(&atom) {
+                minted_lits.insert(l);
+            }
+        }
+        for (i, &(atom, l)) in self.diseq_true.iter().enumerate() {
+            lit_lvl.insert(l, *self.diseq_levels.get(i).unwrap_or(&u32::MAX));
+            if self.minted_eqs.contains(&atom) {
+                minted_lits.insert(l);
+            }
+        }
+
+        // CONDITIONAL-CLASS ROOTS. A term whose EUF class root is in one of these
+        // sets sits in a class a CONDITIONAL (dl>0) (dis)equality merged, so its
+        // `normal_form` substitution may be branch-local. A lemma reading only terms
+        // OUTSIDE these sets used no conditional merge (precise replacement for the
+        // blanket "any conditional active" flags).
+        //   * `input_cond_roots` — classes touched by a conditional INPUT (non-minted)
+        //     (dis)equality (a disjunct decided at dl>0). Gates channels that must stay
+        //     branch-independent but may run over the search's OWN minted disjuncts.
+        //   * `all_cond_roots` — additionally classes touched by a MINTED F-split /
+        //     char-peel disjunct. Gates the GLOBAL same-word conflicts, whose citation
+        //     over a minted-skolem merge is not guaranteed complete.
+        // (An unconditional (dl0) equality contributes to NEITHER — its merge is
+        // globally entailed, so terms it touches stay resolvable.)
+        let mut input_cond_roots: FxHashSet<ENodeId> = FxHashSet::default();
+        let mut all_cond_roots: FxHashSet<ENodeId> = FxHashSet::default();
+        {
+            let mut cond: Vec<(TermId, bool)> = Vec::new(); // (atom, is_minted)
+            for (i, &(atom, _)) in self.eq_true.iter().enumerate() {
+                if *self.eq_levels.get(i).unwrap_or(&u32::MAX) > 0 {
+                    cond.push((atom, self.minted_eqs.contains(&atom)));
+                }
+            }
+            for (i, &(atom, _)) in self.diseq_true.iter().enumerate() {
+                if *self.diseq_levels.get(i).unwrap_or(&u32::MAX) > 0 {
+                    cond.push((atom, self.minted_eqs.contains(&atom)));
+                }
+            }
+            for (atom, minted) in cond {
+                let (a, b) = crate::wordeq::diseq_sides(cx.terms, atom);
+                for side in [a, b] {
+                    let n = cx.eq.intern(side);
+                    let r = cx.eq.find(n);
+                    all_cond_roots.insert(r);
+                    if !minted {
+                        input_cond_roots.insert(r);
+                    }
+                }
+            }
+        }
+
+        // ── E1 (iter 3) side_clean / cond_roots SOUNDNESS INVARIANT (debug-only) ──
+        // Antecedent precision is sound because: a conditional (dl>0) merge of a string
+        // LEAF variable is caused by a TRACKED (dis)equality — an `eq_true`/`diseq_true`
+        // entry — whose sides we just added to `cond_roots`; since every member of an
+        // EUF class shares one root, a conditionally-merged leaf's root is therefore in
+        // `cond_roots`, so `side_clean` flags it. The load-bearing premise is that a
+        // string leaf is NEVER merged by an UNTRACKED mechanism (a merge with no
+        // corresponding `eq_true`/`diseq_true` literal): if it were AND that merge were
+        // branch-local, `cond_roots` would miss it and `side_clean` could wrongly pass.
+        // We pin the WEAKEST sound approximation that catches such a violation: every
+        // `EqLeaf::Asserted` antecedent of any string leaf's merge-to-root is a literal
+        // we track in `lit_lvl` (so its decision level — hence its cond_roots membership
+        // when dl>0 — is known). `Interface` leaves would signal a cross-theory merge of
+        // a string leaf, which does not occur in this fragment (the N-O seam exchanges
+        // only Int length terms, never string-leaf equalities); we assert their absence
+        // too, so a future seam change that violates the premise trips here rather than
+        // silently at a later wrong-UNSAT. Debug-only: no release cost, no verdict change.
+        #[cfg(debug_assertions)]
+        {
+            let leaves: Vec<TermId> = self
+                .str_terms
+                .iter()
+                .copied()
+                .filter(|&t| {
+                    matches!(
+                        cx.terms.term_node(t),
+                        TermNode::App { op: Op::Uninterpreted(_), args, .. }
+                            if cx.terms.children(*args).is_empty()
+                    )
+                })
+                .collect();
+            for t in leaves {
+                let tn = cx.eq.intern(t);
+                let rn = cx.eq.find(tn);
+                if tn == rn {
+                    continue; // canonical node of its class: its merges surface from the
+                              // non-canonical members, which are checked in turn.
+                }
+                let mut ante = Vec::new();
+                cx.eq.explain(tn, rn, &mut ante);
+                for leaf in &ante {
+                    match leaf {
+                        EqLeaf::Asserted(l) => debug_assert!(
+                            lit_lvl.contains_key(l),
+                            "side_clean invariant violated: string leaf {t:?} is merged by \
+                             UNTRACKED literal {l:?} — cond_roots may miss a conditional merge",
+                        ),
+                        EqLeaf::Interface(_) => debug_assert!(
+                            false,
+                            "side_clean invariant violated: string leaf {t:?} merged via a \
+                             cross-theory Interface antecedent — cond_roots cannot level-check it",
+                        ),
+                    }
+                }
+            }
         }
 
         // Build the `known` set FIRST: all string-sorted subterms visible to the
@@ -129,38 +297,48 @@ impl TheorySolver for StrSolver {
             return TCheck::Conflict(just);
         }
 
-        // Per-equation length lemma, RESTRICTED to ATOM equalities (neither side a
-        // concat): `l = r → len(l) = len(r)`, emitted via arith Ge/Le companions
-        // guarded by ¬eq. Required so e.g. `s1 = s2` forces `len(s1) = len(s2)` in
-        // arith (string equality merges s1≈s2 in EUF, but str.len is not an EUF
-        // congruence function here, so arith would otherwise assign inconsistent
-        // lengths → a non-satisfying model). SAFE for atom equalities (no fresh
-        // concat skolems, so it does not feed the unbounded String↔Arith MBTC).
-        // NOT emitted for concat equalities: there the word-equation F-split mints
-        // fresh `str.len(skolem)` terms every round, so a per-concat length lemma
-        // both floods the seam AND (interacting with the length-defining axioms over
-        // those skolems) produced an unsound conflict — so concat length
-        // contradictions are caught DIRECTLY in `resolve_equation` by the
-        // constant-length bound check (a fully-constant side shorter than the other
-        // side's minimum constant length is UNSAT — e.g. `s2++"ba" = "b"`), which
-        // needs no fresh terms. A concat-vs-variable-bound length mismatch that
-        // depends on an arith-only bound (e.g. `s2++"c"++"bc" = (str.at s0 2)`, where
-        // the str.at result is length-bounded only in arith) is left to the bounded
-        // fuel/round/pivot caps, which yield a SOUND `Unknown`.
+        // Per-equation length lemma: `l = r → len(l) = len(r)`, emitted via arith
+        // Ge/Le companions guarded by ¬eq. Required so e.g. `s1 = s2` forces
+        // `len(s1) = len(s2)` in arith (string equality merges s1≈s2 in EUF, but
+        // str.len is not an EUF congruence function here, so arith would otherwise
+        // assign inconsistent lengths → a non-satisfying model). SAFE for atom
+        // equalities (no fresh concat skolems, so it does not feed the unbounded
+        // String↔Arith MBTC).
+        //
+        // Emitted for a CONCAT-sided equality ONLY when the equality is an INPUT
+        // assertion (its atom is NOT in `minted_eqs`) — Task 7.5. This closes the
+        // wrong-SAT on e.g. `s = "ab"++k ∧ len(s)=1`: without the link `len(s)`
+        // floats free in arith (an opaque-var length gets no defining axiom, and
+        // the var-headed word equation solves trivially), so arith SATs `len(s)=1`
+        // while `len("ab"++k) ≥ 2`. Emitting `len(s)=len("ab"++k)` feeds the
+        // existing length-defining fixpoint (`len("ab"++k)=len("ab")+len(k)=2+len(k)
+        // ≥ 2`) → arith UNSAT.
+        //
+        // NOT emitted for a concat-sided equality that the word-equation search
+        // MINTED (`minted_eqs`): those are the F-split disjuncts `a = b++z` / char-
+        // peel `v = h++z`, re-minted with a FRESH skolem `z` every round. A per-
+        // concat length link over them both floods the seam (unbounded fresh
+        // `str.len(skolem)` terms) AND, interacting with the length-defining axioms
+        // over those skolems, produced the historically-documented unsound conflict.
+        // Restricting to input equalities keeps emission FINITE (a fixed set of
+        // input equations, companions deduped via `emitted_len_axioms`) and mints NO
+        // fresh skolems (a concat's parts already exist; their `str.len` terms feed
+        // the existing axiom fixpoint) — so neither the flood nor the skolem
+        // interaction can arise. Concat length contradictions that need no fresh
+        // terms are still ALSO caught directly in `resolve_equation` by the
+        // constant-length bound check (e.g. `s2++"ba" = "b"`).
         {
             let eqs: Vec<(TermId, Lit)> = self.eq_true.clone();
             for (atom, lit) in eqs {
                 let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
-                let is_concat = |t: TermId| {
-                    matches!(
-                        cx.terms.term_node(t),
-                        TermNode::App {
-                            op: Op::Builtin(BuiltinOp::StrConcat),
-                            ..
-                        }
-                    )
-                };
-                if is_concat(l) || is_concat(r) {
+                // Skip ANY equality minted by the word-equation search (its F-split /
+                // char-peel disjuncts carry fresh skolems). NOTE (E1): the original
+                // guard only skipped a CONCAT-sided minted equality, so the char-peel
+                // empty branch `v = ""` (neither side a concat) slipped through and
+                // got a `len(v)=0` link — one of the under-cited minted-skolem length
+                // constraints that, combined across branches, drove the two-suffixof
+                // spurious UNSAT. Gate on `minted_eqs` membership alone.
+                if self.minted_eqs.contains(&atom) {
                     continue;
                 }
                 if cx.terms.string_const_value(l).is_some()
@@ -213,9 +391,21 @@ impl TheorySolver for StrSolver {
         // (a bare Int equality would route to EUF, not Arith — see length.rs).
         let lens: Vec<TermId> = self.len_terms.iter().copied().collect();
         for lt in lens {
-            if let Some(axiom) =
-                length::next_axiom(cx.terms, cx.eq, &known, lt, &self.emitted_len_axioms)
-            {
+            // E1 (iter 3): `next_axiom` resolves an opaque variable's length through
+            // its EUF class CONSTANT (`x ≈ "a"` ⟹ `len(x)=1`) — an UNCONDITIONAL
+            // `guard=None` dl0-pinned unit — only when the SPECIFIC `x ≈ const` merge
+            // is dl0-entailed (checked ANTECEDENT-PRECISELY inside via `lit_lvl`). Over
+            // a branch-local merge it is the wrong-UNSAT channel (ce1/ce3/ce4); an
+            // unrelated conditional equality no longer suppresses it. STRUCTURAL axioms
+            // (`≥0`, literal length, concat sum) are merge-independent and always emitted.
+            if let Some(axiom) = length::next_axiom(
+                cx.terms,
+                cx.eq,
+                &known,
+                lt,
+                &self.emitted_len_axioms,
+                &lit_lvl,
+            ) {
                 // Register NEW str.len subterms introduced by this axiom so the
                 // defining-axiom chain over nested concats continues to a fixpoint.
                 let mut seen = FxHashSet::default();
@@ -251,11 +441,13 @@ impl TheorySolver for StrSolver {
             // `eq_true` may hold a `Distinct` asserted FALSE (¬distinct ≡ eq).
             let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
             // Single-level normal forms for the CONFLICT/SPLIT path (NOT deep: deep
-            // expansion substitutes merge-derived constants, and resolve's ground
-            // conflicts cite only the word-equation literal — not the EUF merge
-            // antecedents — so a branch-local contradiction would be reported as a
-            // GLOBAL conflict (unsound). Model reconstruction uses the deep view in
-            // model.rs).
+            // expansion substitutes merge-derived material whose antecedents the
+            // ground resolver does not cite, so a branch-local contradiction would
+            // be reported as a GLOBAL conflict — unsound). To stay within that
+            // single-level regime, `resolve_equation` refuses to F-split / char-peel
+            // an UNFLATTENED concat class representative (it Saturates instead — the
+            // opaque-concat split is the F1 divergence that yielded a spurious
+            // UNSAT). Model reconstruction uses the deep view in model.rs.
             let lhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, l);
             let rhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, r);
 
@@ -318,7 +510,31 @@ impl TheorySolver for StrSolver {
                                 }
                             )
                     });
-                    if all_var {
+                    // E1: do NOT emit the empty-residual length lemma over a MINTED
+                    // (dis)equality (an F-split disjunct). Its residual is computed
+                    // from merge-substituted normal forms whose antecedents the
+                    // ¬eq guard does not cite; over branch-local minted skolems the
+                    // learnt `Σlen ≤ 0` clause is unsound on backtracked branches.
+                    // E1 (iter 2): also skip while a conditional INPUT (dis)equality is
+                    // active. The residual comes from `normal_form` + `same()` over the
+                    // live merges; the globally-learnt `¬eq ∨ Σlen ≤ 0` (which forces the
+                    // residual VARS empty) is unsound on the branch where the disjunct
+                    // that produced those merges is not selected. Combined with a
+                    // separation `Σlen ≥ 1` over a sibling diseq it manufactured a
+                    // spurious UNSAT (fuzz seed 13: `(or (= s0·s2 s0) (= s1 s0)) ∧
+                    // s2·s1 ≠ s2 ∧ s0 = s0·s0`). Gating THIS channel (not the weaker
+                    // separation `≥1`, which a decided disequality-family SAT needs for
+                    // its model) breaks the chain while preserving the oracle SAT pins.
+                    // E1 (iter 3): precise — emit iff neither side is in a conditional
+                    // class (`all_cond_roots`: input disjunct OR minted split). This
+                    // `Σlen ≤ 0` forces residual vars empty, so it must not read any
+                    // branch-local merge; but an UNRELATED conditional (dis)equality no
+                    // longer blocks it (recovers decisiveness over the old blanket gate).
+                    if all_var
+                        && !self.minted_eqs.contains(&atom)
+                        && side_clean(cx.eq, cx.terms, l, &all_cond_roots)
+                        && side_clean(cx.eq, cx.terms, r, &all_cond_roots)
+                    {
                         let int_s = cx.terms.int_sort();
                         let len_atoms: Vec<TermId> = vars
                             .iter()
@@ -367,59 +583,121 @@ impl TheorySolver for StrSolver {
                 }
             }
 
-            // Build the EqLeaf justification from the asserted equality literal.
-            // This feeds `expand_conflict` so the conflict clause cites the right input literal.
-            let just = vec![EqLeaf::Asserted(lit)];
-            match crate::wordeq::resolve_equation(
-                cx.terms,
-                cx.eq,
-                &lhs,
-                &rhs,
-                just,
-                lit,
-                &mut self.fresh_ctr,
-                &mut self.emitted_splits,
-            ) {
-                crate::wordeq::StepResult::Conflict(cf) => return TCheck::Conflict(cf),
-                crate::wordeq::StepResult::Split { atoms, guard } => {
-                    // Register the new str.len terms produced by the F-split so
-                    // their length axioms are emitted on the next check round.
-                    // The F-split atoms are: [len_eq, a_pref, b_pref].
-                    // len_eq = (= (str.len a) (str.len b)); extract the len sub-terms.
-                    let mut seen = FxHashSet::default();
-                    for &split_atom in &atoms {
-                        collect::collect(
-                            cx.terms,
-                            split_atom,
-                            &mut self.len_terms,
-                            &mut self.str_terms,
-                            &mut seen,
-                        );
+            // E1 (iter 2): the word-equation Conflict/Split are derived from the
+            // SINGLE-LEVEL normal forms `lhs`/`rhs`, which substitute EUF class
+            // representatives — including CONSTANT substitutions from a currently-
+            // active merge (e.g. a decided disjunct `s0="y"` rewrites `"x"++s0`'s
+            // normal form to `"xy"`). When a conditional (dl>0) string (dis)equality
+            // is active, that substitution is branch-local, but the emitted Conflict
+            // cites only `EqLeaf::Asserted(lit)` (the equation literal) and the F-split
+            // is guarded only by `¬eqn` — NEITHER cites the merge antecedent. Learnt
+            // globally, such a Conflict/Split is unsound on the branch where the
+            // merge-producing disjunct is not selected (ce2: the `s0="y"` disjunct's
+            // head-mismatch conflict kills the `s0=s1` branch → wrong global UNSAT).
+            // E1 (iter 3) ANTECEDENT-PRECISE: resolve this word equation iff neither
+            // side sits in a class an INPUT disjunct (dl>0) merged — i.e. the
+            // single-level normal forms `lhs`/`rhs` are branch-independent w.r.t.
+            // external disjunctions (`side_clean(input_cond_roots)`). This replaces the
+            // coarse "no conditional INPUT (dis)equality ANYWHERE" gate: an unrelated
+            // disjunction over OTHER variables no longer disables resolution here. The
+            // search's OWN minted disjuncts are deliberately NOT in `input_cond_roots`,
+            // so it keeps resolving them (else a decided dl0 word equation stalls at
+            // `unknown`). Unconditional constant clashes are still caught by the
+            // (ungated) direct/transitive distinct-const checks above; any SAT this
+            // admits is re-validated by the model gate; skipped ⟹ saturated (no
+            // fabricated verdict).
+            if side_clean(cx.eq, cx.terms, l, &input_cond_roots)
+                && side_clean(cx.eq, cx.terms, r, &input_cond_roots)
+            {
+                // Build the EqLeaf justification from the asserted equality literal.
+                // This feeds `expand_conflict` so the conflict clause cites the right
+                // input literal. `resolve_equation` never derives a ground conflict from
+                // a variable it substituted by a concat class representative (it
+                // Saturates on a concat residual head instead — see wordeq.rs), so no
+                // extra merge-antecedent citation is needed here.
+                let just = vec![EqLeaf::Asserted(lit)];
+                match crate::wordeq::resolve_equation(
+                    cx.terms,
+                    cx.eq,
+                    &lhs,
+                    &rhs,
+                    just,
+                    lit,
+                    &mut self.fresh_ctr,
+                    &mut self.emitted_splits,
+                ) {
+                    crate::wordeq::StepResult::Conflict(cf) => {
+                        // A word-equation Conflict is a GLOBAL fact (`¬eqn` learnt), and
+                        // `resolve_equation` cites only `EqLeaf::Asserted(lit)` — not the
+                        // merges its normal forms substituted. So it must be emitted only
+                        // when the normal forms used NO branch-local merge at all,
+                        // including the search's OWN minted skolem merges (`prefixof "a"
+                        // (s2·"c")` mints `s2 ≈ "a"·!strk`; a later round's head-mismatch
+                        // conflict over that merge, cited by the eq literal alone, kills
+                        // sibling branches → wrong-UNSAT, fuzz 966367641601, also wrong at
+                        // base). E1 (iter 3): gate ANTECEDENT-PRECISELY on `all_cond_roots`
+                        // (input + minted): emit iff neither side touches a conditional
+                        // class. This is strictly more permissive than the old global
+                        // `no_minted_active` (an unrelated minted split elsewhere no
+                        // longer blocks a conflict whose own sides are clean). Declined ⟹
+                        // saturated; the model gate backstops and the conflict re-derives
+                        // from the clean state on backtrack. F-SPLITS still fire (they add
+                        // only guarded branches, never a global fact).
+                        if side_clean(cx.eq, cx.terms, l, &all_cond_roots)
+                            && side_clean(cx.eq, cx.terms, r, &all_cond_roots)
+                        {
+                            return TCheck::Conflict(cf);
+                        }
                     }
-                    // Spend one unit of fuel before emitting a word-equation split.
-                    // If the budget is exhausted, signal Unknown (sound). The
-                    // word-equation search is only semi-decidable; this bounds it.
-                    if !self.fuel.spend() {
-                        return TCheck::Unknown;
+                    crate::wordeq::StepResult::Split { atoms, guard } => {
+                        // Register the new str.len terms produced by the F-split so
+                        // their length axioms are emitted on the next check round.
+                        // The F-split atoms are: [len_eq, a_pref, b_pref].
+                        // len_eq = (= (str.len a) (str.len b)); extract the len sub-terms.
+                        let mut seen = FxHashSet::default();
+                        for &split_atom in &atoms {
+                            collect::collect(
+                                cx.terms,
+                                split_atom,
+                                &mut self.len_terms,
+                                &mut self.str_terms,
+                                &mut seen,
+                            );
+                            // Mark every minted disjunct (`a = b++z`, `v = h++z`,
+                            // `v = ""`) so that once the SAT layer asserts it back into
+                            // `eq_true`, the per-concat length link above skips it — it
+                            // carries a fresh skolem and must not feed the length seam
+                            // (Task 7.5). Recorded HERE, at emission, i.e. strictly
+                            // before the disjunct can be asserted (assertion happens
+                            // between check rounds), so the guard is always in place by
+                            // the time the atom appears in `eq_true`.
+                            self.minted_eqs.insert(split_atom);
+                        }
+                        // Spend one unit of fuel before emitting a word-equation split.
+                        // If the budget is exhausted, signal Unknown (sound). The
+                        // word-equation search is only semi-decidable; this bounds it.
+                        if !self.fuel.spend() {
+                            return TCheck::Unknown;
+                        }
+                        // GUARDED split: `guard = ¬eqn`. The learnt clause is
+                        // `¬eqn ∨ len_eq ∨ a_pref ∨ b_pref` ≡ `eqn → (…)`, a valid
+                        // implication (Nielsen lemma) — NOT the unsound bare disjunction.
+                        return TCheck::Split {
+                            atoms,
+                            guard: Some(guard),
+                        };
                     }
-                    // GUARDED split: `guard = ¬eqn`. The learnt clause is
-                    // `¬eqn ∨ len_eq ∨ a_pref ∨ b_pref` ≡ `eqn → (…)`, a valid
-                    // implication (Nielsen lemma) — NOT the unsound bare disjunction.
-                    return TCheck::Split {
-                        atoms,
-                        guard: Some(guard),
-                    };
+                    crate::wordeq::StepResult::Done => {}
+                    // A dedup-saturated variable-headed residual: the SAT layer must
+                    // case-split on the already-emitted F-split disjunction to make
+                    // progress. Treated like `Done` here (wait for SAT). The (B′)
+                    // premature-SAT hazard — concluding SAT with a model that does not
+                    // actually satisfy the equation — is caught instead by the post-solve
+                    // witness self-check in `Solver::solve` (model-substitution re-check),
+                    // which downgrades an unrealisable SAT to a SOUND `Unknown`.
+                    crate::wordeq::StepResult::Saturated => {}
                 }
-                crate::wordeq::StepResult::Done => {}
-                // A dedup-saturated variable-headed residual: the SAT layer must
-                // case-split on the already-emitted F-split disjunction to make
-                // progress. Treated like `Done` here (wait for SAT). The (B′)
-                // premature-SAT hazard — concluding SAT with a model that does not
-                // actually satisfy the equation — is caught instead by the post-solve
-                // witness self-check in `Solver::solve` (model-substitution re-check),
-                // which downgrades an unrealisable SAT to a SOUND `Unknown`.
-                crate::wordeq::StepResult::Saturated => {}
-            }
+            } // end antecedent-precise word-eq resolution gate (E1 iter 3)
         }
 
         // Disequality same-word conflict check (Task 14).
@@ -528,13 +806,45 @@ impl TheorySolver for StrSolver {
                 // not ground-resolve, so yield a SOUND `Unknown` (never a wrong
                 // verdict). This is the UNIFORM bound for the divergent
                 // self-referential word-equation / disequality shapes.
+                // E1 (iter 3): collect the expansion merge antecedents so the gate can
+                // be ANTECEDENT-PRECISE. Separation is a guarded SPLIT (single-literal
+                // guard), so unlike Case-2 it cannot cite multiple antecedents in its
+                // clause; instead it emits GLOBALLY only when every merge its residual
+                // reads is dl0-entailed (`sep_ante` all level-0), else declines. An
+                // unrelated conditional (dis)equality no longer blocks it.
+                let mut sep_ante: Vec<EqLeaf> = Vec::new();
                 let (lhs, rhs) = match (
-                    crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, l),
-                    crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, r),
+                    crate::normalize::deep_normal_form_cited(
+                        cx.terms,
+                        cx.eq,
+                        &known_d,
+                        l,
+                        &mut sep_ante,
+                    ),
+                    crate::normalize::deep_normal_form_cited(
+                        cx.terms,
+                        cx.eq,
+                        &known_d,
+                        r,
+                        &mut sep_ante,
+                    ),
                 ) {
                     (Some(lhs), Some(rhs)) => (lhs, rhs),
                     _ => return TCheck::Unknown,
                 };
+                // Precise separation gate: decline iff the residual read a MINTED
+                // merge (an F-split / char-peel skolem substitution) — the ce5/ce6
+                // wrong-UNSAT channel. An INPUT-conditional merge is left ENABLED: iter-2
+                // gated separation on `no_minted_active` only (never on input
+                // conditionality), and that stayed sweep-clean while a decided
+                // disequality-family SAT (`targeted_pending_conflict_pop_decides_sat`)
+                // relies on separation firing over its input merges. This is the precise
+                // form of that same rule: block only when THIS residual's antecedents
+                // include a minted-disjunct literal, not whenever any minted split is
+                // active elsewhere.
+                let sep_reads_minted = sep_ante
+                    .iter()
+                    .any(|leaf| matches!(leaf, EqLeaf::Asserted(l) if minted_lits.contains(l)));
                 // Cancel common prefix, then common suffix (free-monoid cancellation).
                 let (mut i, mut j) = (0usize, 0usize);
                 let (mut le, mut re) = (lhs.len(), rhs.len());
@@ -555,7 +865,36 @@ impl TheorySolver for StrSolver {
                 };
                 // Emit only for the genuinely-ambiguous shape: neither residual pins a
                 // non-empty constant, and not both empty (the s=t conflict is Case 2).
-                if !(has_nonempty_const(l_res, cx.terms)
+                // E1: and NOT over a MINTED disequality (a negated F-split disjunct,
+                // e.g. `!sfx ≠ ""`). Its residual comes from `deep_normal_form` +
+                // `same()` cancellation over the CURRENT EUF merges, but the emitted
+                // `Σlen(residual) ≥ 1` clause is guarded only by ¬(diseq) — not the
+                // merges used to compute the residual. Learnt globally, it is unsound
+                // on backtracked branches and (with the other minted-skolem length
+                // constraints) drove the two-suffixof spurious UNSAT (s07). Any SAT it
+                // would otherwise have blocked is now re-validated by the post-solve
+                // model gate (`string_model_satisfies`), so soundness is preserved.
+                let diseq_minted = self.minted_eqs.contains(&atom);
+                // E1 (iter 2): also skip while ANY minted (dis)equality is currently
+                // active (the word-equation search has committed to an F-split /
+                // char-peel disjunct). Even a residual that is per-se sound
+                // (`¬(s2≠s1) ∨ len(s2)≥1 ∨ len(s1)≥1` over an ALWAYS-TRUE input diseq)
+                // then FORCES a length while branch-local minted length axioms are live
+                // (the length-link `len(s2·"b"·s2)=len("c"·!strk)` over the prefixof
+                // rewrite + `next_axiom` over the char-peel), and the combination is a
+                // spurious UNSAT — fuzz seeds 4660 / 966367641601
+                // (`prefixof "c" (s2·"b"·s2) ∧ distinct s2 s1`), also wrong at base.
+                // Declining the AUXILIARY separation lemma while the search is mid-split
+                // breaks the interaction; the decided disequality-family SAT that needs
+                // it (`targeted_pending_conflict_pop_decides_sat`) reaches its separation
+                // E1 (iter 3): emit iff every merge the deep residual read is
+                // dl0-entailed (`sep_ante_dl0`). This precisely replaces iter-2's coarse
+                // `no_minted_active`: it declines only when THIS residual actually used a
+                // branch-local (input-disjunct OR minted-skolem) merge (ce5/ce6), not
+                // whenever any unrelated conditional (dis)equality happens to be active.
+                if !(diseq_minted
+                    || sep_reads_minted
+                    || has_nonempty_const(l_res, cx.terms)
                     || has_nonempty_const(r_res, cx.terms)
                     || l_res.is_empty() && r_res.is_empty())
                 {
@@ -671,16 +1010,59 @@ impl TheorySolver for StrSolver {
             // self-referential merge yields `None`; we then cannot soundly compare
             // the two words for a same-word conflict, so yield a SOUND `Unknown`
             // rather than risk a wrong verdict or diverge.
+            // E1 (iter 3) FULL CITATION: collect the EXPANSION merge antecedents while
+            // building the deep normal forms (`deep_normal_form_cited`). iter-2 gated
+            // this conflict coarsely because `nf_equal_explain` only cites the FINAL
+            // per-pair merges while `deep_normal_form` FOLDS substituted atoms into
+            // constants (`"c"·s0` with `s0≈"b"` → `["cb"]`), losing the `s0≈"b"`
+            // provenance (ce8, wrong-UNSAT 966367641601 @6000, also wrong at base). By
+            // threading every substitution's `eq.explain` leaves into `expand_ante`, the
+            // conflict cites its COMPLETE antecedent set — trigger diseq + all expansion
+            // merges + the final per-pair merges — so it is a fully-cited, globally-valid
+            // clause and needs NO decision-level gate at all (max decisiveness). The
+            // citation is STRING-only (no cross-sort arith), so it stays within the SAT
+            // conflict-analyzability guard.
+            let mut expand_ante: Vec<EqLeaf> = Vec::new();
             let (lhs, rhs) = match (
-                crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, l),
-                crate::normalize::deep_normal_form(cx.terms, cx.eq, &known_d, r),
+                crate::normalize::deep_normal_form_cited(
+                    cx.terms,
+                    cx.eq,
+                    &known_d,
+                    l,
+                    &mut expand_ante,
+                ),
+                crate::normalize::deep_normal_form_cited(
+                    cx.terms,
+                    cx.eq,
+                    &known_d,
+                    r,
+                    &mut expand_ante,
+                ),
             ) {
                 (Some(lhs), Some(rhs)) => (lhs, rhs),
                 _ => return TCheck::Unknown,
             };
             if crate::wordeq::nf_equal(cx.terms, cx.eq, &lhs, &rhs) {
-                // Build conflict: diseq literal + merge antecedents for each pair.
+                // Fully-cited conflict: diseq literal + expansion merges + per-pair merges.
+                //
+                // SOUNDNESS RELIANCE (hardening note): this conflict is emitted UNGATED,
+                // so its correctness depends on the cited antecedent set being SUFFICIENT
+                // — i.e. `diseq ∧ (expand_ante) ∧ (per-pair merges)` really does entail
+                // `nf(l) = nf(r)`, so `¬(that conjunction)` is a valid clause. That in
+                // turn relies on `eq.explain` returning a set of `EqLeaf::Asserted` /
+                // `Interface` leaves that fully justifies each merge it is asked about
+                // (the EUF proof-forest invariant). TWO backstops make an incomplete or
+                // stale citation SAFE rather than a wrong-UNSAT: (1) the SAT seam's
+                // `theory_conflict_analyzable` check REJECTS a malformed conflict clause
+                // (any cited literal not currently false at a level ≤ the current one) and
+                // bails to a SOUND `Unknown` (`theory_guard_bailouts`) instead of learning
+                // it; (2) the post-solve model gate (`Solver::string_model_satisfies`,
+                // Fix B) re-validates any resulting SAT and downgrades an unrealisable one
+                // to `Unknown`. So a citation gap can only cost DECISIVENESS, never
+                // soundness. (Empirically the string-only citation stays analyzable — the
+                // guard-bailout rate is unchanged from before full citation.)
                 let mut just = vec![EqLeaf::Asserted(lit)];
+                just.extend(expand_ante.iter().copied());
                 crate::wordeq::nf_equal_explain(cx.terms, cx.eq, &lhs, &rhs, &mut just);
                 return TCheck::Conflict(just);
             }
@@ -708,6 +1090,9 @@ impl TheorySolver for StrSolver {
         if let Some((e, d)) = self.trail.pop_to(level) {
             self.eq_true.truncate(e);
             self.diseq_true.truncate(d);
+            // Keep the parallel assertion-level records in lock-step (E1 gate).
+            self.eq_levels.truncate(e);
+            self.diseq_levels.truncate(d);
         }
     }
 
@@ -765,6 +1150,43 @@ impl StrSolver {
         }
         model::assign(cx.terms, cx.eq, &known, &str_terms, m);
     }
+}
+
+/// E1 (iter 3) — antecedent-precise gate primitive. `true` iff no flattened atom of
+/// `t` sits in an EUF class whose root is in `cond_roots` — i.e. computing `t`'s
+/// normal form substitutes no term that a conditional (dl>0) (dis)equality merged.
+/// When this holds for both sides of an equation/disequality, the merge-derived
+/// lemma read off their normal forms used only unconditionally-entailed merges and
+/// is a globally-valid clause; when it fails, some substitution the lemma reads is
+/// branch-local, so the global lemma is skipped (or the trigger cited). Sound over-
+/// approximation: it flags a class touched by a conditional equality even if `t`'s
+/// own rep is reachable by a dl0 sub-path — never the reverse.
+fn side_clean(
+    eq: &mut EqualityEngine,
+    terms: &Context,
+    t: TermId,
+    cond_roots: &FxHashSet<ENodeId>,
+) -> bool {
+    if cond_roots.is_empty() {
+        return true;
+    }
+    let mut flat = Vec::new();
+    crate::normalize::flatten(terms, t, &mut flat);
+    flat.iter().all(|&a| {
+        let n = eq.intern(a);
+        !cond_roots.contains(&eq.find(n))
+    })
+}
+
+/// `true` iff every `EqLeaf::Asserted` merge antecedent is a level-0 (unconditional)
+/// literal per `lit_lvl`; an `Interface` (cross-theory) leaf, or an untracked literal,
+/// is treated conservatively as conditional. Used to certify that a specific merge is
+/// dl0-entailed (e.g. the `v ≈ const` merge behind `next_axiom`'s EUF-repr axiom).
+pub(crate) fn leaves_all_dl0(leaves: &[EqLeaf], lit_lvl: &FxHashMap<Lit, u32>) -> bool {
+    leaves.iter().all(|leaf| match leaf {
+        EqLeaf::Asserted(l) => lit_lvl.get(l) == Some(&0),
+        EqLeaf::Interface(_) => false,
+    })
 }
 
 /// If `str.len(s)` is interned in the shared EqualityEngine and lives in a class
@@ -841,6 +1263,9 @@ impl StrSolver {
     /// in unit tests (no combiner expand_conflict path).
     pub fn test_force_eq_true(&mut self, atom: TermId) {
         self.eq_true.push((atom, Lit::new(Var::new(0), true)));
+        // Level 0 ⟹ unconditional, so merge-derived length lemmas stay enabled for
+        // the existing unit tests (which assert without a surrounding disjunction).
+        self.eq_levels.push(0);
     }
 
     /// Push `atom` directly onto `diseq_true`, simulating the SAT layer asserting
@@ -848,6 +1273,7 @@ impl StrSolver {
     /// exercises the conflict detection path, not the full conflict-expansion path.
     pub fn test_force_diseq_true(&mut self, atom: TermId) {
         self.diseq_true.push((atom, Lit::new(Var::new(0), true)));
+        self.diseq_levels.push(0);
     }
 
     /// Override the fuel budget. Used only in unit tests to force exhaustion.
@@ -924,6 +1350,76 @@ mod tests {
         assert!(
             matches!(s.check(&mut cx, Effort::Full), TCheck::Sat),
             "fixpoint after all axioms emitted"
+        );
+    }
+
+    // Task 7.5: an INPUT (assertion-time) equality `s = "ab" ++ k` must emit the
+    // guarded length link `len(s) = len("ab"++k)` (via its Ge/Le arith
+    // companions), so arith can derive `len(s) = 2 + len(k) >= 2` and contradict
+    // an asserted `len(s) = 1`. Before the fix the concat side was unconditionally
+    // skipped and the link was never emitted → the variable-headed word equation
+    // solved trivially and the query was wrongly SAT.
+    #[test]
+    fn input_var_equals_concat_emits_length_link() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mk = |c: &mut Context, n: &str| {
+            let s = c.declare_fun(n, &[], str_s);
+            c.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let s = mk(&mut ctx, "s");
+        let k = mk(&mut ctx, "k");
+        let ab = ctx.mk_string_const("ab");
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[ab, k])
+            .unwrap();
+        let atom = ctx.mk_eq(s, concat).unwrap();
+        let len_s = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[s]).unwrap();
+        let len_c = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrLen), &[concat])
+            .unwrap();
+        // The expected companions of `(= len_s len_c)`.
+        let expected_ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[len_s, len_c])
+            .unwrap();
+        let expected_le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[len_s, len_c])
+            .unwrap();
+
+        let mut solver = StrSolver::default();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        solver.new_var(&mut cx, Var::new(0), atom);
+        solver.test_force_eq_true(atom);
+        let (mut saw_ge, mut saw_le) = (false, false);
+        for _ in 0..64 {
+            match solver.check(&mut cx, Effort::Full) {
+                TCheck::Split { atoms, guard } => {
+                    for a in atoms {
+                        if a == expected_ge {
+                            saw_ge = true;
+                            // Non-tautological len link must be guarded by ¬eqn.
+                            assert!(guard.is_some(), "length link must be guarded (¬eqn)");
+                        }
+                        if a == expected_le {
+                            saw_le = true;
+                            assert!(guard.is_some(), "length link must be guarded (¬eqn)");
+                        }
+                    }
+                }
+                TCheck::Sat => break,
+                TCheck::Conflict(_) => panic!("s = \"ab\"++k is satisfiable in isolation"),
+                TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
+            }
+        }
+        assert!(
+            saw_ge && saw_le,
+            "input `s = \"ab\"++k` must emit the len(s)=len(\"ab\"++k) Ge/Le companions"
         );
     }
 

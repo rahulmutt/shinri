@@ -67,7 +67,7 @@ fn eval_substr_const(ctx: &Context, s: TermId, i: TermId, l: TermId) -> Option<S
 // dependency — any unique name is acceptable regardless of sequencing).
 static FRESH_CTR: AtomicU32 = AtomicU32::new(0);
 
-fn next_fresh() -> u32 {
+pub(crate) fn next_fresh() -> u32 {
     FRESH_CTR.fetch_add(1, Ordering::Relaxed)
 }
 
@@ -143,6 +143,9 @@ fn contains_string_op(ctx: &Context, t: TermId) -> bool {
                         | BuiltinOp::StrSubstr
                         | BuiltinOp::StrConcat
                         | BuiltinOp::StrLen
+                        | BuiltinOp::StrPrefixOf
+                        | BuiltinOp::StrSuffixOf
+                        | BuiltinOp::StrContains
                 )
             ) {
                 return true;

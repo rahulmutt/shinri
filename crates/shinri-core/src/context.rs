@@ -493,6 +493,12 @@ impl Context {
                 }
                 Ok(str_s)
             }
+            StrPrefixOf | StrSuffixOf | StrContains => {
+                expect_arity(args, 2)?;
+                let str_s = self.string_sort();
+                expect_all(self, args, str_s)?;
+                Ok(self.bool_sort())
+            }
             // ── Floating-point: arithmetic ────────────────────────────────────
             FpAbs | FpNeg => {
                 expect_arity(args, 1)?;
@@ -1300,6 +1306,30 @@ mod tests {
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[i]).is_err());
         // Ill-sorted: str.at with String index must fail.
         assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrAt), &[x, y]).is_err());
+    }
+
+    #[test]
+    fn string_predicate_sorts() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let int_s = ctx.int_sort();
+        let bool_s = ctx.bool_sort();
+        let f = ctx.declare_fun("x", &[], str_s);
+        let x = ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap();
+        let lit = ctx.mk_string_const("ab");
+        for op in [
+            BuiltinOp::StrPrefixOf,
+            BuiltinOp::StrSuffixOf,
+            BuiltinOp::StrContains,
+        ] {
+            let t = ctx.mk_app(Op::Builtin(op), &[x, lit]).unwrap();
+            assert_eq!(ctx.sort_of(t), bool_s, "{op:?} must be Bool-sorted");
+            // Arity 2 enforced.
+            assert!(ctx.mk_app(Op::Builtin(op), &[x]).is_err());
+            // Both args must be String-sorted.
+            let one = ctx.mk_numeral(Rational::from_int(1i128.into()), int_s);
+            assert!(ctx.mk_app(Op::Builtin(op), &[x, one]).is_err());
+        }
     }
 
     #[test]

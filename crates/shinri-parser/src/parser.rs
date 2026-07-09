@@ -322,6 +322,9 @@ impl<'a> Parser<'a> {
             "str.len" => StrLen,
             "str.at" => StrAt,
             "str.substr" => StrSubstr,
+            "str.prefixof" => StrPrefixOf,
+            "str.suffixof" => StrSuffixOf,
+            "str.contains" => StrContains,
             // Floating-point bit constructor (SMT-LIB QF_FP)
             "fp" => FpFromBits,
             // Floating-point arithmetic and classification operators (QF_FP)
@@ -877,6 +880,11 @@ impl<'a> Parser<'a> {
             | BuiltinOp::BvRepeat(_) => Self::mk(ctx, Op::Builtin(op), &args, &sp),
             // String ops: delegate directly to mk_app (sort-checking in Context).
             BuiltinOp::StrConcat | BuiltinOp::StrLen | BuiltinOp::StrAt | BuiltinOp::StrSubstr => {
+                Self::mk(ctx, Op::Builtin(op), &args, &sp)
+            }
+            // String predicates (slice 12): delegate directly to mk_app (sort-checking
+            // in Context). Not yet reachable via `builtin_for` — parser wiring is Task 3.
+            BuiltinOp::StrPrefixOf | BuiltinOp::StrSuffixOf | BuiltinOp::StrContains => {
                 Self::mk(ctx, Op::Builtin(op), &args, &sp)
             }
             // Floating-point ops: delegate directly to mk_app (sort-checking in Context).
@@ -1806,6 +1814,54 @@ mod tests {
             } => {}
             other => panic!("expected StrSubstr as lhs of Eq, got {other:?}"),
         }
+    }
+
+    /// Parse each of the three string predicates and verify op + Bool sort
+    /// (slice 12).
+    #[test]
+    fn parses_string_predicates() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        for (src, want) in [
+            (r#"(assert (str.prefixof x "a"))"#, BuiltinOp::StrPrefixOf),
+            (r#"(assert (str.suffixof x "a"))"#, BuiltinOp::StrSuffixOf),
+            (r#"(assert (str.contains x "a"))"#, BuiltinOp::StrContains),
+        ] {
+            let full_src = format!("(declare-fun x () String)\n{src}");
+            let (ctx, cmds) = parse_all_ok(&full_src);
+            assert_eq!(cmds.len(), 2, "expected declare-fun + assert for {src}");
+            let assert_term = match &cmds[1] {
+                Command::Assert(t) => *t,
+                other => panic!("expected Assert, got {other:?}"),
+            };
+            // Top-level term must be the expected predicate op.
+            match ctx.term_node(assert_term).clone() {
+                TermNode::App {
+                    op: Op::Builtin(got),
+                    ..
+                } => {
+                    assert_eq!(got, want, "op mismatch for {src}");
+                }
+                other => panic!("expected App at top level for {src}, got {other:?}"),
+            }
+            // Predicates are Bool-sorted.
+            assert_eq!(
+                ctx.sort_of(assert_term),
+                ctx.bool_sort(),
+                "predicate must be Bool-sorted for {src}"
+            );
+        }
+    }
+
+    /// A predicate with a non-String argument is a sort error, not a parse
+    /// crash (slice 12).
+    #[test]
+    fn string_predicate_wrong_sort_rejected() {
+        let cs = commands("(declare-fun x () String)\n(assert (str.contains x 1))");
+        assert!(matches!(cs[0], Ok(Command::DeclareFun { .. })));
+        assert!(
+            cs[1].is_err(),
+            "(str.contains x 1): 1 is Int, not String, so this must be a diagnostic"
+        );
     }
 
     /// Task-5 TDD test: `(_ FloatingPoint eb sb)`, `FloatNN` aliases, and
