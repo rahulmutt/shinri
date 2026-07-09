@@ -461,6 +461,7 @@ name = "shinri-solver"
 version = "0.1.0"
 dependencies = [
  "easy-smt",
+ "libc",
  "rustc-hash",
  "shinri-abv",
  "shinri-arith",

@@ -22,12 +22,43 @@
 //!      appearance, literals collapsed to a length-tag) so the printed corpus is
 //!      one entry per distinct mechanism.
 //! The printed corpus — counts by class + the minimized shapes — is the artifact.
+//!
+//! ## WARNING
+//! This harness runs the solver with no built-in memory bound; a single
+//! pathological solve can allocate many GiB. It self-caps its address space
+//! via `RLIMIT_AS` (default 20 GiB, override with `E1_MEM_GIB`) so a runaway
+//! aborts the test process rather than OOM-killing the container.
 
 #![cfg(feature = "oracle")]
 
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
 use std::collections::BTreeSet;
+
+/// Bound THIS test process's virtual address space so a single pathological
+/// solve aborts the process (allocation failure) instead of OOM-killing the
+/// whole container. Child z3 processes inherit the limit too. Default 20 GiB;
+/// override with `E1_MEM_GIB`. No-op off Unix.
+#[cfg(unix)]
+fn cap_address_space() {
+    let gib: u64 = std::env::var("E1_MEM_GIB")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    let bytes = gib.saturating_mul(1024 * 1024 * 1024);
+    let lim = libc::rlimit {
+        rlim_cur: bytes as libc::rlim_t,
+        rlim_max: bytes as libc::rlim_t,
+    };
+    // SAFETY: RLIMIT_AS is a valid resource; `&lim` is a valid rlimit pointer.
+    // Lowering only the soft limit within the inherited hard limit always
+    // succeeds; ignore the (unreachable) error path.
+    unsafe {
+        libc::setrlimit(libc::RLIMIT_AS, &lim);
+    }
+}
+#[cfg(not(unix))]
+fn cap_address_space() {}
 
 // ── Deterministic PRNG ───────────────────────────────────────────────────────
 struct Lcg(u64);
@@ -422,6 +453,7 @@ fn shape(inst: &Instance) -> String {
 #[test]
 #[ignore = "long differential fuzz; run explicitly with --ignored"]
 fn e1_enumerate_wrong_verdicts() {
+    cap_address_space();
     let n_iters: usize = std::env::var("E1_ITERS")
         .ok()
         .and_then(|s| s.parse().ok())

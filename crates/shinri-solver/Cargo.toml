@@ -24,6 +24,7 @@ rustc-hash = "2"
 easy-smt = "0.2"
 shinri-parser = { path = "../shinri-parser" }
 shinri-frontend = { path = "../shinri-frontend" }
+libc = "0.2"
 
 [features]
 # Differential oracle harness (Task 17); off by default; needs `z3` on PATH.
