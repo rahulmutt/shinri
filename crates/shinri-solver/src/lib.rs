@@ -985,7 +985,9 @@ impl Solver {
                 ..
             } => {
                 let s = self.eval_str_val(model, self.ctx.children(*args)[0])?;
-                Some(shinri_core::Rational::from_int((s.chars().count() as i128).into()))
+                Some(shinri_core::Rational::from_int(
+                    (s.chars().count() as i128).into(),
+                ))
             }
             _ => {
                 if let Some(ModelVal::Num(r)) = model.values.get(&t) {
@@ -1043,7 +1045,10 @@ impl Solver {
             }
             Op::Builtin(BuiltinOp::Implies) if kids.len() == 2 => {
                 // a → b  ≡  ¬a ∨ b
-                match (self.eval_bool(kids[0], model), self.eval_bool(kids[1], model)) {
+                match (
+                    self.eval_bool(kids[0], model),
+                    self.eval_bool(kids[1], model),
+                ) {
                     (Some(false), _) => Some(true),
                     (_, Some(true)) => Some(true),
                     (Some(true), Some(false)) => Some(false),
@@ -1051,16 +1056,21 @@ impl Solver {
                 }
             }
             Op::Builtin(BuiltinOp::Xor) if kids.len() == 2 => {
-                match (self.eval_bool(kids[0], model), self.eval_bool(kids[1], model)) {
+                match (
+                    self.eval_bool(kids[0], model),
+                    self.eval_bool(kids[1], model),
+                ) {
                     (Some(a), Some(b)) => Some(a != b),
                     _ => None,
                 }
             }
-            Op::Builtin(BuiltinOp::Ite) if kids.len() == 3 => match self.eval_bool(kids[0], model) {
-                Some(true) => self.eval_bool(kids[1], model),
-                Some(false) => self.eval_bool(kids[2], model),
-                None => None,
-            },
+            Op::Builtin(BuiltinOp::Ite) if kids.len() == 3 => {
+                match self.eval_bool(kids[0], model) {
+                    Some(true) => self.eval_bool(kids[1], model),
+                    Some(false) => self.eval_bool(kids[2], model),
+                    None => None,
+                }
+            }
             Op::Builtin(BuiltinOp::Eq) | Op::Builtin(BuiltinOp::Distinct) => {
                 self.eval_atom(op, &kids, model)
             }
