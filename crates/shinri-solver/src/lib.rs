@@ -909,104 +909,198 @@ impl Solver {
         }
     }
 
-    /// Evaluate every top-level asserted String (dis)equality under `model` and
-    /// return `false` if any is violated (so the SAT model is not a real witness).
-    /// Conservative: an atom whose operands are not fully evaluable under the model
-    /// (a missing string value) is SKIPPED (treated as satisfied) — this can only
-    /// MISS a violation, never fabricate one, so it never turns a genuine SAT into a
-    /// spurious Unknown. Used by the string-path witness self-check.
+    /// Re-evaluate every top-level asserted formula under `model` and return
+    /// `false` if any is definitely violated (so the SAT model is not a real
+    /// witness → the caller downgrades the spurious SAT to a SOUND `Unknown`).
+    ///
+    /// The string theory is deliberately INCOMPLETE: on a word equation it cannot
+    /// ground-resolve it saturates to a SAT-ish state and lets the SAT layer choose
+    /// a truth assignment, relying on THIS post-solve gate to reject any model that
+    /// does not actually satisfy the input (the (B′) premature-SAT hazard). For the
+    /// gate to be a sound backstop it must evaluate the FULL Boolean skeleton —
+    /// most importantly `Or`, which routes a disjunction to whichever disjunct the
+    /// theory accepted; if the accepted disjunct's model value is false the whole
+    /// `(or …)` is false and the SAT is spurious. (The prior version descended only
+    /// positive `And` chains and skipped `Or`/`Not`, so a top-level disjunction over
+    /// unsatisfiable disjuncts passed the gate — the wrong-SAT / bad-model corpus.)
+    ///
+    /// Evaluation is 3-VALUED (`Some(true)` / `Some(false)` / `None`=unknown). The
+    /// gate rejects ONLY on a definite `Some(false)` at a top-level assertion; any
+    /// `None` (a term the model cannot fully evaluate — a missing string value, an
+    /// opaque predicate) is treated as satisfied. This can only MISS a violation,
+    /// never fabricate one, so a genuine SAT is never turned into a spurious Unknown.
     fn string_model_satisfies(&self, assertions: &[TermId], model: &Model) -> bool {
-        use shinri_core::{BuiltinOp, Op, TermNode};
-        use shinri_theory::types::ModelVal;
-        // Evaluate a String-sorted term to its concrete value under `model`.
-        fn eval_str(ctx: &shinri_core::Context, model: &Model, t: TermId) -> Option<String> {
-            if let Some(s) = ctx.string_const_value(t) {
-                return Some(s.to_owned());
-            }
-            if let Some(ModelVal::String(s)) = model.values.get(&t) {
-                return Some(s.clone());
-            }
-            match ctx.term_node(t) {
-                TermNode::App {
-                    op: Op::Builtin(BuiltinOp::StrConcat),
-                    args,
-                    ..
-                } => {
-                    let kids = ctx.children(*args).to_vec();
-                    let mut out = String::new();
-                    for k in kids {
-                        out.push_str(&eval_str(ctx, model, k)?);
-                    }
-                    Some(out)
-                }
-                _ => None,
-            }
-        }
-        // Check one (dis)equality atom; `positive` = the atom asserted true.
-        let check_atom = |t: TermId, positive: bool| -> bool {
-            if let TermNode::App { op, args, .. } = self.ctx.term_node(t) {
-                let is_eq = matches!(op, Op::Builtin(BuiltinOp::Eq));
-                let is_distinct = matches!(op, Op::Builtin(BuiltinOp::Distinct));
-                if !is_eq && !is_distinct {
-                    return true;
-                }
-                let kids = self.ctx.children(*args).to_vec();
-                if kids.len() != 2 {
-                    return true;
-                }
-                if self.ctx.sort_of(kids[0]) != self.ctx.string_sort() {
-                    return true;
-                }
-                let (a, b) = match (
-                    eval_str(&self.ctx, model, kids[0]),
-                    eval_str(&self.ctx, model, kids[1]),
-                ) {
-                    (Some(a), Some(b)) => (a, b),
-                    _ => return true, // not fully evaluable: skip (conservative)
-                };
-                // eq-asserted-true ⟹ a==b ; distinct-asserted-true ⟹ a!=b ;
-                // negated forms flip.
-                let want_equal = is_eq == positive;
-                return (a == b) == want_equal;
-            }
-            true
-        };
-        // Collect and check every atom asserted true at the top level,
-        // descending through POSITIVE `And` chains: the conjuncts of an asserted
-        // `And` are all asserted true, so it is sound to check each. word_norm
-        // wraps expanded n-ary (dis)equalities in `(and …)`, so without this
-        // descent those atoms would be skipped (the C1 self-check bypass). We do
-        // NOT descend `Or`/`Not`: only a single top-level `Not` is unwrapped
-        // once (the atom is then asserted false) and never recursed under.
-        let mut worklist: Vec<TermId> = assertions.to_vec();
-        while let Some(a) = worklist.pop() {
-            match self.ctx.term_node(a) {
-                TermNode::App {
-                    op: Op::Builtin(BuiltinOp::And),
-                    args,
-                    ..
-                } => {
-                    let kids = self.ctx.children(*args).to_vec();
-                    worklist.extend(kids);
-                }
-                TermNode::App {
-                    op: Op::Builtin(BuiltinOp::Not),
-                    args,
-                    ..
-                } => {
-                    let inner = self.ctx.children(*args)[0];
-                    if !check_atom(inner, false) {
-                        return false;
-                    }
-                }
-                _ => {
-                    if !check_atom(a, true) {
-                        return false;
-                    }
-                }
+        for &a in assertions {
+            if self.eval_bool(a, model) == Some(false) {
+                return false;
             }
         }
         true
+    }
+
+    /// Evaluate a String-sorted term to its concrete value under `model`.
+    /// `None` if any leaf is un-valued.
+    fn eval_str_val(&self, model: &Model, t: TermId) -> Option<String> {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        use shinri_theory::types::ModelVal;
+        if let Some(s) = self.ctx.string_const_value(t) {
+            return Some(s.to_owned());
+        }
+        if let Some(ModelVal::String(s)) = model.values.get(&t) {
+            return Some(s.clone());
+        }
+        match self.ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrConcat),
+                args,
+                ..
+            } => {
+                let kids = self.ctx.children(*args).to_vec();
+                let mut out = String::new();
+                for k in kids {
+                    out.push_str(&self.eval_str_val(model, k)?);
+                }
+                Some(out)
+            }
+            _ => None,
+        }
+    }
+
+    /// Evaluate an Int/Real-sorted term to a rational under `model`.
+    /// Handles numerals, `str.len` (= char count of the string value), and a bare
+    /// numeric variable via the model. Compound arithmetic (`+`/`-`/`*`) is left
+    /// unevaluated (`None`) — conservatively skipped, so the gate never fabricates
+    /// a violation from an arith sum it cannot compute. `str.len` over a fully
+    /// evaluable string is the shape the string fragment actually needs.
+    fn eval_num_val(&self, model: &Model, t: TermId) -> Option<shinri_core::Rational> {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        use shinri_theory::types::ModelVal;
+        if let Some(r) = self.ctx.numeral_value(t) {
+            return Some(r.clone());
+        }
+        match self.ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrLen),
+                args,
+                ..
+            } => {
+                let s = self.eval_str_val(model, self.ctx.children(*args)[0])?;
+                Some(shinri_core::Rational::from_int((s.chars().count() as i128).into()))
+            }
+            _ => {
+                if let Some(ModelVal::Num(r)) = model.values.get(&t) {
+                    Some(r.clone())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// 3-valued evaluation of a Boolean-sorted formula `t` under `model`.
+    /// `Some(true)`/`Some(false)` are definite; `None` = cannot decide (an opaque
+    /// atom / un-valued leaf). Descends the full Boolean skeleton so a top-level
+    /// disjunction is rejected iff EVERY disjunct is definitely false.
+    fn eval_bool(&self, t: TermId, model: &Model) -> Option<bool> {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let (op, kids) = match self.ctx.term_node(t) {
+            TermNode::App { op, args, .. } => (*op, self.ctx.children(*args).to_vec()),
+            _ => return None,
+        };
+        match op {
+            Op::Builtin(BuiltinOp::And) => {
+                let mut all_true = true;
+                for &k in &kids {
+                    match self.eval_bool(k, model) {
+                        Some(false) => return Some(false),
+                        Some(true) => {}
+                        None => all_true = false,
+                    }
+                }
+                if all_true {
+                    Some(true)
+                } else {
+                    None
+                }
+            }
+            Op::Builtin(BuiltinOp::Or) => {
+                let mut all_false = true;
+                for &k in &kids {
+                    match self.eval_bool(k, model) {
+                        Some(true) => return Some(true),
+                        Some(false) => {}
+                        None => all_false = false,
+                    }
+                }
+                if all_false {
+                    Some(false)
+                } else {
+                    None
+                }
+            }
+            Op::Builtin(BuiltinOp::Not) if kids.len() == 1 => {
+                self.eval_bool(kids[0], model).map(|b| !b)
+            }
+            Op::Builtin(BuiltinOp::Implies) if kids.len() == 2 => {
+                // a → b  ≡  ¬a ∨ b
+                match (self.eval_bool(kids[0], model), self.eval_bool(kids[1], model)) {
+                    (Some(false), _) => Some(true),
+                    (_, Some(true)) => Some(true),
+                    (Some(true), Some(false)) => Some(false),
+                    _ => None,
+                }
+            }
+            Op::Builtin(BuiltinOp::Xor) if kids.len() == 2 => {
+                match (self.eval_bool(kids[0], model), self.eval_bool(kids[1], model)) {
+                    (Some(a), Some(b)) => Some(a != b),
+                    _ => None,
+                }
+            }
+            Op::Builtin(BuiltinOp::Ite) if kids.len() == 3 => match self.eval_bool(kids[0], model) {
+                Some(true) => self.eval_bool(kids[1], model),
+                Some(false) => self.eval_bool(kids[2], model),
+                None => None,
+            },
+            Op::Builtin(BuiltinOp::Eq) | Op::Builtin(BuiltinOp::Distinct) => {
+                self.eval_atom(op, &kids, model)
+            }
+            Op::Builtin(BuiltinOp::Ge | BuiltinOp::Le | BuiltinOp::Lt | BuiltinOp::Gt) => {
+                self.eval_atom(op, &kids, model)
+            }
+            _ => None,
+        }
+    }
+
+    /// Evaluate a leaf (dis)equality or arith-comparison atom under `model`.
+    fn eval_atom(&self, op: shinri_core::Op, kids: &[TermId], model: &Model) -> Option<bool> {
+        use shinri_core::{BuiltinOp, Op};
+        if kids.len() != 2 {
+            return None;
+        }
+        let sort0 = self.ctx.sort_of(kids[0]);
+        if sort0 == self.ctx.string_sort() {
+            let a = self.eval_str_val(model, kids[0])?;
+            let b = self.eval_str_val(model, kids[1])?;
+            return match op {
+                Op::Builtin(BuiltinOp::Eq) => Some(a == b),
+                Op::Builtin(BuiltinOp::Distinct) => Some(a != b),
+                _ => None,
+            };
+        }
+        if sort0 == self.ctx.int_sort() || sort0 == self.ctx.real_sort() {
+            let a = self.eval_num_val(model, kids[0])?;
+            let b = self.eval_num_val(model, kids[1])?;
+            return Some(match op {
+                Op::Builtin(BuiltinOp::Eq) => a == b,
+                Op::Builtin(BuiltinOp::Distinct) => a != b,
+                Op::Builtin(BuiltinOp::Ge) => a >= b,
+                Op::Builtin(BuiltinOp::Le) => a <= b,
+                Op::Builtin(BuiltinOp::Lt) => a < b,
+                Op::Builtin(BuiltinOp::Gt) => a > b,
+                _ => return None,
+            });
+        }
+        None
     }
 
     /// Replay a bit-blasted BV CNF into `sat`: allocate a contiguous block of

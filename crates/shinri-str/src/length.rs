@@ -161,12 +161,23 @@ fn euf_representative_const(
 /// `eq` and `known` are used to check the EUF representative of `arg` so that
 /// when a string variable is merged with a constant (e.g. `x = ""`), the
 /// defining equation is emitted eagerly via N-O.
+/// `lit_lvl` (E1 iter 3): maps each asserted string (dis)equality literal to its
+/// decision level. The EUF-representative resolution of an opaque variable's length
+/// (`x ≈ const` ⟹ `len(x)=const-length`) emits an UNCONDITIONAL `guard=None` unit
+/// pinned at dl0, so it is sound ONLY when the SPECIFIC merge `arg ≈ rep` that
+/// discovered the constant is itself unconditionally entailed — every proof-forest
+/// antecedent of that merge is a level-0 literal. iter-2 gated this coarsely (skip
+/// whenever ANY conditional equality was active); this is ANTECEDENT-PRECISE: an
+/// unrelated conditional (dis)equality no longer suppresses a `len(x)=k` whose own
+/// `x ≈ const` merge is dl0. Structural axioms (arg literally a constant / concat)
+/// are unaffected — they read `arg`'s syntax, not the merge map.
 pub fn next_axiom(
     terms: &mut Context,
     eq: &mut EqualityEngine,
     known: &[TermId],
     len_term: TermId,
     emitted: &FxHashSet<TermId>,
+    lit_lvl: &rustc_hash::FxHashMap<shinri_core::Lit, u32>,
 ) -> Option<TermId> {
     // Extract the single argument of the str.len application.
     let arg = match terms.term_node(len_term).clone() {
@@ -198,8 +209,25 @@ pub fn next_axiom(
             ..
         } => arg,
         _ => {
-            // Try to resolve via EUF.
-            euf_representative_const(terms, eq, arg, known).unwrap_or(arg)
+            // Try to resolve via EUF — but only when the SPECIFIC merge `arg ≈ rep`
+            // is unconditionally entailed (every proof-forest antecedent is dl0). A
+            // branch-local merge (a decided disjunct `x="a"`, or a minted char-peel
+            // `x=""`) must NOT pin a global `len(x)=k` (ce1/ce3/ce4). Leave `arg`
+            // opaque otherwise so `defining_eq` yields `None`.
+            match euf_representative_const(terms, eq, arg, known) {
+                Some(rep) => {
+                    let an = eq.intern(arg);
+                    let rn = eq.intern(rep);
+                    let mut leaves = Vec::new();
+                    eq.explain(an, rn, &mut leaves);
+                    if crate::leaves_all_dl0(&leaves, lit_lvl) {
+                        rep
+                    } else {
+                        arg
+                    }
+                }
+                None => arg,
+            }
         }
     };
     if let Some(eqn) = defining_eq(terms, len_term, effective_arg) {

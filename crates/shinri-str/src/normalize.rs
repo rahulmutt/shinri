@@ -86,6 +86,21 @@ pub fn normal_form(
     known: &[TermId],
     t: TermId,
 ) -> Vec<TermId> {
+    let mut sink = Vec::new();
+    normal_form_cited(terms, eq, known, t, &mut sink)
+}
+
+/// Like `normal_form`, but APPENDS to `ante` the `EqLeaf` merge antecedents of every
+/// `a ≈ rep(a)` substitution it performs (E1 iter 3). A caller can then decide whether
+/// the normal form is unconditionally entailed (all antecedents dl0) or cite them in a
+/// learnt clause. `ante` is additive across calls (deep expansion threads one vec).
+pub(crate) fn normal_form_cited(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    t: TermId,
+    ante: &mut Vec<shinri_theory::types::EqLeaf>,
+) -> Vec<TermId> {
     let mut flat = Vec::new();
     flatten(terms, t, &mut flat);
 
@@ -113,6 +128,15 @@ pub fn normal_form(
     let mut out: Vec<TermId> = Vec::new();
     for a in flat {
         let r = rep(eq, &node_of, a);
+        // Record the merge antecedents that justify substituting `a` by its class
+        // representative `r` (the merges `deep_normal_form`/`normal_form` relies on).
+        if r != a {
+            let an = eq.intern(a);
+            let rn = eq.intern(r);
+            if eq.are_equal(an, rn) {
+                eq.explain(an, rn, ante);
+            }
+        }
         if let Some(s) = terms.string_const_value(r) {
             let s = s.to_owned();
             if s.is_empty() {
@@ -174,13 +198,30 @@ pub fn deep_normal_form(
     known: &[TermId],
     t: TermId,
 ) -> Option<Vec<TermId>> {
+    let mut sink = Vec::new();
+    deep_normal_form_cited(terms, eq, known, t, &mut sink)
+}
+
+/// Like `deep_normal_form`, but APPENDS to `ante` the `EqLeaf` merge antecedents of
+/// EVERY substitution across ALL expansion rounds (E1 iter 3). If `ante` ends up
+/// containing only dl0-entailed literals, the deep normal form is unconditional and a
+/// same-word conflict / separation lemma read off it is a globally-valid clause; the
+/// caller may instead cite `ante` to make the clause branch-local. On the non-
+/// convergent `None` bail, `ante` is irrelevant (no lemma is drawn).
+pub(crate) fn deep_normal_form_cited(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    t: TermId,
+    ante: &mut Vec<shinri_theory::types::EqLeaf>,
+) -> Option<Vec<TermId>> {
     // Start from the regular (single-level) normal form, then expand to a
     // FIXPOINT: each round re-normalizes every atom and re-flattens any concat
     // that surfaced (because rep() substituted a variable with a concat-valued
     // class member). Iterating is required because an expanded concat's own atoms
     // may ALSO be merged with concats (e.g. `x = "a"++z`, `z = "b"++w`): a single
     // pass would leave `z` un-expanded, missing ground conflicts (issue #3).
-    let mut cur = normal_form(terms, eq, known, t);
+    let mut cur = normal_form_cited(terms, eq, known, t, ante);
     if cur.len() > DEEP_NF_ATOM_CAP {
         return None;
     }
@@ -224,7 +265,7 @@ pub fn deep_normal_form(
                 if !expanded.insert(a) {
                     return None;
                 }
-                out.extend(normal_form(terms, eq, known, a));
+                out.extend(normal_form_cited(terms, eq, known, a, ante));
                 if out.len() > DEEP_NF_ATOM_CAP {
                     return None;
                 }
@@ -273,7 +314,7 @@ pub fn atoms_equal(eq: &mut EqualityEngine, a: TermId, b: TermId) -> bool {
 }
 
 /// Recursively flatten a (possibly nested) `str.++` into its atom leaves.
-fn flatten(terms: &Context, t: TermId, out: &mut Vec<TermId>) {
+pub(crate) fn flatten(terms: &Context, t: TermId, out: &mut Vec<TermId>) {
     match terms.term_node(t) {
         TermNode::App {
             op: Op::Builtin(BuiltinOp::StrConcat),

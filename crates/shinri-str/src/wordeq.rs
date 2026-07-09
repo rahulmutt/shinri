@@ -383,39 +383,19 @@ fn resolve_inner(
         }
     }
 
-    // E1 PROBE: single-variable side not occurring in the other → Done.
-    // If one residual is EXACTLY one variable atom `v` and `v` does not occur
-    // (same TermId / same EUF class) anywhere in the other residual, the equation
-    // is a pure assignment `v = W` (v ∉ W), trivially satisfiable by v := W. The
-    // EUF merge already records v ≈ W; the model builder assembles v from W. There
-    // is NOTHING to align, so emitting a char-peel / F-split here is spurious: it
-    // mints a `v = ""` disjunct that (asserted false) becomes a `v ≠ ""` diseq
-    // driving the non-empty separation lemma, and (asserted true) drives a length
-    // link — three interlocking length lemmas whose CDCL interaction manufactures a
-    // false `len(v) ≤ 0` unit (the t8iter175 wrong-UNSAT). Returning Done avoids it.
-    {
-        let occurs_in = |eq: &mut EqualityEngine, v: TermId, w: &[TermId]| -> bool {
-            w.iter().any(|&a| {
-                a == v || {
-                    let an = eq.intern(a);
-                    let vn = eq.intern(v);
-                    eq.are_equal(an, vn)
-                }
-            })
-        };
-        if le - i == 1
-            && terms.string_const_value(lhs[i]).is_none()
-            && !occurs_in(eq, lhs[i], &rhs[j..re])
-        {
-            return StepResult::Done;
-        }
-        if re - j == 1
-            && terms.string_const_value(rhs[j]).is_none()
-            && !occurs_in(eq, rhs[j], &lhs[i..le])
-        {
-            return StepResult::Done;
-        }
-    }
+    // E1 PROBE — REMOVED (E1 design). The probe returned `Done` for a pure
+    // assignment `v = W` (single variable `v` ∉ `W`) to dodge the t8iter175
+    // wrong-UNSAT, whose true cause was the UNDER-CITED minted-skolem length
+    // lemmas (the char-peel `v = ""` empty branch feeding the non-empty separation
+    // + length-link over a fresh skolem). That root cause is now fixed at source in
+    // `lib.rs::check` (the minted-equality gate on the length-link, empty-residual,
+    // and non-empty-separation lemmas), so the probe is redundant. Removing it
+    // restores the correct char-peel/F-split emission for `v = W` (the
+    // `variable_equals_constant_splits_then_sat` and `str_input_var_concat_length_*`
+    // pins the probe had broken) while t8iter175 stays SAT. The probe was also
+    // unsound-shaped: `string_const_value(lhs[i]).is_none()` matches an unflattened
+    // CONCAT rep as if it were a free variable (mitigated only because the wrapper
+    // flattens first) — another reason to drop it rather than narrow it.
 
     // Both residuals fully constant: compare the concatenated words. When neither
     // residual contains a variable, each side denotes a FIXED word; if those words
