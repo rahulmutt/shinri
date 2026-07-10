@@ -28,6 +28,11 @@ use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 /// applications are left in place and fence. Folding has NO cap.
 const INDEXOF_CHAIN_CAP: usize = 64;
 
+/// Cap on the number of non-overlapping occurrences spliced into the
+/// symbolic-`u` `str.replace_all` concat. Over-cap applications are left in
+/// place and fence. Folding (all-literal) has NO cap.
+const REPLACE_ALL_CONCAT_CAP: usize = 64;
+
 /// Every occurrence position (code-point index) of `needle` in `hay`,
 /// ascending, OVERLAPS INCLUDED. The empty needle occurs at every
 /// `0..=|hay|` position (SMT-LIB semantics).
@@ -67,6 +72,49 @@ fn eval_replace(hay: &[char], t: &[char], u: &str) -> String {
     }
 }
 
+/// Non-overlapping occurrence positions of `needle` in `hay`, greedy
+/// left-to-right: after a match at `j`, scanning resumes at `j + |needle|`.
+/// The empty needle yields NO positions — SMT-LIB `str.replace_all` leaves `s`
+/// unchanged on an empty needle (unlike `str.replace`/`str.indexof`).
+fn nonoverlapping_occurrences(hay: &[char], needle: &[char]) -> Vec<usize> {
+    let m = needle.len();
+    if m == 0 {
+        return Vec::new();
+    }
+    let n = hay.len();
+    let mut out = Vec::new();
+    let mut j = 0;
+    while j + m <= n {
+        if hay[j..j + m] == *needle {
+            out.push(j);
+            j += m;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
+/// Concrete `(str.replace_all s t u)`: replace ALL non-overlapping occurrences
+/// of `t` by `u`, left-to-right. Empty `t` or absent `t` → `s` unchanged
+/// (`u` dropped).
+fn eval_replace_all(hay: &[char], t: &[char], u: &str) -> String {
+    let positions = nonoverlapping_occurrences(hay, t);
+    if positions.is_empty() {
+        return hay.iter().collect();
+    }
+    let m = t.len();
+    let mut out = String::new();
+    let mut cursor = 0usize;
+    for &p in &positions {
+        out.extend(&hay[cursor..p]);
+        out.push_str(u);
+        cursor = p + m;
+    }
+    out.extend(&hay[cursor..]);
+    out
+}
+
 /// Stage 1: bottom-up memoized rewrite. Folds / partial-evals every
 /// `str.indexof` / `str.replace` application whose haystack AND needle are
 /// string literals; anything else is left in place (the caller fences it via
@@ -92,6 +140,7 @@ fn rewrite(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -
             let special = match op {
                 Op::Builtin(BuiltinOp::StrIndexOf) => rewrite_indexof(ctx, &new_children),
                 Op::Builtin(BuiltinOp::StrReplace) => rewrite_replace(ctx, &new_children),
+                Op::Builtin(BuiltinOp::StrReplaceAll) => rewrite_replace_all(ctx, &new_children),
                 _ => None,
             };
             if let Some(r) = special {
@@ -214,6 +263,51 @@ fn rewrite_replace(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
     })
 }
 
+/// `(str.replace_all s t u)`, children already rewritten. Some(_) iff haystack
+/// and needle are literals — EXACT for any `u` (all split points are concrete).
+/// None (symbolic haystack/needle, or over-cap occurrence count) leaves the app
+/// in place (→ fence).
+fn rewrite_replace_all(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
+    let hay: Vec<char> = ctx.string_const_value(kids[0])?.chars().collect();
+    let t: Vec<char> = ctx.string_const_value(kids[1])?.chars().collect();
+    let u = kids[2];
+    let positions = nonoverlapping_occurrences(&hay, &t);
+    if positions.is_empty() {
+        // Needle absent or empty: result is the haystack; `u` is irrelevant.
+        return Some(kids[0]);
+    }
+    if let Some(uv) = ctx.string_const_value(u).map(str::to_owned) {
+        // Fully literal: fold to a single literal.
+        return Some(ctx.mk_string_const(&eval_replace_all(&hay, &t, &uv)));
+    }
+    // Symbolic u: bound the concat width by the occurrence count.
+    if positions.len() > REPLACE_ALL_CONCAT_CAP {
+        return None; // over-cap: leave in place → fence
+    }
+    // (str.++ pre u mid1 u … u post), empty literal gaps/flanks dropped.
+    let m = t.len();
+    let mut parts: Vec<TermId> = Vec::new();
+    let mut cursor = 0usize;
+    for &p in &positions {
+        let gap: String = hay[cursor..p].iter().collect();
+        if !gap.is_empty() {
+            parts.push(ctx.mk_string_const(&gap));
+        }
+        parts.push(u);
+        cursor = p + m;
+    }
+    let tail: String = hay[cursor..].iter().collect();
+    if !tail.is_empty() {
+        parts.push(ctx.mk_string_const(&tail));
+    }
+    Some(if parts.len() == 1 {
+        parts[0]
+    } else {
+        ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &parts)
+            .expect("pre ++ u ++ … ++ post")
+    })
+}
+
 /// Stage 2: presence fence. True iff any `str.indexof` / `str.replace`
 /// application SURVIVED [`partial_eval_indexof_replace`] — symbolic haystack
 /// or needle, an over-cap literal, or a non-literal-yet-foldable operand
@@ -226,7 +320,9 @@ pub fn has_unreduced_indexof_replace(ctx: &Context, assertions: &[TermId]) -> bo
             TermNode::App { op, args, .. } => {
                 matches!(
                     op,
-                    Op::Builtin(BuiltinOp::StrIndexOf | BuiltinOp::StrReplace)
+                    Op::Builtin(
+                        BuiltinOp::StrIndexOf | BuiltinOp::StrReplace | BuiltinOp::StrReplaceAll
+                    )
                 ) || ctx.children(*args).to_vec().iter().any(|&c| walk(ctx, c))
             }
             TermNode::Const { .. } => false,
@@ -289,6 +385,34 @@ mod tests {
         assert_eq!(eval_replace(&chars("héllo"), &chars("é"), "e"), "hello");
     }
 
+    #[test]
+    fn nonoverlapping_occurrences_are_greedy_left_to_right() {
+        // Overlaps are NOT taken: "aaa"/"aa" matches only at 0 (resume at 2).
+        assert_eq!(nonoverlapping_occurrences(&chars("aaa"), &chars("aa")), vec![0]);
+        // Adjacent matches: "abab"/"ab" → {0, 2}.
+        assert_eq!(nonoverlapping_occurrences(&chars("abab"), &chars("ab")), vec![0, 2]);
+        // Single-char needle repeated.
+        assert_eq!(nonoverlapping_occurrences(&chars("aaa"), &chars("a")), vec![0, 1, 2]);
+        // Empty needle → NO positions (u dropped downstream).
+        assert_eq!(nonoverlapping_occurrences(&chars("ab"), &chars("")), Vec::<usize>::new());
+        // Code points, not bytes: 'l' in "héllo" at 2 and 3.
+        assert_eq!(nonoverlapping_occurrences(&chars("héllo"), &chars("l")), vec![2, 3]);
+    }
+
+    #[test]
+    fn eval_replace_all_pinned_semantics() {
+        // All non-overlapping occurrences replaced.
+        assert_eq!(eval_replace_all(&chars("abab"), &chars("ab"), "Z"), "ZZ");
+        // Non-overlapping only: "aaa"/"aa" → "Xa" (NOT "XX").
+        assert_eq!(eval_replace_all(&chars("aaa"), &chars("aa"), "X"), "Xa");
+        // Needle absent → haystack unchanged (u dropped).
+        assert_eq!(eval_replace_all(&chars("abc"), &chars("z"), "X"), "abc");
+        // EMPTY needle → haystack unchanged, u DROPPED (contrast str.replace → "Xab").
+        assert_eq!(eval_replace_all(&chars("ab"), &chars(""), "X"), "ab");
+        // Code points.
+        assert_eq!(eval_replace_all(&chars("héllo"), &chars("l"), "L"), "héLLo");
+    }
+
     // ── Fold rewrite ─────────────────────────────────────────────────────
 
     fn str_var(ctx: &mut Context, name: &str) -> TermId {
@@ -325,6 +449,41 @@ mod tests {
         let want1 = ctx.mk_eq(one, one).unwrap();
         let want2 = ctx.mk_eq(want_rep, want_rep).unwrap();
         assert_eq!(out, vec![want1, want2]);
+    }
+
+    #[test]
+    fn folds_all_literal_replace_all() {
+        let mut ctx = Context::new();
+        let abab = ctx.mk_string_const("abab");
+        let ab = ctx.mk_string_const("ab");
+        let z = ctx.mk_string_const("Z");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[abab, ab, z])
+            .unwrap();
+        let want_lit = ctx.mk_string_const("ZZ");
+        let atom = ctx.mk_eq(rep, want_lit).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        // (= "ZZ" "ZZ") — both sides the SAME TermId, and no replace_all survives.
+        let want = ctx.mk_eq(want_lit, want_lit).unwrap();
+        assert_eq!(out, vec![want]);
+        assert!(!has_unreduced_indexof_replace(&ctx, &out));
+    }
+
+    #[test]
+    fn folds_empty_needle_replace_all_drops_u() {
+        // Empty needle: result is the haystack, u dropped (contrast str.replace).
+        let mut ctx = Context::new();
+        let ab = ctx.mk_string_const("ab");
+        let empty = ctx.mk_string_const("");
+        let x = ctx.mk_string_const("X");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[ab, empty, x])
+            .unwrap();
+        let r = str_var(&mut ctx, "r");
+        let atom = ctx.mk_eq(rep, r).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        let want = ctx.mk_eq(ab, r).unwrap(); // (= "ab" r)
+        assert_eq!(out, vec![want]);
     }
 
     #[test]
