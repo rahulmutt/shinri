@@ -4,6 +4,7 @@ on:
   pull_request:
   schedule:
     - cron: '0 3 * * *' # nightly differential/fuzz budget
+  workflow_dispatch: # on-demand smoke test of the differential job
 permissions:
   contents: read
 jobs:
@@ -29,7 +30,7 @@ jobs:
 
   differential:
     runs-on: ubuntu-latest
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2 # installs mise.toml tools: rust, nextest, z3, cvc5 (also deny/fuzz/mutants)
