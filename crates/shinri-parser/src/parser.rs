@@ -888,10 +888,11 @@ impl<'a> Parser<'a> {
             // in Context). Not yet reachable via `builtin_for` — parser wiring is Task 3.
             // String search/replace (slice 13): delegate directly to mk_app (sort-checking
             // in Context). Not yet reachable via `builtin_for` — parser wiring is Task 2.
-            BuiltinOp::StrPrefixOf | BuiltinOp::StrSuffixOf | BuiltinOp::StrContains
-            | BuiltinOp::StrIndexOf | BuiltinOp::StrReplace => {
-                Self::mk(ctx, Op::Builtin(op), &args, &sp)
-            }
+            BuiltinOp::StrPrefixOf
+            | BuiltinOp::StrSuffixOf
+            | BuiltinOp::StrContains
+            | BuiltinOp::StrIndexOf
+            | BuiltinOp::StrReplace => Self::mk(ctx, Op::Builtin(op), &args, &sp),
             // Floating-point ops: delegate directly to mk_app (sort-checking in Context).
             BuiltinOp::FpAbs
             | BuiltinOp::FpNeg
@@ -1887,14 +1888,20 @@ mod tests {
                 Command::Assert(t) => *t,
                 other => panic!("expected Assert, got {other:?}"),
             };
-            let TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } =
-                ctx.term_node(assert_term).clone()
+            let TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } = ctx.term_node(assert_term).clone()
             else {
                 panic!("expected Eq at top level");
             };
             let lhs = ctx.children(args).to_vec()[0];
             match ctx.term_node(lhs).clone() {
-                TermNode::App { op: Op::Builtin(got), .. } => {
+                TermNode::App {
+                    op: Op::Builtin(got),
+                    ..
+                } => {
                     assert_eq!(got, want, "op mismatch");
                 }
                 other => panic!("expected App lhs, got {other:?}"),

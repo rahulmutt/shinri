@@ -811,7 +811,10 @@ fn qfs_indexof_replace_matches_z3() {
          {n_unknown} shinri-unknown (tolerated) / {n_z3skip} z3-unknown / \
          {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
     );
-    assert!(n_sat > 0, "indexof/replace family produced zero SAT instances");
+    assert!(
+        n_sat > 0,
+        "indexof/replace family produced zero SAT instances"
+    );
     assert!(
         n_unsat > 0,
         "indexof/replace family produced zero UNSAT instances"

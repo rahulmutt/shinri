@@ -36,7 +36,9 @@ fn occurrences(hay: &[char], needle: &[char]) -> Vec<usize> {
     if m > n {
         return Vec::new();
     }
-    (0..=(n - m)).filter(|&j| hay[j..j + m] == *needle).collect()
+    (0..=(n - m))
+        .filter(|&j| hay[j..j + m] == *needle)
+        .collect()
 }
 
 /// Concrete `(str.indexof s sub i)` per the pinned SMT-LIB 2.6 semantics.
@@ -266,7 +268,7 @@ mod tests {
         assert_eq!(eval_indexof(&h, &b, 4), -1); // i = |s| in range, no hit
         assert_eq!(eval_indexof(&h, &b, -1), -1); // i < 0
         assert_eq!(eval_indexof(&h, &b, 5), -1); // i > |s|
-        // Empty needle: result = i whenever 0 <= i <= |s| (INCLUDING |s|).
+                                                 // Empty needle: result = i whenever 0 <= i <= |s| (INCLUDING |s|).
         let e = chars("");
         assert_eq!(eval_indexof(&h, &e, 4), 4);
         assert_eq!(eval_indexof(&h, &e, 0), 0);
@@ -444,7 +446,10 @@ mod tests {
     fn is_ite(ctx: &Context, t: TermId) -> bool {
         matches!(
             ctx.term_node(t),
-            TermNode::App { op: Op::Builtin(BuiltinOp::Ite), .. }
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Ite),
+                ..
+            }
         )
     }
 

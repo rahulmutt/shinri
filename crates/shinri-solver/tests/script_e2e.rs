@@ -633,12 +633,10 @@ fn str_predicate_over_uf_fences_unknown() {
 #[test]
 fn str_indexof_replace_literal_folds_decide_any_polarity() {
     // All-literal applications fold to their concrete value at any polarity.
-    let out =
-        run_script(r#"(set-logic QF_S)(assert (= (str.indexof "abcb" "b" 0) 1))(check-sat)"#);
+    let out = run_script(r#"(set-logic QF_S)(assert (= (str.indexof "abcb" "b" 0) 1))(check-sat)"#);
     assert_eq!(out, vec!["sat"]);
     // From start 2 the next "b" is at 3, not 1 → unsat.
-    let out =
-        run_script(r#"(set-logic QF_S)(assert (= (str.indexof "abcb" "b" 2) 1))(check-sat)"#);
+    let out = run_script(r#"(set-logic QF_S)(assert (= (str.indexof "abcb" "b" 2) 1))(check-sat)"#);
     assert_eq!(out, vec!["unsat"]);
     // Negated literal replace folds too (polarity-free).
     let out = run_script(
@@ -646,12 +644,10 @@ fn str_indexof_replace_literal_folds_decide_any_polarity() {
     );
     assert_eq!(out, vec!["unsat"]);
     // Empty-needle edges: indexof at i = |s| is IN range; replace prepends.
-    let out =
-        run_script(r#"(set-logic QF_S)(assert (= (str.indexof "ab" "" 2) 2))(check-sat)"#);
+    let out = run_script(r#"(set-logic QF_S)(assert (= (str.indexof "ab" "" 2) 2))(check-sat)"#);
     assert_eq!(out, vec!["sat"]);
-    let out = run_script(
-        r#"(set-logic QF_S)(assert (= (str.replace "ab" "" "X") "Xab"))(check-sat)"#,
-    );
+    let out =
+        run_script(r#"(set-logic QF_S)(assert (= (str.replace "ab" "" "X") "Xab"))(check-sat)"#);
     assert_eq!(out, vec!["sat"]);
 }
 

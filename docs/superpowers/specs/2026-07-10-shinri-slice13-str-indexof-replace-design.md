@@ -1,7 +1,11 @@
 # Slice 13 design — str.indexof / str.replace (fold + partial-eval + fence)
 
 Date: 2026-07-10
-Status: APPROVED DESIGN (pre-implementation)
+Status: IMPLEMENTED (slice 13 landed 2026-07-10).
+`qfs_indexof_replace_matches_z3` = 44 sat / 85 unsat / 71 shinri-unknown /
+0 z3-unknown / 0 guard-bailout @ 200 iters, 34 witnesses, 0 disagreements;
+existing families unchanged (`qfs_matches_z3` 90/136/74,
+`qfs_predicates_matches_z3` 33/68/97, both 0 disagreements).
 Predecessor: slice 12 (str predicates, landed 2026-07-09, PR #5); differential
 CI item (PR #6, landed 2026-07-10)
 
