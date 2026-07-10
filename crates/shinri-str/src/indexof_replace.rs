@@ -126,13 +126,38 @@ fn rewrite_indexof(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
 }
 
 /// `(str.replace s t u)`, children already rewritten. Some(_) iff haystack
-/// and needle are literals; None leaves the app in place (→ fence).
+/// and needle are literals — EXACT for any `u` (the decomposition point is
+/// concrete). None (symbolic haystack/needle) leaves the app in place (→
+/// fence).
 fn rewrite_replace(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
     let hay: Vec<char> = ctx.string_const_value(kids[0])?.chars().collect();
     let t: Vec<char> = ctx.string_const_value(kids[1])?.chars().collect();
-    let u = ctx.string_const_value(kids[2]).map(str::to_owned)?;
-    Some(ctx.mk_string_const(&eval_replace(&hay, &t, &u)))
-    // Task 4 replaces the two lines above with the symbolic-u decomposition.
+    let u = kids[2];
+    let Some(&p) = occurrences(&hay, &t).first() else {
+        // Needle absent: result is the haystack; `u` is irrelevant (exact).
+        return Some(kids[0]);
+    };
+    if let Some(uv) = ctx.string_const_value(u).map(str::to_owned) {
+        // Fully literal: fold to a single literal.
+        return Some(ctx.mk_string_const(&eval_replace(&hay, &t, &uv)));
+    }
+    // Symbolic u: (str.++ pre u post), empty literal flanks dropped.
+    let pre: String = hay[..p].iter().collect();
+    let post: String = hay[p + t.len()..].iter().collect();
+    let mut parts: Vec<TermId> = Vec::new();
+    if !pre.is_empty() {
+        parts.push(ctx.mk_string_const(&pre));
+    }
+    parts.push(u);
+    if !post.is_empty() {
+        parts.push(ctx.mk_string_const(&post));
+    }
+    Some(if parts.len() == 1 {
+        parts[0]
+    } else {
+        ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), &parts)
+            .expect("pre ++ u ++ post")
+    })
 }
 
 #[cfg(test)]
@@ -256,5 +281,88 @@ mod tests {
         let atom = ctx.mk_eq(idx, one).unwrap();
         let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
         assert_eq!(out, vec![atom], "untouched subtree must keep its TermId");
+    }
+
+    // ── Partial-eval replace (symbolic u) ────────────────────────────────
+
+    /// Destructure `(str.++ …)` into its children.
+    fn concat_parts(ctx: &Context, t: TermId) -> Vec<TermId> {
+        let TermNode::App { op, args, .. } = ctx.term_node(t) else {
+            panic!("expected concat app");
+        };
+        assert!(matches!(op, Op::Builtin(BuiltinOp::StrConcat)));
+        ctx.children(*args).to_vec()
+    }
+
+    #[test]
+    fn replace_symbolic_u_decomposes_at_leftmost_occurrence() {
+        let mut ctx = Context::new();
+        let abcb = ctx.mk_string_const("abcb");
+        let b = ctx.mk_string_const("b");
+        let u = str_var(&mut ctx, "u");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[abcb, b, u])
+            .unwrap();
+        let out_s = str_var(&mut ctx, "r");
+        let atom = ctx.mk_eq(rep, out_s).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        // (= (str.++ "a" u "cb") r) — leftmost "b" is at position 1.
+        let TermNode::App { args, .. } = ctx.term_node(out[0]).clone() else {
+            panic!("eq app");
+        };
+        let eq_kids = ctx.children(args).to_vec();
+        let parts = concat_parts(&ctx, eq_kids[0]);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(ctx.string_const_value(parts[0]), Some("a"));
+        assert_eq!(parts[1], u);
+        assert_eq!(ctx.string_const_value(parts[2]), Some("cb"));
+    }
+
+    #[test]
+    fn replace_empty_flanks_dropped() {
+        let mut ctx = Context::new();
+        let u = str_var(&mut ctx, "u2");
+        let r = str_var(&mut ctx, "r2");
+        // Whole-haystack needle: (str.replace "ab" "ab" u) → bare u.
+        let ab = ctx.mk_string_const("ab");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[ab, ab, u])
+            .unwrap();
+        let atom = ctx.mk_eq(rep, r).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        let want = ctx.mk_eq(u, r).unwrap();
+        assert_eq!(out, vec![want], "both flanks empty → result is bare u");
+        // Empty needle: (str.replace "ab" "" u) → (str.++ u "ab").
+        let empty = ctx.mk_string_const("");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[ab, empty, u])
+            .unwrap();
+        let atom = ctx.mk_eq(rep, r).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        let TermNode::App { args, .. } = ctx.term_node(out[0]).clone() else {
+            panic!("eq app");
+        };
+        let eq_kids = ctx.children(args).to_vec();
+        let parts = concat_parts(&ctx, eq_kids[0]);
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0], u);
+        assert_eq!(ctx.string_const_value(parts[1]), Some("ab"));
+    }
+
+    #[test]
+    fn replace_needle_absent_drops_symbolic_u() {
+        let mut ctx = Context::new();
+        let abc = ctx.mk_string_const("abc");
+        let z = ctx.mk_string_const("z");
+        let u = str_var(&mut ctx, "u3");
+        let r = str_var(&mut ctx, "r3");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[abc, z, u])
+            .unwrap();
+        let atom = ctx.mk_eq(rep, r).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        // Result does not depend on u: (= "abc" r).
+        let want = ctx.mk_eq(abc, r).unwrap();
+        assert_eq!(out, vec![want]);
     }
 }
