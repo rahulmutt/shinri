@@ -628,6 +628,106 @@ fn str_predicate_over_uf_fences_unknown() {
     assert_eq!(out, vec!["unknown"]);
 }
 
+// ── Slice 13: str.indexof / str.replace ──────────────────────────────────────
+
+#[test]
+fn str_indexof_replace_literal_folds_decide_any_polarity() {
+    // All-literal applications fold to their concrete value at any polarity.
+    let out =
+        run_script(r#"(set-logic QF_S)(assert (= (str.indexof "abcb" "b" 0) 1))(check-sat)"#);
+    assert_eq!(out, vec!["sat"]);
+    // From start 2 the next "b" is at 3, not 1 → unsat.
+    let out =
+        run_script(r#"(set-logic QF_S)(assert (= (str.indexof "abcb" "b" 2) 1))(check-sat)"#);
+    assert_eq!(out, vec!["unsat"]);
+    // Negated literal replace folds too (polarity-free).
+    let out = run_script(
+        r#"(set-logic QF_S)(assert (not (= (str.replace "abc" "b" "X") "aXc")))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    // Empty-needle edges: indexof at i = |s| is IN range; replace prepends.
+    let out =
+        run_script(r#"(set-logic QF_S)(assert (= (str.indexof "ab" "" 2) 2))(check-sat)"#);
+    assert_eq!(out, vec!["sat"]);
+    let out = run_script(
+        r#"(set-logic QF_S)(assert (= (str.replace "ab" "" "X") "Xab"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn str_replace_symbolic_replacement_decides() {
+    // (str.replace "abcb" "b" u) → "a" ++ u ++ "cb" (leftmost occurrence @ 1);
+    // equated to "aXcb" this forces u = "X" (z3: sat).
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun u () String)
+           (assert (= (str.replace "abcb" "b" u) "aXcb"))(check-sat)(get-value (u))"#,
+    );
+    assert_eq!(out.first().map(String::as_str), Some("sat"));
+    assert!(
+        out.get(1).is_some_and(|v| v.contains("\"X\"")),
+        "u must be \"X\", got {out:?}"
+    );
+    // Length-based UNSAT: |"a" ++ u ++ "cb"| >= 3, but the target has length 2
+    // (z3: unsat).
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun u () String)
+           (assert (= (str.replace "abcb" "b" u) "zz"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn str_indexof_symbolic_start_decides() {
+    // (str.indexof "abcb" "b" i) = 3 forces i ∈ {2, 3} → sat (z3: sat).
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun i () Int)
+           (assert (= (str.indexof "abcb" "b" i) 3))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["sat"]);
+    // No start position yields 2 (occurrences are at 1 and 3) → unsat (z3: unsat).
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun i () Int)
+           (assert (= (str.indexof "abcb" "b" i) 2))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+// ── Fence canaries: flip-markers for a future symbolic-encoding slice ────────
+
+#[test]
+fn str_indexof_replace_symbolic_haystack_fences_unknown() {
+    // Symbolic haystack (z3: sat) → sound Unknown.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (= (str.indexof s "b" 0) 1))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (= (str.replace s "b" "X") "aXc"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+    // Symbolic needle with literal haystack also fences (z3: sat).
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun t () String)
+           (assert (= (str.indexof "abc" t 0) 1))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn str_indexof_over_cap_literal_fences_unknown() {
+    // 65-char haystack with symbolic i exceeds INDEXOF_CHAIN_CAP = 64 →
+    // left in place → sound Unknown (z3: sat).
+    let hay = "a".repeat(65);
+    let out = run_script(&format!(
+        r#"(set-logic QF_S)(declare-fun i () Int)
+           (assert (= (str.indexof "{hay}" "a" i) 0))(check-sat)"#
+    ));
+    assert_eq!(out, vec!["unknown"]);
+}
+
 // ── Task 7.6 regressions (668bbfd fix-forward) ────────────────────────────────
 
 #[test]

@@ -212,6 +212,27 @@ fn rewrite_replace(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
     })
 }
 
+/// Stage 2: presence fence. True iff any `str.indexof` / `str.replace`
+/// application SURVIVED [`partial_eval_indexof_replace`] — symbolic haystack
+/// or needle, an over-cap literal, or a non-literal-yet-foldable operand
+/// (e.g. a constant substr, which only folds later in `reduce_assertions`).
+/// The solver fences such queries to a sound `Unknown` (canary-pinned
+/// flip-markers for a future symbolic-encoding slice).
+pub fn has_unreduced_indexof_replace(ctx: &Context, assertions: &[TermId]) -> bool {
+    fn walk(ctx: &Context, t: TermId) -> bool {
+        match ctx.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                matches!(
+                    op,
+                    Op::Builtin(BuiltinOp::StrIndexOf | BuiltinOp::StrReplace)
+                ) || ctx.children(*args).to_vec().iter().any(|&c| walk(ctx, c))
+            }
+            TermNode::Const { .. } => false,
+        }
+    }
+    assertions.iter().any(|&a| walk(ctx, a))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -522,5 +543,31 @@ mod tests {
         let atom = ctx.mk_eq(idx, zero).unwrap();
         let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
         assert!(!contains_op(&ctx, out[0], BuiltinOp::StrIndexOf));
+    }
+
+    // ── Fence ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn fence_predicate_classification() {
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "sf");
+        let b = ctx.mk_string_const("b");
+        let zero = int_lit(&mut ctx, 0);
+        let one = int_lit(&mut ctx, 1);
+        // Symbolic haystack survives the rewrite → fence.
+        let idx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[s, b, zero])
+            .unwrap();
+        let atom = ctx.mk_eq(idx, one).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        assert!(has_unreduced_indexof_replace(&ctx, &out));
+        // Literal haystack folds → no fence.
+        let abcb = ctx.mk_string_const("abcb");
+        let idx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[abcb, b, zero])
+            .unwrap();
+        let atom = ctx.mk_eq(idx, one).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        assert!(!has_unreduced_indexof_replace(&ctx, &out));
     }
 }
