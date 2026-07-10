@@ -94,6 +94,8 @@ pub enum BuiltinOp {
     // haystack-first — (str.indexof s sub i), (str.replace s t u).
     StrIndexOf, // String × String × Int → Int
     StrReplace, // String × String × String → String
+    // Slice 14: replace ALL non-overlapping occurrences (leftmost-first).
+    StrReplaceAll, // String × String × String → String
     // Floating-point — arithmetic. Rounded ops take a RoundingMode as arg 0.
     FpAbs,
     FpNeg, // (F) -> F

@@ -518,7 +518,7 @@ impl Context {
                 }
                 Ok(int_s)
             }
-            StrReplace => {
+            StrReplace | StrReplaceAll => {
                 expect_arity(args, 3)?;
                 let str_s = self.string_sort();
                 expect_all(self, args, str_s)?;
@@ -1395,6 +1395,31 @@ mod tests {
         // replace: all three String.
         assert!(ctx
             .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[x, lit, i])
+            .is_err());
+    }
+
+    #[test]
+    fn str_replace_all_sort_rule() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let f = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let lit = ctx.mk_string_const("a");
+        // Well-sorted: String × String × String → String.
+        let app = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[x, lit, lit])
+            .unwrap();
+        assert_eq!(ctx.sort_of(app), str_s);
+        // Wrong arity → error.
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[x, lit])
+            .is_err());
+        // Int replacement operand → error.
+        let i = ctx.mk_numeral(Rational::zero(), ctx.int_sort());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[x, lit, i])
             .is_err());
     }
 

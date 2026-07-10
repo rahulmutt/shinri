@@ -196,6 +196,8 @@ fn builtin_name(b: BuiltinOp) -> String {
         // Slice 13
         StrIndexOf => "str.indexof".to_owned(),
         StrReplace => "str.replace".to_owned(),
+        // Slice 14
+        StrReplaceAll => "str.replace_all".to_owned(),
         // Floating-point ops — SMT-LIB names
         FpAbs => "fp.abs".to_owned(),
         FpNeg => "fp.neg".to_owned(),
@@ -269,5 +271,22 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[x, a, a])
             .unwrap();
         assert_eq!(print_term(&ctx, rep), r#"(str.replace x "a" "a")"#);
+    }
+
+    #[test]
+    fn prints_replace_all() {
+        use shinri_core::{BuiltinOp, Op};
+        let mut ctx = shinri_core::Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let f = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let a = ctx.mk_string_const("a");
+        let b = ctx.mk_string_const("b");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[x, a, b])
+            .unwrap();
+        assert_eq!(print_term(&ctx, rep), r#"(str.replace_all x "a" "b")"#);
     }
 }

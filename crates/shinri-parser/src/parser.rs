@@ -327,6 +327,7 @@ impl<'a> Parser<'a> {
             "str.contains" => StrContains,
             "str.indexof" => StrIndexOf,
             "str.replace" => StrReplace,
+            "str.replace_all" => StrReplaceAll,
             // Floating-point bit constructor (SMT-LIB QF_FP)
             "fp" => FpFromBits,
             // Floating-point arithmetic and classification operators (QF_FP)
@@ -892,7 +893,8 @@ impl<'a> Parser<'a> {
             | BuiltinOp::StrSuffixOf
             | BuiltinOp::StrContains
             | BuiltinOp::StrIndexOf
-            | BuiltinOp::StrReplace => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            | BuiltinOp::StrReplace
+            | BuiltinOp::StrReplaceAll => Self::mk(ctx, Op::Builtin(op), &args, &sp),
             // Floating-point ops: delegate directly to mk_app (sort-checking in Context).
             BuiltinOp::FpAbs
             | BuiltinOp::FpNeg
@@ -1919,6 +1921,42 @@ mod tests {
         // replace third arg must be String.
         let cs = commands(r#"(declare-fun x () String)(assert (= (str.replace x "a" 1) x))"#);
         assert!(cs[1].is_err(), "Int replacement must be a diagnostic");
+    }
+
+    /// Parse str.replace_all, verify op + result sort (slice 14).
+    #[test]
+    fn parses_and_rejects_replace_all() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = r#"(declare-fun x () String)
+(assert (= (str.replace_all x "a" "b") x))"#;
+        let (ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 2);
+        let assert_term = match &cmds[1] {
+            Command::Assert(t) => *t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        let TermNode::App {
+            op: Op::Builtin(BuiltinOp::Eq),
+            args,
+            ..
+        } = ctx.term_node(assert_term).clone()
+        else {
+            panic!("expected Eq at top level");
+        };
+        let lhs = ctx.children(args).to_vec()[0];
+        match ctx.term_node(lhs).clone() {
+            TermNode::App {
+                op: Op::Builtin(got),
+                ..
+            } => {
+                assert_eq!(got, BuiltinOp::StrReplaceAll, "op mismatch");
+            }
+            other => panic!("expected App lhs, got {other:?}"),
+        }
+        assert_eq!(ctx.sort_of(lhs), ctx.string_sort(), "result sort for StrReplaceAll");
+        // Int replacement operand → parse diagnostic.
+        let bad = commands(r#"(declare-fun x () String)(assert (= (str.replace_all x "a" 1) x))"#);
+        assert!(bad[1].is_err(), "Int replacement must be a diagnostic");
     }
 
     /// Task-5 TDD test: `(_ FloatingPoint eb sb)`, `FloatNN` aliases, and
