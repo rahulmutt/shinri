@@ -499,6 +499,31 @@ impl Context {
                 expect_all(self, args, str_s)?;
                 Ok(self.bool_sort())
             }
+            StrIndexOf => {
+                expect_arity(args, 3)?;
+                let (str_s, int_s) = (self.string_sort(), self.int_sort());
+                for &a in &args[0..2] {
+                    if self.sort_of(a) != str_s {
+                        return Err(SortError::Mismatch {
+                            expected: str_s,
+                            found: self.sort_of(a),
+                        });
+                    }
+                }
+                if self.sort_of(args[2]) != int_s {
+                    return Err(SortError::Mismatch {
+                        expected: int_s,
+                        found: self.sort_of(args[2]),
+                    });
+                }
+                Ok(int_s)
+            }
+            StrReplace => {
+                expect_arity(args, 3)?;
+                let str_s = self.string_sort();
+                expect_all(self, args, str_s)?;
+                Ok(str_s)
+            }
             // ── Floating-point: arithmetic ────────────────────────────────────
             FpAbs | FpNeg => {
                 expect_arity(args, 1)?;
@@ -1330,6 +1355,47 @@ mod tests {
             let one = ctx.mk_numeral(Rational::from_int(1i128.into()), int_s);
             assert!(ctx.mk_app(Op::Builtin(op), &[x, one]).is_err());
         }
+    }
+
+    #[test]
+    fn string_indexof_replace_sorts() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let int_s = ctx.int_sort();
+        let f = ctx.declare_fun("x", &[], str_s);
+        let x = ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap();
+        let lit = ctx.mk_string_const("ab");
+        let i = ctx.mk_numeral(Rational::from_int(1i128.into()), int_s);
+
+        // (str.indexof s sub i): String × String × Int → Int.
+        let idx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[x, lit, i])
+            .unwrap();
+        assert_eq!(ctx.sort_of(idx), int_s, "indexof must be Int-sorted");
+        // (str.replace s t u): String × String × String → String.
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[x, lit, lit])
+            .unwrap();
+        assert_eq!(ctx.sort_of(rep), str_s, "replace must be String-sorted");
+
+        // Arity 3 enforced.
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[x, lit])
+            .is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[x, lit])
+            .is_err());
+        // indexof: args 0-1 String, arg 2 Int.
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[x, lit, lit])
+            .is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[x, i, i])
+            .is_err());
+        // replace: all three String.
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[x, lit, i])
+            .is_err());
     }
 
     #[test]

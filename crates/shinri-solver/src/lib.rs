@@ -412,6 +412,22 @@ impl Solver {
             // 3. (Below, after the substr fence) rewrite positive-only atoms
             //    to existential concat equations the wordeq engine owns.
             assertions = shinri_str::predicates::fold_str_predicates(&mut self.ctx, &assertions);
+            // ── Slice 13: str.indexof / str.replace ──────────────────────────
+            // Polarity-FREE exact rewrites (value-sorted functions, not
+            // predicates): fold fully-literal applications; partial-eval
+            // literal-haystack shapes (replace → concat decomposition around
+            // the concrete leftmost occurrence; indexof with symbolic start →
+            // bounded Int-ite chain, eliminated below by reduce_assertions'
+            // elim_term_ite). Zero fresh variables. Any SURVIVING application
+            // (symbolic haystack/needle, over-cap literal) fences to sound
+            // Unknown — canary-pinned flip-markers for a future slice.
+            assertions = shinri_str::indexof_replace::partial_eval_indexof_replace(
+                &mut self.ctx,
+                &assertions,
+            );
+            if shinri_str::indexof_replace::has_unreduced_indexof_replace(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
             if shinri_str::predicates::has_unrewritable_str_predicate(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }

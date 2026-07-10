@@ -193,6 +193,9 @@ fn builtin_name(b: BuiltinOp) -> String {
         StrPrefixOf => "str.prefixof".to_owned(),
         StrSuffixOf => "str.suffixof".to_owned(),
         StrContains => "str.contains".to_owned(),
+        // Slice 13
+        StrIndexOf => "str.indexof".to_owned(),
+        StrReplace => "str.replace".to_owned(),
         // Floating-point ops — SMT-LIB names
         FpAbs => "fp.abs".to_owned(),
         FpNeg => "fp.neg".to_owned(),
@@ -246,5 +249,25 @@ mod tests {
         // rounding mode
         let rne = ctx.mk_rm_const(RoundingMode::Rne);
         assert_eq!(print_term(&ctx, rne), "RNE");
+    }
+
+    #[test]
+    fn prints_indexof_and_replace() {
+        use shinri_core::{BuiltinOp, Op, Rational};
+        let mut ctx = shinri_core::Context::new();
+        let str_s = ctx.string_sort();
+        let int_s = ctx.int_sort();
+        let f = ctx.declare_fun("x", &[], str_s);
+        let x = ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap();
+        let a = ctx.mk_string_const("a");
+        let zero = ctx.mk_numeral(Rational::from_int(0i128.into()), int_s);
+        let idx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[x, a, zero])
+            .unwrap();
+        assert_eq!(print_term(&ctx, idx), r#"(str.indexof x "a" 0)"#);
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplace), &[x, a, a])
+            .unwrap();
+        assert_eq!(print_term(&ctx, rep), r#"(str.replace x "a" "a")"#);
     }
 }
