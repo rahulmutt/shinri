@@ -884,7 +884,10 @@ impl<'a> Parser<'a> {
             }
             // String predicates (slice 12): delegate directly to mk_app (sort-checking
             // in Context). Not yet reachable via `builtin_for` — parser wiring is Task 3.
-            BuiltinOp::StrPrefixOf | BuiltinOp::StrSuffixOf | BuiltinOp::StrContains => {
+            // String search/replace (slice 13): delegate directly to mk_app (sort-checking
+            // in Context). Not yet reachable via `builtin_for` — parser wiring is Task 2.
+            BuiltinOp::StrPrefixOf | BuiltinOp::StrSuffixOf | BuiltinOp::StrContains
+            | BuiltinOp::StrIndexOf | BuiltinOp::StrReplace => {
                 Self::mk(ctx, Op::Builtin(op), &args, &sp)
             }
             // Floating-point ops: delegate directly to mk_app (sort-checking in Context).

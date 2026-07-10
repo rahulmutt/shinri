@@ -193,6 +193,9 @@ fn builtin_name(b: BuiltinOp) -> String {
         StrPrefixOf => "str.prefixof".to_owned(),
         StrSuffixOf => "str.suffixof".to_owned(),
         StrContains => "str.contains".to_owned(),
+        // String search/replace — SMT-LIB names (slice 13, Task 2 owns the real impl)
+        StrIndexOf => "str.indexof".to_owned(),
+        StrReplace => "str.replace".to_owned(),
         // Floating-point ops — SMT-LIB names
         FpAbs => "fp.abs".to_owned(),
         FpNeg => "fp.neg".to_owned(),

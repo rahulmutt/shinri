@@ -90,6 +90,10 @@ pub enum BuiltinOp {
     StrPrefixOf,
     StrSuffixOf,
     StrContains,
+    // Slice 13: search/replace ops. Arg order per SMT-LIB: BOTH are
+    // haystack-first — (str.indexof s sub i), (str.replace s t u).
+    StrIndexOf, // String × String × Int → Int
+    StrReplace, // String × String × String → String
     // Floating-point — arithmetic. Rounded ops take a RoundingMode as arg 0.
     FpAbs,
     FpNeg, // (F) -> F
