@@ -318,6 +318,71 @@ impl Gen {
         self.body
     }
 
+    /// Slice 13: a haystack for the indexof/replace family — literal-heavy
+    /// (3 in 4, 2-4 chars) so the fold / partial-eval paths dominate;
+    /// occasionally a variable (fence path → shinri-unknown, tolerated).
+    fn ir_haystack(&mut self) -> String {
+        if self.rng.below(4) == 0 {
+            self.var()
+        } else {
+            let n = 2 + self.rng.below(3); // 2..=4 chars
+            let mut s = String::new();
+            for _ in 0..n {
+                s.push_str(ALPHABET[self.rng.below(ALPHABET.len() as u64) as usize]);
+            }
+            format!("\"{s}\"")
+        }
+    }
+
+    /// One indexof/replace assertion. MAY be negated — unlike the predicate
+    /// family, the slice-13 rewrites are exact at any polarity. Needle is
+    /// always a literal (the decided fragment); the start index is a small
+    /// numeral or the symbolic `i0`.
+    fn indexof_replace_assertion(&mut self) {
+        let hay = self.ir_haystack();
+        let needle = self.lit();
+        let atom = if self.rng.below(2) == 0 {
+            let start = if self.rng.below(3) == 0 {
+                "i0".to_owned()
+            } else {
+                self.rng.below(4).to_string()
+            };
+            // Result in -1..=3; -1 must be SMT-LIB-spelled (- 1).
+            let v = self.rng.below(5) as i64 - 1;
+            let v = if v < 0 {
+                format!("(- {})", -v)
+            } else {
+                v.to_string()
+            };
+            format!("(= (str.indexof {hay} {needle} {start}) {v})")
+        } else {
+            let u = self.atom_term();
+            let target = self.atom_term();
+            format!("(= (str.replace {hay} {needle} {u}) {target})")
+        };
+        let atom = if self.rng.below(4) == 0 {
+            format!("(not {atom})")
+        } else {
+            atom
+        };
+        self.body.push_str(&format!("(assert {atom})\n"));
+    }
+
+    /// Instance body for the slice-13 family: the shared string vars plus an
+    /// Int start-index var, 1-2 indexof/replace assertions, 0-1 general
+    /// assertions (word eqs / lengths) for cross-theory mixing.
+    fn finish_indexof_replace(mut self) -> String {
+        self.body.push_str("(declare-fun i0 () Int)\n");
+        let np = 1 + self.rng.below(2);
+        for _ in 0..np {
+            self.indexof_replace_assertion();
+        }
+        if self.rng.below(2) == 0 {
+            self.assertion();
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -384,6 +449,10 @@ fn gen_body(seed: u64) -> String {
 
 fn gen_predicates_body(seed: u64) -> String {
     Gen::new(seed).finish_predicates()
+}
+
+fn gen_indexof_replace_body(seed: u64) -> String {
+    Gen::new(seed).finish_indexof_replace()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -660,6 +729,101 @@ fn qfs_predicates_matches_z3() {
         n_guard_bailout <= PRED_MAX_GUARD_BAILOUTS,
         "guard bailouts {n_guard_bailout} exceed bound {PRED_MAX_GUARD_BAILOUTS} — \
          the tolerated slice-11 retraction leak may have widened (investigate, do not raise the bound blindly)"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// indexof/replace differential oracle (slice 13): fold + partial-eval + fence.
+// Rewrites are polarity-free, so atoms MAY be negated (unlike the predicate
+// family). Symbolic-haystack instances fence to sound Unknown (tolerated,
+// counted). Guard bailouts: same tolerated slice-11 retraction-leak class as
+// the predicate family (the mixing `assertion()` emits word equations).
+// ─────────────────────────────────────────────────────────────────────────────
+
+const IR_N_ITERS: usize = 200;
+const IR_MAX_GUARD_BAILOUTS: usize = IR_N_ITERS / 10;
+
+#[test]
+fn qfs_indexof_replace_matches_z3() {
+    let mut rng = Lcg(0x51_3A_0000_0001u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness, mut n_guard_bailout) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..IR_N_ITERS {
+        let seed = rng.next();
+        let body = gen_indexof_replace_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailout += 1;
+            continue; // sound bail-to-unknown: tolerated, counted
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_unknown += 1; // sound fence/fuel: tolerated, counted
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S INDEXOF/REPLACE SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _bailouts) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_indexof_replace_matches_z3: {IR_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown (tolerated) / {n_z3skip} z3-unknown / \
+         {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(n_sat > 0, "indexof/replace family produced zero SAT instances");
+    assert!(
+        n_unsat > 0,
+        "indexof/replace family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_guard_bailout <= IR_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailout} exceed bound {IR_MAX_GUARD_BAILOUTS} — \
+         investigate, do not raise the bound blindly"
     );
 }
 
