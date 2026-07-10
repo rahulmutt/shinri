@@ -325,6 +325,8 @@ impl<'a> Parser<'a> {
             "str.prefixof" => StrPrefixOf,
             "str.suffixof" => StrSuffixOf,
             "str.contains" => StrContains,
+            "str.indexof" => StrIndexOf,
+            "str.replace" => StrReplace,
             // Floating-point bit constructor (SMT-LIB QF_FP)
             "fp" => FpFromBits,
             // Floating-point arithmetic and classification operators (QF_FP)
@@ -1865,6 +1867,51 @@ mod tests {
             cs[1].is_err(),
             "(str.contains x 1): 1 is Int, not String, so this must be a diagnostic"
         );
+    }
+
+    /// Parse str.indexof / str.replace, verify op + result sort (slice 13).
+    #[test]
+    fn parses_indexof_and_replace() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        // Both nested under (= … …) so the asserted term is Bool.
+        let src = r#"(declare-fun x () String)
+(assert (= (str.indexof x "a" 0) 1))
+(assert (= (str.replace x "a" "b") x))"#;
+        let (ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 3);
+        for (ci, want, want_sort) in [
+            (1usize, BuiltinOp::StrIndexOf, ctx.int_sort()),
+            (2usize, BuiltinOp::StrReplace, ctx.string_sort()),
+        ] {
+            let assert_term = match &cmds[ci] {
+                Command::Assert(t) => *t,
+                other => panic!("expected Assert, got {other:?}"),
+            };
+            let TermNode::App { op: Op::Builtin(BuiltinOp::Eq), args, .. } =
+                ctx.term_node(assert_term).clone()
+            else {
+                panic!("expected Eq at top level");
+            };
+            let lhs = ctx.children(args).to_vec()[0];
+            match ctx.term_node(lhs).clone() {
+                TermNode::App { op: Op::Builtin(got), .. } => {
+                    assert_eq!(got, want, "op mismatch");
+                }
+                other => panic!("expected App lhs, got {other:?}"),
+            }
+            assert_eq!(ctx.sort_of(lhs), want_sort, "result sort for {want:?}");
+        }
+    }
+
+    /// Ill-sorted operands are diagnostics, not crashes (slice 13).
+    #[test]
+    fn indexof_replace_wrong_sort_rejected() {
+        // indexof third arg must be Int.
+        let cs = commands(r#"(declare-fun x () String)(assert (= (str.indexof x "a" "b") 0))"#);
+        assert!(cs[1].is_err(), "String start index must be a diagnostic");
+        // replace third arg must be String.
+        let cs = commands(r#"(declare-fun x () String)(assert (= (str.replace x "a" 1) x))"#);
+        assert!(cs[1].is_err(), "Int replacement must be a diagnostic");
     }
 
     /// Task-5 TDD test: `(_ FloatingPoint eb sb)`, `FloatNN` aliases, and
