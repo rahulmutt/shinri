@@ -112,6 +112,12 @@ fn rewrite(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -
     result
 }
 
+/// Construct an Int literal from an i128 value.
+fn int_num(ctx: &mut Context, v: i128) -> TermId {
+    let int_s = ctx.int_sort();
+    ctx.mk_numeral(shinri_core::Rational::from_int(v.into()), int_s)
+}
+
 /// `(str.indexof s sub i)`, children already rewritten. Some(_) iff a fold /
 /// partial-eval case applies; None leaves the app in place (→ fence).
 fn rewrite_indexof(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
@@ -122,7 +128,53 @@ fn rewrite_indexof(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
         let int_s = ctx.int_sort();
         return Some(ctx.mk_numeral(shinri_core::Rational::from_int(v.into()), int_s));
     }
-    None // Task 5 adds the symbolic-i ite chain here.
+    // Symbolic i, literal haystack+needle: the result as a function of i is a
+    // STEP FUNCTION over the concrete occurrence positions o1 < … < ok:
+    //   i < 0 → -1;  i ≤ o1 → o1;  o1 < i ≤ o2 → o2;  …;  i > ok → -1
+    // (i > |s| needs no own arm: it also has no occurrence ≥ i → -1).
+    // Emitted as an Int-ite chain; reduce_assertions' elim_term_ite eliminates
+    // it downstream. Capped to bound term growth on adversarial literals.
+    if hay.len() > INDEXOF_CHAIN_CAP {
+        return None; // over-cap: leave in place → fence
+    }
+    let i = kids[2];
+    let neg1 = int_num(ctx, -1);
+    let zero = int_num(ctx, 0);
+    if needle.is_empty() {
+        // Spec §2.3 special case: (ite (and (>= i 0) (<= i |s|)) i -1).
+        let n_lit = int_num(ctx, hay.len() as i128);
+        let ge0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[i, zero])
+            .expect("i >= 0");
+        let le_n = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[i, n_lit])
+            .expect("i <= |s|");
+        let in_range = ctx
+            .mk_app(Op::Builtin(BuiltinOp::And), &[ge0, le_n])
+            .expect("in_range");
+        return Some(
+            ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[in_range, i, neg1])
+                .expect("empty-needle ite"),
+        );
+    }
+    // Build the chain inside-out (last arm first).
+    let mut chain = neg1;
+    for &o in occurrences(&hay, &needle).iter().rev() {
+        let ov = int_num(ctx, o as i128);
+        let cond = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[i, ov])
+            .expect("i <= o");
+        chain = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[cond, ov, chain])
+            .expect("chain ite");
+    }
+    let lt0 = ctx
+        .mk_app(Op::Builtin(BuiltinOp::Lt), &[i, zero])
+        .expect("i < 0");
+    Some(
+        ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[lt0, neg1, chain])
+            .expect("outer ite"),
+    )
 }
 
 /// `(str.replace s t u)`, children already rewritten. Some(_) iff haystack
@@ -364,5 +416,111 @@ mod tests {
         // Result does not depend on u: (= "abc" r).
         let want = ctx.mk_eq(abc, r).unwrap();
         assert_eq!(out, vec![want]);
+    }
+
+    // ── Partial-eval indexof (symbolic start) ────────────────────────────
+
+    fn is_ite(ctx: &Context, t: TermId) -> bool {
+        matches!(
+            ctx.term_node(t),
+            TermNode::App { op: Op::Builtin(BuiltinOp::Ite), .. }
+        )
+    }
+
+    fn contains_op(ctx: &Context, t: TermId, want: BuiltinOp) -> bool {
+        match ctx.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                matches!(op, Op::Builtin(o) if *o == want)
+                    || ctx
+                        .children(*args)
+                        .to_vec()
+                        .iter()
+                        .any(|&c| contains_op(ctx, c, want))
+            }
+            TermNode::Const { .. } => false,
+        }
+    }
+
+    #[test]
+    fn indexof_symbolic_start_becomes_ite_chain() {
+        let mut ctx = Context::new();
+        let abcb = ctx.mk_string_const("abcb");
+        let b = ctx.mk_string_const("b");
+        let int_s = ctx.int_sort();
+        let i = {
+            let f = ctx.declare_fun("i", &[], int_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let idx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[abcb, b, i])
+            .unwrap();
+        let one = int_lit(&mut ctx, 1);
+        let atom = ctx.mk_eq(idx, one).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        assert!(
+            !contains_op(&ctx, out[0], BuiltinOp::StrIndexOf),
+            "indexof must be rewritten away"
+        );
+        // The eq's lhs is now the outer (ite (< i 0) -1 …) chain.
+        let TermNode::App { args, .. } = ctx.term_node(out[0]).clone() else {
+            panic!("eq app");
+        };
+        let lhs = ctx.children(args).to_vec()[0];
+        assert!(is_ite(&ctx, lhs), "expected an Int-ite chain, got {lhs:?}");
+        assert_eq!(ctx.sort_of(lhs), int_s);
+    }
+
+    #[test]
+    fn indexof_empty_needle_symbolic_start_is_range_ite() {
+        let mut ctx = Context::new();
+        let ab = ctx.mk_string_const("ab");
+        let empty = ctx.mk_string_const("");
+        let int_s = ctx.int_sort();
+        let i = {
+            let f = ctx.declare_fun("i2", &[], int_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let idx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[ab, empty, i])
+            .unwrap();
+        let zero = int_lit(&mut ctx, 0);
+        let atom = ctx.mk_eq(idx, zero).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        assert!(!contains_op(&ctx, out[0], BuiltinOp::StrIndexOf));
+        // (ite (and (>= i 0) (<= i 2)) i -1): the chain contains i itself as
+        // a branch and an And condition.
+        let TermNode::App { args, .. } = ctx.term_node(out[0]).clone() else {
+            panic!("eq app");
+        };
+        let lhs = ctx.children(args).to_vec()[0];
+        assert!(is_ite(&ctx, lhs));
+        assert!(contains_op(&ctx, lhs, BuiltinOp::And));
+    }
+
+    #[test]
+    fn indexof_over_cap_literal_left_in_place() {
+        let mut ctx = Context::new();
+        let big = ctx.mk_string_const(&"a".repeat(65)); // cap is 64
+        let a = ctx.mk_string_const("a");
+        let int_s = ctx.int_sort();
+        let i = {
+            let f = ctx.declare_fun("i3", &[], int_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let idx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[big, a, i])
+            .unwrap();
+        let zero = int_lit(&mut ctx, 0);
+        let atom = ctx.mk_eq(idx, zero).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        assert_eq!(out, vec![atom], "over-cap must survive unchanged (→ fence)");
+        // At exactly the cap it rewrites.
+        let at_cap = ctx.mk_string_const(&"a".repeat(64));
+        let idx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIndexOf), &[at_cap, a, i])
+            .unwrap();
+        let atom = ctx.mk_eq(idx, zero).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        assert!(!contains_op(&ctx, out[0], BuiltinOp::StrIndexOf));
     }
 }
