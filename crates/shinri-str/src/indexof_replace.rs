@@ -1,7 +1,7 @@
-//! Slice 13 pre-pass: `str.indexof` / `str.replace` — fold, partial-eval,
+//! Slice 13–14 pre-pass: `str.indexof` / `str.replace` / `str.replace_all` — fold, partial-eval,
 //! fence.
 //!
-//! Both ops are value-sorted FUNCTIONS (Int / String), so unlike the slice-12
+//! All three ops are value-sorted FUNCTIONS (Int / String), so unlike the slice-12
 //! predicates the rewrites here are exact at any position and polarity — no
 //! polarity analysis, and the pass introduces ZERO fresh variables.
 //!
