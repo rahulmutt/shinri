@@ -724,6 +724,66 @@ fn str_indexof_over_cap_literal_fences_unknown() {
     assert_eq!(out, vec!["unknown"]);
 }
 
+// ── Slice 14: str.replace_all ────────────────────────────────────────────────
+
+#[test]
+fn str_replace_all_literal_folds_decide_any_polarity() {
+    // All non-overlapping occurrences replaced.
+    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "abab" "ab" "Z") "ZZ"))(check-sat)"#);
+    assert_eq!(out, vec!["sat"]);
+    // Non-overlapping only: "aaa"/"aa" → "Xa", so "=…\"XX\"" is unsat.
+    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "aaa" "aa" "X") "XX"))(check-sat)"#);
+    assert_eq!(out, vec!["unsat"]);
+    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "aaa" "aa" "X") "Xa"))(check-sat)"#);
+    assert_eq!(out, vec!["sat"]);
+    // Negated literal fold (polarity-free).
+    let out = run_script(
+        r#"(set-logic QF_S)(assert (not (= (str.replace_all "abc" "b" "X") "aXc")))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+    // EMPTY-needle trap: u DROPPED, result is the haystack (contrast str.replace).
+    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "ab" "" "X") "ab"))(check-sat)"#);
+    assert_eq!(out, vec!["sat"]);
+    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "ab" "" "X") "Xab"))(check-sat)"#);
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn str_replace_all_symbolic_replacement_decides() {
+    // (str.replace_all "aza" "a" u) → (str.++ u "z" u); "=…\"bzb\"" forces u="b".
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun u () String)
+           (assert (= (str.replace_all "aza" "a" u) "bzb"))(check-sat)(get-value (u))"#,
+    );
+    assert_eq!(out.first().map(String::as_str), Some("sat"));
+    assert!(
+        out.get(1).is_some_and(|v| v.contains("\"b\"")),
+        "u must be \"b\", got {out:?}"
+    );
+    // Repeated-variable contradiction: u="b" ∧ u="c" required → unsat.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun u () String)
+           (assert (= (str.replace_all "aza" "a" u) "bzc"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn str_replace_all_symbolic_haystack_fences_unknown() {
+    // Symbolic haystack (z3: sat) → sound Unknown, canary flip-marker.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (= (str.replace_all s "a" "X") "XbX"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+    // Symbolic needle also fences.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun t () String)
+           (assert (= (str.replace_all "abc" t "X") "aXc"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
 // ── Task 7.6 regressions (668bbfd fix-forward) ────────────────────────────────
 
 #[test]
