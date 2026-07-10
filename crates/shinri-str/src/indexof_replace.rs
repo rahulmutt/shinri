@@ -734,4 +734,109 @@ mod tests {
         let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
         assert!(!has_unreduced_indexof_replace(&ctx, &out));
     }
+
+    // ── Partial-eval replace_all (symbolic u) ──────────────────────────────
+
+    #[test]
+    fn replace_all_symbolic_u_two_occurrences_concat() {
+        // (str.replace_all "aza" "a" u) → (str.++ u "z" u): matches at 0 and 2.
+        let mut ctx = Context::new();
+        let aza = ctx.mk_string_const("aza");
+        let a = ctx.mk_string_const("a");
+        let u = str_var(&mut ctx, "u");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[aza, a, u])
+            .unwrap();
+        let out_s = str_var(&mut ctx, "r");
+        let atom = ctx.mk_eq(rep, out_s).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        let TermNode::App { args, .. } = ctx.term_node(out[0]).clone() else {
+            panic!("eq app");
+        };
+        let lhs = ctx.children(args).to_vec()[0];
+        let parts = concat_parts(&ctx, lhs);
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], u);
+        assert_eq!(ctx.string_const_value(parts[1]), Some("z"));
+        assert_eq!(parts[2], u);
+        assert!(!has_unreduced_indexof_replace(&ctx, &out));
+    }
+
+    #[test]
+    fn replace_all_symbolic_u_all_needle_collapses_to_bare_u_repeats() {
+        // (str.replace_all "aa" "a" u) → (str.++ u u): both flanks/gaps empty.
+        let mut ctx = Context::new();
+        let aa = ctx.mk_string_const("aa");
+        let a = ctx.mk_string_const("a");
+        let u = str_var(&mut ctx, "u2");
+        let r = str_var(&mut ctx, "r2");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[aa, a, u])
+            .unwrap();
+        let atom = ctx.mk_eq(rep, r).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        let TermNode::App { args, .. } = ctx.term_node(out[0]).clone() else {
+            panic!("eq app");
+        };
+        let lhs = ctx.children(args).to_vec()[0];
+        let parts = concat_parts(&ctx, lhs);
+        assert_eq!(parts, vec![u, u]);
+    }
+
+    #[test]
+    fn replace_all_needle_absent_drops_symbolic_u() {
+        let mut ctx = Context::new();
+        let abc = ctx.mk_string_const("abc");
+        let z = ctx.mk_string_const("z");
+        let u = str_var(&mut ctx, "u3");
+        let r = str_var(&mut ctx, "r3");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[abc, z, u])
+            .unwrap();
+        let atom = ctx.mk_eq(rep, r).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        let want = ctx.mk_eq(abc, r).unwrap(); // (= "abc" r): u irrelevant
+        assert_eq!(out, vec![want]);
+    }
+
+    #[test]
+    fn replace_all_over_cap_symbolic_u_fences() {
+        // 65 single-char occurrences with symbolic u → over cap (64) → left in place.
+        let mut ctx = Context::new();
+        let big = ctx.mk_string_const(&"a".repeat(65));
+        let a = ctx.mk_string_const("a");
+        let u = str_var(&mut ctx, "u4");
+        let r = str_var(&mut ctx, "r4");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[big, a, u])
+            .unwrap();
+        let atom = ctx.mk_eq(rep, r).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        assert_eq!(out, vec![atom], "over-cap symbolic-u must survive unchanged");
+        assert!(has_unreduced_indexof_replace(&ctx, &out), "→ fence");
+        // At exactly the cap (64 occurrences) it rewrites.
+        let at_cap = ctx.mk_string_const(&"a".repeat(64));
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[at_cap, a, u])
+            .unwrap();
+        let atom = ctx.mk_eq(rep, r).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        assert!(!has_unreduced_indexof_replace(&ctx, &out), "at cap → rewritten");
+    }
+
+    #[test]
+    fn replace_all_symbolic_haystack_fences() {
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "sf2");
+        let a = ctx.mk_string_const("a");
+        let x = ctx.mk_string_const("X");
+        let r = str_var(&mut ctx, "rf2");
+        let rep = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[s, a, x])
+            .unwrap();
+        let atom = ctx.mk_eq(rep, r).unwrap();
+        let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
+        assert_eq!(out, vec![atom], "symbolic haystack survives unchanged");
+        assert!(has_unreduced_indexof_replace(&ctx, &out));
+    }
 }
