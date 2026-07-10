@@ -28,13 +28,12 @@ jobs:
   differential:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
+    env:
+      GITHUB_TOKEN: ${{ github.token }} # mise github backend → avoid API rate limits resolving z3/cvc5 releases
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: jdx/mise-action@v2 # installs mise.toml tools: rust, nextest, z3, cvc5 (also deny/fuzz/mutants)
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest
       - name: Extended differential (more cases)
         run: cargo nextest run -p shinri-sat --test oracle
         env:
@@ -43,3 +42,5 @@ jobs:
         run: cargo nextest run -p shinri-theory --test props
         env:
           PROPTEST_CASES: '4000'
+      - name: z3/cvc5 differential oracle suite
+        run: cargo nextest run -p shinri-solver --features oracle
