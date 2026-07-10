@@ -29,7 +29,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 /// If `t` is an integer numeral, return its value as `i128`. Non-integer
 /// (fractional) or non-numeral terms return `None`.
-fn int_numeral(ctx: &Context, t: TermId) -> Option<i128> {
+pub(crate) fn int_numeral(ctx: &Context, t: TermId) -> Option<i128> {
     let r = ctx.numeral_value(t)?;
     // Reject non-integers: denominator must be exactly 1.
     if r.denom().to_i128() != Some(1) {

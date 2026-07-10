@@ -1,5 +1,6 @@
 mod collect;
 mod fuel;
+pub mod indexof_replace;
 mod length;
 pub mod model;
 pub mod normalize;
