@@ -4,6 +4,8 @@ on:
   pull_request:
   schedule:
     - cron: '0 3 * * *' # nightly differential/fuzz budget
+permissions:
+  contents: read
 jobs:
   test:
     runs-on: ubuntu-latest
@@ -28,11 +30,11 @@ jobs:
   differential:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule'
-    env:
-      GITHUB_TOKEN: ${{ github.token }} # mise github backend → avoid API rate limits resolving z3/cvc5 releases
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2 # installs mise.toml tools: rust, nextest, z3, cvc5 (also deny/fuzz/mutants)
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # mise github backend → avoid API rate limits resolving z3/cvc5 releases
       - uses: Swatinem/rust-cache@v2
       - name: Extended differential (more cases)
         run: cargo nextest run -p shinri-sat --test oracle
