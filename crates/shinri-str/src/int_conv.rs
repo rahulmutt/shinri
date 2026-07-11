@@ -40,8 +40,9 @@ fn eval_from_int(n: &Integer) -> String {
     }
 }
 
-/// Stage 1: bottom-up memoized rewrite. Folds fully-literal applications;
-/// the roundtrip case is added in Task 4. Untouched subtrees keep their TermIds.
+/// Stage 1: bottom-up memoized rewrite. Folds fully-literal applications and
+/// rewrites the roundtrip `str.to_int(str.from_int(n))` → `ite(n >= 0, n, -1)`.
+/// Untouched subtrees keep their TermIds.
 pub fn partial_eval_int_conv(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId> {
     let mut memo: FxHashMap<TermId, TermId> = FxHashMap::default();
     assertions
@@ -85,9 +86,9 @@ fn rewrite(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -
     result
 }
 
-/// `(str.to_int x)`, child already rewritten. Folds a literal argument; the
-/// roundtrip `str.to_int(str.from_int(n))` case is added in Task 4. None leaves
-/// the app in place (-> fence).
+/// `(str.to_int x)`, child already rewritten. Folds a literal argument and
+/// rewrites the roundtrip `str.to_int(str.from_int(n))` → `ite(n >= 0, n, -1)`.
+/// None leaves the app in place (-> fence).
 fn rewrite_to_int(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
     if let Some(s) = ctx.string_const_value(kids[0]).map(str::to_owned) {
         let int_s = ctx.int_sort();
@@ -212,7 +213,7 @@ mod tests {
     fn fold_from_int_of_neg_wrapped_numeral_literal() {
         // The SMT-LIB parser spells negative integer literals as `(- 5)` —
         // `BuiltinOp::Neg` applied to a numeral, NOT a single `Const` numeral
-        // (see `int_literal`'s doc comment). This is the shape `str.from_int`
+        // (see `Context::const_real_value` in shinri-core's context.rs). This is the shape `str.from_int`
         // actually sees from parsed input for its spec-mandated negative case;
         // it must fold exactly like a directly-built negative `mk_numeral`.
         let mut ctx = Context::new();

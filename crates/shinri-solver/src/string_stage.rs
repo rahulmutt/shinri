@@ -50,6 +50,8 @@ fn is_string_op(op: &Op) -> bool {
                 | BuiltinOp::StrIndexOf
                 | BuiltinOp::StrReplace
                 | BuiltinOp::StrReplaceAll
+                | BuiltinOp::StrToInt
+                | BuiltinOp::StrFromInt
         )
     )
 }
