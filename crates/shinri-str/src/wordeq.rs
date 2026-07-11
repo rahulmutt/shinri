@@ -208,6 +208,117 @@ fn occurs_unsat(
         .any(|&a| terms.string_const_value(a).is_some_and(|s| !s.is_empty()))
 }
 
+/// Sound completeness for the "one side fully constant, other side is a single
+/// (possibly repeated) variable interleaved with constants" pattern. Returns
+/// `true` iff the (already head/tail-stripped) equation is UNSAT by this
+/// analysis.
+///
+/// When exactly one residual `cw` is a FIXED word `W` (all string constants,
+/// `|W| = L`) and the other residual `vw` is a sequence of constant atoms
+/// (contributing `C` fixed chars over `k_v` variable occurrences of a SINGLE
+/// variable `v`), the length of `v` is FORCED: `k·|v| + C = L` has a unique
+/// non-negative integer solution `m = (L − C)/k` (or none, ⟹ UNSAT). Given that
+/// forced length the layout of `vw` against `W` is fully determined; tiling it
+/// left-to-right, every constant atom must equal its span and every occurrence
+/// of `v` must equal the SAME span. Any mismatch ⟹ UNSAT in the free monoid.
+///
+/// SOUNDNESS: `m` is genuinely forced (every model must give `v` length `m`),
+/// so a tiling contradiction rules out ALL models — never a wrong UNSAT. The
+/// analysis is COMPLETE for this pattern (a consistent tiling exhibits the model
+/// `v = window`), self-contained (mints no fresh terms, cites only the equation
+/// literal like the neighbouring constant-length/char-set bounds), and only
+/// ADDS conflicts — it never changes SAT/split behaviour. It requires a SINGLE
+/// distinct variable: two distinct variables (e.g. `u ++ w = "bc"`, SAT with
+/// `u="b", w="c"`) are a different pattern and fall through untouched. A
+/// variable EUF-merged to a constant is still treated as a free window here,
+/// which stays sound (we only ever emit a conflict, never claim SAT). This
+/// decides repeated-variable equations such as `u ++ "z" ++ u = "bzc"` (the
+/// `str.replace_all` symbolic-`u` shape) that the atom-wise resolver otherwise
+/// leaves as a sound Unknown.
+fn single_var_forced_length_conflict(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    lhs: &[TermId],
+    rhs: &[TermId],
+) -> bool {
+    let all_const =
+        |sl: &[TermId], terms: &Context| sl.iter().all(|&a| terms.string_const_value(a).is_some());
+    // Identify (fully-constant side `cw`, variable-bearing side `vw`). Exactly one
+    // side must be fully constant (both-const is handled by the caller's earlier
+    // cat-compare; both-variable is not this pattern).
+    let (cw, vw): (&[TermId], &[TermId]) = if all_const(lhs, terms) && !all_const(rhs, terms) {
+        (lhs, rhs)
+    } else if all_const(rhs, terms) && !all_const(lhs, terms) {
+        (rhs, lhs)
+    } else {
+        return false;
+    };
+    // The fixed word as code points (never bytes).
+    let w: Vec<char> = cw
+        .iter()
+        .flat_map(|&a| {
+            terms
+                .string_const_value(a)
+                .unwrap()
+                .chars()
+                .collect::<Vec<char>>()
+        })
+        .collect();
+    let l = w.len();
+    // Partition `vw`: constant atoms contribute fixed chars; every non-constant
+    // atom must be the SAME variable (by TermId / EUF class) or we bail.
+    let mut var_atom: Option<TermId> = None;
+    let mut k = 0usize;
+    let mut c = 0usize;
+    for &a in vw {
+        if let Some(s) = terms.string_const_value(a) {
+            c += s.chars().count();
+        } else {
+            match var_atom {
+                None => var_atom = Some(a),
+                Some(v) if same(terms, eq, a, v) => {}
+                Some(_) => return false, // ≥2 distinct variables: not this pattern
+            }
+            k += 1;
+        }
+    }
+    if k == 0 {
+        return false; // no variable ⟹ both-const, handled by caller
+    }
+    // Forced length: k·m + c = l. No non-negative integer solution ⟹ UNSAT.
+    if l < c || !(l - c).is_multiple_of(k) {
+        return true;
+    }
+    let m = (l - c) / k;
+    // Tile `vw` over `W` at the forced layout; check every span.
+    let mut cursor = 0usize;
+    let mut window: Option<&[char]> = None;
+    for &a in vw {
+        if let Some(s) = terms.string_const_value(a) {
+            let cs: Vec<char> = s.chars().collect();
+            let end = cursor + cs.len();
+            if end > l || w[cursor..end] != cs[..] {
+                return true; // constant atom mismatched its forced span
+            }
+            cursor = end;
+        } else {
+            let end = cursor + m;
+            if end > l {
+                return true;
+            }
+            let span = &w[cursor..end];
+            match window {
+                None => window = Some(span),
+                Some(prev) if prev == span => {}
+                Some(_) => return true, // two occurrences forced to differ
+            }
+            cursor = end;
+        }
+    }
+    // cursor == l by construction and every span matched ⟹ SAT (v = window).
+    false
+}
+
 /// Compare two atoms for definite equality: same TermId, same literal string
 /// value, or same EqualityEngine equivalence class.
 pub(crate) fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: TermId) -> bool {
@@ -492,6 +603,18 @@ fn resolve_inner(
                 }
             }
         }
+    }
+
+    // Single-variable forced-length analysis: one side fully constant, the other
+    // a single (possibly repeated) variable interleaved with constants. The
+    // variable's length is FORCED (k·|v| + C = L); tiling `vw` over the constant
+    // word at that unique length decides this pattern exactly. Sound,
+    // self-contained (no fresh terms), cites only the equation literal, and only
+    // ADDS conflicts — it decides repeated-variable equations like
+    // `u ++ "z" ++ u = "bzc"` (the str.replace_all symbolic-`u` shape) that the
+    // atom-wise resolver otherwise leaves as a sound Unknown.
+    if single_var_forced_length_conflict(terms, eq, &lhs[i..le], &rhs[j..re]) {
+        return StepResult::Conflict(just);
     }
 
     // Both sides non-empty: check for constant-head character mismatch.
@@ -1098,6 +1221,189 @@ mod tests {
             }
             _ => panic!("s = \"b\"++t++s is UNSAT (non-empty constant flank); expected Conflict"),
         }
+    }
+
+    // ── Slice 14 root-fix: single-variable forced-length analysis ────────────
+    // When one side is fully constant and the other is a single (possibly
+    // repeated) variable interleaved with constants, the variable length is
+    // FORCED; tiling at that length decides the pattern exactly.
+
+    // `u ++ u = "bc"`: |u| forced to 1; the two occurrences map to "b" and "c"
+    // → UNSAT (z3: unsat). Was a sound Unknown before this fix.
+    #[test]
+    fn repeated_var_forced_length_mismatch_is_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let u = mk_var(&mut ctx, "u_rv1");
+        let bc = ctx.mk_string_const("bc");
+        let lhs = [u, u];
+        let rhs = [bc];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(result, StepResult::Conflict(_)),
+            "u++u=\"bc\" forces |u|=1 with u=\"b\" and u=\"c\": UNSAT"
+        );
+    }
+
+    // `u ++ "z" ++ u = "bzc"`: the str.replace_all symbolic-u shape → UNSAT.
+    #[test]
+    fn repeated_var_with_gap_forced_length_is_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let u = mk_var(&mut ctx, "u_rv2");
+        let z = ctx.mk_string_const("z");
+        let bzc = ctx.mk_string_const("bzc");
+        let lhs = [u, z, u];
+        let rhs = [bzc];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(result, StepResult::Conflict(_)),
+            "u++\"z\"++u=\"bzc\" forces u=\"b\" and u=\"c\": UNSAT"
+        );
+    }
+
+    // SAT guard: `u ++ u = "aa"` → |u|=1, both windows "a": consistent, NOT conflict.
+    #[test]
+    fn repeated_var_consistent_windows_not_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let u = mk_var(&mut ctx, "u_rv3");
+        let aa = ctx.mk_string_const("aa");
+        let lhs = [u, u];
+        let rhs = [aa];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(result, StepResult::Conflict(_)),
+            "u++u=\"aa\" is SAT (u=\"a\"); must not conflict"
+        );
+    }
+
+    // "Same variable" via a genuine EUF MERGE of DISTINCT TermIds (not literal
+    // TermId reuse): `u1 ++ "z" ++ u2` with `u1 = u2` asserted in the
+    // EqualityEngine collapses to the repeated-variable shape `u++"z"++u="bzc"`
+    // → the merged variable is forced to "b" and "c" ⟹ UNSAT. Exercises the
+    // safety-critical `same(terms, eq, a, v)` classification branch.
+    #[test]
+    fn same_var_via_euf_merge_forced_length_is_conflict() {
+        use shinri_theory::types::EqJust;
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let u1 = mk_var(&mut ctx, "u1_merge");
+        let u2 = mk_var(&mut ctx, "u2_merge");
+        // Merge u1 = u2: distinct TermIds, same equivalence class.
+        let n1 = eq.intern(u1);
+        let n2 = eq.intern(u2);
+        let _ = eq.merge(n1, n2, EqJust::Definitional);
+        let z = ctx.mk_string_const("z");
+        let bzc = ctx.mk_string_const("bzc");
+        let lhs = [u1, z, u2];
+        let rhs = [bzc];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(result, StepResult::Conflict(_)),
+            "u1++\"z\"++u2 with u1=u2 (EUF) collapses to u++\"z\"++u=\"bzc\": UNSAT"
+        );
+    }
+
+    // SOUNDNESS guard: DISTINCT variables `u ++ w = "bc"` → SAT (u="b", w="c").
+    // Two distinct variables are NOT this pattern; must NOT conflict.
+    #[test]
+    fn distinct_vars_forced_length_not_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let u = mk_var(&mut ctx, "u_rv4");
+        let w = mk_var(&mut ctx, "w_rv4");
+        let bc = ctx.mk_string_const("bc");
+        let lhs = [u, w];
+        let rhs = [bc];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(result, StepResult::Conflict(_)),
+            "u++w=\"bc\" is SAT (u=\"b\", w=\"c\"); distinct vars must not conflict"
+        );
+    }
+
+    // SAT guard: single occurrence `u ++ "c" = "bc"` → SAT (u="b"); NOT conflict.
+    #[test]
+    fn single_var_occurrence_not_conflict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let u = mk_var(&mut ctx, "u_rv5");
+        let c = ctx.mk_string_const("c");
+        let bc = ctx.mk_string_const("bc");
+        let lhs = [u, c];
+        let rhs = [bc];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let result = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &lhs,
+            &rhs,
+            vec![],
+            dummy_eqn_lit(),
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(result, StepResult::Conflict(_)),
+            "u++\"c\"=\"bc\" is SAT (u=\"b\"); single occurrence must not conflict"
+        );
     }
 
     // ── Task 14: disequality same-word conflict ──────────────────────────────

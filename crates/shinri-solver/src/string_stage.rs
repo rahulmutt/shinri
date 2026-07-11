@@ -2,7 +2,7 @@
 //!
 //! ## Overview
 //! `uses_strings`: true iff any assertion contains a String-sorted subterm or a
-//! `str.*` operator (`str.++`, `str.len`, `str.at`, `str.substr`).
+//! `str.*` operator (`str.++`, `str.len`, `str.at`, `str.substr`, `str.indexof`, `str.replace`, `str.replace_all`).
 //!
 //! `fenced`: true iff strings are mixed with an out-of-scope theory:
 //!   (a) A String-sorted term appears as operand/result of an **uninterpreted
@@ -49,6 +49,7 @@ fn is_string_op(op: &Op) -> bool {
                 | BuiltinOp::StrContains
                 | BuiltinOp::StrIndexOf
                 | BuiltinOp::StrReplace
+                | BuiltinOp::StrReplaceAll
         )
     )
 }

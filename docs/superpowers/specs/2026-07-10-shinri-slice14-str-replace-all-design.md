@@ -1,7 +1,33 @@
 # Slice 14 design — `str.replace_all` (fold + partial-eval + fence)
 
-Status: DESIGNED (2026-07-10). Follows slice 13 (`str.indexof` / `str.replace`,
-PR #7, merged `568692f`).
+Status: IMPLEMENTED (slice 14 landed 2026-07-10). Follows slice 13
+(`str.indexof` / `str.replace`, PR #7, merged `568692f`).
+
+Oracle (`qfs_replace_all_matches_z3`, fresh seed `0x51_4A_0000_0001`, 200 iters):
+51 sat / 74 unsat / 75 shinri-unknown (tolerated) / 0 z3-unknown / 0
+guard-bailout / 50 witnesses / **0 disagreements**. Full differential suite (all
+string families, 700+ iters) unchanged: 0 disagreements.
+
+**Deviation from the plan — word-equation completeness fix.** During
+implementation the symbolic-`u` `= "bzc"` e2e pin (a repeated-variable
+contradiction, genuinely `unsat`) surfaced that the pre-existing word-equation
+solver returned `Unknown` for it — the gap was in `wordeq.rs`, NOT the
+`replace_all` rewrite (minimal repro `u ++ u = "bc"` → Unknown; z3 `unsat`). It
+was closed at the root by a **sound, self-contained completeness rule** in
+`resolve_inner` (`single_var_forced_length_conflict`): when one side of a word
+equation is a fixed constant word `W` (`|W| = L`) and the other is a single
+(possibly repeated) variable `v` interleaved with constants (`k` occurrences,
+`C` fixed chars), `v`'s length is FORCED — `k·|v| + C = L` has a unique
+non-negative integer solution — so tiling `v`'s side over `W` at that length
+decides the pattern exactly (a constant mismatching its span, or two `v`
+occurrences forced to differing spans, ⟹ `unsat`). The rule only ADDS conflicts
+for provably-unsatisfiable instances (never a wrong `unsat`), cites only the
+equation literal, mints no fresh terms, and was validated by an adversarial
+soundness review (independent brute-force: 8,883 exhaustive + 20,000 random
+cases, 0 wrong-`unsat`) plus the 0-disagreement differential oracle. This turns
+the R3 concession below from "Unknown on exhaustion" into a decided verdict for
+the single-repeated-variable-vs-constant shape that `replace_all`'s symbolic-`u`
+concat produces.
 
 ## Scope
 
@@ -173,6 +199,12 @@ consistent with substr and slice 13.
   `nonoverlapping_occurrences`. Mitigation: the `"aaa"`/`"aa"` → `"Xa"` unit
   test and the oracle family.
 - **R3 — repeated-variable concat completeness.** Symbolic `u` at ≥2
-  occurrences may exhaust the wordeq step budget and return `Unknown` more often
-  than `replace`. This is a completeness (not soundness) concession, bounded by
-  `REPLACE_ALL_CONCAT_CAP` and tolerated by the unknown-tolerant oracle gate.
+  occurrences yields a concat with a repeated variable. This is a completeness
+  (not soundness) concession, bounded by `REPLACE_ALL_CONCAT_CAP` and tolerated
+  by the unknown-tolerant oracle gate. **Resolved for the common shape:** the
+  `single_var_forced_length_conflict` rule added to `wordeq.rs` (see the Status
+  block) now DECIDES the repeated-`u`-vs-fixed-word case at a forced length
+  rather than leaving it `Unknown`, so a symbolic-`u` `replace_all` against a
+  literal target (e.g. `(str.replace_all "aza" "a" u) = "bzc"` → `unsat`) is
+  decided. `Unknown` remains the sound fallback for shapes outside that rule
+  (multiple distinct variables, non-literal targets, over-cap counts).

@@ -383,6 +383,39 @@ impl Gen {
         self.body
     }
 
+    /// One str.replace_all assertion. MAY be negated (the rewrite is exact at
+    /// any polarity). Needle is a literal (the decided fragment); the
+    /// replacement `u` and the target are atomic terms. The literal-heavy
+    /// haystack (via `ir_haystack`) drives the fold / partial-eval paths; a
+    /// variable haystack (1 in 4) fences to sound Unknown (tolerated).
+    fn replace_all_assertion(&mut self) {
+        let hay = self.ir_haystack();
+        let needle = self.lit();
+        let u = self.atom_term();
+        let target = self.atom_term();
+        let atom = format!("(= (str.replace_all {hay} {needle} {u}) {target})");
+        let atom = if self.rng.below(4) == 0 {
+            format!("(not {atom})")
+        } else {
+            atom
+        };
+        self.body.push_str(&format!("(assert {atom})\n"));
+    }
+
+    /// Instance body for the slice-14 family: shared string vars, 1-2
+    /// replace_all assertions, 0-1 general assertions (word eqs / lengths) for
+    /// cross-theory mixing.
+    fn finish_replace_all(mut self) -> String {
+        let np = 1 + self.rng.below(2);
+        for _ in 0..np {
+            self.replace_all_assertion();
+        }
+        if self.rng.below(2) == 0 {
+            self.assertion();
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -453,6 +486,10 @@ fn gen_predicates_body(seed: u64) -> String {
 
 fn gen_indexof_replace_body(seed: u64) -> String {
     Gen::new(seed).finish_indexof_replace()
+}
+
+fn gen_replace_all_body(seed: u64) -> String {
+    Gen::new(seed).finish_replace_all()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -827,6 +864,102 @@ fn qfs_indexof_replace_matches_z3() {
         n_guard_bailout <= IR_MAX_GUARD_BAILOUTS,
         "guard bailouts {n_guard_bailout} exceed bound {IR_MAX_GUARD_BAILOUTS} — \
          investigate, do not raise the bound blindly"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// str.replace_all differential oracle (slice 14): fold + partial-eval + fence.
+// Rewrites are polarity-free, so atoms MAY be negated. Symbolic-u at ≥2
+// occurrences yields a repeated-variable concat — the semi-decidable case,
+// sound via the step budget (Unknown on exhaustion, tolerated & counted).
+// Symbolic haystack/needle fence to sound Unknown. Guard bailouts: same
+// tolerated slice-11 retraction-leak class as the other string families.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RA_N_ITERS: usize = 200;
+const RA_MAX_GUARD_BAILOUTS: usize = RA_N_ITERS / 10;
+
+#[test]
+fn qfs_replace_all_matches_z3() {
+    let mut rng = Lcg(0x51_4A_0000_0001u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness, mut n_guard_bailout) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..RA_N_ITERS {
+        let seed = rng.next();
+        let body = gen_replace_all_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailout += 1;
+            continue; // sound bail-to-unknown: tolerated, counted
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_unknown += 1; // sound fence/fuel: tolerated, counted
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S REPLACE_ALL SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _bailouts) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_replace_all_matches_z3: {RA_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown (tolerated) / {n_z3skip} z3-unknown / \
+         {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(n_sat > 0, "replace_all family produced zero SAT instances");
+    assert!(
+        n_unsat > 0,
+        "replace_all family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_guard_bailout <= RA_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailout} exceed bound {RA_MAX_GUARD_BAILOUTS} — \
+         the tolerated slice-11 retraction leak may have widened (investigate, do not raise the bound blindly)"
     );
 }
 
