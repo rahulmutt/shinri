@@ -93,6 +93,27 @@ fn rewrite_to_int(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
         let int_s = ctx.int_sort();
         return Some(ctx.mk_numeral(Rational::from_int(eval_to_int(&s)), int_s));
     }
+    // Exact roundtrip: str.to_int(str.from_int(n)) = ite(n >= 0, n, -1).
+    // For n >= 0, from_int yields canonical digits recovered exactly; for n < 0,
+    // from_int = "" and to_int("") = -1. Polarity-free, exact.
+    if let TermNode::App {
+        op: Op::Builtin(BuiltinOp::StrFromInt),
+        args,
+        ..
+    } = ctx.term_node(kids[0]).clone()
+    {
+        let n = ctx.children(args)[0];
+        let int_s = ctx.int_sort();
+        let zero = ctx.mk_numeral(Rational::from_int(Integer::from(0i128)), int_s);
+        let neg1 = ctx.mk_numeral(Rational::from_int(Integer::from(-1i128)), int_s);
+        let ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[n, zero])
+            .expect("n >= 0");
+        return Some(
+            ctx.mk_app(Op::Builtin(BuiltinOp::Ite), &[ge, n, neg1])
+                .expect("roundtrip ite"),
+        );
+    }
     None
 }
 
@@ -194,6 +215,44 @@ mod tests {
         assert!(
             has_unreduced_int_conv(&ctx, &out),
             "symbolic to_int must fence"
+        );
+    }
+
+    #[test]
+    fn roundtrip_to_int_of_from_int_rewrites_to_ite() {
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let n = nullary(&mut ctx, "n", int_s); // symbolic Int (helper from Task 3)
+        let inner = from_int(&mut ctx, n);
+        let app = to_int(&mut ctx, inner);
+        let out = partial_eval_int_conv(&mut ctx, &[app]);
+        // Neither str op survives -> not fenced.
+        assert!(
+            !has_unreduced_int_conv(&ctx, &out),
+            "roundtrip must fully eliminate both ops"
+        );
+        // Top node is an Int-sorted ite.
+        match ctx.term_node(out[0]) {
+            TermNode::App { op, .. } => {
+                assert_eq!(*op, Op::Builtin(BuiltinOp::Ite), "expected ite, got {op:?}");
+            }
+            other => panic!("expected ite app, got {other:?}"),
+        }
+        assert_eq!(ctx.sort_of(out[0]), int_s);
+    }
+
+    #[test]
+    fn nested_literal_roundtrip_folds_through() {
+        // str.to_int(str.from_int(42)) : from_int folds to "42", then to_int folds to 42.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let k = ctx.mk_numeral(Rational::from_int(Integer::from(42i128)), int_s);
+        let inner = from_int(&mut ctx, k); // split: avoid double &mut ctx in one expr
+        let app = to_int(&mut ctx, inner);
+        let out = partial_eval_int_conv(&mut ctx, &[app]);
+        assert_eq!(
+            ctx.numeral_value(out[0]).map(|r| r.numer().to_string()),
+            Some("42".to_string())
         );
     }
 }
