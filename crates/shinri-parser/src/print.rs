@@ -198,6 +198,9 @@ fn builtin_name(b: BuiltinOp) -> String {
         StrReplace => "str.replace".to_owned(),
         // Slice 14
         StrReplaceAll => "str.replace_all".to_owned(),
+        // Slice 15
+        StrToInt => "str.to_int".to_owned(),
+        StrFromInt => "str.from_int".to_owned(),
         // Floating-point ops — SMT-LIB names
         FpAbs => "fp.abs".to_owned(),
         FpNeg => "fp.neg".to_owned(),
@@ -288,5 +291,27 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::StrReplaceAll), &[x, a, b])
             .unwrap();
         assert_eq!(print_term(&ctx, rep), r#"(str.replace_all x "a" "b")"#);
+    }
+
+    #[test]
+    fn print_to_from_int_roundtrip() {
+        use shinri_core::{BuiltinOp, Op};
+        let mut ctx = shinri_core::Context::new();
+        let str_s = ctx.string_sort();
+        let int_s = ctx.int_sort();
+        let s = {
+            let f = ctx.declare_fun("s", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let n = {
+            let f = ctx.declare_fun("n", &[], int_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let ti = ctx.mk_app(Op::Builtin(BuiltinOp::StrToInt), &[s]).unwrap();
+        assert_eq!(print_term(&ctx, ti), "(str.to_int s)");
+        let fi = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrFromInt), &[n])
+            .unwrap();
+        assert_eq!(print_term(&ctx, fi), "(str.from_int n)");
     }
 }

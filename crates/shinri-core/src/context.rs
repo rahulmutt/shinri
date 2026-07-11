@@ -524,6 +524,28 @@ impl Context {
                 expect_all(self, args, str_s)?;
                 Ok(str_s)
             }
+            StrToInt => {
+                expect_arity(args, 1)?;
+                let (str_s, int_s) = (self.string_sort(), self.int_sort());
+                if self.sort_of(args[0]) != str_s {
+                    return Err(SortError::Mismatch {
+                        expected: str_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                Ok(int_s)
+            }
+            StrFromInt => {
+                expect_arity(args, 1)?;
+                let (str_s, int_s) = (self.string_sort(), self.int_sort());
+                if self.sort_of(args[0]) != int_s {
+                    return Err(SortError::Mismatch {
+                        expected: int_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                Ok(str_s)
+            }
             // ── Floating-point: arithmetic ────────────────────────────────────
             FpAbs | FpNeg => {
                 expect_arity(args, 1)?;
@@ -1612,5 +1634,42 @@ mod tests {
     // helper local to the test module
     fn ctx_decl(ctx: &mut Context, name: &str, s: SortId) -> SymbolId {
         ctx.declare_fun(name, &[], s)
+    }
+
+    #[test]
+    fn str_to_from_int_sort_rules() {
+        // A nullary uninterpreted constant of the given sort (there is no
+        // `mk_const`; this is the codebase pattern — see indexof_replace tests).
+        fn nullary(ctx: &mut Context, name: &str, sort: SortId) -> TermId {
+            let f = ctx.declare_fun(name, &[], sort);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        }
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let int_s = ctx.int_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let n = nullary(&mut ctx, "n", int_s);
+
+        // str.to_int : String -> Int
+        let ti = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrToInt), &[s])
+            .expect("to_int well-sorted");
+        assert_eq!(ctx.sort_of(ti), int_s);
+
+        // str.from_int : Int -> String
+        let fi = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrFromInt), &[n])
+            .expect("from_int well-sorted");
+        assert_eq!(ctx.sort_of(fi), str_s);
+
+        // Wrong sorts rejected.
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrToInt), &[n]).is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrFromInt), &[s])
+            .is_err());
+        // Wrong arity rejected.
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrToInt), &[s, s])
+            .is_err());
     }
 }

@@ -431,6 +431,17 @@ impl Solver {
             if shinri_str::predicates::has_unrewritable_str_predicate(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
+            // ── Slice 15: str.to_int / str.from_int ──────────────────────────
+            // Polarity-FREE exact rewrites: fold all-literal applications;
+            // rewrite the roundtrip str.to_int(str.from_int(n)) → ite(n≥0,n,-1)
+            // (eliminated below by reduce_assertions' elim_term_ite). Any
+            // SURVIVING application (symbolic string to str.to_int; symbolic /
+            // non-roundtrip Int to str.from_int) fences to sound Unknown —
+            // canary-pinned flip-markers for a future digit-bridge slice.
+            assertions = shinri_str::int_conv::partial_eval_int_conv(&mut self.ctx, &assertions);
+            if shinri_str::int_conv::has_unreduced_int_conv(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
             // Soundness fence for the substr/str.at seam: a `str.substr`/`str.at`
             // over a NON-constant base (or non-numeral index/length) reduces to the
             // generic `pre++mid++post` + length-guard encoding, which the String↔Arith

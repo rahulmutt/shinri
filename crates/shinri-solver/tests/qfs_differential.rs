@@ -416,6 +416,91 @@ impl Gen {
         self.body
     }
 
+    /// A short ASCII-digit literal (0–3 digits, leading zeros allowed) — drives
+    /// the to_int fold decided path. Empty and non-digit cases come via `lit()`.
+    fn digit_lit(&mut self) -> String {
+        let n = self.rng.below(4); // 0..=3 digits (0 -> "", exercises -1)
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push((b'0' + self.rng.below(10) as u8) as char);
+        }
+        format!("\"{s}\"")
+    }
+
+    /// A string term for to_int: mostly a digit literal (fold path), sometimes a
+    /// letter literal (`lit()`, folds to -1), sometimes a variable (fence path).
+    fn to_int_arg(&mut self) -> String {
+        match self.rng.below(4) {
+            0 => self.var(), // symbolic -> fence (tolerated unknown)
+            1 => self.lit(), // letters -> folds to -1
+            _ => self.digit_lit(),
+        }
+    }
+
+    /// One to_int / from_int / roundtrip assertion. MAY be negated (exact at any
+    /// polarity). Small Int RHS (incl. `(- 1)` and `(- 2)`) so both sat and
+    /// unsat verdicts arise on the decided paths.
+    fn to_from_int_assertion(&mut self) {
+        let atom = match self.rng.below(3) {
+            // to_int(<str>) = k : fold (or fence on a symbolic string arg).
+            0 => {
+                let arg = self.to_int_arg();
+                let k = self.small_int_rhs();
+                format!("(= (str.to_int {arg}) {k})")
+            }
+            // from_int(<int>) = <lit> : fold on a numeral; fence on the Int var.
+            1 => {
+                let n = if self.rng.below(2) == 0 {
+                    "n0".to_owned() // symbolic -> fence
+                } else {
+                    self.small_int_rhs() // numeral -> fold
+                };
+                let target = if self.rng.below(2) == 0 {
+                    self.digit_lit()
+                } else {
+                    self.lit()
+                };
+                format!("(= (str.from_int {n}) {target})")
+            }
+            // roundtrip to_int(from_int(n0)) = k : decided via ite.
+            _ => {
+                let k = self.small_int_rhs();
+                format!("(= (str.to_int (str.from_int n0)) {k})")
+            }
+        };
+        let atom = if self.rng.below(4) == 0 {
+            format!("(not {atom})")
+        } else {
+            atom
+        };
+        self.body.push_str(&format!("(assert {atom})\n"));
+    }
+
+    /// A small Int literal in -2..=3; negatives SMT-LIB-spelled `(- n)`.
+    fn small_int_rhs(&mut self) -> String {
+        let v = self.rng.below(6) as i64 - 2; // -2..=3
+        if v < 0 {
+            format!("(- {})", -v)
+        } else {
+            v.to_string()
+        }
+    }
+
+    /// Instance body for the slice-15 family: shared string vars, an Int var
+    /// `n0`, 1–2 conversion assertions, 0–1 general assertions for cross-theory
+    /// mixing (so the SAT witness path references string vars).
+    fn finish_to_from_int(mut self) -> String {
+        self.body.push_str("(declare-fun n0 () Int)\n");
+        let np = 1 + self.rng.below(2);
+        for _ in 0..np {
+            self.to_from_int_assertion();
+        }
+        if self.rng.below(2) == 0 {
+            self.assertion();
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -490,6 +575,10 @@ fn gen_indexof_replace_body(seed: u64) -> String {
 
 fn gen_replace_all_body(seed: u64) -> String {
     Gen::new(seed).finish_replace_all()
+}
+
+fn gen_to_from_int_body(seed: u64) -> String {
+    Gen::new(seed).finish_to_from_int()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -964,6 +1053,100 @@ fn qfs_replace_all_matches_z3() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// str.to_int/str.from_int differential oracle (slice 15): fold + fence.
+// Rewrites are polarity-free, so atoms MAY be negated. Symbolic-string
+// to to_int and symbolic-Int to from_int fence to sound Unknown (tolerated,
+// counted). Guard bailouts: same tolerated slice-11 retraction-leak class as
+// the other string families.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TFI_N_ITERS: usize = 200;
+const TFI_MAX_GUARD_BAILOUTS: usize = TFI_N_ITERS / 10;
+
+#[test]
+fn qfs_to_from_int_matches_z3() {
+    let mut rng = Lcg(0x51_5A_0000_0001u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness, mut n_guard_bailout) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..TFI_N_ITERS {
+        let seed = rng.next();
+        let body = gen_to_from_int_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailout += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S TO/FROM_INT SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _b) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_to_from_int_matches_z3: {TFI_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown (tolerated) / {n_z3skip} z3-unknown / \
+         {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(n_sat > 0, "to/from_int family produced zero SAT instances");
+    assert!(
+        n_unsat > 0,
+        "to/from_int family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_guard_bailout <= TFI_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailout} exceed bound {TFI_MAX_GUARD_BAILOUTS}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Targeted explicit cases
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1260,6 +1443,77 @@ fn targeted_substr_out_of_range_nonempty_unsat() {
         "(set-logic QF_S)\
          (assert (= (str.substr \"abc\" 5 1) \"x\"))(check-sat)",
         Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_to_int_fold_decided() {
+    // str.to_int("42") = 42 -> SAT ; = 5 -> UNSAT.
+    expect(
+        "(set-logic QF_S)(assert (= (str.to_int \"42\") 42))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(assert (= (str.to_int \"42\") 5))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Non-digit / empty -> -1.
+    expect(
+        "(set-logic QF_S)(assert (= (str.to_int \"a1\") (- 1)))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_from_int_fold_decided() {
+    // str.from_int(0) = "0" -> SAT ; negative -> "".
+    expect(
+        "(set-logic QF_S)(assert (= (str.from_int 0) \"0\"))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(assert (= (str.from_int (- 5)) \"\"))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(assert (= (str.from_int (- 5)) \"-5\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_roundtrip_decided() {
+    // to_int(from_int(n)) = ite(n>=0,n,-1): reachable at 5 (n=5) -> SAT;
+    // never -2 -> UNSAT.
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.to_int (str.from_int n)) 5))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.to_int (str.from_int n)) (- 2)))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_symbolic_to_from_int_fences_unknown() {
+    // Symbolic string to to_int, and symbolic Int to a bare from_int, both fence.
+    // Flip-markers: if a future slice decides these, these canaries flip.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+                        (assert (= (str.to_int s) 5))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun n () Int)\
+                        (assert (= (str.from_int n) \"5\"))(check-sat)"
+        ),
+        Verdict::Unknown,
     );
 }
 
