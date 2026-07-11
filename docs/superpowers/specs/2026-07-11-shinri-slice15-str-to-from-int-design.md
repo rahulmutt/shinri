@@ -1,7 +1,28 @@
 # Slice 15 design — str.to_int / str.from_int (fold + exact rewrites + fence)
 
 Date: 2026-07-11
-Status: DESIGN APPROVED (not yet implemented).
+Status: IMPLEMENTED (slice 15 landed 2026-07-11).
+
+Oracle (`qfs_to_from_int_matches_z3`, fresh seed `0x51_5A_0000_0001`, 200
+iters): 44 sat / 87 unsat / 69 shinri-unknown (tolerated) / 0 z3-unknown / 0
+guard-bailout / 16 witnesses / **0 disagreements**. All four pre-existing
+string families re-run unperturbed (tallies identical to their committed
+values): 0 disagreements.
+
+**Deviations from the plan.**
+1. *Tasks 1+2 folded into one commit* — adding the `BuiltinOp` variants in
+   `shinri-core` alone breaks the wildcard-free exhaustive matches in
+   `shinri-parser` (`parser.rs` dispatch, `print.rs` name table), so the core
+   and parser/printer changes landed atomically (same resolution as slice 14).
+2. *Negative-literal recognition in `rewrite_from_int`* — the plan's code
+   obtained the argument via `numeral_value` only, but the parser spells
+   `(- 5)` as `Neg`-of-numeral (no constant folding at `mk_app`), which left
+   the pinned `(= (str.from_int (- 5)) "")` case fenced to `Unknown` instead
+   of folding. Fixed by delegating to `Context::const_real_value` — the
+   existing cross-crate literal-recognition helper (documented soundness
+   invariant, shared with the FP fence/folder; recursive, so nested
+   `(- (- 5))` also folds). Pinned by unit tests for both the single- and
+   nested-`Neg` shapes.
 Predecessor: slice 14 (str.replace_all, landed 2026-07-10, PR #8). Sibling
 lineage: slice 13 (str.indexof / str.replace, PR #7) — this slice follows its
 fold + exact-partial-eval + sound-fence template closely.
