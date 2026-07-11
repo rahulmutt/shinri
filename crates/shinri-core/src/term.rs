@@ -96,6 +96,9 @@ pub enum BuiltinOp {
     StrReplace, // String × String × String → String
     // Slice 14: replace ALL non-overlapping occurrences (leftmost-first).
     StrReplaceAll, // String × String × String → String
+    // Slice 15: string <-> integer conversions (SMT-LIB 2.6).
+    StrToInt,   // String -> Int
+    StrFromInt, // Int -> String
     // Floating-point — arithmetic. Rounded ops take a RoundingMode as arg 0.
     FpAbs,
     FpNeg, // (F) -> F

@@ -328,6 +328,8 @@ impl<'a> Parser<'a> {
             "str.indexof" => StrIndexOf,
             "str.replace" => StrReplace,
             "str.replace_all" => StrReplaceAll,
+            "str.to_int" => StrToInt,
+            "str.from_int" => StrFromInt,
             // Floating-point bit constructor (SMT-LIB QF_FP)
             "fp" => FpFromBits,
             // Floating-point arithmetic and classification operators (QF_FP)
@@ -894,7 +896,9 @@ impl<'a> Parser<'a> {
             | BuiltinOp::StrContains
             | BuiltinOp::StrIndexOf
             | BuiltinOp::StrReplace
-            | BuiltinOp::StrReplaceAll => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            | BuiltinOp::StrReplaceAll
+            | BuiltinOp::StrToInt
+            | BuiltinOp::StrFromInt => Self::mk(ctx, Op::Builtin(op), &args, &sp),
             // Floating-point ops: delegate directly to mk_app (sort-checking in Context).
             BuiltinOp::FpAbs
             | BuiltinOp::FpNeg
@@ -1961,6 +1965,59 @@ mod tests {
         // Int replacement operand → parse diagnostic.
         let bad = commands(r#"(declare-fun x () String)(assert (= (str.replace_all x "a" 1) x))"#);
         assert!(bad[1].is_err(), "Int replacement must be a diagnostic");
+    }
+
+    /// Parse str.to_int / str.from_int, verify op + result sort (slice 15).
+    /// Mirrors `parses_indexof_and_replace` (uses the same `parse_all_ok` helper).
+    #[test]
+    fn parses_to_int_and_from_int() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = r#"(declare-fun s () String)
+(declare-fun n () Int)
+(assert (= (str.to_int s) 5))
+(assert (= (str.from_int n) "12"))"#;
+        let (ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 4); // 2 declares + 2 asserts
+        for (ci, want, want_sort) in [
+            (2usize, BuiltinOp::StrToInt, ctx.int_sort()),
+            (3usize, BuiltinOp::StrFromInt, ctx.string_sort()),
+        ] {
+            let assert_term = match &cmds[ci] {
+                Command::Assert(t) => *t,
+                other => panic!("expected Assert, got {other:?}"),
+            };
+            let TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } = ctx.term_node(assert_term).clone()
+            else {
+                panic!("expected Eq at top level");
+            };
+            let lhs = ctx.children(args).to_vec()[0];
+            match ctx.term_node(lhs).clone() {
+                TermNode::App {
+                    op: Op::Builtin(got),
+                    ..
+                } => assert_eq!(got, want, "op mismatch"),
+                other => panic!("expected App lhs, got {other:?}"),
+            }
+            assert_eq!(ctx.sort_of(lhs), want_sort, "result sort for {want:?}");
+        }
+    }
+
+    /// Ill-sorted operands are diagnostics, not crashes (mirror of the slice-13 test).
+    #[test]
+    fn to_from_int_wrong_sort_rejected() {
+        // str.to_int arg must be String.
+        let cs = commands(r#"(declare-fun n () Int)(assert (= (str.to_int n) 0))"#);
+        assert!(cs[1].is_err(), "Int arg to str.to_int must be a diagnostic");
+        // str.from_int arg must be Int.
+        let cs = commands(r#"(declare-fun s () String)(assert (= (str.from_int s) s))"#);
+        assert!(
+            cs[1].is_err(),
+            "String arg to str.from_int must be a diagnostic"
+        );
     }
 
     /// Task-5 TDD test: `(_ FloatingPoint eb sb)`, `FloatNN` aliases, and
