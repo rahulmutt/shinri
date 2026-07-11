@@ -256,7 +256,13 @@ fn single_var_forced_length_conflict(
     // The fixed word as code points (never bytes).
     let w: Vec<char> = cw
         .iter()
-        .flat_map(|&a| terms.string_const_value(a).unwrap().chars().collect::<Vec<char>>())
+        .flat_map(|&a| {
+            terms
+                .string_const_value(a)
+                .unwrap()
+                .chars()
+                .collect::<Vec<char>>()
+        })
         .collect();
     let l = w.len();
     // Partition `vw`: constant atoms contribute fixed chars; every non-constant

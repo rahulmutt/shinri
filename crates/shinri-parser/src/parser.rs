@@ -1953,7 +1953,11 @@ mod tests {
             }
             other => panic!("expected App lhs, got {other:?}"),
         }
-        assert_eq!(ctx.sort_of(lhs), ctx.string_sort(), "result sort for StrReplaceAll");
+        assert_eq!(
+            ctx.sort_of(lhs),
+            ctx.string_sort(),
+            "result sort for StrReplaceAll"
+        );
         // Int replacement operand → parse diagnostic.
         let bad = commands(r#"(declare-fun x () String)(assert (= (str.replace_all x "a" 1) x))"#);
         assert!(bad[1].is_err(), "Int replacement must be a diagnostic");

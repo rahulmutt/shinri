@@ -948,8 +948,14 @@ fn qfs_replace_all_matches_z3() {
          {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
     );
     assert!(n_sat > 0, "replace_all family produced zero SAT instances");
-    assert!(n_unsat > 0, "replace_all family produced zero UNSAT instances");
-    assert!(n_witness > 0, "no witnesses checked — model path not exercised");
+    assert!(
+        n_unsat > 0,
+        "replace_all family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
     assert!(
         n_guard_bailout <= RA_MAX_GUARD_BAILOUTS,
         "guard bailouts {n_guard_bailout} exceed bound {RA_MAX_GUARD_BAILOUTS} — \

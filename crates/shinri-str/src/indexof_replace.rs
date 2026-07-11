@@ -388,15 +388,30 @@ mod tests {
     #[test]
     fn nonoverlapping_occurrences_are_greedy_left_to_right() {
         // Overlaps are NOT taken: "aaa"/"aa" matches only at 0 (resume at 2).
-        assert_eq!(nonoverlapping_occurrences(&chars("aaa"), &chars("aa")), vec![0]);
+        assert_eq!(
+            nonoverlapping_occurrences(&chars("aaa"), &chars("aa")),
+            vec![0]
+        );
         // Adjacent matches: "abab"/"ab" → {0, 2}.
-        assert_eq!(nonoverlapping_occurrences(&chars("abab"), &chars("ab")), vec![0, 2]);
+        assert_eq!(
+            nonoverlapping_occurrences(&chars("abab"), &chars("ab")),
+            vec![0, 2]
+        );
         // Single-char needle repeated.
-        assert_eq!(nonoverlapping_occurrences(&chars("aaa"), &chars("a")), vec![0, 1, 2]);
+        assert_eq!(
+            nonoverlapping_occurrences(&chars("aaa"), &chars("a")),
+            vec![0, 1, 2]
+        );
         // Empty needle → NO positions (u dropped downstream).
-        assert_eq!(nonoverlapping_occurrences(&chars("ab"), &chars("")), Vec::<usize>::new());
+        assert_eq!(
+            nonoverlapping_occurrences(&chars("ab"), &chars("")),
+            Vec::<usize>::new()
+        );
         // Code points, not bytes: 'l' in "héllo" at 2 and 3.
-        assert_eq!(nonoverlapping_occurrences(&chars("héllo"), &chars("l")), vec![2, 3]);
+        assert_eq!(
+            nonoverlapping_occurrences(&chars("héllo"), &chars("l")),
+            vec![2, 3]
+        );
     }
 
     #[test]
@@ -812,7 +827,11 @@ mod tests {
             .unwrap();
         let atom = ctx.mk_eq(rep, r).unwrap();
         let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
-        assert_eq!(out, vec![atom], "over-cap symbolic-u must survive unchanged");
+        assert_eq!(
+            out,
+            vec![atom],
+            "over-cap symbolic-u must survive unchanged"
+        );
         assert!(has_unreduced_indexof_replace(&ctx, &out), "→ fence");
         // At exactly the cap (64 occurrences) it rewrites.
         let at_cap = ctx.mk_string_const(&"a".repeat(64));
@@ -821,7 +840,10 @@ mod tests {
             .unwrap();
         let atom = ctx.mk_eq(rep, r).unwrap();
         let out = partial_eval_indexof_replace(&mut ctx, &[atom]);
-        assert!(!has_unreduced_indexof_replace(&ctx, &out), "at cap → rewritten");
+        assert!(
+            !has_unreduced_indexof_replace(&ctx, &out),
+            "at cap → rewritten"
+        );
     }
 
     #[test]

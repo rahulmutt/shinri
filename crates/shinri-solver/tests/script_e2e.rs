@@ -729,12 +729,18 @@ fn str_indexof_over_cap_literal_fences_unknown() {
 #[test]
 fn str_replace_all_literal_folds_decide_any_polarity() {
     // All non-overlapping occurrences replaced.
-    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "abab" "ab" "Z") "ZZ"))(check-sat)"#);
+    let out = run_script(
+        r#"(set-logic QF_S)(assert (= (str.replace_all "abab" "ab" "Z") "ZZ"))(check-sat)"#,
+    );
     assert_eq!(out, vec!["sat"]);
     // Non-overlapping only: "aaa"/"aa" → "Xa", so "=…\"XX\"" is unsat.
-    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "aaa" "aa" "X") "XX"))(check-sat)"#);
+    let out = run_script(
+        r#"(set-logic QF_S)(assert (= (str.replace_all "aaa" "aa" "X") "XX"))(check-sat)"#,
+    );
     assert_eq!(out, vec!["unsat"]);
-    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "aaa" "aa" "X") "Xa"))(check-sat)"#);
+    let out = run_script(
+        r#"(set-logic QF_S)(assert (= (str.replace_all "aaa" "aa" "X") "Xa"))(check-sat)"#,
+    );
     assert_eq!(out, vec!["sat"]);
     // Negated literal fold (polarity-free).
     let out = run_script(
@@ -742,9 +748,12 @@ fn str_replace_all_literal_folds_decide_any_polarity() {
     );
     assert_eq!(out, vec!["unsat"]);
     // EMPTY-needle trap: u DROPPED, result is the haystack (contrast str.replace).
-    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "ab" "" "X") "ab"))(check-sat)"#);
+    let out =
+        run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "ab" "" "X") "ab"))(check-sat)"#);
     assert_eq!(out, vec!["sat"]);
-    let out = run_script(r#"(set-logic QF_S)(assert (= (str.replace_all "ab" "" "X") "Xab"))(check-sat)"#);
+    let out = run_script(
+        r#"(set-logic QF_S)(assert (= (str.replace_all "ab" "" "X") "Xab"))(check-sat)"#,
+    );
     assert_eq!(out, vec!["unsat"]);
 }
 
