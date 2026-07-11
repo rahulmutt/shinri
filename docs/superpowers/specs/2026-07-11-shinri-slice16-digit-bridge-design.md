@@ -1,7 +1,21 @@
 # Slice 16 design — bounded digit bridge for symbolic str.to_int / str.from_int
 
 Date: 2026-07-11
-Status: APPROVED (design), not yet implemented.
+Status: CLOSED — INFEASIBLE AS DESIGNED (2026-07-11). The encoding (Tasks 1–2)
+was implemented, review-clean, and is archived at tag
+`archive/slice16-eager-bridge` (commits 25ee5dd, 81927db); the solver wiring
+was never merged. Three independent investigations proved the eager gadget
+cannot be decided by the engine at K=8 (or any useful K): the wall is
+compound — LIA a-priori bound-box blowup from the 10^7 digit-sum
+coefficients, O(K²) cumulative String↔Arith interface probing, and B&B
+divergence over the K length cases; the word-equation engine is never on the
+critical path. The encoding itself is sound (all Unsat-demotion canaries held
+throughout). Full evidence:
+`docs/superpowers/research/2026-07-11-eager-digit-bridge-infeasibility.md`.
+Successor: a lazy theory-level bridge — the alternative this spec's
+design-selection note below rejected; the evidence now mandates it (lazy
+int-conv propagator slice). Slice 15's presence fence remains the shipped
+behavior.
 
 Predecessor: slice 15 (str.to_int / str.from_int fold + roundtrip + fence,
 landed 2026-07-11, PR #9). This slice replaces slice 15's presence fence with a
