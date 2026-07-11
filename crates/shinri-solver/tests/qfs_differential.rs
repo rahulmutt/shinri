@@ -1263,6 +1263,77 @@ fn targeted_substr_out_of_range_nonempty_unsat() {
     );
 }
 
+#[test]
+fn targeted_to_int_fold_decided() {
+    // str.to_int("42") = 42 -> SAT ; = 5 -> UNSAT.
+    expect(
+        "(set-logic QF_S)(assert (= (str.to_int \"42\") 42))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(assert (= (str.to_int \"42\") 5))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Non-digit / empty -> -1.
+    expect(
+        "(set-logic QF_S)(assert (= (str.to_int \"a1\") (- 1)))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_from_int_fold_decided() {
+    // str.from_int(0) = "0" -> SAT ; negative -> "".
+    expect(
+        "(set-logic QF_S)(assert (= (str.from_int 0) \"0\"))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(assert (= (str.from_int (- 5)) \"\"))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(assert (= (str.from_int (- 5)) \"-5\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_roundtrip_decided() {
+    // to_int(from_int(n)) = ite(n>=0,n,-1): reachable at 5 (n=5) -> SAT;
+    // never -2 -> UNSAT.
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.to_int (str.from_int n)) 5))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.to_int (str.from_int n)) (- 2)))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_symbolic_to_from_int_fences_unknown() {
+    // Symbolic string to to_int, and symbolic Int to a bare from_int, both fence.
+    // Flip-markers: if a future slice decides these, these canaries flip.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+                        (assert (= (str.to_int s) 5))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun n () Int)\
+                        (assert (= (str.from_int n) \"5\"))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fence cases — strings mixed with an out-of-scope theory ⇒ shinri Unknown.
 // (Soundness fence; not over-fencing: these constructs are genuinely out of scope.)

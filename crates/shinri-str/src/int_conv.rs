@@ -120,8 +120,32 @@ fn rewrite_to_int(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
 /// `(str.from_int x)`, child already rewritten. Folds a numeral argument.
 /// None (symbolic Int) leaves the app in place (-> fence).
 fn rewrite_from_int(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
-    let r = ctx.numeral_value(kids[0])?.clone();
+    let r = int_literal(ctx, kids[0])?;
     Some(ctx.mk_string_const(&eval_from_int(&r.numer())))
+}
+
+/// Extracts an integer numeral's exact value from `t`: either a plain literal
+/// (`ctx.numeral_value`), or `(- <numeral>)` — `BuiltinOp::Neg` applied to a
+/// numeral, the standard SMT-LIB spelling of a negative integer literal (the
+/// parser does NOT fold unary `-` into a `Const` numeral; see
+/// `shinri-parser`'s `unify_arith`/`Sub` handling). `None` for any other
+/// (non-literal / symbolic) term.
+fn int_literal(ctx: &Context, t: TermId) -> Option<Rational> {
+    if let Some(r) = ctx.numeral_value(t) {
+        return Some(r.clone());
+    }
+    if let TermNode::App {
+        op: Op::Builtin(BuiltinOp::Neg),
+        args,
+        ..
+    } = ctx.term_node(t)
+    {
+        let children = ctx.children(*args);
+        if let [only] = children {
+            return ctx.numeral_value(*only).cloned().map(|r| -r);
+        }
+    }
+    None
 }
 
 /// Stage 2: presence fence. True iff any `str.to_int` / `str.from_int`
@@ -202,6 +226,23 @@ mod tests {
         let out = partial_eval_int_conv(&mut ctx, &[app]);
         assert_eq!(ctx.string_const_value(out[0]), Some(""));
         // No survivor -> not fenced.
+        assert!(!has_unreduced_int_conv(&ctx, &out));
+    }
+
+    #[test]
+    fn fold_from_int_of_neg_wrapped_numeral_literal() {
+        // The SMT-LIB parser spells negative integer literals as `(- 5)` —
+        // `BuiltinOp::Neg` applied to a numeral, NOT a single `Const` numeral
+        // (see `int_literal`'s doc comment). This is the shape `str.from_int`
+        // actually sees from parsed input for its spec-mandated negative case;
+        // it must fold exactly like a directly-built negative `mk_numeral`.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let five = ctx.mk_numeral(Rational::from_int(Integer::from(5i128)), int_s);
+        let neg_five = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[five]).unwrap();
+        let app = from_int(&mut ctx, neg_five);
+        let out = partial_eval_int_conv(&mut ctx, &[app]);
+        assert_eq!(ctx.string_const_value(out[0]), Some(""));
         assert!(!has_unreduced_int_conv(&ctx, &out));
     }
 

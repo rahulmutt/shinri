@@ -148,6 +148,8 @@ fn contains_string_op(ctx: &Context, t: TermId) -> bool {
                         | BuiltinOp::StrContains
                         | BuiltinOp::StrIndexOf
                         | BuiltinOp::StrReplace
+                        | BuiltinOp::StrToInt
+                        | BuiltinOp::StrFromInt
                 )
             ) {
                 return true;
