@@ -1,7 +1,17 @@
 # Slice 18 design — str.to_code / str.from_code / str.is_digit by exact rewriting
 
 Date: 2026-07-12
-Status: Approved design, pre-implementation.
+Status: IMPLEMENTED (slice 18 landed 2026-07-12).
+
+Oracle (`qfs_code_conv_matches_z3`, fresh seed `0x51_62_0000_0001`, 200
+iters): 92 sat / 97 unsat / 11 shinri-unknown (tolerated) / 0 z3-unknown /
+0 guard-bailout / 63 witnesses / **0 disagreements**. All pre-existing
+string families re-ran unperturbed with tallies identical to their committed
+values (e.g. qfs_replace_all 51/74/75, qfs_const_int_conv 59/57/84).
+
+**Deviations from the spec.**
+1. Witness-harness serialization fix (test-only, `crates/shinri-solver/tests/qfs_differential.rs`): the plan's Task-5 generator emits MAX_CODE (196607 = U+2FFFF) as a `to_code` RHS, forcing a correct SAT model `s = U+2FFFF`. The `smt_escape` witness helper previously spliced raw UTF-8 bytes into the z3 pin query, so z3 read the supplementary-plane model as four characters and the witness cross-check spuriously failed. Fixed `smt_escape` to emit `\u{<hex>}` escapes for non-printable/non-ASCII characters (backward-compatible: existing families use ASCII alphabets, so their serialization is byte-identical and tallies are unperturbed). The rewrite rules in `code_conv.rs` were NOT changed — shinri's verdict and model were correct; only the test harness's model serialization was fixed. The spec's model printer is unchanged (the plan forbids changing it).
+2. No canary flips this slice (as the spec predicted — these operators were previously unparseable).
 
 Predecessor: slice 17 (constant-RHS `to_int`/`from_int` decision stage,
 landed 2026-07-12). This slice adds the **last Spec-4 operators** —
