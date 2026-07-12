@@ -1,7 +1,28 @@
 # Slice 17 design — constant-RHS decision stage for symbolic str.to_int / str.from_int
 
 Date: 2026-07-12
-Status: APPROVED (design), not yet implemented.
+Status: IMPLEMENTED (slice 17 landed 2026-07-12).
+
+Oracle (`qfs_const_int_conv_matches_z3`, fresh seed `0x51_61_0000_0001`, 200
+iters): 59 sat / 57 unsat / 84 shinri-unknown (tolerated) / 0 z3-unknown / 0
+guard-bailout / 55 witnesses / **0 disagreements**. All five pre-existing
+string families re-ran unperturbed with 0 disagreements; four are
+tally-identical to their committed values, and `qfs_to_from_int_matches_z3`
+improved as intended — previously-fenced constant-RHS instances are now
+decided: shinri-unknown 69 → 14, sat 44 → 69, unsat 87 → 116, witnesses
+16 → 36 (all z3-verified), still 0 disagreements.
+
+**Deviations from the spec.**
+1. *Witness rewrites restricted to nullary uninterpreted constants* — the R2
+   repair overrides the variable's model value at output, which is only sound
+   when `s` is itself a variable; `str.to_int` over compound arguments (e.g.
+   a concat) fences to sound Unknown instead of taking the witness rewrite.
+2. *`INT_CONV_PIN_LEN_CAP = 1024` pin guard* — length pins with
+   `L > 1024` are ignored (the pinned atom fences) rather than expanded,
+   guarding against memory-bomb padded witness strings.
+None beyond the two above. (Tooling note, not a spec deviation: the Gates
+command below needs `--features oracle` for `qfs_differential.rs` to actually
+run — the whole file is `#![cfg(feature = "oracle")]`.)
 
 Predecessor: slice 16 (eager bounded digit bridge) — CLOSED, INFEASIBLE AS
 DESIGNED. Three investigations proved the eager per-length gadget cannot be
