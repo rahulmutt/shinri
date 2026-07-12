@@ -242,7 +242,7 @@ fn collect_len_pins(ctx: &Context, assertions: &[TermId]) -> FxHashMap<TermId, u
 /// Neg-wrapped `(- 5)` shape — via the cross-crate `const_real_value`
 /// (single source of truth for literal recognition). None for non-literals
 /// and non-integral rationals.
-fn int_const_value(ctx: &Context, t: TermId) -> Option<Integer> {
+pub(crate) fn int_const_value(ctx: &Context, t: TermId) -> Option<Integer> {
     let r = ctx.const_real_value(t)?;
     if r.denom() == Integer::one() {
         Some(r.numer())
