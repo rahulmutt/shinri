@@ -399,6 +399,7 @@ impl Solver {
         // guarantee termination — the `str.substr` reduction over a variable
         // string can otherwise diverge into an unbounded fresh-variable search.
         let mut on_string_path = false;
+        let mut int_conv_repairs: Vec<shinri_str::int_conv::IntConvRepair> = Vec::new();
         if crate::string_stage::uses_strings(&self.ctx, &assertions) {
             if crate::string_stage::fenced(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
@@ -431,14 +432,23 @@ impl Solver {
             if shinri_str::predicates::has_unrewritable_str_predicate(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
-            // ── Slice 15: str.to_int / str.from_int ──────────────────────────
-            // Polarity-FREE exact rewrites: fold all-literal applications;
-            // rewrite the roundtrip str.to_int(str.from_int(n)) → ite(n≥0,n,-1)
-            // (eliminated below by reduce_assertions' elim_term_ite). Any
-            // SURVIVING application (symbolic string to str.to_int; symbolic /
-            // non-roundtrip Int to str.from_int) fences to sound Unknown —
-            // canary-pinned flip-markers for a future digit-bridge slice.
+            // ── Slice 15 + 17: str.to_int / str.from_int ─────────────────────
+            // Stage 1 (slice 15): polarity-free exact rewrites — fold
+            // all-literal applications; rewrite the roundtrip
+            // str.to_int(str.from_int(n)) → ite(n≥0,n,-1) (eliminated below
+            // by reduce_assertions' elim_term_ite).
+            // Stage 2 (slice 17): constant-RHS decision — from_int/"lit" and
+            // to_int ≤ -2 equivalences, length-pin expansion, lone-occurrence
+            // witness rewrites. Verdict-exact at any polarity: NO bound, NO
+            // demotion. Witness rewrites record model-repair obligations
+            // applied to the Sat model below (R2).
+            // Stage 3: any SURVIVING application still fences to sound
+            // Unknown — flip-markers for a future lazy-propagator slice.
             assertions = shinri_str::int_conv::partial_eval_int_conv(&mut self.ctx, &assertions);
+            let (decided, repairs) =
+                shinri_str::int_conv::decide_const_int_conv(&mut self.ctx, assertions);
+            assertions = decided;
+            int_conv_repairs = repairs;
             if shinri_str::int_conv::has_unreduced_int_conv(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
@@ -918,6 +928,27 @@ impl Solver {
                     }
                 }
                 self.eliminated_ite_vals = ite_vals;
+                // Slice 17 (R2): apply int-conv witness-rewrite model repairs
+                // BEFORE the string witness self-check. On a negative-polarity
+                // branch the engine may falsify the witness equality
+                // `s = dec(k)` with a value that still satisfies the ORIGINAL
+                // to_int atom (e.g. "05" for k = 5); replace it with the
+                // canonical fallback that falsifies the original atom. Safe:
+                // the var is lone (R3), so the change perturbs nothing else,
+                // and the fallback also differs from the witness, keeping the
+                // rewritten atom false.
+                for rep in &int_conv_repairs {
+                    let needs_repair = matches!(
+                        model.values.get(&rep.var),
+                        Some(shinri_theory::types::ModelVal::String(v)) if v != &rep.witness
+                    );
+                    if needs_repair {
+                        model.values.insert(
+                            rep.var,
+                            shinri_theory::types::ModelVal::String(rep.fallback.clone()),
+                        );
+                    }
+                }
                 // Witness self-check (string path): the word-equation F-split can
                 // dedup-saturate and let SAT conclude SAT with a model the model
                 // builder cannot realise into a satisfying witness (the (B′)

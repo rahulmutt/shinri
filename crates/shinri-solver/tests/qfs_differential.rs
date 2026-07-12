@@ -501,6 +501,81 @@ impl Gen {
         self.body
     }
 
+    /// One constant-RHS int-conv assertion (slice 17): decided shapes
+    /// dominate (equivalences, pin expansion, witness rewrites), with fence
+    /// shapes (var reuse across assertions breaks loneness; symbolic RHS)
+    /// and fold shapes mixed in. MAY be negated — the decision stage is
+    /// verdict-exact at any polarity, and the family's z3 witness check
+    /// exercises the R2 model repair on negated witness shapes.
+    fn const_int_conv_assertion(&mut self) {
+        let atom = match self.rng.below(6) {
+            // to_int(var) = k, k in -2..=3: range fact, -1 escape, witness.
+            0 => format!("(= (str.to_int {}) {})", self.var(), self.small_int_rhs()),
+            // to_int(<mixed arg>) = k: literals keep the fold path's
+            // sat/unsat coverage; vars exercise witness/fence.
+            1 => {
+                let arg = self.to_int_arg();
+                let k = self.small_int_rhs();
+                format!("(= (str.to_int {arg}) {k})")
+            }
+            // to_int(var) = multi-digit k: multi-digit witnesses.
+            2 => format!(
+                "(= (str.to_int {}) {})",
+                self.var(),
+                100 + self.rng.below(400)
+            ),
+            // from_int(n0) = target: full equivalence — canonical digits,
+            // letters (false), explicit leading-zero literals (false).
+            3 => {
+                let target = match self.rng.below(3) {
+                    0 => self.digit_lit(),
+                    1 => self.lit(),
+                    _ => format!("\"0{}\"", self.rng.below(10)),
+                };
+                format!("(= (str.from_int n0) {target})")
+            }
+            // from_int(n0) = var: symbolic RHS -> fence (tolerated unknown).
+            4 => format!("(= (str.from_int n0) {})", self.var()),
+            // Length pin + to_int on the same var: pin expansion straddling
+            // |dec(k)| (pin 1..=3 vs 1-3 digit k), both padded-Sat and
+            // too-short-Unsat.
+            _ => {
+                let v = self.var();
+                let l = 1 + self.rng.below(3);
+                self.body
+                    .push_str(&format!("(assert (= (str.len {v}) {l}))\n"));
+                let k = if self.rng.below(2) == 0 {
+                    self.small_int_rhs()
+                } else {
+                    (10 + self.rng.below(990)).to_string()
+                };
+                format!("(= (str.to_int {v}) {k})")
+            }
+        };
+        let atom = if self.rng.below(4) == 0 {
+            format!("(not {atom})")
+        } else {
+            atom
+        };
+        self.body.push_str(&format!("(assert {atom})\n"));
+    }
+
+    /// Instance body for the slice-17 family: shared string vars, an Int var
+    /// `n0`, 1–2 int-conv assertions, 0–1 general assertions (cross-theory
+    /// mixing; reusing a var in a general assertion breaks loneness, giving
+    /// the fence path differential coverage).
+    fn finish_const_int_conv(mut self) -> String {
+        self.body.push_str("(declare-fun n0 () Int)\n");
+        let np = 1 + self.rng.below(2);
+        for _ in 0..np {
+            self.const_int_conv_assertion();
+        }
+        if self.rng.below(2) == 0 {
+            self.assertion();
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -579,6 +654,10 @@ fn gen_replace_all_body(seed: u64) -> String {
 
 fn gen_to_from_int_body(seed: u64) -> String {
     Gen::new(seed).finish_to_from_int()
+}
+
+fn gen_const_int_conv_body(seed: u64) -> String {
+    Gen::new(seed).finish_const_int_conv()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1147,6 +1226,104 @@ fn qfs_to_from_int_matches_z3() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Const-int-conv differential oracle (slice 17): constant-RHS to_int/from_int
+// atoms are DECIDED by exact rewriting (both verdicts — no demotion). Sat AND
+// Unsat must agree with z3 (a wrong equivalence surfaces as a verdict
+// disagreement; a wrong witness model surfaces as a WITNESS FAILURE via the
+// R2 repair path). Out-of-fragment shapes fence (tolerated unknown). Fresh
+// seed — never perturb existing families' seeds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CIC_N_ITERS: usize = 200;
+const CIC_MAX_GUARD_BAILOUTS: usize = CIC_N_ITERS / 10;
+
+#[test]
+fn qfs_const_int_conv_matches_z3() {
+    let mut rng = Lcg(0x51_61_0000_0001u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness, mut n_guard_bailout) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..CIC_N_ITERS {
+        let seed = rng.next();
+        let body = gen_const_int_conv_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailout += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S CONST-INT-CONV SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _b) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_const_int_conv_matches_z3: {CIC_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown (tolerated) / {n_z3skip} z3-unknown / \
+         {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(
+        n_sat > 0,
+        "const-int-conv family produced zero SAT instances"
+    );
+    assert!(
+        n_unsat > 0,
+        "const-int-conv family produced zero UNSAT instances (false-rewrite shapes missing?)"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model/repair path not exercised"
+    );
+    assert!(
+        n_guard_bailout <= CIC_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailout} exceed bound {CIC_MAX_GUARD_BAILOUTS}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Targeted explicit cases
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1498,22 +1675,114 @@ fn targeted_roundtrip_decided() {
 }
 
 #[test]
-fn targeted_symbolic_to_from_int_fences_unknown() {
-    // Symbolic string to to_int, and symbolic Int to a bare from_int, both fence.
-    // Flip-markers: if a future slice decides these, these canaries flip.
+fn targeted_const_int_conv_decided_sat() {
+    // Slice-15 fence canaries FLIPPED (slice 17): the constant-RHS decision
+    // stage decides these with zero search.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_int s) 5))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.from_int n) \"5\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // Leading zeros: a length pin forces the non-canonical form "005".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_int s) 5))(assert (= (str.len s) 3))(check-sat)",
+        Verdict::Sat,
+    );
+    // Non-digit escape: -1 is reachable (empty or any non-digit string).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_int s) (- 1)))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.from_int n) \"42\"))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_const_int_conv_decided_unsat() {
+    // GENUINE Unsat, matching z3 — the equivalence rewrites prove these
+    // outright (slice 16's bounded bridge could only have demoted them).
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (= (str.to_int x) (- 5)))(check-sat)",
+        Verdict::Unsat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.from_int n) \"05\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.from_int n) \"abc\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Pin shorter than the decimal: no 3-char string has value 1234.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_int s) 1234))(assert (= (str.len s) 3))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_const_int_conv_fences_unknown() {
+    // Outside the constant-RHS fragment: still fenced (sound Unknown).
+    // Flip-markers for a future lazy-propagator slice.
+    // Non-lone s (EUF-pinned to a literal the syntactic pre-pass won't chase).
     assert_eq!(
         shinri_verdict(
             "(set-logic QF_S)(declare-fun s () String)\
-                        (assert (= (str.to_int s) 5))(check-sat)"
+             (assert (= (str.to_int s) (- 1)))(assert (= s \"7\"))(check-sat)"
         ),
         Verdict::Unknown,
     );
+    // Fully-symbolic linking.
     assert_eq!(
         shinri_verdict(
-            "(set-logic QF_S)(declare-fun n () Int)\
-                        (assert (= (str.from_int n) \"5\"))(check-sat)"
+            "(set-logic QF_S)(declare-fun s () String)(declare-fun n () Int)\
+             (assert (= (str.to_int s) n))(check-sat)"
         ),
         Verdict::Unknown,
+    );
+    // k = -1 under a length pin has no finite exact form.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (= (str.to_int s) (- 1)))(assert (= (str.len s) 2))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+}
+
+#[test]
+fn targeted_const_int_conv_negated_witness_model_repair() {
+    // R2 end-to-end: a NEGATED lone witness atom is decided Sat, and the
+    // reported model must satisfy the ORIGINAL formula (z3-checked). Without
+    // the repair the engine could answer s = "05" — it falsifies the
+    // rewritten (= s "5") but still has to_int 5, violating the negation.
+    let body = "(set-logic QF_S)(declare-fun s () String)\
+                (assert (not (= (str.to_int s) 5)))\n";
+    let get = format!("{body}(check-sat)\n(get-value (s))\n");
+    let (lines, bailouts) = shinri_lines_counting_bailouts(&get);
+    assert_eq!(bailouts, 0, "no guard bailouts expected");
+    assert_eq!(lines.first().map(String::as_str), Some("sat"));
+    let resp = lines.get(1).expect("get-value response");
+    let model = parse_string_values(resp);
+    assert!(!model.is_empty(), "model must bind s");
+    assert_eq!(
+        z3_with_model(body, &model),
+        Verdict::Sat,
+        "repaired model must satisfy the ORIGINAL negated atom (got {model:?})"
     );
 }
 
