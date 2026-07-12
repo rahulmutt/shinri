@@ -1787,6 +1787,63 @@ fn targeted_const_int_conv_negated_witness_model_repair() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Slice 18: str.to_code / str.from_code / str.is_digit — fence pins.
+// These shapes stay OUTSIDE the decided fragment permanently (symbolic
+// linking, nested arithmetic, surrogate code points): sound Unknown.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn targeted_code_conv_fences_unknown() {
+    // Fully-symbolic linking.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)(declare-fun n () Int)\
+             (assert (= (str.to_code s) n))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // Symbolic-RHS from_code.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)(declare-fun n () Int)\
+             (assert (= (str.from_code n) s))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // Surrogate code point (0xD800 = 55296): representational fence.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (= (str.to_code s) 55296))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (= (str.from_code 55296) s))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // Nested arithmetic around to_code.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (= (+ (str.to_code s) 1) 98))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // Inequality atom.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (>= (str.to_code s) 48))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Fence cases — strings mixed with an out-of-scope theory ⇒ shinri Unknown.
 // (Soundness fence; not over-fencing: these constructs are genuinely out of scope.)
 // ─────────────────────────────────────────────────────────────────────────────

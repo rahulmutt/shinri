@@ -1,3 +1,4 @@
+pub mod code_conv;
 mod collect;
 mod fuel;
 pub mod indexof_replace;

@@ -99,6 +99,10 @@ pub enum BuiltinOp {
     // Slice 15: string <-> integer conversions (SMT-LIB 2.6).
     StrToInt,   // String -> Int
     StrFromInt, // Int -> String
+    // Slice 18: character-code conversions + digit test (SMT-LIB 2.6).
+    StrToCode,   // String -> Int
+    StrFromCode, // Int -> String
+    StrIsDigit,  // String -> Bool
     // Floating-point — arithmetic. Rounded ops take a RoundingMode as arg 0.
     FpAbs,
     FpNeg, // (F) -> F

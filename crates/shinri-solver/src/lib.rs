@@ -452,6 +452,14 @@ impl Solver {
             if shinri_str::int_conv::has_unreduced_int_conv(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
+            // ── Slice 18: str.to_code / str.from_code / str.is_digit ─────────
+            // Universal presence fence (Task 1). Tasks 2–3 insert the exact
+            // rewrite pass above this check; anything the pass leaves behind
+            // (symbolic linking, inequality / nested-arith shapes, surrogate
+            // code points) fences to sound Unknown.
+            if shinri_str::code_conv::has_unreduced_code_conv(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
             // Soundness fence for the substr/str.at seam: a `str.substr`/`str.at`
             // over a NON-constant base (or non-numeral index/length) reduces to the
             // generic `pre++mid++post` + length-guard encoding, which the String↔Arith
