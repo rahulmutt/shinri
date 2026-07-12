@@ -576,6 +576,81 @@ impl Gen {
         self.body
     }
 
+    /// A code-point RHS for to_code (slice 18): boundary lattice (alphabet
+    /// edges, surrogate block, -1 escape, out-of-range) + small in-range
+    /// codes. Surrogate RHS exercises the representational fence
+    /// (shinri-unknown, tolerated; z3 decides).
+    fn code_rhs(&mut self) -> String {
+        match self.rng.below(8) {
+            0 => "(- 2)".to_owned(),
+            1 => "(- 1)".to_owned(),
+            2 => "0".to_owned(),
+            3 => (0x30 + self.rng.below(10)).to_string(), // '0'..'9'
+            4 => (97 + self.rng.below(3)).to_string(),    // 'a'..'c' (matches ALPHABET)
+            5 => ["55295", "55296", "57343", "57344"][self.rng.below(4) as usize].to_owned(),
+            6 => "196607".to_owned(), // MAX_CODE
+            _ => "196608".to_owned(), // MAX_CODE + 1
+        }
+    }
+
+    /// One slice-18 assertion: constant-RHS to_code/from_code equalities
+    /// across the boundary lattice, both roundtrips, and is_digit over
+    /// literal / var / from_code arguments. MAY be negated — every rewrite
+    /// is a full equivalence, exact at any polarity.
+    fn code_conv_assertion(&mut self) {
+        let atom = match self.rng.below(6) {
+            // to_code(var) = k across the lattice (R4/R5/R6 + fence).
+            0 => format!("(= (str.to_code {}) {})", self.var(), self.code_rhs()),
+            // to_code(<literal>) = k: the R1 fold path.
+            1 => format!("(= (str.to_code {}) {})", self.lit(), self.code_rhs()),
+            // from_code(n0) = target: "" / singleton / multi-char (R7/R8/R9).
+            2 => {
+                let target = match self.rng.below(3) {
+                    0 => "\"\"".to_owned(),
+                    1 => format!("\"{}\"", ALPHABET[self.rng.below(3) as usize]),
+                    _ => self.lit(),
+                };
+                format!("(= (str.from_code n0) {target})")
+            }
+            // R2 roundtrip, decided via the range ite.
+            3 => format!("(= (str.to_code (str.from_code n0)) {})", self.code_rhs()),
+            // R3 roundtrip vs a literal: exercises elim_term_ite + wordeq.
+            4 => format!(
+                "(= (str.from_code (str.to_code {})) {})",
+                self.var(),
+                self.lit()
+            ),
+            // is_digit over literal / var / from_code (R1 / R10 / minted-atom
+            // chain).
+            _ => match self.rng.below(3) {
+                0 => format!("(str.is_digit {})", self.lit()),
+                1 => format!("(str.is_digit {})", self.var()),
+                _ => "(str.is_digit (str.from_code n0))".to_owned(),
+            },
+        };
+        let atom = if self.rng.below(4) == 0 {
+            format!("(not {atom})")
+        } else {
+            atom
+        };
+        self.body.push_str(&format!("(assert {atom})\n"));
+    }
+
+    /// Instance body for the slice-18 family: shared string vars, an Int var
+    /// `n0`, 1–2 code-conv assertions, 0–1 general assertions (cross-theory
+    /// mixing keeps the SAT witness path referencing string vars).
+    fn finish_code_conv(mut self) -> String {
+        self.body.push_str("(declare-fun n0 () Int)\n");
+        let np = 1 + self.rng.below(2);
+        for _ in 0..np {
+            self.code_conv_assertion();
+        }
+        if self.rng.below(2) == 0 {
+            self.assertion();
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -660,6 +735,10 @@ fn gen_const_int_conv_body(seed: u64) -> String {
     Gen::new(seed).finish_const_int_conv()
 }
 
+fn gen_code_conv_body(seed: u64) -> String {
+    Gen::new(seed).finish_code_conv()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Witness check
 // ─────────────────────────────────────────────────────────────────────────────
@@ -724,9 +803,23 @@ fn parse_string_values(resp: &str) -> Vec<(String, String)> {
     out
 }
 
-/// Escape a raw string value for an SMT-LIB string literal.
+/// Escape a raw string value for an SMT-LIB string literal. `"` is doubled
+/// per SMT-LIB quoting; safe printable ASCII (0x20..=0x7E, excluding `"`) is
+/// emitted literally; everything else — non-ASCII (including supplementary-
+/// plane code points) and control chars — is emitted as a `\u{<hex>}` escape
+/// so z3 parses it as the SAME single code point shinri's model printer
+/// produced, rather than re-interpreting raw UTF-8 bytes as multiple chars.
 fn smt_escape(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\"\""),
+            ' '..='~' => out.push(c),
+            _ => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Build a z3 script that asserts the ORIGINAL body AND pins each model value,
@@ -1320,6 +1413,102 @@ fn qfs_const_int_conv_matches_z3() {
     assert!(
         n_guard_bailout <= CIC_MAX_GUARD_BAILOUTS,
         "guard bailouts {n_guard_bailout} exceed bound {CIC_MAX_GUARD_BAILOUTS}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Code-conv differential oracle (slice 18): to_code/from_code/is_digit are
+// DECIDED by exact full-equivalence rewriting (both verdicts, any polarity —
+// no repair, no demotion). Sat AND Unsat must agree with z3; Sat models are
+// z3-verified (a wrong equivalence surfaces as a verdict disagreement or a
+// WITNESS FAILURE). Out-of-fragment shapes — symbolic linking, surrogate code
+// points — fence (tolerated unknown). Fresh seed — never perturb existing
+// families' seeds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CC_N_ITERS: usize = 200;
+const CC_MAX_GUARD_BAILOUTS: usize = CC_N_ITERS / 10;
+
+#[test]
+fn qfs_code_conv_matches_z3() {
+    let mut rng = Lcg(0x51_62_0000_0001u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness, mut n_guard_bailout) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..CC_N_ITERS {
+        let seed = rng.next();
+        let body = gen_code_conv_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailout += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S CODE_CONV SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _b) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_code_conv_matches_z3: {CC_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown (tolerated) / {n_z3skip} z3-unknown / \
+         {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(n_sat > 0, "code-conv family produced zero SAT instances");
+    assert!(
+        n_unsat > 0,
+        "code-conv family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_guard_bailout <= CC_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailout} exceed bound {CC_MAX_GUARD_BAILOUTS}"
     );
 }
 
