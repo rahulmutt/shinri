@@ -1843,6 +1843,114 @@ fn targeted_code_conv_fences_unknown() {
     );
 }
 
+#[test]
+fn targeted_code_conv_decided_sat() {
+    // R4: to_code(s) = 97 ⇒ s = "a".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_code s) 97))(check-sat)",
+        Verdict::Sat,
+    );
+    // R5: the -1 escape (any non-singleton s).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_code s) (- 1)))(check-sat)",
+        Verdict::Sat,
+    );
+    // R7 / R8.
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.from_code n) \"a\"))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.from_code n) \"\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // R10 expansion, plus a corroborating word equation.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.is_digit s))(assert (= s \"7\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // R2 roundtrip through the ite.
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.to_code (str.from_code n)) 5))(check-sat)",
+        Verdict::Sat,
+    );
+    // Negated atom — the equivalences are polarity-free.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (not (= (str.to_code s) 97)))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_code_conv_decided_unsat() {
+    // R6: below -1 / above the alphabet.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_code s) (- 5)))(check-sat)",
+        Verdict::Unsat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_code s) 196608))(check-sat)",
+        Verdict::Unsat,
+    );
+    // R4 + a conflicting word equation.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_code s) 97))(assert (= s \"b\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // R9: multi-char is outside from_code's range.
+    expect(
+        "(set-logic QF_S)(declare-fun n () Int)\
+         (assert (= (str.from_code n) \"ab\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // R1 fold: is_digit("x") = false.
+    expect(
+        "(set-logic QF_S)(assert (str.is_digit \"x\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // R10 + conflicting equation.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.is_digit s))(assert (= s \"x\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // R5 + a length pin forcing a singleton.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (str.to_code s) (- 1)))(assert (= (str.len s) 1))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_code_conv_get_value() {
+    // A decided-Sat instance must produce a concrete, correct model:
+    // to_code(s) = 97 forces s = "a" exactly (no model repair involved —
+    // the rewrite IS the equivalence).
+    let src = "(set-logic QF_S)(declare-fun s () String)\
+               (assert (= (str.to_code s) 97))\n(check-sat)\n(get-value (s))\n";
+    let (lines, bailouts) = shinri_lines_counting_bailouts(src);
+    assert_eq!(bailouts, 0, "no guard bailouts expected");
+    assert_eq!(lines.first().map(String::as_str), Some("sat"));
+    let resp = lines.get(1).expect("get-value response");
+    let model = parse_string_values(resp);
+    assert_eq!(
+        model,
+        vec![("s".to_owned(), "a".to_owned())],
+        "to_code(s) = 97 pins s to \"a\""
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fence cases — strings mixed with an out-of-scope theory ⇒ shinri Unknown.
 // (Soundness fence; not over-fencing: these constructs are genuinely out of scope.)
