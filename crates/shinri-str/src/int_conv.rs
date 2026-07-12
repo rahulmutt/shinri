@@ -1,4 +1,4 @@
-//! Slice 15 pre-pass: `str.to_int` / `str.from_int` — fold + exact roundtrip
+//! Slice 15 + 17 pre-pass: `str.to_int` / `str.from_int` — fold + exact roundtrip
 //! rewrite + fence.
 //!
 //! Both ops are value-sorted FUNCTIONS (Int / String), so — like the slice-13
@@ -10,7 +10,12 @@
 //! 1. [`partial_eval_int_conv`] — bottom-up memoized rewrite:
 //!    - fold `str.to_int(<lit>)` / `str.from_int(<numeral>)` to a literal;
 //!    - rewrite `str.to_int(str.from_int(n))` → `ite(n >= 0, n, -1)` (exact).
-//! 2. [`has_unreduced_int_conv`] — presence fence: any surviving application
+//! 2. [`decide_const_int_conv`] (slice 17) — constant-RHS decision: rewrite
+//!    `str.from_int(n) = "lit"` to its exact Int equivalent and
+//!    `str.to_int(s) = k` to `false` for `k <= -2` (range fact). Full
+//!    equivalences, valid at any polarity; both verdicts preserved exactly —
+//!    no bound, no demotion (unlike the closed slice 16).
+//! 3. [`has_unreduced_int_conv`] — presence fence: any surviving application
 //!    (symbolic string to `to_int`; symbolic non-roundtrip Int to `from_int`)
 //!    fences the query to a sound `Unknown`.
 //!
@@ -141,6 +146,181 @@ pub fn has_unreduced_int_conv(ctx: &Context, assertions: &[TermId]) -> bool {
         }
     }
     assertions.iter().any(|&a| walk(ctx, a))
+}
+
+/// A model-repair obligation recorded by a lone-occurrence witness rewrite
+/// (spec R2, added in Task 2). The rewrite `to_int(s) = k` → `s = dec(k)` is
+/// verdict-exact at any polarity, but on a negative-polarity branch the
+/// solver may falsify `s = dec(k)` with a value that still satisfies the
+/// ORIGINAL atom (e.g. "05" for k = 5). At model output the solver replaces
+/// `var`'s value by `fallback` whenever it differs from `witness` — the
+/// canonical value falsifying the original atom.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntConvRepair {
+    pub var: TermId,
+    pub witness: String,
+    pub fallback: String,
+}
+
+/// Integer value of an Int-sorted literal — numeral or the parser's
+/// Neg-wrapped `(- 5)` shape — via the cross-crate `const_real_value`
+/// (single source of truth for literal recognition). None for non-literals
+/// and non-integral rationals.
+fn int_const_value(ctx: &Context, t: TermId) -> Option<Integer> {
+    let r = ctx.const_real_value(t)?;
+    if r.denom() == Integer::one() {
+        Some(r.numer())
+    } else {
+        None
+    }
+}
+
+/// Stage 2 (slice 17): constant-RHS decision. Rewrites decidable
+/// `str.to_int` / `str.from_int` equality atoms in place (bottom-up,
+/// memoized; unchanged subterms keep their TermId) and returns the rewritten
+/// assertions plus the model-repair obligations of any witness rewrites
+/// (Task 2). Every rewrite preserves BOTH verdicts: no bound, no demotion.
+pub fn decide_const_int_conv(
+    ctx: &mut Context,
+    assertions: Vec<TermId>,
+) -> (Vec<TermId>, Vec<IntConvRepair>) {
+    let mut st = ConstIntConv {
+        memo: FxHashMap::default(),
+        repairs: Vec::new(),
+    };
+    let out: Vec<TermId> = assertions.iter().map(|&a| st.rewrite(ctx, a)).collect();
+    (out, st.repairs)
+}
+
+struct ConstIntConv {
+    /// Term-rewrite memo: hash-consing gives a repeated atom the same TermId,
+    /// so a memo hit reuses the same replacement and (Task 2) emits its
+    /// repair obligation exactly once.
+    memo: FxHashMap<TermId, TermId>,
+    /// Witness-rewrite repair obligations (Task 2; always empty in Task 1).
+    repairs: Vec<IntConvRepair>,
+}
+
+impl ConstIntConv {
+    fn rewrite(&mut self, ctx: &mut Context, t: TermId) -> TermId {
+        if let Some(&r) = self.memo.get(&t) {
+            return r;
+        }
+        let result = match ctx.term_node(t).clone() {
+            TermNode::Const { .. } => t,
+            TermNode::App { op, args, .. } => {
+                let children: Vec<TermId> = ctx.children(args).to_vec();
+                let new_children: Vec<TermId> =
+                    children.iter().map(|&c| self.rewrite(ctx, c)).collect();
+                if let Some(r) = self.try_atom(ctx, t, &op, &new_children) {
+                    r
+                } else {
+                    let changed = new_children
+                        .iter()
+                        .zip(children.iter())
+                        .any(|(n, o)| n != o);
+                    if changed {
+                        ctx.mk_app(op, &new_children)
+                            .expect("const int-conv: well-sorted rebuild")
+                    } else {
+                        t
+                    }
+                }
+            }
+        };
+        self.memo.insert(t, result);
+        result
+    }
+
+    /// Constant-RHS atom match: `(= (str.to_int s) k)` / `(= (str.from_int n)
+    /// "lit")`, either argument order. Candidate atoms never have rewritten
+    /// children (their children are a to_int/from_int app and a literal), so
+    /// `atom` — the original node id — identifies the atom for Task 2's
+    /// occurrence analysis. Returns the replacement, or None (not a
+    /// constant-RHS int-conv atom, or outside the decided fragment → fence).
+    fn try_atom(
+        &mut self,
+        ctx: &mut Context,
+        atom: TermId,
+        op: &Op,
+        kids: &[TermId],
+    ) -> Option<TermId> {
+        if !matches!(op, Op::Builtin(BuiltinOp::Eq)) || kids.len() != 2 {
+            return None;
+        }
+        for (a, b) in [(kids[0], kids[1]), (kids[1], kids[0])] {
+            match ctx.term_node(a).clone() {
+                TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrFromInt),
+                    args,
+                    ..
+                } => {
+                    let n = ctx.children(args)[0];
+                    if let Some(lit) = ctx.string_const_value(b).map(str::to_owned) {
+                        return Some(self.rw_from_int_const(ctx, n, &lit));
+                    }
+                }
+                TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrToInt),
+                    args,
+                    ..
+                } => {
+                    let s = ctx.children(args)[0];
+                    if let Some(k) = int_const_value(ctx, b) {
+                        if let Some(r) = self.rw_to_int_const(ctx, atom, a, s, &k) {
+                            return Some(r);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// `(= (str.from_int n) "lit")` — full equivalence, any polarity:
+    /// canonical decimal ⇒ `n = val(lit)`; empty ⇒ `n < 0`; anything else
+    /// (leading zeros, non-digits, signs) is outside from_int's range ⇒
+    /// `false`. Canonicality check reuses the slice-15 evaluators: `lit` is
+    /// canonical iff `to_int(lit) >= 0` and `from_int(to_int(lit))`
+    /// round-trips to `lit` exactly (rejects "05": to_int("05") = 5 but
+    /// from_int(5) = "5" ≠ "05").
+    fn rw_from_int_const(&mut self, ctx: &mut Context, n: TermId, lit: &str) -> TermId {
+        let v = eval_to_int(lit);
+        if v.signum() >= 0 && eval_from_int(&v) == lit {
+            let int_s = ctx.int_sort();
+            let k = ctx.mk_numeral(Rational::from_int(v), int_s);
+            return ctx.mk_eq(n, k).expect("const int-conv: well-sorted n = k");
+        }
+        if lit.is_empty() {
+            let int_s = ctx.int_sort();
+            let zero = ctx.mk_numeral(Rational::from_int(Integer::from(0i128)), int_s);
+            return ctx
+                .mk_app(Op::Builtin(BuiltinOp::Lt), &[n, zero])
+                .expect("const int-conv: well-sorted n < 0");
+        }
+        ctx.mk_const_bool(false)
+    }
+
+    /// `(= (str.to_int s) k)`. Task 1 decides only the context-free range
+    /// fact: `k <= -2` is outside to_int's range `{-1} ∪ ℕ` ⇒ `false` (any
+    /// polarity). Task 2 adds the length-pin expansion and the
+    /// lone-occurrence witness rewrite. None ⇒ the atom survives to the
+    /// fence.
+    fn rw_to_int_const(
+        &mut self,
+        ctx: &mut Context,
+        atom: TermId,
+        to_int_node: TermId,
+        s: TermId,
+        k: &Integer,
+    ) -> Option<TermId> {
+        let _ = (atom, to_int_node, s); // used by Task 2
+        if k.signum() < 0 && *k != Integer::from(-1i128) {
+            return Some(ctx.mk_const_bool(false));
+        }
+        None
+    }
 }
 
 #[cfg(test)]
@@ -293,5 +473,158 @@ mod tests {
             ctx.numeral_value(out[0]).map(|r| r.numer().to_string()),
             Some("42".to_string())
         );
+    }
+
+    // ── Slice 17: constant-RHS decision stage ───────────────────────────────
+
+    #[test]
+    fn const_from_int_canonical_literal_rewrites_to_int_eq() {
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let n = nullary(&mut ctx, "n", int_s);
+        let app = from_int(&mut ctx, n);
+        let lit = ctx.mk_string_const("42");
+        let atom = ctx.mk_eq(app, lit).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![atom]);
+        let k42 = ctx.mk_numeral(Rational::from_int(Integer::from(42i128)), int_s);
+        let expected = ctx.mk_eq(n, k42).unwrap();
+        assert_eq!(out, vec![expected], "from_int = \"42\"  <=>  n = 42");
+        assert!(repairs.is_empty(), "equivalences carry no repair");
+        assert!(!has_unreduced_int_conv(&ctx, &out));
+    }
+
+    #[test]
+    fn const_from_int_reversed_args_and_zero() {
+        // (= "0" (str.from_int n)) — reversed argument order; "0" IS canonical.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let n = nullary(&mut ctx, "n", int_s);
+        let app = from_int(&mut ctx, n);
+        let lit = ctx.mk_string_const("0");
+        let atom = ctx.mk_eq(lit, app).unwrap();
+        let (out, _) = decide_const_int_conv(&mut ctx, vec![atom]);
+        let zero = ctx.mk_numeral(Rational::from_int(Integer::from(0i128)), int_s);
+        let expected = ctx.mk_eq(n, zero).unwrap();
+        assert_eq!(out, vec![expected]);
+    }
+
+    #[test]
+    fn const_from_int_empty_literal_rewrites_to_n_lt_zero() {
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let n = nullary(&mut ctx, "n", int_s);
+        let app = from_int(&mut ctx, n);
+        let lit = ctx.mk_string_const("");
+        let atom = ctx.mk_eq(app, lit).unwrap();
+        let (out, _) = decide_const_int_conv(&mut ctx, vec![atom]);
+        let zero = ctx.mk_numeral(Rational::from_int(Integer::from(0i128)), int_s);
+        let expected = ctx.mk_app(Op::Builtin(BuiltinOp::Lt), &[n, zero]).unwrap();
+        assert_eq!(out, vec![expected], "from_int = \"\"  <=>  n < 0");
+    }
+
+    #[test]
+    fn const_from_int_noncanonical_literals_rewrite_to_false() {
+        // Leading zero, non-digit, and sign literals are outside from_int's
+        // range: the atom is FALSE regardless of n.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let n = nullary(&mut ctx, "n", int_s);
+        let f = ctx.mk_const_bool(false);
+        for bad in ["05", "abc", "-5", "+5", " 5", "0042"] {
+            let app = from_int(&mut ctx, n);
+            let lit = ctx.mk_string_const(bad);
+            let atom = ctx.mk_eq(app, lit).unwrap();
+            let (out, _) = decide_const_int_conv(&mut ctx, vec![atom]);
+            assert_eq!(out, vec![f], "from_int = {bad:?} must be false");
+        }
+    }
+
+    #[test]
+    fn const_from_int_rewrites_under_negation() {
+        // Full equivalence: valid at ANY polarity — the Not survives, the
+        // atom inside it rewrites.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let n = nullary(&mut ctx, "n", int_s);
+        let app = from_int(&mut ctx, n);
+        let lit = ctx.mk_string_const("7");
+        let atom = ctx.mk_eq(app, lit).unwrap();
+        let neg = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[atom]).unwrap();
+        let (out, _) = decide_const_int_conv(&mut ctx, vec![neg]);
+        let k7 = ctx.mk_numeral(Rational::from_int(Integer::from(7i128)), int_s);
+        let inner = ctx.mk_eq(n, k7).unwrap();
+        let expected = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[inner]).unwrap();
+        assert_eq!(out, vec![expected]);
+    }
+
+    #[test]
+    fn const_from_int_big_literal_arbitrary_precision() {
+        let big = "1234567890123456789012345678901234567890";
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let n = nullary(&mut ctx, "n", int_s);
+        let app = from_int(&mut ctx, n);
+        let lit = ctx.mk_string_const(big);
+        let atom = ctx.mk_eq(app, lit).unwrap();
+        let (out, _) = decide_const_int_conv(&mut ctx, vec![atom]);
+        let v = Integer::from_str_radix(big, 10).unwrap();
+        let k = ctx.mk_numeral(Rational::from_int(v), int_s);
+        let expected = ctx.mk_eq(n, k).unwrap();
+        assert_eq!(out, vec![expected]);
+    }
+
+    #[test]
+    fn const_to_int_below_neg_one_rewrites_to_false() {
+        // to_int's range is {-1} ∪ ℕ: k <= -2 is a context-free range fact.
+        // Covers both a directly-built negative numeral and the parser's
+        // Neg-wrapped shape (via const_real_value).
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let f = ctx.mk_const_bool(false);
+        let app = to_int(&mut ctx, s);
+        let m2 = ctx.mk_numeral(Rational::from_int(Integer::from(-2i128)), int_s);
+        let atom = ctx.mk_eq(app, m2).unwrap();
+        let (out, _) = decide_const_int_conv(&mut ctx, vec![atom]);
+        assert_eq!(out, vec![f]);
+        // Neg-wrapped `(- 7)`.
+        let seven = ctx.mk_numeral(Rational::from_int(Integer::from(7i128)), int_s);
+        let neg7 = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[seven]).unwrap();
+        let app = to_int(&mut ctx, s);
+        let atom = ctx.mk_eq(app, neg7).unwrap();
+        let (out, _) = decide_const_int_conv(&mut ctx, vec![atom]);
+        assert_eq!(out, vec![f]);
+    }
+
+    #[test]
+    fn const_to_int_non_lone_survives_to_fence() {
+        // Two atoms over the same to_int(s): outside Task 1's fragment (and
+        // Task 2 keeps them fenced: the to_int node has two atom parents).
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let app = to_int(&mut ctx, s);
+        let five = ctx.mk_numeral(Rational::from_int(Integer::from(5i128)), int_s);
+        let seven = ctx.mk_numeral(Rational::from_int(Integer::from(7i128)), int_s);
+        let a1 = ctx.mk_eq(app, five).unwrap();
+        let a2 = ctx.mk_eq(app, seven).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![a1, a2]);
+        assert_eq!(out, vec![a1, a2], "non-lone to_int atoms are untouched");
+        assert!(repairs.is_empty());
+        assert!(has_unreduced_int_conv(&ctx, &out), "still fenced");
+    }
+
+    #[test]
+    fn const_stage_noop_without_int_conv() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = nullary(&mut ctx, "x", str_s);
+        let y = nullary(&mut ctx, "y", str_s);
+        let eq = ctx.mk_eq(x, y).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![eq]);
+        assert_eq!(out, vec![eq], "assertions untouched (same TermIds)");
+        assert!(repairs.is_empty());
     }
 }
