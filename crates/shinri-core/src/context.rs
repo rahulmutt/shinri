@@ -524,7 +524,7 @@ impl Context {
                 expect_all(self, args, str_s)?;
                 Ok(str_s)
             }
-            StrToInt => {
+            StrToInt | StrToCode => {
                 expect_arity(args, 1)?;
                 let (str_s, int_s) = (self.string_sort(), self.int_sort());
                 if self.sort_of(args[0]) != str_s {
@@ -535,7 +535,7 @@ impl Context {
                 }
                 Ok(int_s)
             }
-            StrFromInt => {
+            StrFromInt | StrFromCode => {
                 expect_arity(args, 1)?;
                 let (str_s, int_s) = (self.string_sort(), self.int_sort());
                 if self.sort_of(args[0]) != int_s {
@@ -545,6 +545,17 @@ impl Context {
                     });
                 }
                 Ok(str_s)
+            }
+            StrIsDigit => {
+                expect_arity(args, 1)?;
+                let str_s = self.string_sort();
+                if self.sort_of(args[0]) != str_s {
+                    return Err(SortError::Mismatch {
+                        expected: str_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                Ok(self.bool_sort())
             }
             // ── Floating-point: arithmetic ────────────────────────────────────
             FpAbs | FpNeg => {
@@ -1670,6 +1681,51 @@ mod tests {
         // Wrong arity rejected.
         assert!(ctx
             .mk_app(Op::Builtin(BuiltinOp::StrToInt), &[s, s])
+            .is_err());
+    }
+
+    #[test]
+    fn str_code_conv_sort_rules() {
+        fn nullary(ctx: &mut Context, name: &str, sort: SortId) -> TermId {
+            let f = ctx.declare_fun(name, &[], sort);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        }
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let int_s = ctx.int_sort();
+        let bool_s = ctx.bool_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let n = nullary(&mut ctx, "n", int_s);
+
+        // str.to_code : String -> Int
+        let tc = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrToCode), &[s])
+            .expect("to_code well-sorted");
+        assert_eq!(ctx.sort_of(tc), int_s);
+
+        // str.from_code : Int -> String
+        let fc = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrFromCode), &[n])
+            .expect("from_code well-sorted");
+        assert_eq!(ctx.sort_of(fc), str_s);
+
+        // str.is_digit : String -> Bool
+        let id = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIsDigit), &[s])
+            .expect("is_digit well-sorted");
+        assert_eq!(ctx.sort_of(id), bool_s);
+
+        // Wrong sorts rejected.
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrToCode), &[n]).is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrFromCode), &[s])
+            .is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrIsDigit), &[n])
+            .is_err());
+        // Wrong arity rejected.
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrToCode), &[s, s])
             .is_err());
     }
 }

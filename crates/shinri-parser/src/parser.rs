@@ -330,6 +330,9 @@ impl<'a> Parser<'a> {
             "str.replace_all" => StrReplaceAll,
             "str.to_int" => StrToInt,
             "str.from_int" => StrFromInt,
+            "str.to_code" => StrToCode,
+            "str.from_code" => StrFromCode,
+            "str.is_digit" => StrIsDigit,
             // Floating-point bit constructor (SMT-LIB QF_FP)
             "fp" => FpFromBits,
             // Floating-point arithmetic and classification operators (QF_FP)
@@ -898,7 +901,10 @@ impl<'a> Parser<'a> {
             | BuiltinOp::StrReplace
             | BuiltinOp::StrReplaceAll
             | BuiltinOp::StrToInt
-            | BuiltinOp::StrFromInt => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            | BuiltinOp::StrFromInt
+            | BuiltinOp::StrToCode
+            | BuiltinOp::StrFromCode
+            | BuiltinOp::StrIsDigit => Self::mk(ctx, Op::Builtin(op), &args, &sp),
             // Floating-point ops: delegate directly to mk_app (sort-checking in Context).
             BuiltinOp::FpAbs
             | BuiltinOp::FpNeg
@@ -2004,6 +2010,62 @@ mod tests {
             }
             assert_eq!(ctx.sort_of(lhs), want_sort, "result sort for {want:?}");
         }
+    }
+
+    /// Parse str.to_code / str.from_code / str.is_digit, verify op + result
+    /// sort (slice 18). Mirrors `parses_to_int_and_from_int`.
+    #[test]
+    fn parses_code_conv_ops() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = r#"(declare-fun s () String)
+(declare-fun n () Int)
+(assert (= (str.to_code s) 97))
+(assert (= (str.from_code n) "a"))
+(assert (str.is_digit s))"#;
+        let (ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 5); // 2 declares + 3 asserts
+
+        // The two Eq-wrapped conversions.
+        for (ci, want, want_sort) in [
+            (2usize, BuiltinOp::StrToCode, ctx.int_sort()),
+            (3usize, BuiltinOp::StrFromCode, ctx.string_sort()),
+        ] {
+            let assert_term = match &cmds[ci] {
+                Command::Assert(t) => *t,
+                other => panic!("expected Assert, got {other:?}"),
+            };
+            let TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } = ctx.term_node(assert_term).clone()
+            else {
+                panic!("expected Eq at top level");
+            };
+            let lhs = ctx.children(args).to_vec()[0];
+            match ctx.term_node(lhs).clone() {
+                TermNode::App {
+                    op: Op::Builtin(got),
+                    ..
+                } => assert_eq!(got, want, "op mismatch"),
+                other => panic!("expected App lhs, got {other:?}"),
+            }
+            assert_eq!(ctx.sort_of(lhs), want_sort, "result sort for {want:?}");
+        }
+
+        // is_digit: Bool-sorted app at the assert's top level.
+        let assert_term = match &cmds[4] {
+            Command::Assert(t) => *t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        let TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrIsDigit),
+            ..
+        } = ctx.term_node(assert_term).clone()
+        else {
+            panic!("expected str.is_digit app at top level");
+        };
+        assert_eq!(ctx.sort_of(assert_term), ctx.bool_sort());
     }
 
     /// Ill-sorted operands are diagnostics, not crashes (mirror of the slice-13 test).

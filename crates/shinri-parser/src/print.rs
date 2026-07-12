@@ -201,6 +201,10 @@ fn builtin_name(b: BuiltinOp) -> String {
         // Slice 15
         StrToInt => "str.to_int".to_owned(),
         StrFromInt => "str.from_int".to_owned(),
+        // Slice 18
+        StrToCode => "str.to_code".to_owned(),
+        StrFromCode => "str.from_code".to_owned(),
+        StrIsDigit => "str.is_digit".to_owned(),
         // Floating-point ops — SMT-LIB names
         FpAbs => "fp.abs".to_owned(),
         FpNeg => "fp.neg".to_owned(),

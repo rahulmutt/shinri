@@ -452,6 +452,18 @@ impl Solver {
             if shinri_str::int_conv::has_unreduced_int_conv(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
+            // ── Slice 18: str.to_code / str.from_code / str.is_digit ─────────
+            // A SINGLE exact rewrite pass — every rule is a full equivalence
+            // (no repair, no pins, no occurrence analysis): literal folds,
+            // both roundtrip rewrites (elim_term_ite below eliminates the
+            // minted ites), constant-RHS atom equivalences at any polarity,
+            // and is_digit expansion. Any SURVIVING application (symbolic
+            // linking, inequality / nested-arith shapes, surrogate code
+            // points — see the module docs) fences to sound Unknown.
+            assertions = shinri_str::code_conv::rewrite_code_conv(&mut self.ctx, &assertions);
+            if shinri_str::code_conv::has_unreduced_code_conv(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
             // Soundness fence for the substr/str.at seam: a `str.substr`/`str.at`
             // over a NON-constant base (or non-numeral index/length) reduces to the
             // generic `pre++mid++post` + length-guard encoding, which the String↔Arith

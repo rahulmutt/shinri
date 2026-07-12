@@ -150,6 +150,9 @@ fn contains_string_op(ctx: &Context, t: TermId) -> bool {
                         | BuiltinOp::StrReplace
                         | BuiltinOp::StrToInt
                         | BuiltinOp::StrFromInt
+                        | BuiltinOp::StrToCode
+                        | BuiltinOp::StrFromCode
+                        | BuiltinOp::StrIsDigit
                 )
             ) {
                 return true;
