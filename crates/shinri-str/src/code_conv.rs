@@ -191,21 +191,121 @@ fn rewrite_from_code(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
     None
 }
 
-/// `(str.is_digit x)`, child already rewritten. R1 literal fold in this task;
-/// the R10 expansion for non-literals lands in Task 3 (returns None -> fence
-/// until then).
+/// `(str.is_digit x)`, child already rewritten. R1 fold for a literal; R10
+/// expansion otherwise: `(or (= t "0") … (= t "9"))` — each minted equality
+/// is routed back through the atom rules, so `is_digit(from_code(n))`
+/// reduces fully in this same pass (no fixpoint loop).
 fn rewrite_is_digit(ctx: &mut Context, t: TermId) -> Option<TermId> {
     if let Some(s) = ctx.string_const_value(t).map(str::to_owned) {
         let mut it = s.chars();
         let v = matches!((it.next(), it.next()), (Some('0'..='9'), None));
         return Some(ctx.mk_const_bool(v));
     }
+    let disjuncts: Vec<TermId> = ('0'..='9')
+        .map(|d| {
+            let lit = ctx.mk_string_const(&d.to_string());
+            let kids = [t, lit];
+            try_code_atom(ctx, &kids)
+                .unwrap_or_else(|| ctx.mk_eq(t, lit).expect("is_digit: t = digit"))
+        })
+        .collect();
+    Some(
+        ctx.mk_app(Op::Builtin(BuiltinOp::Or), &disjuncts)
+            .expect("is_digit expansion"),
+    )
+}
+
+/// R4–R9: constant-RHS equality atoms, either orientation. Children are
+/// already rewritten (so a foldable side has already folded). None → not a
+/// code-conv atom, or the surrogate fence.
+fn try_code_atom(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
+    if kids.len() != 2 {
+        return None;
+    }
+    for (a, b) in [(kids[0], kids[1]), (kids[1], kids[0])] {
+        match ctx.term_node(a).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrToCode),
+                args,
+                ..
+            } => {
+                let s = ctx.children(args)[0];
+                if let Some(k) = int_const_value(ctx, b) {
+                    return rw_to_code_const(ctx, s, &k);
+                }
+            }
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrFromCode),
+                args,
+                ..
+            } => {
+                let n = ctx.children(args)[0];
+                if let Some(lit) = ctx.string_const_value(b).map(str::to_owned) {
+                    return Some(rw_from_code_const(ctx, n, &lit));
+                }
+            }
+            _ => {}
+        }
+    }
     None
 }
 
-/// Constant-RHS equality atoms (R4–R9). Stub in this task — Task 3 fills it.
-fn try_code_atom(_ctx: &mut Context, _kids: &[TermId]) -> Option<TermId> {
-    None
+/// R4/R5/R6: `(= (str.to_code s) k)` — a full partition of k:
+/// `-1` ⇒ `not (len(s) = 1)`; in-alphabet non-surrogate ⇒ `s = "<char k>"`;
+/// surrogate ⇒ None (representational fence); anything else ⇒ `false`.
+fn rw_to_code_const(ctx: &mut Context, s: TermId, k: &Integer) -> Option<TermId> {
+    match k.to_i128() {
+        Some(-1) => {
+            let len = ctx
+                .mk_app(Op::Builtin(BuiltinOp::StrLen), &[s])
+                .expect("len");
+            let int_s = ctx.int_sort();
+            let one = ctx.mk_numeral(Rational::from_int(Integer::one()), int_s);
+            let eq1 = ctx.mk_eq(len, one).expect("len = 1");
+            Some(
+                ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[eq1])
+                    .expect("not singleton"),
+            )
+        }
+        Some(v) if (0..=MAX_CODE).contains(&v) => {
+            let c = char_of_code(v)?; // surrogate → fence
+            let lit = ctx.mk_string_const(&c.to_string());
+            Some(ctx.mk_eq(s, lit).expect("s = char"))
+        }
+        // k <= -2, k > MAX_CODE, or |k| beyond i128: outside to_code's range.
+        _ => Some(ctx.mk_const_bool(false)),
+    }
+}
+
+/// R7/R8/R9: `(= (str.from_code n) "lit")`.
+fn rw_from_code_const(ctx: &mut Context, n: TermId, lit: &str) -> TermId {
+    if lit.is_empty() {
+        // R8: the out-of-alphabet escape — n < 0 ∨ n > MAX_CODE.
+        let int_s = ctx.int_sort();
+        let zero = ctx.mk_numeral(Rational::from_int(Integer::zero()), int_s);
+        let max = ctx.mk_numeral(Rational::from_int(Integer::from(MAX_CODE)), int_s);
+        let lt = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Lt), &[n, zero])
+            .expect("n < 0");
+        let gt = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Gt), &[n, max])
+            .expect("n > MAX_CODE");
+        return ctx
+            .mk_app(Op::Builtin(BuiltinOp::Or), &[lt, gt])
+            .expect("escape disj");
+    }
+    let mut it = lit.chars();
+    match (it.next(), it.next()) {
+        // R7: from_code is injective on the alphabet ⇒ n = code(c).
+        (Some(c), None) if (c as u32 as i128) <= MAX_CODE => {
+            let int_s = ctx.int_sort();
+            let code = ctx.mk_numeral(Rational::from_int(Integer::from(c as u32 as i128)), int_s);
+            ctx.mk_eq(n, code).expect("n = code")
+        }
+        // R9: multi-char, or a singleton above the alphabet — outside
+        // from_code's range.
+        _ => ctx.mk_const_bool(false),
+    }
 }
 
 /// Presence fence: true iff any `str.to_code` / `str.from_code` /
@@ -381,5 +481,176 @@ mod tests {
         let eq = ctx.mk_eq(s, t).unwrap();
         let out = rewrite_code_conv(&mut ctx, &[eq]);
         assert_eq!(out[0], eq, "no-op inputs must keep their TermId");
+    }
+
+    /// Convenience: rewrite a single assertion.
+    fn rw1(ctx: &mut Context, t: TermId) -> TermId {
+        rewrite_code_conv(ctx, &[t])[0]
+    }
+
+    #[test]
+    fn to_code_const_rhs_boundary_lattice() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let tc = to_code(&mut ctx, s);
+
+        // R4: in-alphabet, non-surrogate k ⇒ s = "<char k>". Check the edges
+        // and a digit: 0, '9' (0x39), 0xD7FF, 0xE000, MAX_CODE.
+        for k in [0i128, 0x39, 0xD7FF, 0xE000, MAX_CODE] {
+            let kt = int_lit(&mut ctx, k);
+            let atom = ctx.mk_eq(tc, kt).unwrap();
+            let lit = ctx.mk_string_const(&char::from_u32(k as u32).unwrap().to_string());
+            let want = ctx.mk_eq(s, lit).unwrap();
+            assert_eq!(rw1(&mut ctx, atom), want, "k = {k:#x}");
+        }
+
+        // R5: k = -1 ⇒ not (len(s) = 1).
+        let neg1 = int_lit(&mut ctx, -1);
+        let atom = ctx.mk_eq(tc, neg1).unwrap();
+        let len = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[s]).unwrap();
+        let one = int_lit(&mut ctx, 1);
+        let eq1 = ctx.mk_eq(len, one).unwrap();
+        let want = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[eq1]).unwrap();
+        assert_eq!(rw1(&mut ctx, atom), want);
+
+        // R6: k <= -2 or k > MAX_CODE ⇒ false.
+        for k in [-2i128, 0x30000] {
+            let kt = int_lit(&mut ctx, k);
+            let atom = ctx.mk_eq(tc, kt).unwrap();
+            assert_eq!(rw1(&mut ctx, atom), ctx.mk_const_bool(false), "k = {k}");
+        }
+
+        // Surrogate k: representational fence — the atom must SURVIVE.
+        for k in [0xD800i128, 0xDFFF] {
+            let kt = int_lit(&mut ctx, k);
+            let atom = ctx.mk_eq(tc, kt).unwrap();
+            let out = rw1(&mut ctx, atom);
+            assert_eq!(out, atom, "surrogate k = {k:#x} must fence");
+            assert!(has_unreduced_code_conv(&ctx, &[out]));
+        }
+    }
+
+    #[test]
+    fn to_code_const_rhs_matches_either_orientation() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let tc = to_code(&mut ctx, s);
+        let k = int_lit(&mut ctx, 97);
+        // (= 97 (str.to_code s)) — literal on the LEFT.
+        let atom = ctx.mk_eq(k, tc).unwrap();
+        let a_lit = ctx.mk_string_const("a");
+        let want = ctx.mk_eq(s, a_lit).unwrap();
+        assert_eq!(rw1(&mut ctx, atom), want);
+    }
+
+    #[test]
+    fn to_code_const_rhs_under_negation_and_or() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let tc = to_code(&mut ctx, s);
+        let k = int_lit(&mut ctx, 97);
+        let atom = ctx.mk_eq(tc, k).unwrap();
+        let neg = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[atom]).unwrap();
+        let bool_s = ctx.bool_sort();
+        let t = nullary(&mut ctx, "p", bool_s);
+        let or = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[neg, t]).unwrap();
+
+        let a_lit = ctx.mk_string_const("a");
+        let want_eq = ctx.mk_eq(s, a_lit).unwrap();
+        let want_neg = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[want_eq]).unwrap();
+        let want = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Or), &[want_neg, t])
+            .unwrap();
+        assert_eq!(rw1(&mut ctx, or), want);
+    }
+
+    #[test]
+    fn from_code_const_rhs_shapes() {
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let n = nullary(&mut ctx, "n", int_s);
+        let fc = from_code(&mut ctx, n);
+
+        // R7: singleton literal ⇒ n = code.
+        let a_lit = ctx.mk_string_const("a");
+        let atom = ctx.mk_eq(fc, a_lit).unwrap();
+        let k97 = int_lit(&mut ctx, 97);
+        let want = ctx.mk_eq(n, k97).unwrap();
+        assert_eq!(rw1(&mut ctx, atom), want);
+
+        // R8: empty literal ⇒ n < 0 ∨ n > MAX_CODE.
+        let empty = ctx.mk_string_const("");
+        let atom = ctx.mk_eq(fc, empty).unwrap();
+        let zero = int_lit(&mut ctx, 0);
+        let max = int_lit(&mut ctx, MAX_CODE);
+        let lt = ctx.mk_app(Op::Builtin(BuiltinOp::Lt), &[n, zero]).unwrap();
+        let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[n, max]).unwrap();
+        let want = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[lt, gt]).unwrap();
+        assert_eq!(rw1(&mut ctx, atom), want);
+
+        // R9: multi-char literal ⇒ false; above-alphabet singleton ⇒ false.
+        for lit in ["ab", "\u{30000}"] {
+            let l = ctx.mk_string_const(lit);
+            let atom = ctx.mk_eq(fc, l).unwrap();
+            assert_eq!(rw1(&mut ctx, atom), ctx.mk_const_bool(false), "lit {lit:?}");
+        }
+    }
+
+    #[test]
+    fn is_digit_expands_to_ten_way_disjunction() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let idig = is_digit(&mut ctx, s);
+        let out = rw1(&mut ctx, idig);
+        let disjuncts: Vec<TermId> = ('0'..='9')
+            .map(|d| {
+                let lit = ctx.mk_string_const(&d.to_string());
+                ctx.mk_eq(s, lit).unwrap()
+            })
+            .collect();
+        let want = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &disjuncts).unwrap();
+        assert_eq!(out, want);
+        assert!(!has_unreduced_code_conv(&ctx, &[out]));
+    }
+
+    #[test]
+    fn is_digit_of_from_code_reduces_fully_in_one_pass() {
+        // The minted-atom chain: is_digit(from_code(n)) must become a pure
+        // LIA disjunction n = 48 ∨ … ∨ n = 57 — R10 routing each minted
+        // equality through R7.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let n = nullary(&mut ctx, "n", int_s);
+        let fc = from_code(&mut ctx, n);
+        let idig = is_digit(&mut ctx, fc);
+        let out = rw1(&mut ctx, idig);
+        let disjuncts: Vec<TermId> = (48i128..=57)
+            .map(|code| {
+                let k = int_lit(&mut ctx, code);
+                ctx.mk_eq(n, k).unwrap()
+            })
+            .collect();
+        let want = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &disjuncts).unwrap();
+        assert_eq!(out, want);
+        assert!(!has_unreduced_code_conv(&ctx, &[out]));
+    }
+
+    #[test]
+    fn symbolic_linking_still_fences() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let int_s = ctx.int_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let n = nullary(&mut ctx, "n", int_s);
+        let tc = to_code(&mut ctx, s);
+        // (= (str.to_code s) n): symbolic RHS — no rule applies.
+        let atom = ctx.mk_eq(tc, n).unwrap();
+        let out = rw1(&mut ctx, atom);
+        assert_eq!(out, atom);
+        assert!(has_unreduced_code_conv(&ctx, &[out]));
     }
 }
