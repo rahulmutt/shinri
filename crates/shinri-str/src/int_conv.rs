@@ -12,9 +12,12 @@
 //!    - rewrite `str.to_int(str.from_int(n))` → `ite(n >= 0, n, -1)` (exact).
 //! 2. [`decide_const_int_conv`] (slice 17) — constant-RHS decision: rewrite
 //!    `str.from_int(n) = "lit"` to its exact Int equivalent and
-//!    `str.to_int(s) = k` to `false` for `k <= -2` (range fact). Full
-//!    equivalences, valid at any polarity; both verdicts preserved exactly —
-//!    no bound, no demotion (unlike the closed slice 16).
+//!    `str.to_int(s) = k` to `false` for `k <= -2` (any polarity, exact);
+//!    expand `str.to_int(s) = k` under a top-level length pin (R4, capped by
+//!    [`INT_CONV_PIN_LEN_CAP`]); witness-rewrite lone-occurrence
+//!    `str.to_int(s) = k` atoms to `s = dec(k)` / `s = ""` with a
+//!    model-repair obligation ([`IntConvRepair`], R2). Both verdicts
+//!    preserved exactly — no bound, no demotion (unlike the closed slice 16).
 //! 3. [`has_unreduced_int_conv`] — presence fence: any surviving application
 //!    (symbolic string to `to_int`; symbolic non-roundtrip Int to `from_int`)
 //!    fences the query to a sound `Unknown`.
@@ -23,7 +26,7 @@
 //! `char::is_ascii_digit()` (`'0'..='9'`) — never `char::is_numeric()`, which
 //! would unsoundly fold non-ASCII Unicode digits.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Integer, Op, Rational, TermId, TermNode};
 
 /// Concrete `str.to_int(s)` per SMT-LIB 2.6: the value of `s` iff it is a
@@ -162,6 +165,79 @@ pub struct IntConvRepair {
     pub fallback: String,
 }
 
+/// Length-pin expansion guard: a pin `(= (str.len s) L)` with
+/// `L > INT_CONV_PIN_LEN_CAP` is ignored (the padded witness string would
+/// allocate L bytes). Over-cap instances fence to sound Unknown.
+pub const INT_CONV_PIN_LEN_CAP: usize = 1024;
+
+/// Distinct parent nodes of every term reachable from `assertions`
+/// (DAG-aware: parent edges are recorded when the parent is first visited).
+/// Drives the R3 lone-occurrence check.
+fn parent_map(ctx: &Context, assertions: &[TermId]) -> FxHashMap<TermId, FxHashSet<TermId>> {
+    let mut parents: FxHashMap<TermId, FxHashSet<TermId>> = FxHashMap::default();
+    let mut visited: FxHashSet<TermId> = FxHashSet::default();
+    let mut stack: Vec<TermId> = assertions.to_vec();
+    while let Some(t) = stack.pop() {
+        if !visited.insert(t) {
+            continue;
+        }
+        if let TermNode::App { args, .. } = ctx.term_node(t) {
+            for &c in ctx.children(*args) {
+                parents.entry(c).or_default().insert(t);
+                stack.push(c);
+            }
+        }
+    }
+    parents
+}
+
+/// Top-level length pins: assertions of the exact shape `(= (str.len x) L)`
+/// (either argument order) with `L` an integral literal in
+/// `0..=INT_CONV_PIN_LEN_CAP`. First pin per subject wins; the expansion is
+/// valid GIVEN the pin (R4), which always stays asserted, so contradictory
+/// pins are harmless.
+fn collect_len_pins(ctx: &Context, assertions: &[TermId]) -> FxHashMap<TermId, usize> {
+    let mut pins: FxHashMap<TermId, usize> = FxHashMap::default();
+    for &a in assertions {
+        let TermNode::App {
+            op: Op::Builtin(BuiltinOp::Eq),
+            args,
+            ..
+        } = ctx.term_node(a)
+        else {
+            continue;
+        };
+        let kids: Vec<TermId> = ctx.children(*args).to_vec();
+        if kids.len() != 2 {
+            continue;
+        }
+        for (x, y) in [(kids[0], kids[1]), (kids[1], kids[0])] {
+            let TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrLen),
+                args,
+                ..
+            } = ctx.term_node(x)
+            else {
+                continue;
+            };
+            let subject = ctx.children(*args)[0];
+            let Some(l) = int_const_value(ctx, y) else {
+                continue;
+            };
+            if l.signum() < 0 {
+                continue;
+            }
+            let Some(l) = l.to_i128() else { continue };
+            if l < 0 || l as usize > INT_CONV_PIN_LEN_CAP {
+                continue;
+            }
+            pins.entry(subject).or_insert(l as usize);
+            break;
+        }
+    }
+    pins
+}
+
 /// Integer value of an Int-sorted literal — numeral or the parser's
 /// Neg-wrapped `(- 5)` shape — via the cross-crate `const_real_value`
 /// (single source of truth for literal recognition). None for non-literals
@@ -184,9 +260,13 @@ pub fn decide_const_int_conv(
     ctx: &mut Context,
     assertions: Vec<TermId>,
 ) -> (Vec<TermId>, Vec<IntConvRepair>) {
+    let pins = collect_len_pins(ctx, &assertions);
+    let parents = parent_map(ctx, &assertions);
     let mut st = ConstIntConv {
         memo: FxHashMap::default(),
         repairs: Vec::new(),
+        pins,
+        parents,
     };
     let out: Vec<TermId> = assertions.iter().map(|&a| st.rewrite(ctx, a)).collect();
     (out, st.repairs)
@@ -194,11 +274,18 @@ pub fn decide_const_int_conv(
 
 struct ConstIntConv {
     /// Term-rewrite memo: hash-consing gives a repeated atom the same TermId,
-    /// so a memo hit reuses the same replacement and (Task 2) emits its
-    /// repair obligation exactly once.
+    /// so a memo hit reuses the same replacement and emits its repair
+    /// obligation exactly once.
     memo: FxHashMap<TermId, TermId>,
-    /// Witness-rewrite repair obligations (Task 2; always empty in Task 1).
+    /// Witness-rewrite repair obligations, consumed by the solver at model
+    /// output (R2).
     repairs: Vec<IntConvRepair>,
+    /// Top-level length pins (R4), computed over the ORIGINAL assertions.
+    pins: FxHashMap<TermId, usize>,
+    /// Parent map for the R3 lone-occurrence check, computed over the
+    /// ORIGINAL assertions (rewrites do not change other atoms' occurrence
+    /// structure).
+    parents: FxHashMap<TermId, FxHashSet<TermId>>,
 }
 
 impl ConstIntConv {
@@ -302,11 +389,24 @@ impl ConstIntConv {
         ctx.mk_const_bool(false)
     }
 
-    /// `(= (str.to_int s) k)`. Task 1 decides only the context-free range
-    /// fact: `k <= -2` is outside to_int's range `{-1} ∪ ℕ` ⇒ `false` (any
-    /// polarity). Task 2 adds the length-pin expansion and the
-    /// lone-occurrence witness rewrite. None ⇒ the atom survives to the
-    /// fence.
+    /// `(= (str.to_int s) k)` — the three decidable cases (spec table):
+    ///
+    /// 1. `k <= -2` ⇒ `false`: outside to_int's range `{-1} ∪ ℕ` (any
+    ///    polarity, context-free).
+    /// 2. Top-level length pin `len(s) = L` and `k >= 0` ⇒ the unique
+    ///    length-L digit string of value k, or `false` if `|dec(k)| > L`.
+    ///    Valid at any polarity GIVEN the pin, which stays asserted (R4).
+    ///    `k = -1` under a pin has no finite exact form ⇒ None (fence).
+    /// 3. `s` a lone nullary uninterpreted constant (R3) ⇒ witness rewrite
+    ///    `s = dec(k)` (`s = ""` for k = -1), verdict-exact at any polarity,
+    ///    plus an [`IntConvRepair`] the solver applies at model output (R2):
+    ///    with `s` lone, both the original atom and the replacement are
+    ///    two-way realizable, so satisfiability is preserved exactly in both
+    ///    directions; only the reported model can drift, and the repair's
+    ///    fallback (`""` has to_int -1 ≠ k; `"0"` has to_int 0 ≠ -1)
+    ///    restores it.
+    ///
+    /// None ⇒ the atom survives to the fence.
     fn rw_to_int_const(
         &mut self,
         ctx: &mut Context,
@@ -315,11 +415,69 @@ impl ConstIntConv {
         s: TermId,
         k: &Integer,
     ) -> Option<TermId> {
-        let _ = (atom, to_int_node, s); // used by Task 2
-        if k.signum() < 0 && *k != Integer::from(-1i128) {
+        let neg1 = Integer::from(-1i128);
+        if k.signum() < 0 && *k != neg1 {
             return Some(ctx.mk_const_bool(false));
         }
+        if let Some(&l) = self.pins.get(&s) {
+            if *k == neg1 {
+                return None;
+            }
+            let dec = eval_from_int(k);
+            if dec.len() > l {
+                return Some(ctx.mk_const_bool(false));
+            }
+            let padded = format!("{}{}", "0".repeat(l - dec.len()), dec);
+            let w = ctx.mk_string_const(&padded);
+            return Some(
+                ctx.mk_eq(s, w)
+                    .expect("const int-conv: well-sorted s = padded"),
+            );
+        }
+        if self.is_lone_var(ctx, s, to_int_node, atom) {
+            let (witness, fallback) = if *k == neg1 {
+                (String::new(), "0".to_string())
+            } else {
+                (eval_from_int(k), String::new())
+            };
+            let w = ctx.mk_string_const(&witness);
+            let eq = ctx
+                .mk_eq(s, w)
+                .expect("const int-conv: well-sorted s = witness");
+            self.repairs.push(IntConvRepair {
+                var: s,
+                witness,
+                fallback,
+            });
+            return Some(eq);
+        }
         None
+    }
+
+    /// R3: `s` is lone iff it is a nullary uninterpreted constant whose only
+    /// parent in the whole assertion forest is `to_int_node`, and that node's
+    /// only parent is the candidate `atom`. The atom's own parents are
+    /// unrestricted (any boolean structure — polarity is handled by R2's
+    /// repair). Restricted to variables because the repair overrides the
+    /// var's model value; compound arguments fence.
+    fn is_lone_var(&self, ctx: &Context, s: TermId, to_int_node: TermId, atom: TermId) -> bool {
+        let is_nullary_var = matches!(
+            ctx.term_node(s),
+            TermNode::App {
+                op: Op::Uninterpreted(_),
+                args,
+                ..
+            } if ctx.children(*args).is_empty()
+        );
+        is_nullary_var
+            && self
+                .parents
+                .get(&s)
+                .is_some_and(|p| p.len() == 1 && p.contains(&to_int_node))
+            && self
+                .parents
+                .get(&to_int_node)
+                .is_some_and(|p| p.len() == 1 && p.contains(&atom))
     }
 }
 
@@ -626,5 +784,227 @@ mod tests {
         let (out, repairs) = decide_const_int_conv(&mut ctx, vec![eq]);
         assert_eq!(out, vec![eq], "assertions untouched (same TermIds)");
         assert!(repairs.is_empty());
+    }
+
+    /// Builds `(= (str.len s) l)` for pin tests.
+    fn len_pin(ctx: &mut Context, s: TermId, l: i128) -> TermId {
+        let int_s = ctx.int_sort();
+        let len = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[s]).unwrap();
+        let ln = ctx.mk_numeral(Rational::from_int(Integer::from(l)), int_s);
+        ctx.mk_eq(len, ln).unwrap()
+    }
+
+    #[test]
+    fn pin_expansion_pads_leading_zeros() {
+        // len(s) = 3 ∧ to_int(s) = 5  ⇒  s = "005" (pin kept, atom replaced).
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let pin = len_pin(&mut ctx, s, 3);
+        let app = to_int(&mut ctx, s);
+        let five = ctx.mk_numeral(Rational::from_int(Integer::from(5i128)), int_s);
+        let atom = ctx.mk_eq(app, five).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![pin, atom]);
+        let w = ctx.mk_string_const("005");
+        let expected = ctx.mk_eq(s, w).unwrap();
+        assert_eq!(out, vec![pin, expected], "pin unchanged, atom expanded");
+        assert!(
+            repairs.is_empty(),
+            "pin expansion is an equivalence: no repair"
+        );
+        assert!(!has_unreduced_int_conv(&ctx, &out));
+    }
+
+    #[test]
+    fn pin_expansion_edges() {
+        // k = 0, L = 3 → "000"; |dec(k)| = L → no padding; |dec(k)| > L → false.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let f = ctx.mk_const_bool(false);
+        for (k, l, want) in [
+            (0i128, 3i128, Some("000")),
+            (123, 3, Some("123")),
+            (1234, 3, None),
+        ] {
+            let s = nullary(&mut ctx, &format!("s_{k}_{l}"), str_s);
+            let pin = len_pin(&mut ctx, s, l);
+            let app = to_int(&mut ctx, s);
+            let kn = ctx.mk_numeral(Rational::from_int(Integer::from(k)), int_s);
+            let atom = ctx.mk_eq(app, kn).unwrap();
+            let (out, _) = decide_const_int_conv(&mut ctx, vec![pin, atom]);
+            let expected = match want {
+                Some(w) => {
+                    let wt = ctx.mk_string_const(w);
+                    ctx.mk_eq(s, wt).unwrap()
+                }
+                None => f,
+            };
+            assert_eq!(out, vec![pin, expected], "k={k} L={l}");
+        }
+    }
+
+    #[test]
+    fn pin_expansion_reversed_pin_and_neg_one_fences() {
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        // Reversed pin argument order: (= 2 (str.len s)) still counts.
+        let s = nullary(&mut ctx, "s", str_s);
+        let len = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[s]).unwrap();
+        let two = ctx.mk_numeral(Rational::from_int(Integer::from(2i128)), int_s);
+        let pin = ctx.mk_eq(two, len).unwrap();
+        let app = to_int(&mut ctx, s);
+        let k = ctx.mk_numeral(Rational::from_int(Integer::from(42i128)), int_s);
+        let atom = ctx.mk_eq(app, k).unwrap();
+        let (out, _) = decide_const_int_conv(&mut ctx, vec![pin, atom]);
+        let w = ctx.mk_string_const("42");
+        let expected = ctx.mk_eq(s, w).unwrap();
+        assert_eq!(out, vec![pin, expected]);
+        // k = -1 under a pin: "length-L non-digit-run" has no finite exact
+        // form — fence (spec table).
+        let t = nullary(&mut ctx, "t", str_s);
+        let pin_t = len_pin(&mut ctx, t, 2);
+        let app_t = to_int(&mut ctx, t);
+        let neg1 = ctx.mk_numeral(Rational::from_int(Integer::from(-1i128)), int_s);
+        let atom_t = ctx.mk_eq(app_t, neg1).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![pin_t, atom_t]);
+        assert_eq!(out, vec![pin_t, atom_t], "k = -1 under a pin fences");
+        assert!(repairs.is_empty());
+        assert!(has_unreduced_int_conv(&ctx, &out));
+    }
+
+    #[test]
+    fn pin_over_cap_is_ignored() {
+        // A pathological pin (L > INT_CONV_PIN_LEN_CAP) must NOT expand
+        // (memory-bomb guard) — and s is not lone (it occurs in the pin), so
+        // the atom fences.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let pin = len_pin(&mut ctx, s, (INT_CONV_PIN_LEN_CAP as i128) + 1);
+        let app = to_int(&mut ctx, s);
+        let five = ctx.mk_numeral(Rational::from_int(Integer::from(5i128)), int_s);
+        let atom = ctx.mk_eq(app, five).unwrap();
+        let (out, _) = decide_const_int_conv(&mut ctx, vec![pin, atom]);
+        assert_eq!(out, vec![pin, atom], "over-cap pin ignored → fence");
+        assert!(has_unreduced_int_conv(&ctx, &out));
+    }
+
+    #[test]
+    fn lone_witness_rewrite_positive_and_repair() {
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let app = to_int(&mut ctx, s);
+        let five = ctx.mk_numeral(Rational::from_int(Integer::from(5i128)), int_s);
+        let atom = ctx.mk_eq(app, five).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![atom]);
+        let w = ctx.mk_string_const("5");
+        let expected = ctx.mk_eq(s, w).unwrap();
+        assert_eq!(out, vec![expected]);
+        assert_eq!(
+            repairs,
+            vec![IntConvRepair {
+                var: s,
+                witness: "5".to_string(),
+                fallback: String::new(),
+            }]
+        );
+        assert!(!has_unreduced_int_conv(&ctx, &out));
+    }
+
+    #[test]
+    fn lone_witness_rewrite_neg_one_and_negated_polarity() {
+        // k = -1: witness "" / fallback "0". Negated atom (any polarity):
+        // rewrites INSIDE the Not, repair still emitted.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let app = to_int(&mut ctx, s);
+        let neg1 = ctx.mk_numeral(Rational::from_int(Integer::from(-1i128)), int_s);
+        let atom = ctx.mk_eq(app, neg1).unwrap();
+        let not = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[atom]).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![not]);
+        let empty = ctx.mk_string_const("");
+        let inner = ctx.mk_eq(s, empty).unwrap();
+        let expected = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[inner]).unwrap();
+        assert_eq!(out, vec![expected]);
+        assert_eq!(
+            repairs,
+            vec![IntConvRepair {
+                var: s,
+                witness: String::new(),
+                fallback: "0".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn witness_repair_emitted_once_for_shared_atom() {
+        // The same atom TermId in two assertions: memoized rewrite ⇒ one
+        // consistent replacement, exactly ONE repair obligation.
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let app = to_int(&mut ctx, s);
+        let five = ctx.mk_numeral(Rational::from_int(Integer::from(5i128)), int_s);
+        let atom = ctx.mk_eq(app, five).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![atom, atom]);
+        assert_eq!(out[0], out[1], "consistent replacement");
+        assert_eq!(repairs.len(), 1, "memo hit must not duplicate the repair");
+    }
+
+    #[test]
+    fn non_lone_and_compound_args_fence() {
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let five = ctx.mk_numeral(Rational::from_int(Integer::from(5i128)), int_s);
+        // s reused by a second atom: not lone.
+        let s = nullary(&mut ctx, "s", str_s);
+        let x = nullary(&mut ctx, "x", str_s);
+        let app = to_int(&mut ctx, s);
+        let a1 = ctx.mk_eq(app, five).unwrap();
+        let a2 = ctx.mk_eq(s, x).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![a1, a2]);
+        assert_eq!(out, vec![a1, a2], "non-lone s fences");
+        assert!(repairs.is_empty());
+        // Compound to_int argument: fences even when its vars are lone
+        // (witness rewrites require a nullary uninterpreted constant — the
+        // model repair overrides a VARIABLE's value).
+        let u = nullary(&mut ctx, "u", str_s);
+        let v = nullary(&mut ctx, "v", str_s);
+        let cc = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[u, v])
+            .unwrap();
+        let app = to_int(&mut ctx, cc);
+        let a = ctx.mk_eq(app, five).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![a]);
+        assert_eq!(out, vec![a], "compound argument fences");
+        assert!(repairs.is_empty());
+        assert!(has_unreduced_int_conv(&ctx, &out));
+    }
+
+    #[test]
+    fn lone_witness_multi_digit() {
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let app = to_int(&mut ctx, s);
+        let k = ctx.mk_numeral(Rational::from_int(Integer::from(305i128)), int_s);
+        let atom = ctx.mk_eq(app, k).unwrap();
+        let (out, repairs) = decide_const_int_conv(&mut ctx, vec![atom]);
+        let w = ctx.mk_string_const("305");
+        let expected = ctx.mk_eq(s, w).unwrap();
+        assert_eq!(out, vec![expected]);
+        assert_eq!(repairs[0].witness, "305");
+        assert_eq!(repairs[0].fallback, "");
     }
 }
