@@ -1,7 +1,19 @@
 # Slice 19 design — RegLan plumbing + ground str.in_re by Brzozowski derivatives
 
 Date: 2026-07-13
-Status: Approved design, pre-implementation.
+Status: IMPLEMENTED (slice 19 landed 2026-07-13).
+
+Oracle (`qfs_regex_ground_matches_z3`, fresh seed `0x51_63_0000_0001`, 200
+iters): 50 sat / 88 unsat / 62 shinri-unknown (tolerated) /
+0 z3-unknown / 0 guard-bailout / 17 witnesses / **0
+disagreements**. All pre-existing string families re-ran unperturbed with
+tallies identical to their committed values.
+
+**Deviations from the spec.**
+None. (Production code matches the spec at every operator; the only
+implementation-time adjustments were transient clippy `#[allow(dead_code)]`
+attributes added in Task 2 and removed in Task 3, and cargo-fmt line
+reflows — neither changes behavior or the spec's contract.)
 
 Predecessor: slice 18 (`str.to_code`/`str.from_code`/`str.is_digit`, landed
 2026-07-12), which completed roadmap **Spec 4** (conversions). This slice

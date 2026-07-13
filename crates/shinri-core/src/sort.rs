@@ -18,4 +18,6 @@ pub enum SortNode {
     Float(u32, u32),
     /// The RoundingMode sort (5 enumerated values; see term::RoundingMode).
     RoundingMode,
+    /// The RegLan sort (SMT-LIB regular expressions over String, slice 19).
+    RegLan,
 }

@@ -34,6 +34,7 @@ pub struct Context {
     int_sort: SortId,
     real_sort: SortId,
     string_sort: SortId,
+    reglan_sort: SortId,
 }
 
 impl Default for Context {
@@ -62,11 +63,13 @@ impl Context {
             int_sort: SortId::from_index(0),
             real_sort: SortId::from_index(0),
             string_sort: SortId::from_index(0),
+            reglan_sort: SortId::from_index(0),
         };
         ctx.bool_sort = ctx.intern_sort(SortNode::Bool);
         ctx.int_sort = ctx.intern_sort(SortNode::Int);
         ctx.real_sort = ctx.intern_sort(SortNode::Real);
         ctx.string_sort = ctx.intern_sort(SortNode::String);
+        ctx.reglan_sort = ctx.intern_sort(SortNode::RegLan);
         ctx
     }
 
@@ -95,6 +98,10 @@ impl Context {
     #[inline]
     pub fn string_sort(&self) -> SortId {
         self.string_sort
+    }
+    #[inline]
+    pub fn reglan_sort(&self) -> SortId {
+        self.reglan_sort
     }
 
     pub fn declare_sort(&mut self, name: &str) -> SortId {
@@ -160,6 +167,15 @@ impl Context {
         let sym = self.symbols.intern(name);
         self.fun_sigs.insert(sym, (params.to_vec(), result));
         sym
+    }
+
+    /// True iff any declared function signature mentions the given sort
+    /// (result or any parameter). Slice 19: fences queries that declare a
+    /// RegLan-sorted symbol — RegLan must never reach model construction.
+    pub fn any_fun_sig_mentions(&self, s: SortId) -> bool {
+        self.fun_sigs
+            .values()
+            .any(|(params, ret)| *ret == s || params.contains(&s))
     }
 
     /// Look up a symbol by name without interning it. Used by the solver's
@@ -556,6 +572,67 @@ impl Context {
                     });
                 }
                 Ok(self.bool_sort())
+            }
+            // ── Regular expressions (slice 19) ───────────────────────────────
+            StrInRe => {
+                expect_arity(args, 2)?;
+                let (str_s, re_s) = (self.string_sort(), self.reglan_sort());
+                if self.sort_of(args[0]) != str_s {
+                    return Err(SortError::Mismatch {
+                        expected: str_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                if self.sort_of(args[1]) != re_s {
+                    return Err(SortError::Mismatch {
+                        expected: re_s,
+                        found: self.sort_of(args[1]),
+                    });
+                }
+                Ok(self.bool_sort())
+            }
+            StrToRe => {
+                expect_arity(args, 1)?;
+                let str_s = self.string_sort();
+                if self.sort_of(args[0]) != str_s {
+                    return Err(SortError::Mismatch {
+                        expected: str_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                Ok(self.reglan_sort())
+            }
+            ReNone | ReAll | ReAllChar => {
+                expect_arity(args, 0)?;
+                Ok(self.reglan_sort())
+            }
+            ReConcat | ReUnion | ReInter | ReDiff => {
+                if args.len() < 2 {
+                    return Err(SortError::Arity {
+                        expected: 2,
+                        found: args.len(),
+                    });
+                }
+                let re_s = self.reglan_sort();
+                expect_all(self, args, re_s)?;
+                Ok(re_s)
+            }
+            ReStar | RePlus | ReOpt | ReComp | ReLoop { .. } | RePow(_) => {
+                expect_arity(args, 1)?;
+                let re_s = self.reglan_sort();
+                if self.sort_of(args[0]) != re_s {
+                    return Err(SortError::Mismatch {
+                        expected: re_s,
+                        found: self.sort_of(args[0]),
+                    });
+                }
+                Ok(re_s)
+            }
+            ReRange => {
+                expect_arity(args, 2)?;
+                let str_s = self.string_sort();
+                expect_all(self, args, str_s)?;
+                Ok(self.reglan_sort())
             }
             // ── Floating-point: arithmetic ────────────────────────────────────
             FpAbs | FpNeg => {
@@ -1727,5 +1804,93 @@ mod tests {
         assert!(ctx
             .mk_app(Op::Builtin(BuiltinOp::StrToCode), &[s, s])
             .is_err());
+    }
+
+    #[test]
+    fn regex_sort_rules() {
+        fn nullary(ctx: &mut Context, name: &str, sort: SortId) -> TermId {
+            let f = ctx.declare_fun(name, &[], sort);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        }
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let re_s = ctx.reglan_sort();
+        let bool_s = ctx.bool_sort();
+        let int_s = ctx.int_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let n = nullary(&mut ctx, "n", int_s);
+
+        // Nullary RegLan constants.
+        let none = ctx.mk_app(Op::Builtin(BuiltinOp::ReNone), &[]).unwrap();
+        let all = ctx.mk_app(Op::Builtin(BuiltinOp::ReAll), &[]).unwrap();
+        let allchar = ctx.mk_app(Op::Builtin(BuiltinOp::ReAllChar), &[]).unwrap();
+        for r in [none, all, allchar] {
+            assert_eq!(ctx.sort_of(r), re_s);
+        }
+
+        // str.to_re : String -> RegLan.
+        let tore = ctx.mk_app(Op::Builtin(BuiltinOp::StrToRe), &[s]).unwrap();
+        assert_eq!(ctx.sort_of(tore), re_s);
+
+        // str.in_re : String x RegLan -> Bool.
+        let inre = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[s, tore])
+            .unwrap();
+        assert_eq!(ctx.sort_of(inre), bool_s);
+
+        // n-ary combinators (>= 2 args, all RegLan).
+        for op in [
+            BuiltinOp::ReConcat,
+            BuiltinOp::ReUnion,
+            BuiltinOp::ReInter,
+            BuiltinOp::ReDiff,
+        ] {
+            let r = ctx.mk_app(Op::Builtin(op), &[none, all, allchar]).unwrap();
+            assert_eq!(ctx.sort_of(r), re_s, "{op:?}");
+            assert!(
+                ctx.mk_app(Op::Builtin(op), &[none]).is_err(),
+                "{op:?} arity"
+            );
+        }
+
+        // Unary combinators, indexed included.
+        for op in [
+            BuiltinOp::ReStar,
+            BuiltinOp::RePlus,
+            BuiltinOp::ReOpt,
+            BuiltinOp::ReComp,
+            BuiltinOp::ReLoop { lo: 2, hi: 5 },
+            BuiltinOp::RePow(3),
+        ] {
+            let r = ctx.mk_app(Op::Builtin(op), &[allchar]).unwrap();
+            assert_eq!(ctx.sort_of(r), re_s, "{op:?}");
+        }
+
+        // re.range : String x String -> RegLan.
+        let a = ctx.mk_string_const("a");
+        let z = ctx.mk_string_const("z");
+        let range = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReRange), &[a, z])
+            .unwrap();
+        assert_eq!(ctx.sort_of(range), re_s);
+
+        // Wrong sorts rejected.
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::StrToRe), &[n]).is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[s, s])
+            .is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[none, none])
+            .is_err());
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::ReStar), &[s]).is_err());
+        assert!(ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReRange), &[a, n])
+            .is_err());
+        assert!(ctx.mk_app(Op::Builtin(BuiltinOp::ReNone), &[s]).is_err());
+
+        // any_fun_sig_mentions: false before, true after a RegLan declaration.
+        assert!(!ctx.any_fun_sig_mentions(re_s));
+        ctx.declare_fun("r", &[], re_s);
+        assert!(ctx.any_fun_sig_mentions(re_s));
     }
 }
