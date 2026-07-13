@@ -188,9 +188,12 @@ fuel, model construction, or printing — same posture as slice 18.
 - **Differential oracle**: new family `qfs_regex_ground_matches_z3` under
   `--features oracle`, fresh seed, 200 iters — random constant-regex ASTs
   of bounded depth weighted across *all* operators × ground strings over
-  a small alphabet (`{a,b,c}` plus occasional non-ASCII characters, all
-  ≤ `0x2FFFF` — above-alphabet chars are pinned in e2e, not generated
-  here) — positive-biased by
+  a small **ASCII-only** alphabet (`{a,b,c}`; shinri's parser does not
+  decode `\u{...}` escapes and z3 reads raw UTF-8 byte-wise — the
+  slice-18 witness-harness lesson — so non-ASCII in a script shared with
+  z3 is a harness-semantics mismatch, not a solver signal; non-ASCII and
+  above-alphabet membership is covered by unit tests and shinri-only
+  pins) — positive-biased by
   sampling matching strings via a regex walk on the `comp`/`inter`-free
   subset, with the small alphabet keeping random hits likely for
   `comp`/`inter` shapes; ~25% negation wrapping; unknown-tolerant;
