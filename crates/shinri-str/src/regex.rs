@@ -28,16 +28,16 @@
 //! or a range endpoint contains one, the fold is skipped (→ fence) rather
 //! than guessing semantics.
 
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 use std::collections::BTreeSet;
 
 /// Largest SMT-LIB string character (inclusive): U+2FFFF.
-const MAX_CODE: u32 = 0x2FFFF;
+pub(crate) const MAX_CODE: u32 = 0x2FFFF;
 
 /// Derivative-size fuel: if any intermediate derivative exceeds this many
 /// AST nodes the fold is abandoned (→ presence fence → sound Unknown).
-const FUEL_NODE_CAP: usize = 10_000;
+pub(crate) const FUEL_NODE_CAP: usize = 10_000;
 
 /// Canonical regex AST for ground evaluation. Invariants (enforced by the
 /// smart constructors, NEVER by direct construction of compound nodes):
@@ -48,8 +48,8 @@ const FUEL_NODE_CAP: usize = 10_000;
 /// - `Star`: argument is not `Empty`/`Eps`/`Star`.
 /// - `Comp`: argument is not `Comp`.
 /// - `Loop(r, lo, hi)`: `lo <= hi`, `hi >= 1`, `r` not `Empty`/`Eps`.
-#[derive(Clone, PartialEq, Eq, Debug)]
-enum Rex {
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Rex {
     /// ∅ — matches nothing.
     Empty,
     /// {ε} — matches exactly the empty string.
@@ -66,7 +66,7 @@ enum Rex {
     Loop(Box<Rex>, u32, u32),
 }
 
-fn concat(parts: Vec<Rex>) -> Rex {
+pub(crate) fn concat(parts: Vec<Rex>) -> Rex {
     let mut out = Vec::new();
     for p in parts {
         match p {
@@ -83,7 +83,7 @@ fn concat(parts: Vec<Rex>) -> Rex {
     }
 }
 
-fn union(parts: Vec<Rex>) -> Rex {
+pub(crate) fn union(parts: Vec<Rex>) -> Rex {
     let mut out: Vec<Rex> = Vec::new();
     for p in parts {
         match p {
@@ -109,7 +109,7 @@ fn union(parts: Vec<Rex>) -> Rex {
     }
 }
 
-fn inter(parts: Vec<Rex>) -> Rex {
+pub(crate) fn inter(parts: Vec<Rex>) -> Rex {
     let mut out: Vec<Rex> = Vec::new();
     for p in parts {
         match p {
@@ -137,7 +137,7 @@ fn inter(parts: Vec<Rex>) -> Rex {
     }
 }
 
-fn star(r: Rex) -> Rex {
+pub(crate) fn star(r: Rex) -> Rex {
     match r {
         Rex::Empty | Rex::Eps => Rex::Eps,
         s @ Rex::Star(_) => s,
@@ -145,14 +145,14 @@ fn star(r: Rex) -> Rex {
     }
 }
 
-fn comp(r: Rex) -> Rex {
+pub(crate) fn comp(r: Rex) -> Rex {
     match r {
         Rex::Comp(inner) => *inner,
         other => Rex::Comp(Box::new(other)),
     }
 }
 
-fn loop_(r: Rex, lo: u32, hi: u32) -> Rex {
+pub(crate) fn loop_(r: Rex, lo: u32, hi: u32) -> Rex {
     if lo > hi {
         return Rex::Empty;
     }
@@ -174,7 +174,7 @@ fn loop_(r: Rex, lo: u32, hi: u32) -> Rex {
 }
 
 /// ε ∈ L(r)?
-fn nullable(r: &Rex) -> bool {
+pub(crate) fn nullable(r: &Rex) -> bool {
     match r {
         Rex::Empty | Rex::Range(..) => false,
         Rex::Eps | Rex::Star(_) => true,
@@ -188,7 +188,7 @@ fn nullable(r: &Rex) -> bool {
 /// The Brzozowski derivative of `r` w.r.t. the char with code point `c`:
 /// `L(deriv(c, r)) = { w | c·w ∈ L(r) }`. Total — every operator (comp,
 /// inter, loop included) has a native rule; no automaton is built.
-fn deriv(c: u32, r: &Rex) -> Rex {
+pub(crate) fn deriv(c: u32, r: &Rex) -> Rex {
     match r {
         Rex::Empty | Rex::Eps => Rex::Empty,
         Rex::Range(lo, hi) => {
@@ -223,7 +223,7 @@ fn deriv(c: u32, r: &Rex) -> Rex {
     }
 }
 
-fn node_count(r: &Rex) -> usize {
+pub(crate) fn node_count(r: &Rex) -> usize {
     1 + match r {
         Rex::Empty | Rex::Eps | Rex::Range(..) => 0,
         Rex::Concat(ps) | Rex::Union(ps) | Rex::Inter(ps) => ps.iter().map(node_count).sum(),
@@ -244,7 +244,7 @@ fn eval_membership_capped(s: &str, r: &Rex, cap: usize) -> Option<bool> {
     Some(nullable(&cur))
 }
 
-fn eval_membership(s: &str, r: &Rex) -> Option<bool> {
+pub(crate) fn eval_membership(s: &str, r: &Rex) -> Option<bool> {
     eval_membership_capped(s, r, FUEL_NODE_CAP)
 }
 
@@ -260,6 +260,265 @@ fn lit_to_rex(s: &str) -> Option<Rex> {
         parts.push(Rex::Range(code, code));
     }
     Some(concat(parts)) // "" → Eps
+}
+
+// ─── Slice 21: derivative unfolding support ──────────────────────────────
+
+/// Max next-character classes per Rule-E expansion; more ⇒ fence (Unknown).
+pub(crate) const CLASS_SPLIT_CAP: usize = 64;
+/// Max derivative states visited by the model-repair word search.
+pub(crate) const MEMB_SEARCH_STEP_CAP: usize = 10_000;
+
+const SURR_LO: u32 = 0xD800;
+const SURR_HI: u32 = 0xDFFF;
+
+/// Collect the class boundaries contributed by every `Range` node in `r`:
+/// each range [lo, hi] cuts Σ at lo and hi+1.
+fn range_bounds(r: &Rex, out: &mut BTreeSet<u32>) {
+    match r {
+        Rex::Empty | Rex::Eps => {}
+        Rex::Range(lo, hi) => {
+            out.insert(*lo);
+            if *hi < MAX_CODE {
+                out.insert(hi + 1);
+            }
+        }
+        Rex::Concat(ps) | Rex::Union(ps) | Rex::Inter(ps) => {
+            for p in ps {
+                range_bounds(p, out);
+            }
+        }
+        Rex::Star(i) | Rex::Comp(i) | Rex::Loop(i, ..) => range_bounds(i, out),
+    }
+}
+
+/// Next-character classes: a partition of Σ = [0, MAX_CODE] into maximal
+/// ranges on which `deriv` is uniform. `deriv` branches only on `Range`
+/// membership tests, and no `Range` boundary of `r` falls strictly inside a
+/// class, so every test answers identically across the class. Using ALL
+/// ranges in `r` (not just head-reachable ones) yields a finer-than-needed
+/// partition — still correct. `None` iff the partition exceeds
+/// `CLASS_SPLIT_CAP` (→ caller fences).
+pub(crate) fn next_classes(r: &Rex) -> Option<Vec<(u32, u32)>> {
+    let mut bounds = BTreeSet::new();
+    bounds.insert(0u32);
+    range_bounds(r, &mut bounds);
+    let cuts: Vec<u32> = bounds.into_iter().collect();
+    if cuts.len() > CLASS_SPLIT_CAP {
+        return None;
+    }
+    let mut classes = Vec::with_capacity(cuts.len());
+    for (i, &lo) in cuts.iter().enumerate() {
+        let hi = if i + 1 < cuts.len() {
+            cuts[i + 1] - 1
+        } else {
+            MAX_CODE
+        };
+        classes.push((lo, hi));
+    }
+    Some(classes)
+}
+
+/// The syntactic shape `Range · R''` (Rule-E disjunct shape): a bare `Range`
+/// (residual ε) or a `Concat` whose head is a `Range`. Rule S peels exactly
+/// this shape; everything else goes through Rule E first.
+#[allow(dead_code)]
+pub(crate) fn head_forced(r: &Rex) -> Option<((u32, u32), Rex)> {
+    match r {
+        Rex::Range(lo, hi) => Some(((*lo, *hi), Rex::Eps)),
+        Rex::Concat(ps) => match &ps[0] {
+            Rex::Range(lo, hi) => Some(((*lo, *hi), concat(ps[1..].to_vec()))),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `(re.range c c')` for NON-surrogate endpoints.
+fn range_term_raw(ctx: &mut Context, lo: u32, hi: u32) -> TermId {
+    let l = ctx.mk_string_const(&char::from_u32(lo).expect("non-surrogate lo").to_string());
+    let h = ctx.mk_string_const(&char::from_u32(hi).expect("non-surrogate hi").to_string());
+    ctx.mk_app(Op::Builtin(BuiltinOp::ReRange), &[l, h])
+        .expect("re.range well-sorted")
+}
+
+/// A RegLan term denoting exactly the char set [lo, hi] ⊆ Σ. Surrogate
+/// endpoints — only `lo = 0xD800` / `hi = 0xDFFF` can arise, because class
+/// boundaries are user chars ±1 and user chars are never surrogates — are
+/// handled by splitting at the block and encoding the FULL block as
+/// `(re.diff (re.range \u{D7FF} \u{E000}) (re.union (re.range \u{D7FF} \u{D7FF})
+/// (re.range \u{E000} \u{E000})))`, whose endpoints are all expressible.
+#[allow(dead_code)]
+fn range_term(ctx: &mut Context, lo: u32, hi: u32) -> TermId {
+    debug_assert!(lo <= hi && hi <= MAX_CODE);
+    debug_assert!(
+        lo == SURR_LO || !(SURR_LO..=SURR_HI).contains(&lo),
+        "interior surrogate lo"
+    );
+    debug_assert!(
+        hi == SURR_HI || !(SURR_LO..=SURR_HI).contains(&hi),
+        "interior surrogate hi"
+    );
+    let mut parts: Vec<TermId> = Vec::new();
+    if lo < SURR_LO {
+        parts.push(range_term_raw(ctx, lo, hi.min(SURR_LO - 1)));
+    }
+    if lo <= SURR_LO && hi >= SURR_HI {
+        let outer = range_term_raw(ctx, SURR_LO - 1, SURR_HI + 1);
+        let a = range_term_raw(ctx, SURR_LO - 1, SURR_LO - 1);
+        let b = range_term_raw(ctx, SURR_HI + 1, SURR_HI + 1);
+        let u = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReUnion), &[a, b])
+            .expect("re.union well-sorted");
+        parts.push(
+            ctx.mk_app(Op::Builtin(BuiltinOp::ReDiff), &[outer, u])
+                .expect("re.diff well-sorted"),
+        );
+    }
+    if hi > SURR_HI {
+        parts.push(range_term_raw(ctx, lo.max(SURR_HI + 1), hi));
+    }
+    match parts.len() {
+        1 => parts[0],
+        _ => ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReUnion), &parts)
+            .expect("re.union well-sorted"),
+    }
+}
+
+/// Reverse translation Rex → RegLan term over the existing Re* builtins.
+/// Total (surrogate-endpoint ranges included). Guarantee: the minted term
+/// re-extracts (`extract_const_regex` succeeds) to a Rex with the SAME
+/// LANGUAGE — not always the same shape (the surrogate-block diff extracts
+/// as Inter/Comp). Deterministic, so hash-consing gives TermId identity for
+/// equal Rex inputs (the engine's dedup keys rely on this).
+#[allow(dead_code)]
+pub(crate) fn rex_to_term(ctx: &mut Context, r: &Rex) -> TermId {
+    let kids = |ctx: &mut Context, ps: &[Rex]| -> Vec<TermId> {
+        ps.iter().map(|p| rex_to_term(ctx, p)).collect()
+    };
+    match r {
+        Rex::Empty => ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReNone), &[])
+            .expect("re.none well-sorted"),
+        Rex::Eps => {
+            let e = ctx.mk_string_const("");
+            ctx.mk_app(Op::Builtin(BuiltinOp::StrToRe), &[e])
+                .expect("str.to_re well-sorted")
+        }
+        Rex::Range(lo, hi) => range_term(ctx, *lo, *hi),
+        Rex::Concat(ps) => {
+            let ks = kids(ctx, ps);
+            ctx.mk_app(Op::Builtin(BuiltinOp::ReConcat), &ks)
+                .expect("re.++ well-sorted")
+        }
+        Rex::Union(ps) => {
+            let ks = kids(ctx, ps);
+            ctx.mk_app(Op::Builtin(BuiltinOp::ReUnion), &ks)
+                .expect("re.union well-sorted")
+        }
+        Rex::Inter(ps) => {
+            let ks = kids(ctx, ps);
+            ctx.mk_app(Op::Builtin(BuiltinOp::ReInter), &ks)
+                .expect("re.inter well-sorted")
+        }
+        Rex::Star(i) => {
+            let k = rex_to_term(ctx, i);
+            ctx.mk_app(Op::Builtin(BuiltinOp::ReStar), &[k])
+                .expect("re.* well-sorted")
+        }
+        Rex::Comp(i) => {
+            let k = rex_to_term(ctx, i);
+            ctx.mk_app(Op::Builtin(BuiltinOp::ReComp), &[k])
+                .expect("re.comp well-sorted")
+        }
+        Rex::Loop(i, lo, hi) => {
+            let k = rex_to_term(ctx, i);
+            ctx.mk_app(Op::Builtin(BuiltinOp::ReLoop { lo: *lo, hi: *hi }), &[k])
+                .expect("re.loop well-sorted")
+        }
+    }
+}
+
+/// A word of length EXACTLY `n` in L(r), or None if none exists within
+/// `MEMB_SEARCH_STEP_CAP` visited states (an abort is NOT a verdict — the
+/// caller leaves the value untouched and the self-check backstops). DFS over
+/// next-character classes; per class the witness char is the smallest
+/// NON-SURROGATE code point (a pure-surrogate class has no Rust witness and
+/// is skipped — sound: skipping loses completeness only). `dead` memoizes
+/// (remaining, Rex) states with no word, preventing exponential re-search.
+#[allow(dead_code)]
+pub(crate) fn search_word(r: &Rex, n: usize) -> Option<String> {
+    fn go(
+        r: &Rex,
+        n: usize,
+        steps: &mut usize,
+        dead: &mut FxHashSet<(usize, Rex)>,
+        out: &mut String,
+    ) -> bool {
+        if *steps >= MEMB_SEARCH_STEP_CAP {
+            return false;
+        }
+        *steps += 1;
+        if n == 0 {
+            return nullable(r);
+        }
+        if matches!(r, Rex::Empty) {
+            return false;
+        }
+        let key = (n, r.clone());
+        if dead.contains(&key) {
+            return false;
+        }
+        if let Some(classes) = next_classes(r) {
+            for (lo, hi) in classes {
+                // Smallest non-surrogate witness in the class (boundaries can
+                // only be 0xD800 / 0xDFFF, so lo either avoids the block or
+                // the block ends inside the class at 0xDFFF).
+                let c = if (SURR_LO..=SURR_HI).contains(&lo) {
+                    if hi > SURR_HI {
+                        SURR_HI + 1
+                    } else {
+                        continue; // pure-surrogate class: no Rust witness
+                    }
+                } else {
+                    lo
+                };
+                let d = deriv(c, r);
+                if node_count(&d) > FUEL_NODE_CAP {
+                    continue;
+                }
+                out.push(char::from_u32(c).expect("non-surrogate in-alphabet"));
+                if go(&d, n - 1, steps, dead, out) {
+                    return true;
+                }
+                out.pop();
+            }
+        }
+        dead.insert(key);
+        false
+    }
+    let mut out = String::new();
+    let mut steps = 0usize;
+    let mut dead = FxHashSet::default();
+    if go(r, n, &mut steps, &mut dead, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// Ground membership of a CONCRETE string in the regex TERM `re_t`.
+/// 3-valued for the post-solve witness self-check: `Some(verdict)` iff `s`
+/// is in-alphabet, `re_t` extracts as a constant regex, and evaluation stays
+/// within fuel; `None` = cannot evaluate (treated as satisfied — can only
+/// MISS a violation, never fabricate one).
+pub fn eval_str_in_re(ctx: &Context, s: &str, re_t: TermId) -> Option<bool> {
+    if s.chars().any(|c| c as u32 > MAX_CODE) {
+        return None;
+    }
+    let rex = extract_const_regex(ctx, re_t)?;
+    eval_membership(s, &rex)
 }
 
 // ─── Slice 20: finite / co-finite language enumeration ──────────────────
@@ -475,7 +734,7 @@ fn enum_comp(r: &Rex) -> Option<Words> {
 /// non-constant leaf (symbolic `str.to_re` argument, non-literal `re.range`
 /// endpoint, RegLan variable / non-builtin application) or an
 /// above-alphabet literal char (→ fence).
-fn extract_const_regex(ctx: &Context, t: TermId) -> Option<Rex> {
+pub(crate) fn extract_const_regex(ctx: &Context, t: TermId) -> Option<Rex> {
     let TermNode::App { op, args, .. } = ctx.term_node(t) else {
         return None;
     };
@@ -605,7 +864,7 @@ fn mk_eq_disjunction(ctx: &mut Context, t: TermId, words: &Words, negate: bool) 
 }
 
 /// Any literal character above the SMT-LIB alphabet anywhere in `t`?
-fn str_term_mentions_above_alphabet(ctx: &Context, t: TermId) -> bool {
+pub(crate) fn str_term_mentions_above_alphabet(ctx: &Context, t: TermId) -> bool {
     if let Some(s) = ctx.string_const_value(t) {
         return s.chars().any(|c| c as u32 > MAX_CODE);
     }
@@ -1406,5 +1665,174 @@ mod tests {
         let out = rewrite_ground_in_re(&mut ctx, &[eq, atom]);
         assert_eq!(out[0], eq, "unrelated assertion must keep its TermId");
         assert_ne!(out[1], atom, "membership atom must be rewritten");
+    }
+
+    // ── Task 1 (slice 21): classes, reverse translation, word search ────────
+
+    #[test]
+    fn next_classes_partition_sigma() {
+        // [a-z]* → boundaries {0, 'a', 'z'+1} → 3 classes covering Σ exactly.
+        let r = star(Rex::Range('a' as u32, 'z' as u32));
+        let cls = next_classes(&r).unwrap();
+        assert_eq!(
+            cls,
+            vec![
+                (0, 'a' as u32 - 1),
+                ('a' as u32, 'z' as u32),
+                ('z' as u32 + 1, MAX_CODE)
+            ]
+        );
+        // Σ itself (re.allchar): ONE class.
+        assert_eq!(
+            next_classes(&Rex::Range(0, MAX_CODE)),
+            Some(vec![(0, MAX_CODE)])
+        );
+        // No ranges at all (∅, ε): one class covering Σ.
+        assert_eq!(next_classes(&Rex::Eps), Some(vec![(0, MAX_CODE)]));
+        // Cap abort: 40 disjoint single-char ranges → 81 boundaries > 64.
+        let many = union((0..40u32).map(|i| Rex::Range(3 * i, 3 * i)).collect());
+        assert_eq!(next_classes(&many), None);
+    }
+
+    #[test]
+    fn next_classes_derivative_uniform() {
+        // Inside each class the derivative is identical to the representative's.
+        let r = concat(vec![
+            union(vec![Rex::Range('a' as u32, 'm' as u32), lit("xy")]),
+            star(Rex::Range('0' as u32, '9' as u32)),
+        ]);
+        for (lo, hi) in next_classes(&r).unwrap() {
+            let d0 = deriv(lo, &r);
+            for c in [lo, (lo + hi) / 2, hi] {
+                assert_eq!(deriv(c, &r), d0, "class [{lo},{hi}] not uniform at {c}");
+            }
+        }
+    }
+
+    #[test]
+    fn head_forced_shapes() {
+        // Bare range: forced head, ε residual.
+        assert_eq!(
+            head_forced(&Rex::Range('a' as u32, 'z' as u32)),
+            Some((('a' as u32, 'z' as u32), Rex::Eps))
+        );
+        // Range-headed concat: forced head, concat residual.
+        let r = concat(vec![Rex::Range('a' as u32, 'a' as u32), star(lit("b"))]);
+        let (c, rest) = head_forced(&r).unwrap();
+        assert_eq!(c, ('a' as u32, 'a' as u32));
+        assert_eq!(rest, star(lit("b")));
+        // Not head-forced: star, union, eps, empty, comp.
+        assert_eq!(head_forced(&star(lit("a"))), None);
+        assert_eq!(head_forced(&Rex::Eps), None);
+        assert_eq!(head_forced(&Rex::Empty), None);
+        assert_eq!(head_forced(&comp(lit("a"))), None);
+    }
+
+    #[test]
+    fn rex_to_term_roundtrips_language() {
+        // Round-trip is SEMANTIC (same language), not syntactic — the
+        // surrogate-block encoding extracts back as Inter/Comp shapes.
+        let mut ctx = Context::new();
+        let samples = ["", "a", "z", "ab", "ba", "0", "abc", "zzz"];
+        let cases = vec![
+            Rex::Empty,
+            Rex::Eps,
+            Rex::Range('a' as u32, 'z' as u32),
+            star(Rex::Range('a' as u32, 'z' as u32)),
+            comp(star(Rex::Range('a' as u32, 'z' as u32))),
+            concat(vec![lit("a"), star(union(vec![lit("b"), lit("c")]))]),
+            loop_(Rex::Range('a' as u32, 'b' as u32), 1, 3),
+            inter(vec![star(lit("a")), comp(lit("aa"))]),
+        ];
+        for r in cases {
+            let t = rex_to_term(&mut ctx, &r);
+            let back = extract_const_regex(&ctx, t).expect("minted term must extract");
+            for s in samples {
+                assert_eq!(
+                    eval_membership(s, &back),
+                    eval_membership(s, &r),
+                    "language mismatch on {s:?} for {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rex_to_term_surrogate_block_range() {
+        // A class ending at 0xDFFF and one starting at 0xD800 — the only
+        // surrogate endpoints that can arise. The minted term must extract to
+        // a Rex with the same membership on representative code points.
+        let mut ctx = Context::new();
+        for (lo, hi) in [
+            (0xD800u32, 0xDFFFu32),
+            ('a' as u32, 0xDFFF),
+            (0xD800, 0x2FFFF),
+        ] {
+            let t = rex_to_term(&mut ctx, &Rex::Range(lo, hi));
+            let back = extract_const_regex(&ctx, t).expect("surrogate range term extracts");
+            // Membership decided per code point via deriv (u32-exact — works
+            // for surrogates even though no Rust literal can hold them).
+            for c in [
+                0u32, 'a' as u32, 0xD7FF, 0xD800, 0xDBBB, 0xDFFF, 0xE000, 0x2FFFF,
+            ] {
+                let want = lo <= c && c <= hi;
+                assert_eq!(
+                    nullable(&deriv(c, &back)),
+                    want,
+                    "code point {c:#x} in [{lo:#x},{hi:#x}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn search_word_finds_and_bounds() {
+        let az_star = star(Rex::Range('a' as u32, 'z' as u32));
+        // Word of exact length, all lengths realizable.
+        assert_eq!(search_word(&az_star, 0), Some(String::new()));
+        let w = search_word(&az_star, 3).unwrap();
+        assert_eq!(w.chars().count(), 3);
+        assert_eq!(eval_membership(&w, &az_star), Some(true));
+        // Intersection via the smart constructor: a* ∩ [a-z]{2}.
+        let two = loop_(Rex::Range('a' as u32, 'z' as u32), 2, 2);
+        let w2 = search_word(&inter(vec![star(lit("a")), two]), 2).unwrap();
+        assert_eq!(w2, "aa");
+        // No word of that length: a* has no length-1 word other than "a";
+        // a* ∩ b* has none at length ≥ 1.
+        assert_eq!(
+            search_word(&inter(vec![star(lit("a")), star(lit("b"))]), 1),
+            None
+        );
+        // Surrogate-only language: L = the surrogate block — no Rust witness.
+        assert_eq!(search_word(&Rex::Range(0xD800, 0xDFFF), 1), None);
+        // Witness skips the block: [0xD7FF-0xE001] at length 1 minted as 0xD7FF.
+        let w3 = search_word(&Rex::Range(0xD7FF, 0xE001), 1).unwrap();
+        assert_eq!(w3.chars().next().unwrap() as u32, 0xD7FF);
+        // Step-cap abort returns None (sound): a comp-heavy state space at a
+        // length the cap cannot cover. comp(a*) words of length 40 over Σ force
+        // one derivative state per prefix — cap trips before depth 40 × classes.
+        let hard = inter(
+            (0..12)
+                .map(|i| comp(loop_(Rex::Range(0, MAX_CODE), i, i)))
+                .collect(),
+        );
+        let _ = search_word(&hard, 40); // must terminate (None or Some) without hanging
+    }
+
+    #[test]
+    fn eval_str_in_re_term_level() {
+        let mut ctx = Context::new();
+        let r = star(Rex::Range('a' as u32, 'z' as u32));
+        let t = rex_to_term(&mut ctx, &r);
+        assert_eq!(eval_str_in_re(&ctx, "abc", t), Some(true));
+        assert_eq!(eval_str_in_re(&ctx, "aBc", t), Some(false));
+        // Symbolic regex term → None (cannot evaluate).
+        let v = {
+            let s = ctx.declare_fun("L", &[], ctx.reglan_sort());
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        assert_eq!(eval_str_in_re(&ctx, "a", v), None);
+        // Above-alphabet string → None.
+        assert_eq!(eval_str_in_re(&ctx, "\u{30000}", t), None);
     }
 }
