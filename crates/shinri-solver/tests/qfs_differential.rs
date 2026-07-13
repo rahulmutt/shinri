@@ -2478,7 +2478,9 @@ fn targeted_regex_ground_decided_unsat() {
 
 #[test]
 fn targeted_regex_fences_unknown() {
-    // Symbolic string side.
+    // Symbolic string side over re.allchar: STILL fenced after slice 20 —
+    // Σ has 0x30000 single-char words, far over ENUM_WORD_CAP, and Σ's
+    // complement ({""} ∪ longer words) is not co-finite.
     assert_eq!(
         shinri_verdict(
             "(set-logic QF_S)(declare-fun s () String)\
@@ -2515,6 +2517,123 @@ fn targeted_regex_fences_unknown() {
     // UTF-8 does not matter here).
     assert_eq!(
         shinri_verdict("(set-logic QF_S)(assert (str.in_re \"\u{30000}\" re.all))(check-sat)"),
+        Verdict::Unknown,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 20: symbolic str.in_re over finite / co-finite constant languages.
+// The atom rewrites to a FULL equivalence over word equations (⋁ t = wᵢ,
+// negated over the exception set for co-finite) — any polarity, any string
+// term. Neither-finite-nor-co-finite and over-cap shapes keep fencing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn targeted_regex_symbolic_decided_sat() {
+    // Finite: s ∈ {ab, c} minus "ab" → s = "c".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.union (str.to_re \"ab\") (str.to_re \"c\"))))\
+         (assert (not (= s \"ab\")))(check-sat)",
+        Verdict::Sat,
+    );
+    // Co-finite: s ≠ \"a\" with length 1 — e.g. s = \"b\".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.comp (str.to_re \"a\"))))\
+         (assert (= (str.len s) 1))(check-sat)",
+        Verdict::Sat,
+    );
+    // re.all over a fully symbolic term folds to true.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s re.all))(check-sat)",
+        Verdict::Sat,
+    );
+    // Concat string side: (s ++ \"b\") ∈ {ab} forces s = \"a\".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re (str.++ s \"b\") (str.to_re \"ab\")))\
+         (assert (= s \"a\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // Bounded loop over a range: 1–2 chars of {a,b,c}, length pinned to 2.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s ((_ re.loop 1 2) (re.range \"a\" \"c\"))))\
+         (assert (= (str.len s) 2))(check-sat)",
+        Verdict::Sat,
+    );
+    // Under Boolean structure (term ite): forces the membership true.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (ite (str.in_re s (str.to_re \"a\")) \"x\" \"y\") \"x\"))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_regex_symbolic_decided_unsat() {
+    // Finite: s constrained away from every word of the language.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.union (str.to_re \"a\") (str.to_re \"b\"))))\
+         (assert (not (= s \"a\")))(assert (not (= s \"b\")))(check-sat)",
+        Verdict::Unsat,
+    );
+    // re.none over a symbolic term folds to false.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s re.none))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Negated re.all membership folds to (not true).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (not (str.in_re s re.all)))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Co-finite vs pin: s ∈ comp({a}) conflicts with s = \"a\".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.comp (str.to_re \"a\"))))\
+         (assert (= s \"a\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Both polarities of one membership atom.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (str.to_re \"a\")))\
+         (assert (not (str.in_re s (str.to_re \"a\"))))(check-sat)",
+        Verdict::Unsat,
+    );
+    // re.diff(re.all, {a}): the co-finite Inter/Comp extraction shape.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.diff re.all (str.to_re \"a\"))))\
+         (assert (= s \"a\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_regex_symbolic_fences_unknown() {
+    // Star over a range: neither finite nor co-finite.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.* (re.range \"a\" \"b\"))))(check-sat)",
+        Verdict::Unknown,
+    );
+    // Cardinality cap: 300 words > ENUM_WORD_CAP = 256.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s ((_ re.loop 1 300) (str.to_re \"a\"))))(check-sat)",
+        Verdict::Unknown,
+    );
+    // Byte cap: one 9000-byte word ((_ re.^ 300) over a 30-char literal).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s ((_ re.^ 300) (str.to_re \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"))))(check-sat)",
         Verdict::Unknown,
     );
 }
