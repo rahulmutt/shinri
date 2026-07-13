@@ -22,6 +22,7 @@
 
 use rustc_hash::FxHashMap;
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
+use std::collections::BTreeSet;
 
 /// Largest SMT-LIB string character (inclusive): U+2FFFF.
 const MAX_CODE: u32 = 0x2FFFF;
@@ -251,6 +252,219 @@ fn lit_to_rex(s: &str) -> Option<Rex> {
         parts.push(Rex::Range(code, code));
     }
     Some(concat(parts)) // "" → Eps
+}
+
+// ─── Slice 20: finite / co-finite language enumeration ──────────────────
+
+/// Max cardinality of any intermediate word set in either enumerator.
+const ENUM_WORD_CAP: usize = 256;
+/// Max total bytes (sum of word lengths) of any intermediate word set.
+/// The cardinality cap alone does not bound work: `(_ re.loop n n)` over a
+/// one-word language has exactly ONE word of unbounded length.
+const ENUM_TOTAL_BYTES_CAP: usize = 4096;
+
+type Words = BTreeSet<String>;
+
+/// `None` iff the set crosses either enumeration cap (→ caller aborts).
+#[allow(dead_code)]
+fn check_caps(ws: Words) -> Option<Words> {
+    if ws.len() > ENUM_WORD_CAP {
+        return None;
+    }
+    if ws.iter().map(|w| w.len()).sum::<usize>() > ENUM_TOTAL_BYTES_CAP {
+        return None;
+    }
+    Some(ws)
+}
+
+/// Pairwise concatenation of two finite languages, cap-checked.
+#[allow(dead_code)]
+fn concat_words(a: &Words, b: &Words) -> Option<Words> {
+    let mut out = Words::new();
+    for x in a {
+        for y in b {
+            out.insert(format!("{x}{y}"));
+            if out.len() > ENUM_WORD_CAP {
+                return None;
+            }
+        }
+    }
+    check_caps(out)
+}
+
+/// The words of `L(r)` when STRUCTURALLY finite and within the caps; `None`
+/// otherwise. A `None` is never wrong — it only means "not recognized"
+/// (→ the atom survives to the presence fence).
+#[allow(dead_code)]
+fn enum_lang(r: &Rex) -> Option<Words> {
+    match r {
+        Rex::Empty => Some(Words::new()),
+        Rex::Eps => Some(Words::from([String::new()])),
+        Rex::Range(lo, hi) => {
+            // Surrogates (0xD800..=0xDFFF) are SMT-LIB alphabet characters
+            // but not Rust chars — a range touching them cannot be
+            // enumerated faithfully (words would be silently MISSED,
+            // breaking the equivalence). Any such range spans >= 2050
+            // chars (endpoints are Rust chars, hence non-surrogate), so
+            // the cardinality cap also rejects it — this guard makes the
+            // soundness argument local instead of an accident of the cap.
+            if *lo <= 0xDFFF && *hi >= 0xD800 {
+                return None;
+            }
+            if (*hi - *lo) as usize + 1 > ENUM_WORD_CAP {
+                return None;
+            }
+            let ws: Words = (*lo..=*hi)
+                .map(|c| {
+                    char::from_u32(c)
+                        .expect("non-surrogate in-alphabet code point")
+                        .to_string()
+                })
+                .collect();
+            check_caps(ws)
+        }
+        Rex::Concat(ps) => {
+            let mut acc = Words::from([String::new()]);
+            for p in ps {
+                acc = concat_words(&acc, &enum_lang(p)?)?;
+            }
+            Some(acc)
+        }
+        Rex::Union(ps) => {
+            let mut acc = Words::new();
+            for p in ps {
+                acc.extend(enum_lang(p)?);
+            }
+            check_caps(acc)
+        }
+        Rex::Inter(ps) => {
+            // Some part must enumerate finite; filter its words through
+            // the remaining parts by ground evaluation (comp/star parts
+            // are fine — eval_membership is total up to fuel).
+            let (i, base) = ps
+                .iter()
+                .enumerate()
+                .find_map(|(i, p)| Some((i, enum_lang(p)?)))?;
+            let mut out = Words::new();
+            for w in base {
+                let mut keep = true;
+                for (j, p) in ps.iter().enumerate() {
+                    if j == i {
+                        continue;
+                    }
+                    match eval_membership(&w, p) {
+                        Some(true) => {}
+                        Some(false) => {
+                            keep = false;
+                            break;
+                        }
+                        // Derivative fuel — abort the WHOLE enumeration,
+                        // never guess.
+                        None => return None,
+                    }
+                }
+                if keep {
+                    out.insert(w);
+                }
+            }
+            Some(out)
+        }
+        Rex::Loop(inner, lo, hi) => {
+            let s = enum_lang(inner)?;
+            // Early-outs the smart constructors cannot see (they only
+            // collapse SYNTACTIC Empty/Eps arguments): L(inner) = ∅ or
+            // {""} would otherwise spin up to `hi` no-growth iterations.
+            if s.is_empty() {
+                return Some(if *lo == 0 {
+                    Words::from([String::new()])
+                } else {
+                    Words::new()
+                });
+            }
+            if s.len() == 1 && s.contains("") {
+                return Some(Words::from([String::new()]));
+            }
+            // cur = S^n from n = 0; acc collects S^lo ∪ … ∪ S^hi.
+            // Termination: S now has a nonempty word, so every power
+            // either grows `cur`'s total bytes (single-word S) or `acc`'s
+            // cardinality — one of the caps fires within ~max(cap) steps
+            // unless the fixpoint breaks first.
+            let mut cur = Words::from([String::new()]);
+            let mut acc = Words::new();
+            let mut n: u32 = 0;
+            loop {
+                if n >= *lo {
+                    let before = acc.len();
+                    acc.extend(cur.iter().cloned());
+                    acc = check_caps(acc)?;
+                    if acc.len() == before && n > *lo {
+                        // S^n ⊆ (union of lower powers ≥ lo) implies
+                        // S^(n+1) = S^n·S ⊆ acc·S ⊆ acc, inductively for
+                        // all higher powers — nothing new can appear.
+                        break;
+                    }
+                }
+                if n == *hi {
+                    break;
+                }
+                cur = concat_words(&cur, &s)?;
+                n += 1;
+            }
+            Some(acc)
+        }
+        Rex::Star(_) | Rex::Comp(_) => None,
+    }
+}
+
+/// The EXCEPTION set `Σ* \ L(r)` when `L(r)` is STRUCTURALLY co-finite and
+/// within the caps; `None` otherwise.
+#[allow(dead_code)]
+fn enum_comp(r: &Rex) -> Option<Words> {
+    match r {
+        Rex::Comp(inner) => enum_lang(inner),
+        // Σ* itself (re.all's extraction): co-finite, zero exceptions.
+        Rex::Star(inner) if **inner == Rex::Range(0, MAX_CODE) => Some(Words::new()),
+        // Σ* \ ⋂ps = ⋃(Σ* \ p): EVERY part must be co-finite.
+        Rex::Inter(ps) => {
+            let mut acc = Words::new();
+            for p in ps {
+                acc.extend(enum_comp(p)?);
+            }
+            check_caps(acc)
+        }
+        // Σ* \ ⋃ps = ⋂(Σ* \ p): SOME part must be co-finite; its
+        // exceptions, filtered by NON-membership in every other part.
+        Rex::Union(ps) => {
+            let (i, base) = ps
+                .iter()
+                .enumerate()
+                .find_map(|(i, p)| Some((i, enum_comp(p)?)))?;
+            let mut out = Words::new();
+            for w in base {
+                let mut keep = true;
+                for (j, p) in ps.iter().enumerate() {
+                    if j == i {
+                        continue;
+                    }
+                    match eval_membership(&w, p) {
+                        Some(false) => {}
+                        Some(true) => {
+                            keep = false;
+                            break;
+                        }
+                        None => return None,
+                    }
+                }
+                if keep {
+                    out.insert(w);
+                }
+            }
+            Some(out)
+        }
+        // Complements of Empty/Eps/Range/Concat/Loop and other Stars are
+        // infinite (or rare enough not to chase) — not recognized.
+        _ => None,
+    }
 }
 
 /// Structural translation of a CONSTANT RegLan term. None on any
@@ -837,5 +1051,130 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ── Task 1 (slice 20): finite / co-finite enumeration ────────────────
+
+    fn words(xs: &[&str]) -> Words {
+        xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn enum_lang_per_operator() {
+        // Leaves.
+        assert_eq!(enum_lang(&Rex::Empty), Some(words(&[])));
+        assert_eq!(enum_lang(&Rex::Eps), Some(words(&[""])));
+        assert_eq!(
+            enum_lang(&Rex::Range('a' as u32, 'c' as u32)),
+            Some(words(&["a", "b", "c"]))
+        );
+        // Concat: cross product.
+        assert_eq!(
+            enum_lang(&concat(vec![union(vec![lit("a"), lit("b")]), lit("x")])),
+            Some(words(&["ax", "bx"]))
+        );
+        // Union: set union, deduped (BTreeSet order = determinism).
+        assert_eq!(
+            enum_lang(&union(vec![lit("b"), lit("a"), lit("b")])),
+            Some(words(&["a", "b"]))
+        );
+        // Inter: filter the finite side through the other (comp!) sides.
+        assert_eq!(
+            enum_lang(&inter(vec![
+                union(vec![lit("a"), lit("b")]),
+                comp(lit("a"))
+            ])),
+            Some(words(&["b"]))
+        );
+        // Loop: bounded powers, including the ε floor at lo = 0.
+        assert_eq!(
+            enum_lang(&loop_(lit("a"), 1, 3)),
+            Some(words(&["a", "aa", "aaa"]))
+        );
+        assert_eq!(
+            enum_lang(&loop_(union(vec![lit("a"), lit("b")]), 0, 1)),
+            Some(words(&["", "a", "b"]))
+        );
+        // Star / Comp: never structurally finite.
+        assert_eq!(enum_lang(&star(lit("a"))), None);
+        assert_eq!(enum_lang(&comp(lit("a"))), None);
+    }
+
+    #[test]
+    fn enum_lang_loop_degenerate_inner_terminates() {
+        // L(inner) = ∅ (Inter of disjoint literals) — invisible to the smart
+        // constructors, so the Loop node survives; the enumerator must
+        // early-out instead of iterating toward the huge bound.
+        let empty_lang = inter(vec![lit("a"), lit("b")]);
+        assert_eq!(
+            enum_lang(&loop_(empty_lang.clone(), 1, u32::MAX)),
+            Some(words(&[]))
+        );
+        assert_eq!(
+            enum_lang(&loop_(empty_lang, 0, u32::MAX)),
+            Some(words(&[""]))
+        );
+        // L(inner) = {""}: Inter of two opt-shapes — again invisible to the
+        // constructors. Without the early-out this loop would spin ~2^32
+        // no-growth iterations.
+        let eps_lang = inter(vec![
+            union(vec![lit("a"), Rex::Eps]),
+            union(vec![lit("b"), Rex::Eps]),
+        ]);
+        assert_eq!(enum_lang(&loop_(eps_lang, 5, u32::MAX)), Some(words(&[""])));
+    }
+
+    #[test]
+    fn enum_caps_and_surrogates_abort() {
+        // Cardinality cap: 3^6 = 729 words > 256.
+        let abc = union(vec![lit("a"), lit("b"), lit("c")]);
+        assert_eq!(enum_lang(&loop_(abc, 6, 6)), None);
+        // Byte cap: ONE word of 100·60 = 6000 bytes > 4096 — the shape the
+        // cardinality cap cannot see.
+        let a100 = lit(&"a".repeat(100));
+        assert_eq!(enum_lang(&loop_(a100, 60, 60)), None);
+        // Huge-bound loop over a single word: aborts via the caps, fast.
+        assert_eq!(enum_lang(&loop_(lit("a"), 1, u32::MAX)), None);
+        // Range wider than the cardinality cap.
+        assert_eq!(enum_lang(&Rex::Range(0, 300)), None);
+        // Surrogate-crossing range: explicit guard.
+        assert_eq!(enum_lang(&Rex::Range(0xD000, 0xE000)), None);
+    }
+
+    #[test]
+    fn enum_comp_per_operator() {
+        let sigma_star = star(Rex::Range(0, MAX_CODE));
+        // re.all: co-finite with zero exceptions.
+        assert_eq!(enum_comp(&sigma_star), Some(words(&[])));
+        // comp(finite): exceptions are exactly the finite words.
+        assert_eq!(
+            enum_comp(&comp(union(vec![lit("a"), lit("b")]))),
+            Some(words(&["a", "b"]))
+        );
+        // Inter of co-finites: union of exceptions (Σ*\⋂ = ⋃ complements).
+        assert_eq!(
+            enum_comp(&inter(vec![comp(lit("a")), comp(lit("b"))])),
+            Some(words(&["a", "b"]))
+        );
+        // The extracted re.diff(re.all, X) shape: inter(Σ*, comp(X)).
+        assert_eq!(
+            enum_comp(&inter(vec![sigma_star.clone(), comp(lit("a"))])),
+            Some(words(&["a"]))
+        );
+        // Union with a co-finite part: its exceptions filtered by
+        // NON-membership in the other parts ("b" rejoins via to_re "b").
+        assert_eq!(
+            enum_comp(&union(vec![
+                comp(union(vec![lit("a"), lit("b")])),
+                lit("b")
+            ])),
+            Some(words(&["a"]))
+        );
+        // Not structurally co-finite: finite shapes, star, bare ranges.
+        assert_eq!(enum_comp(&lit("a")), None);
+        assert_eq!(enum_comp(&Rex::Eps), None);
+        assert_eq!(enum_comp(&Rex::Empty), None);
+        assert_eq!(enum_comp(&star(lit("a"))), None);
+        assert_eq!(enum_comp(&Rex::Range('a' as u32, 'c' as u32)), None);
     }
 }
