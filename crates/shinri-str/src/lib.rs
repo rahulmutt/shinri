@@ -37,6 +37,11 @@ pub struct StrSolver {
     /// them only when NO conditional string (dis)equality is active.
     eq_levels: Vec<u32>,
     diseq_levels: Vec<u32>,
+    /// Asserted str.in_re atoms: (atom, literal, polarity). Polarity false ⟹
+    /// the membership is asserted NEGATIVELY (t ∉ R ≡ t ∈ comp(R) internally).
+    memb_true: Vec<(TermId, Lit, bool)>,
+    /// SAT decision level per memb_true entry (lock-step; truncated on pop).
+    memb_levels: Vec<u32>,
     len_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
     emitted_len_axioms: FxHashSet<TermId>,
@@ -103,6 +108,13 @@ impl TheorySolver for StrSolver {
                     }
                     None => {}
                 }
+            }
+            // Slice 21: record membership atoms at both polarities. The regex
+            // side is constant by the solver fence (input atoms) or by
+            // construction (engine-minted atoms).
+            if matches!(op, Op::Builtin(BuiltinOp::StrInRe)) {
+                self.memb_true.push((atom, lit, lit.is_positive()));
+                self.memb_levels.push(lvl);
             }
         }
         None
@@ -1087,16 +1099,22 @@ impl TheorySolver for StrSolver {
     }
 
     fn push(&mut self) {
-        self.trail.push(self.eq_true.len(), self.diseq_true.len());
+        self.trail.push(
+            self.eq_true.len(),
+            self.diseq_true.len(),
+            self.memb_true.len(),
+        );
     }
 
     fn pop(&mut self, level: usize) {
-        if let Some((e, d)) = self.trail.pop_to(level) {
+        if let Some((e, d, mb)) = self.trail.pop_to(level) {
             self.eq_true.truncate(e);
             self.diseq_true.truncate(d);
             // Keep the parallel assertion-level records in lock-step (E1 gate).
             self.eq_levels.truncate(e);
             self.diseq_levels.truncate(d);
+            self.memb_true.truncate(mb);
+            self.memb_levels.truncate(mb);
         }
     }
 
@@ -1104,6 +1122,7 @@ impl TheorySolver for StrSolver {
     fn cited_lits(&self, out: &mut Vec<(Lit, &'static str)>) {
         out.extend(self.eq_true.iter().map(|&(_, l)| (l, "str.eq_true")));
         out.extend(self.diseq_true.iter().map(|&(_, l)| (l, "str.diseq_true")));
+        out.extend(self.memb_true.iter().map(|&(_, l, _)| (l, "str.memb_true")));
     }
 
     fn shared_arith_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
@@ -1289,6 +1308,14 @@ impl StrSolver {
     /// Used in unit tests to seed model construction.
     pub fn test_force_str_term(&mut self, t: TermId) {
         self.str_terms.insert(t);
+    }
+
+    /// Push a membership atom directly onto `memb_true` (dummy Lit, level 0),
+    /// simulating the SAT layer asserting `str.in_re` at the given polarity.
+    pub fn test_force_memb_true(&mut self, atom: TermId, positive: bool) {
+        self.memb_true
+            .push((atom, Lit::new(Var::new(0), true), positive));
+        self.memb_levels.push(0);
     }
 }
 
@@ -1513,5 +1540,32 @@ mod tests {
             }
             other => panic!("expected a String model for x, got {other:?}"),
         }
+    }
+
+    // ── Task 2 (slice 21): membership intake + retraction bookkeeping ───────
+
+    #[test]
+    fn memb_intake_and_pop_truncate_together() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let re_t = crate::regex::test_az_star_term(&mut ctx);
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        let mut s = StrSolver::default();
+        s.test_force_memb_true(atom, true);
+        assert_eq!(s.memb_true.len(), 1);
+        assert_eq!(s.memb_levels, vec![0]);
+        // push/pop keep memb_true in lock-step with eq_true/diseq_true.
+        s.push();
+        s.test_force_memb_true(atom, false);
+        assert_eq!(s.memb_true.len(), 2);
+        s.pop(0);
+        assert_eq!(s.memb_true.len(), 1);
+        assert_eq!(s.memb_levels.len(), 1);
     }
 }

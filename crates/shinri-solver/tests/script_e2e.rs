@@ -942,3 +942,46 @@ fn str_e1_wrong_unsat_regression_pins() {
         "s07 (E1 regression pin: sound unknown)"
     );
 }
+
+// Slice 21 (Task 2): fence narrowed, engine rules not yet wired. Sound
+// verdicts only — Sat must carry a genuine witness (self-check), everything
+// else Unknown. These pins tighten in Tasks 3–5.
+//
+// NOTE (deviation from the task-2 brief): the brief's verbatim snippet uses an
+// `expect(src, Verdict::..)` helper that lives only in `qfs_differential.rs`
+// (and there also cross-checks z3). `script_e2e.rs` has no such helper — every
+// test in this file drives `run_script` directly and asserts on the raw
+// `Vec<String>` output — so these three pins are transcribed in that idiom
+// instead, with the exact SMT-LIB scripts and expected verdicts from the brief.
+
+#[test]
+fn in_re_symbolic_nullable_sat_via_selfcheck() {
+    // x ∈ [a-z]* is satisfied by the default model (x = "" — nullable), and
+    // the extended self-check verifies it: sat with witness even pre-engine.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (str.in_re x (re.* (re.range \"a\" \"z\"))))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn in_re_symbolic_nonnullable_unknown_pre_engine() {
+    // x ∈ [a-z]+ : the default model (x = "") violates the membership; no
+    // engine rules yet, so the self-check downgrades to Unknown — NOT a wrong
+    // verdict. Task 4 flips this pin to Sat.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))(check-sat)",
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn in_re_symbolic_regex_side_still_fenced() {
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun L () RegLan)\
+         (assert (str.in_re x L))(check-sat)",
+    );
+    assert_eq!(out, vec!["unknown"]);
+}

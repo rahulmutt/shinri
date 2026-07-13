@@ -947,6 +947,40 @@ pub fn has_unreduced_regex(ctx: &Context, assertions: &[TermId]) -> bool {
     assertions.iter().any(|&a| walk(ctx, a))
 }
 
+/// Slice-21 fence (replaces the slice-19/20 blanket presence fence at the
+/// solver seam): true iff anything regex-shaped survives that the ENGINE
+/// cannot own — a `str.in_re` whose regex side fails constant extraction or
+/// whose string side mentions an above-alphabet literal, or any
+/// RegLan-sorted subterm OUTSIDE the regex position of a supported
+/// membership (RegLan equality, bare RegLan terms). Engine-eligible
+/// memberships are NOT fenced — they flow to StrSolver as ordinary atoms.
+pub fn has_unsupported_regex(ctx: &Context, assertions: &[TermId]) -> bool {
+    fn walk(ctx: &Context, t: TermId) -> bool {
+        if ctx.sort_of(t) == ctx.reglan_sort() {
+            return true; // RegLan term outside a supported membership position
+        }
+        match ctx.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                let kids: Vec<TermId> = ctx.children(*args).to_vec();
+                if matches!(op, Op::Builtin(BuiltinOp::StrInRe)) {
+                    return extract_const_regex(ctx, kids[1]).is_none()
+                        || str_term_mentions_above_alphabet(ctx, kids[0])
+                        || walk(ctx, kids[0]);
+                }
+                kids.iter().any(|&c| walk(ctx, c))
+            }
+            TermNode::Const { .. } => false,
+        }
+    }
+    assertions.iter().any(|&a| walk(ctx, a))
+}
+
+/// Test-only: `(re.* (re.range "a" "z"))` as a term.
+#[cfg(test)]
+pub(crate) fn test_az_star_term(ctx: &mut Context) -> TermId {
+    rex_to_term(ctx, &star(Rex::Range('a' as u32, 'z' as u32)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1834,5 +1868,45 @@ mod tests {
         assert_eq!(eval_str_in_re(&ctx, "a", v), None);
         // Above-alphabet string → None.
         assert_eq!(eval_str_in_re(&ctx, "\u{30000}", t), None);
+    }
+
+    // ── Task 2 (slice 21): narrowed fence ────────────────────────────────
+
+    #[test]
+    fn unsupported_regex_fence_narrowed() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        // Engine-eligible: symbolic string × constant infinite regex → NOT fenced.
+        let az_star = rex_to_term(&mut ctx, &star(Rex::Range('a' as u32, 'z' as u32)));
+        let ok = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, az_star])
+            .unwrap();
+        assert!(!has_unsupported_regex(&ctx, &[ok]));
+        // Symbolic REGEX side → fenced.
+        let lvar = {
+            let s = ctx.declare_fun("L", &[], ctx.reglan_sort());
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let sym = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, lvar])
+            .unwrap();
+        assert!(has_unsupported_regex(&ctx, &[sym]));
+        // Above-alphabet string side → fenced.
+        let hi = ctx.mk_string_const("\u{30000}");
+        let bad = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[hi, az_star])
+            .unwrap();
+        assert!(has_unsupported_regex(&ctx, &[bad]));
+        // Bare RegLan term outside membership position (RegLan equality) → fenced.
+        let two = rex_to_term(&mut ctx, &lit("q"));
+        let re_eq = ctx.mk_eq(lvar, two).unwrap();
+        assert!(has_unsupported_regex(&ctx, &[re_eq]));
+        // The eligible atom under Boolean structure stays unfenced.
+        let notok = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[ok]).unwrap();
+        assert!(!has_unsupported_regex(&ctx, &[notok]));
     }
 }

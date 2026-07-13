@@ -2811,11 +2811,14 @@ fn targeted_regex_symbolic_decided_unsat() {
 
 #[test]
 fn targeted_regex_symbolic_fences_unknown() {
-    // Star over a range: neither finite nor co-finite.
+    // Star over a range: neither finite nor co-finite. slice 21: decided (was
+    // fenced Unknown) — the membership flows to StrSolver as an ordinary atom,
+    // the default model s="" genuinely satisfies the nullable [a-b]*, and the
+    // membership-aware self-check validates it (z3 cross-checked via expect).
     expect(
         "(set-logic QF_S)(declare-fun s () String)\
          (assert (str.in_re s (re.* (re.range \"a\" \"b\"))))(check-sat)",
-        Verdict::Unknown,
+        Verdict::Sat,
     );
     // Cardinality cap: 300 words > ENUM_WORD_CAP = 256.
     expect(
