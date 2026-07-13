@@ -1,4 +1,4 @@
-//! Slice 19 pre-pass: `str.in_re` over SMT-LIB regular expressions —
+//! Slice 19+20 pre-pass: `str.in_re` over SMT-LIB regular expressions —
 //! ground evaluation by Brzozowski derivatives + presence fence.
 //!
 //! Decided fragment: `str.in_re(s, R)` where `s` is a string literal and `R`
@@ -6,6 +6,14 @@
 //! endpoint is a literal). The atom folds to true/false — evaluation, a full
 //! logical equivalence at any polarity, any occurrence count. No model
 //! repair, no fresh variables.
+//!
+//! Slice 20 adds: `str.in_re(t, R)` for ANY String term `t` when `L(R)` is
+//! STRUCTURALLY finite (rewrites to `⋁ t = wᵢ`) or co-finite (rewrites to
+//! `¬⋁ t = wᵢ` over the exception set) within the enumeration caps
+//! (`ENUM_WORD_CAP`, `ENUM_TOTAL_BYTES_CAP`) — full equivalences at any
+//! polarity; the produced (dis)equalities are word equations the engine
+//! already owns. Surrogate-crossing ranges and above-alphabet string
+//! sides are skipped (→ fence), never guessed.
 //!
 //! Stages (run by the solver's string-path seam, right after code_conv):
 //! 1. [`rewrite_ground_in_re`] — bottom-up memoized pass folding every ground
@@ -266,7 +274,6 @@ const ENUM_TOTAL_BYTES_CAP: usize = 4096;
 type Words = BTreeSet<String>;
 
 /// `None` iff the set crosses either enumeration cap (→ caller aborts).
-#[allow(dead_code)]
 fn check_caps(ws: Words) -> Option<Words> {
     if ws.len() > ENUM_WORD_CAP {
         return None;
@@ -278,7 +285,6 @@ fn check_caps(ws: Words) -> Option<Words> {
 }
 
 /// Pairwise concatenation of two finite languages, cap-checked.
-#[allow(dead_code)]
 fn concat_words(a: &Words, b: &Words) -> Option<Words> {
     let mut out = Words::new();
     for x in a {
@@ -295,7 +301,6 @@ fn concat_words(a: &Words, b: &Words) -> Option<Words> {
 /// The words of `L(r)` when STRUCTURALLY finite and within the caps; `None`
 /// otherwise. A `None` is never wrong — it only means "not recognized"
 /// (→ the atom survives to the presence fence).
-#[allow(dead_code)]
 fn enum_lang(r: &Rex) -> Option<Words> {
     match r {
         Rex::Empty => Some(Words::new()),
@@ -418,7 +423,6 @@ fn enum_lang(r: &Rex) -> Option<Words> {
 
 /// The EXCEPTION set `Σ* \ L(r)` when `L(r)` is STRUCTURALLY co-finite and
 /// within the caps; `None` otherwise.
-#[allow(dead_code)]
 fn enum_comp(r: &Rex) -> Option<Words> {
     match r {
         Rex::Comp(inner) => enum_lang(inner),
@@ -554,6 +558,67 @@ fn try_fold_in_re(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
     Some(ctx.mk_const_bool(v))
 }
 
+/// Slice 20: `t ∈ R` for ANY string term `t` when `L(R)` is structurally
+/// finite (⇒ `⋁ t = wᵢ`) or co-finite (⇒ `¬⋁ t = wᵢ` over the exception
+/// set). Full equivalences at any polarity — no fresh variables, no
+/// repair. Skipped (→ fence) when the string side contains an
+/// above-alphabet literal character (slice-18/19 posture: don't guess
+/// semantics outside Σ) or when neither enumerator recognizes `R`.
+fn try_rewrite_symbolic_in_re(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
+    if str_term_mentions_above_alphabet(ctx, kids[0]) {
+        return None;
+    }
+    let rex = extract_const_regex(ctx, kids[1])?;
+    if let Some(ws) = enum_lang(&rex) {
+        return Some(mk_eq_disjunction(ctx, kids[0], &ws, false));
+    }
+    let exceptions = enum_comp(&rex)?;
+    Some(mk_eq_disjunction(ctx, kids[0], &exceptions, true))
+}
+
+/// `⋁ᵢ (= t wᵢ)` — 0-ary folds straight to a Bool const (`negate` for the
+/// co-finite reading), 1-ary is the bare equality, and `negate` wraps the
+/// result in Not.
+fn mk_eq_disjunction(ctx: &mut Context, t: TermId, words: &Words, negate: bool) -> TermId {
+    if words.is_empty() {
+        return ctx.mk_const_bool(negate);
+    }
+    let disj: Vec<TermId> = words
+        .iter()
+        .map(|w| {
+            let lit = ctx.mk_string_const(w);
+            ctx.mk_eq(t, lit).expect("well-sorted equality")
+        })
+        .collect();
+    let core = if disj.len() == 1 {
+        disj[0]
+    } else {
+        ctx.mk_app(Op::Builtin(BuiltinOp::Or), &disj)
+            .expect("well-sorted disjunction")
+    };
+    if negate {
+        ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[core])
+            .expect("well-sorted negation")
+    } else {
+        core
+    }
+}
+
+/// Any literal character above the SMT-LIB alphabet anywhere in `t`?
+fn str_term_mentions_above_alphabet(ctx: &Context, t: TermId) -> bool {
+    if let Some(s) = ctx.string_const_value(t) {
+        return s.chars().any(|c| c as u32 > MAX_CODE);
+    }
+    match ctx.term_node(t) {
+        TermNode::App { args, .. } => {
+            let kids: Vec<TermId> = ctx.children(*args).to_vec();
+            kids.iter()
+                .any(|&k| str_term_mentions_above_alphabet(ctx, k))
+        }
+        TermNode::Const { .. } => false,
+    }
+}
+
 /// Bottom-up memoized pass folding every GROUND `str.in_re` atom to a Bool
 /// constant. Untouched subtrees keep their TermIds. Mirrors
 /// `code_conv::rewrite_code_conv`.
@@ -576,7 +641,13 @@ fn rewrite(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -
             let new_children: Vec<TermId> =
                 children.iter().map(|&c| rewrite(ctx, c, memo)).collect();
             let special = match op {
-                Op::Builtin(BuiltinOp::StrInRe) => try_fold_in_re(ctx, &new_children),
+                // Ground fold first (cheaper; also decides INFINITE
+                // languages for literal strings), then the slice-20
+                // finite/co-finite equivalence rewrite.
+                Op::Builtin(BuiltinOp::StrInRe) => match try_fold_in_re(ctx, &new_children) {
+                    Some(r) => Some(r),
+                    None => try_rewrite_symbolic_in_re(ctx, &new_children),
+                },
                 _ => None,
             };
             if let Some(r) = special {
@@ -979,9 +1050,15 @@ mod tests {
         let s = nullary(&mut ctx, "s", str_s);
         let a = slit(&mut ctx, "a");
 
-        // Symbolic string side.
+        // Symbolic string side, against a genuinely undecidable (neither
+        // finite nor co-finite) language: slice 20 DECIDES symbolic string
+        // sides when `L(R)` is finite/co-finite (see the
+        // `symbolic_*` tests below), so `to_re("a")` alone (finite, {"a"})
+        // no longer belongs here — use `re.*` to keep testing a genuine
+        // fence reason.
         let re_a = to_re(&mut ctx, a);
-        let atom = in_re(&mut ctx, s, re_a);
+        let st = ctx.mk_app(Op::Builtin(BuiltinOp::ReStar), &[re_a]).unwrap();
+        let atom = in_re(&mut ctx, s, st);
         let out = rewrite_ground_in_re(&mut ctx, &[atom]);
         assert_eq!(out[0], atom, "must not rewrite");
         assert!(has_unreduced_regex(&ctx, &out));
@@ -1176,5 +1253,158 @@ mod tests {
         assert_eq!(enum_comp(&Rex::Empty), None);
         assert_eq!(enum_comp(&star(lit("a"))), None);
         assert_eq!(enum_comp(&Rex::Range('a' as u32, 'c' as u32)), None);
+    }
+
+    // ── Task 2 (slice 20): symbolic rewrite fallback ─────────────────────
+
+    /// Collect the string-literal RHS values of an Or-of-equalities term.
+    fn eq_disjunct_values(ctx: &Context, t: TermId) -> Vec<String> {
+        let TermNode::App { op, args, .. } = ctx.term_node(t) else {
+            panic!("expected app");
+        };
+        let kids: Vec<TermId> = ctx.children(*args).to_vec();
+        let eqs: Vec<TermId> = match op {
+            Op::Builtin(BuiltinOp::Or) => kids,
+            Op::Builtin(BuiltinOp::Eq) => vec![t],
+            other => panic!("expected Or/Eq, got {other:?}"),
+        };
+        eqs.iter()
+            .map(|&e| {
+                let TermNode::App { args, .. } = ctx.term_node(e) else {
+                    panic!("expected Eq app");
+                };
+                let ch = ctx.children(*args).to_vec();
+                ctx.string_const_value(ch[1])
+                    .expect("literal RHS")
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn symbolic_finite_atom_rewrites_to_eq_disjunction() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let a = slit(&mut ctx, "a");
+        let b = slit(&mut ctx, "b");
+        let re_a = to_re(&mut ctx, a);
+        let re_b = to_re(&mut ctx, b);
+        let un = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReUnion), &[re_a, re_b])
+            .unwrap();
+        let atom = in_re(&mut ctx, s, un);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(!has_unreduced_regex(&ctx, &out), "atom must be rewritten");
+        let mut vals = eq_disjunct_values(&ctx, out[0]);
+        vals.sort();
+        assert_eq!(vals, vec!["a".to_owned(), "b".to_owned()]);
+
+        // Singleton language: a bare equality, no Or wrapper.
+        let atom = in_re(&mut ctx, s, re_a);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert_eq!(eq_disjunct_values(&ctx, out[0]), vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn symbolic_cofinite_atom_rewrites_to_negated_disjunction() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let a = slit(&mut ctx, "a");
+        let re_a = to_re(&mut ctx, a);
+        let cmp = ctx.mk_app(Op::Builtin(BuiltinOp::ReComp), &[re_a]).unwrap();
+        let atom = in_re(&mut ctx, s, cmp);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(!has_unreduced_regex(&ctx, &out));
+        // Shape: (not (= s "a")).
+        let TermNode::App {
+            op: Op::Builtin(BuiltinOp::Not),
+            args,
+            ..
+        } = ctx.term_node(out[0]).clone()
+        else {
+            panic!("expected Not, got {:?}", ctx.term_node(out[0]));
+        };
+        let inner = ctx.children(args).to_vec()[0];
+        assert_eq!(eq_disjunct_values(&ctx, inner), vec!["a".to_owned()]);
+    }
+
+    #[test]
+    fn symbolic_zero_word_languages_fold_to_bool_consts() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        // s ∈ re.none → false.
+        let none = ctx.mk_app(Op::Builtin(BuiltinOp::ReNone), &[]).unwrap();
+        let atom = in_re(&mut ctx, s, none);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+        // s ∈ re.all → true (co-finite, zero exceptions).
+        let all = ctx.mk_app(Op::Builtin(BuiltinOp::ReAll), &[]).unwrap();
+        let atom = in_re(&mut ctx, s, all);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+    }
+
+    #[test]
+    fn symbolic_out_of_fragment_shapes_still_fence() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let a = slit(&mut ctx, "a");
+        let re_a = to_re(&mut ctx, a);
+        // Star: neither finite nor co-finite.
+        let st = ctx.mk_app(Op::Builtin(BuiltinOp::ReStar), &[re_a]).unwrap();
+        let atom = in_re(&mut ctx, s, st);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+        // Over-cap: (_ re.loop 1 300) over one char = 300 words > 256.
+        let l = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReLoop { lo: 1, hi: 300 }), &[re_a])
+            .unwrap();
+        let atom = in_re(&mut ctx, s, l);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+        // Symbolic regex leaf still fences (extraction fails).
+        let re_s = to_re(&mut ctx, s);
+        let atom = in_re(&mut ctx, s, re_s);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+    }
+
+    #[test]
+    fn above_alphabet_string_side_skips_symbolic_rewrite() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let a = slit(&mut ctx, "a");
+        let re_a = to_re(&mut ctx, a);
+        // Bare above-alphabet literal side (ground path already declines;
+        // the symbolic path must decline too, not "decide" it).
+        let hi = slit(&mut ctx, "\u{30000}");
+        let atom = in_re(&mut ctx, hi, re_a);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+        // Concat-embedded above-alphabet literal.
+        let cc = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[s, hi])
+            .unwrap();
+        let atom = in_re(&mut ctx, cc, re_a);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+    }
+
+    #[test]
+    fn symbolic_rewrite_keeps_unrelated_termids() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let lit_xy = slit(&mut ctx, "xy");
+        let eq = ctx.mk_eq(s, lit_xy).unwrap();
+        let a = slit(&mut ctx, "a");
+        let re_a = to_re(&mut ctx, a);
+        let atom = in_re(&mut ctx, s, re_a);
+        let out = rewrite_ground_in_re(&mut ctx, &[eq, atom]);
+        assert_eq!(out[0], eq, "unrelated assertion must keep its TermId");
+        assert_ne!(out[1], atom, "membership atom must be rewritten");
     }
 }
