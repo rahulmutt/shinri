@@ -250,6 +250,7 @@ impl<'a> Parser<'a> {
             "Int" => Ok(ctx.int_sort()),
             "Real" => Ok(ctx.real_sort()),
             "String" => Ok(ctx.string_sort()),
+            "RegLan" => Ok(ctx.reglan_sort()),
             "Float16" => Ok(ctx.fp_sort(5, 11)),
             "Float32" => Ok(ctx.fp_sort(8, 24)),
             "Float64" => Ok(ctx.fp_sort(11, 53)),
@@ -333,6 +334,19 @@ impl<'a> Parser<'a> {
             "str.to_code" => StrToCode,
             "str.from_code" => StrFromCode,
             "str.is_digit" => StrIsDigit,
+            // Regular expressions (slice 19). The nullary constants re.none /
+            // re.all / re.allchar are bare symbols, resolved in resolve_leaf.
+            "str.in_re" => StrInRe,
+            "str.to_re" => StrToRe,
+            "re.++" => ReConcat,
+            "re.union" => ReUnion,
+            "re.inter" => ReInter,
+            "re.diff" => ReDiff,
+            "re.*" => ReStar,
+            "re.+" => RePlus,
+            "re.opt" => ReOpt,
+            "re.comp" => ReComp,
+            "re.range" => ReRange,
             // Floating-point bit constructor (SMT-LIB QF_FP)
             "fp" => FpFromBits,
             // Floating-point arithmetic and classification operators (QF_FP)
@@ -442,7 +456,7 @@ impl<'a> Parser<'a> {
     /// `_` has already been consumed.  Returns the corresponding `BuiltinOp`.
     ///
     /// Handles: `extract i j`, `zero_extend k`, `sign_extend k`,
-    /// `rotate_left k`, `rotate_right k`, `repeat k`.
+    /// `rotate_left k`, `rotate_right k`, `repeat k`, `re.loop lo hi`, `re.^ n`.
     fn parse_indexed_op(&mut self, usp: Span) -> Result<shinri_core::BuiltinOp, Diagnostic> {
         use shinri_core::BuiltinOp::*;
         let (id, isp) = self.expect_symbol()?;
@@ -457,6 +471,13 @@ impl<'a> Parser<'a> {
             "rotate_left" => BvRotateLeft(self.expect_numeral_u32()?),
             "rotate_right" => BvRotateRight(self.expect_numeral_u32()?),
             "repeat" => BvRepeat(self.expect_numeral_u32()?),
+            // Regular-expression indexed operators (slice 19)
+            "re.loop" => {
+                let lo = self.expect_numeral_u32()?;
+                let hi = self.expect_numeral_u32()?;
+                ReLoop { lo, hi }
+            }
+            "re.^" => RePow(self.expect_numeral_u32()?),
             // Floating-point indexed conversions
             "to_fp" => {
                 let eb = self.expect_numeral_u32()?;
@@ -508,6 +529,20 @@ impl<'a> Parser<'a> {
             }
             "RTZ" | "roundTowardZero" => {
                 return Ok(ctx.mk_rm_const(shinri_core::term::RoundingMode::Rtz));
+            }
+            "re.none" => {
+                return Self::mk(ctx, Op::Builtin(shinri_core::BuiltinOp::ReNone), &[], &sp);
+            }
+            "re.all" => {
+                return Self::mk(ctx, Op::Builtin(shinri_core::BuiltinOp::ReAll), &[], &sp);
+            }
+            "re.allchar" => {
+                return Self::mk(
+                    ctx,
+                    Op::Builtin(shinri_core::BuiltinOp::ReAllChar),
+                    &[],
+                    &sp,
+                );
             }
             _ => {}
         }
@@ -904,7 +939,23 @@ impl<'a> Parser<'a> {
             | BuiltinOp::StrFromInt
             | BuiltinOp::StrToCode
             | BuiltinOp::StrFromCode
-            | BuiltinOp::StrIsDigit => Self::mk(ctx, Op::Builtin(op), &args, &sp),
+            | BuiltinOp::StrIsDigit
+            | BuiltinOp::StrInRe
+            | BuiltinOp::StrToRe
+            | BuiltinOp::ReNone
+            | BuiltinOp::ReAll
+            | BuiltinOp::ReAllChar
+            | BuiltinOp::ReConcat
+            | BuiltinOp::ReUnion
+            | BuiltinOp::ReInter
+            | BuiltinOp::ReDiff
+            | BuiltinOp::ReStar
+            | BuiltinOp::RePlus
+            | BuiltinOp::ReOpt
+            | BuiltinOp::ReComp
+            | BuiltinOp::ReRange
+            | BuiltinOp::ReLoop { .. }
+            | BuiltinOp::RePow(_) => Self::mk(ctx, Op::Builtin(op), &args, &sp),
             // Floating-point ops: delegate directly to mk_app (sort-checking in Context).
             BuiltinOp::FpAbs
             | BuiltinOp::FpNeg
@@ -2066,6 +2117,102 @@ mod tests {
             panic!("expected str.is_digit app at top level");
         };
         assert_eq!(ctx.sort_of(assert_term), ctx.bool_sort());
+    }
+
+    /// Parse the full RegLan operator surface (slice 19): sort name, nullary
+    /// constants, n-ary/unary combinators, indexed re.loop / re.^, str.in_re,
+    /// str.to_re, re.range. Mirrors `parses_code_conv_ops`.
+    #[test]
+    #[allow(clippy::needless_range_loop)] // ci indexes cmds AND labels each assert's panic message
+    fn parses_regex_ops() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = r#"(declare-fun s () String)
+(declare-fun r () RegLan)
+(assert (str.in_re s (re.++ (str.to_re "ab") (re.union re.none re.all re.allchar))))
+(assert (str.in_re s (re.inter (re.* (re.range "a" "z")) (re.comp (re.diff re.all (re.opt (re.+ (str.to_re "x"))))))))
+(assert (str.in_re s ((_ re.loop 2 5) (str.to_re "a"))))
+(assert (str.in_re s ((_ re.^ 3) re.allchar)))
+(assert (= r re.none))"#;
+        let (ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 7); // 2 declares + 5 asserts
+
+        // Every str.in_re assert is a Bool-sorted StrInRe app whose second
+        // child is RegLan-sorted.
+        for ci in 2..=5 {
+            let assert_term = match &cmds[ci] {
+                Command::Assert(t) => *t,
+                other => panic!("expected Assert, got {other:?}"),
+            };
+            let TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrInRe),
+                args,
+                ..
+            } = ctx.term_node(assert_term).clone()
+            else {
+                panic!("expected str.in_re app at top level of assert {ci}");
+            };
+            assert_eq!(ctx.sort_of(assert_term), ctx.bool_sort());
+            let kids = ctx.children(args).to_vec();
+            assert_eq!(ctx.sort_of(kids[0]), ctx.string_sort());
+            assert_eq!(ctx.sort_of(kids[1]), ctx.reglan_sort());
+        }
+
+        // The indexed ops carried their parameters.
+        let loop_assert = match &cmds[4] {
+            Command::Assert(t) => *t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        let TermNode::App { args, .. } = ctx.term_node(loop_assert).clone() else {
+            panic!("expected app");
+        };
+        let re_arg = ctx.children(args).to_vec()[1];
+        match ctx.term_node(re_arg).clone() {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::ReLoop { lo: 2, hi: 5 }),
+                ..
+            } => {}
+            other => panic!("expected (_ re.loop 2 5), got {other:?}"),
+        }
+
+        // RegLan equality parses (fenced later by the solver, not the parser).
+        let eq_assert = match &cmds[6] {
+            Command::Assert(t) => *t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        assert_eq!(ctx.sort_of(eq_assert), ctx.bool_sort());
+    }
+
+    /// Ill-sorted regex operands are diagnostics, not crashes.
+    #[test]
+    fn regex_wrong_sort_rejected() {
+        // str.to_re arg must be String.
+        let src = r#"(declare-fun n () Int)
+(assert (str.in_re "a" (str.to_re n)))"#;
+        let mut ctx = shinri_core::Context::new();
+        let mut p = Parser::new(src);
+        let mut saw_err = false;
+        while let Some(r) = p.next_command(&mut ctx) {
+            if r.is_err() {
+                saw_err = true;
+            }
+        }
+        assert!(saw_err, "ill-sorted str.to_re must be a diagnostic");
+    }
+
+    /// Loop/power indices above u32::MAX are diagnostics (an error is not a
+    /// verdict — same discipline as the BvIndex/FpIndex range errors).
+    #[test]
+    fn regex_loop_index_overflow_rejected() {
+        let src = r#"(assert (str.in_re "a" ((_ re.loop 0 5000000000) re.allchar)))"#;
+        let mut ctx = shinri_core::Context::new();
+        let mut p = Parser::new(src);
+        let mut saw_err = false;
+        while let Some(r) = p.next_command(&mut ctx) {
+            if r.is_err() {
+                saw_err = true;
+            }
+        }
+        assert!(saw_err, "loop index beyond u32 must be a diagnostic");
     }
 
     /// Ill-sorted operands are diagnostics, not crashes (mirror of the slice-13 test).

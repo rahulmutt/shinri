@@ -153,6 +153,22 @@ fn contains_string_op(ctx: &Context, t: TermId) -> bool {
                         | BuiltinOp::StrToCode
                         | BuiltinOp::StrFromCode
                         | BuiltinOp::StrIsDigit
+                        | BuiltinOp::StrInRe
+                        | BuiltinOp::StrToRe
+                        | BuiltinOp::ReNone
+                        | BuiltinOp::ReAll
+                        | BuiltinOp::ReAllChar
+                        | BuiltinOp::ReConcat
+                        | BuiltinOp::ReUnion
+                        | BuiltinOp::ReInter
+                        | BuiltinOp::ReDiff
+                        | BuiltinOp::ReStar
+                        | BuiltinOp::RePlus
+                        | BuiltinOp::ReOpt
+                        | BuiltinOp::ReComp
+                        | BuiltinOp::ReRange
+                        | BuiltinOp::ReLoop { .. }
+                        | BuiltinOp::RePow(_)
                 )
             ) {
                 return true;

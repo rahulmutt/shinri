@@ -383,6 +383,14 @@ impl Solver {
         // only ever see shapes they handle. See word_norm.rs.
         assertions = self.word_norm.normalize(&mut self.ctx, &assertions);
 
+        // ── Slice 19: RegLan declaration fence ─────────────────────────────
+        // A query that DECLARES a RegLan-sorted symbol is out of the decided
+        // fragment even if the symbol never appears in an assertion — RegLan
+        // must never reach model construction. Sound Unknown.
+        if self.ctx.any_fun_sig_mentions(self.ctx.reglan_sort()) {
+            return SolveOutcome::Unknown;
+        }
+
         // ── String theory routing ─────────────────────────────────────────────
         // If any assertion uses strings (String-sorted subterm or str.* op):
         //   1. Check the soundness fence: strings mixed with BV ops, uninterpreted
@@ -462,6 +470,14 @@ impl Solver {
             // points — see the module docs) fences to sound Unknown.
             assertions = shinri_str::code_conv::rewrite_code_conv(&mut self.ctx, &assertions);
             if shinri_str::code_conv::has_unreduced_code_conv(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
+            // ── Slice 19: RegLan + ground str.in_re ──────────────────────────
+            // (Task 3 inserts the rewrite pass here.) Any str.in_re
+            // application or RegLan-sorted subterm — symbolic string or regex
+            // side, RegLan equality, above-alphabet literals, fuel exhaustion
+            // — fences to sound Unknown.
+            if shinri_str::regex::has_unreduced_regex(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
             // Soundness fence for the substr/str.at seam: a `str.substr`/`str.at`

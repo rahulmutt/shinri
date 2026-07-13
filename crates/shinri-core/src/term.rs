@@ -103,6 +103,27 @@ pub enum BuiltinOp {
     StrToCode,   // String -> Int
     StrFromCode, // Int -> String
     StrIsDigit,  // String -> Bool
+    // Slice 19: regular expressions (SMT-LIB 2.6 RegLan).
+    StrInRe,   // String × RegLan -> Bool
+    StrToRe,   // String -> RegLan
+    ReNone,    // RegLan (nullary): ∅
+    ReAll,     // RegLan (nullary): Σ*
+    ReAllChar, // RegLan (nullary): Σ (one char)
+    ReConcat,  // RegLan^n -> RegLan, n >= 2
+    ReUnion,   // RegLan^n -> RegLan, n >= 2
+    ReInter,   // RegLan^n -> RegLan, n >= 2
+    ReDiff,    // RegLan^n -> RegLan, n >= 2 (left-assoc difference)
+    ReStar,    // RegLan -> RegLan
+    RePlus,    // RegLan -> RegLan
+    ReOpt,     // RegLan -> RegLan
+    ReComp,    // RegLan -> RegLan
+    ReRange,   // String × String -> RegLan
+    // Indexed (parameters carried in the op, like BvExtract/BvRepeat).
+    ReLoop {
+        lo: u32,
+        hi: u32,
+    }, // (_ re.loop lo hi)
+    RePow(u32), // (_ re.^ n) ≡ (_ re.loop n n)
     // Floating-point — arithmetic. Rounded ops take a RoundingMode as arg 0.
     FpAbs,
     FpNeg, // (F) -> F

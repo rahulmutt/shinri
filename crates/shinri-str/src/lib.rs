@@ -8,6 +8,7 @@ pub mod model;
 pub mod normalize;
 pub mod predicates;
 pub mod reduce;
+pub mod regex;
 mod trail;
 pub mod wordeq;
 pub use fuel::Fuel;

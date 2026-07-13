@@ -2,7 +2,10 @@
 //!
 //! ## Overview
 //! `uses_strings`: true iff any assertion contains a String-sorted subterm or a
-//! `str.*` operator (`str.++`, `str.len`, `str.at`, `str.substr`, `str.indexof`, `str.replace`, `str.replace_all`, `str.to_code`, `str.from_code`, `str.is_digit`).
+//! `str.*` operator (`str.++`, `str.len`, `str.at`, `str.substr`, `str.indexof`, `str.replace`, `str.replace_all`, `str.to_code`, `str.from_code`, `str.is_digit`, `str.in_re`, `str.to_re`)
+//! or any `re.*` combinator (`re.none`, `re.all`, `re.allchar`, `re.++`, `re.union`, `re.inter`, `re.diff`, `re.*`, `re.+`, `re.opt`, `re.comp`, `re.range`, `re.loop`, `re.^`).
+//! A RegLan-sorted subterm (e.g. a bare `RegLan` variable) also counts as string usage, so a pure RegLan
+//! equality routes to the string path and hits the slice-19 regex fence.
 //!
 //! `fenced`: true iff strings are mixed with an out-of-scope theory:
 //!   (a) A String-sorted term appears as operand/result of an **uninterpreted
@@ -55,6 +58,22 @@ fn is_string_op(op: &Op) -> bool {
                 | BuiltinOp::StrToCode
                 | BuiltinOp::StrFromCode
                 | BuiltinOp::StrIsDigit
+                | BuiltinOp::StrInRe
+                | BuiltinOp::StrToRe
+                | BuiltinOp::ReNone
+                | BuiltinOp::ReAll
+                | BuiltinOp::ReAllChar
+                | BuiltinOp::ReConcat
+                | BuiltinOp::ReUnion
+                | BuiltinOp::ReInter
+                | BuiltinOp::ReDiff
+                | BuiltinOp::ReStar
+                | BuiltinOp::RePlus
+                | BuiltinOp::ReOpt
+                | BuiltinOp::ReComp
+                | BuiltinOp::ReRange
+                | BuiltinOp::ReLoop { .. }
+                | BuiltinOp::RePow(_)
         )
     )
 }
@@ -153,6 +172,7 @@ pub fn uses_strings(ctx: &Context, assertions: &[TermId]) -> bool {
     assertions.iter().any(|&a| {
         walk_any(ctx, a, &mut seen, &mut |ctx, t| {
             is_string_sort(ctx, t)
+                || ctx.sort_of(t) == ctx.reglan_sort()
                 || match ctx.term_node(t) {
                     TermNode::App { op, .. } => is_string_op(op),
                     _ => false,
