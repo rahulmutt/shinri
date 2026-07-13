@@ -651,6 +651,149 @@ impl Gen {
         self.body
     }
 
+    /// A ground string for the regex family: 0..=3 chars over the ASCII
+    /// alphabet (ASCII ONLY — raw non-ASCII in a script shared with z3 is a
+    /// parser-semantics mismatch, not a solver bug; see the slice-19 plan's
+    /// global constraints). Includes "" — nullability coverage.
+    fn ground_str(&mut self) -> String {
+        let n = self.rng.below(4);
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push_str(ALPHABET[self.rng.below(ALPHABET.len() as u64) as usize]);
+        }
+        format!("\"{s}\"")
+    }
+
+    /// A random CONSTANT regex s-expression, depth-bounded, weighted across
+    /// ALL slice-19 operators (comp/inter/diff/loop included). Leaves are
+    /// re.none / re.allchar / to_re literals / ranges (occasionally
+    /// degenerate: reversed or multi-char endpoints ⇒ empty per SMT-LIB).
+    fn rex_sexpr(&mut self, depth: u64) -> String {
+        if depth == 0 {
+            return match self.rng.below(6) {
+                0 => "re.none".to_owned(),
+                1 => "re.allchar".to_owned(),
+                2 => format!("(str.to_re {})", self.lit()),
+                3 => "(str.to_re \"\")".to_owned(),
+                4 => "(re.range \"a\" \"c\")".to_owned(),
+                // Degenerate ranges: reversed / multi-char endpoint ⇒ ∅.
+                _ => ["(re.range \"c\" \"a\")", "(re.range \"a\" \"ab\")"]
+                    [self.rng.below(2) as usize]
+                    .to_owned(),
+            };
+        }
+        let d = depth - 1;
+        match self.rng.below(10) {
+            0 => format!("(re.++ {} {})", self.rex_sexpr(d), self.rex_sexpr(d)),
+            1 => format!("(re.union {} {})", self.rex_sexpr(d), self.rex_sexpr(d)),
+            2 => format!("(re.inter {} {})", self.rex_sexpr(d), self.rex_sexpr(d)),
+            3 => format!("(re.diff {} {})", self.rex_sexpr(d), self.rex_sexpr(d)),
+            4 => format!("(re.* {})", self.rex_sexpr(d)),
+            5 => format!("(re.+ {})", self.rex_sexpr(d)),
+            6 => format!("(re.opt {})", self.rex_sexpr(d)),
+            7 => format!("(re.comp {})", self.rex_sexpr(d)),
+            8 => format!(
+                "((_ re.loop {} {}) {})",
+                self.rng.below(3),
+                self.rng.below(4),
+                self.rex_sexpr(d)
+            ),
+            _ => format!("((_ re.^ {}) {})", self.rng.below(3), self.rex_sexpr(d)),
+        }
+    }
+
+    /// Co-generate (regex-sexpr, matching word) on the comp/inter-free
+    /// subset — the positive-bias sampler: `str.in_re <word> <regex>` is
+    /// guaranteed to fold true, so decided-SAT shapes stay common no matter
+    /// how the random shapes skew.
+    fn rex_with_witness(&mut self, depth: u64) -> (String, String) {
+        if depth == 0 {
+            return match self.rng.below(3) {
+                0 => {
+                    let l = self.lit();
+                    let w = l.trim_matches('"').to_owned();
+                    (format!("(str.to_re {l})"), w)
+                }
+                1 => ("(str.to_re \"\")".to_owned(), String::new()),
+                _ => {
+                    let c = ALPHABET[self.rng.below(ALPHABET.len() as u64) as usize];
+                    ("(re.range \"a\" \"c\")".to_owned(), c.to_owned())
+                }
+            };
+        }
+        let d = depth - 1;
+        match self.rng.below(5) {
+            0 => {
+                let (r1, w1) = self.rex_with_witness(d);
+                let (r2, w2) = self.rex_with_witness(d);
+                (format!("(re.++ {r1} {r2})"), format!("{w1}{w2}"))
+            }
+            1 => {
+                let (r1, w1) = self.rex_with_witness(d);
+                let (r2, _) = self.rex_with_witness(d);
+                (format!("(re.union {r1} {r2})"), w1)
+            }
+            2 => {
+                let (r, w) = self.rex_with_witness(d);
+                let k = self.rng.below(3) as usize;
+                (format!("(re.* {r})"), w.repeat(k))
+            }
+            3 => {
+                let (r, w) = self.rex_with_witness(d);
+                let keep = self.rng.below(2) == 0;
+                (
+                    format!("(re.opt {r})"),
+                    if keep { w } else { String::new() },
+                )
+            }
+            _ => {
+                let (r, w) = self.rex_with_witness(d);
+                let k = 1 + self.rng.below(2);
+                (format!("((_ re.^ {k}) {r})"), w.repeat(k as usize))
+            }
+        }
+    }
+
+    /// One slice-19 membership assertion. Half the atoms are witness-built
+    /// (guaranteed ground-true before negation), half fully random; ~1 in 6
+    /// uses a VARIABLE string side (fence path → shinri-unknown, tolerated).
+    /// ~25% negation — the fold is polarity-free.
+    fn regex_assertion(&mut self) {
+        let depth = 1 + self.rng.below(3); // 1..=3
+        let atom = if self.rng.below(6) == 0 {
+            format!("(str.in_re {} {})", self.var(), self.rex_sexpr(depth))
+        } else if self.rng.below(2) == 0 {
+            let (r, w) = self.rex_with_witness(depth);
+            format!("(str.in_re \"{w}\" {r})")
+        } else {
+            format!(
+                "(str.in_re {} {})",
+                self.ground_str(),
+                self.rex_sexpr(depth)
+            )
+        };
+        let atom = if self.rng.below(4) == 0 {
+            format!("(not {atom})")
+        } else {
+            atom
+        };
+        self.body.push_str(&format!("(assert {atom})\n"));
+    }
+
+    /// Instance body for the slice-19 family: 1–2 membership assertions +
+    /// 0–1 general assertions (cross-theory mixing keeps the SAT witness
+    /// path referencing string vars).
+    fn finish_regex_ground(mut self) -> String {
+        let np = 1 + self.rng.below(2);
+        for _ in 0..np {
+            self.regex_assertion();
+        }
+        if self.rng.below(2) == 0 {
+            self.assertion();
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -737,6 +880,10 @@ fn gen_const_int_conv_body(seed: u64) -> String {
 
 fn gen_code_conv_body(seed: u64) -> String {
     Gen::new(seed).finish_code_conv()
+}
+
+fn gen_regex_ground_body(seed: u64) -> String {
+    Gen::new(seed).finish_regex_ground()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1509,6 +1656,101 @@ fn qfs_code_conv_matches_z3() {
     assert!(
         n_guard_bailout <= CC_MAX_GUARD_BAILOUTS,
         "guard bailouts {n_guard_bailout} exceed bound {CC_MAX_GUARD_BAILOUTS}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Ground-regex differential oracle (slice 19): literal-string × constant-regex
+// str.in_re atoms are DECIDED by Brzozowski-derivative evaluation (both
+// verdicts, any polarity). Sat AND Unsat must agree with z3; Sat models are
+// z3-verified. Out-of-fragment shapes — variable string sides — fence
+// (tolerated unknown). ASCII-only scripts (see the slice-19 plan). Fresh
+// seed — never perturb existing families' seeds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RG_N_ITERS: usize = 200;
+const RG_MAX_GUARD_BAILOUTS: usize = RG_N_ITERS / 10;
+
+#[test]
+fn qfs_regex_ground_matches_z3() {
+    let mut rng = Lcg(0x51_63_0000_0001u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness, mut n_guard_bailout) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..RG_N_ITERS {
+        let seed = rng.next();
+        let body = gen_regex_ground_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailout += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S REGEX_GROUND SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _b) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_regex_ground_matches_z3: {RG_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown (tolerated) / {n_z3skip} z3-unknown / \
+         {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(n_sat > 0, "regex-ground family produced zero SAT instances");
+    assert!(
+        n_unsat > 0,
+        "regex-ground family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_guard_bailout <= RG_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailout} exceed bound {RG_MAX_GUARD_BAILOUTS}"
     );
 }
 
