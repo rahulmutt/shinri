@@ -20,15 +20,14 @@
 //! or a range endpoint contains one, the fold is skipped (→ fence) rather
 //! than guessing semantics.
 
+use rustc_hash::FxHashMap;
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 
 /// Largest SMT-LIB string character (inclusive): U+2FFFF.
-#[allow(dead_code)] // used by Task 2/3's ground-evaluation engine
 const MAX_CODE: u32 = 0x2FFFF;
 
 /// Derivative-size fuel: if any intermediate derivative exceeds this many
 /// AST nodes the fold is abandoned (→ presence fence → sound Unknown).
-#[allow(dead_code)] // used by Task 3's rewrite pass
 const FUEL_NODE_CAP: usize = 10_000;
 
 /// Canonical regex AST for ground evaluation. Invariants (enforced by the
@@ -40,7 +39,6 @@ const FUEL_NODE_CAP: usize = 10_000;
 /// - `Star`: argument is not `Empty`/`Eps`/`Star`.
 /// - `Comp`: argument is not `Comp`.
 /// - `Loop(r, lo, hi)`: `lo <= hi`, `hi >= 1`, `r` not `Empty`/`Eps`.
-#[allow(dead_code)] // used by Task 3's rewrite pass
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum Rex {
     /// ∅ — matches nothing.
@@ -59,7 +57,6 @@ enum Rex {
     Loop(Box<Rex>, u32, u32),
 }
 
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn concat(parts: Vec<Rex>) -> Rex {
     let mut out = Vec::new();
     for p in parts {
@@ -77,7 +74,6 @@ fn concat(parts: Vec<Rex>) -> Rex {
     }
 }
 
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn union(parts: Vec<Rex>) -> Rex {
     let mut out: Vec<Rex> = Vec::new();
     for p in parts {
@@ -104,7 +100,6 @@ fn union(parts: Vec<Rex>) -> Rex {
     }
 }
 
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn inter(parts: Vec<Rex>) -> Rex {
     let mut out: Vec<Rex> = Vec::new();
     for p in parts {
@@ -133,7 +128,6 @@ fn inter(parts: Vec<Rex>) -> Rex {
     }
 }
 
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn star(r: Rex) -> Rex {
     match r {
         Rex::Empty | Rex::Eps => Rex::Eps,
@@ -142,7 +136,6 @@ fn star(r: Rex) -> Rex {
     }
 }
 
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn comp(r: Rex) -> Rex {
     match r {
         Rex::Comp(inner) => *inner,
@@ -150,7 +143,6 @@ fn comp(r: Rex) -> Rex {
     }
 }
 
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn loop_(r: Rex, lo: u32, hi: u32) -> Rex {
     if lo > hi {
         return Rex::Empty;
@@ -173,7 +165,6 @@ fn loop_(r: Rex, lo: u32, hi: u32) -> Rex {
 }
 
 /// ε ∈ L(r)?
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn nullable(r: &Rex) -> bool {
     match r {
         Rex::Empty | Rex::Range(..) => false,
@@ -188,7 +179,6 @@ fn nullable(r: &Rex) -> bool {
 /// The Brzozowski derivative of `r` w.r.t. the char with code point `c`:
 /// `L(deriv(c, r)) = { w | c·w ∈ L(r) }`. Total — every operator (comp,
 /// inter, loop included) has a native rule; no automaton is built.
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn deriv(c: u32, r: &Rex) -> Rex {
     match r {
         Rex::Empty | Rex::Eps => Rex::Empty,
@@ -224,7 +214,6 @@ fn deriv(c: u32, r: &Rex) -> Rex {
     }
 }
 
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn node_count(r: &Rex) -> usize {
     1 + match r {
         Rex::Empty | Rex::Eps | Rex::Range(..) => 0,
@@ -235,7 +224,6 @@ fn node_count(r: &Rex) -> usize {
 
 /// Ground membership by |s| derivative steps + nullability. `None` iff an
 /// intermediate derivative exceeds `cap` nodes (→ caller fences).
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn eval_membership_capped(s: &str, r: &Rex, cap: usize) -> Option<bool> {
     let mut cur = r.clone();
     for c in s.chars() {
@@ -247,9 +235,154 @@ fn eval_membership_capped(s: &str, r: &Rex, cap: usize) -> Option<bool> {
     Some(nullable(&cur))
 }
 
-#[allow(dead_code)] // used by Task 3's rewrite pass
 fn eval_membership(s: &str, r: &Rex) -> Option<bool> {
     eval_membership_capped(s, r, FUEL_NODE_CAP)
+}
+
+/// A literal word as a Rex (concat of single-char ranges). None if any char
+/// is above the SMT-LIB alphabet (→ fence).
+fn lit_to_rex(s: &str) -> Option<Rex> {
+    let mut parts = Vec::new();
+    for c in s.chars() {
+        let code = c as u32;
+        if code > MAX_CODE {
+            return None;
+        }
+        parts.push(Rex::Range(code, code));
+    }
+    Some(concat(parts)) // "" → Eps
+}
+
+/// Structural translation of a CONSTANT RegLan term. None on any
+/// non-constant leaf (symbolic `str.to_re` argument, non-literal `re.range`
+/// endpoint, RegLan variable / non-builtin application) or an
+/// above-alphabet literal char (→ fence).
+fn extract_const_regex(ctx: &Context, t: TermId) -> Option<Rex> {
+    let TermNode::App { op, args, .. } = ctx.term_node(t) else {
+        return None;
+    };
+    let Op::Builtin(b) = *op else {
+        return None; // RegLan variable or uninterpreted application.
+    };
+    let kids: Vec<TermId> = ctx.children(*args).to_vec();
+    let sub = |ctx: &Context, ids: &[TermId]| -> Option<Vec<Rex>> {
+        ids.iter().map(|&k| extract_const_regex(ctx, k)).collect()
+    };
+    match b {
+        BuiltinOp::StrToRe => lit_to_rex(ctx.string_const_value(kids[0])?),
+        BuiltinOp::ReNone => Some(Rex::Empty),
+        BuiltinOp::ReAll => Some(star(Rex::Range(0, MAX_CODE))),
+        BuiltinOp::ReAllChar => Some(Rex::Range(0, MAX_CODE)),
+        BuiltinOp::ReConcat => Some(concat(sub(ctx, &kids)?)),
+        BuiltinOp::ReUnion => Some(union(sub(ctx, &kids)?)),
+        BuiltinOp::ReInter => Some(inter(sub(ctx, &kids)?)),
+        BuiltinOp::ReDiff => {
+            // Left-associative difference: a \ b \ c = inter(a, comp(b), comp(c)).
+            let mut rs = sub(ctx, &kids)?.into_iter();
+            let first = rs.next().expect("arity >= 2");
+            let mut parts = vec![first];
+            for r in rs {
+                parts.push(comp(r));
+            }
+            Some(inter(parts))
+        }
+        BuiltinOp::ReStar => Some(star(extract_const_regex(ctx, kids[0])?)),
+        BuiltinOp::RePlus => {
+            // r+ = r · r*.
+            let r = extract_const_regex(ctx, kids[0])?;
+            Some(concat(vec![r.clone(), star(r)]))
+        }
+        BuiltinOp::ReOpt => {
+            let r = extract_const_regex(ctx, kids[0])?;
+            Some(union(vec![r, Rex::Eps]))
+        }
+        BuiltinOp::ReComp => Some(comp(extract_const_regex(ctx, kids[0])?)),
+        BuiltinOp::ReRange => {
+            let a = ctx.string_const_value(kids[0])?;
+            let b = ctx.string_const_value(kids[1])?;
+            let single = |s: &str| -> Option<Option<u32>> {
+                // Outer None = fence (above alphabet); inner None = not a
+                // single char (⇒ empty range per SMT-LIB).
+                let mut it = s.chars();
+                match (it.next(), it.next()) {
+                    (Some(c), None) => {
+                        let code = c as u32;
+                        if code > MAX_CODE {
+                            None // fence
+                        } else {
+                            Some(Some(code))
+                        }
+                    }
+                    _ => Some(None), // empty range, decided
+                }
+            };
+            match (single(a)?, single(b)?) {
+                (Some(lo), Some(hi)) if lo <= hi => Some(Rex::Range(lo, hi)),
+                _ => Some(Rex::Empty), // multi-char endpoint or lo > hi
+            }
+        }
+        BuiltinOp::ReLoop { lo, hi } => Some(loop_(extract_const_regex(ctx, kids[0])?, lo, hi)),
+        BuiltinOp::RePow(n) => Some(loop_(extract_const_regex(ctx, kids[0])?, n, n)),
+        _ => None, // not a RegLan constructor
+    }
+}
+
+/// `(str.in_re s R)`, children already rewritten. Some(bool-const) iff the
+/// string side is a literal with no above-alphabet chars, `R` extracts as a
+/// constant regex, and evaluation stays within fuel.
+fn try_fold_in_re(ctx: &mut Context, kids: &[TermId]) -> Option<TermId> {
+    let s = ctx.string_const_value(kids[0])?.to_owned();
+    if s.chars().any(|c| c as u32 > MAX_CODE) {
+        return None; // above-alphabet fence
+    }
+    let rex = extract_const_regex(ctx, kids[1])?;
+    let v = eval_membership(&s, &rex)?; // None = fuel → fence
+    Some(ctx.mk_const_bool(v))
+}
+
+/// Bottom-up memoized pass folding every GROUND `str.in_re` atom to a Bool
+/// constant. Untouched subtrees keep their TermIds. Mirrors
+/// `code_conv::rewrite_code_conv`.
+pub fn rewrite_ground_in_re(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId> {
+    let mut memo: FxHashMap<TermId, TermId> = FxHashMap::default();
+    assertions
+        .iter()
+        .map(|&a| rewrite(ctx, a, &mut memo))
+        .collect()
+}
+
+fn rewrite(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -> TermId {
+    if let Some(&r) = memo.get(&t) {
+        return r;
+    }
+    let result = match ctx.term_node(t).clone() {
+        TermNode::Const { .. } => t,
+        TermNode::App { op, args, .. } => {
+            let children: Vec<TermId> = ctx.children(args).to_vec();
+            let new_children: Vec<TermId> =
+                children.iter().map(|&c| rewrite(ctx, c, memo)).collect();
+            let special = match op {
+                Op::Builtin(BuiltinOp::StrInRe) => try_fold_in_re(ctx, &new_children),
+                _ => None,
+            };
+            if let Some(r) = special {
+                r
+            } else {
+                let changed = new_children
+                    .iter()
+                    .zip(children.iter())
+                    .any(|(n, o)| n != o);
+                if changed {
+                    ctx.mk_app(op, &new_children)
+                        .expect("regex: well-sorted rebuild")
+                } else {
+                    t
+                }
+            }
+        }
+    };
+    memo.insert(t, result);
+    result
 }
 
 /// Presence fence: true iff any `str.in_re` application or RegLan-sorted
@@ -448,5 +581,261 @@ mod tests {
         assert_eq!(eval_membership_capped("aaaaaaaa", &r, 1), None);
         // The real cap decides this easily (and correctly).
         assert!(eval_membership("aaaaaaaa", &r).is_some());
+    }
+
+    // ── Task 3: extraction + ground rewrite pass ─────────────────────────
+
+    /// Build a str.in_re atom over a LITERAL string from an SMT-LIB-shaped
+    /// term tree, run the rewrite pass, and expect a Bool fold.
+    fn fold_of(ctx: &mut Context, atom: TermId) -> Option<bool> {
+        let out = rewrite_ground_in_re(ctx, &[atom]);
+        match ctx.term_node(out[0]) {
+            TermNode::Const {
+                val: shinri_core::ConstVal::Bool(b),
+                ..
+            } => Some(*b),
+            _ => None,
+        }
+    }
+
+    fn slit(ctx: &mut Context, s: &str) -> TermId {
+        ctx.mk_string_const(s)
+    }
+
+    #[test]
+    fn ground_atoms_fold_per_operator() {
+        let mut ctx = Context::new();
+
+        // ("ab", to_re("ab")) → true; ("ab", re.none) → false.
+        let ab = slit(&mut ctx, "ab");
+        let re_ab = to_re(&mut ctx, ab);
+        let atom = in_re(&mut ctx, ab, re_ab);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+
+        let none = ctx.mk_app(Op::Builtin(BuiltinOp::ReNone), &[]).unwrap();
+        let atom = in_re(&mut ctx, ab, none);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+
+        // re.all / re.allchar.
+        let all = ctx.mk_app(Op::Builtin(BuiltinOp::ReAll), &[]).unwrap();
+        let atom = in_re(&mut ctx, ab, all);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+        let allchar = ctx.mk_app(Op::Builtin(BuiltinOp::ReAllChar), &[]).unwrap();
+        let atom = in_re(&mut ctx, ab, allchar);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+        let a = slit(&mut ctx, "a");
+        let atom = in_re(&mut ctx, a, allchar);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+
+        // (_ re.loop 1 2) over to_re("a"): "aa" in, "aaa" out.
+        let re_a = to_re(&mut ctx, a);
+        let loop12 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReLoop { lo: 1, hi: 2 }), &[re_a])
+            .unwrap();
+        let aa = slit(&mut ctx, "aa");
+        let aaa = slit(&mut ctx, "aaa");
+        let atom = in_re(&mut ctx, aa, loop12);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+        let atom = in_re(&mut ctx, aaa, loop12);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+
+        // (_ re.^ 2): exactly two copies.
+        let pow2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::RePow(2)), &[re_a])
+            .unwrap();
+        let atom = in_re(&mut ctx, aa, pow2);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+        let atom = in_re(&mut ctx, a, pow2);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+
+        // re.comp / re.diff / re.inter / re.union / re.opt / re.+ / re.range.
+        let b = slit(&mut ctx, "b");
+        let re_b = to_re(&mut ctx, b);
+        let comp_a = ctx.mk_app(Op::Builtin(BuiltinOp::ReComp), &[re_a]).unwrap();
+        let atom = in_re(&mut ctx, b, comp_a);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+        let atom = in_re(&mut ctx, a, comp_a);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+
+        let diff = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReDiff), &[allchar, re_a])
+            .unwrap();
+        let atom = in_re(&mut ctx, b, diff);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+        let atom = in_re(&mut ctx, a, diff);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+
+        let un = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReUnion), &[re_a, re_b])
+            .unwrap();
+        let atom = in_re(&mut ctx, b, un);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+
+        let it = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReInter), &[un, re_b])
+            .unwrap();
+        let atom = in_re(&mut ctx, b, it);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+        let atom = in_re(&mut ctx, a, it);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+
+        let empty = slit(&mut ctx, "");
+        let opt = ctx.mk_app(Op::Builtin(BuiltinOp::ReOpt), &[re_a]).unwrap();
+        let atom = in_re(&mut ctx, empty, opt);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+
+        let plus = ctx.mk_app(Op::Builtin(BuiltinOp::RePlus), &[re_a]).unwrap();
+        let atom = in_re(&mut ctx, empty, plus);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+        let atom = in_re(&mut ctx, aaa, plus);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+
+        let z = slit(&mut ctx, "c");
+        let range = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReRange), &[a, z])
+            .unwrap();
+        let atom = in_re(&mut ctx, b, range);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+        let d = slit(&mut ctx, "d");
+        let atom = in_re(&mut ctx, d, range);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+    }
+
+    #[test]
+    fn degenerate_range_and_loop_are_decided_empty() {
+        let mut ctx = Context::new();
+        let a = slit(&mut ctx, "a");
+        // Multi-char endpoint ⇒ empty range (decided, NOT fenced).
+        let ab = slit(&mut ctx, "ab");
+        let r = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReRange), &[a, ab])
+            .unwrap();
+        let atom = in_re(&mut ctx, a, r);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+        // Reversed endpoints ⇒ empty.
+        let c = slit(&mut ctx, "c");
+        let r = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReRange), &[c, a])
+            .unwrap();
+        let atom = in_re(&mut ctx, a, r);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+        // Loop lo > hi ⇒ empty.
+        let re_a = to_re(&mut ctx, a);
+        let l = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReLoop { lo: 3, hi: 1 }), &[re_a])
+            .unwrap();
+        let atom = in_re(&mut ctx, a, l);
+        assert_eq!(fold_of(&mut ctx, atom), Some(false));
+        // Empty-string membership of ε-shapes: "" in to_re("") → true.
+        let empty = slit(&mut ctx, "");
+        let re_empty = to_re(&mut ctx, empty);
+        let atom = in_re(&mut ctx, empty, re_empty);
+        assert_eq!(fold_of(&mut ctx, atom), Some(true));
+    }
+
+    #[test]
+    fn atoms_fold_under_boolean_structure() {
+        // Equivalences need no polarity tracking: fold under not/or/ite too.
+        let mut ctx = Context::new();
+        let a = slit(&mut ctx, "a");
+        let re_a = to_re(&mut ctx, a);
+        let atom = in_re(&mut ctx, a, re_a); // true
+        let not = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[atom]).unwrap();
+        let out = rewrite_ground_in_re(&mut ctx, &[not]);
+        // not(true) — the pass does NOT simplify Boolean structure, only the
+        // atom folds; check the child became const true.
+        let TermNode::App { args, .. } = ctx.term_node(out[0]).clone() else {
+            panic!("expected Not app");
+        };
+        let child = ctx.children(args).to_vec()[0];
+        assert!(matches!(
+            ctx.term_node(child),
+            TermNode::Const {
+                val: shinri_core::ConstVal::Bool(true),
+                ..
+            }
+        ));
+        assert!(!has_unreduced_regex(&ctx, &out));
+    }
+
+    #[test]
+    fn non_ground_shapes_survive_to_fence() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let a = slit(&mut ctx, "a");
+
+        // Symbolic string side.
+        let re_a = to_re(&mut ctx, a);
+        let atom = in_re(&mut ctx, s, re_a);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert_eq!(out[0], atom, "must not rewrite");
+        assert!(has_unreduced_regex(&ctx, &out));
+
+        // Symbolic to_re argument.
+        let re_s = to_re(&mut ctx, s);
+        let atom = in_re(&mut ctx, a, re_s);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+
+        // Symbolic range endpoint.
+        let r = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReRange), &[a, s])
+            .unwrap();
+        let atom = in_re(&mut ctx, a, r);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+
+        // RegLan variable in the regex.
+        let reglan = ctx.reglan_sort();
+        let rv = nullary(&mut ctx, "r", reglan);
+        let atom = in_re(&mut ctx, a, rv);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+    }
+
+    #[test]
+    fn above_alphabet_literals_fence() {
+        let mut ctx = Context::new();
+        // Ground string containing U+30000 (> MAX_CODE) — no fold.
+        let hi = slit(&mut ctx, "\u{30000}");
+        let all = ctx.mk_app(Op::Builtin(BuiltinOp::ReAll), &[]).unwrap();
+        let atom = in_re(&mut ctx, hi, all);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+        // Range endpoint above the alphabet — no fold.
+        let a = slit(&mut ctx, "a");
+        let r = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReRange), &[a, hi])
+            .unwrap();
+        let atom = in_re(&mut ctx, a, r);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+        // to_re over an above-alphabet literal — no fold.
+        let re_hi = to_re(&mut ctx, hi);
+        let atom = in_re(&mut ctx, a, re_hi);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        assert!(has_unreduced_regex(&ctx, &out));
+    }
+
+    #[test]
+    fn untouched_subtrees_keep_their_termids() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let lit = slit(&mut ctx, "xy");
+        let eq = ctx.mk_eq(s, lit).unwrap();
+        let a = slit(&mut ctx, "a");
+        let re_a = to_re(&mut ctx, a);
+        let atom = in_re(&mut ctx, a, re_a);
+        let out = rewrite_ground_in_re(&mut ctx, &[eq, atom]);
+        assert_eq!(out[0], eq, "unrelated assertion must keep its TermId");
+        assert!(matches!(
+            ctx.term_node(out[1]),
+            TermNode::Const {
+                val: shinri_core::ConstVal::Bool(true),
+                ..
+            }
+        ));
     }
 }

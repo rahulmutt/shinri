@@ -473,10 +473,15 @@ impl Solver {
                 return SolveOutcome::Unknown;
             }
             // ── Slice 19: RegLan + ground str.in_re ──────────────────────────
-            // (Task 3 inserts the rewrite pass here.) Any str.in_re
-            // application or RegLan-sorted subterm — symbolic string or regex
-            // side, RegLan equality, above-alphabet literals, fuel exhaustion
-            // — fences to sound Unknown.
+            // One bottom-up pass folds every GROUND membership atom (literal
+            // string × constant regex) to true/false by Brzozowski derivative
+            // + nullability — full equivalences, any polarity, no fresh
+            // variables. Any surviving str.in_re application or RegLan-sorted
+            // subterm (symbolic string or regex side, RegLan equality,
+            // above-alphabet literals, fuel exhaustion) fences to sound
+            // Unknown. Queries DECLARING RegLan symbols were already fenced
+            // right after word_norm.
+            assertions = shinri_str::regex::rewrite_ground_in_re(&mut self.ctx, &assertions);
             if shinri_str::regex::has_unreduced_regex(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
