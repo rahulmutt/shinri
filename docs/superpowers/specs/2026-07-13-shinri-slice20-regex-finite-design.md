@@ -1,7 +1,35 @@
 # Slice 20 design — symbolic `str.in_re` over finite / co-finite constant languages
 
 Date: 2026-07-13
-Status: DESIGNED — implementation pending.
+Status: IMPLEMENTED (slice 20 landed 2026-07-13).
+
+Oracle (`qfs_regex_symbolic_matches_z3`, fresh seed `0x52_00_0000_0001`, 200
+iters): 101 sat / 68 unsat / 31 shinri-unknown (tolerated) /
+0 z3-unknown / 0 guard-bailout (tolerated) / 96 witnesses / **0
+disagreements**. The pre-existing code_conv, const_int_conv, and
+replace_all families re-ran with tallies identical to their committed
+values; `qfs_regex_ground_matches_z3` improved to 66 sat / 107 unsat /
+27 shinri-unknown / 31 witnesses (0 disagreements) — an intended effect
+of this slice: ground-fold declines (derivative fuel) are now rescued by
+the finite/co-finite enumeration rewrite, so strictly more instances are
+decided (generator and seed untouched).
+
+**Deviations from the spec.**
+Production code matches the spec at every operator (the only
+implementation-time adjustments were transient Task-1 clippy
+`#[allow(dead_code)]` attributes, added and removed within the slice, as
+slice 19 did). Three plan predictions needed correcting:
+1. The slice-19 module test `non_ground_shapes_survive_to_fence` had one
+   sub-case (symbolic string side over `str.to_re "a"`) that the new
+   rewrite now correctly decides; the sub-case was swapped to a `re.*`
+   shape so it keeps testing a genuine fence. (The plan predicted no
+   non-oracle test pinned the old behavior — one did.)
+2. The plan expected all pre-existing oracle tallies to be identical;
+   `qfs_regex_ground_matches_z3`'s tally improved as quoted above
+   (generator and seed untouched — the solver simply decides more).
+3. The plan described the Task-3 pins as "shinri-only"; in fact the
+   `expect()` helper cross-checks z3 for Sat/Unsat pins — stricter than
+   described. Wording note only.
 
 Predecessor: slice 19 (RegLan plumbing + ground `str.in_re` by Brzozowski
 derivatives, landed 2026-07-13). This is the second slice of roadmap
