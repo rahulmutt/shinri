@@ -2141,6 +2141,143 @@ fn targeted_code_conv_get_value() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Slice 19: ground str.in_re pins. The decided fragment is literal-string ×
+// constant-regex membership at ANY polarity (evaluation — a full
+// equivalence). Everything else fences: symbolic string side, symbolic regex
+// leaves, RegLan equality, RegLan declarations, above-alphabet literals.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn targeted_regex_ground_decided_sat() {
+    // Trivial ground fold + a live string var alongside.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re \"ab\" (str.to_re \"ab\")))(assert (= s \"x\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // Concat + star + range.
+    expect(
+        "(set-logic QF_S)\
+         (assert (str.in_re \"abc\" (re.++ (str.to_re \"a\") (re.* (re.range \"b\" \"c\")))))(check-sat)",
+        Verdict::Sat,
+    );
+    // Negated membership — polarity-free.
+    expect(
+        "(set-logic QF_S)(assert (not (str.in_re \"ab\" re.none)))(check-sat)",
+        Verdict::Sat,
+    );
+    // Empty string in a star.
+    expect(
+        "(set-logic QF_S)(assert (str.in_re \"\" (re.* (str.to_re \"a\"))))(check-sat)",
+        Verdict::Sat,
+    );
+    // Complement.
+    expect(
+        "(set-logic QF_S)(assert (str.in_re \"b\" (re.comp (str.to_re \"a\"))))(check-sat)",
+        Verdict::Sat,
+    );
+    // Under or: a false fold forces the other disjunct.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (or (str.in_re \"a\" re.none) (= s \"k\")))(check-sat)",
+        Verdict::Sat,
+    );
+    // Indexed loop.
+    expect(
+        "(set-logic QF_S)(assert (str.in_re \"aa\" ((_ re.loop 1 3) (str.to_re \"a\"))))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_regex_ground_decided_unsat() {
+    expect(
+        "(set-logic QF_S)(assert (str.in_re \"ab\" re.none))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Out of range.
+    expect(
+        "(set-logic QF_S)(assert (str.in_re \"d\" (re.range \"a\" \"c\")))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Negated true fold.
+    expect(
+        "(set-logic QF_S)(assert (not (str.in_re \"aa\" ((_ re.^ 2) (str.to_re \"a\")))))(check-sat)",
+        Verdict::Unsat,
+    );
+    // r ∩ ¬r = ∅.
+    expect(
+        "(set-logic QF_S)\
+         (assert (str.in_re \"ab\" (re.inter (str.to_re \"ab\") (re.comp (str.to_re \"ab\")))))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Loop upper bound.
+    expect(
+        "(set-logic QF_S)(assert (str.in_re \"aaa\" ((_ re.loop 1 2) (str.to_re \"a\"))))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Difference removes the word.
+    expect(
+        "(set-logic QF_S)(assert (str.in_re \"a\" (re.diff re.allchar (str.to_re \"a\"))))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Degenerate range (multi-char endpoint) is EMPTY — decided, not fenced.
+    expect(
+        "(set-logic QF_S)(assert (str.in_re \"a\" (re.range \"a\" \"ab\")))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Fold under ite: (ite true "x" "y") = "y" is unsat.
+    expect(
+        "(set-logic QF_S)\
+         (assert (= (ite (str.in_re \"a\" (str.to_re \"a\")) \"x\" \"y\") \"y\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_regex_fences_unknown() {
+    // Symbolic string side.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (str.in_re s re.allchar))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // Symbolic regex leaf (to_re over a var).
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (str.in_re \"a\" (str.to_re s)))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // RegLan equality.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun r () RegLan)\
+             (assert (= r re.none))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // A declared-but-unused RegLan symbol fences the whole query.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun r () RegLan)(declare-fun s () String)\
+             (assert (= s \"a\"))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // Above-alphabet ground literal (U+30000 raw in the script; shinri-only —
+    // z3 is NOT consulted for Unknown pins, so its byte-wise reading of raw
+    // UTF-8 does not matter here).
+    assert_eq!(
+        shinri_verdict("(set-logic QF_S)(assert (str.in_re \"\u{30000}\" re.all))(check-sat)"),
+        Verdict::Unknown,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Fence cases — strings mixed with an out-of-scope theory ⇒ shinri Unknown.
 // (Soundness fence; not over-fencing: these constructs are genuinely out of scope.)
 // ─────────────────────────────────────────────────────────────────────────────
