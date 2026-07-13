@@ -96,20 +96,38 @@ when finite and within cap; `None` otherwise (→ caller falls through):
 existing `FUEL_NODE_CAP`; a `None` from fuel exhaustion aborts the whole
 enumeration (→ fence), never guesses.
 
-**Fuel.** One new constant in `regex.rs`:
-`ENUM_WORD_CAP: usize = 256` — the maximum set size at any intermediate
-point of either enumerator. Crossing it aborts the enumeration; the atom
-survives; the existing presence fence returns sound `Unknown`. No separate
-byte cap: every word is composed from literals and ≤ 256-char ranges
-already present in the query, composed at most cap-many times, so payload
-is bounded as a consequence.
+**Fuel.** Two new constants in `regex.rs`, both checked on every
+intermediate word set of either enumerator; crossing either aborts the
+enumeration → the atom survives → presence fence → sound `Unknown`:
+
+- `ENUM_WORD_CAP: usize = 256` — maximum set cardinality.
+- `ENUM_TOTAL_BYTES_CAP: usize = 4096` — maximum sum of word lengths.
+  The cardinality cap alone does NOT bound work: `(_ re.loop n n)` over a
+  one-word language has exactly one word of unbounded length, so `Loop`
+  power-iteration must also be byte-capped (and must early-out when the
+  inner language is `∅` or `{""}`, which the smart constructors cannot
+  see — e.g. an `Inter` of disjoint literals — so a huge lazy bound never
+  spins).
+
+**Surrogate guard.** SMT-LIB's alphabet includes the surrogate block
+`0xD800..=0xDFFF`, but Rust strings cannot represent those code points, so
+a `Range` that intersects the block cannot be enumerated faithfully —
+enumeration would silently MISS words and break the equivalence.
+`enum_lang(Range)` returns `None` for any surrogate-intersecting range.
+(Defense-in-depth: such a range necessarily spans ≥ 2050 characters —
+range endpoints are Rust chars, hence non-surrogate — so the cardinality
+cap already rejects it; the explicit guard makes the soundness argument
+local instead of an accident of the cap constant.)
 
 **Top-level driver** (extends `try_fold_in_re`): after the ground fold
-declines, extract the constant `Rex` (existing `extract_const_regex`; its
-above-alphabet fences apply unchanged), then try `enum_lang`; on `None`,
-try `enum_comp`; on `None`, leave the atom for the fence. On success,
-build `⋁ᵢ (t = wᵢ)` via `ctx.mk_eq` / `mk_app(Or, …)` (co-finite: wrapped
-in `Not`), with 0-ary → Bool const.
+declines, skip if the string side `t` contains any above-alphabet literal
+character (slice-18/19 posture — don't guess semantics outside Σ, whether
+`t` is a bare literal or a concat containing one); extract the constant
+`Rex` (existing `extract_const_regex`; its above-alphabet fences apply
+unchanged), then try `enum_lang`; on `None`, try `enum_comp`; on `None`,
+leave the atom for the fence. On success, build `⋁ᵢ (t = wᵢ)` via
+`ctx.mk_eq` / `mk_app(Or, …)` (co-finite: wrapped in `Not`), with 0-ary →
+Bool const (`false` finite, `true` co-finite).
 
 ## Architecture
 
@@ -141,13 +159,17 @@ model construction and printing; the parser (nothing new to parse).
   posture.
 - **Alphabet.** Enumerated words are in-alphabet by construction:
   `extract_const_regex` already fences above-alphabet literals and range
-  endpoints, and enumeration only composes those characters. The
-  equivalences quantify over the SMT-LIB domain, so a symbolic `t` is
-  covered regardless of which value the model builder later picks (it
-  only mints in-alphabet strings today).
-- **Fuel.** `ENUM_WORD_CAP` exhaustion — or `FUEL_NODE_CAP` exhaustion
-  inside a filter's `eval_membership` — means no rewrite → presence fence
-  → sound `Unknown`, never a wrong verdict.
+  endpoints, enumeration only composes those characters, and the
+  surrogate guard rejects the one shape (`Range` crossing
+  `0xD800..=0xDFFF`) where in-alphabet words would be unrepresentable and
+  silently dropped. The equivalences quantify over the SMT-LIB domain, so
+  a symbolic `t` is covered regardless of which value the model builder
+  later picks (it only mints in-alphabet strings today). A string side
+  containing an above-alphabet **literal** skips the rewrite (→ fence) —
+  same posture as the slice-19 ground path.
+- **Fuel.** `ENUM_WORD_CAP` / `ENUM_TOTAL_BYTES_CAP` exhaustion — or
+  `FUEL_NODE_CAP` exhaustion inside a filter's `eval_membership` — means
+  no rewrite → presence fence → sound `Unknown`, never a wrong verdict.
 - Co-finite `k = 0` (`re.all`-equivalent shapes) folds the atom to `true`;
   finite `k = 0` (`re.none`-equivalent) to `false` — evaluation, not
   heuristics.
@@ -169,21 +191,25 @@ model construction and printing; the parser (nothing new to parse).
 ## Testing
 
 - **Unit tests** (`regex.rs`): `enum_lang` per node type incl. the
-  `Inter`/`Diff` filter path and the `Loop` fixpoint/early-stop; the
-  degenerate collapses (`star(∅)`, `loop lo>hi`, empty ranges);
+  `Inter`/`Diff` filter path and the `Loop` fixpoint/early-outs
+  (`L(inner) = ∅` and `= {""}` with huge lazy bounds must terminate);
   `enum_comp` for `Comp`, `re.all`, `Inter`-of-comps,
   `Union`-with-co-finite-part, and `None` for plain
-  `Eps`/`Range`/`Concat`/`Star`; cap-abort at both enumerators and via
-  filter fuel; dedup + determinism (`BTreeSet` order); the rewritten
-  atom's shape (disjunction / negated disjunction / Bool consts at
-  `k = 0`); TermId stability of untouched subtrees.
+  `Eps`/`Range`/`Concat`/`Star`; **both** cap aborts (cardinality and
+  total-bytes — the one-long-word loop shape) plus the surrogate-range
+  guard; dedup + determinism (`BTreeSet` order); the rewritten atom's
+  shape (disjunction / negated disjunction / Bool consts at `k = 0`);
+  the above-alphabet string-side skip (bare literal and concat-embedded);
+  TermId stability of untouched subtrees.
 - **E2e pins** (`shinri-solver` tests): sat/unsat/get-value through the
   full solver for symbolic-variable membership at both polarities, under
   `not`/`or`/`ite`; co-finite shapes (`re.comp`, `re.diff(re.all, ·)`);
   `Unknown` pins for neither-finite-nor-co-finite (`(re.* (re.range "a"
-  "b"))`) and an over-cap enumeration (e.g. `(_ re.loop 1 3)` over a
-  large union). Slice-19 `Unknown` flip-markers whose languages are
-  finite/co-finite **flip to real verdicts** — update those pins.
+  "b"))`) and an over-cap enumeration (e.g. `(_ re.loop 1 300)` over a
+  single-char language — 300 words). The slice-19 symbolic-string-side
+  `Unknown` pin (`str.in_re s re.allchar`) does **not** flip: Σ has
+  `0x30000` single-char words, far over the cap — it stays fenced, with
+  its comment updated to name the new (over-cap) reason.
 - **Differential oracle**: new family `qfs_regex_symbolic_matches_z3`
   (`--features oracle`, fresh seed, 200 iters): random finite/co-finite
   constant regexes over the ASCII `{a,b,c}` alphabet (slice-18/19 harness
