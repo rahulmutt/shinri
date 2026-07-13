@@ -794,6 +794,96 @@ impl Gen {
         self.body
     }
 
+    /// A random constant regex biased to be STRUCTURALLY finite: literal /
+    /// small-range leaves; union/concat/inter/diff/opt/small-loop/pow
+    /// combinators. One star arm intentionally falls outside the decided
+    /// fragment — fence coverage (tolerated unknown).
+    fn rex_finite_sexpr(&mut self, depth: u64) -> String {
+        if depth == 0 {
+            return match self.rng.below(5) {
+                0 => "re.none".to_owned(),
+                1 => format!("(str.to_re {})", self.lit()),
+                2 => "(str.to_re \"\")".to_owned(),
+                3 => "(re.range \"a\" \"c\")".to_owned(),
+                _ => "(re.range \"b\" \"c\")".to_owned(),
+            };
+        }
+        let d = depth - 1;
+        match self.rng.below(9) {
+            0 => format!(
+                "(re.++ {} {})",
+                self.rex_finite_sexpr(d),
+                self.rex_finite_sexpr(d)
+            ),
+            1 | 2 => format!(
+                "(re.union {} {})",
+                self.rex_finite_sexpr(d),
+                self.rex_finite_sexpr(d)
+            ),
+            3 => format!(
+                "(re.inter {} {})",
+                self.rex_finite_sexpr(d),
+                self.rex_finite_sexpr(d)
+            ),
+            4 => format!(
+                "(re.diff {} {})",
+                self.rex_finite_sexpr(d),
+                self.rex_finite_sexpr(d)
+            ),
+            5 => format!("(re.opt {})", self.rex_finite_sexpr(d)),
+            6 => format!(
+                "((_ re.loop {} {}) {})",
+                self.rng.below(2),
+                1 + self.rng.below(3),
+                self.rex_finite_sexpr(d)
+            ),
+            7 => format!(
+                "((_ re.^ {}) {})",
+                self.rng.below(3),
+                self.rex_finite_sexpr(d)
+            ),
+            // Star — usually outside the decided fragment (fence coverage).
+            _ => format!("(re.* {})", self.rex_finite_sexpr(d)),
+        }
+    }
+
+    /// One slice-20 membership assertion: VARIABLE string side (sometimes
+    /// var ++ literal) × finite-biased constant regex; ~1/4 comp-wrapped
+    /// (the co-finite path), ~1/4 negated (the rewrite is polarity-free).
+    fn regex_symbolic_assertion(&mut self) {
+        let depth = 1 + self.rng.below(2); // 1..=2
+        let mut r = self.rex_finite_sexpr(depth);
+        if self.rng.below(4) == 0 {
+            r = format!("(re.comp {r})");
+        }
+        let t = if self.rng.below(4) == 0 {
+            format!("(str.++ {} {})", self.var(), self.lit())
+        } else {
+            self.var()
+        };
+        let atom = format!("(str.in_re {t} {r})");
+        let atom = if self.rng.below(4) == 0 {
+            format!("(not {atom})")
+        } else {
+            atom
+        };
+        self.body.push_str(&format!("(assert {atom})\n"));
+    }
+
+    /// Instance body for the slice-20 family: 1–2 symbolic membership
+    /// assertions + 0–1 general assertions (equalities/lengths keep the
+    /// word-equation path and the SAT witness path exercised).
+    fn finish_regex_symbolic(mut self) -> String {
+        let np = 1 + self.rng.below(2);
+        for _ in 0..np {
+            self.regex_symbolic_assertion();
+        }
+        if self.rng.below(2) == 0 {
+            self.assertion();
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -884,6 +974,10 @@ fn gen_code_conv_body(seed: u64) -> String {
 
 fn gen_regex_ground_body(seed: u64) -> String {
     Gen::new(seed).finish_regex_ground()
+}
+
+fn gen_regex_symbolic_body(seed: u64) -> String {
+    Gen::new(seed).finish_regex_symbolic()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1755,6 +1849,105 @@ fn qfs_regex_ground_matches_z3() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Symbolic-regex differential oracle (slice 20): VARIABLE-string × constant-
+// regex str.in_re atoms whose language is structurally finite or co-finite
+// are DECIDED via the equivalence rewrite to word equations (both verdicts,
+// any polarity). Sat AND Unsat must agree with z3; Sat models are
+// z3-verified. Out-of-fragment shapes — star arms, over-cap loops — fence
+// (tolerated unknown). ASCII-only scripts (see the slice-19/20 plans).
+// Fresh seed — never perturb existing families' seeds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RS_N_ITERS: usize = 200;
+const RS_MAX_GUARD_BAILOUTS: usize = RS_N_ITERS / 10;
+
+#[test]
+fn qfs_regex_symbolic_matches_z3() {
+    let mut rng = Lcg(0x52_00_0000_0001u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness, mut n_guard_bailout) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..RS_N_ITERS {
+        let seed = rng.next();
+        let body = gen_regex_symbolic_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailout += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S REGEX_SYMBOLIC SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _b) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_regex_symbolic_matches_z3: {RS_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown (tolerated) / {n_z3skip} z3-unknown / \
+         {n_guard_bailout} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(
+        n_sat > 0,
+        "regex-symbolic family produced zero SAT instances"
+    );
+    assert!(
+        n_unsat > 0,
+        "regex-symbolic family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_guard_bailout <= RS_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailout} exceed bound {RS_MAX_GUARD_BAILOUTS}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Targeted explicit cases
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2478,7 +2671,9 @@ fn targeted_regex_ground_decided_unsat() {
 
 #[test]
 fn targeted_regex_fences_unknown() {
-    // Symbolic string side.
+    // Symbolic string side over re.allchar: STILL fenced after slice 20 —
+    // Σ has 0x30000 single-char words, far over ENUM_WORD_CAP, and Σ's
+    // complement ({""} ∪ longer words) is not co-finite.
     assert_eq!(
         shinri_verdict(
             "(set-logic QF_S)(declare-fun s () String)\
@@ -2515,6 +2710,123 @@ fn targeted_regex_fences_unknown() {
     // UTF-8 does not matter here).
     assert_eq!(
         shinri_verdict("(set-logic QF_S)(assert (str.in_re \"\u{30000}\" re.all))(check-sat)"),
+        Verdict::Unknown,
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 20: symbolic str.in_re over finite / co-finite constant languages.
+// The atom rewrites to a FULL equivalence over word equations (⋁ t = wᵢ,
+// negated over the exception set for co-finite) — any polarity, any string
+// term. Neither-finite-nor-co-finite and over-cap shapes keep fencing.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn targeted_regex_symbolic_decided_sat() {
+    // Finite: s ∈ {ab, c} minus "ab" → s = "c".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.union (str.to_re \"ab\") (str.to_re \"c\"))))\
+         (assert (not (= s \"ab\")))(check-sat)",
+        Verdict::Sat,
+    );
+    // Co-finite: s ≠ \"a\" with length 1 — e.g. s = \"b\".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.comp (str.to_re \"a\"))))\
+         (assert (= (str.len s) 1))(check-sat)",
+        Verdict::Sat,
+    );
+    // re.all over a fully symbolic term folds to true.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s re.all))(check-sat)",
+        Verdict::Sat,
+    );
+    // Concat string side: (s ++ \"b\") ∈ {ab} forces s = \"a\".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re (str.++ s \"b\") (str.to_re \"ab\")))\
+         (assert (= s \"a\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // Bounded loop over a range: 1–2 chars of {a,b,c}, length pinned to 2.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s ((_ re.loop 1 2) (re.range \"a\" \"c\"))))\
+         (assert (= (str.len s) 2))(check-sat)",
+        Verdict::Sat,
+    );
+    // Under Boolean structure (term ite): forces the membership true.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= (ite (str.in_re s (str.to_re \"a\")) \"x\" \"y\") \"x\"))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_regex_symbolic_decided_unsat() {
+    // Finite: s constrained away from every word of the language.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.union (str.to_re \"a\") (str.to_re \"b\"))))\
+         (assert (not (= s \"a\")))(assert (not (= s \"b\")))(check-sat)",
+        Verdict::Unsat,
+    );
+    // re.none over a symbolic term folds to false.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s re.none))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Negated re.all membership folds to (not true).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (not (str.in_re s re.all)))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Co-finite vs pin: s ∈ comp({a}) conflicts with s = \"a\".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.comp (str.to_re \"a\"))))\
+         (assert (= s \"a\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Both polarities of one membership atom.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (str.to_re \"a\")))\
+         (assert (not (str.in_re s (str.to_re \"a\"))))(check-sat)",
+        Verdict::Unsat,
+    );
+    // re.diff(re.all, {a}): the co-finite Inter/Comp extraction shape.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.diff re.all (str.to_re \"a\"))))\
+         (assert (= s \"a\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_regex_symbolic_fences_unknown() {
+    // Star over a range: neither finite nor co-finite.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.* (re.range \"a\" \"b\"))))(check-sat)",
+        Verdict::Unknown,
+    );
+    // Cardinality cap: 300 words > ENUM_WORD_CAP = 256.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s ((_ re.loop 1 300) (str.to_re \"a\"))))(check-sat)",
+        Verdict::Unknown,
+    );
+    // Byte cap: one 9000-byte word ((_ re.^ 300) over a 30-char literal).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s ((_ re.^ 300) (str.to_re \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"))))(check-sat)",
         Verdict::Unknown,
     );
 }
