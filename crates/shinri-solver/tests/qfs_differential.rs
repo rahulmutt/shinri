@@ -995,6 +995,53 @@ impl Gen {
         self.body
     }
 
+    /// Slice 22 corpus: conjunctions of constant-RHS `str.to_code` inequality
+    /// atoms over ONE symbolic string, plus the slice-21 side constraints
+    /// (literal equations, concat equations, length pins). Several bounds on the
+    /// same variable is the point — that is what exercises the interval meet.
+    fn finish_to_code_range(mut self) -> String {
+        let x = self.var();
+        let n_bounds = 1 + self.rng.below(3); // 1..=3 bounds on the SAME var
+        for _ in 0..n_bounds {
+            let op = ["<=", "<", ">=", ">"][self.rng.below(4) as usize];
+            let k = self.to_code_threshold();
+            let atom = if self.rng.below(2) == 0 {
+                format!("({op} (str.to_code {x}) {k})")
+            } else {
+                format!("({op} {k} (str.to_code {x}))") // mirrored orientation
+            };
+            let atom = if self.rng.below(4) == 0 {
+                format!("(not {atom})")
+            } else {
+                atom
+            };
+            self.body.push_str(&format!("(assert {atom})\n"));
+        }
+        let n_side = self.rng.below(3); // 0..=2
+        for _ in 0..n_side {
+            self.regex_unfold_side_constraint(&x);
+        }
+        self.body
+    }
+
+    /// A NON-NEGATIVE, NON-SURROGATE Int threshold. Mostly code points around
+    /// the generator's ALPHABET (so the fused ranges stay narrow and slice 20
+    /// enumerates them), plus 0 and the alphabet boundary (which exercise the
+    /// `len = 1` identity and the degenerate folds of spec §1.2).
+    ///
+    /// Surrogates are EXCLUDED: they are a permanent representational fence
+    /// (§3.1), so the oracle could only ever score them as tolerated Unknowns.
+    /// Negatives are excluded because `-` parses as `Sub` — there is no negative
+    /// numeral literal.
+    fn to_code_threshold(&mut self) -> String {
+        match self.rng.below(8) {
+            0 => "0".to_string(),
+            1 => "196607".to_string(),                   // MAX_CODE
+            2 => "196608".to_string(),                   // MAX_CODE + 1 — out of the alphabet
+            _ => format!("{}", 96 + self.rng.below(30)), // 96..=125, around [a-z]
+        }
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -2165,6 +2212,110 @@ fn qfs_regex_unfold_matches_z3() {
     assert!(
         n_guard_bailouts <= RU_MAX_GUARD_BAILOUTS,
         "guard bailouts {n_guard_bailouts} exceed bound {RU_MAX_GUARD_BAILOUTS}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 22: str.to_code character-range gadget
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TCR_SEED: u64 = 0x53_00_0000_0002;
+const TCR_N_ITERS: usize = 200;
+const TCR_MAX_GUARD_BAILOUTS: usize = TCR_N_ITERS / 10;
+
+fn gen_to_code_range_body(seed: u64) -> String {
+    Gen::new(seed).finish_to_code_range()
+}
+
+#[test]
+fn qfs_to_code_range_matches_z3() {
+    let mut rng = Lcg(TCR_SEED);
+    let (
+        mut n_sat,
+        mut n_unsat,
+        mut n_shinri_unknown,
+        mut n_z3_unknown,
+        mut n_guard_bailouts,
+        mut n_witness,
+    ) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..TCR_N_ITERS {
+        let seed = rng.next();
+        let body = gen_to_code_range_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailouts += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_shinri_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3_unknown += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S TO_CODE_RANGE SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _b) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_to_code_range_matches_z3: {TCR_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_shinri_unknown} shinri-unknown (tolerated) / {n_z3_unknown} z3-unknown / \
+         {n_guard_bailouts} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(
+        n_sat > 0,
+        "to_code-range family produced zero SAT instances"
+    );
+    assert!(
+        n_unsat > 0,
+        "to_code-range family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_guard_bailouts <= TCR_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailouts} exceed bound {TCR_MAX_GUARD_BAILOUTS}"
     );
 }
 
