@@ -968,22 +968,20 @@ fn in_re_symbolic_nullable_sat_via_selfcheck() {
 #[test]
 fn in_re_symbolic_nonnullable_unknown_pre_engine() {
     // x ∈ [a-z]+ : the default model (x = "") violates the membership.
-    // slice 21 Task 4 KNOWN GAP (NOT flipped to Sat as the brief proposed):
-    // Task 3's Rule S unfolds x = "" ∨ x = h·z, then RECURSES on `h`'s own
-    // `h ∈ [a-z]` membership via the SAME head-forced S1–S4 machinery (a bare
-    // `Rex::Range` head-forces to `(class, Eps)` — see `regex::head_forced`),
-    // minting a FRESH (h2, z2) pair every level. Confirmed via direct trace
-    // (40 vs 500 fuel units gave the IDENTICAL search path/result — NOT a
-    // fuel-tuning gap): the SAT layer can satisfy an S3/S4 guard clause
-    // `¬lit ∨ dist ∨ m_h` by deciding `dist` (the fresh pair's distinctness)
-    // true instead of `m_h` (the actual `h ∈ C` membership), so the leaf that
-    // ultimately needs a concrete letter never gets an explicit `str.in_re`
-    // atom recorded in `memb_true` — `memb_seeds` (scoped to recorded atoms
-    // on unpinned leaves, by design/soundness) never sees it, and the
-    // model's length-consistency guard discards the wrongly-composed concat,
-    // free-filling instead — self-check correctly downgrades to Unknown.
-    // Fixing this needs a Rule-S change in memb.rs (out of Task 4's allowed
-    // files) — reported BLOCKED, not adjudicated; pin left as observed.
+    // slice 21 Task 4 KNOWN GAP (still NOT flipped to Sat after the
+    // adjudicated bare-range-leaf + length-link fixes in memb.rs): the
+    // engine now reaches Sat internally with `h ∈ [a-z]` recorded on the
+    // witness leaf `h` and `len(h)=1` in the arith model, but the
+    // WORD-EQUATION loop also resolves the pass-minted `x = h·z` from
+    // `eq_true` and F-splits its var-var heads (`resolve_equation`), and the
+    // SAT model branch asserts the `h = x·z2'` disjunct — minting a concat
+    // into `h`'s class from a channel the membership pass does not control.
+    // `memb_seeds` (soundly, by its adjudicated eligibility contract)
+    // declines the now-pinned leaf, the cyclic concat resolution free-fills,
+    // and the self-check correctly downgrades to Unknown. The spec forbids
+    // the remaining fix avenues to this task ("No changes to the
+    // word-equation stepper (`resolve_equation`) ... or the `Fuel` allotment
+    // value") — reported BLOCKED with trace; pin left as observed.
     let out = run_script(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))(check-sat)",
@@ -1067,18 +1065,17 @@ fn in_re_unfold_negative_polarity_unsat() {
 // helper that does not exist in this file; the surviving pin is transcribed
 // with `run_script` and a direct assertion on the raw output.
 //
-// NOTE (BLOCKED — not adjudicated, pins NOT added): the brief's other two
-// proposed pins (`in_re_unfold_sat_plus_with_length`,
-// `in_re_unfold_sat_negative_polarity`) do not hold against the current
-// engine — both reach `check-sat` = "unknown", for the SAME root cause
-// documented on `in_re_symbolic_nonnullable_unknown_pre_engine` above
-// (Task 3's Rule S recurses on already length-pinned bare-range residual
-// memberships via fresh skolem pairs, and the SAT layer can dodge deciding
-// the actual `h ∈ C` atom via the sibling `dist` disjunct — confirmed NOT a
-// fuel-tuning gap via a 40-vs-500-fuel-unit A/B test giving an IDENTICAL
-// wrong witness). `memb_seeds` only repairs vars carrying a RECORDED
-// `str.in_re` atom on an unpinned leaf (the brief's own soundness
-// constraint) and correctly declines to guess for these. See task-4-report.md.
+// NOTE (BLOCKED after adjudicated fixes — pins NOT added): the brief's other
+// two proposed pins (`in_re_unfold_sat_plus_with_length`,
+// `in_re_unfold_sat_negative_polarity`) still do not hold after the
+// bare-range-leaf + length-link fixes: both exhaust the 40-unit `Fuel`
+// budget (traced: `emit_split` fuel exhaustion mid-unfolding) — the
+// unfolding needs one S1/link/S2/S3/S4 level per witness character plus the
+// interleaved length-axiom fixpoint and the word-equation loop's redundant
+// F-splits over the pass's own minted equalities, and `len(x)=3` does not
+// fit. The spec pins the budget ("No changes to ... the `Fuel` allotment
+// value") and the word-equation stepper, so this cannot be fixed within the
+// membership pass — see task-4-report.md (deviations D-leaf/D-lenlink).
 
 #[test]
 fn in_re_unfold_sat_under_boolean_structure() {

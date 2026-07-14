@@ -10,7 +10,9 @@ use shinri_theory::{TCheck, TheoryCtx};
 
 const RULE_E: u8 = 0;
 const RULE_S1: u8 = 1;
-const RULE_S2: u8 = 2;
+// RULE tag 2 (the old one-shot S2 gate) retired: S2's witness-length axiom is
+// now emitted through its two arith companions, deduped via
+// `emitted_len_axioms` (see the S2 block).
 const RULE_S3: u8 = 3;
 const RULE_S4: u8 = 4;
 
@@ -73,6 +75,52 @@ fn emit_split(
         return TCheck::Unknown;
     }
     TCheck::Split { atoms, guard }
+}
+
+/// Length link for a PASS-MINTED string equality `l = r`: the pure tautology
+/// `l = r → len(l) = len(r)`, emitted through its `(>=)`/`(<=)` arith
+/// companions (a bare theory-emitted Int equality routes to EUF, not Arith —
+/// the `length::next_axiom` seam note), one per round, in the pass's own
+/// unguarded `[distinct(l,r), companion]` clause shape (Rule S2's posture;
+/// the E1 note in `lib.rs::check` blesses "`¬eq ∨ len(l)=len(r)` over the
+/// equality's OWN sides" as "a pure tautology").
+///
+/// CONTRACT MATCH (Task 4 adjudication — why the pass emits these itself
+/// instead of unmarking its equalities from `minted_eqs`): the generic
+/// per-equality link in `lib.rs::check` skips `minted_eqs` because F-split /
+/// char-peel disjuncts are "re-minted with a FRESH skolem z every round" (the
+/// seam-flood + skolem-interaction rationale documented there); memb-pass
+/// equalities are minted ONCE per `(x, cur_t)` (deduped via `emitted_memb`,
+/// witnesses memoized in `memb_wits`), so the finite-emission premise holds
+/// and the pass carries its own length axioms — the same posture as the
+/// F-split, whose `fsplit_atoms` carries its `len_eq` inside its own split.
+/// Unmarking instead would put the pass's own decided disjuncts into
+/// `input_cond_roots`, and the `side_clean` gate below would then stall
+/// unfolding at the first decision (the stall documented at that gate), while
+/// also un-gating the GLOBAL same-word conflicts over pass-skolem merges (the
+/// `all_cond_roots` wrong-UNSAT channel).
+///
+/// Dedup rides `emitted_len_axioms`, exactly like the `lib.rs` link block.
+/// Returns `Some(split)` for the first unemitted companion; `None` when both
+/// are already out.
+fn len_link_split(s: &mut StrSolver, terms: &mut Context, eq_atom: TermId) -> Option<TCheck> {
+    let (l, r) = wordeq::sides(terms, eq_atom);
+    let ll = wordeq::len_of(terms, l);
+    let lr = wordeq::len_of(terms, r);
+    let len_eq = terms.mk_eq(ll, lr).expect("(= len(l) len(r)) well-sorted");
+    let (ge, le) =
+        crate::length::arith_eq_companions(terms, len_eq).expect("len equality has Int sides");
+    let dist = terms
+        .mk_app(Op::Builtin(BuiltinOp::Distinct), &[l, r])
+        .expect("distinct well-sorted");
+    for comp in [ge, le] {
+        if s.emitted_len_axioms.contains(&comp) {
+            continue;
+        }
+        s.emitted_len_axioms.insert(comp);
+        return Some(emit_split(s, terms, vec![dist, comp], None));
+    }
+    None
 }
 
 /// The slice-21 membership pass. `Some(tcheck)` = a verdict or an emission
@@ -138,6 +186,23 @@ pub(crate) fn memb_check(
             return Some(TCheck::Conflict(just));
         }
 
+        // ── Bare-range LEAF: leave for Rule G + model repair ─────────────
+        // Spec (design §Rule S): "the `x = h·z` branch grounds out once
+        // search or the model pins `h` (a `M(h, C)` atom with `len(h) = 1`
+        // is decided by Rule G the moment `h`'s class acquires a literal,
+        // and is realised by model repair otherwise)" — a bare single-class
+        // membership is the GROUND-OUT point of the unfolding, not another
+        // S target. Recursing S on it (a bare `Rex::Range` head-forces to
+        // `(C, ε)`) mints a fresh concat into the witness's own class,
+        // which destroys the leaf's repair eligibility (`memb_seeds`
+        // repairs only a leaf whose class holds no constant and no concat)
+        // — the Task-4 wrong-witness channel. Skip: the atom stays in
+        // `memb_true`; Rule G decides it whenever the class grounds;
+        // `memb_seeds` realises it otherwise; the self-check backstops.
+        if matches!(cur, Rex::Range(..)) {
+            continue;
+        }
+
         // Residual: nf[i..] with a variable head. Guarded lemmas read the
         // NF, so they fire only when it is branch-independent w.r.t. EXTERNAL
         // disjunctions — `side_clean(input_cond_roots)`, the SAME gate the
@@ -188,16 +253,46 @@ pub(crate) fn memb_check(
                 .terms
                 .mk_app(Op::Builtin(BuiltinOp::Distinct), &[x, hz])
                 .expect("distinct well-sorted");
-            // S2 (unguarded fresh-witness canonicalization): x=h·z → len(h)=1.
-            if !s.emitted_memb.contains(&(x, cur_t, RULE_S2)) {
-                s.emitted_memb.insert((x, cur_t, RULE_S2));
+            // Length link for the S1-minted equality `x = h·z` — without it
+            // the equality never reaches the length seam (it is
+            // `minted_eqs`-skipped there), so `len(z)` never links to
+            // `len(x)` and an asserted `len(x) = k` cannot drive the
+            // unfolding depth. See `len_link_split` for the contract note.
+            // The sibling ε equality `x = ""` deliberately gets NO link: a
+            // head-forced `cur` (`C·R''`) is never nullable, so Rule G
+            // conflicts the ε branch on membership grounds alone the moment
+            // `x ≈ ""` merges — a link there is dead fuel. (Rule E's ε
+            // disjunct, whose regex IS nullable, gets its link below.)
+            {
+                let x_hz = cx.terms.mk_eq(x, hz).expect("eq well-sorted");
+                if let Some(tc) = len_link_split(s, cx.terms, x_hz) {
+                    return Some(tc);
+                }
+            }
+            // S2 (unguarded fresh-witness canonicalization): x=h·z →
+            // len(h)=1, emitted through its `(>=)`/`(<=)` arith companions —
+            // a bare theory-emitted Int equality routes to EUF, not Arith
+            // (the `length::next_axiom` seam note), so the witness length
+            // must take the companion form to reach the ARITH model (which
+            // both the model builder's class-length read and `memb_seeds`'
+            // capped word search consult). Dedup rides `emitted_len_axioms`,
+            // exactly like `len_link_split`.
+            {
                 let lh = wordeq::len_of(cx.terms, h);
                 let one = cx.terms.mk_numeral(
                     shinri_core::Rational::from_int(1i128.into()),
                     cx.terms.int_sort(),
                 );
                 let len1 = cx.terms.mk_eq(lh, one).expect("eq well-sorted");
-                return Some(emit_split(s, cx.terms, vec![dist, len1], None));
+                let (ge, le) = crate::length::arith_eq_companions(cx.terms, len1)
+                    .expect("len(h)=1 has Int sides");
+                for comp in [ge, le] {
+                    if s.emitted_len_axioms.contains(&comp) {
+                        continue;
+                    }
+                    s.emitted_len_axioms.insert(comp);
+                    return Some(emit_split(s, cx.terms, vec![dist, comp], None));
+                }
             }
             // S3: lit ∧ x=h·z → h ∈ C.
             if !s.emitted_memb.contains(&(x, cur_t, RULE_S3)) {
@@ -263,6 +358,19 @@ pub(crate) fn memb_check(
                 return Some(TCheck::Conflict(just));
             }
             return Some(emit_split(s, cx.terms, disj, guard));
+        }
+        // Rule E already expanded: emit the ε-disjunct equality's length
+        // links (`residual = "" → len(residual) = 0` via companions plus the
+        // `len("")` defining axiom) — same contract note as the S1 links
+        // (see `len_link_split`). Without this the minted ε equality never
+        // reaches the length seam and an asserted `len ≥ k` cannot close the
+        // ε branch.
+        if regex::nullable(&cur) {
+            let e = cx.terms.mk_string_const("");
+            let eps_eq = cx.terms.mk_eq(residual, e).expect("eq well-sorted");
+            if let Some(tc) = len_link_split(s, cx.terms, eps_eq) {
+                return Some(tc);
+            }
         }
     }
     None
@@ -462,10 +570,18 @@ mod tests {
 
     #[test]
     fn rule_s_head_split_clause_sequence() {
-        // x ∈ [a-c]·(str.to_re "") — head-forced: S1..S4 in order, then fixpoint.
+        // x ∈ [a-c]·"b" — head-forced with a non-ε residual: S1..S4 in
+        // order, then fixpoint. (Shape changed for the Task-4 bare-range
+        // leaf skip: the original `[a-c]` — the smart constructor collapses
+        // `[a-c]·(str.to_re "")` to a bare `Rex::Range` — is now a repair
+        // LEAF on which Rule S deliberately never fires; a concat with a
+        // non-ε tail remains genuinely head-forced.)
         let mut ctx = Context::new();
         let x = var(&mut ctx, "x");
-        let r = Rex::Range('a' as u32, 'c' as u32);
+        let r = regex::concat(vec![
+            Rex::Range('a' as u32, 'c' as u32),
+            regex::lit_test("b"),
+        ]);
         let m = memb_atom(&mut ctx, x, &r);
         let (mut s, mut eq_e, atoms) = harness(&mut ctx);
         let mut cx = TheoryCtx {
@@ -504,16 +620,43 @@ mod tests {
                     .all(|&t| !is_memb(cx.terms, t) && !is_dist(cx.terms, t))
         });
         assert_eq!(s1.count(), 1, "exactly one S1 head split");
-        // S2: the ONLY unguarded clause — [distinct(x,h·z), len(h)=1].
-        let s2: Vec<_> = splits
+        // Task 4: the pass's own length axioms are now emitted as unguarded
+        // [distinct(x,h·z), arith-companion] clauses (see `len_link_split`
+        // and the S2 block): ge+le companions of the `x = h·z` length link
+        // `len(x)=len(h·z)` PLUS ge+le companions of the S2 witness
+        // canonicalization `len(h)=1` — four unguarded [dist, cmp] clauses,
+        // all sharing the S1 witnesses' distinct atom, and NO other
+        // unguarded clause. (Formerly S2 was a single unguarded
+        // [dist, len(h)=1] clause; the bare Int equality routed to EUF, not
+        // Arith, so the witness length never reached the arith model.)
+        let is_cmp = |terms: &Context, t: TermId| {
+            matches!(
+                terms.term_node(t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::Ge | BuiltinOp::Le),
+                    ..
+                }
+            )
+        };
+        // (The single-atom `guard: None` splits from the generic length-axiom
+        // fixpoint — `≥0` / defining companions — also interleave; the pass's
+        // own clauses are the unguarded ones carrying the distinct atom.)
+        let unguarded: Vec<_> = splits
             .iter()
             .filter(|(a, g)| !*g && a.iter().any(|&t| is_dist(cx.terms, t)))
             .collect();
         assert_eq!(
-            s2.len(),
-            1,
-            "exactly one unguarded witness canonicalization (S2)"
+            unguarded.len(),
+            4,
+            "link (2) + S2 witness-length (2) companion clauses"
         );
+        for (a, _) in &unguarded {
+            assert_eq!(a.len(), 2, "companion clause is [dist, cmp]");
+            assert!(
+                a.iter().any(|&t| is_cmp(cx.terms, t)),
+                "every unguarded [dist, _] clause is a [distinct, arith-companion] pair"
+            );
+        }
         // S3 + S4: guarded [distinct, str.in_re] clauses.
         let s34: Vec<_> = splits
             .iter()
