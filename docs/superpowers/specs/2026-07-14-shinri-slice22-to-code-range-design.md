@@ -485,9 +485,9 @@ Three cases decline:
 **E2E pins** (`qfs_differential.rs`, `script_e2e.rs`):
 
 - **The flip — as-landed.** `targeted_code_conv_fences_unknown`
-  (`qfs_differential.rs:2641`) had its inequality case (`(>= (str.to_code s)
-  48)` at `Unknown`, `:2681`) **deleted** rather than flipped to a decided
-  pin. That deletion passed **vacuously**: the atom is no longer fenced by
+  (`qfs_differential.rs:2793` on this branch) had its inequality case
+  (`(>= (str.to_code s) 48)` at `Unknown`) **deleted** rather than flipped to
+  a decided pin. That deletion passed **vacuously**: the atom is no longer fenced by
   `has_unreduced_code_conv` (the rewrite genuinely fires — this much of the
   spec's prediction holds), but the query is *still* `Unknown` — now
   produced by the regex engine's wide-arm gap instead of the presence fence
