@@ -88,8 +88,10 @@ pub fn rewrite_code_conv(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId
         .map(|&a| rewrite(ctx, a, &mut memo))
         .collect();
 
+    // The top-level assertion list is an implicit conjunction (§1.3).
+    let fused = fuse_bounds(ctx, &folded);
     let mut gmemo: FxHashMap<TermId, TermId> = FxHashMap::default();
-    folded.iter().map(|&a| gadget(ctx, a, &mut gmemo)).collect()
+    fused.iter().map(|&a| gadget(ctx, a, &mut gmemo)).collect()
 }
 
 fn rewrite(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -> TermId {
@@ -454,8 +456,147 @@ fn try_code_ineq_atom(ctx: &mut Context, op: Op, kids: &[TermId]) -> Option<Term
     })
 }
 
-/// Pass 2. Memoized. Task 2 adds the `And` fusion arm; for now every bound is
-/// materialized on its own.
+/// Canonicalize a whole conjunct to `(s, to_code(s) >= k)` (spec §1.1),
+/// absorbing an optional `not` wrapper into the polarity. None ⇒ not a
+/// `to_code` bound, so it passes through the conjunction untouched.
+fn match_bound(ctx: &Context, t: TermId) -> Option<(TermId, Bound)> {
+    let (inner, neg) = match ctx.term_node(t) {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::Not),
+            args,
+            ..
+        } => (ctx.children(*args)[0], true),
+        _ => (t, false),
+    };
+    let TermNode::App {
+        op: Op::Builtin(bop),
+        args,
+        ..
+    } = ctx.term_node(inner)
+    else {
+        return None;
+    };
+    let (bop, kids) = (*bop, ctx.children(*args).to_vec());
+    let (s, mut b) = match_code_ineq(ctx, bop, &kids)?;
+    if neg {
+        b.negated = !b.negated;
+    }
+    Some((s, b))
+}
+
+/// Spec §1.3 interval meet: the bounds on ONE string term within ONE
+/// conjunction collapse to a single membership. None ⇒ the fused range has an
+/// inexpressible endpoint (§3.1) and the caller must leave the group alone.
+fn fuse_group(ctx: &mut Context, s: TermId, bounds: &[Bound]) -> Option<TermId> {
+    let mut lo: Option<i128> = None; // max of the positive thresholds
+    let mut cap: Option<i128> = None; // min of the negated thresholds
+    for b in bounds {
+        // Degenerate thresholds fold to constants (§1.2) and so never enter the
+        // meet: a tautological conjunct drops out, an unsatisfiable one
+        // collapses the whole conjunction.
+        if b.k <= -1 {
+            // `to_code(s) >= k` is a tautology.
+            if b.negated {
+                return Some(ctx.mk_const_bool(false));
+            }
+            continue;
+        }
+        if b.k > MAX_CODE {
+            // `to_code(s) >= k` is unsatisfiable.
+            if !b.negated {
+                return Some(ctx.mk_const_bool(false));
+            }
+            continue;
+        }
+        if b.negated {
+            cap = Some(cap.map_or(b.k, |c| c.min(b.k)));
+        } else {
+            lo = Some(lo.map_or(b.k, |l| l.max(b.k)));
+        }
+    }
+    match (lo, cap) {
+        // A lower bound forces len(s) = 1, which kills the `-1` escape and
+        // turns every upper bound into a clean interval cap.
+        (Some(lo), cap) => range_membership(ctx, s, lo, cap.map_or(MAX_CODE, |c| c - 1)),
+        // Upper bounds only: the `len != 1` escape survives, so this is a
+        // genuine complement — but still ONE membership.
+        (None, Some(cap)) => {
+            let m = range_membership(ctx, s, cap, MAX_CODE)?;
+            Some(
+                ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[m])
+                    .expect("not membership"),
+            )
+        }
+        // Every bound was degenerate and dropped: vacuously true.
+        (None, None) => Some(ctx.mk_const_bool(true)),
+    }
+}
+
+/// Spec §1.3. Fuse the `to_code` bounds among an implicit conjunction — an
+/// `And` node's children, or the top-level assertion list — into AT MOST ONE
+/// membership per string term. That invariant is what keeps slice 21's
+/// intersection gap out of reach.
+///
+/// Conjuncts that are not `to_code` bounds pass through untouched. A group
+/// whose fused range is inexpressible (§3.1) is left entirely alone, so its
+/// atoms survive to the presence fence.
+///
+/// `Or` nodes are deliberately NOT fused: SAT selects one disjunct, so only one
+/// membership is ever asserted on `s` and there is nothing to intersect.
+fn fuse_bounds(ctx: &mut Context, conjuncts: &[TermId]) -> Vec<TermId> {
+    let mut order: Vec<TermId> = Vec::new();
+    let mut groups: FxHashMap<TermId, Vec<(usize, Bound)>> = FxHashMap::default();
+    for (i, &c) in conjuncts.iter().enumerate() {
+        if let Some((s, b)) = match_bound(ctx, c) {
+            groups
+                .entry(s)
+                .or_insert_with(|| {
+                    order.push(s);
+                    Vec::new()
+                })
+                .push((i, b));
+        }
+    }
+    let mut out: Vec<TermId> = conjuncts.to_vec();
+    for s in order {
+        let members = &groups[&s];
+        if members.len() < 2 {
+            // A lone bound needs no meet — `gadget` materializes it directly.
+            continue;
+        }
+        let bounds: Vec<Bound> = members.iter().map(|&(_, b)| b).collect();
+        let Some(fused) = fuse_group(ctx, s, &bounds) else {
+            continue; // inexpressible ⇒ leave the group alone ⇒ fence
+        };
+        out[members[0].0] = fused;
+        let tt = ctx.mk_const_bool(true);
+        for &(i, _) in &members[1..] {
+            out[i] = tt;
+        }
+    }
+    out
+}
+
+/// Pass 2 (spec §1.2 / §1.3). An `And` fuses its conjuncts BEFORE recursing
+/// (top-down); every other node recurses first. Memoized: fusion happens at the
+/// PARENT and never inside `gadget(atom)`, so a bound shared between an `And`
+/// (fused) and an `Or` (not fused) still caches one consistent result.
+///
+/// A2 (controller adjudication, overrides the brief as written): on a match,
+/// the brief's `gadget` returns the produced term `r` directly without
+/// recursing into it. That leaves a `to_code` inequality nested INSIDE the
+/// string argument `s` of a matched atom un-canonicalized (reachable e.g. via
+/// a string-sorted `ite` whose condition is itself a `to_code` inequality).
+/// Sound today (the fence still catches it) but a completeness gap and an
+/// asymmetry with pass 1, which is genuinely bottom-up. Closed here by
+/// recursing into `r` instead of returning it verbatim. `r` is always a
+/// membership (`str.in_re`), its negation, or a Bool constant — never itself
+/// an inequality atom or an `And` — so this cannot re-match/re-fuse; it can
+/// only walk into `r`'s children (in particular the `s` that was pulled out),
+/// which are strict subterms of the ORIGINAL `t` (the term DAG is acyclic, so
+/// no subterm can contain an ancestor), so the recursion is well-founded and
+/// terminates, and it is idempotent because a second `gadget` pass over the
+/// now-canonical `r` finds nothing left to change.
 fn gadget(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -> TermId {
     if let Some(&r) = memo.get(&t) {
         return r;
@@ -464,10 +605,20 @@ fn gadget(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) ->
         TermNode::Const { .. } => t,
         TermNode::App { op, args, .. } => {
             let orig: Vec<TermId> = ctx.children(args).to_vec();
-            match try_code_ineq_atom(ctx, op, &orig) {
-                Some(r) => r,
+            let conjuncts = if matches!(op, Op::Builtin(BuiltinOp::And)) {
+                fuse_bounds(ctx, &orig)
+            } else {
+                orig.clone()
+            };
+            match try_code_ineq_atom(ctx, op, &conjuncts) {
+                // Recurse into the result so a to_code inequality nested in
+                // the string argument is canonicalized too. `r` is a
+                // membership or a Bool constant — never an inequality atom —
+                // so this terminates and cannot re-fuse.
+                Some(r) => gadget(ctx, r, memo),
                 None => {
-                    let kids: Vec<TermId> = orig.iter().map(|&c| gadget(ctx, c, memo)).collect();
+                    let kids: Vec<TermId> =
+                        conjuncts.iter().map(|&c| gadget(ctx, c, memo)).collect();
                     if kids == orig {
                         t
                     } else {
@@ -960,7 +1111,10 @@ mod tests {
     #[test]
     fn far_out_of_range_thresholds_fold() {
         // §1.1 clamping: a threshold too large for i128 still folds — the sign
-        // decides. `>= 10^40` is unsatisfiable.
+        // decides. The threshold built here is a 40-digit repunit (111…1,
+        // ≈1.11×10^39) — comfortably beyond `i128::MAX`, so it exercises the
+        // bignum-clamp path — and being positive is unsatisfiable regardless
+        // of its exact magnitude.
         let mut ctx = Context::new();
         let s = str_var(&mut ctx, "s");
         let int_s = ctx.int_sort();
@@ -998,5 +1152,138 @@ mod tests {
                 "threshold {k:#x} must express"
             );
         }
+    }
+
+    #[test]
+    fn two_sided_bounds_fuse_to_one_range() {
+        // §1.3, the whole point of the slice. 48 <= to_code(s) <= 57 must
+        // produce ONE membership — s ∈ Range(48, 57) — not two. Two would land
+        // on slice 21's intersection gap and return Unknown.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let lo = ineq(&mut ctx, BuiltinOp::Ge, s, 48);
+        let hi = ineq(&mut ctx, BuiltinOp::Le, s, 57);
+        // The top-level assertion list is an implicit conjunction.
+        let out = rewrite_code_conv(&mut ctx, &[lo, hi]);
+        let want = want_range(&mut ctx, s, 48, 57);
+        let tt = ctx.mk_const_bool(true);
+        assert_eq!(out[0], want);
+        assert_eq!(out[1], tt);
+    }
+
+    #[test]
+    fn fusion_meets_the_interval() {
+        // §1.3 algebra: several lower bounds meet to their MAX, several upper
+        // bounds to their MIN.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let a = ineq(&mut ctx, BuiltinOp::Ge, s, 40);
+        let b = ineq(&mut ctx, BuiltinOp::Ge, s, 48); // max ⇒ lo = 48
+        let c = ineq(&mut ctx, BuiltinOp::Le, s, 90);
+        let d = ineq(&mut ctx, BuiltinOp::Le, s, 57); // min ⇒ hi = 57
+        let out = rewrite_code_conv(&mut ctx, &[a, b, c, d]);
+        let want = want_range(&mut ctx, s, 48, 57);
+        assert_eq!(out[0], want);
+    }
+
+    #[test]
+    fn fusion_inside_an_and_node() {
+        // §1.3: `And` nodes fuse exactly like the top-level list.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let lo = ineq(&mut ctx, BuiltinOp::Ge, s, 97);
+        let hi = ineq(&mut ctx, BuiltinOp::Le, s, 122);
+        let conj = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[lo, hi]).unwrap();
+        let out = rewrite_code_conv(&mut ctx, &[conj]);
+        let want = want_range(&mut ctx, s, 97, 122);
+        let tt = ctx.mk_const_bool(true);
+        let want_and = ctx
+            .mk_app(Op::Builtin(BuiltinOp::And), &[want, tt])
+            .unwrap();
+        assert_eq!(out[0], want_and);
+    }
+
+    #[test]
+    fn fusion_absorbs_a_not_wrapper() {
+        // §1.3: `(not (>= tc 58))` is the negated bound k = 58 — it must join
+        // the meet, not sit outside it as a second membership.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let lo = ineq(&mut ctx, BuiltinOp::Ge, s, 48);
+        let raw = ineq(&mut ctx, BuiltinOp::Ge, s, 58);
+        let neg = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[raw]).unwrap();
+        let out = rewrite_code_conv(&mut ctx, &[lo, neg]);
+        let want = want_range(&mut ctx, s, 48, 57);
+        assert_eq!(out[0], want);
+    }
+
+    #[test]
+    fn crossed_bounds_fuse_to_false() {
+        // §1.3: lo > hi ⇒ the empty interval ⇒ `false`.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let lo = ineq(&mut ctx, BuiltinOp::Ge, s, 57);
+        let hi = ineq(&mut ctx, BuiltinOp::Le, s, 48);
+        let out = rewrite_code_conv(&mut ctx, &[lo, hi]);
+        assert_eq!(out[0], ctx.mk_const_bool(false));
+    }
+
+    #[test]
+    fn crossed_bounds_beat_the_surrogate_fence() {
+        // §1.3 / §3.1, ordering: the empty-interval check runs BEFORE the
+        // expressibility check, so `to_code(s) >= 0xD801 ∧ to_code(s) <= 0xD7FF`
+        // decides `false` even though 0xD801 is an inexpressible endpoint.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let lo = ineq(&mut ctx, BuiltinOp::Ge, s, 0xD801);
+        let hi = ineq(&mut ctx, BuiltinOp::Le, s, 0xD7FF);
+        let out = rewrite_code_conv(&mut ctx, &[lo, hi]);
+        assert_eq!(out[0], ctx.mk_const_bool(false));
+        assert!(!has_unreduced_code_conv(&ctx, &out));
+    }
+
+    #[test]
+    fn upper_bounds_only_stay_a_complement() {
+        // §1.3: with NO lower bound the `-1` escape survives (to_code(s) = -1
+        // whenever len(s) != 1), so the constraint is genuinely a complement —
+        // one NEGATED membership, still not an intersection.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let a = ineq(&mut ctx, BuiltinOp::Le, s, 90);
+        let b = ineq(&mut ctx, BuiltinOp::Le, s, 57); // min ⇒ ¬(>= 58)
+        let out = rewrite_code_conv(&mut ctx, &[a, b]);
+        let m = want_range(&mut ctx, s, 58, MAX_U32);
+        let want = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[m]).unwrap();
+        assert_eq!(out[0], want);
+    }
+
+    #[test]
+    fn fusion_groups_by_string_term() {
+        // §1.3: bounds on DIFFERENT string terms must not be meeted together.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let t = str_var(&mut ctx, "t");
+        let s_lo = ineq(&mut ctx, BuiltinOp::Ge, s, 48);
+        let t_lo = ineq(&mut ctx, BuiltinOp::Ge, t, 97);
+        let s_hi = ineq(&mut ctx, BuiltinOp::Le, s, 57);
+        let out = rewrite_code_conv(&mut ctx, &[s_lo, t_lo, s_hi]);
+        let want_s = want_range(&mut ctx, s, 48, 57);
+        let want_t = want_range(&mut ctx, t, 97, MAX_U32);
+        let tt = ctx.mk_const_bool(true);
+        assert_eq!(out[0], want_s);
+        assert_eq!(out[1], want_t);
+        assert_eq!(out[2], tt);
+    }
+
+    #[test]
+    fn inexpressible_fused_range_leaves_the_group_alone() {
+        // §3.1: if the FUSED range has an interior-surrogate endpoint, the
+        // whole group is left untouched and the presence fence catches it.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let lo = ineq(&mut ctx, BuiltinOp::Ge, s, 0xD801);
+        let hi = ineq(&mut ctx, BuiltinOp::Le, s, 0xDF00);
+        let out = rewrite_code_conv(&mut ctx, &[lo, hi]);
+        assert!(has_unreduced_code_conv(&ctx, &out));
     }
 }
