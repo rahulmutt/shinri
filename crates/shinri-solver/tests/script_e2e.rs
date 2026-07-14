@@ -985,3 +985,63 @@ fn in_re_symbolic_regex_side_still_fenced() {
     );
     assert_eq!(out, vec!["unknown"]);
 }
+
+// Slice 21 (Task 3): derivative unfolding — unsat verdicts through the full
+// solver. Sat-with-witness shapes need Task 4's model repair.
+//
+// NOTE (deviation from the task-3 brief, same idiom as Task 2's pins above):
+// the brief's verbatim snippet uses an `expect(src, Verdict::..)` helper that
+// does not exist in this file; these pins are transcribed with `run_script`
+// and a direct assertion on the raw output, with the exact SMT-LIB scripts
+// and expected verdicts from the brief.
+
+#[test]
+fn in_re_unfold_unsat_disjoint_stars() {
+    // x ∈ a* ∧ x ∈ b* ∧ len(x) ≥ 1 — the intersection above length 0 is empty.
+    // slice 21 KNOWN GAP: spec claims unsat, but deciding a* ∩ b* above ε
+    // needs an intersection-aware rule (the single-guard Split channel cannot
+    // cite two membership lits); the G/E/S unfolding saturates → sound
+    // Unknown. See spec Deviations.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (str.in_re x (re.* (str.to_re \"a\"))))\
+         (assert (str.in_re x (re.* (str.to_re \"b\"))))\
+         (assert (>= (str.len x) 1))(check-sat)",
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn in_re_unfold_unsat_concat_context() {
+    // x = y·"b" ∧ x ∈ a* — every word of a* ends in 'a' (or is empty).
+    // slice 21 KNOWN GAP: spec claims unsat, but "every a*-word ends in 'a'"
+    // is inductive — forward derivative unfolding left-peels unboundedly;
+    // fuel exhaustion → sound Unknown. See spec Deviations.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
+         (assert (= x (str.++ y \"b\")))\
+         (assert (str.in_re x (re.* (str.to_re \"a\"))))(check-sat)",
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn in_re_unfold_unsat_literal_by_merge() {
+    // x = "b0" via equality, x ∈ [a-z]+ — ground consumption over the merge.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (= x \"b0\"))\
+         (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn in_re_unfold_negative_polarity_unsat() {
+    // ¬(x ∈ Σ*) is unsatisfiable — comp(Σ*) = ∅.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (not (str.in_re x re.all)))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}

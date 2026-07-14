@@ -4,6 +4,7 @@ mod fuel;
 pub mod indexof_replace;
 pub mod int_conv;
 mod length;
+mod memb;
 pub mod model;
 pub mod normalize;
 pub mod predicates;
@@ -49,6 +50,13 @@ pub struct StrSolver {
     /// Monotone (never cleared on backtrack); prevents re-emitting the same
     /// split after dedup (termination guarantee).
     emitted_splits: FxHashSet<(TermId, TermId)>,
+    /// Dedup for membership lemmas (slice 21): (string-side term, RegLan term
+    /// of the residual Rex, rule tag 0=E / 1..=4=S1..S4). Monotone, like
+    /// `emitted_splits` — a dedup hit means the clause is already learnt.
+    emitted_memb: FxHashSet<(TermId, TermId, u8)>,
+    /// Fresh witnesses minted by head splits, keyed by (x, residual regex
+    /// term) so clauses S2..S4 reuse S1's h/z across rounds. Monotone.
+    memb_wits: FxHashMap<(TermId, TermId), (TermId, TermId)>,
     /// String-equality atoms MINTED by the word-equation search itself (the
     /// F-split `a = b++z` / char-peel `v = h++z` / `v = ""` disjuncts), as
     /// opposed to equalities present in the reduced INPUT assertions. These carry
@@ -1082,6 +1090,19 @@ impl TheorySolver for StrSolver {
                 crate::wordeq::nf_equal_explain(cx.terms, cx.eq, &lhs, &rhs, &mut just);
                 return TCheck::Conflict(just);
             }
+        }
+
+        // ── Slice 21: membership pass (derivative unfolding) ─────────────────
+        // Runs after word equations and disequalities so ground substitutions
+        // are already merged. Guarded lemma emission is gated on
+        // `input_cond_roots` — the SAME set that gates F-SPLIT resolution
+        // above (membership lemmas, like F-splits, add only guarded branches,
+        // never a global fact; the fully-cited Rule-G/E conflicts inside need
+        // no gate at all). Returns Some on any emission/verdict; None ⟹
+        // every membership is discharged, deduped, or skipped (unclean NF) —
+        // the Sat fixpoint below is then backstopped by the model self-check.
+        if let Some(res) = memb::memb_check(self, cx, &known, &input_cond_roots) {
+            return res;
         }
 
         TCheck::Sat

@@ -322,7 +322,6 @@ pub(crate) fn next_classes(r: &Rex) -> Option<Vec<(u32, u32)>> {
 /// The syntactic shape `Range · R''` (Rule-E disjunct shape): a bare `Range`
 /// (residual ε) or a `Concat` whose head is a `Range`. Rule S peels exactly
 /// this shape; everything else goes through Rule E first.
-#[allow(dead_code)]
 pub(crate) fn head_forced(r: &Rex) -> Option<((u32, u32), Rex)> {
     match r {
         Rex::Range(lo, hi) => Some(((*lo, *hi), Rex::Eps)),
@@ -348,7 +347,6 @@ fn range_term_raw(ctx: &mut Context, lo: u32, hi: u32) -> TermId {
 /// handled by splitting at the block and encoding the FULL block as
 /// `(re.diff (re.range \u{D7FF} \u{E000}) (re.union (re.range \u{D7FF} \u{D7FF})
 /// (re.range \u{E000} \u{E000})))`, whose endpoints are all expressible.
-#[allow(dead_code)]
 fn range_term(ctx: &mut Context, lo: u32, hi: u32) -> TermId {
     debug_assert!(lo <= hi && hi <= MAX_CODE);
     debug_assert!(
@@ -392,7 +390,6 @@ fn range_term(ctx: &mut Context, lo: u32, hi: u32) -> TermId {
 /// LANGUAGE — not always the same shape (the surrogate-block diff extracts
 /// as Inter/Comp). Deterministic, so hash-consing gives TermId identity for
 /// equal Rex inputs (the engine's dedup keys rely on this).
-#[allow(dead_code)]
 pub(crate) fn rex_to_term(ctx: &mut Context, r: &Rex) -> TermId {
     let kids = |ctx: &mut Context, ps: &[Rex]| -> Vec<TermId> {
         ps.iter().map(|p| rex_to_term(ctx, p)).collect()
@@ -979,6 +976,23 @@ pub fn has_unsupported_regex(ctx: &Context, assertions: &[TermId]) -> bool {
 #[cfg(test)]
 pub(crate) fn test_az_star_term(ctx: &mut Context) -> TermId {
     rex_to_term(ctx, &star(Rex::Range('a' as u32, 'z' as u32)))
+}
+
+#[cfg(test)]
+pub(crate) fn rex_to_term_test(ctx: &mut Context, r: &Rex) -> TermId {
+    rex_to_term(ctx, r)
+}
+#[cfg(test)]
+pub(crate) fn lit_test(s: &str) -> Rex {
+    lit_to_rex(s).expect("ascii test literal")
+}
+#[cfg(test)]
+pub(crate) fn star_lit_test(s: &str) -> Rex {
+    star(lit_test(s))
+}
+#[cfg(test)]
+pub(crate) fn star_range_test(lo: char, hi: char) -> Rex {
+    star(Rex::Range(lo as u32, hi as u32))
 }
 
 #[cfg(test)]
