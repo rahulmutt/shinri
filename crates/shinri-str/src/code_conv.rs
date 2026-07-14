@@ -543,6 +543,15 @@ fn fuse_group(ctx: &mut Context, s: TermId, bounds: &[Bound]) -> Option<TermId> 
 ///
 /// `Or` nodes are deliberately NOT fused: SAT selects one disjunct, so only one
 /// membership is ever asserted on `s` and there is nothing to intersect.
+///
+/// Fusion is per-syntactic-conjunction: it groups bounds among ONE `And`
+/// node's direct children (or the top-level list), never across levels, and
+/// never through a wrapper. Two bounds on the same string term do NOT fuse —
+/// so both survive as separate memberships and can hit slice 21's
+/// intersection gap (a sound `Unknown`, never a wrong answer) — when they sit
+/// in a nested `And` rather than a flat one, when one is at the top level and
+/// its partner is inside an `And`, or when either is wrapped in a double
+/// negation (`match_bound` absorbs one `not`, not two).
 fn fuse_bounds(ctx: &mut Context, conjuncts: &[TermId]) -> Vec<TermId> {
     let mut order: Vec<TermId> = Vec::new();
     let mut groups: FxHashMap<TermId, Vec<(usize, Bound)>> = FxHashMap::default();
@@ -582,21 +591,22 @@ fn fuse_bounds(ctx: &mut Context, conjuncts: &[TermId]) -> Vec<TermId> {
 /// PARENT and never inside `gadget(atom)`, so a bound shared between an `And`
 /// (fused) and an `Or` (not fused) still caches one consistent result.
 ///
-/// A2 (controller adjudication, overrides the brief as written): on a match,
-/// the brief's `gadget` returns the produced term `r` directly without
-/// recursing into it. That leaves a `to_code` inequality nested INSIDE the
-/// string argument `s` of a matched atom un-canonicalized (reachable e.g. via
-/// a string-sorted `ite` whose condition is itself a `to_code` inequality).
-/// Sound today (the fence still catches it) but a completeness gap and an
-/// asymmetry with pass 1, which is genuinely bottom-up. Closed here by
-/// recursing into `r` instead of returning it verbatim. `r` is always a
+/// The `And` arm must fuse before recursing: fusion needs to see the raw,
+/// un-materialized inequality atoms, and once each atom has already been
+/// turned into its own membership term there is nothing left for it to fuse.
+///
+/// On a match, `gadget` recurses into the produced term `r` rather than
+/// returning it verbatim, because the string argument `s` extracted from the
+/// atom may itself contain a `to_code` inequality (reachable e.g. via a
+/// string-sorted `ite` whose condition is itself a `to_code` inequality) —
+/// without recursing, that nested atom would survive un-canonicalized. This
+/// recursion is well-founded and cannot re-match or re-fuse: `r` is always a
 /// membership (`str.in_re`), its negation, or a Bool constant — never itself
-/// an inequality atom or an `And` — so this cannot re-match/re-fuse; it can
-/// only walk into `r`'s children (in particular the `s` that was pulled out),
-/// which are strict subterms of the ORIGINAL `t` (the term DAG is acyclic, so
-/// no subterm can contain an ancestor), so the recursion is well-founded and
-/// terminates, and it is idempotent because a second `gadget` pass over the
-/// now-canonical `r` finds nothing left to change.
+/// an inequality atom or an `And` — and `r`'s children (in particular the `s`
+/// that was pulled out) are strict subterms of the ORIGINAL `t` (the term DAG
+/// is acyclic, so no subterm can contain an ancestor). It is idempotent
+/// because a second `gadget` pass over the now-canonical `r` finds nothing
+/// left to change.
 fn gadget(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -> TermId {
     if let Some(&r) = memo.get(&t) {
         return r;
@@ -1023,14 +1033,12 @@ mod tests {
         // §1.1: every op, both orientations, reduced to `to_code(s) >= k*`.
         // `>  47` ≡ `>= 48`;  `<  48` ≡ ¬(>= 48);  `<= 47` ≡ ¬(>= 48).
         //
-        // A1 (controller adjudication, overrides the brief as written): each
-        // atom below gets its OWN string variable (`s_gt`/`s_lt`/`s_le`)
-        // rather than sharing one `s`. Task 2 adds bound FUSION, which groups
-        // bounds by string term and collapses each group to one membership —
-        // three bounds sharing `s` would fuse into a single result and no
-        // longer pin these per-atom expectations. Distinct variables ensure
-        // fusion never groups them, so this table keeps testing the
-        // canonicalization table atom-by-atom across Task 2.
+        // Each atom below gets its OWN string variable (`s_gt`/`s_lt`/`s_le`)
+        // rather than sharing one `s`: bound fusion groups bounds by string
+        // term and collapses each group to one membership, so three bounds
+        // sharing `s` would fuse into a single result and no longer pin these
+        // per-atom expectations. Distinct variables ensure fusion never
+        // groups them, keeping this table's atom-by-atom pins exact.
         let mut ctx = Context::new();
         let s_gt = str_var(&mut ctx, "s_gt");
         let s_lt = str_var(&mut ctx, "s_lt");
@@ -1081,12 +1089,10 @@ mod tests {
         // {-1} ∪ [0, MAX_CODE]); `>= MAX_CODE + 1` is unsatisfiable. Negation
         // flips each.
         //
-        // A1 (controller adjudication, overrides the brief as written): each
-        // atom gets its OWN string variable (`s_taut`/`s_unsat`/
-        // `s_neg_taut`/`s_neg_unsat`) instead of sharing one `s`, for the
-        // same fusion-grouping reason as `canonicalization_table` above —
-        // this pins the degenerate folds atom-by-atom and survives Task 2's
-        // bound fusion unchanged.
+        // Each atom gets its OWN string variable (`s_taut`/`s_unsat`/
+        // `s_neg_taut`/`s_neg_unsat`) instead of sharing one `s`, for the same
+        // fusion-grouping reason as `canonicalization_table` above — this
+        // pins the degenerate folds atom-by-atom, unaffected by bound fusion.
         let mut ctx = Context::new();
         let s_taut = str_var(&mut ctx, "s_taut");
         let s_unsat = str_var(&mut ctx, "s_unsat");
@@ -1278,12 +1284,50 @@ mod tests {
     #[test]
     fn inexpressible_fused_range_leaves_the_group_alone() {
         // §3.1: if the FUSED range has an interior-surrogate endpoint, the
-        // whole group is left untouched and the presence fence catches it.
+        // whole group is left untouched — both conjuncts come back exactly as
+        // they went in, not just fenced independently — and the presence
+        // fence catches it.
         let mut ctx = Context::new();
         let s = str_var(&mut ctx, "s");
         let lo = ineq(&mut ctx, BuiltinOp::Ge, s, 0xD801);
         let hi = ineq(&mut ctx, BuiltinOp::Le, s, 0xDF00);
         let out = rewrite_code_conv(&mut ctx, &[lo, hi]);
+        assert_eq!(out, vec![lo, hi]);
         assert!(has_unreduced_code_conv(&ctx, &out));
+    }
+
+    #[test]
+    fn gadget_recurses_into_a_nested_to_code_inside_the_matched_string_arg() {
+        // `gadget` recurses into the term it produces on a match, so a
+        // `to_code` inequality nested INSIDE the string argument of another
+        // `to_code` inequality — reachable via a String-sorted `ite` whose
+        // condition holds one — gets canonicalized too, instead of surviving
+        // to the fence:
+        //   (>= (str.to_code (ite (>= (str.to_code x) 48) "a" "b")) 48)
+        // must rewrite the INNER atom (the `ite`'s condition) to
+        // `x ∈ Range(48, MAX_CODE)`, and the outer atom to
+        // `(ite <that> "a" "b") ∈ Range(48, MAX_CODE)`.
+        let mut ctx = Context::new();
+        let x = str_var(&mut ctx, "x");
+        let inner_atom = ineq(&mut ctx, BuiltinOp::Ge, x, 48);
+        let a_lit = ctx.mk_string_const("a");
+        let b_lit = ctx.mk_string_const("b");
+        let ite_term = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[inner_atom, a_lit, b_lit])
+            .unwrap();
+        let outer_atom = ineq(&mut ctx, BuiltinOp::Ge, ite_term, 48);
+
+        let out = rewrite_code_conv(&mut ctx, &[outer_atom]);
+        assert!(
+            !has_unreduced_code_conv(&ctx, &out),
+            "the nested to_code must be canonicalized away, not just fenced"
+        );
+
+        let want_inner = want_range(&mut ctx, x, 48, MAX_U32);
+        let want_ite = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[want_inner, a_lit, b_lit])
+            .unwrap();
+        let want_outer = want_range(&mut ctx, want_ite, 48, MAX_U32);
+        assert_eq!(out[0], want_outer);
     }
 }
