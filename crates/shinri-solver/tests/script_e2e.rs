@@ -1122,12 +1122,13 @@ fn in_re_unfold_sat_under_boolean_structure() {
 #[test]
 fn in_re_unfold_slice20_star_range_flips_sat() {
     // `(re.* (re.range "a" "b"))` — neither finite nor co-finite, so slice 20's
-    // equivalence-rewrite pass could never decide it (see the STALE pin
-    // `targeted_regex_symbolic_fences_unknown` in qfs_differential.rs, still
-    // `Unknown` there, out of scope for this task). Slice 21: decided by
+    // equivalence-rewrite pass could never decide it. Slice 21: decided by
     // derivative unfolding (was fenced -> Unknown in slices 19-20) — the
     // language is NULLABLE (x = "" is a member), so even the pre-repair
-    // self-check accepts the default empty fill. Observed matches the brief's
+    // self-check accepts the default empty fill. This star-range sibling pin
+    // was already flipped to Sat by slice-21 Task 2 (commit 1274398); only the
+    // allchar sibling pin (`targeted_regex_fences_unknown` in qfs_differential.rs)
+    // remains stale for Task 7 reconciliation. Observed matches the brief's
     // prediction.
     let out = run_script(
         "(set-logic QF_S)(declare-fun s () String)\
@@ -1232,10 +1233,13 @@ fn in_re_unfold_plus_with_length2_unknown_intersection_gap() {
 
 #[test]
 fn in_re_unfold_unknown_class_cap() {
-    // > 64 classes: 33 disjoint single-char printable-ASCII ranges at
-    // codepoints 33, 35, …, 97 → 66 range boundaries + the 0 cut = 67 > 64.
-    // Observed: Unknown, as expected — the CLASS_SPLIT_CAP fence (regex.rs)
-    // holds.
+    // The shape family (re.* (re.union range×N)) + len≥1 yields Unknown from
+    // N=4 (only 9 cuts), well below the CLASS_SPLIT_CAP=64 fence — cause not
+    // isolated (fuel/branch exploration). N=33 is chosen because it additionally
+    // guarantees the structural CLASS_SPLIT_CAP fence in next_classes fires
+    // (33 disjoint single-char printable-ASCII ranges → 66 boundaries + 0 cut =
+    // 67 > 64), so the pin holds regardless of which limit trips first.
+    // Observed: Unknown, as expected.
     let ranges: String = (0..33)
         .map(|i| {
             let a = char::from(b'!' + 2 * i as u8); // '!'(33) … 'a'(97), printable
@@ -1256,13 +1260,14 @@ fn in_re_unfold_unknown_fuel_depth() {
     // A shape whose unfolding needs more than the 40-unit fuel budget
     // (`Fuel::default`, fuel.rs): a 12-deep forced-prefix language intersected
     // with an unconstrained `[a-a]+`, against an otherwise free variable —
-    // each unfolding level costs multiple emissions (Rule E + S1..S4), so ~10
-    // levels exhausts fuel. Observed: Unknown — matches the brief's
-    // fuel-genuinely-trips branch (post-D-satfuel, fuel exhaustion SATURATES
-    // to model repair rather than a hard Unknown, but here repair has nothing
-    // to seed from either — the pass never reached a decided leaf — so the
-    // post-solve self-check correctly finds no witness and downgrades). No
-    // deepening needed; this shape already exhausts fuel as-is.
+    // crossover is between depth 2 (Sat) and depth 4 (Unknown), so fuel
+    // exhausts by ~3-4 levels; depth 12 safely clears the threshold. Observed:
+    // Unknown — matches the brief's fuel-genuinely-trips branch (post-D-satfuel,
+    // fuel exhaustion SATURATES to model repair rather than a hard Unknown, but
+    // here repair has nothing to seed from either — the pass never reached a
+    // decided leaf — so the post-solve self-check correctly finds no witness
+    // and downgrades). No deepening needed; this shape already exhausts fuel
+    // as-is.
     let out = run_script(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (str.in_re x ((_ re.loop 12 12) (re.range \"a\" \"b\"))))\
