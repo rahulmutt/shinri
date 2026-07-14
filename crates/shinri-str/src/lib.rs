@@ -4,6 +4,7 @@ mod fuel;
 pub mod indexof_replace;
 pub mod int_conv;
 mod length;
+mod memb;
 pub mod model;
 pub mod normalize;
 pub mod predicates;
@@ -37,6 +38,11 @@ pub struct StrSolver {
     /// them only when NO conditional string (dis)equality is active.
     eq_levels: Vec<u32>,
     diseq_levels: Vec<u32>,
+    /// Asserted str.in_re atoms: (atom, literal, polarity). Polarity false ⟹
+    /// the membership is asserted NEGATIVELY (t ∉ R ≡ t ∈ comp(R) internally).
+    memb_true: Vec<(TermId, Lit, bool)>,
+    /// SAT decision level per memb_true entry (lock-step; truncated on pop).
+    memb_levels: Vec<u32>,
     len_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
     emitted_len_axioms: FxHashSet<TermId>,
@@ -44,6 +50,13 @@ pub struct StrSolver {
     /// Monotone (never cleared on backtrack); prevents re-emitting the same
     /// split after dedup (termination guarantee).
     emitted_splits: FxHashSet<(TermId, TermId)>,
+    /// Dedup for membership lemmas (slice 21): (string-side term, RegLan term
+    /// of the residual Rex, rule tag 0=E / 1..=4=S1..S4). Monotone, like
+    /// `emitted_splits` — a dedup hit means the clause is already learnt.
+    emitted_memb: FxHashSet<(TermId, TermId, u8)>,
+    /// Fresh witnesses minted by head splits, keyed by (x, residual regex
+    /// term) so clauses S2..S4 reuse S1's h/z across rounds. Monotone.
+    memb_wits: FxHashMap<(TermId, TermId), (TermId, TermId)>,
     /// String-equality atoms MINTED by the word-equation search itself (the
     /// F-split `a = b++z` / char-peel `v = h++z` / `v = ""` disjuncts), as
     /// opposed to equalities present in the reduced INPUT assertions. These carry
@@ -52,6 +65,18 @@ pub struct StrSolver {
     /// and the historical unsound-conflict note there). Monotone: recorded at the
     /// moment a split is emitted, before the disjunct can be asserted back.
     minted_eqs: FxHashSet<TermId>,
+    /// String Eq/Distinct atoms minted by the MEMBERSHIP pass (S1's `x = ""` /
+    /// `x = h·z`, Rule E's ε equality, the S-rules' `distinct(x, h·z)`
+    /// companions) — a subset of `minted_eqs` that distinguishes the MINTER
+    /// (slice 21, D-wordeq-skip, owner-authorized). These equalities are
+    /// DEFINITIONAL: the derivative S-rules are their resolution, so the
+    /// word-equation loop DEFERS F-split/char-peel emission over them —
+    /// re-skolemizing them both burned fuel and minted leaf-destroying
+    /// concats into the repair witnesses' EUF classes (`h = x·z2'`). Their
+    /// EUF merges at assert, their participation in normal forms, and all
+    /// ground/conflict handling stay fully intact; ONLY the Split emission
+    /// is suppressed. Monotone, like `minted_eqs`.
+    memb_minted_eqs: FxHashSet<TermId>,
     /// Counter for fresh string skolem variables minted by F-split.
     fresh_ctr: u32,
     fuel: Fuel,
@@ -103,6 +128,13 @@ impl TheorySolver for StrSolver {
                     }
                     None => {}
                 }
+            }
+            // Slice 21: record membership atoms at both polarities. The regex
+            // side is constant by the solver fence (input atoms) or by
+            // construction (engine-minted atoms).
+            if matches!(op, Op::Builtin(BuiltinOp::StrInRe)) {
+                self.memb_true.push((atom, lit, lit.is_positive()));
+                self.memb_levels.push(lvl);
             }
         }
         None
@@ -654,6 +686,25 @@ impl TheorySolver for StrSolver {
                         }
                     }
                     crate::wordeq::StepResult::Split { atoms, guard } => {
+                        // D-wordeq-skip (owner-authorized freeze lift): a
+                        // MEMBERSHIP-PASS-minted equality is DEFINITIONAL — the
+                        // derivative S-rules are its resolution — so the
+                        // word-equation loop defers its skolemizing split.
+                        // Suppressing a GUARDED split emission is always sound
+                        // (strictly fewer lemmas; splits add guarded branches,
+                        // never verdicts) and touches none of the E1 invariants
+                        // above (nothing is emitted or cited here). Ground
+                        // resolution, conflict derivation, and the EUF merges all
+                        // ran unchanged before this point. `resolve_equation`
+                        // already recorded the head-pair dedup key, so this pair
+                        // reports `Saturated` on later rounds — the same
+                        // wait-for-SAT posture as an emitted-and-decided split.
+                        // Completeness cost lands on shapes where a memb-minted
+                        // equation genuinely needed wordeq skolemization; those
+                        // degrade through the model gate to a sound Unknown.
+                        if self.memb_minted_eqs.contains(&atom) {
+                            continue;
+                        }
                         // Register the new str.len terms produced by the F-split so
                         // their length axioms are emitted on the next check round.
                         // The F-split atoms are: [len_eq, a_pref, b_pref].
@@ -1072,6 +1123,19 @@ impl TheorySolver for StrSolver {
             }
         }
 
+        // ── Slice 21: membership pass (derivative unfolding) ─────────────────
+        // Runs after word equations and disequalities so ground substitutions
+        // are already merged. Guarded lemma emission is gated on
+        // `input_cond_roots` — the SAME set that gates F-SPLIT resolution
+        // above (membership lemmas, like F-splits, add only guarded branches,
+        // never a global fact; the fully-cited Rule-G/E conflicts inside need
+        // no gate at all). Returns Some on any emission/verdict; None ⟹
+        // every membership is discharged, deduped, or skipped (unclean NF) —
+        // the Sat fixpoint below is then backstopped by the model self-check.
+        if let Some(res) = memb::memb_check(self, cx, &known, &input_cond_roots) {
+            return res;
+        }
+
         TCheck::Sat
     }
 
@@ -1087,16 +1151,22 @@ impl TheorySolver for StrSolver {
     }
 
     fn push(&mut self) {
-        self.trail.push(self.eq_true.len(), self.diseq_true.len());
+        self.trail.push(
+            self.eq_true.len(),
+            self.diseq_true.len(),
+            self.memb_true.len(),
+        );
     }
 
     fn pop(&mut self, level: usize) {
-        if let Some((e, d)) = self.trail.pop_to(level) {
+        if let Some((e, d, mb)) = self.trail.pop_to(level) {
             self.eq_true.truncate(e);
             self.diseq_true.truncate(d);
             // Keep the parallel assertion-level records in lock-step (E1 gate).
             self.eq_levels.truncate(e);
             self.diseq_levels.truncate(d);
+            self.memb_true.truncate(mb);
+            self.memb_levels.truncate(mb);
         }
     }
 
@@ -1104,6 +1174,7 @@ impl TheorySolver for StrSolver {
     fn cited_lits(&self, out: &mut Vec<(Lit, &'static str)>) {
         out.extend(self.eq_true.iter().map(|&(_, l)| (l, "str.eq_true")));
         out.extend(self.diseq_true.iter().map(|&(_, l)| (l, "str.diseq_true")));
+        out.extend(self.memb_true.iter().map(|&(_, l, _)| (l, "str.memb_true")));
     }
 
     fn shared_arith_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
@@ -1152,7 +1223,11 @@ impl StrSolver {
             known.push(l);
             known.push(r);
         }
-        model::assign(cx.terms, cx.eq, &known, &str_terms, m);
+        // Slice 21: seed free membership variables with searched words so
+        // concat assembly composes REPAIRED values, not default fills.
+        let membs: Vec<(TermId, bool)> = self.memb_true.iter().map(|&(a, _, p)| (a, p)).collect();
+        let seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
+        model::assign(cx.terms, cx.eq, &known, &str_terms, m, &seeds);
     }
 }
 
@@ -1289,6 +1364,14 @@ impl StrSolver {
     /// Used in unit tests to seed model construction.
     pub fn test_force_str_term(&mut self, t: TermId) {
         self.str_terms.insert(t);
+    }
+
+    /// Push a membership atom directly onto `memb_true` (dummy Lit, level 0),
+    /// simulating the SAT layer asserting `str.in_re` at the given polarity.
+    pub fn test_force_memb_true(&mut self, atom: TermId, positive: bool) {
+        self.memb_true
+            .push((atom, Lit::new(Var::new(0), true), positive));
+        self.memb_levels.push(0);
     }
 }
 
@@ -1513,5 +1596,32 @@ mod tests {
             }
             other => panic!("expected a String model for x, got {other:?}"),
         }
+    }
+
+    // ── Task 2 (slice 21): membership intake + retraction bookkeeping ───────
+
+    #[test]
+    fn memb_intake_and_pop_truncate_together() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let re_t = crate::regex::test_az_star_term(&mut ctx);
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        let mut s = StrSolver::default();
+        s.test_force_memb_true(atom, true);
+        assert_eq!(s.memb_true.len(), 1);
+        assert_eq!(s.memb_levels, vec![0]);
+        // push/pop keep memb_true in lock-step with eq_true/diseq_true.
+        s.push();
+        s.test_force_memb_true(atom, false);
+        assert_eq!(s.memb_true.len(), 2);
+        s.pop(0);
+        assert_eq!(s.memb_true.len(), 1);
+        assert_eq!(s.memb_levels.len(), 1);
     }
 }

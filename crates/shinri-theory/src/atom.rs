@@ -70,6 +70,18 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
             return Ok(Owner::String);
         }
     }
+    // String routing (slice 21): a `str.in_re` membership atom belongs to the
+    // String theory. Routing is unconditional — the solver-seam fence
+    // (`has_unsupported_regex`) guarantees any membership that survives to SAT
+    // is engine-eligible (constant regex side, in-alphabet string side), and
+    // engine-minted membership atoms are eligible by construction.
+    if let TermNode::App {
+        op: Op::Builtin(BuiltinOp::StrInRe),
+        ..
+    } = terms.term_node(atom)
+    {
+        return Ok(Owner::String);
+    }
     match terms.term_node(atom) {
         TermNode::App { op, args, .. } => {
             let children = terms.children(*args);

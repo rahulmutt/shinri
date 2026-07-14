@@ -472,17 +472,16 @@ impl Solver {
             if shinri_str::code_conv::has_unreduced_code_conv(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
-            // ── Slice 19: RegLan + ground str.in_re ──────────────────────────
-            // One bottom-up pass folds every GROUND membership atom (literal
-            // string × constant regex) to true/false by Brzozowski derivative
-            // + nullability — full equivalences, any polarity, no fresh
-            // variables. Any surviving str.in_re application or RegLan-sorted
-            // subterm (symbolic string or regex side, RegLan equality,
-            // above-alphabet literals, fuel exhaustion) fences to sound
-            // Unknown. Queries DECLARING RegLan symbols were already fenced
-            // right after word_norm.
+            // ── Slices 19–21: RegLan + str.in_re ─────────────────────────────
+            // Ground folds (19) and finite/co-finite equivalence rewrites (20)
+            // run in the pass; what survives is either ENGINE-ELIGIBLE — a
+            // constant-regex membership over an in-alphabet string side, which
+            // slice 21's derivative unfolding owns as an ordinary theory atom —
+            // or unsupported (symbolic regex side, RegLan equality,
+            // above-alphabet literals) and fences to sound Unknown. Queries
+            // DECLARING RegLan symbols were already fenced after word_norm.
             assertions = shinri_str::regex::rewrite_ground_in_re(&mut self.ctx, &assertions);
-            if shinri_str::regex::has_unreduced_regex(&self.ctx, &assertions) {
+            if shinri_str::regex::has_unsupported_regex(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
             // Soundness fence for the substr/str.at seam: a `str.substr`/`str.at`
@@ -1167,6 +1166,12 @@ impl Solver {
             }
             Op::Builtin(BuiltinOp::Ge | BuiltinOp::Le | BuiltinOp::Lt | BuiltinOp::Gt) => {
                 self.eval_atom(op, &kids, model)
+            }
+            Op::Builtin(BuiltinOp::StrInRe) => {
+                // 3-valued: None (symbolic regex / un-valued string / fuel)
+                // is NOT a verdict — the gate treats it as satisfied.
+                let s = self.eval_str_val(model, kids[0])?;
+                shinri_str::regex::eval_str_in_re(&self.ctx, &s, kids[1])
             }
             _ => None,
         }

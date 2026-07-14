@@ -884,6 +884,117 @@ impl Gen {
         self.body
     }
 
+    /// A random word of length ≤ `max_len` over the ASCII `{a,b,c}` alphabet,
+    /// UNQUOTED (callers embed it in a literal or a `str.to_re`).
+    fn unfold_word(&mut self, max_len: u64) -> String {
+        let n = self.rng.below(max_len + 1);
+        let mut s = String::new();
+        for _ in 0..n {
+            s.push_str(ALPHABET[self.rng.below(ALPHABET.len() as u64) as usize]);
+        }
+        s
+    }
+
+    /// A random constant regex s-expression biased toward INFINITE /
+    /// CO-INFINITE languages over `{a,b,c}` (slice-21 derivative-unfolding
+    /// family): star/plus/loop/comp/union/concat/inter combinators over
+    /// range/to_re leaves, depth ≤ 3. Unlike the slice-19/20 samplers this
+    /// one is NOT finite-biased — it deliberately targets the fragment the
+    /// unfolding engine (not the finite/co-finite rewrite) is responsible
+    /// for deciding.
+    fn rex_unfold_sexpr(&mut self, depth: u64) -> String {
+        if depth == 0 {
+            return if self.rng.below(2) == 0 {
+                "(re.range \"a\" \"c\")".to_owned()
+            } else {
+                format!("(str.to_re \"{}\")", self.unfold_word(2))
+            };
+        }
+        let d = depth - 1;
+        match self.rng.below(9) {
+            0 => format!("(re.* {})", self.rex_unfold_sexpr(d)),
+            1 => format!("(re.+ {})", self.rex_unfold_sexpr(d)),
+            2 => {
+                let lo = self.rng.below(5); // 0..=4
+                let hi = lo + self.rng.below(5 - lo); // lo..=4
+                format!("((_ re.loop {lo} {hi}) {})", self.rex_unfold_sexpr(d))
+            }
+            3 => format!("(re.comp {})", self.rex_unfold_sexpr(d)),
+            4 => format!(
+                "(re.union {} {})",
+                self.rex_unfold_sexpr(d),
+                self.rex_unfold_sexpr(d)
+            ),
+            5 => format!(
+                "(re.++ {} {})",
+                self.rex_unfold_sexpr(d),
+                self.rex_unfold_sexpr(d)
+            ),
+            6 => format!(
+                "(re.inter {} {})",
+                self.rex_unfold_sexpr(d),
+                self.rex_unfold_sexpr(d)
+            ),
+            7 => "(re.range \"a\" \"c\")".to_owned(),
+            _ => format!("(str.to_re \"{}\")", self.unfold_word(2)),
+        }
+    }
+
+    /// One slice-21 side constraint on the membership variable `x`: a small
+    /// mix of (dis)equalities, a `str.++`-with-fresh-var equation, and length
+    /// bounds — keeps the word-equation and length-fence paths exercised
+    /// alongside the regex-derivative path.
+    fn regex_unfold_side_constraint(&mut self, x: &str) {
+        match self.rng.below(5) {
+            0 => {
+                let w = self.lit();
+                self.body.push_str(&format!("(assert (= {x} {w}))\n"));
+            }
+            1 => {
+                let w = self.lit();
+                self.body.push_str(&format!("(assert (not (= {x} {w})))\n"));
+            }
+            2 => {
+                let w = self.lit();
+                let x2 = self.var();
+                self.body
+                    .push_str(&format!("(assert (= {x} (str.++ {w} {x2})))\n"));
+            }
+            3 => {
+                let n = self.rng.below(5); // 0..=4
+                self.body
+                    .push_str(&format!("(assert (= (str.len {x}) {n}))\n"));
+            }
+            _ => {
+                let n = self.rng.below(5); // 0..=4
+                self.body
+                    .push_str(&format!("(assert (>= (str.len {x}) {n}))\n"));
+            }
+        }
+    }
+
+    /// Instance body for the slice-21 family: one symbolic membership atom
+    /// `(str.in_re x R)` against the infinite/co-infinite-biased sampler
+    /// above (~25% negation-wrapped), plus 0–2 side constraints on `x`.
+    fn finish_regex_unfold(mut self) -> String {
+        let x = self.var();
+        let depth = self.rng.below(4); // 0..=3
+        let r = self.rex_unfold_sexpr(depth);
+        let atom = format!("(str.in_re {x} {r})");
+        let atom = if self.rng.below(4) == 0 {
+            format!("(not {atom})")
+        } else {
+            atom
+        };
+        self.body.push_str(&format!("(assert {atom})\n"));
+
+        let n_side = self.rng.below(3); // 0..=2
+        for _ in 0..n_side {
+            self.regex_unfold_side_constraint(&x);
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -978,6 +1089,10 @@ fn gen_regex_ground_body(seed: u64) -> String {
 
 fn gen_regex_symbolic_body(seed: u64) -> String {
     Gen::new(seed).finish_regex_symbolic()
+}
+
+fn gen_regex_unfold_body(seed: u64) -> String {
+    Gen::new(seed).finish_regex_unfold()
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1948,6 +2063,112 @@ fn qfs_regex_symbolic_matches_z3() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Derivative-unfolding differential oracle (slice 21): VARIABLE-string ×
+// constant-regex str.in_re atoms whose language is biased INFINITE /
+// CO-INFINITE (star/plus/loop/comp/union/concat/inter combinators) are
+// DECIDED via Brzozowski-derivative unfolding to word equations (both
+// verdicts, any polarity). Sat AND Unsat must agree with z3; Sat models are
+// z3-verified. This engine has adjudicated KNOWN GAPS (star-intersection,
+// inductive-suffix, length-constrained memberships, bare-range leaves
+// without pinned length) that soundly fence to Unknown — tolerated here.
+// ASCII-only scripts (see the slice-19/20 plans). Fresh seed — never
+// perturb existing families' seeds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RU_SEED: u64 = 0x53_00_0000_0001;
+const RU_N_ITERS: usize = 200;
+const RU_MAX_GUARD_BAILOUTS: usize = RU_N_ITERS / 10;
+
+#[test]
+fn qfs_regex_unfold_matches_z3() {
+    let mut rng = Lcg(RU_SEED);
+    let (
+        mut n_sat,
+        mut n_unsat,
+        mut n_shinri_unknown,
+        mut n_z3_unknown,
+        mut n_guard_bailouts,
+        mut n_witness,
+    ) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..RU_N_ITERS {
+        let seed = rng.next();
+        let body = gen_regex_unfold_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailouts += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_shinri_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3_unknown += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S REGEX_UNFOLD SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _b) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_regex_unfold_matches_z3: {RU_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_shinri_unknown} shinri-unknown (tolerated) / {n_z3_unknown} z3-unknown / \
+         {n_guard_bailouts} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(n_sat > 0, "regex-unfold family produced zero SAT instances");
+    assert!(
+        n_unsat > 0,
+        "regex-unfold family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_guard_bailouts <= RU_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailouts} exceed bound {RU_MAX_GUARD_BAILOUTS}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Targeted explicit cases
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2671,9 +2892,15 @@ fn targeted_regex_ground_decided_unsat() {
 
 #[test]
 fn targeted_regex_fences_unknown() {
-    // Symbolic string side over re.allchar: STILL fenced after slice 20 —
-    // Σ has 0x30000 single-char words, far over ENUM_WORD_CAP, and Σ's
-    // complement ({""} ∪ longer words) is not co-finite.
+    // Symbolic string side over re.allchar: still Unknown after slice 21,
+    // but no longer via the fence — the membership pass treats the bare
+    // Rex::Range residual as a repair LEAF (no Rule-S unfolding, so no
+    // minted len(h)=1 link), Σ has 0x30000 single-char words (far over
+    // ENUM_WORD_CAP, so slice 20's enumeration rewrite is closed too), and
+    // with no pinned length model repair has no length to search a word
+    // at; the post-solve self-check downgrades to a sound Unknown. Decides
+    // Sat the moment a length is pinned — see the script_e2e.rs companion
+    // pin in_re_unfold_slice20_allchar_with_length_decides_sat.
     assert_eq!(
         shinri_verdict(
             "(set-logic QF_S)(declare-fun s () String)\
@@ -2811,11 +3038,14 @@ fn targeted_regex_symbolic_decided_unsat() {
 
 #[test]
 fn targeted_regex_symbolic_fences_unknown() {
-    // Star over a range: neither finite nor co-finite.
+    // Star over a range: neither finite nor co-finite. slice 21: decided (was
+    // fenced Unknown) — the membership flows to StrSolver as an ordinary atom,
+    // the default model s="" genuinely satisfies the nullable [a-b]*, and the
+    // membership-aware self-check validates it (z3 cross-checked via expect).
     expect(
         "(set-logic QF_S)(declare-fun s () String)\
          (assert (str.in_re s (re.* (re.range \"a\" \"b\"))))(check-sat)",
-        Verdict::Unknown,
+        Verdict::Sat,
     );
     // Cardinality cap: 300 words > ENUM_WORD_CAP = 256.
     expect(

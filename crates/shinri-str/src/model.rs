@@ -91,8 +91,9 @@ pub fn assign(
     known: &[TermId],
     str_terms: &[TermId],
     m: &mut ModelBuilder,
+    seed: &FxHashMap<TermId, String>,
 ) {
-    let mut memo: FxHashMap<TermId, String> = FxHashMap::default();
+    let mut memo: FxHashMap<TermId, String> = seed.clone();
     let mut in_progress: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
 
     // Value concat terms FIRST: an anchored concat (e.g. `x++y = "ab"`) slices its
@@ -420,5 +421,100 @@ fn concat_arity(terms: &Context, t: TermId) -> usize {
             ..
         } => terms.children(*args).len(),
         _ => 0,
+    }
+}
+
+/// Slice 21: words for FREE string variables carrying membership atoms.
+/// A variable is repair-eligible iff it is a leaf (nullary uninterpreted)
+/// whose class holds no constant and no concat (the `value_of` free path) —
+/// anything else has its value dictated elsewhere and repair would fight it.
+/// The word: `search_word` over the intersection of all its (polarity-
+/// adjusted) Rex constraints at the class's model length. No word / cap hit
+/// / extraction failure ⇒ no seed (the post-solve self-check backstops).
+pub(crate) fn memb_seeds(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    membs: &[(TermId, bool)],
+    m: &ModelBuilder,
+) -> FxHashMap<TermId, String> {
+    use crate::regex;
+    let mut per_var: FxHashMap<TermId, Vec<regex::Rex>> = FxHashMap::default();
+    for &(atom, pos) in membs {
+        let (t, re_t) = crate::memb::memb_sides(terms, atom);
+        let is_leaf = matches!(
+            terms.term_node(t),
+            TermNode::App { op: Op::Uninterpreted(_), args, .. }
+                if terms.children(*args).is_empty()
+        );
+        if !is_leaf {
+            continue;
+        }
+        let Some(mut rex) = regex::extract_const_regex(terms, re_t) else {
+            continue;
+        };
+        if !pos {
+            rex = regex::comp(rex);
+        }
+        per_var.entry(t).or_default().push(rex);
+    }
+    let mut out = FxHashMap::default();
+    for (v, rexes) in per_var {
+        // Free check: no constant and no concat in v's class.
+        let pinned = class_member(terms, eq, known, v, |terms, mm| {
+            (terms.string_const_value(mm).is_some() || is_concat(terms, mm)) && mm != v
+        });
+        if pinned.is_some() {
+            continue;
+        }
+        let n = class_len_in_model(terms, eq, known, m, v);
+        let goal = regex::inter(rexes);
+        if let Some(w) = regex::search_word(&goal, n) {
+            out.insert(v, w);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shinri_core::BuiltinOp;
+    use shinri_theory::types::ModelVal;
+
+    // ── Task 4 (slice 21): membership-aware seeding ──────────────────────
+
+    #[test]
+    fn memb_seed_replaces_free_fill() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let re_t = crate::regex::test_az_star_term(&mut ctx);
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        let mut eq = EqualityEngine::default();
+        let mut m = ModelBuilder::default();
+        // Arith pinned len(x) = 3.
+        let len_x = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
+        m.assign(
+            len_x,
+            ModelVal::Num(shinri_core::Rational::from_int(3i128.into())),
+        );
+        let known = vec![x];
+        let seeds = memb_seeds(&mut ctx, &mut eq, &known, &[(atom, true)], &m);
+        let w = seeds.get(&x).expect("free membership var must be seeded");
+        assert_eq!(w.chars().count(), 3);
+        assert!(w.chars().all(|c| c.is_ascii_lowercase()));
+        // A var pinned by a class CONSTANT must NOT be seeded (not free).
+        let ab = ctx.mk_string_const("ab");
+        let xa = eq.intern(x);
+        let ca = eq.intern(ab);
+        let _ = eq.merge(xa, ca, shinri_theory::types::EqJust::Definitional);
+        let seeds2 = memb_seeds(&mut ctx, &mut eq, &[x, ab], &[(atom, true)], &m);
+        assert!(seeds2.is_empty(), "constant-pinned var is not repaired");
     }
 }

@@ -1,24 +1,21 @@
 #[derive(Default)]
 pub struct Trail {
-    marks: Vec<(usize, usize)>, // (eq_true_len, diseq_true_len) at each push
+    marks: Vec<(usize, usize, usize)>, // (eq_true_len, diseq_true_len, memb_true_len)
 }
 
 impl Trail {
-    pub fn push(&mut self, eq_len: usize, diseq_len: usize) {
-        self.marks.push((eq_len, diseq_len));
+    pub fn push(&mut self, eq_len: usize, diseq_len: usize, memb_len: usize) {
+        self.marks.push((eq_len, diseq_len, memb_len));
     }
 
-    /// Current absolute decision level = number of open scopes. `push` is called
-    /// once per SAT decision level, so this mirrors the SAT trail's decision level.
-    /// A (dis)equality asserted while this returns 0 is UNCONDITIONALLY entailed
-    /// (a top-level fact); one asserted at level > 0 is only CONDITIONALLY active
-    /// (selected inside some disjunction at a decision).
+    /// Current absolute decision level = number of open scopes. (Unchanged
+    /// semantics — see the original doc comment.)
     pub fn level(&self) -> u32 {
         self.marks.len() as u32
     }
 
-    /// Returns the (eq_true_len, diseq_true_len) to truncate to for absolute `target` level.
-    pub fn pop_to(&mut self, target: usize) -> Option<(usize, usize)> {
+    /// Returns the (eq, diseq, memb) lengths to truncate to for absolute `target`.
+    pub fn pop_to(&mut self, target: usize) -> Option<(usize, usize, usize)> {
         let mut last = None;
         while self.marks.len() > target {
             last = self.marks.pop();
