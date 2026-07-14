@@ -3158,6 +3158,27 @@ fn targeted_to_code_range_length_seam_known_gap() {
     );
 }
 
+/// Regression pin for the un-lifted `ite`-subject regex surface (slice 22,
+/// task 2 `gadget` recursion): `elim_term_ite` runs AFTER `code_conv`
+/// (`lib.rs`), so a `str.to_code` gadget applied to a String-valued `ite`
+/// reaches the regex stage with the `ite` — and the `str.in_re` nested in its
+/// condition — still un-lifted. This shape is novel to slice 22; slices
+/// 19-21 never exercised it. `str.to_code` of either 1-char branch ("a" = 97,
+/// "b" = 98) is >= 48 regardless of which arm the free `ite` condition on `x`
+/// picks, so negating `>= 48` is unconditionally contradictory: UNSAT no
+/// matter what the un-lifted `ite`/`in_re` decide. If `elim_term_ite`
+/// ordering or the regex stage ever mishandles an `ite` subject, this flips
+/// to a wrong Sat.
+#[test]
+fn targeted_to_code_range_ite_subject_unlifted_unsat() {
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (not (>= (str.to_code (ite (>= (str.to_code x) 48) \"a\" \"b\")) 48)))\
+         (check-sat)",
+        Verdict::Unsat,
+    );
+}
+
 #[test]
 fn targeted_code_conv_decided_unsat() {
     // R6: below -1 / above the alphabet.

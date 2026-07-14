@@ -381,10 +381,9 @@ fn match_code_ineq(ctx: &Context, op: BuiltinOp, kids: &[TermId]) -> Option<(Ter
     }
     let (s, k, op) = if let Some(s) = to_code_arg(ctx, kids[0]) {
         (s, clamp_code(&int_const_value(ctx, kids[1])?), op)
-    } else if let Some(s) = to_code_arg(ctx, kids[1]) {
-        (s, clamp_code(&int_const_value(ctx, kids[0])?), mirror(op))
     } else {
-        return None;
+        let s = to_code_arg(ctx, kids[1])?;
+        (s, clamp_code(&int_const_value(ctx, kids[0])?), mirror(op))
     };
     let b = match op {
         BuiltinOp::Ge => Bound { k, negated: false },
