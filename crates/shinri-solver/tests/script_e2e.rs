@@ -967,9 +967,23 @@ fn in_re_symbolic_nullable_sat_via_selfcheck() {
 
 #[test]
 fn in_re_symbolic_nonnullable_unknown_pre_engine() {
-    // x ∈ [a-z]+ : the default model (x = "") violates the membership; no
-    // engine rules yet, so the self-check downgrades to Unknown — NOT a wrong
-    // verdict. Task 4 flips this pin to Sat.
+    // x ∈ [a-z]+ : the default model (x = "") violates the membership.
+    // slice 21 Task 4 KNOWN GAP (NOT flipped to Sat as the brief proposed):
+    // Task 3's Rule S unfolds x = "" ∨ x = h·z, then RECURSES on `h`'s own
+    // `h ∈ [a-z]` membership via the SAME head-forced S1–S4 machinery (a bare
+    // `Rex::Range` head-forces to `(class, Eps)` — see `regex::head_forced`),
+    // minting a FRESH (h2, z2) pair every level. Confirmed via direct trace
+    // (40 vs 500 fuel units gave the IDENTICAL search path/result — NOT a
+    // fuel-tuning gap): the SAT layer can satisfy an S3/S4 guard clause
+    // `¬lit ∨ dist ∨ m_h` by deciding `dist` (the fresh pair's distinctness)
+    // true instead of `m_h` (the actual `h ∈ C` membership), so the leaf that
+    // ultimately needs a concrete letter never gets an explicit `str.in_re`
+    // atom recorded in `memb_true` — `memb_seeds` (scoped to recorded atoms
+    // on unpinned leaves, by design/soundness) never sees it, and the
+    // model's length-consistency guard discards the wrongly-composed concat,
+    // free-filling instead — self-check correctly downgrades to Unknown.
+    // Fixing this needs a Rule-S change in memb.rs (out of Task 4's allowed
+    // files) — reported BLOCKED, not adjudicated; pin left as observed.
     let out = run_script(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))(check-sat)",
@@ -1044,4 +1058,36 @@ fn in_re_unfold_negative_polarity_unsat() {
          (assert (not (str.in_re x re.all)))(check-sat)",
     );
     assert_eq!(out, vec!["unsat"]);
+}
+
+// Slice 21 (Task 4): sat with witnesses via membership-aware model repair.
+//
+// NOTE (deviation from the task-4 brief, same idiom as Tasks 2–3's pins
+// above): the brief's verbatim snippet uses an `expect(src, Verdict::..)`
+// helper that does not exist in this file; the surviving pin is transcribed
+// with `run_script` and a direct assertion on the raw output.
+//
+// NOTE (BLOCKED — not adjudicated, pins NOT added): the brief's other two
+// proposed pins (`in_re_unfold_sat_plus_with_length`,
+// `in_re_unfold_sat_negative_polarity`) do not hold against the current
+// engine — both reach `check-sat` = "unknown", for the SAME root cause
+// documented on `in_re_symbolic_nonnullable_unknown_pre_engine` above
+// (Task 3's Rule S recurses on already length-pinned bare-range residual
+// memberships via fresh skolem pairs, and the SAT layer can dodge deciding
+// the actual `h ∈ C` atom via the sibling `dist` disjunct — confirmed NOT a
+// fuel-tuning gap via a 40-vs-500-fuel-unit A/B test giving an IDENTICAL
+// wrong witness). `memb_seeds` only repairs vars carrying a RECORDED
+// `str.in_re` atom on an unpinned leaf (the brief's own soundness
+// constraint) and correctly declines to guess for these. See task-4-report.md.
+
+#[test]
+fn in_re_unfold_sat_under_boolean_structure() {
+    // Memberships under or/not/ite — the atom is decided at whatever polarity
+    // the SAT layer picks.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun b () Bool)\
+         (assert (or (str.in_re x (re.+ (str.to_re \"q\"))) (= x \"zz\")))\
+         (assert (ite b (= x \"zz\") (= x \"qq\")))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
 }

@@ -444,7 +444,6 @@ pub(crate) fn rex_to_term(ctx: &mut Context, r: &Rex) -> TermId {
 /// NON-SURROGATE code point (a pure-surrogate class has no Rust witness and
 /// is skipped — sound: skipping loses completeness only). `dead` memoizes
 /// (remaining, Rex) states with no word, preventing exponential re-search.
-#[allow(dead_code)]
 pub(crate) fn search_word(r: &Rex, n: usize) -> Option<String> {
     fn go(
         r: &Rex,

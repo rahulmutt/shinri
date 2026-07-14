@@ -1192,7 +1192,11 @@ impl StrSolver {
             known.push(l);
             known.push(r);
         }
-        model::assign(cx.terms, cx.eq, &known, &str_terms, m);
+        // Slice 21: seed free membership variables with searched words so
+        // concat assembly composes REPAIRED values, not default fills.
+        let membs: Vec<(TermId, bool)> = self.memb_true.iter().map(|&(a, _, p)| (a, p)).collect();
+        let seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
+        model::assign(cx.terms, cx.eq, &known, &str_terms, m, &seeds);
     }
 }
 
