@@ -25,6 +25,7 @@ use rustc_hash::FxHashMap;
 use shinri_core::{BuiltinOp, Context, Integer, Op, Rational, TermId, TermNode};
 
 use crate::int_conv::int_const_value;
+use crate::regex::{rex_to_term, Rex};
 
 /// Largest SMT-LIB string character (inclusive): U+2FFFF.
 pub const MAX_CODE: i128 = 0x2FFFF;
@@ -71,15 +72,24 @@ fn eval_from_code(k: &Integer) -> Option<String> {
     }
 }
 
-/// Single exact rewrite pass (spec R1–R10): bottom-up, memoized; untouched
-/// subtrees keep their TermIds. Every rule is a full equivalence — no model
-/// repair, no polarity tracking, no occurrence analysis.
+/// Two passes over the assertion list.
+///
+/// Pass 1 (slice 18, R1–R10): bottom-up, memoized; untouched subtrees keep
+/// their TermIds. Every rule is a full equivalence — no model repair, no
+/// polarity tracking, no occurrence analysis.
+///
+/// Pass 2 (slice 22): the `str.to_code` character-range gadget. It runs SECOND
+/// so every foldable `to_code` application is already gone and it only ever
+/// sees genuinely symbolic ones.
 pub fn rewrite_code_conv(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId> {
     let mut memo: FxHashMap<TermId, TermId> = FxHashMap::default();
-    assertions
+    let folded: Vec<TermId> = assertions
         .iter()
         .map(|&a| rewrite(ctx, a, &mut memo))
-        .collect()
+        .collect();
+
+    let mut gmemo: FxHashMap<TermId, TermId> = FxHashMap::default();
+    folded.iter().map(|&a| gadget(ctx, a, &mut gmemo)).collect()
 }
 
 fn rewrite(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -> TermId {
@@ -306,6 +316,169 @@ fn rw_from_code_const(ctx: &mut Context, n: TermId, lit: &str) -> TermId {
         // from_code's range.
         _ => ctx.mk_const_bool(false),
     }
+}
+
+// ─── Slice 22: the str.to_code character-range gadget ────────────────────
+//
+// A SECOND pass over the same assertion list, run after the slice-18 pass
+// above (so every foldable `str.to_code` application is already gone and only
+// genuinely symbolic ones remain). Every rule is a full equivalence.
+
+/// A `str.to_code` inequality atom canonicalized to the lower-bound form
+/// `to_code(s) >= k`, possibly negated (spec §1.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Bound {
+    k: i128,
+    negated: bool,
+}
+
+/// Clamp a threshold to `[-2, MAX_CODE + 1]`. Exact, because `to_code` is
+/// total into `{-1} ∪ [0, MAX_CODE]`: every value below `-1` makes
+/// `to_code(s) >= k` a tautology, and every value above `MAX_CODE` makes it
+/// unsatisfiable. Clamping removes the i128-overflow and bignum cases in one
+/// step, so the `+1` shifts below cannot overflow.
+fn clamp_code(k: &Integer) -> i128 {
+    match k.to_i128() {
+        Some(v) => v.clamp(-2, MAX_CODE + 1),
+        None if k.is_negative() => -2,
+        None => MAX_CODE + 1,
+    }
+}
+
+/// `(>= k (str.to_code s))` ≡ `(<= (str.to_code s) k)` — mirroring the operator
+/// is how the reversed orientation joins the same canonical table.
+fn mirror(op: BuiltinOp) -> BuiltinOp {
+    match op {
+        BuiltinOp::Ge => BuiltinOp::Le,
+        BuiltinOp::Le => BuiltinOp::Ge,
+        BuiltinOp::Gt => BuiltinOp::Lt,
+        BuiltinOp::Lt => BuiltinOp::Gt,
+        other => other,
+    }
+}
+
+/// The String argument of a `(str.to_code s)` application.
+fn to_code_arg(ctx: &Context, t: TermId) -> Option<TermId> {
+    match ctx.term_node(t) {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrToCode),
+            args,
+            ..
+        } => Some(ctx.children(*args)[0]),
+        _ => None,
+    }
+}
+
+/// Spec §1.1: match `(⋈ (str.to_code s) k)` / `(⋈ k (str.to_code s))` for
+/// `⋈ ∈ {>=, >, <=, <}` and constant Int `k`, canonicalized to
+/// `to_code(s) >= b.k`. The strict/non-strict shifts are exact because
+/// `to_code` is Int-valued.
+fn match_code_ineq(ctx: &Context, op: BuiltinOp, kids: &[TermId]) -> Option<(TermId, Bound)> {
+    if kids.len() != 2 {
+        return None;
+    }
+    let (s, k, op) = if let Some(s) = to_code_arg(ctx, kids[0]) {
+        (s, clamp_code(&int_const_value(ctx, kids[1])?), op)
+    } else if let Some(s) = to_code_arg(ctx, kids[1]) {
+        (s, clamp_code(&int_const_value(ctx, kids[0])?), mirror(op))
+    } else {
+        return None;
+    };
+    let b = match op {
+        BuiltinOp::Ge => Bound { k, negated: false },
+        BuiltinOp::Gt => Bound {
+            k: k + 1,
+            negated: false,
+        },
+        BuiltinOp::Le => Bound {
+            k: k + 1,
+            negated: true,
+        },
+        BuiltinOp::Lt => Bound { k, negated: true },
+        _ => return None,
+    };
+    Some((s, b))
+}
+
+/// `s ∈ Range(lo, hi)` as a `str.in_re` term. An empty interval is `false`.
+///
+/// None ⇒ the representational fence (spec §3.1): `range_term` encodes the FULL
+/// surrogate block via `re.diff`, so `0xD800` is an admissible `lo` and
+/// `0xDFFF` an admissible `hi`, but an endpoint STRICTLY inside the block would
+/// need a lone-surrogate `re.range` endpoint, which is not a `Box<str>`. The
+/// caller then leaves the atom alone and `has_unreduced_code_conv` turns it into
+/// a sound Unknown.
+///
+/// The empty-interval check comes FIRST, deliberately: `48 <= to_code(s) <= 47`
+/// is unsatisfiable whatever the endpoints are, so it decides even when they
+/// would not have been expressible.
+fn range_membership(ctx: &mut Context, s: TermId, lo: i128, hi: i128) -> Option<TermId> {
+    if lo > hi {
+        return Some(ctx.mk_const_bool(false));
+    }
+    debug_assert!((0..=MAX_CODE).contains(&lo) && (0..=MAX_CODE).contains(&hi));
+    if (is_surrogate(lo) && lo != 0xD800) || (is_surrogate(hi) && hi != 0xDFFF) {
+        return None;
+    }
+    let r = rex_to_term(ctx, &Rex::Range(lo as u32, hi as u32));
+    Some(
+        ctx.mk_app(Op::Builtin(BuiltinOp::StrInRe), &[s, r])
+            .expect("str.in_re well-sorted"),
+    )
+}
+
+/// Spec §1.2, for a bound no fusion group claimed. None ⇒ not a `to_code`
+/// inequality atom, or an inexpressible threshold (→ fence).
+fn try_code_ineq_atom(ctx: &mut Context, op: Op, kids: &[TermId]) -> Option<TermId> {
+    let Op::Builtin(bop) = op else { return None };
+    if !matches!(
+        bop,
+        BuiltinOp::Ge | BuiltinOp::Gt | BuiltinOp::Le | BuiltinOp::Lt
+    ) {
+        return None;
+    }
+    let (s, b) = match_code_ineq(ctx, bop, kids)?;
+    // Degenerate thresholds fold to constants, negation included.
+    if b.k <= -1 {
+        return Some(ctx.mk_const_bool(!b.negated)); // `>= k` is a tautology
+    }
+    if b.k > MAX_CODE {
+        return Some(ctx.mk_const_bool(b.negated)); // `>= k` is unsatisfiable
+    }
+    let m = range_membership(ctx, s, b.k, MAX_CODE)?;
+    Some(if b.negated {
+        ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[m])
+            .expect("not membership")
+    } else {
+        m
+    })
+}
+
+/// Pass 2. Memoized. Task 2 adds the `And` fusion arm; for now every bound is
+/// materialized on its own.
+fn gadget(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermId>) -> TermId {
+    if let Some(&r) = memo.get(&t) {
+        return r;
+    }
+    let result = match ctx.term_node(t).clone() {
+        TermNode::Const { .. } => t,
+        TermNode::App { op, args, .. } => {
+            let orig: Vec<TermId> = ctx.children(args).to_vec();
+            match try_code_ineq_atom(ctx, op, &orig) {
+                Some(r) => r,
+                None => {
+                    let kids: Vec<TermId> = orig.iter().map(|&c| gadget(ctx, c, memo)).collect();
+                    if kids == orig {
+                        t
+                    } else {
+                        ctx.mk_app(op, &kids).expect("gadget: well-sorted rebuild")
+                    }
+                }
+            }
+        }
+    };
+    memo.insert(t, result);
+    result
 }
 
 /// Presence fence: true iff any `str.to_code` / `str.from_code` /
@@ -652,5 +825,178 @@ mod tests {
         let out = rw1(&mut ctx, atom);
         assert_eq!(out, atom);
         assert!(has_unreduced_code_conv(&ctx, &[out]));
+    }
+
+    // ── Slice 22: the character-range gadget ─────────────────────────────
+    //
+    // The assertions below compare TermIds directly. That is exact, not
+    // fragile: the Context is hash-consed and `rex_to_term` is documented as
+    // deterministic (regex.rs:387-392), so an equal Rex yields an equal
+    // TermId.
+
+    fn str_var(ctx: &mut Context, name: &str) -> TermId {
+        let s = ctx.string_sort();
+        nullary(ctx, name, s)
+    }
+
+    /// `(<op> (str.to_code s) k)`.
+    fn ineq(ctx: &mut Context, op: BuiltinOp, s: TermId, k: i128) -> TermId {
+        let tc = to_code(ctx, s);
+        let kk = int_lit(ctx, k);
+        ctx.mk_app(Op::Builtin(op), &[tc, kk]).unwrap()
+    }
+
+    /// The expected `s ∈ Range(lo, hi)` membership term.
+    fn want_range(ctx: &mut Context, s: TermId, lo: u32, hi: u32) -> TermId {
+        let r = crate::regex::rex_to_term(ctx, &crate::regex::Rex::Range(lo, hi));
+        ctx.mk_app(Op::Builtin(BuiltinOp::StrInRe), &[s, r])
+            .unwrap()
+    }
+
+    const MAX_U32: u32 = MAX_CODE as u32;
+
+    #[test]
+    fn ge_rewrites_to_suffix_range_membership() {
+        // §1.2 master equivalence: to_code(s) >= 48 ⟺ s ∈ Range(48, MAX_CODE).
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let atom = ineq(&mut ctx, BuiltinOp::Ge, s, 48);
+        let out = rewrite_code_conv(&mut ctx, &[atom]);
+        assert!(!has_unreduced_code_conv(&ctx, &out), "to_code must be gone");
+        let want = want_range(&mut ctx, s, 48, MAX_U32);
+        assert_eq!(out[0], want);
+    }
+
+    #[test]
+    fn canonicalization_table() {
+        // §1.1: every op, both orientations, reduced to `to_code(s) >= k*`.
+        // `>  47` ≡ `>= 48`;  `<  48` ≡ ¬(>= 48);  `<= 47` ≡ ¬(>= 48).
+        //
+        // A1 (controller adjudication, overrides the brief as written): each
+        // atom below gets its OWN string variable (`s_gt`/`s_lt`/`s_le`)
+        // rather than sharing one `s`. Task 2 adds bound FUSION, which groups
+        // bounds by string term and collapses each group to one membership —
+        // three bounds sharing `s` would fuse into a single result and no
+        // longer pin these per-atom expectations. Distinct variables ensure
+        // fusion never groups them, so this table keeps testing the
+        // canonicalization table atom-by-atom across Task 2.
+        let mut ctx = Context::new();
+        let s_gt = str_var(&mut ctx, "s_gt");
+        let s_lt = str_var(&mut ctx, "s_lt");
+        let s_le = str_var(&mut ctx, "s_le");
+        let want_pos_gt = want_range(&mut ctx, s_gt, 48, MAX_U32);
+        let want_pos_lt = want_range(&mut ctx, s_lt, 48, MAX_U32);
+        let want_pos_le = want_range(&mut ctx, s_le, 48, MAX_U32);
+        let want_neg_lt = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Not), &[want_pos_lt])
+            .unwrap();
+        let want_neg_le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Not), &[want_pos_le])
+            .unwrap();
+
+        let gt = ineq(&mut ctx, BuiltinOp::Gt, s_gt, 47);
+        let lt = ineq(&mut ctx, BuiltinOp::Lt, s_lt, 48);
+        let le = ineq(&mut ctx, BuiltinOp::Le, s_le, 47);
+        let out = rewrite_code_conv(&mut ctx, &[gt, lt, le]);
+        assert_eq!(out[0], want_pos_gt);
+        assert_eq!(out[1], want_neg_lt);
+        assert_eq!(out[2], want_neg_le);
+
+        // Mirrored orientation: `(<= k (to_code s))` ≡ `(>= (to_code s) k)`.
+        let s = str_var(&mut ctx, "s");
+        let want_pos = want_range(&mut ctx, s, 48, MAX_U32);
+        let tc = to_code(&mut ctx, s);
+        let k = int_lit(&mut ctx, 48);
+        let mirrored = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[k, tc]).unwrap();
+        let out = rewrite_code_conv(&mut ctx, &[mirrored]);
+        assert_eq!(out[0], want_pos);
+    }
+
+    #[test]
+    fn zero_threshold_is_the_singleton_language() {
+        // §1.2: to_code(s) >= 0 ⟺ len(s) = 1 ⟺ s ∈ Range(0, MAX_CODE)
+        // (= re.allchar). Not a special case — it falls out of the formula.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let atom = ineq(&mut ctx, BuiltinOp::Ge, s, 0);
+        let out = rewrite_code_conv(&mut ctx, &[atom]);
+        let want = want_range(&mut ctx, s, 0, MAX_U32);
+        assert_eq!(out[0], want);
+    }
+
+    #[test]
+    fn degenerate_thresholds_fold_to_constants() {
+        // §1.2. `to_code(s) >= -1` is a TAUTOLOGY (to_code is total into
+        // {-1} ∪ [0, MAX_CODE]); `>= MAX_CODE + 1` is unsatisfiable. Negation
+        // flips each.
+        //
+        // A1 (controller adjudication, overrides the brief as written): each
+        // atom gets its OWN string variable (`s_taut`/`s_unsat`/
+        // `s_neg_taut`/`s_neg_unsat`) instead of sharing one `s`, for the
+        // same fusion-grouping reason as `canonicalization_table` above —
+        // this pins the degenerate folds atom-by-atom and survives Task 2's
+        // bound fusion unchanged.
+        let mut ctx = Context::new();
+        let s_taut = str_var(&mut ctx, "s_taut");
+        let s_unsat = str_var(&mut ctx, "s_unsat");
+        let s_neg_taut = str_var(&mut ctx, "s_neg_taut");
+        let s_neg_unsat = str_var(&mut ctx, "s_neg_unsat");
+        let tt = ctx.mk_const_bool(true);
+        let ff = ctx.mk_const_bool(false);
+
+        let taut = ineq(&mut ctx, BuiltinOp::Ge, s_taut, -1);
+        let unsat = ineq(&mut ctx, BuiltinOp::Ge, s_unsat, MAX_CODE + 1);
+        // `< -1` is ¬(>= -1) = false;  `<= MAX_CODE` is ¬(>= MAX_CODE+1) = true.
+        let neg_taut = ineq(&mut ctx, BuiltinOp::Lt, s_neg_taut, -1);
+        let neg_unsat = ineq(&mut ctx, BuiltinOp::Le, s_neg_unsat, MAX_CODE);
+
+        let out = rewrite_code_conv(&mut ctx, &[taut, unsat, neg_taut, neg_unsat]);
+        assert_eq!(out[0], tt);
+        assert_eq!(out[1], ff);
+        assert_eq!(out[2], ff);
+        assert_eq!(out[3], tt);
+    }
+
+    #[test]
+    fn far_out_of_range_thresholds_fold() {
+        // §1.1 clamping: a threshold too large for i128 still folds — the sign
+        // decides. `>= 10^40` is unsatisfiable.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let int_s = ctx.int_sort();
+        let huge = Integer::from_str_radix("1".repeat(40).as_str(), 10).unwrap();
+        let k = ctx.mk_numeral(Rational::from_int(huge), int_s);
+        let tc = to_code(&mut ctx, s);
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[tc, k]).unwrap();
+        let out = rewrite_code_conv(&mut ctx, &[atom]);
+        assert_eq!(out[0], ctx.mk_const_bool(false));
+    }
+
+    #[test]
+    fn interior_surrogate_threshold_fences() {
+        // §3.1 representational fence. `range_term` encodes the FULL surrogate
+        // block via `re.diff`, so 0xD800 is an admissible `lo`; a threshold
+        // STRICTLY inside the block would need a lone-surrogate `re.range`
+        // endpoint, which is not a `Box<str>`. Those survive to the fence.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+
+        for k in [0xD801, 0xDFFF] {
+            let atom = ineq(&mut ctx, BuiltinOp::Ge, s, k);
+            let out = rewrite_code_conv(&mut ctx, &[atom]);
+            assert!(
+                has_unreduced_code_conv(&ctx, &out),
+                "threshold {k:#x} must fence"
+            );
+        }
+        // The block boundaries DO express.
+        for k in [0xD7FF, 0xD800] {
+            let atom = ineq(&mut ctx, BuiltinOp::Ge, s, k);
+            let out = rewrite_code_conv(&mut ctx, &[atom]);
+            assert!(
+                !has_unreduced_code_conv(&ctx, &out),
+                "threshold {k:#x} must express"
+            );
+        }
     }
 }

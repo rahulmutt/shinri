@@ -2633,8 +2633,9 @@ fn targeted_const_int_conv_negated_witness_model_repair() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Slice 18: str.to_code / str.from_code / str.is_digit — fence pins.
-// These shapes stay OUTSIDE the decided fragment permanently (symbolic
-// linking, nested arithmetic, surrogate code points): sound Unknown.
+// These shapes stay OUTSIDE the decided fragment: symbolic linking, nested
+// arithmetic, surrogate code points. Slice 22 REMOVED the inequality-atom pin
+// from this list — those decide now (see targeted_to_code_range_decided).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -2675,14 +2676,6 @@ fn targeted_code_conv_fences_unknown() {
         shinri_verdict(
             "(set-logic QF_S)(declare-fun s () String)\
              (assert (= (+ (str.to_code s) 1) 98))(check-sat)"
-        ),
-        Verdict::Unknown,
-    );
-    // Inequality atom.
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)\
-             (assert (>= (str.to_code s) 48))(check-sat)"
         ),
         Verdict::Unknown,
     );
