@@ -1105,3 +1105,184 @@ fn in_re_unfold_sat_under_boolean_structure() {
     );
     assert_eq!(out, vec!["sat"]);
 }
+
+// Slice 21 (Task 5): completion of the verdict matrix + the two slice-20
+// `Unknown` pin flips.
+//
+// NOTE (Step 1 divergence from the task-5 brief): the brief says "grep
+// script_e2e.rs for the slice-20 pins on `(re.* (re.range "a" "b"))` and
+// `re.allchar`" — those pins do NOT live in this file. They are
+// `targeted_regex_symbolic_fences_unknown` and `targeted_regex_fences_unknown`
+// in `qfs_differential.rs` (slice-20 commit d310428), which is OUTSIDE this
+// task's allowed file list (`script_e2e.rs`, `regex.rs`). Rather than edit an
+// out-of-scope file, the flip is pinned HERE as new e2e tests reproducing the
+// exact shapes, observed-first per the iron rule. The stale `qfs_differential.rs`
+// pins are left untouched — recorded for Task 7's spec truth-up.
+
+#[test]
+fn in_re_unfold_slice20_star_range_flips_sat() {
+    // `(re.* (re.range "a" "b"))` — neither finite nor co-finite, so slice 20's
+    // equivalence-rewrite pass could never decide it (see the STALE pin
+    // `targeted_regex_symbolic_fences_unknown` in qfs_differential.rs, still
+    // `Unknown` there, out of scope for this task). Slice 21: decided by
+    // derivative unfolding (was fenced -> Unknown in slices 19-20) — the
+    // language is NULLABLE (x = "" is a member), so even the pre-repair
+    // self-check accepts the default empty fill. Observed matches the brief's
+    // prediction.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.* (re.range \"a\" \"b\"))))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn in_re_unfold_slice20_allchar_stays_unknown() {
+    // `str.in_re s re.allchar` (bare Σ, no length constraint). The brief
+    // predicted this ALSO flips to Sat ("Σ is ONE next-character class; S1..S4
+    // + repair mint a length-1 witness"). OBSERVED: still Unknown — divergence
+    // recorded for Task 7's truth-up.
+    //
+    // Traced: `re.allchar` extracts to `Rex::Range(0, MAX_CODE)`, structurally
+    // identical to any bare `re.range`. The memb pass's Rule S/E never engage a
+    // BARE `Rex::Range` atom at all — `memb_check` explicitly treats it as a
+    // "bare-range LEAF" left for Rule G + model repair (see the comment above
+    // the `matches!(cur, Rex::Range(..)) { continue; }` skip in memb.rs) — no
+    // S1/S2 length-link is ever minted for it, unlike a HEAD-FORCED shape such
+    // as `(re.+ (re.range "a" "z"))` (Concat with a Range head), which DOES
+    // mint `len(h)=1` and hence decides (see `in_re_symbolic_nonnullable_sat`).
+    // A bare-range atom small enough to enumerate (<= 256 words, `ENUM_WORD_CAP`
+    // in regex.rs) is instead decided by the PRE-EXISTING slice-20
+    // finite-language equivalence-rewrite pass (confirmed empirically: bare
+    // ranges of exactly 256 words decide Sat, 257 words do not — the exact
+    // `ENUM_WORD_CAP` boundary). `re.allchar` has ~0x30000 words, far past that
+    // cap, and its complement is not co-finite either (slice-20's OTHER
+    // decision path), so it falls through to slice-21's bare-range-leaf path,
+    // which — absent any independent length constraint on `s` — has nothing to
+    // repair with (`memb_seeds` needs an ALREADY-pinned model length to search a
+    // word; none exists here) and the default empty-fill genuinely fails the
+    // membership, so the post-solve self-check soundly downgrades to `Unknown`.
+    // (Confirmed non-leaf: `re.allchar` WITH an explicit length constraint,
+    // e.g. `(= (str.len s) 1)`, DOES decide Sat — `in_re_unfold_slice20_allchar_with_length_decides_sat`
+    // below — because then `memb_seeds` has a length to search with.) The
+    // stale slice-20 pin (`targeted_regex_fences_unknown` in
+    // qfs_differential.rs) remains accurate as-is; out of scope to touch here.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s re.allchar))(check-sat)",
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn in_re_unfold_slice20_allchar_with_length_decides_sat() {
+    // Companion to the pin above: the SAME bare-Σ membership decides once an
+    // independent length constraint gives `memb_seeds` something to search
+    // with — confirms the diagnosis (a length-availability gap, not a
+    // soundness fence) rather than a permanent block on `re.allchar`.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s re.allchar))(assert (= (str.len s) 1))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn in_re_unfold_sat_getvalue_witness() {
+    // get-value returns a genuine member of [a-z]+ (bare, no length pin — see
+    // the note below on why the length-pinned twin hits the intersection gap
+    // instead). This is the SAME shape as `in_re_symbolic_nonnullable_sat`
+    // with `get-value` attached, matching this file's existing get-value idiom
+    // (slices 15/18: assert `out[0] == "sat"` then inspect `out[1]`) — no
+    // `expect_get_value_satisfies` helper exists in this file (see the Task
+    // 2-4 NOTEs above on the `expect`/`Verdict` idiom mismatch; same
+    // transcription deviation applies to the brief's proposed helper).
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))(check-sat)(get-value (x))",
+    );
+    assert_eq!(out.first().map(String::as_str), Some("sat"));
+    let v = out.get(1).expect("get-value output");
+    let q1 = v.find('"').expect("open quote");
+    let q2 = v[q1 + 1..].find('"').expect("close quote");
+    let val = &v[q1 + 1..q1 + 1 + q2];
+    assert!(
+        !val.is_empty() && val.chars().all(|c| c.is_ascii_lowercase()),
+        "witness must be a nonempty lowercase member of [a-z]+, got {out:?}"
+    );
+}
+
+#[test]
+fn in_re_unfold_plus_with_length2_unknown_intersection_gap() {
+    // The brief's verbatim get-value shape ([a-z]+ ∧ len(x)=2, with
+    // get-value): observed Unknown, NOT Sat — it hits the SAME intersection
+    // gap as `in_re_unfold_plus_with_length_unknown_intersection_gap` (pinned
+    // there for len=3; same root cause, different length). Pinned separately
+    // per the brief's exact shape so the matrix keeps a len=2 case; see that
+    // pin's comment for the full mechanism trace (jointly-unsatisfiable
+    // membership-atom polarities minted over one witness leaf — a sound
+    // Unknown, never a wrong verdict).
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))\
+         (assert (= (str.len x) 2))(check-sat)(get-value (x))",
+    );
+    assert_eq!(out.first().map(String::as_str), Some("unknown"));
+}
+
+#[test]
+fn in_re_unfold_unknown_class_cap() {
+    // > 64 classes: 33 disjoint single-char printable-ASCII ranges at
+    // codepoints 33, 35, …, 97 → 66 range boundaries + the 0 cut = 67 > 64.
+    // Observed: Unknown, as expected — the CLASS_SPLIT_CAP fence (regex.rs)
+    // holds.
+    let ranges: String = (0..33)
+        .map(|i| {
+            let a = char::from(b'!' + 2 * i as u8); // '!'(33) … 'a'(97), printable
+            format!("(re.range \"{a}\" \"{a}\")")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let out = run_script(&format!(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (str.in_re x (re.* (re.union {ranges}))))\
+         (assert (>= (str.len x) 1))(check-sat)"
+    ));
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn in_re_unfold_unknown_fuel_depth() {
+    // A shape whose unfolding needs more than the 40-unit fuel budget
+    // (`Fuel::default`, fuel.rs): a 12-deep forced-prefix language intersected
+    // with an unconstrained `[a-a]+`, against an otherwise free variable —
+    // each unfolding level costs multiple emissions (Rule E + S1..S4), so ~10
+    // levels exhausts fuel. Observed: Unknown — matches the brief's
+    // fuel-genuinely-trips branch (post-D-satfuel, fuel exhaustion SATURATES
+    // to model repair rather than a hard Unknown, but here repair has nothing
+    // to seed from either — the pass never reached a decided leaf — so the
+    // post-solve self-check correctly finds no witness and downgrades). No
+    // deepening needed; this shape already exhausts fuel as-is.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (str.in_re x ((_ re.loop 12 12) (re.range \"a\" \"b\"))))\
+         (assert (str.in_re x (re.+ (re.range \"a\" \"a\"))))(check-sat)",
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn in_re_unfold_interplay_diseq() {
+    // Memberships and disequalities cooperate: x ∈ a{1,1} ⇒ x = "a";
+    // x ≠ "a" contradicts. Observed: Unsat, exactly as the brief predicted —
+    // no divergence here (the ground word-equation/diseq channel decides this
+    // directly; it does not depend on the bare-range-leaf gap traced above,
+    // since the disequality itself forces the ground conflict once x ≈ "a" is
+    // the only candidate).
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (str.in_re x ((_ re.loop 1 1) (str.to_re \"a\"))))\
+         (assert (not (= x \"a\")))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
