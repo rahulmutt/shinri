@@ -65,6 +65,18 @@ pub struct StrSolver {
     /// and the historical unsound-conflict note there). Monotone: recorded at the
     /// moment a split is emitted, before the disjunct can be asserted back.
     minted_eqs: FxHashSet<TermId>,
+    /// String Eq/Distinct atoms minted by the MEMBERSHIP pass (S1's `x = ""` /
+    /// `x = h·z`, Rule E's ε equality, the S-rules' `distinct(x, h·z)`
+    /// companions) — a subset of `minted_eqs` that distinguishes the MINTER
+    /// (slice 21, D-wordeq-skip, owner-authorized). These equalities are
+    /// DEFINITIONAL: the derivative S-rules are their resolution, so the
+    /// word-equation loop DEFERS F-split/char-peel emission over them —
+    /// re-skolemizing them both burned fuel and minted leaf-destroying
+    /// concats into the repair witnesses' EUF classes (`h = x·z2'`). Their
+    /// EUF merges at assert, their participation in normal forms, and all
+    /// ground/conflict handling stay fully intact; ONLY the Split emission
+    /// is suppressed. Monotone, like `minted_eqs`.
+    memb_minted_eqs: FxHashSet<TermId>,
     /// Counter for fresh string skolem variables minted by F-split.
     fresh_ctr: u32,
     fuel: Fuel,
@@ -674,6 +686,25 @@ impl TheorySolver for StrSolver {
                         }
                     }
                     crate::wordeq::StepResult::Split { atoms, guard } => {
+                        // D-wordeq-skip (owner-authorized freeze lift): a
+                        // MEMBERSHIP-PASS-minted equality is DEFINITIONAL — the
+                        // derivative S-rules are its resolution — so the
+                        // word-equation loop defers its skolemizing split.
+                        // Suppressing a GUARDED split emission is always sound
+                        // (strictly fewer lemmas; splits add guarded branches,
+                        // never verdicts) and touches none of the E1 invariants
+                        // above (nothing is emitted or cited here). Ground
+                        // resolution, conflict derivation, and the EUF merges all
+                        // ran unchanged before this point. `resolve_equation`
+                        // already recorded the head-pair dedup key, so this pair
+                        // reports `Saturated` on later rounds — the same
+                        // wait-for-SAT posture as an emitted-and-decided split.
+                        // Completeness cost lands on shapes where a memb-minted
+                        // equation genuinely needed wordeq skolemization; those
+                        // degrade through the model gate to a sound Unknown.
+                        if self.memb_minted_eqs.contains(&atom) {
+                            continue;
+                        }
                         // Register the new str.len terms produced by the F-split so
                         // their length axioms are emitted on the next check round.
                         // The F-split atoms are: [len_eq, a_pref, b_pref].

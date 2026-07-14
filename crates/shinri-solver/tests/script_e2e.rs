@@ -966,27 +966,18 @@ fn in_re_symbolic_nullable_sat_via_selfcheck() {
 }
 
 #[test]
-fn in_re_symbolic_nonnullable_unknown_pre_engine() {
-    // x ∈ [a-z]+ : the default model (x = "") violates the membership.
-    // slice 21 Task 4 KNOWN GAP under the spec freeze (still Unknown after
-    // the adjudicated bare-range-leaf + length-link fixes AND the
-    // owner-authorized D-satfuel saturation): the engine reaches Sat
-    // internally with `h ∈ [a-z]` recorded on the witness leaf `h` and
-    // `len(h)=1` in the arith model, but the WORD-EQUATION loop also
-    // resolves the pass-minted `x = h·z` from `eq_true` and F-splits its
-    // var-var heads (`resolve_equation`), and the SAT model branch asserts
-    // the `h = x·z2'` disjunct — minting a concat into `h`'s class from a
-    // channel the membership pass does not control. `memb_seeds` (soundly,
-    // by its adjudicated eligibility contract) declines the now-pinned
-    // leaf, the cyclic concat resolution free-fills, and the self-check
-    // correctly downgrades to Unknown. The spec freeze stands ("No changes
-    // to the word-equation stepper (`resolve_equation`) ...") — pin per
-    // observed verdict.
+fn in_re_symbolic_nonnullable_sat() {
+    // slice 21 Task 4: repair finds a [a-z]+ witness (was Unknown pre-repair).
+    // Flipped by D-wordeq-skip (owner-authorized freeze lift): the wordeq
+    // loop no longer re-skolemizes the pass-minted `x = h·z`, so the witness
+    // leaf `h` stays concat-free and `memb_seeds` realises `h ∈ [a-z]` at
+    // its arith-pinned length (observed witness x = "a",
+    // self-check-validated).
     let out = run_script(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))(check-sat)",
     );
-    assert_eq!(out, vec!["unknown"]);
+    assert_eq!(out, vec!["sat"]);
 }
 
 #[test]
@@ -1059,32 +1050,49 @@ fn in_re_unfold_negative_polarity_unsat() {
 }
 
 // Slice 21 (Task 4): sat with witnesses via membership-aware model repair.
+// Decided by the D-leaf / D-lenlink / D-satfuel / D-wordeq-skip adjudication
+// chain — see task-4-report.md.
 //
 // NOTE (deviation from the task-4 brief, same idiom as Tasks 2–3's pins
 // above): the brief's verbatim snippet uses an `expect(src, Verdict::..)`
-// helper that does not exist in this file; the surviving pin is transcribed
-// with `run_script` and a direct assertion on the raw output.
-//
-// NOTE (BLOCKED after adjudicated fixes — pins NOT added): the brief's other
-// two proposed pins (`in_re_unfold_sat_plus_with_length`,
-// `in_re_unfold_sat_negative_polarity`) still do not hold after the
-// bare-range-leaf + length-link fixes AND the owner-authorized D-satfuel
-// saturation (traced per query):
-// - plus_with_length: the memb pass now saturates instead of hard-fuel-
-//   Unknown, and Sat IS reached — but the word-equation loop's F-splits over
-//   the pass's own minted equalities pin EVERY positive-membership witness
-//   leaf with an `h = x·z2'`-style concat (the same interference documented
-//   on `in_re_symbolic_nonnullable_unknown_pre_engine`), so repair declines
-//   and the composed witness fails the self-check → sound Unknown.
-// - negative_polarity: at fuel exhaustion the WORD-EQUATION loop (which runs
-//   before the membership pass and whose fuel behavior is deliberately
-//   unchanged) still has an F-split pending — over the pass's minted
-//   equalities — and hard-Unknowns at its own spend guard before the memb
-//   saturation is reachable.
-// Both trace to the word-equation loop's handling of memb-minted
-// equalities, which the spec freezes ("No changes to the word-equation
-// stepper (`resolve_equation`) ...") — see task-4-report.md (deviations
-// D-leaf / D-lenlink / D-satfuel).
+// helper that does not exist in this file; these pins are transcribed with
+// `run_script` and a direct assertion on the raw output.
+
+#[test]
+fn in_re_unfold_plus_with_length_unknown_intersection_gap() {
+    // x ∈ [a-z]+ ∧ len(x) = 3. The brief proposed Sat; observed: unknown —
+    // slice 21 KNOWN GAP (the SAME intersection gap adjudicated on
+    // `in_re_unfold_unsat_disjoint_stars`): the SAT layer may decide the
+    // pass-MINTED membership atoms at polarities that are JOINTLY
+    // unsatisfiable over one witness leaf (traced: a leaf carrying both
+    // `⟨first char ≥ 'a'⟩·Σ*` positively and its complement negatively —
+    // empty at every length), and refuting that combination needs an
+    // intersection-aware conflict rule citing TWO membership literals,
+    // which the single-guard Split channel cannot express. The pass
+    // saturates, `search_word` correctly finds no word for the
+    // contradictory leaf, and the self-check downgrades — a SOUND unknown,
+    // never a wrong verdict. Pinned per observed verdict.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))\
+         (assert (= (str.len x) 3))(check-sat)",
+    );
+    assert_eq!(out, vec!["unknown"]);
+}
+
+#[test]
+fn in_re_unfold_sat_negative_polarity() {
+    // ¬(x ∈ [a-z]*): comp is co-infinite; a witness like "0" exists.
+    // Flipped to Sat by D-wordeq-skip: without the wordeq loop's redundant
+    // F-splits over the pass-minted equalities, the unfolding converges
+    // within budget and repair realises the complement leaf (observed
+    // witness x = "BBBBB" — 'B' ∉ [a-z] — self-check-validated).
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (not (str.in_re x (re.* (re.range \"a\" \"z\")))))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
 
 #[test]
 fn in_re_unfold_sat_under_boolean_structure() {

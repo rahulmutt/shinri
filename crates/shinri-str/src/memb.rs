@@ -44,7 +44,10 @@ fn mk_concat(terms: &mut Context, atoms: &[TermId]) -> TermId {
 
 /// Register a freshly-minted split atom exactly like the F-split path does:
 /// collect its len/str terms and mark any string equality as minted so the
-/// length seam skips it.
+/// length seam skips it. Additionally recorded in `memb_minted_eqs`
+/// (D-wordeq-skip): these equalities are DEFINITIONAL — the S-rules are their
+/// resolution — so the word-equation loop defers F-split emission over them
+/// (see the gate at the wordeq loop's Split arm in `lib.rs::check`).
 fn register_atom(s: &mut StrSolver, terms: &mut Context, atom: TermId) {
     let mut seen = FxHashSet::default();
     collect::collect(terms, atom, &mut s.len_terms, &mut s.str_terms, &mut seen);
@@ -57,6 +60,7 @@ fn register_atom(s: &mut StrSolver, terms: &mut Context, atom: TermId) {
         let kids = terms.children(*args).to_vec();
         if !kids.is_empty() && terms.sort_of(kids[0]) == terms.string_sort() {
             s.minted_eqs.insert(atom);
+            s.memb_minted_eqs.insert(atom);
         }
     }
 }
@@ -781,6 +785,65 @@ mod tests {
         assert!(
             matches!(s.check(&mut cx, Effort::Full), TCheck::Split { .. }),
             "the saturated round dropped nothing — the expansion now emits"
+        );
+    }
+
+    #[test]
+    fn memb_minted_eq_defers_wordeq_fsplit() {
+        // D-wordeq-skip (owner-authorized): an equality MINTED BY THE
+        // MEMBERSHIP PASS sitting in eq_true must NOT trigger the
+        // word-equation F-split — the S-rules are its resolution, and the
+        // redundant Nielsen skolemization minted leaf-destroying concats
+        // (`h = x·z2'`) into the repair witnesses' classes. A USER-INPUT
+        // equation of the same shape still F-splits.
+        let mk = |ctx: &mut Context| -> (TermId, TermId) {
+            let x = var(ctx, "x");
+            let y = var(ctx, "y");
+            let z = var(ctx, "z");
+            let yz = ctx
+                .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[y, z])
+                .unwrap();
+            let eq = ctx.mk_eq(x, yz).unwrap();
+            (eq, x)
+        };
+
+        // Case 1: memb-minted (as `register_atom` records it) — no split at
+        // all; the equality is definitional and waits on the S-rules.
+        let mut ctx = Context::new();
+        let (eq, _) = mk(&mut ctx);
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), eq);
+        s.minted_eqs.insert(eq);
+        s.memb_minted_eqs.insert(eq);
+        s.test_force_eq_true(eq);
+        let (splits, terminal) = run_rounds(&mut s, &mut cx, 8);
+        assert!(matches!(terminal, TCheck::Sat));
+        assert!(
+            splits.is_empty(),
+            "no wordeq lemma over a memb-minted definitional equality"
+        );
+
+        // Case 2: the SAME shape as user input — the Nielsen F-split
+        // [len_eq, a_pref, b_pref] still fires.
+        let mut ctx2 = Context::new();
+        let (eq2, _) = mk(&mut ctx2);
+        let (mut s2, mut eq_e2, atoms2) = harness(&mut ctx2);
+        let mut cx2 = TheoryCtx {
+            terms: &mut ctx2,
+            eq: &mut eq_e2,
+            atoms: &atoms2,
+        };
+        s2.new_var(&mut cx2, shinri_core::Var::new(0), eq2);
+        s2.test_force_eq_true(eq2);
+        let (splits2, _) = run_rounds(&mut s2, &mut cx2, 16);
+        assert!(
+            splits2.iter().any(|(a, g)| *g && a.len() == 3),
+            "user-input concat equation still emits the 3-disjunct F-split"
         );
     }
 }
