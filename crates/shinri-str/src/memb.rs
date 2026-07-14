@@ -62,6 +62,12 @@ fn register_atom(s: &mut StrSolver, terms: &mut Context, atom: TermId) {
 }
 
 /// Spend fuel and emit one guarded/unguarded split, registering every atom.
+///
+/// D-satfuel: fuel availability is guaranteed by the per-atom peek at the top
+/// of `memb_check`'s loop (each loop iteration emits at most ONE split and
+/// spends nothing before it), so the spend here cannot fail — the membership
+/// pass never hard-`Unknown`s on fuel; exhaustion SATURATES at the loop top,
+/// before any dedup key or witness is minted. Debug-assert the invariant.
 fn emit_split(
     s: &mut StrSolver,
     terms: &mut Context,
@@ -71,9 +77,11 @@ fn emit_split(
     for &a in &atoms {
         register_atom(s, terms, a);
     }
-    if !s.fuel.spend() {
-        return TCheck::Unknown;
-    }
+    let had_fuel = s.fuel.spend();
+    debug_assert!(
+        had_fuel,
+        "emit_split without fuel — memb_check's per-atom peek must run first"
+    );
     TCheck::Split { atoms, guard }
 }
 
@@ -135,6 +143,27 @@ pub(crate) fn memb_check(
 ) -> Option<TCheck> {
     let membs: Vec<(TermId, shinri_core::Lit, bool)> = s.memb_true.clone();
     for (atom, lit, pos) in membs {
+        // ── D-satfuel (owner-authorized): saturate on fuel exhaustion ────
+        // With the shared budget exhausted no lemma can be emitted this
+        // round: SATURATE — return None so `check()` falls through to
+        // `TCheck::Sat` and the model build + membership repair + post-solve
+        // self-check decide the verdict — rather than a hard
+        // `TCheck::Unknown`. Spec basis (Saturation paragraph): the pass
+        // "must not report Sat on its own authority; the model build + the
+        // extended self-check are the only path to Sat" — every Sat is
+        // gated, so exhaustion can only cost decisiveness, never soundness.
+        // Peeked BEFORE any dedup key / witness is minted, so a
+        // never-emitted lemma is never recorded as emitted (which would
+        // silently drop it forever). Each loop iteration emits at most ONE
+        // split and spends nothing before it, so `remaining ≥ 1` here
+        // guarantees the iteration's single `emit_split` succeeds. The
+        // `Unknown` fences below (const-regex extraction, non-convergent
+        // NF, node caps, CLASS_SPLIT_CAP) are per-atom SOUNDNESS fences,
+        // not fuel, and stay. The wordeq/length passes' own fuel behavior
+        // is unchanged.
+        if s.fuel.remaining == 0 {
+            return None;
+        }
         let (t, re_t) = memb_sides(cx.terms, atom);
         // Constant by the solver fence (input) or by construction (minted);
         // a failure here is a seam break — fence to Unknown, never guess.
@@ -704,7 +733,19 @@ mod tests {
     }
 
     #[test]
-    fn fuel_exhaustion_yields_unknown() {
+    fn fuel_exhaustion_saturates_to_model_path() {
+        // D-satfuel (owner-authorized rework — this test formerly pinned a
+        // hard `TCheck::Unknown` on fuel exhaustion): at fuel 0 the
+        // membership pass SATURATES — `check()` falls through to
+        // `TCheck::Sat` so the model build + membership repair + post-solve
+        // self-check decide the final verdict (spec Saturation paragraph:
+        // the pass "must not report Sat on its own authority; the model
+        // build + the extended self-check are the only path to Sat" — the
+        // SOLVER-level self-check still downgrades an unrealised Sat to
+        // Unknown; that end-to-end posture is pinned at the solver level,
+        // not here). Critically, saturation must not pollute the dedup
+        // keys: a key minted for a never-emitted lemma would silently drop
+        // that lemma forever.
         let mut ctx = Context::new();
         let x = var(&mut ctx, "x");
         let m = memb_atom(&mut ctx, x, &regex::star_range_test('a', 'c'));
@@ -717,6 +758,29 @@ mod tests {
         s.new_var(&mut cx, shinri_core::Var::new(0), m);
         s.test_force_memb_true(m, true);
         s.test_set_fuel(0);
-        assert!(matches!(s.check(&mut cx, Effort::Full), TCheck::Unknown));
+        assert!(
+            matches!(s.check(&mut cx, Effort::Full), TCheck::Sat),
+            "fuel exhaustion saturates (falls through to the model path)"
+        );
+        // No dedup-key / witness pollution for the never-emitted expansion.
+        assert!(
+            s.emitted_memb.is_empty(),
+            "no emitted_memb key for a never-emitted lemma"
+        );
+        assert!(
+            s.memb_wits.is_empty(),
+            "no witness pair for a never-emitted S1"
+        );
+        assert!(
+            s.emitted_len_axioms.is_empty(),
+            "no length-axiom key for a never-emitted companion"
+        );
+        // With fuel restored, the exact same expansion is still emittable
+        // (nothing was dropped by the saturated round).
+        s.test_set_fuel(40);
+        assert!(
+            matches!(s.check(&mut cx, Effort::Full), TCheck::Split { .. }),
+            "the saturated round dropped nothing — the expansion now emits"
+        );
     }
 }

@@ -968,20 +968,20 @@ fn in_re_symbolic_nullable_sat_via_selfcheck() {
 #[test]
 fn in_re_symbolic_nonnullable_unknown_pre_engine() {
     // x ∈ [a-z]+ : the default model (x = "") violates the membership.
-    // slice 21 Task 4 KNOWN GAP (still NOT flipped to Sat after the
-    // adjudicated bare-range-leaf + length-link fixes in memb.rs): the
-    // engine now reaches Sat internally with `h ∈ [a-z]` recorded on the
-    // witness leaf `h` and `len(h)=1` in the arith model, but the
-    // WORD-EQUATION loop also resolves the pass-minted `x = h·z` from
-    // `eq_true` and F-splits its var-var heads (`resolve_equation`), and the
-    // SAT model branch asserts the `h = x·z2'` disjunct — minting a concat
-    // into `h`'s class from a channel the membership pass does not control.
-    // `memb_seeds` (soundly, by its adjudicated eligibility contract)
-    // declines the now-pinned leaf, the cyclic concat resolution free-fills,
-    // and the self-check correctly downgrades to Unknown. The spec forbids
-    // the remaining fix avenues to this task ("No changes to the
-    // word-equation stepper (`resolve_equation`) ... or the `Fuel` allotment
-    // value") — reported BLOCKED with trace; pin left as observed.
+    // slice 21 Task 4 KNOWN GAP under the spec freeze (still Unknown after
+    // the adjudicated bare-range-leaf + length-link fixes AND the
+    // owner-authorized D-satfuel saturation): the engine reaches Sat
+    // internally with `h ∈ [a-z]` recorded on the witness leaf `h` and
+    // `len(h)=1` in the arith model, but the WORD-EQUATION loop also
+    // resolves the pass-minted `x = h·z` from `eq_true` and F-splits its
+    // var-var heads (`resolve_equation`), and the SAT model branch asserts
+    // the `h = x·z2'` disjunct — minting a concat into `h`'s class from a
+    // channel the membership pass does not control. `memb_seeds` (soundly,
+    // by its adjudicated eligibility contract) declines the now-pinned
+    // leaf, the cyclic concat resolution free-fills, and the self-check
+    // correctly downgrades to Unknown. The spec freeze stands ("No changes
+    // to the word-equation stepper (`resolve_equation`) ...") — pin per
+    // observed verdict.
     let out = run_script(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))(check-sat)",
@@ -1068,14 +1068,23 @@ fn in_re_unfold_negative_polarity_unsat() {
 // NOTE (BLOCKED after adjudicated fixes — pins NOT added): the brief's other
 // two proposed pins (`in_re_unfold_sat_plus_with_length`,
 // `in_re_unfold_sat_negative_polarity`) still do not hold after the
-// bare-range-leaf + length-link fixes: both exhaust the 40-unit `Fuel`
-// budget (traced: `emit_split` fuel exhaustion mid-unfolding) — the
-// unfolding needs one S1/link/S2/S3/S4 level per witness character plus the
-// interleaved length-axiom fixpoint and the word-equation loop's redundant
-// F-splits over the pass's own minted equalities, and `len(x)=3` does not
-// fit. The spec pins the budget ("No changes to ... the `Fuel` allotment
-// value") and the word-equation stepper, so this cannot be fixed within the
-// membership pass — see task-4-report.md (deviations D-leaf/D-lenlink).
+// bare-range-leaf + length-link fixes AND the owner-authorized D-satfuel
+// saturation (traced per query):
+// - plus_with_length: the memb pass now saturates instead of hard-fuel-
+//   Unknown, and Sat IS reached — but the word-equation loop's F-splits over
+//   the pass's own minted equalities pin EVERY positive-membership witness
+//   leaf with an `h = x·z2'`-style concat (the same interference documented
+//   on `in_re_symbolic_nonnullable_unknown_pre_engine`), so repair declines
+//   and the composed witness fails the self-check → sound Unknown.
+// - negative_polarity: at fuel exhaustion the WORD-EQUATION loop (which runs
+//   before the membership pass and whose fuel behavior is deliberately
+//   unchanged) still has an F-split pending — over the pass's minted
+//   equalities — and hard-Unknowns at its own spend guard before the memb
+//   saturation is reachable.
+// Both trace to the word-equation loop's handling of memb-minted
+// equalities, which the spec freezes ("No changes to the word-equation
+// stepper (`resolve_equation`) ...") — see task-4-report.md (deviations
+// D-leaf / D-lenlink / D-satfuel).
 
 #[test]
 fn in_re_unfold_sat_under_boolean_structure() {
