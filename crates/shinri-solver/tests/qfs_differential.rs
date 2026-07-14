@@ -2892,9 +2892,15 @@ fn targeted_regex_ground_decided_unsat() {
 
 #[test]
 fn targeted_regex_fences_unknown() {
-    // Symbolic string side over re.allchar: STILL fenced after slice 20 —
-    // Σ has 0x30000 single-char words, far over ENUM_WORD_CAP, and Σ's
-    // complement ({""} ∪ longer words) is not co-finite.
+    // Symbolic string side over re.allchar: still Unknown after slice 21,
+    // but no longer via the fence — the membership pass treats the bare
+    // Rex::Range residual as a repair LEAF (no Rule-S unfolding, so no
+    // minted len(h)=1 link), Σ has 0x30000 single-char words (far over
+    // ENUM_WORD_CAP, so slice 20's enumeration rewrite is closed too), and
+    // with no pinned length model repair has no length to search a word
+    // at; the post-solve self-check downgrades to a sound Unknown. Decides
+    // Sat the moment a length is pinned — see the script_e2e.rs companion
+    // pin in_re_unfold_slice20_allchar_with_length_decides_sat.
     assert_eq!(
         shinri_verdict(
             "(set-logic QF_S)(declare-fun s () String)\
