@@ -927,10 +927,9 @@ impl<'a> Parser<'a> {
             BuiltinOp::StrConcat | BuiltinOp::StrLen | BuiltinOp::StrAt | BuiltinOp::StrSubstr => {
                 Self::mk(ctx, Op::Builtin(op), &args, &sp)
             }
-            // String predicates (slice 12): delegate directly to mk_app (sort-checking
-            // in Context). Not yet reachable via `builtin_for` — parser wiring is Task 3.
-            // String search/replace (slice 13): delegate directly to mk_app (sort-checking
-            // in Context). Not yet reachable via `builtin_for` — parser wiring is Task 2.
+            // String/regex predicates, search/replace, conversions, and ordering:
+            // delegate directly to mk_app (sort-checking in Context). All reachable
+            // via `builtin_for`.
             BuiltinOp::StrPrefixOf
             | BuiltinOp::StrSuffixOf
             | BuiltinOp::StrContains

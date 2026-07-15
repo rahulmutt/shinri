@@ -1,7 +1,24 @@
 # Slice 23 design — `str.<` / `str.<=` lexicographic ordering
 
 Date: 2026-07-15
-Status: DESIGN (not yet implemented).
+Status: IMPLEMENTED (2026-07-15). Landed as designed — the decided/fenced/banked
+partition below holds verbatim; no substantive deviations.
+
+**Implementation notes (truth-up):**
+- Surface + pass + fence + wiring + oracle delivered across 5 commits
+  (`b709aef` parse/sort, `d588593` `order.rs` rewrite+fence, `47687fd` fence-
+  recursion test, `5a277ee` pipeline wiring + e2e pins, `c0a8582` oracle family).
+- Differential oracle (`qfs_str_order_matches_z3`, seed `0x53_00_0000_0003`,
+  200 iters): **45 sat / 75 unsat / 80 shinri-unknown (the tolerated fenced free-
+  var comparisons) / 0 z3-unknown / 0 guard-bailout; 0 disagreements.** The three
+  pre-existing regex/to_code oracle families re-ran bit-for-bit unchanged.
+- Two cosmetic clarifications to §2's arm attribution (behaviour unchanged, both
+  sound): (i) the both-empty-literal case `("" < "")` / `("" <= "")` folds via the
+  **reflexivity** arm (c) — both args are the same hash-consed `""` `TermId` — not
+  the literal-fold arm (a); the §2b note "arm (a) fires first" describes intent,
+  the result (false / true) is identical either way. (ii) The presence fence's
+  recursion into nested boolean structure (e.g. `(not (str.< s u))`) is pinned by
+  a dedicated unit test proven load-bearing (`47687fd`).
 
 Predecessor: slice 22 (`str.to_code` inequality atoms via a character-range
 gadget, landed 2026-07-14). Slice 22's non-goals bank `str.<` / `str.<=`
