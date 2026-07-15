@@ -1042,6 +1042,39 @@ impl Gen {
         }
     }
 
+    /// A conjunction of 1–3 `str.<` / `str.<=` atoms over the declared string
+    /// vars and small ASCII literals, plus the empty literal. Biased so decided
+    /// idioms (empty-boundary, literal–literal) and fenced free-var comparisons
+    /// both occur. Some atoms are negated. ASCII-only (z3-CLI byte-parse safety).
+    fn finish_str_order(mut self) -> String {
+        let n_atoms = 1 + self.rng.below(3); // 1..=3
+        for _ in 0..n_atoms {
+            let op = if self.rng.below(2) == 0 {
+                "str.<"
+            } else {
+                "str.<="
+            };
+            // Each side is independently: a var, a small literal, or "".
+            let side = |g: &mut Gen| -> String {
+                match g.rng.below(3) {
+                    0 => g.var(),
+                    1 => g.lit(),
+                    _ => "\"\"".to_string(),
+                }
+            };
+            let l = side(&mut self);
+            let r = side(&mut self);
+            let atom = format!("({op} {l} {r})");
+            let atom = if self.rng.below(4) == 0 {
+                format!("(not {atom})")
+            } else {
+                atom
+            };
+            self.body.push_str(&format!("(assert {atom})\n"));
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -2316,6 +2349,75 @@ fn qfs_to_code_range_matches_z3() {
     assert!(
         n_guard_bailouts <= TCR_MAX_GUARD_BAILOUTS,
         "guard bailouts {n_guard_bailouts} exceed bound {TCR_MAX_GUARD_BAILOUTS}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 23: str.< / str.<= lexicographic ordering
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn gen_str_order_body(seed: u64) -> String {
+    Gen::new(seed).finish_str_order()
+}
+
+const SO_SEED: u64 = 0x53_00_0000_0003;
+const SO_N_ITERS: usize = 200;
+const SO_MAX_GUARD_BAILOUTS: usize = SO_N_ITERS / 10;
+
+#[test]
+fn qfs_str_order_matches_z3() {
+    let mut rng = Lcg(SO_SEED);
+    let (mut n_sat, mut n_unsat, mut n_shinri_unknown, mut n_z3_unknown, mut n_guard_bailouts) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..SO_N_ITERS {
+        let seed = rng.next();
+        let body = gen_str_order_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailouts += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_shinri_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3_unknown += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S STR_ORDER SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => n_sat += 1,
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_str_order_matches_z3: {SO_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_shinri_unknown} shinri-unknown (tolerated) / {n_z3_unknown} z3-unknown / \
+         {n_guard_bailouts} guard-bailout (tolerated); 0 disagreements"
+    );
+    assert!(n_sat > 0, "str-order family produced zero SAT instances");
+    assert!(
+        n_unsat > 0,
+        "str-order family produced zero UNSAT instances"
+    );
+    assert!(
+        n_guard_bailouts <= SO_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailouts} exceed bound {SO_MAX_GUARD_BAILOUTS}"
     );
 }
 
