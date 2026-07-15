@@ -995,6 +995,53 @@ impl Gen {
         self.body
     }
 
+    /// Slice 22 corpus: conjunctions of constant-RHS `str.to_code` inequality
+    /// atoms over ONE symbolic string, plus the slice-21 side constraints
+    /// (literal equations, concat equations, length pins). Several bounds on the
+    /// same variable is the point — that is what exercises the interval meet.
+    fn finish_to_code_range(mut self) -> String {
+        let x = self.var();
+        let n_bounds = 1 + self.rng.below(3); // 1..=3 bounds on the SAME var
+        for _ in 0..n_bounds {
+            let op = ["<=", "<", ">=", ">"][self.rng.below(4) as usize];
+            let k = self.to_code_threshold();
+            let atom = if self.rng.below(2) == 0 {
+                format!("({op} (str.to_code {x}) {k})")
+            } else {
+                format!("({op} {k} (str.to_code {x}))") // mirrored orientation
+            };
+            let atom = if self.rng.below(4) == 0 {
+                format!("(not {atom})")
+            } else {
+                atom
+            };
+            self.body.push_str(&format!("(assert {atom})\n"));
+        }
+        let n_side = self.rng.below(3); // 0..=2
+        for _ in 0..n_side {
+            self.regex_unfold_side_constraint(&x);
+        }
+        self.body
+    }
+
+    /// A NON-NEGATIVE, NON-SURROGATE Int threshold. Mostly code points around
+    /// the generator's ALPHABET (so the fused ranges stay narrow and slice 20
+    /// enumerates them), plus 0 and the alphabet boundary (which exercise the
+    /// `len = 1` identity and the degenerate folds of spec §1.2).
+    ///
+    /// Surrogates are EXCLUDED: they are a permanent representational fence
+    /// (§3.1), so the oracle could only ever score them as tolerated Unknowns.
+    /// Negatives are excluded because `-` parses as `Sub` — there is no negative
+    /// numeral literal.
+    fn to_code_threshold(&mut self) -> String {
+        match self.rng.below(8) {
+            0 => "0".to_string(),
+            1 => "196607".to_string(),                   // MAX_CODE
+            2 => "196608".to_string(),                   // MAX_CODE + 1 — out of the alphabet
+            _ => format!("{}", 96 + self.rng.below(30)), // 96..=125, around [a-z]
+        }
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -2169,6 +2216,110 @@ fn qfs_regex_unfold_matches_z3() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Slice 22: str.to_code character-range gadget
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TCR_SEED: u64 = 0x53_00_0000_0002;
+const TCR_N_ITERS: usize = 200;
+const TCR_MAX_GUARD_BAILOUTS: usize = TCR_N_ITERS / 10;
+
+fn gen_to_code_range_body(seed: u64) -> String {
+    Gen::new(seed).finish_to_code_range()
+}
+
+#[test]
+fn qfs_to_code_range_matches_z3() {
+    let mut rng = Lcg(TCR_SEED);
+    let (
+        mut n_sat,
+        mut n_unsat,
+        mut n_shinri_unknown,
+        mut n_z3_unknown,
+        mut n_guard_bailouts,
+        mut n_witness,
+    ) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..TCR_N_ITERS {
+        let seed = rng.next();
+        let body = gen_to_code_range_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailouts += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_shinri_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3_unknown += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S TO_CODE_RANGE SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let get = format!(
+                    "{body}(check-sat)\n(get-value ({}))\n",
+                    (0..N_VARS)
+                        .map(|k| format!("s{k}"))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let (lines, _b) = shinri_lines_counting_bailouts(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_to_code_range_matches_z3: {TCR_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_shinri_unknown} shinri-unknown (tolerated) / {n_z3_unknown} z3-unknown / \
+         {n_guard_bailouts} guard-bailout (tolerated); {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(
+        n_sat > 0,
+        "to_code-range family produced zero SAT instances"
+    );
+    assert!(
+        n_unsat > 0,
+        "to_code-range family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_guard_bailouts <= TCR_MAX_GUARD_BAILOUTS,
+        "guard bailouts {n_guard_bailouts} exceed bound {TCR_MAX_GUARD_BAILOUTS}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Targeted explicit cases
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -2633,8 +2784,9 @@ fn targeted_const_int_conv_negated_witness_model_repair() {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Slice 18: str.to_code / str.from_code / str.is_digit — fence pins.
-// These shapes stay OUTSIDE the decided fragment permanently (symbolic
-// linking, nested arithmetic, surrogate code points): sound Unknown.
+// These shapes stay OUTSIDE the decided fragment: symbolic linking, nested
+// arithmetic, surrogate code points. Slice 22 REMOVED the inequality-atom pin
+// from this list — those decide now (see targeted_to_code_range_decided).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -2675,14 +2827,6 @@ fn targeted_code_conv_fences_unknown() {
         shinri_verdict(
             "(set-logic QF_S)(declare-fun s () String)\
              (assert (= (+ (str.to_code s) 1) 98))(check-sat)"
-        ),
-        Verdict::Unknown,
-    );
-    // Inequality atom.
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)\
-             (assert (>= (str.to_code s) 48))(check-sat)"
         ),
         Verdict::Unknown,
     );
@@ -2730,6 +2874,308 @@ fn targeted_code_conv_decided_sat() {
         "(set-logic QF_S)(declare-fun s () String)\
          (assert (not (= (str.to_code s) 97)))(check-sat)",
         Verdict::Sat,
+    );
+}
+
+/// Slice 22: the `str.to_code` character-range gadget. Inequality atoms rewrite
+/// to constant-range memberships (spec §1.2), and the bounds on one string term
+/// FUSE into a single membership (§1.3) — which is what keeps them off slice
+/// 21's intersection gap.
+///
+/// No negative-threshold case here: `-` parses as `Sub`, so there is no
+/// negative-numeral literal to write. The `k <= -1` degenerate folds are pinned
+/// at the unit level instead (`degenerate_thresholds_fold_to_constants`).
+///
+/// DEVIATION FROM THE ORIGINAL BRIEF, established by direct repro (see
+/// `task-3-report.md`): the brief predicted a LONE lower bound over a free `s`
+/// (`(>= (str.to_code s) 48)` alone, no upper cap, no other constraint) decides
+/// Sat because slice 21 takes the wide `Range(48, MAX_CODE)` as "a single
+/// character class". Observed: shinri returns **Unknown** (z3 says Sat). The
+/// gadget conversion itself succeeds — `code_conv` DOES emit a proper
+/// `str.in_re` membership term, confirmed by the crossed/degenerate/ground
+/// cases below which all still decide correctly regardless of width — but
+/// slice 21's generic membership decision procedure has no closing rule for a
+/// genuinely-infinite, NON-nullable character class over a FREE variable: it's
+/// far over `ENUM_WORD_CAP` (256 words) so slice 20 declines to enumerate, and
+/// slice 21 only closes via the trivial empty-string default-model check
+/// (nullable languages) or via enumeration under the cap — neither applies
+/// here. This is moved to `targeted_to_code_range_wide_arm_known_gap` below,
+/// which pins the TRUE observed verdict with the real mechanism, and is a
+/// pre-existing slice-21 completeness gap (independently reproducible with a
+/// directly-asserted wide `str.in_re`, no `to_code` involved at all — see that
+/// test's comment), not a defect introduced by this slice.
+#[test]
+fn targeted_to_code_range_decided() {
+    // The digit idiom ⇒ the narrow range Range(48, 57). 10 words, under
+    // ENUM_WORD_CAP, so slice 20 enumerates it into `⋁ s = "0" … "9"` and the
+    // word engine decides it. CONFIRMED narrow-enumeration route: the
+    // get-value witness in script_e2e.rs (`to_code_digit_range_get_value_witness`)
+    // reads back an actual digit model, which only a word-equation disjunction
+    // could produce (a single character-class membership over a free var with
+    // no other grounding does NOT decide — see the wide-arm gap above).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (>= (str.to_code s) 48))(assert (<= (str.to_code s) 57))(check-sat)",
+        Verdict::Sat,
+    );
+    // ... and it really is a digit constraint.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (>= (str.to_code s) 48))(assert (<= (str.to_code s) 57))\
+         (assert (= s \"x\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Same idiom written as one `and` — `And` nodes fuse like the top-level list.
+    // Still narrow (Range(97,122), 26 words, under the cap) ⇒ enumerated route.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (and (>= (str.to_code s) 97) (<= (str.to_code s) 122)))\
+         (assert (= s \"7\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Crossed bounds fuse to `false` (§1.3) — a pure syntactic fold in
+    // `fuse_group`/`range_membership`'s empty-interval check, decided before
+    // any regex/enumeration machinery runs at all, so width is irrelevant.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (>= (str.to_code s) 57))(assert (<= (str.to_code s) 48))(check-sat)",
+        Verdict::Unsat,
+    );
+    // A threshold above the alphabet is unsatisfiable (MAX_CODE = 196607) — the
+    // `k > MAX_CODE` degenerate fold in `try_code_ineq_atom`/`fuse_group` to a
+    // constant, again decided before any regex stage.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (> (str.to_code s) 196607))(check-sat)",
+        Verdict::Unsat,
+    );
+    // `>= 0` is exactly `len(s) = 1` (§1.2): it rules out the empty string.
+    // Here `s` is GROUND (pinned to the literal `""`), so this is a cheap
+    // concrete-string-against-automaton check, not a free-var search — decides
+    // regardless of the fused range's width (Range(0, MAX_CODE) is wide).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (>= (str.to_code s) 0))(assert (= s \"\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // The `-1` sentinel, upper bound only: with NO lower bound the `len != 1`
+    // escape survives, so a two-char string satisfies `to_code(s) <= 48`.
+    // Mirrored orientation too. `s` is GROUND (pinned to `"ab"`) — a concrete
+    // check against the (negated, wide) membership, so it decides despite (w2)'s
+    // free-var upper-bound-only gap (verified: a free, unpinned
+    // `(<= (str.to_code s) 57)` alone is ALSO Unknown, same mechanism as the
+    // wide-arm gap below).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (>= 48 (str.to_code s)))(assert (= s \"ab\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // ... but pin the length to 1 and the escape dies, so the range binds.
+    // Also GROUND (`s = "z"`) — same concrete-check route.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (<= (str.to_code s) 48))(assert (= s \"z\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+/// Slice 22 KNOWN GAP, owned by slice 21's generic membership routine: a bare
+/// inequality atom over a FREE string variable — lower-bound-only
+/// (`Range(k, MAX_CODE)`) or upper-bound-only (`¬Range(k, MAX_CODE)`) —
+/// converts cleanly to a `str.in_re` membership (the gadget itself never
+/// declines here), but that membership does not decide downstream. A
+/// genuinely-infinite, non-nullable character class over a free variable
+/// closes only through one of three routes: (a) the trivial nullable-empty-
+/// string default-model check, (b) capped enumeration under `ENUM_WORD_CAP`
+/// (slice 20), or (c) `memb_seeds`' capped word search once the SAME
+/// variable's length is already pinned — route (c) closes over-cap ranges
+/// fine (see `in_re_unfold_slice20_allchar_with_length_decides_sat` in
+/// `script_e2e.rs`). None of the three apply to the query pinned below: the
+/// class is non-nullable and over `ENUM_WORD_CAP` wide, ruling out (a) and
+/// (b); `s`'s length is UNPINNED, ruling out (c). The operative condition is
+/// the absence of a length pin, not the word cap by itself. Sound Unknown; z3
+/// says Sat. This is PRE-EXISTING and not introduced by this slice: an
+/// unrelated, directly-asserted wide `str.in_re` (no `to_code` in sight) shows
+/// the identical cliff (`targeted_regex_symbolic_fences_unknown`'s 300-word
+/// loop case is Unknown for the same reason; independently, a fused
+/// `Range(48, 247)` — 200 words, under the cap — decides Sat while
+/// `Range(48, 347)` — 300 words, over the cap — is Unknown).
+///
+/// A further wrinkle specific to THIS range: `Range(48, MAX_CODE)` spans the
+/// surrogate block, so `range_term` emits a `re.union`/`re.diff` composite
+/// rather than a bare `Rex::Range` leaf. That composite shape does not get the
+/// bare-range-leaf `memb_seeds` treatment EVEN IF a length were pinned here —
+/// so route (c) would not close this particular query regardless. This
+/// composite-shape gap reproduces with zero `to_code` in the formula: it is
+/// pre-existing slice-21 `regex.rs` behavior, unrelated to `to_code` or this
+/// slice.
+#[test]
+fn targeted_to_code_range_wide_arm_known_gap() {
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (>= (str.to_code s) 48))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+}
+
+/// Slice 22 §3.1: an interior-surrogate threshold is a PERMANENT
+/// representational fence — `re.range` endpoints are `Box<str>` literals and a
+/// lone surrogate is not one. The block boundaries are expressible, the inside
+/// is not. Sound Unknown, never a guess.
+///
+/// The block-boundary case (`0xD800`) is ALSO Unknown at the top level, same
+/// as the strictly-interior case above — but for a DIFFERENT reason: the
+/// wide-arm free-var cap gap (`targeted_to_code_range_wide_arm_known_gap`),
+/// not a representational fence. The two Unknowns are observationally
+/// identical at the top-level verdict, so this test proves expressibility a
+/// different way: it PINS `s` to a concrete code point straddling the
+/// boundary (sidestepping the free-var cap gap entirely, since a ground
+/// string-against-automaton check is cheap) and confirms `code_conv` treated
+/// `55296` as a genuine range endpoint rather than leaving the atom
+/// un-rewritten. These two ground sub-checks use `str.from_code` rather than a
+/// string literal containing the raw code point, and are z3-cross-checked via
+/// `expect()` — see the comment at the two `expect()` calls below for why.
+#[test]
+fn targeted_to_code_range_surrogate_fences_unknown() {
+    // 0xD801 = 55297: strictly inside the surrogate block. code_conv's gadget
+    // returns None (the representational fence) and the raw `to_code`
+    // application survives, so `has_unreduced_code_conv` forces Unknown.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (>= (str.to_code s) 55297))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // 0xD800 = 55296 alone: STILL Unknown at the top level, but now via the
+    // wide-arm free-var gap (see `targeted_to_code_range_wide_arm_known_gap`),
+    // NOT the representational fence — confirmed below by grounding `s`.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (>= (str.to_code s) 55296))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // Ground proof that 0xD800 IS an expressible endpoint: pin `s` to the BMP
+    // char just BELOW the block (0xD7FF = 55295 < 55296) via `str.from_code`
+    // — if `code_conv` had fenced this threshold, the raw `to_code` atom would
+    // survive and the WHOLE formula would be Unknown (`has_unreduced_code_conv`);
+    // instead it decides Unsat, proving the atom became a real membership that
+    // the ground check evaluates.
+    //
+    // `str.from_code` is used here rather than a raw non-ASCII string literal
+    // because z3's SMT-LIB CLI parses a quoted string literal's bytes BYTE-WISE
+    // (e.g. `(str.len "<U+D7FF>")` reads back as 3 in z3, not 1), while shinri
+    // decodes it as a single Rust `char` — the two engines do not share a
+    // language for non-ASCII literals, so no `expect()` cross-check is
+    // possible in that form. `str.from_code` names the code point directly and
+    // both engines agree on its meaning, so it carries the z3 cross-check that
+    // a literal-based pin cannot.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= s (str.from_code 55295)))\
+         (assert (>= (str.to_code s) 55296))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Mirrored: pin `s` to the BMP char just AFTER the block (0xE000 = 57344
+    // >= 55296) via `str.from_code` — decides Sat, the same ground-membership
+    // route, and again z3-cross-checked.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (= s (str.from_code 57344)))\
+         (assert (>= (str.to_code s) 55296))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+/// Slice 22 §4, KNOWN GAP: fusion only sees within a single conjunction, so
+/// splitting the two bounds across a disjunction defeats it — each half is
+/// then asserted independently. Both halves are, ON THEIR OWN, already
+/// Unknown before this disjunction is even built: `(>= (str.to_code s) 48)`
+/// alone is the wide-arm gap (`targeted_to_code_range_wide_arm_known_gap`),
+/// and `(<= (str.to_code s) 57)` alone is that same gap's upper-bound mirror
+/// (any single `to_code` bound is semi-infinite — `Range(k, MAX_CODE)` or its
+/// complement — so it can never close via routes (a)/(b)/(c) above on its
+/// own). That fully accounts for the observed Unknown here.
+///
+/// A stronger claim — that this saturates via slice 21's INTERSECTION gap
+/// (two live memberships on the same variable failing to compose) — is NOT
+/// demonstrated by this construction and remains an unconfirmed hypothesis:
+/// two independent memberships on one variable joined by `or` do not, by
+/// themselves, trigger it — `(str.in_re s (re.range "0" "9")) ∧ (or (str.in_re
+/// s (re.range "5" "z")) p)` decides Sat, with no gap in sight. So this test
+/// cannot isolate "Unknown from an intersection gap" from "Unknown because the
+/// un-fused wide-arm half never decides" — the wide-arm explanation is fully
+/// sufficient on its own, and no evidence here supports the intersection-gap
+/// reading. The pin below is still a correct, sound regression guard: z3 says
+/// Sat, so a future regression to a WRONG decided verdict would be caught.
+#[test]
+fn targeted_to_code_range_split_bounds_known_gap() {
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)(declare-fun p () Bool)\
+             (assert (>= (str.to_code s) 48))\
+             (assert (or (<= (str.to_code s) 57) p))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+}
+
+/// Slice 22 KNOWN GAP: a fused narrow range (`Range(48, 57)`, 10 words, under
+/// `ENUM_WORD_CAP`) enumerates fine on its own, but adding an independent
+/// length constraint of 2 on the SAME variable does not close — each
+/// enumerated disjunct is a length-1 word equation, and the seam between the
+/// enumerated word-equation disjunction and a separately-asserted `str.len`
+/// constraint does not resolve the resulting contradiction. Sound Unknown; z3
+/// says Unsat.
+///
+/// This is a pre-existing slice-20/21 enumeration-length seam gap, not a
+/// `to_code` artifact: the hand-written, `to_code`-free equivalent —
+/// `(str.in_re s (re.range "0" "9")) ∧ (str.len s) = 2` — is ALSO Unknown (z3:
+/// unsat), so the `to_code` gadget conversion is not implicated.
+#[test]
+fn targeted_to_code_range_length_seam_known_gap() {
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (>= (str.to_code s) 48))(assert (<= (str.to_code s) 57))\
+             (assert (= (str.len s) 2))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    // Control: the same language, `to_code`-free, shows the identical gap —
+    // this is not something the `to_code` gadget introduces.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (str.in_re s (re.range \"0\" \"9\")))\
+             (assert (= (str.len s) 2))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+}
+
+/// Regression pin for the un-lifted `ite`-subject regex surface (slice 22,
+/// task 2 `gadget` recursion): `elim_term_ite` runs AFTER `code_conv`
+/// (`lib.rs`), so a `str.to_code` gadget applied to a String-valued `ite`
+/// reaches the regex stage with the `ite` — and the `str.in_re` nested in its
+/// condition — still un-lifted. This shape is novel to slice 22; slices
+/// 19-21 never exercised it. `str.to_code` of either 1-char branch ("a" = 97,
+/// "b" = 98) is >= 48 regardless of which arm the free `ite` condition on `x`
+/// picks, so negating `>= 48` is unconditionally contradictory: UNSAT no
+/// matter what the un-lifted `ite`/`in_re` decide. If `elim_term_ite`
+/// ordering or the regex stage ever mishandles an `ite` subject, this flips
+/// to a wrong Sat.
+#[test]
+fn targeted_to_code_range_ite_subject_unlifted_unsat() {
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)\
+         (assert (not (>= (str.to_code (ite (>= (str.to_code x) 48) \"a\" \"b\")) 48)))\
+         (check-sat)",
+        Verdict::Unsat,
     );
 }
 

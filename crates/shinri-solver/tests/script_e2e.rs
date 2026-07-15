@@ -1291,3 +1291,21 @@ fn in_re_unfold_interplay_diseq() {
     );
     assert_eq!(out, vec!["unsat"]);
 }
+
+/// Slice 22: the digit range fuses to `s ∈ Range(48, 57)` (spec §1.3), which is
+/// 10 words — under ENUM_WORD_CAP — so slice 20 enumerates it into
+/// `⋁ s = "0" … "9"` and the word engine produces the witness.
+#[test]
+fn to_code_digit_range_get_value_witness() {
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (>= (str.to_code s) 48))(assert (<= (str.to_code s) 57))\
+         (check-sat)(get-value (s))",
+    );
+    assert_eq!(out[0], "sat");
+    assert!(
+        ('0'..='9').any(|d| out[1].contains(&format!("\"{d}\""))),
+        "expected a digit witness, got {}",
+        out[1]
+    );
+}
