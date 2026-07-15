@@ -193,6 +193,9 @@ fn builtin_name(b: BuiltinOp) -> String {
         StrPrefixOf => "str.prefixof".to_owned(),
         StrSuffixOf => "str.suffixof".to_owned(),
         StrContains => "str.contains".to_owned(),
+        // Slice 23
+        StrLt => "str.<".to_owned(),
+        StrLeq => "str.<=".to_owned(),
         // Slice 13
         StrIndexOf => "str.indexof".to_owned(),
         StrReplace => "str.replace".to_owned(),
