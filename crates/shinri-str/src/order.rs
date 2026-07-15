@@ -203,4 +203,18 @@ mod tests {
         assert_eq!(out, vec![lt]);
         assert!(has_unreduced_str_order(&ctx, &out));
     }
+
+    #[test]
+    fn fence_recurses_into_nested_str_order() {
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let u = str_var(&mut ctx, "u");
+        // s < u over two distinct free vars: no arm fires -> survives.
+        let lt = order(&mut ctx, BuiltinOp::StrLt, s, u);
+        // Bury it: (not (str.< s u)).
+        let nested = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[lt]).unwrap();
+        let out = rewrite_str_order(&mut ctx, &[nested]);
+        assert_eq!(out, vec![nested]);
+        assert!(has_unreduced_str_order(&ctx, &out));
+    }
 }
