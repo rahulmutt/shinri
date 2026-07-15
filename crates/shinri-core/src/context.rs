@@ -509,7 +509,7 @@ impl Context {
                 }
                 Ok(str_s)
             }
-            StrPrefixOf | StrSuffixOf | StrContains => {
+            StrPrefixOf | StrSuffixOf | StrContains | StrLt | StrLeq => {
                 expect_arity(args, 2)?;
                 let str_s = self.string_sort();
                 expect_all(self, args, str_s)?;

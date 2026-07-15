@@ -326,6 +326,8 @@ impl<'a> Parser<'a> {
             "str.prefixof" => StrPrefixOf,
             "str.suffixof" => StrSuffixOf,
             "str.contains" => StrContains,
+            "str.<" => StrLt,
+            "str.<=" => StrLeq,
             "str.indexof" => StrIndexOf,
             "str.replace" => StrReplace,
             "str.replace_all" => StrReplaceAll,
@@ -932,6 +934,8 @@ impl<'a> Parser<'a> {
             BuiltinOp::StrPrefixOf
             | BuiltinOp::StrSuffixOf
             | BuiltinOp::StrContains
+            | BuiltinOp::StrLt
+            | BuiltinOp::StrLeq
             | BuiltinOp::StrIndexOf
             | BuiltinOp::StrReplace
             | BuiltinOp::StrReplaceAll
@@ -2473,5 +2477,21 @@ mod attr_tests {
                 value: AttrValue::Token(None),
             }
         );
+    }
+
+    #[test]
+    fn parse_str_order_ops_sort_to_bool() {
+        use shinri_core::Context;
+        fn parse(src: &str) -> (Context, shinri_core::TermId) {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            let t = p.parse_term_pub(&mut ctx).expect("parse term");
+            (ctx, t)
+        }
+        // Both operators over string literals sort to Bool.
+        let (ctx, t) = parse("(str.< \"a\" \"b\")");
+        assert_eq!(ctx.sort_of(t), ctx.bool_sort());
+        let (ctx, t) = parse("(str.<= \"a\" \"b\")");
+        assert_eq!(ctx.sort_of(t), ctx.bool_sort());
     }
 }

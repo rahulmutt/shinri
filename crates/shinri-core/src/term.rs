@@ -90,6 +90,9 @@ pub enum BuiltinOp {
     StrPrefixOf,
     StrSuffixOf,
     StrContains,
+    // Slice 23: lexicographic ordering, String × String → Bool.
+    StrLt,  // str.<
+    StrLeq, // str.<=
     // Slice 13: search/replace ops. Arg order per SMT-LIB: BOTH are
     // haystack-first — (str.indexof s sub i), (str.replace s t u).
     StrIndexOf, // String × String × Int → Int
