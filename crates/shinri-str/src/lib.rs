@@ -7,6 +7,7 @@ mod length;
 mod memb;
 pub mod model;
 pub mod normalize;
+pub mod order;
 pub mod predicates;
 pub mod reduce;
 pub mod regex;
