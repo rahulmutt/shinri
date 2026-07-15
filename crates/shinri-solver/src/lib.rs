@@ -472,6 +472,16 @@ impl Solver {
             if shinri_str::code_conv::has_unreduced_code_conv(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
+            // ── Slice 23: str.< / str.<= lexicographic ordering ──────────────
+            // A SINGLE exact rewrite pass — every rule is a full equivalence
+            // (literal folds, empty-string boundary idioms, reflexivity). Any
+            // SURVIVING application (general symbolic comparison — needs the
+            // existential first-differing-position split, banked) fences to
+            // sound Unknown.
+            assertions = shinri_str::order::rewrite_str_order(&mut self.ctx, &assertions);
+            if shinri_str::order::has_unreduced_str_order(&self.ctx, &assertions) {
+                return SolveOutcome::Unknown;
+            }
             // ── Slices 19–21: RegLan + str.in_re ─────────────────────────────
             // Ground folds (19) and finite/co-finite equivalence rewrites (20)
             // run in the pass; what survives is either ENGINE-ELIGIBLE — a

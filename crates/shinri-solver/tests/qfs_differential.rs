@@ -3507,6 +3507,78 @@ fn targeted_regex_symbolic_fences_unknown() {
     );
 }
 
+#[test]
+fn targeted_str_order_literal_folds() {
+    // Ground comparisons decide by fold.
+    expect(
+        "(set-logic QF_S)(assert (str.< \"a\" \"b\"))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(assert (str.< \"b\" \"a\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    expect(
+        "(set-logic QF_S)(assert (str.<= \"a\" \"a\"))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_str_order_empty_boundaries_decide() {
+    // "" <= s is valid; s < "" is unsatisfiable.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"\" s))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // s <= "" forces s = "": consistent with s = "", contradicts s = "x".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.<= s \"\"))(assert (= s \"\"))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.<= s \"\"))(assert (= s \"x\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // "" < s forces s != "": contradicts s = "".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.< \"\" s))(assert (= s \"\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_str_order_reflexivity_decides() {
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.< s s))(check-sat)",
+        Verdict::Unsat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.<= s s))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_str_order_symbolic_pair_known_gap() {
+    // KNOWN GAP (slice 23 §4): general symbolic lexicographic comparison over two
+    // free vars is NOT decided — it needs the existential first-differing-position
+    // split (banked). shinri returns sound Unknown; z3 answers Sat. When the future
+    // symbolic-decision slice lands, this pin flips to Sat.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(declare-fun u () String)\
+         (assert (str.< s u))(check-sat)",
+        Verdict::Unknown,
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fence cases — strings mixed with an out-of-scope theory ⇒ shinri Unknown.
 // (Soundness fence; not over-fencing: these constructs are genuinely out of scope.)
