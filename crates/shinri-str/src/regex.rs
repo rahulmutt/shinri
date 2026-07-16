@@ -439,9 +439,11 @@ fn range_term(ctx: &mut Context, lo: u32, hi: u32) -> TermId {
 /// Reverse translation Rex → RegLan term over the existing Re* builtins.
 /// Total (surrogate-endpoint ranges included). Guarantee: the minted term
 /// re-extracts (`extract_const_regex` succeeds) to a Rex with the SAME
-/// LANGUAGE — not always the same shape (the surrogate-block diff extracts
-/// as Inter/Comp). Deterministic, so hash-consing gives TermId identity for
-/// equal Rex inputs (the engine's dedup keys rely on this).
+/// LANGUAGE — not always the same shape (e.g. RePlus's `r+ = r · r*` desugar
+/// changes shape; the surrogate-block re.diff gadget, however, now folds
+/// back to the Range it encodes — see `class_intervals`/`interval_diff`).
+/// Deterministic, so hash-consing gives TermId identity for equal Rex inputs
+/// (the engine's dedup keys rely on this).
 pub(crate) fn rex_to_term(ctx: &mut Context, r: &Rex) -> TermId {
     let kids = |ctx: &mut Context, ps: &[Rex]| -> Vec<TermId> {
         ps.iter().map(|p| rex_to_term(ctx, p)).collect()
@@ -778,6 +780,56 @@ fn enum_comp(r: &Rex) -> Option<Words> {
     }
 }
 
+/// `Some(sorted, coalesced intervals)` iff `r` is a pure character class:
+/// `Empty`, a `Range`, or a `Union` whose members are themselves classes.
+/// `None` for anything else (the caller falls back to the generic path).
+fn class_intervals(r: &Rex) -> Option<Vec<(u32, u32)>> {
+    fn go(r: &Rex, out: &mut Vec<(u32, u32)>) -> Option<()> {
+        match r {
+            Rex::Empty => Some(()),
+            Rex::Range(lo, hi) => {
+                out.push((*lo, *hi));
+                Some(())
+            }
+            Rex::Union(ps) => ps.iter().try_for_each(|p| go(p, out)),
+            _ => None,
+        }
+    }
+    let mut out = Vec::new();
+    go(r, &mut out)?;
+    Some(coalesce(out))
+}
+
+/// `a \ b` over sorted, coalesced inclusive interval sets; output sorted,
+/// coalesced. Exact set arithmetic — the ReDiff fast path's core.
+fn interval_diff(a: &[(u32, u32)], b: &[(u32, u32)]) -> Vec<(u32, u32)> {
+    let mut out = Vec::new();
+    for &(alo, ahi) in a {
+        let mut lo = alo;
+        let mut live = true;
+        for &(blo, bhi) in b {
+            if bhi < lo {
+                continue;
+            }
+            if blo > ahi {
+                break;
+            }
+            if blo > lo {
+                out.push((lo, blo - 1));
+            }
+            if bhi >= ahi {
+                live = false;
+                break;
+            }
+            lo = bhi + 1;
+        }
+        if live {
+            out.push((lo, ahi));
+        }
+    }
+    out
+}
+
 /// Structural translation of a CONSTANT RegLan term. None on any
 /// non-constant leaf (symbolic `str.to_re` argument, non-literal `re.range`
 /// endpoint, RegLan variable / non-builtin application) or an
@@ -802,8 +854,33 @@ pub(crate) fn extract_const_regex(ctx: &Context, t: TermId) -> Option<Rex> {
         BuiltinOp::ReUnion => Some(union(sub(ctx, &kids)?)),
         BuiltinOp::ReInter => Some(inter(sub(ctx, &kids)?)),
         BuiltinOp::ReDiff => {
+            let rs = sub(ctx, &kids)?;
+            // Character-class fast path (slice 25): when every operand is a
+            // character class, compute the difference as intervals, so the
+            // surrogate-block gadget minted by `range_term` re-extracts as the
+            // Range it encodes (round-trip shape stability). Derived endpoints
+            // are `operand endpoint ± 1`, which for non-interior inputs can only
+            // be the block edges D800/DFFF — never an interior surrogate.
+            if let Some(all) = rs.iter().map(class_intervals).collect::<Option<Vec<_>>>() {
+                let mut it = all.into_iter();
+                let mut acc = it.next().expect("re.diff arity >= 2");
+                for b in it {
+                    acc = interval_diff(&acc, &b);
+                }
+                let parts: Vec<Rex> = acc
+                    .into_iter()
+                    .map(|(lo, hi)| {
+                        debug_assert!(
+                            range_rex(lo as i128, hi as i128).is_some(),
+                            "interval algebra minted an interior-surrogate endpoint"
+                        );
+                        Rex::Range(lo, hi)
+                    })
+                    .collect();
+                return Some(union(parts));
+            }
             // Left-associative difference: a \ b \ c = inter(a, comp(b), comp(c)).
-            let mut rs = sub(ctx, &kids)?.into_iter();
+            let mut rs = rs.into_iter();
             let first = rs.next().expect("arity >= 2");
             let mut parts = vec![first];
             for r in rs {
@@ -1884,8 +1961,10 @@ mod tests {
 
     #[test]
     fn rex_to_term_roundtrips_language() {
-        // Round-trip is SEMANTIC (same language), not syntactic — the
-        // surrogate-block encoding extracts back as Inter/Comp shapes.
+        // Round-trip is SEMANTIC (same language), not syntactic in general —
+        // e.g. RePlus desugars to Concat/Star on the way back. (Surrogate
+        // ranges specifically DO fold back to Range shape; see
+        // rediff_block_gadget_folds_to_range.)
         let mut ctx = Context::new();
         let samples = ["", "a", "z", "ab", "ba", "0", "abc", "zzz"];
         let cases = vec![
@@ -2028,6 +2107,93 @@ mod tests {
         // The eligible atom under Boolean structure stays unfenced.
         let notok = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[ok]).unwrap();
         assert!(!has_unsupported_regex(&ctx, &[notok]));
+    }
+
+    #[test]
+    fn rediff_block_gadget_folds_to_range() {
+        let mut ctx = Context::new();
+        // rex_to_term encodes the surrogate block Range(D800,DFFF) as the
+        // re.diff gadget (range_term); extraction must fold it back to the
+        // Range it encodes — shape, not just language.
+        let block = Rex::Range(0xD800, 0xDFFF);
+        let t = rex_to_term(&mut ctx, &block);
+        assert_eq!(extract_const_regex(&ctx, t), Some(block));
+        // A full straddling range round-trips whole (gadget fold + Task 1's
+        // union coalescing).
+        let straddle = Rex::Range('c' as u32, 0xE000);
+        let t = rex_to_term(&mut ctx, &straddle);
+        assert_eq!(extract_const_regex(&ctx, t), Some(straddle));
+        let full = Rex::Range('c' as u32, MAX_CODE);
+        let t = rex_to_term(&mut ctx, &full);
+        assert_eq!(extract_const_regex(&ctx, t), Some(full));
+    }
+
+    #[test]
+    fn rediff_ascii_interval_algebra() {
+        let mut ctx = Context::new();
+        // [a-z] \ [d-f] = [a-c] ∪ [g-z].
+        let az = range_term_raw(&mut ctx, 'a' as u32, 'z' as u32);
+        let df = range_term_raw(&mut ctx, 'd' as u32, 'f' as u32);
+        let d = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReDiff), &[az, df])
+            .unwrap();
+        assert_eq!(
+            extract_const_regex(&ctx, d),
+            Some(Rex::Union(vec![
+                Rex::Range('a' as u32, 'c' as u32),
+                Rex::Range('g' as u32, 'z' as u32)
+            ]))
+        );
+        // Subtracting a superset → Empty.
+        let d2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReDiff), &[df, az])
+            .unwrap();
+        assert_eq!(extract_const_regex(&ctx, d2), Some(Rex::Empty));
+    }
+
+    #[test]
+    fn rediff_non_class_operand_keeps_inter_comp_shape() {
+        let mut ctx = Context::new();
+        // A non-class operand (Star) must keep today's inter/comp construction
+        // bit-for-bit — the fast path fires ONLY when all operands are classes.
+        let az = range_term_raw(&mut ctx, 'a' as u32, 'z' as u32);
+        let inner = range_term_raw(&mut ctx, 'a' as u32, 'z' as u32);
+        let star_t = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReStar), &[inner])
+            .unwrap();
+        let d = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReDiff), &[az, star_t])
+            .unwrap();
+        assert_eq!(
+            extract_const_regex(&ctx, d),
+            Some(inter(vec![
+                Rex::Range('a' as u32, 'z' as u32),
+                comp(star(Rex::Range('a' as u32, 'z' as u32)))
+            ]))
+        );
+    }
+
+    #[test]
+    fn interval_diff_edges() {
+        // b covers a's head; a's tail survives.
+        assert_eq!(interval_diff(&[(5, 20)], &[(0, 9)]), vec![(10, 20)]);
+        // b splits a in two.
+        assert_eq!(
+            interval_diff(&[(5, 20)], &[(8, 12)]),
+            vec![(5, 7), (13, 20)]
+        );
+        // Multiple b intervals carve multiple holes.
+        assert_eq!(
+            interval_diff(&[(0, 30)], &[(5, 6), (10, 12), (28, 40)]),
+            vec![(0, 4), (7, 9), (13, 27)]
+        );
+        // Disjoint b: a unchanged.
+        assert_eq!(interval_diff(&[(5, 9)], &[(20, 30)]), vec![(5, 9)]);
+        // Exact cover → empty.
+        assert_eq!(
+            interval_diff(&[(5, 9)], &[(5, 9)]),
+            Vec::<(u32, u32)>::new()
+        );
     }
 
     #[test]
