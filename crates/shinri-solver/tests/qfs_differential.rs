@@ -3212,11 +3212,10 @@ fn targeted_to_code_range_decided() {
 /// ruling out (a) and (b); `s`'s length was UNPINNED, ruling out (c) as it
 /// existed then. An unrelated, directly-asserted wide `str.in_re` (no
 /// `to_code` in sight) showed the identical cliff
-/// (`targeted_regex_symbolic_fences_unknown`'s 300-word loop case remains
-/// Unknown for the same reason — that test is untouched by this slice;
-/// independently, a fused `Range(48, 247)` — 200 words, under the cap —
-/// decides Sat while `Range(48, 347)` — 300 words, over the cap — is
-/// Unknown).
+/// (`targeted_regex_symbolic_fences_now_decide`'s 300-word loop case was
+/// predicted to remain Unknown for the same reason when this comment was
+/// written — SUPERSEDED by slice 26's lone-leaf carve-out, which decides it
+/// via a different, independent mechanism; see that test).
 ///
 /// A further wrinkle specific to THIS range: `Range(48, MAX_CODE)` spans the
 /// surrogate block, so `range_term` mints a `re.union`/`re.diff` composite
@@ -3773,7 +3772,7 @@ fn targeted_regex_symbolic_decided_unsat() {
 }
 
 #[test]
-fn targeted_regex_symbolic_fences_unknown() {
+fn targeted_regex_symbolic_fences_now_decide() {
     // Star over a range: neither finite nor co-finite. slice 21: decided (was
     // fenced Unknown) — the membership flows to StrSolver as an ordinary atom,
     // the default model s="" genuinely satisfies the nullable [a-b]*, and the
@@ -3783,17 +3782,25 @@ fn targeted_regex_symbolic_fences_unknown() {
          (assert (str.in_re s (re.* (re.range \"a\" \"b\"))))(check-sat)",
         Verdict::Sat,
     );
-    // Cardinality cap: 300 words > ENUM_WORD_CAP = 256.
+    // Slice 26 (controller-adjudicated, plan deviation): 300 words no longer
+    // fences to Unknown — `re.loop` is a const-cur lone leaf, so the
+    // carve-out emits the guarded 1 ≤ len ≤ 300 bound and repair searches the
+    // witness (self-check verifies it). z3-confirmed sat.
     expect(
         "(set-logic QF_S)(declare-fun s () String)\
          (assert (str.in_re s ((_ re.loop 1 300) (str.to_re \"a\"))))(check-sat)",
-        Verdict::Unknown,
+        Verdict::Sat,
     );
-    // Byte cap: one 9000-byte word ((_ re.^ 300) over a 30-char literal).
+    // Slice 26 (controller-adjudicated, plan deviation): same mechanism —
+    // `re.^` is also a const-cur lone leaf, so the carve-out emits the
+    // guarded len = 9000 bound and repair/model-length search finds the
+    // witness (self-check verifies it). z3 times out (2min) on this query,
+    // but sat is semantically forced regardless: L = {a^9000} is a
+    // nonempty singleton, so shinri's self-check-verified sat is correct.
     expect(
         "(set-logic QF_S)(declare-fun s () String)\
          (assert (str.in_re s ((_ re.^ 300) (str.to_re \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"))))(check-sat)",
-        Verdict::Unknown,
+        Verdict::Sat,
     );
 }
 
@@ -3899,45 +3906,118 @@ fn targeted_str_order_single_char_left_decides() {
 }
 
 #[test]
-fn targeted_str_order_single_char_left_free_known_gap() {
-    // KNOWN GAP (slice 25 amendment; NARROWED by task 5b's comp() fix — see
-    // `targeted_str_order_single_char_left_free_len_pinned_decides` for the
-    // two sub-cases that now decide): constant-on-LEFT STRICT order
-    // (str.< "b" s) over a FULLY-FREE s — with or without a pinned str.len —
-    // is still a sound Unknown, and (str.<= "b" s) stays Unknown when s is
-    // fully free (no length pin). Re-probed end-to-end via the CLI (all four
-    // shapes below); every one still returns `unknown` (z3: sat for all
-    // four). Mechanism: the strict-< proper-prefix gadget
-    // (word("b")·Σ·Σ*) churns the string↔arith length seam to the fuel
-    // fence before model repair gets a chance to search a witness —
-    // separate from the bare-range leaf gap task 5b's Part 2 closed (that
-    // one had an independent length fact to conflict with; here there is
-    // none to seed a witness search either way for a FULLY-FREE s). Banked
-    // follow-up; not in slice-25 scope. A future slice should flip these to
-    // Sat deliberately once the seam is closed.
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(check-sat)"
-        ),
-        Verdict::Unknown,
+fn targeted_str_order_single_char_left_free_now_decides() {
+    // Slice 26 (leaf-membership length-seam termination): the four shapes
+    // pinned Unknown since slice 25 — the strict-< proper-prefix gadget
+    // (word("b")·Σ·Σ*) used to churn the string↔arith length seam to the
+    // fuel fence before model repair could search a witness. The lone-leaf
+    // carve-out (memb.rs) + shortest-word repair fallback (model.rs) now
+    // decide them. z3-confirmed verdicts.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(check-sat)",
+        Verdict::Sat,
     );
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))(check-sat)"
-        ),
-        Verdict::Unknown,
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))(check-sat)",
+        Verdict::Sat,
     );
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))\
-             (assert (= (str.len s) 1))(check-sat)"
-        ),
-        Verdict::Unknown,
+    // len=1 is Sat too (z3-adjudicated during planning: the gadget's
+    // above-arm Range(99,MAX)·Σ* admits the length-1 witness "c"; only the
+    // PURE prefix-arm membership b·Σ·Σ* is Unsat at len 1 — pinned
+    // separately in targeted_leaf_membership_min_len_conflict_unsat).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))\
+         (assert (= (str.len s) 1))(check-sat)",
+        Verdict::Sat,
     );
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))\
+         (assert (= (str.len s) 2))(check-sat)",
+        Verdict::Sat,
+    );
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))\
+         (assert (= (str.len s) 3))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_leaf_membership_star_tail_decides() {
+    // Slice 26 membership-level cells (the mechanism behind the order
+    // pins, str.< eliminated): min-len ≥ 2 shapes with star tails over a
+    // free leaf. All z3-sat; all Unknown before the leaf carve-out.
+    for re in [
+        "(re.++ (str.to_re \"b\") re.allchar (re.* re.allchar))",
+        "(re.++ (str.to_re \"bc\") (re.* re.allchar))",
+        "(re.++ re.allchar re.allchar (re.* re.allchar))",
+        "(re.++ (re.* re.allchar) (str.to_re \"b\") re.allchar)",
+        "(re.++ (str.to_re \"b\") (re.range \"a\" \"z\") (re.* re.allchar))",
+        "(re.++ (str.to_re \"b\") re.allchar (re.* (str.to_re \"x\")))",
+        "(re.++ (str.to_re \"b\") (re.++ re.allchar (re.* re.allchar)))",
+    ] {
+        expect(
+            &format!(
+                "(set-logic QF_S)(declare-fun s () String)\
+                 (assert (str.in_re s {re}))(check-sat)"
+            ),
+            Verdict::Sat,
+        );
+    }
+    // Pinned length rescues too (the fuel used to die before repair saw it).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.++ (str.to_re \"b\") re.allchar (re.* re.allchar))))\
+         (assert (= (str.len s) 2))(check-sat)",
+        Verdict::Sat,
+    );
+    // Union with a trivially-sat arm no longer poisoned.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.union (re.++ (str.to_re \"bc\") (re.* re.allchar)) (str.to_re \"q\"))))\
+         (check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_leaf_membership_min_len_conflict_unsat() {
+    // Slice 26: the guarded lower-bound axiom (len ≥ 2 for b·Σ·Σ*) turns
+    // an independently-asserted len(s)=1 into a direct arith conflict —
+    // Unsat was already the verdict pre-slice (via churn-then-conflict);
+    // it must survive the carve-out. z3: unsat.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.++ (str.to_re \"b\") re.allchar (re.* re.allchar))))\
+         (assert (= (str.len s) 1))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_str_order_two_gadget_conjunction_decides() {
+    // Slice 26: two order gadgets on one leaf — memb_seeds intersects all
+    // of the leaf's Rexes, so ("b" < s) ∧ (s < "d") finds "c". z3: sat.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.< \"b\" s))(assert (str.< s \"d\"))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
+fn targeted_leaf_membership_infinite_conflict_known_gap() {
+    // KNOWN GAP (slice 26, banked): conflicting INFINITE leaf memberships
+    // — s ∈ a·Σ* ∧ s ∈ b·Σ* (z3: unsat). The carve-out leaves both for
+    // repair; the intersected goal is empty, no seed is found, and repair
+    // can never produce Unsat — sound Unknown, same verdict as pre-slice.
+    // Refutation needs Rex intersection-emptiness (banked non-goal §Non-
+    // goals). A future slice should flip this to Unsat deliberately.
     assert_eq!(
         shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))\
-             (assert (= (str.len s) 2))(check-sat)"
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (str.in_re s (re.++ (str.to_re \"a\") (re.* re.allchar))))\
+             (assert (str.in_re s (re.++ (str.to_re \"b\") (re.* re.allchar))))(check-sat)"
         ),
         Verdict::Unknown,
     );
