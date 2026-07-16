@@ -283,6 +283,12 @@ core frozen by this slice's constraints), never unsound (differential: 0
 disagreements), and is the main driver of the new oracle family's
 shinri-unknown count. Banked follow-up: engine-side witness synthesis for
 non-nullable constant-regex memberships over free variables.
+[Correction, slice 25 (2026-07-16): the nullability framing above is
+falsified — non-nullable memberships over free variables decide fine when the
+range does not straddle the surrogate block. The actual driver is
+shape loss in the `rex_to_term`/`extract_const_regex` round-trip for
+surrogate-straddling ranges; the banked item is cashed as slice 25
+(`2026-07-16-shinri-slice25-surrogate-range-roundtrip-design.md`).]
 
 **Oracle tallies** (reviewer-reproduced bit-for-bit, 2 independent runs):
 
