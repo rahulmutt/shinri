@@ -49,7 +49,9 @@ pub(crate) const FUEL_NODE_CAP: usize = 10_000;
 /// - `Concat`/`Union`/`Inter`: >= 2 elements, flattened, no identity/absorber
 ///   elements; `Union`/`Inter` deduped.
 /// - `Star`: argument is not `Empty`/`Eps`/`Star`.
-/// - `Comp`: argument is not `Comp`.
+/// - `Comp`: argument is not `Comp`, `Empty`, or Σ* (`Star(Range(0,
+///   MAX_CODE))`) — `comp` collapses `comp(∅) = Σ*` and `comp(Σ*) = ∅` in
+///   addition to cancelling `Comp∘Comp` (slice 25 task 5b).
 /// - `Loop(r, lo, hi)`: `lo <= hi`, `hi >= 1`, `r` not `Empty`/`Eps`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum Rex {
@@ -203,8 +205,16 @@ pub(crate) fn range_rex(lo: i128, hi: i128) -> Option<Rex> {
 pub(crate) fn comp(r: Rex) -> Rex {
     match r {
         Rex::Comp(inner) => *inner,
+        Rex::Empty => star(Rex::Range(0, MAX_CODE)), // comp(∅) = Σ*
+        ref s if is_sigma_star(s) => Rex::Empty,     // comp(Σ*) = ∅
         other => Rex::Comp(Box::new(other)),
     }
+}
+
+/// True iff `r` is exactly `Σ*` (`Star(Range(0, MAX_CODE))`) — the canonical
+/// shape `star`/`extract_const_regex` produce for `re.all`/derived universals.
+fn is_sigma_star(r: &Rex) -> bool {
+    matches!(r, Rex::Star(inner) if **inner == Rex::Range(0, MAX_CODE))
 }
 
 pub(crate) fn loop_(r: Rex, lo: u32, hi: u32) -> Rex {
@@ -1210,6 +1220,26 @@ mod tests {
         assert_eq!(loop_(chr('a'), 0, 0), Rex::Eps);
         assert_eq!(loop_(Rex::Empty, 0, 4), Rex::Eps);
         assert_eq!(loop_(Rex::Empty, 1, 4), Rex::Empty);
+    }
+
+    #[test]
+    fn comp_collapses_universal_and_empty_complements() {
+        // Slice 25 task 5b, Part 1: comp(∅) = Σ* and comp(Σ*) = ∅ — the two
+        // complement-of-Σ* identities the smart constructor was previously
+        // missing (it only cancelled Comp∘Comp). Without these, derivatives
+        // under negative polarity mint Comp(Star(Range(0,MAX_CODE))) (= ∅)
+        // and Comp(Empty) (= Σ*) that never collapse, cascading toward the
+        // Fuel budget.
+        assert_eq!(comp(Rex::Empty), star(Rex::Range(0, MAX_CODE)));
+        assert_eq!(comp(star(Rex::Range(0, MAX_CODE))), Rex::Empty);
+        // Double-complement through the new identities too.
+        assert_eq!(comp(comp(Rex::Empty)), Rex::Empty);
+        assert_eq!(
+            comp(comp(star(Rex::Range(0, MAX_CODE)))),
+            star(Rex::Range(0, MAX_CODE))
+        );
+        // Generic double-complement (pre-existing identity) still holds.
+        assert_eq!(comp(comp(chr('a'))), chr('a'));
     }
 
     #[test]
