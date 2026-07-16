@@ -41,8 +41,11 @@ pub(crate) const FUEL_NODE_CAP: usize = 10_000;
 
 /// Canonical regex AST for ground evaluation. Invariants (enforced by the
 /// smart constructors, NEVER by direct construction of compound nodes):
-/// - `Range(lo, hi)`: `lo <= hi <= MAX_CODE` where produced from user syntax;
-///   derivatives never mint new ranges.
+/// - `Range(lo, hi)`: `lo <= hi <= MAX_CODE`; a surrogate endpoint is legal
+///   only as `lo = 0xD800` / `hi = 0xDFFF` (block edges — `range_rex`'s
+///   policy; interval algebra preserves this since derived endpoints are
+///   `endpoint ± 1` of non-interior inputs). Interior surrogates may occur
+///   strictly INSIDE a range (a straddling range covers the block).
 /// - `Concat`/`Union`/`Inter`: >= 2 elements, flattened, no identity/absorber
 ///   elements; `Union`/`Inter` deduped.
 /// - `Star`: argument is not `Empty`/`Eps`/`Star`.
@@ -437,13 +440,13 @@ fn range_term(ctx: &mut Context, lo: u32, hi: u32) -> TermId {
 }
 
 /// Reverse translation Rex → RegLan term over the existing Re* builtins.
-/// Total (surrogate-endpoint ranges included). Guarantee: the minted term
-/// re-extracts (`extract_const_regex` succeeds) to a Rex with the SAME
-/// LANGUAGE — not always the same shape (e.g. RePlus's `r+ = r · r*` desugar
-/// changes shape; the surrogate-block re.diff gadget, however, now folds
-/// back to the Range it encodes — see `class_intervals`/`interval_diff`).
-/// Deterministic, so hash-consing gives TermId identity for equal Rex inputs
-/// (the engine's dedup keys rely on this).
+/// Total (surrogate-endpoint ranges included). Guarantee (slice 25): the
+/// minted term re-extracts (`extract_const_regex`) to the SAME Rex — shape
+/// identity, not merely language equality; the surrogate-block diff gadget
+/// folds back to its Range via the ReDiff character-class fast path.
+/// Deterministic, so hash-consing gives TermId identity for equal Rex
+/// inputs (the engine's dedup keys rely on this).
+/// Pinned by `roundtrip_extract_of_rex_to_term_is_identity`.
 pub(crate) fn rex_to_term(ctx: &mut Context, r: &Rex) -> TermId {
     let kids = |ctx: &mut Context, ps: &[Rex]| -> Vec<TermId> {
         ps.iter().map(|p| rex_to_term(ctx, p)).collect()
@@ -2210,5 +2213,99 @@ mod tests {
         // An endpoint STRICTLY inside the surrogate block ⇒ None (fence).
         assert_eq!(range_rex(0, 0xDA00), None);
         assert_eq!(range_rex(0xDA00, 0xE000), None);
+    }
+
+    /// Deterministic LCG (same recurrence as the differential harness's).
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    /// A random legal Range: endpoints drawn from a pool mixing ASCII, the
+    /// block edges, and beyond-BMP codes; retried until `range_rex`'s endpoint
+    /// policy admits it (lo may be D800, hi may be DFFF, never interior).
+    fn arb_range(g: &mut Lcg) -> Rex {
+        const POOL: [u32; 8] = [
+            0, 'a' as u32, 'z' as u32, 0xD7FF, 0xD800, 0xDFFF, 0xE000, MAX_CODE,
+        ];
+        loop {
+            let a = POOL[(g.next() % 8) as usize];
+            let b = POOL[(g.next() % 8) as usize];
+            let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+            if let Some(r @ Rex::Range(..)) = range_rex(lo as i128, hi as i128) {
+                return r;
+            }
+        }
+    }
+
+    /// A random CANONICAL Rex — built exclusively through the smart
+    /// constructors, so the enum invariants hold by construction.
+    fn arb_rex(g: &mut Lcg, depth: u32) -> Rex {
+        if depth == 0 {
+            return match g.next() % 3 {
+                0 => Rex::Eps,
+                1 => Rex::Empty,
+                _ => arb_range(g),
+            };
+        }
+        match g.next() % 7 {
+            0 => arb_range(g),
+            1 => concat(vec![arb_rex(g, depth - 1), arb_rex(g, depth - 1)]),
+            2 => union(vec![arb_rex(g, depth - 1), arb_rex(g, depth - 1)]),
+            3 => inter(vec![arb_rex(g, depth - 1), arb_rex(g, depth - 1)]),
+            4 => star(arb_rex(g, depth - 1)),
+            5 => comp(arb_rex(g, depth - 1)),
+            _ => {
+                let lo = (g.next() % 3) as u32;
+                let hi = lo + 1 + (g.next() % 3) as u32;
+                loop_(arb_rex(g, depth - 1), lo, hi)
+            }
+        }
+    }
+
+    #[test]
+    fn roundtrip_extract_of_rex_to_term_is_identity() {
+        // The slice's acceptance property: the term↔Rex round-trip is
+        // SHAPE-stable (not merely language-preserving) for canonical Rex.
+        let mut g = Lcg(0x5EED_25_5EED_25_01);
+        let mut ctx = Context::new();
+        for i in 0..500 {
+            let r = arb_rex(&mut g, 4);
+            let t = rex_to_term(&mut ctx, &r);
+            assert_eq!(
+                extract_const_regex(&ctx, t),
+                Some(r.clone()),
+                "round-trip changed shape at iter {i}: {r:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn straddling_range_consumer_shapes_survive_roundtrip() {
+        // The two consumer misses from the spec's Root cause: head_forced and
+        // the bare-Range ground-out both key on Rex SHAPE after extraction.
+        let mut ctx = Context::new();
+        // Bare straddling range: stays a bare Range (memb.rs's ground-out arm).
+        let bare = Rex::Range('c' as u32, 0xE000);
+        let t = rex_to_term(&mut ctx, &bare);
+        let back = extract_const_regex(&ctx, t).unwrap();
+        assert!(matches!(back, Rex::Range(..)), "got {back:?}");
+        // Straddling Range·Σ*: stays head-forced (memb.rs's Rule-S arm).
+        let shape = concat(vec![
+            Rex::Range('c' as u32, MAX_CODE),
+            star(Rex::Range(0, MAX_CODE)),
+        ]);
+        let t = rex_to_term(&mut ctx, &shape);
+        let back = extract_const_regex(&ctx, t).unwrap();
+        assert_eq!(
+            head_forced(&back),
+            Some((('c' as u32, MAX_CODE), star(Rex::Range(0, MAX_CODE))))
+        );
     }
 }
