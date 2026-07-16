@@ -336,6 +336,21 @@ mod tests {
     }
 
     #[test]
+    fn single_char_const_right_null_char_leq_keeps_word_branch() {
+        // (str.<= s "\0") (m = 0): the below-range Range(0,-1) is empty and drops,
+        // but the reflexive word branch survives:
+        // s ∈ Eps ∪ Range(0,0) ≡ s = "" ∨ s = "\0".
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let nul = ctx.mk_string_const("\u{0}");
+        let le = order(&mut ctx, BuiltinOp::StrLeq, s, nul);
+        let out = rewrite_str_order(&mut ctx, &[le]);
+        let want = membership(&mut ctx, s, union(vec![Rex::Eps, Rex::Range(0, 0)]));
+        assert_eq!(out, vec![want]);
+        assert!(!has_unreduced_str_order(&ctx, &out));
+    }
+
+    #[test]
     fn multi_char_const_right_survives_to_fence() {
         // A length-2 constant is out of scope (banked) ⇒ the atom survives ⇒ fence.
         let mut ctx = Context::new();
