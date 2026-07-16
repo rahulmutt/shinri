@@ -232,7 +232,57 @@ pub(crate) fn memb_check(
         // — the Task-4 wrong-witness channel. Skip: the atom stays in
         // `memb_true`; Rule G decides it whenever the class grounds;
         // `memb_seeds` realises it otherwise; the self-check backstops.
+        //
+        // Slice 25 task 5b, Part 2: before skipping, emit the GUARDED
+        // tautology `lit → len(residual) = 1` (through its arith companions,
+        // deduped via `emitted_len_axioms` — same posture as the S2 witness
+        // axiom) so an independently-asserted `len(residual)` conflicts with
+        // the single-char class instead of silently falling to model repair
+        // (which can never produce Unsat). Mints NO concat — `residual`
+        // itself, not a fresh witness, carries the length fact, so the
+        // leaf's repair eligibility is untouched. Soundness: a single-char
+        // class matches exactly length-1 words, so the implication is a
+        // tautology — guarded, it can only ADD a fact arith lacked, never
+        // flip a verdict.
         if matches!(cur, Rex::Range(..)) {
+            // Guarded like the variable-head arm below: `residual` is an NF
+            // read (`nf[i..]`), and the clause this emits is persisted
+            // GLOBALLY (`emitted_len_axioms`, not scoped to this branch) —
+            // so if the `t = prefix·residual` decomposition came from a
+            // CONDITIONAL (dl>0) merge, the global clause would only be
+            // branch-locally valid. `side_clean` is the same branch-
+            // independence gate the sibling arm applies at the `!side_clean`
+            // check just below (memb.rs:301) — mirrored here, same
+            // arguments, same semantics. When it fails, fall through to the
+            // pre-existing `continue` (repair-eligibility untouched).
+            //
+            // Known decisiveness limitation (documented, not fixed): the
+            // dedup key `emitted_len_axioms` is keyed on the arith companion
+            // alone, not on this guard — so if two membership literals with
+            // different `lit`s share the same `residual`, only the FIRST
+            // one's guard is emitted. Still sound (each guarded clause is a
+            // tautology on its own), just less decisive than emitting one
+            // per literal.
+            if !side_clean(cx.eq, cx.terms, t, input_cond_roots) {
+                continue;
+            }
+            let residual = mk_concat(cx.terms, &nf[i..]);
+            let lr = wordeq::len_of(cx.terms, residual);
+            let one = cx.terms.mk_numeral(
+                shinri_core::Rational::from_int(1i128.into()),
+                cx.terms.int_sort(),
+            );
+            let len1 = cx.terms.mk_eq(lr, one).expect("eq well-sorted");
+            let (ge, le) = crate::length::arith_eq_companions(cx.terms, len1)
+                .expect("len(residual)=1 has Int sides");
+            let guard = Some(lit.negate());
+            for comp in [ge, le] {
+                if s.emitted_len_axioms.contains(&comp) {
+                    continue;
+                }
+                s.emitted_len_axioms.insert(comp);
+                return Some(emit_split(s, cx.terms, vec![comp], guard));
+            }
             continue;
         }
 
@@ -715,6 +765,68 @@ mod tests {
             assert_ne!(side, x, "S3/S4 memberships are on fresh witnesses");
             assert!(crate::regex::extract_const_regex(cx.terms, re_side).is_some());
         }
+    }
+
+    #[test]
+    fn bare_range_leaf_emits_guarded_len1_axiom() {
+        // Slice 25 task 5b, Part 2: x ∈ [a-z] is a bare-range LEAF (no ground
+        // prefix, not head-forced past itself) — before the leaf skip, the
+        // pass must emit `lit → len(x) = 1` through its two arith companions
+        // (deduped via `emitted_len_axioms`, same shape as the S2 witness
+        // axiom), guarded by ¬lit, and mint NO concat on x (repair
+        // eligibility preserved) — then leave the atom for model repair.
+        let mut ctx = Context::new();
+        let x = var(&mut ctx, "x");
+        let m = memb_atom(&mut ctx, x, &Rex::Range('a' as u32, 'z' as u32));
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), m);
+        s.test_force_memb_true(m, true);
+        let (splits, terminal) = run_rounds(&mut s, &mut cx, 16);
+        assert!(
+            matches!(terminal, TCheck::Sat),
+            "leaf saturates to the model-repair path"
+        );
+        let is_cmp = |terms: &Context, t: TermId| {
+            matches!(
+                terms.term_node(t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::Ge | BuiltinOp::Le),
+                    ..
+                }
+            )
+        };
+        let len_axiom_splits: Vec<_> = splits
+            .iter()
+            .filter(|(a, g)| *g && a.len() == 1 && is_cmp(cx.terms, a[0]))
+            .collect();
+        assert_eq!(
+            len_axiom_splits.len(),
+            2,
+            "ge + le companions of len(x)=1, each its own guarded [comp] split"
+        );
+        // No str.++ concat was minted on x — the leaf's repair eligibility
+        // (memb_seeds requires a witness class with no constant, no concat)
+        // is untouched.
+        let is_memb = |terms: &Context, t: TermId| {
+            matches!(
+                terms.term_node(t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrInRe),
+                    ..
+                }
+            )
+        };
+        assert!(
+            splits
+                .iter()
+                .all(|(a, _)| !a.iter().any(|&t| is_memb(cx.terms, t))),
+            "bare-range leaf must never emit its own S-rule split"
+        );
     }
 
     #[test]
