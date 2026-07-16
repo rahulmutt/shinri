@@ -113,6 +113,11 @@ fn try_order_atom(ctx: &mut Context, args: &[TermId], reflexive: bool) -> Option
             Some(m) => order_const_right(ctx, a, m, reflexive),
             None => None, // multi-char constant ⇒ banked (spec §5)
         },
+        // Single-character constant on the LEFT: (str.< c s) / (str.<= c s).
+        (Some(x), None) => match single_char_code(&x) {
+            Some(m) => order_const_left(ctx, b, m, reflexive),
+            None => None, // multi-char constant ⇒ banked (spec §5)
+        },
         _ => None,
     }
 }
@@ -158,6 +163,25 @@ fn order_const_right(ctx: &mut Context, s: TermId, m: i128, reflexive: bool) -> 
         branches.push(Rex::Range(m as u32, m as u32)); // word(c)
     }
     Some(membership(ctx, s, union(branches)))
+}
+
+/// `(str.< c s)` / `(str.<= c s)` for a single-character constant `c` (code `m`)
+/// and symbolic `s`. `reflexive` = the `<=` case.
+///
+/// `c <  s` ≡ s ∈ Range(m+1, MAX)·Σ* ∪ word(c)·Σ·Σ*  (first char > m, or c a
+///                                                     PROPER prefix of s)
+/// `c <= s` ≡ s ∈ Range(m+1, MAX)·Σ* ∪ word(c)·Σ*     (… or c a prefix incl. = c)
+///
+/// `m = MAX` collapses `Range(MAX+1, MAX)` to empty, dropping the range branch.
+fn order_const_left(ctx: &mut Context, s: TermId, m: i128, reflexive: bool) -> Option<TermId> {
+    let above = concat(vec![range_rex(m + 1, MAX_CODE as i128)?, sigma_star()]);
+    let word_c = Rex::Range(m as u32, m as u32);
+    let prefix = if reflexive {
+        concat(vec![word_c, sigma_star()]) // word(c)·Σ*
+    } else {
+        concat(vec![word_c, sigma(), sigma_star()]) // word(c)·Σ·Σ*
+    };
+    Some(membership(ctx, s, union(vec![above, prefix])))
 }
 
 /// Presence fence: `true` iff any `str.<`/`str.<=` application survives the
@@ -318,5 +342,81 @@ mod tests {
         let out = rewrite_str_order(&mut ctx, &[lt]);
         assert_eq!(out, vec![lt]);
         assert!(has_unreduced_str_order(&ctx, &out));
+    }
+
+    #[test]
+    fn single_char_const_left_rewrites() {
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let b = ctx.mk_string_const("b"); // code 98
+                                          // (str.< "b" s) ≡ s ∈ Range(99,MAX)·Σ* ∪ "b"·Σ·Σ*.
+        let lt = order(&mut ctx, BuiltinOp::StrLt, b, s);
+        let out = rewrite_str_order(&mut ctx, &[lt]);
+        let want_lang = union(vec![
+            concat(vec![
+                Rex::Range(99, MAX_CODE),
+                star(Rex::Range(0, MAX_CODE)),
+            ]),
+            concat(vec![
+                Rex::Range(98, 98),
+                Rex::Range(0, MAX_CODE),
+                star(Rex::Range(0, MAX_CODE)),
+            ]),
+        ]);
+        let want = membership(&mut ctx, s, want_lang);
+        assert_eq!(out, vec![want]);
+        assert!(!has_unreduced_str_order(&ctx, &out));
+        // (str.<= "b" s) ≡ s ∈ Range(99,MAX)·Σ* ∪ "b"·Σ*.
+        let le = order(&mut ctx, BuiltinOp::StrLeq, b, s);
+        let out = rewrite_str_order(&mut ctx, &[le]);
+        let want_lang = union(vec![
+            concat(vec![
+                Rex::Range(99, MAX_CODE),
+                star(Rex::Range(0, MAX_CODE)),
+            ]),
+            concat(vec![Rex::Range(98, 98), star(Rex::Range(0, MAX_CODE))]),
+        ]);
+        let want = membership(&mut ctx, s, want_lang);
+        assert_eq!(out, vec![want]);
+    }
+
+    #[test]
+    fn single_char_const_left_max_char_drops_range_branch() {
+        // c = U+2FFFF (greatest char): Range(MAX+1, MAX) empty ⇒ only the prefix branch.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let mx = ctx.mk_string_const("\u{2FFFF}");
+        let lt = order(&mut ctx, BuiltinOp::StrLt, mx, s);
+        let out = rewrite_str_order(&mut ctx, &[lt]);
+        let want_lang = concat(vec![
+            Rex::Range(MAX_CODE, MAX_CODE),
+            Rex::Range(0, MAX_CODE),
+            star(Rex::Range(0, MAX_CODE)),
+        ]);
+        let want = membership(&mut ctx, s, want_lang);
+        assert_eq!(out, vec![want]);
+        assert!(!has_unreduced_str_order(&ctx, &out));
+    }
+
+    #[test]
+    fn single_char_const_block_edge_does_not_fence() {
+        // c = U+E000 (first char above the surrogate block): the endpoint m-1 = 0xDFFF
+        // is the block EDGE (expressible) ⇒ must NOT fence (spec §3: guard is
+        // provably non-load-bearing for a single char).
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let c = ctx.mk_string_const("\u{E000}"); // code 0xE000
+        let lt = order(&mut ctx, BuiltinOp::StrLt, s, c);
+        let out = rewrite_str_order(&mut ctx, &[lt]);
+        assert!(
+            !has_unreduced_str_order(&ctx, &out),
+            "block-edge endpoint must not fence"
+        );
+        let want_lang = union(vec![
+            Rex::Eps,
+            concat(vec![Rex::Range(0, 0xDFFF), star(Rex::Range(0, MAX_CODE))]),
+        ]);
+        let want = membership(&mut ctx, s, want_lang);
+        assert_eq!(out, vec![want]);
     }
 }
