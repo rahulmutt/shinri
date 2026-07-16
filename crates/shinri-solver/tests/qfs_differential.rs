@@ -3553,23 +3553,26 @@ fn targeted_regex_ground_decided_unsat() {
 }
 
 #[test]
-fn targeted_regex_fences_unknown() {
-    // Symbolic string side over re.allchar: still Unknown after slice 21,
-    // but no longer via the fence — the membership pass treats the bare
-    // Rex::Range residual as a repair LEAF (no Rule-S unfolding, so no
-    // minted len(h)=1 link), Σ has 0x30000 single-char words (far over
-    // ENUM_WORD_CAP, so slice 20's enumeration rewrite is closed too), and
-    // with no pinned length model repair has no length to search a word
-    // at; the post-solve self-check downgrades to a sound Unknown. Decides
-    // Sat the moment a length is pinned — see the script_e2e.rs companion
-    // pin in_re_unfold_slice20_allchar_with_length_decides_sat.
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)\
-             (assert (str.in_re s re.allchar))(check-sat)"
-        ),
-        Verdict::Unknown,
+fn targeted_regex_allchar_decides() {
+    // Symbolic string side over re.allchar: DECIDES Sat as of slice 25 —
+    // was a sound Unknown through slice 24 (the membership pass treated the
+    // bare Rex::Range residual as a repair LEAF with no length to search a
+    // word at). Task 4b's memb_seeds now bumps to a length-1 witness for
+    // non-nullable goals, so model repair has a length to search at without
+    // requiring the caller to pin one. z3-cross-checked via expect. (Length
+    // was already known to decide it Sat pre-slice-25 — see the
+    // script_e2e.rs companion pin
+    // in_re_unfold_slice20_allchar_with_length_decides_sat — this is the
+    // free-variable case newly joining it.)
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s re.allchar))(check-sat)",
+        Verdict::Sat,
     );
+}
+
+#[test]
+fn targeted_regex_fences_unknown() {
     // Symbolic regex leaf (to_re over a var).
     assert_eq!(
         shinri_verdict(
@@ -3822,6 +3825,100 @@ fn targeted_str_order_single_char_left_decides() {
     expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(assert (= s \"a\"))(check-sat)", Verdict::Unsat);
     // (str.<= "b" s): s = "b" is now allowed.
     expect("(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))(assert (= s \"b\"))(check-sat)", Verdict::Sat);
+}
+
+#[test]
+fn targeted_str_order_single_char_left_free_known_gap() {
+    // KNOWN GAP (slice 25 amendment): constant-on-LEFT strict order over a
+    // FULLY-FREE s — (str.< "b" s), with or without a pinned str.len — is
+    // STILL a sound Unknown, and stays Unknown for str.<= too. Probed
+    // end-to-end via the CLI (six shapes: str.< and str.<= free, plus each
+    // at str.len = 1 and str.len = 2); every one returned `unknown`, none
+    // returned `sat` or `unsat`. Mechanism: the strict-< proper-prefix
+    // gadget (word("b")·Σ·Σ*) churns the string↔arith length seam to the
+    // fuel fence before model repair gets a chance to search a witness —
+    // separate from the straddling-range membership stall this slice fixed
+    // (Root cause was a Range round-trip shape loss, not a fuel/seam issue).
+    // Banked follow-up; not in slice-25 scope. A future slice should flip
+    // these to Sat deliberately once the seam is closed.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))\
+             (assert (= (str.len s) 1))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))\
+             (assert (= (str.len s) 2))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))\
+             (assert (= (str.len s) 1))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))\
+             (assert (= (str.len s) 2))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+}
+
+#[test]
+fn targeted_straddling_range_membership_decides() {
+    // User-written surrogate-straddling re.range memberships (the probe-19/22
+    // shapes). Raw U+E000 character in the literal — the text frontend does
+    // not decode \u{...} escapes (slice-24 spec §6 note), and z3 WOULD decode
+    // them, so the same source would mean different things to each solver;
+    // shinri-only verdicts here (the sat model is validated by the post-solve
+    // self-check; z3 coverage of this fragment rides the ASCII families).
+    let bare = format!(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.range \"c\" \"{}\")))(check-sat)",
+        '\u{E000}'
+    );
+    assert_eq!(shinri_verdict(&bare), Verdict::Sat, "bare straddle, free s");
+    let under_concat = format!(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.++ (re.range \"c\" \"{}\") (re.* re.allchar))))\
+         (check-sat)",
+        '\u{E000}'
+    );
+    assert_eq!(
+        shinri_verdict(&under_concat),
+        Verdict::Sat,
+        "straddle under concat, free s"
+    );
+    let len_pinned = format!(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.++ (re.range \"c\" \"{}\") (re.* re.allchar))))\
+         (assert (= (str.len s) 1))(check-sat)",
+        '\u{E000}'
+    );
+    assert_eq!(
+        shinri_verdict(&len_pinned),
+        Verdict::Sat,
+        "straddle under concat, len pinned"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
