@@ -1,7 +1,7 @@
 # Slice 24 design — single-character `str.<` / `str.<=` vs. a constant
 
 Date: 2026-07-16
-Status: DESIGN (not yet implemented).
+Status: IMPLEMENTED (2026-07-16). See "Implementation notes (truth-up)" at the end.
 
 Predecessor: slice 23 (`str.<` / `str.<=` literal–literal folds, empty-string
 boundaries, and syntactic reflexivity, landed 2026-07-15). Slice 23's non-goals
@@ -246,3 +246,66 @@ change that silently reroutes them trips a test:
   `Rex`, not a parsed escape — assert through the term API or a construction
   test, since the CLI text frontend does not decode `\u{...}`).
 - **negation**: `(not (str.< s "b")) ∧ (= s "a")` unsat.
+
+## Implementation notes (truth-up, 2026-07-16)
+
+Implemented as designed on branch `slice24-str-order-single-char`, commits
+`017ca99` (Task 1: `range_rex` extract + `range_membership` delegation),
+`d95b516` (Task 2: constant-on-right arms), `985a82d` (Task 3:
+constant-on-left arms), `799907f` (Task 4: e2e pins), `eb9ffc5` (Task 5:
+oracle family), plus three follow-ups found during review: `eb7cf6a`
+(doc-comment lint on `range_rex`), `bb965a4` (see "above-alphabet" below),
+`5c02610` (unit test for the `str.<=`/`m = 0` degenerate). Final whole-branch
+review: ready-to-merge, 0 critical / 0 important.
+
+**Above-alphabet guard (implementation addition).** The spec's arm tables
+assume `c`'s code point is in the SMT-LIB alphabet, but Rust `char`s run to
+U+10FFFF and a raw above-alphabet character in a string literal reached the
+new arms and panicked debug builds (out-of-alphabet `Rex::Range` tripping
+`range_rex`'s debug_assert / `rex_to_term`'s invariant assert; both
+orientations reproduced). Fixed in `bb965a4`: `single_char_code` now also
+requires `code <= MAX_CODE`, so above-alphabet single-char constants fall to
+the fence (sound `Unknown`), exactly like multi-char constants. Pinned by
+`above_alphabet_const_survives_to_fence` (proven load-bearing: panicked
+pre-guard) and `max_code_char_still_decides` (U+2FFFF boundary).
+
+**Completeness caveat on §Goal (adjudicated, banked).** "Flips that fenced
+sub-fragment to decided" is exact for the *rewrite* — it fires on every
+in-alphabet single-char atom, both orientations, any polarity — but the
+end-to-end verdict additionally needs the engine to decide the minted
+membership. The two constant-on-left languages are never nullable (every
+branch consumes ≥ 1 character), and the engine self-decides SAT for a
+*fully-free* variable only when the language contains ε; so e.g.
+`(str.< "b" s)` with `s` otherwise unconstrained returns sound `Unknown`,
+while every constant-on-right shape (ε branch present) and every otherwise-
+constrained left shape decides. This is pre-existing engine behavior (regex
+core frozen by this slice's constraints), never unsound (differential: 0
+disagreements), and is the main driver of the new oracle family's
+shinri-unknown count. Banked follow-up: engine-side witness synthesis for
+non-nullable constant-regex memberships over free variables.
+
+**Oracle tallies** (reviewer-reproduced bit-for-bit, 2 independent runs):
+
+    qfs_str_order_single_char_matches_z3: 200 iters — 54 sat / 18 unsat /
+      128 shinri-unknown / 0 z3-unknown / 0 guard-bailout; 0 disagreements
+
+**Adjudicated deviation from §6 "tallies expected unchanged":**
+`qfs_str_order_matches_z3` (slice 23) moved 45 sat / 75 unsat /
+80 shinri-unknown → 54 / 80 / 66 (total 200, 0 disagreements). The §6
+expectation was wrong as written: that family's generator emits single-char
+literal-vs-variable atoms, which slice 23 fenced and this slice now decides —
+so its unknowns shifting to sat/unsat is precisely this slice landing. The
+part §6 actually protects — two-symbolic comparisons staying fenced — holds
+(`targeted_str_order_symbolic_pair_known_gap` still passes).
+`qfs_to_code_range` and `qfs_regex_ground` re-ran bit-for-bit unchanged
+(28/105/67, 26 witnesses; 71/113/16, 36 witnesses; 0 disagreements),
+confirming the `range_membership` delegation is observably pure. Full
+differential file: 62/62.
+
+**Minor liberties.** The e2e degenerate pin for `m = 0` lives as `order.rs`
+unit tests (`..._null_char_collapses_to_empty`, `..._leq_keeps_word_branch`)
+rather than a CLI-text pin, per §6's own note that the text frontend does not
+decode `\u{...}`. Deferred cosmetics from review: `range_rex` inherits
+slice-22's asymmetric surrogate-edge exemption (`lo == 0xD800` /
+`hi == 0xDFFF` only — unreachable for single chars); long `expect(...)` lines
+in the differential file follow that file's existing convention.
