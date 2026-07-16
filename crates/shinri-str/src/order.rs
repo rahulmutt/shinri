@@ -122,11 +122,14 @@ fn try_order_atom(ctx: &mut Context, args: &[TermId], reflexive: bool) -> Option
     }
 }
 
-/// The single code point of a one-character string; None if empty or multi-char.
+/// The single code point of a one-character string, if it is within the
+/// SMT-LIB alphabet; None if empty, multi-char, or above `MAX_CODE`
+/// (above-alphabet constants are banked -> fence, like any other
+/// out-of-scope atom).
 fn single_char_code(s: &str) -> Option<i128> {
     let mut it = s.chars();
     match (it.next(), it.next()) {
-        (Some(c), None) => Some(c as u32 as i128),
+        (Some(c), None) if c as u32 <= MAX_CODE => Some(c as u32 as i128),
         _ => None,
     }
 }
@@ -396,6 +399,37 @@ mod tests {
         let want = membership(&mut ctx, s, want_lang);
         assert_eq!(out, vec![want]);
         assert!(!has_unreduced_str_order(&ctx, &out));
+    }
+
+    #[test]
+    fn above_alphabet_const_survives_to_fence() {
+        // U+30001 > MAX_CODE: out of the SMT-LIB alphabet — banked ⇒ fence, both
+        // orientations (pre-guard these panicked on out-of-alphabet Range terms).
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let c = ctx.mk_string_const("\u{30001}");
+        for (l, r) in [(s, c), (c, s)] {
+            for op in [BuiltinOp::StrLt, BuiltinOp::StrLeq] {
+                let atom = order(&mut ctx, op, l, r);
+                let out = rewrite_str_order(&mut ctx, &[atom]);
+                assert_eq!(out, vec![atom]);
+                assert!(has_unreduced_str_order(&ctx, &out));
+            }
+        }
+    }
+
+    #[test]
+    fn max_code_char_still_decides() {
+        // Exactly MAX_CODE (U+2FFFF) is IN the alphabet and must keep deciding.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let mx = ctx.mk_string_const("\u{2FFFF}");
+        let le = order(&mut ctx, BuiltinOp::StrLeq, s, mx);
+        let out = rewrite_str_order(&mut ctx, &[le]);
+        assert!(
+            !has_unreduced_str_order(&ctx, &out),
+            "in-alphabet max char must not fence"
+        );
     }
 
     #[test]
