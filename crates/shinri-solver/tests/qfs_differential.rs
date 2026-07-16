@@ -3106,20 +3106,20 @@ fn targeted_code_conv_decided_sat() {
 /// `task-3-report.md`): the brief predicted a LONE lower bound over a free `s`
 /// (`(>= (str.to_code s) 48)` alone, no upper cap, no other constraint) decides
 /// Sat because slice 21 takes the wide `Range(48, MAX_CODE)` as "a single
-/// character class". Observed: shinri returns **Unknown** (z3 says Sat). The
-/// gadget conversion itself succeeds — `code_conv` DOES emit a proper
-/// `str.in_re` membership term, confirmed by the crossed/degenerate/ground
-/// cases below which all still decide correctly regardless of width — but
-/// slice 21's generic membership decision procedure has no closing rule for a
-/// genuinely-infinite, NON-nullable character class over a FREE variable: it's
-/// far over `ENUM_WORD_CAP` (256 words) so slice 20 declines to enumerate, and
-/// slice 21 only closes via the trivial empty-string default-model check
-/// (nullable languages) or via enumeration under the cap — neither applies
-/// here. This is moved to `targeted_to_code_range_wide_arm_known_gap` below,
-/// which pins the TRUE observed verdict with the real mechanism, and is a
-/// pre-existing slice-21 completeness gap (independently reproducible with a
-/// directly-asserted wide `str.in_re`, no `to_code` involved at all — see that
-/// test's comment), not a defect introduced by this slice.
+/// character class". Observed AT SLICE 22: shinri returns **Unknown** (z3
+/// says Sat). The gadget conversion itself succeeds — `code_conv` DOES emit a
+/// proper `str.in_re` membership term, confirmed by the crossed/degenerate/
+/// ground cases below which all still decide correctly regardless of width —
+/// but slice 21's generic membership decision procedure at the time had no
+/// closing rule for a genuinely-infinite, NON-nullable character class over a
+/// FREE variable: it's far over `ENUM_WORD_CAP` (256 words) so slice 20
+/// declines to enumerate, and slice 21 only closed via the trivial
+/// empty-string default-model check (nullable languages) or via enumeration
+/// under the cap — neither applied then. This was moved to
+/// `targeted_to_code_range_wide_arm_decides` below, which pinned that
+/// then-Unknown verdict and now (slice 25) pins its flip to Sat — a
+/// `memb_seeds` length-1 witness closing this exact gap, not a defect — see
+/// that test's comment for the full mechanism.
 #[test]
 fn targeted_to_code_range_decided() {
     // The digit idiom ⇒ the narrow range Range(48, 57). 10 words, under
@@ -3195,69 +3195,99 @@ fn targeted_to_code_range_decided() {
     );
 }
 
-/// Slice 22 KNOWN GAP, owned by slice 21's generic membership routine: a bare
-/// inequality atom over a FREE string variable — lower-bound-only
-/// (`Range(k, MAX_CODE)`) or upper-bound-only (`¬Range(k, MAX_CODE)`) —
-/// converts cleanly to a `str.in_re` membership (the gadget itself never
-/// declines here), but that membership does not decide downstream. A
-/// genuinely-infinite, non-nullable character class over a free variable
-/// closes only through one of three routes: (a) the trivial nullable-empty-
+/// Slice 22 KNOWN GAP THROUGH SLICE 24, CLOSED AS OF SLICE 25 — see below:
+/// owned by slice 21's generic membership routine, a bare inequality atom
+/// over a FREE string variable — lower-bound-only (`Range(k, MAX_CODE)`) or
+/// upper-bound-only (`¬Range(k, MAX_CODE)`) — converts cleanly to a
+/// `str.in_re` membership (the gadget itself never declines here), but
+/// through slice 24 that membership did not decide downstream. A
+/// genuinely-infinite, non-nullable character class over a free variable used
+/// to close only through one of three routes: (a) the trivial nullable-empty-
 /// string default-model check, (b) capped enumeration under `ENUM_WORD_CAP`
 /// (slice 20), or (c) `memb_seeds`' capped word search once the SAME
-/// variable's length is already pinned — route (c) closes over-cap ranges
+/// variable's length was already pinned — route (c) closes over-cap ranges
 /// fine (see `in_re_unfold_slice20_allchar_with_length_decides_sat` in
-/// `script_e2e.rs`). None of the three apply to the query pinned below: the
-/// class is non-nullable and over `ENUM_WORD_CAP` wide, ruling out (a) and
-/// (b); `s`'s length is UNPINNED, ruling out (c). The operative condition is
-/// the absence of a length pin, not the word cap by itself. Sound Unknown; z3
-/// says Sat. This is PRE-EXISTING and not introduced by this slice: an
-/// unrelated, directly-asserted wide `str.in_re` (no `to_code` in sight) shows
-/// the identical cliff (`targeted_regex_symbolic_fences_unknown`'s 300-word
-/// loop case is Unknown for the same reason; independently, a fused
-/// `Range(48, 247)` — 200 words, under the cap — decides Sat while
-/// `Range(48, 347)` — 300 words, over the cap — is Unknown).
+/// `script_e2e.rs`). None of the three applied to the query pinned below
+/// through slice 24: the class is non-nullable and over `ENUM_WORD_CAP` wide,
+/// ruling out (a) and (b); `s`'s length was UNPINNED, ruling out (c) as it
+/// existed then. An unrelated, directly-asserted wide `str.in_re` (no
+/// `to_code` in sight) showed the identical cliff
+/// (`targeted_regex_symbolic_fences_unknown`'s 300-word loop case remains
+/// Unknown for the same reason — that test is untouched by this slice;
+/// independently, a fused `Range(48, 247)` — 200 words, under the cap —
+/// decides Sat while `Range(48, 347)` — 300 words, over the cap — is
+/// Unknown).
 ///
 /// A further wrinkle specific to THIS range: `Range(48, MAX_CODE)` spans the
-/// surrogate block, so `range_term` emits a `re.union`/`re.diff` composite
-/// rather than a bare `Rex::Range` leaf. That composite shape does not get the
-/// bare-range-leaf `memb_seeds` treatment EVEN IF a length were pinned here —
-/// so route (c) would not close this particular query regardless. This
-/// composite-shape gap reproduces with zero `to_code` in the formula: it is
-/// pre-existing slice-21 `regex.rs` behavior, unrelated to `to_code` or this
-/// slice.
+/// surrogate block, so `range_term` mints a `re.union`/`re.diff` composite
+/// rather than a bare `Rex::Range` leaf, and — through slice 24 —
+/// `extract_const_regex` read that composite back in the SAME shape, so
+/// `memb_seeds` never saw a bare-range-leaf goal here even once a length was
+/// pinned; route (c) could not close this particular query regardless.
+///
+/// SLICE 25 CLOSES THIS via two independent, compounding changes: (1) commit
+/// 0617a14 makes `extract_const_regex`'s `ReDiff` case fold a character-class
+/// difference back to the `Range`(s) it encodes, so this composite now
+/// re-extracts as the bare `Range(48, MAX_CODE)` it was built from; (2)
+/// commit 9dd353f (`memb_seeds` Task 4b) adds a FOURTH route, (d): a fully-
+/// free variable with NO length pinned and a non-nullable regex goal now
+/// additionally gets a length-1 witness search (a bare `Range`'s members are
+/// exactly its length-1 words, so this is the exact witness shape, not a
+/// guess). Together, (1) turns this query's goal back into a bare `Range`,
+/// and (2) then decides it via route (d): `search_word` returns the smallest
+/// NON-surrogate witness in the class — 48 = `"0"`, nowhere near the
+/// surrogate block — so this is a genuine, sound Sat, cross-checked with z3
+/// below (agrees: sat). This is the intended widening of the route-(c) gap
+/// into route (d), not a regression.
 #[test]
-fn targeted_to_code_range_wide_arm_known_gap() {
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)\
-             (assert (>= (str.to_code s) 48))(check-sat)"
-        ),
-        Verdict::Unknown,
+fn targeted_to_code_range_wide_arm_decides() {
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (>= (str.to_code s) 48))(check-sat)",
+        Verdict::Sat,
     );
 }
 
 /// Slice 22 §3.1: an interior-surrogate threshold is a PERMANENT
 /// representational fence — `re.range` endpoints are `Box<str>` literals and a
 /// lone surrogate is not one. The block boundaries are expressible, the inside
-/// is not. Sound Unknown, never a guess.
+/// is not. Sound Unknown, never a guess. UNCHANGED by slice 25: `code_conv`'s
+/// gadget still returns `None` for a strictly-interior endpoint, so the raw
+/// `to_code` application survives un-rewritten and `has_unreduced_code_conv`
+/// forces Unknown before `memb_seeds`' new length-1 witness route (or any
+/// other regex/model-repair machinery) is ever reached.
 ///
-/// The block-boundary case (`0xD800`) is ALSO Unknown at the top level, same
-/// as the strictly-interior case above — but for a DIFFERENT reason: the
-/// wide-arm free-var cap gap (`targeted_to_code_range_wide_arm_known_gap`),
-/// not a representational fence. The two Unknowns are observationally
-/// identical at the top-level verdict, so this test proves expressibility a
-/// different way: it PINS `s` to a concrete code point straddling the
-/// boundary (sidestepping the free-var cap gap entirely, since a ground
-/// string-against-automaton check is cheap) and confirms `code_conv` treated
-/// `55296` as a genuine range endpoint rather than leaving the atom
+/// The block-boundary case (`0xD800` = 55296, no upper bound) USED TO be
+/// Unknown at the top level too, through slice 24 — for a DIFFERENT reason
+/// than the interior case above: the wide-arm free-var gap
+/// (`targeted_to_code_range_wide_arm_decides`), not the representational
+/// fence, since `code_conv` DOES rewrite this endpoint (it's expressible on
+/// the block boundary); it just didn't decide downstream yet. AS OF SLICE 25
+/// it DECIDES Sat, via the same combined mechanism as that test: `range_term`
+/// still mints a surrogate-block-straddling composite for
+/// `Range(55296, MAX_CODE)`, but `extract_const_regex` now folds that
+/// composite back to the bare `Range` it encodes (commit 0617a14), so
+/// `memb_seeds`' length-1 witness route (commit 9dd353f) applies; `search_word`
+/// returns the smallest NON-surrogate witness in the class, which for a class
+/// starting exactly at the block edge is the first code point past the WHOLE
+/// block (57344 = `U+E000`) — never a raw surrogate, so this is a sound Sat.
+/// z3-cross-checked via `expect` below (agrees: sat).
+///
+/// This test still proves expressibility a second, independent way, unrelated
+/// to the free-var mechanism above: it PINS `s` to a concrete code point
+/// straddling the boundary (sidestepping the free-var route entirely, since a
+/// ground string-against-automaton check is cheap) and confirms `code_conv`
+/// treated `55296` as a genuine range endpoint rather than leaving the atom
 /// un-rewritten. These two ground sub-checks use `str.from_code` rather than a
 /// string literal containing the raw code point, and are z3-cross-checked via
 /// `expect()` — see the comment at the two `expect()` calls below for why.
 #[test]
-fn targeted_to_code_range_surrogate_fences_unknown() {
+fn targeted_to_code_range_surrogate_interior_fenced_boundary_decides() {
     // 0xD801 = 55297: strictly inside the surrogate block. code_conv's gadget
     // returns None (the representational fence) and the raw `to_code`
     // application survives, so `has_unreduced_code_conv` forces Unknown.
+    // Unaffected by slice 25 — the gadget never runs for this endpoint, so
+    // `memb_seeds` never even sees a goal for this atom.
     assert_eq!(
         shinri_verdict(
             "(set-logic QF_S)(declare-fun s () String)\
@@ -3265,15 +3295,14 @@ fn targeted_to_code_range_surrogate_fences_unknown() {
         ),
         Verdict::Unknown,
     );
-    // 0xD800 = 55296 alone: STILL Unknown at the top level, but now via the
-    // wide-arm free-var gap (see `targeted_to_code_range_wide_arm_known_gap`),
-    // NOT the representational fence — confirmed below by grounding `s`.
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)\
-             (assert (>= (str.to_code s) 55296))(check-sat)"
-        ),
-        Verdict::Unknown,
+    // 0xD800 = 55296 alone: DECIDES Sat as of slice 25 — the wide-arm gap
+    // closing (commits 9dd353f / 0617a14; see
+    // `targeted_to_code_range_wide_arm_decides` and the docstring above),
+    // NOT the representational fence. z3 agrees: sat.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (>= (str.to_code s) 55296))(check-sat)",
+        Verdict::Sat,
     );
     // Ground proof that 0xD800 IS an expressible endpoint: pin `s` to the BMP
     // char just BELOW the block (0xD7FF = 55295 < 55296) via `str.from_code`
@@ -3309,13 +3338,19 @@ fn targeted_to_code_range_surrogate_fences_unknown() {
 
 /// Slice 22 §4, KNOWN GAP: fusion only sees within a single conjunction, so
 /// splitting the two bounds across a disjunction defeats it — each half is
-/// then asserted independently. Both halves are, ON THEIR OWN, already
-/// Unknown before this disjunction is even built: `(>= (str.to_code s) 48)`
-/// alone is the wide-arm gap (`targeted_to_code_range_wide_arm_known_gap`),
-/// and `(<= (str.to_code s) 57)` alone is that same gap's upper-bound mirror
-/// (any single `to_code` bound is semi-infinite — `Range(k, MAX_CODE)` or its
-/// complement — so it can never close via routes (a)/(b)/(c) above on its
-/// own). That fully accounts for the observed Unknown here.
+/// then asserted independently. THROUGH SLICE 24, both halves were, ON THEIR
+/// OWN, already Unknown before this disjunction was even built:
+/// `(>= (str.to_code s) 48)` alone was the wide-arm gap (as pinned, at the
+/// time, by `targeted_to_code_range_wide_arm_decides` — renamed in slice 25;
+/// see that test's docstring, since it now DECIDES Sat standalone and this
+/// premise is accordingly STALE post-slice-25), and `(<= (str.to_code s) 57)`
+/// alone is that same gap's upper-bound mirror (any single `to_code` bound is
+/// semi-infinite — `Range(k, MAX_CODE)` or its complement — so THROUGH SLICE
+/// 24 it could never close via routes (a)/(b)/(c) above on its own). This
+/// test's own pin (Unknown, re-confirmed at slice 25) is unaffected — the
+/// `or`-with-a-free-Bool shape here still does not decide even though the
+/// first half now does in isolation — but re-deriving WHY it still holds is
+/// out of scope for this truth-up; flagged as a follow-up, not fixed here.
 ///
 /// A stronger claim — that this saturates via slice 21's INTERSECTION gap
 /// (two live memberships on the same variable failing to compose) — is NOT
