@@ -250,6 +250,44 @@ pub(crate) fn nullable(r: &Rex) -> bool {
     }
 }
 
+/// Sound LOWER bound on accepted-word length: every `w ∈ L(r)` has
+/// `|w| ≥ min_len(r)`. Exact for the range/concat/union/inter/star/loop
+/// shapes the membership pass mints; conservative (0) for `Comp`. `Empty`
+/// returns 0 — vacuously sound (L = ∅); the memb.rs leaf arm never consults
+/// it for `Empty` (excluded there so the Rule-E conflict path keeps firing).
+pub(crate) fn min_len(r: &Rex) -> u32 {
+    match r {
+        Rex::Empty | Rex::Eps | Rex::Star(_) | Rex::Comp(_) => 0,
+        Rex::Range(..) => 1,
+        Rex::Concat(ps) => ps.iter().map(min_len).fold(0u32, u32::saturating_add),
+        Rex::Union(ps) => ps.iter().map(min_len).min().unwrap_or(0),
+        Rex::Inter(ps) => ps.iter().map(min_len).max().unwrap_or(0),
+        Rex::Loop(inner, lo, _) => min_len(inner).saturating_mul(*lo),
+    }
+}
+
+/// Sound UPPER bound: `Some(k)` ⟹ every `w ∈ L(r)` has `|w| ≤ k`; `None`
+/// when no finite bound is known (star, comp, or any unbounded part). For
+/// `Inter` the MIN of the finite arm bounds is sound (a word must satisfy
+/// every arm); for `Union`/`Concat` one unbounded arm forfeits the bound.
+pub(crate) fn max_len(r: &Rex) -> Option<u32> {
+    match r {
+        Rex::Empty | Rex::Eps => Some(0),
+        Rex::Range(..) => Some(1),
+        Rex::Star(_) | Rex::Comp(_) => None,
+        Rex::Concat(ps) => ps
+            .iter()
+            .map(max_len)
+            .try_fold(0u32, |a, b| Some(a.saturating_add(b?))),
+        Rex::Union(ps) => ps
+            .iter()
+            .map(max_len)
+            .try_fold(0u32, |a, b| Some(a.max(b?))),
+        Rex::Inter(ps) => ps.iter().filter_map(max_len).min(),
+        Rex::Loop(inner, _, hi) => max_len(inner).map(|m| m.saturating_mul(*hi)),
+    }
+}
+
 /// The Brzozowski derivative of `r` w.r.t. the char with code point `c`:
 /// `L(deriv(c, r)) = { w | c·w ∈ L(r) }`. Total — every operator (comp,
 /// inter, loop included) has a native rule; no automaton is built.
@@ -2083,6 +2121,52 @@ mod tests {
                 .collect(),
         );
         let _ = search_word(&hard, 40); // must terminate (None or Some) without hanging
+    }
+
+    #[test]
+    fn min_max_len_bounds() {
+        let sigma = Rex::Range(0, MAX_CODE);
+        let sigma_star = star(Rex::Range(0, MAX_CODE));
+        let b = Rex::Range('b' as u32, 'b' as u32);
+        let c = Rex::Range('c' as u32, 'c' as u32);
+        // The strict-< gadget arm: b·Σ·Σ* — min 2, no upper bound.
+        let strict = concat(vec![b.clone(), sigma.clone(), sigma_star.clone()]);
+        assert_eq!(min_len(&strict), 2);
+        assert_eq!(max_len(&strict), None);
+        // The full order gadget: Range(c,MAX)·Σ* ∪ b·Σ·Σ* — min 1 (above arm).
+        let above = concat(vec![Rex::Range('c' as u32, MAX_CODE), sigma_star.clone()]);
+        let gadget = union(vec![above, strict.clone()]);
+        assert_eq!(min_len(&gadget), 1);
+        assert_eq!(max_len(&gadget), None);
+        // Finite concat: b·Σ·Σ — exactly [3,3].
+        let finite = concat(vec![b.clone(), sigma.clone(), sigma.clone()]);
+        assert_eq!(min_len(&finite), 3);
+        assert_eq!(max_len(&finite), Some(3));
+        // Bare range: the degenerate [1,1] (the sibling leaf arm's axiom).
+        assert_eq!(min_len(&b), 1);
+        assert_eq!(max_len(&b), Some(1));
+        // Word via concat of ranges: "bc" then Σ* — min 2, unbounded.
+        let bc_star = concat(vec![b.clone(), c.clone(), sigma_star.clone()]);
+        assert_eq!(min_len(&bc_star), 2);
+        assert_eq!(max_len(&bc_star), None);
+        // Nullable shapes: 0.
+        assert_eq!(min_len(&sigma_star), 0);
+        assert_eq!(max_len(&sigma_star), None);
+        assert_eq!(min_len(&Rex::Eps), 0);
+        assert_eq!(max_len(&Rex::Eps), Some(0));
+        // Comp is conservative: [0, None] — sound, not exact.
+        assert_eq!(min_len(&comp(b.clone())), 0);
+        assert_eq!(max_len(&comp(b.clone())), None);
+        // Inter: min is the MAX of arm minima; max is the MIN of finite arm maxima.
+        let i = inter(vec![strict.clone(), finite.clone()]);
+        assert_eq!(min_len(&i), 3);
+        assert_eq!(max_len(&i), Some(3));
+        // Loop: r{2,4} over a single char.
+        let l = loop_(b.clone(), 2, 4);
+        assert_eq!(min_len(&l), 2);
+        assert_eq!(max_len(&l), Some(4));
+        // Union with an unbounded arm has no finite max.
+        assert_eq!(max_len(&union(vec![b.clone(), sigma_star])), None);
     }
 
     #[test]
