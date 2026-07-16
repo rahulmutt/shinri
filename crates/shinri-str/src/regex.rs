@@ -609,6 +609,62 @@ pub(crate) fn search_word(r: &Rex, n: usize) -> Option<String> {
     }
 }
 
+/// The SHORTEST word in L(r), or None if none is found within
+/// `MEMB_SEARCH_STEP_CAP` expanded states (an abort is NOT a verdict — the
+/// caller leaves the variable un-seeded and the post-solve self-check
+/// backstops, exactly like `search_word`). Breadth-first over
+/// next-character classes, so the first nullable state reached sits at the
+/// minimal length; per class the witness char is the smallest non-surrogate
+/// code point (pure-surrogate classes are skipped — sound: completeness
+/// only). Visited Rex states are memoized globally: re-reaching a state at
+/// a longer prefix can only yield longer words, so it is skipped.
+pub(crate) fn search_shortest(r: &Rex) -> Option<String> {
+    let mut steps = 0usize;
+    let mut seen: FxHashSet<Rex> = FxHashSet::default();
+    seen.insert(r.clone());
+    let mut frontier: Vec<(Rex, String)> = vec![(r.clone(), String::new())];
+    while !frontier.is_empty() {
+        let mut next: Vec<(Rex, String)> = Vec::new();
+        for (state, word) in frontier {
+            if nullable(&state) {
+                return Some(word);
+            }
+            if matches!(state, Rex::Empty) {
+                continue;
+            }
+            if steps >= MEMB_SEARCH_STEP_CAP {
+                return None;
+            }
+            steps += 1;
+            let Some(classes) = next_classes(&state) else {
+                continue;
+            };
+            for (lo, hi) in classes {
+                let c = if (SURR_LO..=SURR_HI).contains(&lo) {
+                    if hi > SURR_HI {
+                        SURR_HI + 1
+                    } else {
+                        continue; // pure-surrogate class: no Rust witness
+                    }
+                } else {
+                    lo
+                };
+                let d = deriv(c, &state);
+                if node_count(&d) > FUEL_NODE_CAP {
+                    continue;
+                }
+                if seen.insert(d.clone()) {
+                    let mut w = word.clone();
+                    w.push(char::from_u32(c).expect("non-surrogate in-alphabet"));
+                    next.push((d, w));
+                }
+            }
+        }
+        frontier = next;
+    }
+    None
+}
+
 /// Ground membership of a CONCRETE string in the regex TERM `re_t`.
 /// 3-valued for the post-solve witness self-check: `Some(verdict)` iff `s`
 /// is in-alphabet, `re_t` extracts as a constant regex, and evaluation stays
@@ -2121,6 +2177,34 @@ mod tests {
                 .collect(),
         );
         let _ = search_word(&hard, 40); // must terminate (None or Some) without hanging
+    }
+
+    #[test]
+    fn search_shortest_finds_minimal_words() {
+        let sigma = Rex::Range(0, MAX_CODE);
+        let sigma_star = star(Rex::Range(0, MAX_CODE));
+        let b = Rex::Range('b' as u32, 'b' as u32);
+        let c = Rex::Range('c' as u32, 'c' as u32);
+        // b·Σ·Σ*: shortest word has exactly 2 chars and is a member.
+        let strict = concat(vec![b.clone(), sigma.clone(), sigma_star.clone()]);
+        let w = search_shortest(&strict).unwrap();
+        assert_eq!(w.chars().count(), 2);
+        assert_eq!(eval_membership(&w, &strict), Some(true));
+        // Union with a trivially-short arm: (bc·Σ* ∪ "q") → the length-1 arm.
+        let bc_star = concat(vec![b.clone(), c.clone(), sigma_star.clone()]);
+        let q = Rex::Range('q' as u32, 'q' as u32);
+        let u = union(vec![bc_star, q]);
+        let wq = search_shortest(&u).unwrap();
+        assert_eq!(wq, "q");
+        // Nullable goal: the shortest word is ε.
+        assert_eq!(search_shortest(&sigma_star), Some(String::new()));
+        // Empty intersection: no word at any length — None, terminating.
+        let empty = inter(vec![b.clone(), c.clone()]);
+        assert_eq!(search_shortest(&empty), None);
+        // Rex::Empty: None.
+        assert_eq!(search_shortest(&Rex::Empty), None);
+        // Pure-surrogate language: no Rust witness — None (skipped classes).
+        assert_eq!(search_shortest(&Rex::Range(0xD800, 0xDFFF)), None);
     }
 
     #[test]
