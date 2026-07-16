@@ -3681,6 +3681,35 @@ fn targeted_str_order_symbolic_pair_known_gap() {
     );
 }
 
+#[test]
+fn targeted_str_order_single_char_right_decides() {
+    // (str.< s "b"): decided end-to-end (was fenced pre-slice-24).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(check-sat)",
+        Verdict::Sat, // free s (e.g. "a") — now DECIDES rather than fencing
+    );
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"a\"))(check-sat)", Verdict::Sat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"b\"))(check-sat)", Verdict::Unsat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"c\"))(check-sat)", Verdict::Unsat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"\"))(check-sat)", Verdict::Sat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"aa\"))(check-sat)", Verdict::Sat);
+    // (str.<= s "b"): s = "b" is now allowed.
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.<= s \"b\"))(assert (= s \"b\"))(check-sat)", Verdict::Sat);
+    // Negation: ¬(s < "b") ∧ s = "a" ⇒ unsat.
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (not (str.< s \"b\")))(assert (= s \"a\"))(check-sat)", Verdict::Unsat);
+}
+
+#[test]
+fn targeted_str_order_single_char_left_decides() {
+    // (str.< "b" s): first char > 'b', or "b" a proper prefix.
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(assert (= s \"c\"))(check-sat)", Verdict::Sat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(assert (= s \"ba\"))(check-sat)", Verdict::Sat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(assert (= s \"b\"))(check-sat)", Verdict::Unsat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(assert (= s \"a\"))(check-sat)", Verdict::Unsat);
+    // (str.<= "b" s): s = "b" is now allowed.
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))(assert (= s \"b\"))(check-sat)", Verdict::Sat);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Fence cases — strings mixed with an out-of-scope theory ⇒ shinri Unknown.
 // (Soundness fence; not over-fencing: these constructs are genuinely out of scope.)
