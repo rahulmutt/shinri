@@ -245,6 +245,27 @@ pub(crate) fn memb_check(
         // tautology — guarded, it can only ADD a fact arith lacked, never
         // flip a verdict.
         if matches!(cur, Rex::Range(..)) {
+            // Guarded like the variable-head arm below: `residual` is an NF
+            // read (`nf[i..]`), and the clause this emits is persisted
+            // GLOBALLY (`emitted_len_axioms`, not scoped to this branch) —
+            // so if the `t = prefix·residual` decomposition came from a
+            // CONDITIONAL (dl>0) merge, the global clause would only be
+            // branch-locally valid. `side_clean` is the same branch-
+            // independence gate the sibling arm applies at the `!side_clean`
+            // check just below (memb.rs:280) — mirrored here, same
+            // arguments, same semantics. When it fails, fall through to the
+            // pre-existing `continue` (repair-eligibility untouched).
+            //
+            // Known decisiveness limitation (documented, not fixed): the
+            // dedup key `emitted_len_axioms` is keyed on the arith companion
+            // alone, not on this guard — so if two membership literals with
+            // different `lit`s share the same `residual`, only the FIRST
+            // one's guard is emitted. Still sound (each guarded clause is a
+            // tautology on its own), just less decisive than emitting one
+            // per literal.
+            if !side_clean(cx.eq, cx.terms, t, input_cond_roots) {
+                continue;
+            }
             let residual = mk_concat(cx.terms, &nf[i..].to_vec());
             let lr = wordeq::len_of(cx.terms, residual);
             let one = cx.terms.mk_numeral(
