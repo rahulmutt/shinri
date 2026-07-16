@@ -1138,11 +1138,10 @@ fn in_re_unfold_slice20_star_range_flips_sat() {
 }
 
 #[test]
-fn in_re_unfold_slice20_allchar_stays_unknown() {
-    // `str.in_re s re.allchar` (bare Σ, no length constraint). The brief
-    // predicted this ALSO flips to Sat ("Σ is ONE next-character class; S1..S4
-    // + repair mint a length-1 witness"). OBSERVED: still Unknown — divergence
-    // recorded for Task 7's truth-up.
+fn in_re_unfold_slice20_allchar_now_decides_sat() {
+    // `str.in_re s re.allchar` (bare Σ, no length constraint). Was Unknown
+    // through slice 24 (see the mechanism trace below, kept for provenance);
+    // slice 25 Task 4b flips this to Sat.
     //
     // Traced: `re.allchar` extracts to `Rex::Range(0, MAX_CODE)`, structurally
     // identical to any bare `re.range`. The memb pass's Rule S/E never engage a
@@ -1158,21 +1157,27 @@ fn in_re_unfold_slice20_allchar_stays_unknown() {
     // ranges of exactly 256 words decide Sat, 257 words do not — the exact
     // `ENUM_WORD_CAP` boundary). `re.allchar` has ~0x30000 words, far past that
     // cap, and its complement is not co-finite either (slice-20's OTHER
-    // decision path), so it falls through to slice-21's bare-range-leaf path,
-    // which — absent any independent length constraint on `s` — has nothing to
-    // repair with (`memb_seeds` needs an ALREADY-pinned model length to search a
-    // word; none exists here) and the default empty-fill genuinely fails the
-    // membership, so the post-solve self-check soundly downgrades to `Unknown`.
-    // (Confirmed non-leaf: `re.allchar` WITH an explicit length constraint,
-    // e.g. `(= (str.len s) 1)`, DOES decide Sat — `in_re_unfold_slice20_allchar_with_length_decides_sat`
-    // below — because then `memb_seeds` has a length to search with.) The
+    // decision path), so it falls through to slice-21's bare-range-leaf path.
+    // Through slice 24, absent any independent length constraint on `s`, that
+    // path had nothing to repair with (`memb_seeds` needed an ALREADY-pinned
+    // model length to search a word; none existed here) and the default
+    // empty-fill genuinely failed the membership, so the post-solve self-check
+    // soundly downgraded to `Unknown`. Slice 25 Task 4b closes exactly this
+    // gap: `memb_seeds` now additionally tries length 1 when the model length
+    // reads 0 and the goal is non-nullable (a bare Range always is), so a
+    // length-1 witness (e.g. any non-surrogate char) is found and the
+    // self-check accepts it. (`re.allchar` WITH an explicit length constraint,
+    // e.g. `(= (str.len s) 1)`, already decided Sat before this fix — see
+    // `in_re_unfold_slice20_allchar_with_length_decides_sat` below, unchanged
+    // — because then `memb_seeds` already had a length to search with.) The
     // stale slice-20 pin (`targeted_regex_fences_unknown` in
-    // qfs_differential.rs) remains accurate as-is; out of scope to touch here.
+    // qfs_differential.rs) is a SEPARATE task's oracle pin; out of scope to
+    // touch here.
     let out = run_script(
         "(set-logic QF_S)(declare-fun s () String)\
          (assert (str.in_re s re.allchar))(check-sat)",
     );
-    assert_eq!(out, vec!["unknown"]);
+    assert_eq!(out, vec!["sat"]);
 }
 
 #[test]
@@ -1186,6 +1191,70 @@ fn in_re_unfold_slice20_allchar_with_length_decides_sat() {
          (assert (str.in_re s re.allchar))(assert (= (str.len s) 1))(check-sat)",
     );
     assert_eq!(out, vec!["sat"]);
+}
+
+/// Slice 25 Task 4b: `s ∈ R` over a fully-free `s`, where `R` is a bare
+/// `Rex::Range` wider than `ENUM_WORD_CAP` (256) — cannot fold to a word
+/// disjunction upstream, and (pre-fix) had no independent length to seed
+/// `memb_seeds` with, so it free-filled to "" and the self-check downgraded
+/// to Unknown. Task 4b's length-1 witness bump decides it Sat.
+#[test]
+fn in_re_unfold_wide_range_over_cap_free_var_decides_sat() {
+    // "c" (0x63) .. U+D000 (0xD000): 0xD000 - 0x63 + 1 = 53150 words, far past
+    // ENUM_WORD_CAP; does not straddle the surrogate block (D800-DFFF).
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.range \"c\" \"\u{D000}\")))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+/// Companion: the SAME shape but straddling the surrogate block (D800-DFFF),
+/// which additionally trips the surrogate guard in `try_rewrite_symbolic_in_re`
+/// (regex.rs) on top of the width cap. Same fix, same decisive Sat.
+#[test]
+fn in_re_unfold_surrogate_straddling_range_free_var_decides_sat() {
+    // "c" (0x63) .. U+E000 (0xE000): straddles D800-DFFF.
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.range \"c\" \"\u{E000}\")))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+/// Regression companion: an explicit `len(s) = 1` alongside the same
+/// straddling-range membership must still decide Sat (unchanged from
+/// pre-fix — `memb_seeds` already had a length to search with).
+#[test]
+fn in_re_unfold_surrogate_straddling_range_length_one_decides_sat() {
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.range \"c\" \"\u{E000}\")))\
+         (assert (= (str.len s) 1))(check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+/// Soundness pin (slice 25 Task 4b): if `len(s) = 0` is genuinely ASSERTED
+/// alongside a non-nullable membership (a bare Range never accepts the empty
+/// word), the true verdict is Unsat. `memb_seeds` cannot see the difference
+/// between "no length constraint" and "length asserted to 0" (both read as
+/// model length 0), so it still proposes its length-1 witness bump — but that
+/// witness then contradicts the asserted `len(s) = 0` under the post-solve
+/// self-check (`string_model_satisfies`, lib.rs), which downgrades to Unknown
+/// rather than fabricate a wrong Sat. Pins: this must NEVER be Sat.
+#[test]
+fn in_re_unfold_surrogate_straddling_range_length_zero_never_sat() {
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.range \"c\" \"\u{E000}\")))\
+         (assert (= (str.len s) 0))(check-sat)",
+    );
+    assert_ne!(
+        out,
+        vec!["sat"],
+        "asserted len=0 + non-nullable membership must never decide Sat"
+    );
 }
 
 #[test]

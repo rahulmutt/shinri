@@ -467,8 +467,25 @@ pub(crate) fn memb_seeds(
         if pinned.is_some() {
             continue;
         }
-        let n = class_len_in_model(terms, eq, known, m, v);
+        let mut n = class_len_in_model(terms, eq, known, m, v);
         let goal = regex::inter(rexes);
+        // A fully-free variable with no independent length constraint reads
+        // model length 0 here. If the goal is non-nullable (e.g. a bare wide
+        // or surrogate-straddling `Rex::Range`, which can never fold to a
+        // word disjunction upstream — regex.rs's ENUM_WORD_CAP / surrogate
+        // guards), length 0 can never match and `search_word` fails, leaving
+        // the variable un-seeded to free-fill "" — which then fails the
+        // post-solve self-check and downgrades a decidable Sat to Unknown.
+        // Also try length 1: every consumer shape reaching this bare-leaf
+        // path today is a single Range, whose members are exactly length-1
+        // words, so this is not a guess but the exact witness shape. This
+        // seed is only ever a CANDIDATE re-checked by the post-solve
+        // self-check against every assertion (including any independently
+        // asserted `len(v) = 0`), so a wrong bump can only fall back to the
+        // prior sound Unknown, never fabricate a wrong Sat.
+        if n == 0 && !regex::nullable(&goal) {
+            n = 1;
+        }
         if let Some(w) = regex::search_word(&goal, n) {
             out.insert(v, w);
         }
@@ -516,5 +533,90 @@ mod tests {
         let _ = eq.merge(xa, ca, shinri_theory::types::EqJust::Definitional);
         let seeds2 = memb_seeds(&mut ctx, &mut eq, &[x, ab], &[(atom, true)], &m);
         assert!(seeds2.is_empty(), "constant-pinned var is not repaired");
+    }
+
+    // ── Task 4b (slice 25): witness search at length 1 for non-nullable
+    // free leaves (bare wide / surrogate-straddling Range goals) ─────────
+
+    #[test]
+    fn memb_seed_wide_straddling_range_gets_length_one_witness() {
+        // `s ∈ [c, U+E000]` — a bare Range straddling the surrogate block
+        // (D800-DFFF) and far wider than ENUM_WORD_CAP (256), so it can never
+        // fold to a word disjunction upstream. With NO independent length
+        // constraint on `x`, the arith model has no `str.len x` entry, so
+        // `class_len_in_model` reads 0. A bare Range is never nullable, so
+        // `search_word(&goal, 0)` fails and (pre-fix) no seed is produced.
+        // Pins the fix: `memb_seeds` must additionally try length 1.
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let re_rex = crate::regex::Rex::Range('c' as u32, 0xE000);
+        let re_t = crate::regex::rex_to_term(&mut ctx, &re_rex);
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        let mut eq = EqualityEngine::default();
+        let m = ModelBuilder::default(); // no len(x) pinned -> model length reads 0.
+        let known = vec![x];
+        let seeds = memb_seeds(&mut ctx, &mut eq, &known, &[(atom, true)], &m);
+        let w = seeds
+            .get(&x)
+            .expect("non-nullable bare-range leaf must get a length-1 witness");
+        assert_eq!(w.chars().count(), 1);
+    }
+
+    #[test]
+    fn memb_seed_wide_range_over_256_gets_length_one_witness() {
+        // Companion shape: a wide but non-straddling Range (> ENUM_WORD_CAP
+        // words), e.g. "c".."<U+D000>" from the slice-25 spec. Same gap, same
+        // fix.
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let re_rex = crate::regex::Rex::Range('c' as u32, 0xD000);
+        let re_t = crate::regex::rex_to_term(&mut ctx, &re_rex);
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        let mut eq = EqualityEngine::default();
+        let m = ModelBuilder::default();
+        let known = vec![x];
+        let seeds = memb_seeds(&mut ctx, &mut eq, &known, &[(atom, true)], &m);
+        let w = seeds
+            .get(&x)
+            .expect("non-nullable bare-range leaf must get a length-1 witness");
+        assert_eq!(w.chars().count(), 1);
+    }
+
+    #[test]
+    fn memb_seed_nullable_goal_at_zero_length_unchanged() {
+        // No-regression pin: when the goal IS nullable (e.g. `(re.* (re.range
+        // "a" "z")))`), n=0 with no length constraint must still resolve to
+        // the empty-string witness as before the fix — the length-1 bump
+        // must only fire for NON-nullable goals.
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let re_t = crate::regex::test_az_star_term(&mut ctx);
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        let mut eq = EqualityEngine::default();
+        let m = ModelBuilder::default(); // no len(x) pinned -> model length reads 0.
+        let known = vec![x];
+        let seeds = memb_seeds(&mut ctx, &mut eq, &known, &[(atom, true)], &m);
+        let w = seeds
+            .get(&x)
+            .expect("nullable free membership var must be seeded at length 0");
+        assert_eq!(w, "");
     }
 }
