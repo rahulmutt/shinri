@@ -3336,40 +3336,76 @@ fn targeted_to_code_range_surrogate_interior_fenced_boundary_decides() {
     );
 }
 
-/// Slice 22 §4, KNOWN GAP: fusion only sees within a single conjunction, so
-/// splitting the two bounds across a disjunction defeats it — each half is
-/// then asserted independently. THROUGH SLICE 24, both halves were, ON THEIR
-/// OWN, already Unknown before this disjunction was even built:
-/// `(>= (str.to_code s) 48)` alone was the wide-arm gap (as pinned, at the
-/// time, by `targeted_to_code_range_wide_arm_decides` — renamed in slice 25;
-/// see that test's docstring, since it now DECIDES Sat standalone and this
-/// premise is accordingly STALE post-slice-25), and `(<= (str.to_code s) 57)`
-/// alone is that same gap's upper-bound mirror (any single `to_code` bound is
-/// semi-infinite — `Range(k, MAX_CODE)` or its complement — so THROUGH SLICE
-/// 24 it could never close via routes (a)/(b)/(c) above on its own). This
-/// test's own pin (Unknown, re-confirmed at slice 25) is unaffected — the
-/// `or`-with-a-free-Bool shape here still does not decide even though the
-/// first half now does in isolation — but re-deriving WHY it still holds is
-/// out of scope for this truth-up; flagged as a follow-up, not fixed here.
+/// Slice 22 §4 KNOWN GAP, CLOSED by slice 25 task 5b: fusion only sees
+/// within a single conjunction, so splitting the two `to_code` bounds across
+/// a disjunction used to defeat it — each half, on its own, was already
+/// Unknown before this disjunction was even built (through slice 24). Task
+/// 5b's comp() fix (Part 1) restores decisiveness on the wide-arm half
+/// (`>= 48` alone — see `targeted_to_code_range_wide_arm_decides`), and that
+/// decisiveness now propagates through the `or`-with-a-free-Bool shape here
+/// too: DECIDES Sat (renamed from `..._known_gap`; z3-confirmed, witness `s
+/// = "0"`).
 ///
-/// A stronger claim — that this saturates via slice 21's INTERSECTION gap
-/// (two live memberships on the same variable failing to compose) — is NOT
-/// demonstrated by this construction and remains an unconfirmed hypothesis:
-/// two independent memberships on one variable joined by `or` do not, by
-/// themselves, trigger it — `(str.in_re s (re.range "0" "9")) ∧ (or (str.in_re
-/// s (re.range "5" "z")) p)` decides Sat, with no gap in sight. So this test
-/// cannot isolate "Unknown from an intersection gap" from "Unknown because the
-/// un-fused wide-arm half never decides" — the wide-arm explanation is fully
-/// sufficient on its own, and no evidence here supports the intersection-gap
-/// reading. The pin below is still a correct, sound regression guard: z3 says
-/// Sat, so a future regression to a WRONG decided verdict would be caught.
+/// (Historical note, no longer load-bearing now that this decides: an
+/// earlier draft of this comment speculated the stall might instead be
+/// slice 21's INTERSECTION gap — two live memberships on the same variable
+/// failing to compose. That was never demonstrated and is moot now that the
+/// construction decides outright.)
 #[test]
-fn targeted_to_code_range_split_bounds_known_gap() {
+fn targeted_to_code_range_split_bounds_decides() {
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(declare-fun p () Bool)\
+         (assert (>= (str.to_code s) 48))\
+         (assert (or (<= (str.to_code s) 57) p))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+/// Slice 25 task 5b regression pin ("repro B"): the folded `code_conv`
+/// range membership (`str.to_code s0 >= 120` ⇒ `s0 ∈ Range(120, MAX_CODE)`)
+/// used to hit the bare-range LEAF skip in `memb.rs` with no length fact —
+/// routed to model repair, which can only find a length-1 witness, never
+/// UNSAT — so the `len(s0) = 0` conflict was lost (Unsat → Unknown
+/// regression bisected to 0617a14). Part 2's guarded `lit → len(residual) =
+/// 1` axiom on the bare-range leaf restores the conflict: z3-confirmed
+/// Unsat.
+#[test]
+fn targeted_to_code_range_length_zero_conflict_decides_unsat() {
+    expect(
+        "(set-logic QF_S)(declare-fun s0 () String)\
+         (assert (>= (str.to_code s0) 120))(assert (= (str.len s0) 0))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+/// Slice 25 task 5b regression pin ("repro A"): under NEGATIVE polarity
+/// `memb_check` complements the extracted Rex (`t ∉ R ≡ t ∈ comp(R)`); for
+/// `str.<= s1 "c"` this mints `Comp(Star(Range(0,MAX_CODE)))` (= ∅) /
+/// `Comp(Empty)` (= Σ*) derivative tokens that the pre-fix `comp()` never
+/// collapsed, cascading toward the Fuel budget (Sat → Unknown regression
+/// bisected to 0617a14). Part 1's `comp(∅) = Σ*` / `comp(Σ*) = ∅` identities
+/// collapse the cascade: z3-confirmed Sat (e.g. `s1 = ""`).
+#[test]
+fn targeted_str_order_left_free_le_decides_sat() {
+    expect(
+        "(set-logic QF_S)(declare-fun s1 () String)(assert (str.<= s1 \"c\"))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+/// Slice 25 task 5b investigator's residual-risk pin: a bare-range
+/// membership whose word-equation side has a MULTI-ATOM residual —
+/// `s·"a" ∈ [x-z]` forces `len(s·"a") = 1` (Part 2's new axiom) ⇒ `s = ""`
+/// ⇒ `"a" ∈ [x-z]` is false ⇒ UNSAT (z3-confirmed). shinri currently
+/// returns Unknown on this shape (the multi-atom residual is not the single
+/// free-variable leaf Part 2's fix targets) — sound, not required to
+/// decide; pinned as observed, not as hoped-for.
+#[test]
+fn targeted_regex_bare_range_multi_atom_residual_stays_unknown() {
     assert_eq!(
         shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)(declare-fun p () Bool)\
-             (assert (>= (str.to_code s) 48))\
-             (assert (or (<= (str.to_code s) 57) p))(check-sat)"
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (str.in_re (str.++ s \"a\") (re.range \"x\" \"z\")))(check-sat)"
         ),
         Verdict::Unknown,
     );
@@ -3864,18 +3900,21 @@ fn targeted_str_order_single_char_left_decides() {
 
 #[test]
 fn targeted_str_order_single_char_left_free_known_gap() {
-    // KNOWN GAP (slice 25 amendment): constant-on-LEFT strict order over a
-    // FULLY-FREE s — (str.< "b" s), with or without a pinned str.len — is
-    // STILL a sound Unknown, and stays Unknown for str.<= too. Probed
-    // end-to-end via the CLI (six shapes: str.< and str.<= free, plus each
-    // at str.len = 1 and str.len = 2); every one returned `unknown`, none
-    // returned `sat` or `unsat`. Mechanism: the strict-< proper-prefix
-    // gadget (word("b")·Σ·Σ*) churns the string↔arith length seam to the
-    // fuel fence before model repair gets a chance to search a witness —
-    // separate from the straddling-range membership stall this slice fixed
-    // (Root cause was a Range round-trip shape loss, not a fuel/seam issue).
-    // Banked follow-up; not in slice-25 scope. A future slice should flip
-    // these to Sat deliberately once the seam is closed.
+    // KNOWN GAP (slice 25 amendment; NARROWED by task 5b's comp() fix — see
+    // `targeted_str_order_single_char_left_free_len_pinned_decides` for the
+    // two sub-cases that now decide): constant-on-LEFT STRICT order
+    // (str.< "b" s) over a FULLY-FREE s — with or without a pinned str.len —
+    // is still a sound Unknown, and (str.<= "b" s) stays Unknown when s is
+    // fully free (no length pin). Re-probed end-to-end via the CLI (all four
+    // shapes below); every one still returns `unknown` (z3: sat for all
+    // four). Mechanism: the strict-< proper-prefix gadget
+    // (word("b")·Σ·Σ*) churns the string↔arith length seam to the fuel
+    // fence before model repair gets a chance to search a witness —
+    // separate from the bare-range leaf gap task 5b's Part 2 closed (that
+    // one had an independent length fact to conflict with; here there is
+    // none to seed a witness search either way for a FULLY-FREE s). Banked
+    // follow-up; not in slice-25 scope. A future slice should flip these to
+    // Sat deliberately once the seam is closed.
     assert_eq!(
         shinri_verdict(
             "(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(check-sat)"
@@ -3902,19 +3941,24 @@ fn targeted_str_order_single_char_left_free_known_gap() {
         ),
         Verdict::Unknown,
     );
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))\
-             (assert (= (str.len s) 1))(check-sat)"
-        ),
-        Verdict::Unknown,
+}
+
+#[test]
+fn targeted_str_order_single_char_left_free_len_pinned_decides() {
+    // Slice 25 task 5b: the two (str.<= "b" s) + pinned-length sub-cases
+    // carved out of `targeted_str_order_single_char_left_free_known_gap` —
+    // the comp() fix (Part 1) lets the non-strict left-constant gadget's
+    // derivative-driven unfolding reach a decisive Rule-E/model-repair path
+    // once the length pin bounds the search. z3-confirmed Sat both ways.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))\
+         (assert (= (str.len s) 1))(check-sat)",
+        Verdict::Sat,
     );
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))\
-             (assert (= (str.len s) 2))(check-sat)"
-        ),
-        Verdict::Unknown,
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))\
+         (assert (= (str.len s) 2))(check-sat)",
+        Verdict::Sat,
     );
 }
 
