@@ -158,6 +158,7 @@ pub(crate) fn is_surrogate(k: i128) -> bool {
 ///   * an endpoint STRICTLY inside the surrogate block (a surrogate other than
 ///     the block edges `0xD800` / `0xDFFF`, which ARE expressible) ⇒ `None`.
 ///   * otherwise ⇒ `Some(Rex::Range(lo as u32, hi as u32))`.
+///
 /// Takes `i128` so callers can pass `m-1` / `m+1` / `MAX+1` without under/overflow.
 pub(crate) fn range_rex(lo: i128, hi: i128) -> Option<Rex> {
     if lo > hi {
