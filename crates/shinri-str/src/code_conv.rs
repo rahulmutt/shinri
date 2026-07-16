@@ -414,18 +414,19 @@ fn match_code_ineq(ctx: &Context, op: BuiltinOp, kids: &[TermId]) -> Option<(Ter
 /// is unsatisfiable whatever the endpoints are, so it decides even when they
 /// would not have been expressible.
 fn range_membership(ctx: &mut Context, s: TermId, lo: i128, hi: i128) -> Option<TermId> {
-    if lo > hi {
-        return Some(ctx.mk_const_bool(false));
+    match crate::regex::range_rex(lo, hi)? {
+        // Empty interval: the membership is unsatisfiable. Keep emitting the
+        // Bool constant `false` (NOT `str.in_re s re.none`) so slice-22's
+        // term-exact tests and the downstream shape are unchanged.
+        Rex::Empty => Some(ctx.mk_const_bool(false)),
+        r => {
+            let rt = rex_to_term(ctx, &r);
+            Some(
+                ctx.mk_app(Op::Builtin(BuiltinOp::StrInRe), &[s, rt])
+                    .expect("str.in_re well-sorted"),
+            )
+        }
     }
-    debug_assert!((0..=MAX_CODE).contains(&lo) && (0..=MAX_CODE).contains(&hi));
-    if (is_surrogate(lo) && lo != 0xD800) || (is_surrogate(hi) && hi != 0xDFFF) {
-        return None;
-    }
-    let r = rex_to_term(ctx, &Rex::Range(lo as u32, hi as u32));
-    Some(
-        ctx.mk_app(Op::Builtin(BuiltinOp::StrInRe), &[s, r])
-            .expect("str.in_re well-sorted"),
-    )
 }
 
 /// Spec §1.2, for a bound no fusion group claimed. None ⇒ not a `to_code`

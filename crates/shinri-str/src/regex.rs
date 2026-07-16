@@ -145,6 +145,32 @@ pub(crate) fn star(r: Rex) -> Rex {
     }
 }
 
+/// True iff `k` is a UTF-16 surrogate code point — in the SMT-LIB alphabet but
+/// unrepresentable as a `Box<str>` character.
+pub(crate) fn is_surrogate(k: i128) -> bool {
+    (0xD800..=0xDFFF).contains(&k)
+}
+
+/// A single character class `[lo, hi]` as a `Rex`, applying slice-22's endpoint
+/// policy (the term-free core shared with `code_conv::range_membership`):
+///   * `lo > hi`  ⇒ `Some(Rex::Empty)` (the empty interval; the caller's
+///     `union`/`concat` drop it — see `regex.rs` `concat`/`union`).
+///   * an endpoint STRICTLY inside the surrogate block (a surrogate other than
+///     the block edges `0xD800` / `0xDFFF`, which ARE expressible) ⇒ `None`.
+///   * otherwise ⇒ `Some(Rex::Range(lo as u32, hi as u32))`.
+///
+/// Takes `i128` so callers can pass `m-1` / `m+1` / `MAX+1` without under/overflow.
+pub(crate) fn range_rex(lo: i128, hi: i128) -> Option<Rex> {
+    if lo > hi {
+        return Some(Rex::Empty);
+    }
+    debug_assert!((0..=MAX_CODE as i128).contains(&lo) && (0..=MAX_CODE as i128).contains(&hi));
+    if (is_surrogate(lo) && lo != 0xD800) || (is_surrogate(hi) && hi != 0xDFFF) {
+        return None;
+    }
+    Some(Rex::Range(lo as u32, hi as u32))
+}
+
 pub(crate) fn comp(r: Rex) -> Rex {
     match r {
         Rex::Comp(inner) => *inner,
@@ -1921,5 +1947,21 @@ mod tests {
         // The eligible atom under Boolean structure stays unfenced.
         let notok = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[ok]).unwrap();
         assert!(!has_unsupported_regex(&ctx, &[notok]));
+    }
+
+    #[test]
+    fn range_rex_endpoint_policy() {
+        // Empty interval ⇒ Rex::Empty (the caller's union/concat then drop it).
+        assert_eq!(range_rex(0, -1), Some(Rex::Empty));
+        assert_eq!(range_rex(98, 97), Some(Rex::Empty));
+        // Ordinary in-alphabet range.
+        assert_eq!(range_rex(0, 97), Some(Rex::Range(0, 97)));
+        assert_eq!(range_rex(97, 97), Some(Rex::Range(97, 97)));
+        // Surrogate BLOCK EDGES (0xD800 / 0xDFFF) are expressible via re.diff.
+        assert_eq!(range_rex(0, 0xDFFF), Some(Rex::Range(0, 0xDFFF)));
+        assert_eq!(range_rex(0xD800, 0xDFFF), Some(Rex::Range(0xD800, 0xDFFF)));
+        // An endpoint STRICTLY inside the surrogate block ⇒ None (fence).
+        assert_eq!(range_rex(0, 0xDA00), None);
+        assert_eq!(range_rex(0xDA00, 0xE000), None);
     }
 }

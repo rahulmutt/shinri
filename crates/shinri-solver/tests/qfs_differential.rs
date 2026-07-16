@@ -1075,6 +1075,53 @@ impl Gen {
         self.body
     }
 
+    /// A conjunction of single-char-constant-vs-symbolic `str.<` / `str.<=`
+    /// atoms (constant on either side), plus a forcing equality/length
+    /// constraint on a symbolic var to drive both Sat and Unsat — exactly
+    /// slice 24's decided fragment. ASCII-only (z3-CLI byte-parse safety);
+    /// some atoms negated. The declared string-var pool is small (see
+    /// `Gen::new`), so the forcing constraint frequently binds a var used in
+    /// an atom, yielding UNSAT instances as well as SAT.
+    fn finish_str_order_single_char(mut self) -> String {
+        const CHARS: [&str; 5] = ["a", "b", "c", "d", "e"];
+        let n_atoms = 1 + self.rng.below(2); // 1..=2
+        for _ in 0..n_atoms {
+            let op = if self.rng.below(2) == 0 {
+                "str.<"
+            } else {
+                "str.<="
+            };
+            let v = self.var();
+            let c = format!("\"{}\"", CHARS[self.rng.below(5) as usize]);
+            let atom = if self.rng.below(2) == 0 {
+                format!("({op} {v} {c})") // constant on the right
+            } else {
+                format!("({op} {c} {v})") // constant on the left
+            };
+            let atom = if self.rng.below(4) == 0 {
+                format!("(not {atom})")
+            } else {
+                atom
+            };
+            self.body.push_str(&format!("(assert {atom})\n"));
+        }
+        // Force decisions on a symbolic var (some SAT, some UNSAT).
+        let v = self.var();
+        match self.rng.below(3) {
+            0 => {
+                let c = CHARS[self.rng.below(5) as usize];
+                self.body.push_str(&format!("(assert (= {v} \"{c}\"))\n"));
+            }
+            1 => {
+                let k = self.rng.below(3);
+                self.body
+                    .push_str(&format!("(assert (= (str.len {v}) {k}))\n"));
+            }
+            _ => {}
+        }
+        self.body
+    }
+
     /// Emit one assertion of a randomly chosen shape. The corpus now spans the FULL
     /// QF_SLIA-core fragment: general multi-variable word (dis)equations (both sides
     /// may be arbitrary concat/var/literal/substr terms), substr/at extracts, length
@@ -2422,6 +2469,73 @@ fn qfs_str_order_matches_z3() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Slice 24: single-character str.< / str.<= vs a constant
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn gen_str_order_single_char_body(seed: u64) -> String {
+    Gen::new(seed).finish_str_order_single_char()
+}
+
+const SOSC_SEED: u64 = 0x53_00_0000_0004;
+const SOSC_N_ITERS: usize = 200;
+
+#[test]
+fn qfs_str_order_single_char_matches_z3() {
+    let mut rng = Lcg(SOSC_SEED);
+    let (mut n_sat, mut n_unsat, mut n_shinri_unknown, mut n_z3_unknown, mut n_guard_bailouts) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..SOSC_N_ITERS {
+        let seed = rng.next();
+        let body = gen_str_order_single_char_body(seed);
+
+        let (lines, bailouts) = shinri_lines_counting_bailouts(&format!("{body}(check-sat)\n"));
+        if bailouts > 0 {
+            n_guard_bailouts += 1;
+            continue;
+        }
+        let ours = match lines.first().map(String::as_str) {
+            Some("sat") => Verdict::Sat,
+            Some("unsat") => Verdict::Unsat,
+            _ => Verdict::Unknown,
+        };
+        if ours == Verdict::Unknown {
+            n_shinri_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&format!("{body}(check-sat)\n"));
+        if theirs == Verdict::Unknown {
+            n_z3_unknown += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S STR_ORDER SINGLE-CHAR SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{body}(check-sat)"
+        );
+        match ours {
+            Verdict::Sat => n_sat += 1,
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_str_order_single_char_matches_z3: {SOSC_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_shinri_unknown} shinri-unknown / {n_z3_unknown} z3-unknown / {n_guard_bailouts} guard-bailout; \
+         0 disagreements"
+    );
+    assert!(
+        n_sat > 0,
+        "single-char str-order family produced zero SAT instances"
+    );
+    assert!(
+        n_unsat > 0,
+        "single-char str-order family produced zero UNSAT instances"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Targeted explicit cases
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -3679,6 +3793,35 @@ fn targeted_str_order_symbolic_pair_known_gap() {
          (assert (str.< s u))(check-sat)",
         Verdict::Unknown,
     );
+}
+
+#[test]
+fn targeted_str_order_single_char_right_decides() {
+    // (str.< s "b"): decided end-to-end (was fenced pre-slice-24).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(check-sat)",
+        Verdict::Sat, // free s (e.g. "a") — now DECIDES rather than fencing
+    );
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"a\"))(check-sat)", Verdict::Sat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"b\"))(check-sat)", Verdict::Unsat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"c\"))(check-sat)", Verdict::Unsat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"\"))(check-sat)", Verdict::Sat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< s \"b\"))(assert (= s \"aa\"))(check-sat)", Verdict::Sat);
+    // (str.<= s "b"): s = "b" is now allowed.
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.<= s \"b\"))(assert (= s \"b\"))(check-sat)", Verdict::Sat);
+    // Negation: ¬(s < "b") ∧ s = "a" ⇒ unsat.
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (not (str.< s \"b\")))(assert (= s \"a\"))(check-sat)", Verdict::Unsat);
+}
+
+#[test]
+fn targeted_str_order_single_char_left_decides() {
+    // (str.< "b" s): first char > 'b', or "b" a proper prefix.
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(assert (= s \"c\"))(check-sat)", Verdict::Sat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(assert (= s \"ba\"))(check-sat)", Verdict::Sat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(assert (= s \"b\"))(check-sat)", Verdict::Unsat);
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.< \"b\" s))(assert (= s \"a\"))(check-sat)", Verdict::Unsat);
+    // (str.<= "b" s): s = "b" is now allowed.
+    expect("(set-logic QF_S)(declare-fun s () String)(assert (str.<= \"b\" s))(assert (= s \"b\"))(check-sat)", Verdict::Sat);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
