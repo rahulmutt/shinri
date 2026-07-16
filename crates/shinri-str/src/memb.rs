@@ -252,7 +252,7 @@ pub(crate) fn memb_check(
             // CONDITIONAL (dl>0) merge, the global clause would only be
             // branch-locally valid. `side_clean` is the same branch-
             // independence gate the sibling arm applies at the `!side_clean`
-            // check just below (memb.rs:280) — mirrored here, same
+            // check just below (memb.rs:301) — mirrored here, same
             // arguments, same semantics. When it fails, fall through to the
             // pre-existing `continue` (repair-eligibility untouched).
             //

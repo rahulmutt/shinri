@@ -345,9 +345,7 @@ expected tallies (fixed seeds); 0 disagreements in every run.
   comment on `class_intervals` pointing at the no-interior-surrogate
   invariant it relies on. **m3** — no direct pins for the nested class-diff
   inductive case, the `blo=0` row, or the tail-overlap row (reviewer
-  hand-derived all three correct). **m4** —
-  `targeted_to_code_range_split_bounds_known_gap`'s docstring is partly
-  stale post-flip (the pin itself is correct). **m5** —
+  hand-derived all three correct). **m4**: RESOLVED by Task 5b's split_bounds rename/rewrite; originally: `targeted_to_code_range_split_bounds_known_gap`'s docstring is partly stale post-flip (the pin itself is correct). **m5** —
   `emitted_len_axioms` dedup key drops a second guard on shared residuals
   (decisiveness-only). **m6** — a comment's `memb.rs:280` sibling reference
   is pre-fix line numbering (now `:301`), cosmetic. **m7** — the multi-atom
