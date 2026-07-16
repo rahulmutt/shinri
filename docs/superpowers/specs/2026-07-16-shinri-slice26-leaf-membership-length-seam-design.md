@@ -33,7 +33,7 @@ Order shapes (the slice-25 pins, reconfirmed):
 | --------------------------------------- | ----------- |
 | `(str.< "b" s)`                          | unknown     |
 | `(str.<= "b" s)`                         | unknown     |
-| `(str.< "b" s)` + `len(s)=1` (z3: unsat) | unknown     |
+| `(str.< "b" s)` + `len(s)=1` (z3: sat, "c") | unknown  |
 | `(str.< "b" s)` + `len(s)=2`             | unknown     |
 | `(str.< "b" s)` + `len(s)=3`             | unknown     |
 | `(str.< s "b")` (constant on RIGHT)      | **sat**     |
@@ -118,9 +118,11 @@ After this slice, all of the following decide (z3-agreeing verdicts):
 1. The order-pin shapes (the four pinned in
    `targeted_str_order_single_char_left_free_known_gap`, plus the `len=3`
    probe): `(str.< "b" s)`, `(str.<= "b" s)` free → **Sat**;
-   `(str.< "b" s)` + `len(s)=2`, `+ len(s)=3` → **Sat**;
-   `(str.< "b" s)` + `len(s)=1` → **Unsat** (upgraded from Unknown via the
-   new min-length axiom). `targeted_str_order_single_char_left_free_known_gap`
+   `(str.< "b" s)` + `len(s) ∈ {1,2,3}` → **Sat** (z3-adjudicated during
+   planning: at length 1 the gadget's above-arm `Range(99,MAX)·Σ*` admits
+   `"c"` — the Unsat-at-len-1 case is the PURE prefix-arm membership in
+   item 2, not the order shape).
+   `targeted_str_order_single_char_left_free_known_gap`
    retires into `_now_decides` pins, per its own comment ("a future slice
    should flip these to Sat deliberately once the seam is closed").
 2. The membership-level cells behind them: `b·Σ·Σ*`, `bc·Σ*`, `Σ·Σ·Σ*`,
@@ -265,8 +267,7 @@ gadgets are handled by the existing intersection.
 **e2e pins (`qfs_differential.rs`).**
 
 - Retire `targeted_str_order_single_char_left_free_known_gap` into
-  `_now_decides` pins: free `<` and `<=` → Sat; `len∈{2,3}` strict → Sat;
-  `len=1` strict → **Unsat**.
+  `_now_decides` pins: free `<` and `<=` → Sat; `len∈{1,2,3}` strict → Sat.
 - New membership pins: `bc·Σ*`, `Σ·Σ·Σ*`, `Σ*·b·Σ`, `(bc·Σ* ∪ "q")`,
   pinned-length rescue (`b·Σ·Σ*` + `len=2` → Sat), `b·Σ·Σ*` + `len=1` →
   Unsat, `(str.< "b" s) ∧ (str.< s "d")` → Sat.
