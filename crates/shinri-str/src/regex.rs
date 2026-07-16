@@ -2215,7 +2215,8 @@ mod tests {
         assert_eq!(range_rex(0xDA00, 0xE000), None);
     }
 
-    /// Deterministic LCG (same recurrence as the differential harness's).
+    /// Deterministic LCG (Knuth's MMIX constants), independent of the
+    /// differential harness's generator.
     struct Lcg(u64);
     impl Lcg {
         fn next(&mut self) -> u64 {
