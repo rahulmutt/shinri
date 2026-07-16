@@ -266,7 +266,7 @@ pub(crate) fn memb_check(
             if !side_clean(cx.eq, cx.terms, t, input_cond_roots) {
                 continue;
             }
-            let residual = mk_concat(cx.terms, &nf[i..].to_vec());
+            let residual = mk_concat(cx.terms, &nf[i..]);
             let lr = wordeq::len_of(cx.terms, residual);
             let one = cx.terms.mk_numeral(
                 shinri_core::Rational::from_int(1i128.into()),

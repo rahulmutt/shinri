@@ -2304,7 +2304,7 @@ mod tests {
     fn roundtrip_extract_of_rex_to_term_is_identity() {
         // The slice's acceptance property: the term↔Rex round-trip is
         // SHAPE-stable (not merely language-preserving) for canonical Rex.
-        let mut g = Lcg(0x5EED_25_5EED_25_01);
+        let mut g = Lcg(0x5E_ED_25_5E_ED_25_01);
         let mut ctx = Context::new();
         for i in 0..500 {
             let r = arb_rex(&mut g, 4);
