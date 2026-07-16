@@ -83,25 +83,51 @@ pub(crate) fn concat(parts: Vec<Rex>) -> Rex {
     }
 }
 
+/// Sort inclusive intervals by `lo` and merge overlapping or ADJACENT ones
+/// (`[a,b] ∪ [b+1,c] → [a,c]`). Exact set arithmetic on character classes.
+fn coalesce(mut iv: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+    iv.sort_unstable();
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    for (lo, hi) in iv {
+        match out.last_mut() {
+            Some((_, phi)) if lo <= phi.saturating_add(1) => *phi = (*phi).max(hi),
+            _ => out.push((lo, hi)),
+        }
+    }
+    out
+}
+
 pub(crate) fn union(parts: Vec<Rex>) -> Rex {
-    let mut out: Vec<Rex> = Vec::new();
-    for p in parts {
+    // Slice 25: Range members are coalesced (sorted by lo, overlapping/
+    // adjacent merged) and emitted FIRST; non-range members follow in
+    // first-appearance order, deduped. Deterministic output — hash-consing
+    // and the engine's dedup keys rely on `rex_to_term` determinism per Rex.
+    fn add(p: Rex, ranges: &mut Vec<(u32, u32)>, others: &mut Vec<Rex>) {
         match p {
             Rex::Empty => {}
+            Rex::Range(lo, hi) => ranges.push((lo, hi)),
             Rex::Union(inner) => {
                 for q in inner {
-                    if !out.contains(&q) {
-                        out.push(q);
-                    }
+                    add(q, ranges, others);
                 }
             }
             other => {
-                if !out.contains(&other) {
-                    out.push(other);
+                if !others.contains(&other) {
+                    others.push(other);
                 }
             }
         }
     }
+    let mut ranges = Vec::new();
+    let mut others = Vec::new();
+    for p in parts {
+        add(p, &mut ranges, &mut others);
+    }
+    let mut out: Vec<Rex> = coalesce(ranges)
+        .into_iter()
+        .map(|(lo, hi)| Rex::Range(lo, hi))
+        .collect();
+    out.extend(others);
     match out.len() {
         0 => Rex::Empty,
         1 => out.pop().expect("len 1"),
@@ -1104,6 +1130,61 @@ mod tests {
         assert_eq!(loop_(chr('a'), 0, 0), Rex::Eps);
         assert_eq!(loop_(Rex::Empty, 0, 4), Rex::Eps);
         assert_eq!(loop_(Rex::Empty, 1, 4), Rex::Empty);
+    }
+
+    #[test]
+    fn union_coalesces_ranges() {
+        // Adjacent intervals merge ([a,b] ∪ [b+1,c] = [a,c]).
+        assert_eq!(
+            union(vec![Rex::Range(97, 99), Rex::Range(100, 105)]),
+            Rex::Range(97, 105)
+        );
+        // Overlapping intervals merge.
+        assert_eq!(
+            union(vec![Rex::Range(97, 103), Rex::Range(100, 105)]),
+            Rex::Range(97, 105)
+        );
+        // Contained interval collapses.
+        assert_eq!(
+            union(vec![Rex::Range(97, 120), Rex::Range(100, 105)]),
+            Rex::Range(97, 120)
+        );
+        // Disjoint (gap > 1) stays split, sorted by lo regardless of input order.
+        assert_eq!(
+            union(vec![Rex::Range(110, 120), Rex::Range(97, 99)]),
+            Rex::Union(vec![Rex::Range(97, 99), Rex::Range(110, 120)])
+        );
+        // The slice's motivating fold: lo..D7FF ∪ block ∪ E000..hi = lo..hi.
+        assert_eq!(
+            union(vec![
+                Rex::Range(99, 0xD7FF),
+                Rex::Range(0xD800, 0xDFFF),
+                Rex::Range(0xE000, MAX_CODE)
+            ]),
+            Rex::Range(99, MAX_CODE)
+        );
+        // Mixed members: coalesced ranges FIRST (sorted), then non-range
+        // members in first-appearance order. Deterministic under permutation
+        // of the range members.
+        let st = star(Rex::Range(0, MAX_CODE));
+        assert_eq!(
+            union(vec![
+                st.clone(),
+                Rex::Range(100, 105),
+                Rex::Eps,
+                Rex::Range(97, 99)
+            ]),
+            Rex::Union(vec![Rex::Range(97, 105), st.clone(), Rex::Eps])
+        );
+        assert_eq!(
+            union(vec![
+                Rex::Range(97, 99),
+                st.clone(),
+                Rex::Range(100, 105),
+                Rex::Eps
+            ]),
+            Rex::Union(vec![Rex::Range(97, 105), st, Rex::Eps])
+        );
     }
 
     #[test]
