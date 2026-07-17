@@ -424,6 +424,34 @@ fn concat_arity(terms: &Context, t: TermId) -> usize {
     }
 }
 
+/// True iff `v`'s equality class holds a constant or a concat OTHER than `v`
+/// itself — the repair-INELIGIBILITY condition. A pinned variable's value is
+/// dictated elsewhere (by the constant/concat merged into its class), so
+/// free-witness repair would fight that pin instead of realising it.
+///
+/// Shared by two callers that both need "is this leaf repair-eligible":
+/// `memb_seeds` below (its original owner) and `memb::memb_check`'s Slice-26
+/// leaf carve-out (Task 6b). The carve-out's OWN syntactic `lone_leaf` check
+/// (an NF-local read: is the residual exactly one bare uninterpreted atom?)
+/// is blind to this — a class merge introduced by an ENTIRELY DIFFERENT
+/// assertion (e.g. `x = x·y·z`) can pin `x` while `x`'s own normal form
+/// still reads atomic (deep NF doesn't need to expand through a
+/// self-referential merge to resolve `x`'s OWN read). Gating the carve-out
+/// on this same check closes that gap: a pinned lone leaf now falls back to
+/// Rule S/E unfolding (the pre-slice-26 behavior for that atom) instead of
+/// being silently un-decided by BOTH the carve-out and `memb_seeds`.
+pub(crate) fn is_repair_pinned(
+    terms: &Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    v: TermId,
+) -> bool {
+    class_member(terms, eq, known, v, |terms, mm| {
+        (terms.string_const_value(mm).is_some() || is_concat(terms, mm)) && mm != v
+    })
+    .is_some()
+}
+
 /// Slice 21: words for FREE string variables carrying membership atoms.
 /// A variable is repair-eligible iff it is a leaf (nullary uninterpreted)
 /// whose class holds no constant and no concat (the `value_of` free path) —
@@ -461,32 +489,25 @@ pub(crate) fn memb_seeds(
     let mut out = FxHashMap::default();
     for (v, rexes) in per_var {
         // Free check: no constant and no concat in v's class.
-        let pinned = class_member(terms, eq, known, v, |terms, mm| {
-            (terms.string_const_value(mm).is_some() || is_concat(terms, mm)) && mm != v
-        });
-        if pinned.is_some() {
+        if is_repair_pinned(terms, eq, known, v) {
             continue;
         }
-        let mut n = class_len_in_model(terms, eq, known, m, v);
+        let n = class_len_in_model(terms, eq, known, m, v);
         let goal = regex::inter(rexes);
-        // A fully-free variable with no independent length constraint reads
-        // model length 0 here. If the goal is non-nullable (e.g. a bare wide
-        // or surrogate-straddling `Rex::Range`, which can never fold to a
-        // word disjunction upstream — regex.rs's ENUM_WORD_CAP / surrogate
-        // guards), length 0 can never match and `search_word` fails, leaving
-        // the variable un-seeded to free-fill "" — which then fails the
-        // post-solve self-check and downgrades a decidable Sat to Unknown.
-        // Also try length 1: every consumer shape reaching this bare-leaf
-        // path today is a single Range, whose members are exactly length-1
-        // words, so this is not a guess but the exact witness shape. This
-        // seed is only ever a CANDIDATE re-checked by the post-solve
-        // self-check against every assertion (including any independently
-        // asserted `len(v) = 0`), so a wrong bump can only fall back to the
-        // prior sound Unknown, never fabricate a wrong Sat.
-        if n == 0 && !regex::nullable(&goal) {
-            n = 1;
-        }
-        if let Some(w) = regex::search_word(&goal, n) {
+        // Try the model length first: `n` comes from the arith model, so it
+        // respects every genuinely-asserted length pin. It can still fail —
+        // a fully-free variable reads 0 here, and the slice-26 leaf axiom is
+        // a LOWER bound only, so arith may pick any feasible length the goal
+        // cannot realize (parity-constrained languages, arbitrary slack). On
+        // failure fall back to the SHORTEST accepted word (slice 26 —
+        // subsumes the slice-25 amendment-1 length-1 bump: a nullable goal
+        // at n=0 still resolves to "" via `search_word`, a non-nullable one
+        // falls through to its true minimal witness). Seeds are only ever
+        // CANDIDATES re-checked by the post-solve self-check against every
+        // assertion, so a fallback seed that violates a real length pin can
+        // only fall back to the prior sound Unknown, never fabricate a
+        // wrong Sat.
+        if let Some(w) = regex::search_word(&goal, n).or_else(|| regex::search_shortest(&goal)) {
             out.insert(v, w);
         }
     }
@@ -618,5 +639,72 @@ mod tests {
             .get(&x)
             .expect("nullable free membership var must be seeded at length 0");
         assert_eq!(w, "");
+    }
+
+    // ── Task 3 (slice 26): shortest-word fallback replaces the length-1
+    // bump ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn memb_seed_min_len_two_goal_gets_shortest_witness() {
+        // Slice 26: `x ∈ "b"·Σ·Σ*` (the strict-< proper-prefix gadget arm)
+        // over a fully-free leaf — no length constraint, so the model length
+        // reads 0 and `search_word(goal, 0)` fails (non-nullable). The
+        // shortest-word fallback must produce a length-2 member. Subsumes
+        // the slice-25 amendment-1 length-1 bump (whose pins stay green).
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let sigma = crate::regex::Rex::Range(0, crate::regex::MAX_CODE);
+        let goal = crate::regex::concat(vec![
+            crate::regex::Rex::Range('b' as u32, 'b' as u32),
+            sigma.clone(),
+            crate::regex::star(sigma),
+        ]);
+        let re_t = crate::regex::rex_to_term(&mut ctx, &goal);
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        let mut eq = EqualityEngine::default();
+        let m = ModelBuilder::default(); // no len(x) pinned -> model length 0.
+        let known = vec![x];
+        let seeds = memb_seeds(&mut ctx, &mut eq, &known, &[(atom, true)], &m);
+        let w = seeds
+            .get(&x)
+            .expect("min-len-2 star-tail leaf must get a shortest witness");
+        assert_eq!(w.chars().count(), 2);
+        assert_eq!(crate::regex::eval_membership(w, &goal), Some(true));
+    }
+
+    #[test]
+    fn memb_seed_union_easy_arm_gets_witness() {
+        // Slice 26: `x ∈ (bc·Σ* ∪ "q")` — the union-poisoning probe cell.
+        // The shortest-word fallback finds the trivially-sat length-1 arm.
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let sigma_star = crate::regex::star(crate::regex::Rex::Range(0, crate::regex::MAX_CODE));
+        let goal = crate::regex::union(vec![
+            crate::regex::concat(vec![
+                crate::regex::Rex::Range('b' as u32, 'b' as u32),
+                crate::regex::Rex::Range('c' as u32, 'c' as u32),
+                sigma_star,
+            ]),
+            crate::regex::Rex::Range('q' as u32, 'q' as u32),
+        ]);
+        let re_t = crate::regex::rex_to_term(&mut ctx, &goal);
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        let mut eq = EqualityEngine::default();
+        let m = ModelBuilder::default();
+        let known = vec![x];
+        let seeds = memb_seeds(&mut ctx, &mut eq, &known, &[(atom, true)], &m);
+        assert_eq!(seeds.get(&x).map(String::as_str), Some("q"));
     }
 }

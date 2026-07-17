@@ -1059,25 +1059,23 @@ fn in_re_unfold_negative_polarity_unsat() {
 // `run_script` and a direct assertion on the raw output.
 
 #[test]
-fn in_re_unfold_plus_with_length_unknown_intersection_gap() {
-    // x ∈ [a-z]+ ∧ len(x) = 3. The brief proposed Sat; observed: unknown —
-    // slice 21 KNOWN GAP (the SAME intersection gap adjudicated on
-    // `in_re_unfold_unsat_disjoint_stars`): the SAT layer may decide the
-    // pass-MINTED membership atoms at polarities that are JOINTLY
-    // unsatisfiable over one witness leaf (traced: a leaf carrying both
-    // `⟨first char ≥ 'a'⟩·Σ*` positively and its complement negatively —
-    // empty at every length), and refuting that combination needs an
-    // intersection-aware conflict rule citing TWO membership literals,
-    // which the single-guard Split channel cannot express. The pass
-    // saturates, `search_word` correctly finds no word for the
-    // contradictory leaf, and the self-check downgrades — a SOUND unknown,
-    // never a wrong verdict. Pinned per observed verdict.
+fn in_re_unfold_plus_with_length_now_decides() {
+    // x ∈ [a-z]+ ∧ len(x) = 3. Slice 21 KNOWN GAP (history): the SAT layer
+    // could mint pass-level membership atom polarities that were jointly
+    // unsatisfiable over one witness leaf, and the single-guard Split
+    // channel couldn't express the intersection-aware conflict rule needed
+    // to refute them, so the pass saturated and downgraded to a sound
+    // Unknown. Slice 26: the leaf carve-out in memb.rs no longer unfolds the
+    // lone free leaf at all — `memb_seeds` intersects the leaf's goal Rexes
+    // directly and calls `search_word` at the pinned model length 3 over
+    // that intersection, finding a witness the post-solve self-check
+    // verifies. z3-confirmed sat (controller-adjudicated deviation, slice 26).
     let out = run_script(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))\
          (assert (= (str.len x) 3))(check-sat)",
     );
-    assert_eq!(out, vec!["unknown"]);
+    assert_eq!(out, vec!["sat"]);
 }
 
 #[test]
@@ -1283,21 +1281,29 @@ fn in_re_unfold_sat_getvalue_witness() {
 }
 
 #[test]
-fn in_re_unfold_plus_with_length2_unknown_intersection_gap() {
+fn in_re_unfold_plus_with_length2_now_decides() {
     // The brief's verbatim get-value shape ([a-z]+ ∧ len(x)=2, with
-    // get-value): observed Unknown, NOT Sat — it hits the SAME intersection
-    // gap as `in_re_unfold_plus_with_length_unknown_intersection_gap` (pinned
-    // there for len=3; same root cause, different length). Pinned separately
-    // per the brief's exact shape so the matrix keeps a len=2 case; see that
-    // pin's comment for the full mechanism trace (jointly-unsatisfiable
-    // membership-atom polarities minted over one witness leaf — a sound
-    // Unknown, never a wrong verdict).
+    // get-value): slice 21 pinned this Unknown as the SAME intersection gap
+    // as `in_re_unfold_plus_with_length_now_decides` (there for len=3; same
+    // root cause, different length). Slice 26: same leaf carve-out mechanism
+    // — see that pin's comment for the full trace — flips this to Sat too;
+    // `memb_seeds` intersects the goal Rexes and `search_word` finds a
+    // length-2 witness, self-check verified. z3-confirmed sat
+    // (controller-adjudicated deviation, slice 26).
     let out = run_script(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (str.in_re x (re.+ (re.range \"a\" \"z\"))))\
          (assert (= (str.len x) 2))(check-sat)(get-value (x))",
     );
-    assert_eq!(out.first().map(String::as_str), Some("unknown"));
+    assert_eq!(out[0], "sat");
+    let v = out.get(1).expect("get-value output");
+    let q1 = v.find('"').expect("open quote");
+    let q2 = v[q1 + 1..].find('"').expect("close quote");
+    let val = &v[q1 + 1..q1 + 1 + q2];
+    assert!(
+        val.chars().count() == 2 && val.chars().all(|c| c.is_ascii_lowercase()),
+        "witness must be a 2-char lowercase member of [a-z]+, got {out:?}"
+    );
 }
 
 #[test]
@@ -1325,24 +1331,23 @@ fn in_re_unfold_unknown_class_cap() {
 }
 
 #[test]
-fn in_re_unfold_unknown_fuel_depth() {
-    // A shape whose unfolding needs more than the 40-unit fuel budget
+fn in_re_unfold_fuel_depth_now_decides() {
+    // A shape whose unfolding needed more than the 40-unit fuel budget
     // (`Fuel::default`, fuel.rs): a 12-deep forced-prefix language intersected
     // with an unconstrained `[a-a]+`, against an otherwise free variable —
-    // crossover is between depth 2 (Sat) and depth 4 (Unknown), so fuel
-    // exhausts by ~3-4 levels; depth 12 safely clears the threshold. Observed:
-    // Unknown — matches the brief's fuel-genuinely-trips branch (post-D-satfuel,
-    // fuel exhaustion SATURATES to model repair rather than a hard Unknown, but
-    // here repair has nothing to seed from either — the pass never reached a
-    // decided leaf — so the post-solve self-check correctly finds no witness
-    // and downgrades). No deepening needed; this shape already exhausts fuel
-    // as-is.
+    // pre-slice-26, fuel exhausted before reaching a decided leaf, and repair
+    // had nothing to seed from, so the self-check downgraded to Unknown.
+    // Slice 26: both memberships sit on one lone free leaf, so the carve-out
+    // suppresses unfolding entirely (no fuel spent) — `memb_seeds` intersects
+    // the two goal Rexes directly and the witness search finds "a"×12,
+    // self-check verified. z3-confirmed sat (controller-adjudicated
+    // deviation, slice 26).
     let out = run_script(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (str.in_re x ((_ re.loop 12 12) (re.range \"a\" \"b\"))))\
          (assert (str.in_re x (re.+ (re.range \"a\" \"a\"))))(check-sat)",
     );
-    assert_eq!(out, vec!["unknown"]);
+    assert_eq!(out, vec!["sat"]);
 }
 
 #[test]

@@ -2,7 +2,7 @@
 //! `str.in_re` atoms into word equations, run at the end of every Full check.
 
 use crate::regex::{self, Rex};
-use crate::{collect, normalize, side_clean, wordeq, StrSolver};
+use crate::{collect, model, normalize, side_clean, wordeq, StrSolver};
 use rustc_hash::FxHashSet;
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 use shinri_theory::types::{ENodeId, EqLeaf};
@@ -282,6 +282,90 @@ pub(crate) fn memb_check(
                 }
                 s.emitted_len_axioms.insert(comp);
                 return Some(emit_split(s, cx.terms, vec![comp], guard));
+            }
+            continue;
+        }
+
+        // ── Slice 26: general const-Rex LEAF carve-out ───────────────────
+        // A LONE repair-eligible leaf residual (single NF atom, nullary
+        // uninterpreted — the same shape `memb_seeds` requires, and now
+        // ALSO gated below on `memb_seeds`'s own repair-eligibility check
+        // — Task 6b fixed a gap where a class holding a constant or concat
+        // could still reach here: deep NF resolving `nf[i]` to itself does
+        // NOT imply the class is unpinned, e.g. a self-referential merge
+        // `x = x·y·z`) with any const `cur` is the GROUND-OUT point of the
+        // unfolding, exactly like the bare-`Range` arm above:
+        // Rule S/E on it mints fresh skolems whose `str.len` companions
+        // flood the string↔arith seam every round until the shared fuel
+        // dies in the length-axiom loop (`lib.rs::check`) — a hard Unknown
+        // BEFORE model repair can ever search a witness (the slice-26 root
+        // cause). Skip unfolding: emit the guarded tautology
+        // `lit → min_len(cur) ≤ len(residual) [≤ max_len(cur) if finite]`
+        // (bounds are sound by construction — `regex::min_len`/`max_len`
+        // doc), deduped via `emitted_len_axioms`, one clause per round, same
+        // posture as the sibling arm; then leave the atom in `memb_true`
+        // for Rule G / `memb_seeds` / the post-solve self-check. `Empty`
+        // and `Eps` are excluded so the existing decisive paths (Rule-E
+        // conflict on ∅, ε-forcing) keep firing; `Range` took the sibling
+        // arm. Mints NO concat — repair eligibility untouched.
+        let lone_leaf = nf.len() - i == 1
+            && matches!(
+                cx.terms.term_node(nf[i]),
+                shinri_core::TermNode::App { op: Op::Uninterpreted(_), args, .. }
+                    if cx.terms.children(*args).is_empty()
+            );
+        // Task 6b (slice-26 regression fix): `lone_leaf` is an NF-LOCAL
+        // syntactic read — it says nothing about whether `nf[i]`'s equality
+        // CLASS also holds a constant or a concat merged in by some OTHER
+        // assertion (deep NF can resolve `nf[i]` to itself without ever
+        // needing to expand through that merge, e.g. a self-referential
+        // `x = x·y·z`). Such a leaf is EQUALITY-PINNED and `memb_seeds`
+        // (model.rs) — the carve-out's own stated repair-eligibility
+        // authority — would refuse to seed it. Carving out here anyway
+        // leaves NEITHER path deciding the atom (the it194 root cause: a
+        // hard `Unknown` bailout). Gate on the SAME check `memb_seeds` uses
+        // (`model::is_repair_pinned`, shared, not duplicated): a pinned lone
+        // leaf falls through to the pre-existing Rule-S/Rule-E unfolding
+        // below, exactly the pre-slice-26 behavior for that atom.
+        let carve_out_eligible =
+            lone_leaf && !model::is_repair_pinned(cx.terms, cx.eq, known, nf[i]);
+        if carve_out_eligible && !matches!(cur, Rex::Empty | Rex::Eps) {
+            if !side_clean(cx.eq, cx.terms, t, input_cond_roots) {
+                continue;
+            }
+            let residual = nf[i];
+            let lr = wordeq::len_of(cx.terms, residual);
+            let guard = Some(lit.negate());
+            let mut bounds: Vec<TermId> = Vec::new();
+            let lo = regex::min_len(&cur);
+            if lo > 0 {
+                let k = cx.terms.mk_numeral(
+                    shinri_core::Rational::from_int(i128::from(lo).into()),
+                    cx.terms.int_sort(),
+                );
+                bounds.push(
+                    cx.terms
+                        .mk_app(Op::Builtin(BuiltinOp::Ge), &[lr, k])
+                        .expect("(>= len k) well-sorted"),
+                );
+            }
+            if let Some(hi) = regex::max_len(&cur) {
+                let k = cx.terms.mk_numeral(
+                    shinri_core::Rational::from_int(i128::from(hi).into()),
+                    cx.terms.int_sort(),
+                );
+                bounds.push(
+                    cx.terms
+                        .mk_app(Op::Builtin(BuiltinOp::Le), &[lr, k])
+                        .expect("(<= len k) well-sorted"),
+                );
+            }
+            for b in bounds {
+                if s.emitted_len_axioms.contains(&b) {
+                    continue;
+                }
+                s.emitted_len_axioms.insert(b);
+                return Some(emit_split(s, cx.terms, vec![b], guard));
             }
             continue;
         }
@@ -598,10 +682,18 @@ mod tests {
         // x ∈ [a-c]* (not head-forced, nullable): ONE guarded clause whose
         // atoms are the ε equality + one membership per class with a
         // non-empty derivative (here exactly one: [a-c]·[a-c]*).
+        //
+        // Slice 26 carrier truth-up: a LONE leaf x now takes the leaf
+        // carve-out (no Rule-E expansion), so pin Rule E's shape on a
+        // two-atom carrier x·y, which is not repair-eligible.
         let mut ctx = Context::new();
         let x = var(&mut ctx, "x");
+        let y = var(&mut ctx, "y");
+        let xy = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
         let r = regex::star_range_test('a', 'c');
-        let m = memb_atom(&mut ctx, x, &r);
+        let m = memb_atom(&mut ctx, xy, &r);
         let (mut s, mut eq_e, atoms) = harness(&mut ctx);
         let mut cx = TheoryCtx {
             terms: &mut ctx,
@@ -642,7 +734,7 @@ mod tests {
         // One disjunct is x = "" and the other a str.in_re atom on x.
         let memb_disj = disj.iter().find(|t| is_memb(t)).unwrap();
         let (mt, _) = super::memb_sides(cx.terms, *memb_disj);
-        assert_eq!(mt, x);
+        assert_eq!(mt, xy);
         let eq_disj = disj.iter().find(|t| !is_memb(t)).unwrap();
         let (l, rr) = crate::wordeq::sides(cx.terms, *eq_disj);
         assert!(
@@ -653,19 +745,30 @@ mod tests {
 
     #[test]
     fn rule_s_head_split_clause_sequence() {
-        // x ∈ [a-c]·"b" — head-forced with a non-ε residual: S1..S4 in
+        // x·y ∈ [a-c]·"b" — head-forced with a non-ε residual: S1..S4 in
         // order, then fixpoint. (Shape changed for the Task-4 bare-range
         // leaf skip: the original `[a-c]` — the smart constructor collapses
         // `[a-c]·(str.to_re "")` to a bare `Rex::Range` — is now a repair
         // LEAF on which Rule S deliberately never fires; a concat with a
         // non-ε tail remains genuinely head-forced.)
+        //
+        // Slice 26 carrier truth-up: a LONE leaf x over this same regex now
+        // takes the general leaf carve-out (see
+        // `lone_leaf_finite_concat_emits_both_bounds`), so pin Rule S's
+        // clause-sequence shape on a two-atom carrier x·y, which is not
+        // repair-eligible. Rule S still peels `residual_atoms[0] = x`, so
+        // every existing assertion below holds verbatim.
         let mut ctx = Context::new();
         let x = var(&mut ctx, "x");
+        let y = var(&mut ctx, "y");
+        let xy = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
         let r = regex::concat(vec![
             Rex::Range('a' as u32, 'c' as u32),
             regex::lit_test("b"),
         ]);
-        let m = memb_atom(&mut ctx, x, &r);
+        let m = memb_atom(&mut ctx, xy, &r);
         let (mut s, mut eq_e, atoms) = harness(&mut ctx);
         let mut cx = TheoryCtx {
             terms: &mut ctx,
@@ -830,6 +933,139 @@ mod tests {
     }
 
     #[test]
+    fn lone_leaf_star_tail_carves_out_with_min_len_axiom() {
+        // Slice 26: x ∈ "b"·Σ·Σ* over a lone free leaf — the general LEAF
+        // carve-out. NO Rule-S/E split ever fires (no skolems, no seam
+        // churn); exactly ONE guarded [(>= (str.len x) 2)] clause (star
+        // tail ⇒ no finite upper bound); then saturate to the model-repair
+        // path.
+        let mut ctx = Context::new();
+        let x = var(&mut ctx, "x");
+        let sigma = Rex::Range(0, regex::MAX_CODE);
+        let r = regex::concat(vec![
+            Rex::Range('b' as u32, 'b' as u32),
+            sigma.clone(),
+            regex::star(sigma),
+        ]);
+        let m = memb_atom(&mut ctx, x, &r);
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), m);
+        s.test_force_memb_true(m, true);
+        let (splits, terminal) = run_rounds(&mut s, &mut cx, 16);
+        assert!(
+            matches!(terminal, TCheck::Sat),
+            "leaf saturates to the model-repair path"
+        );
+        let is_memb = |terms: &Context, t: TermId| {
+            matches!(
+                terms.term_node(t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrInRe),
+                    ..
+                }
+            )
+        };
+        assert!(
+            splits
+                .iter()
+                .all(|(a, _)| !a.iter().any(|&t| is_memb(cx.terms, t))),
+            "leaf carve-out must never emit an S/E membership split"
+        );
+        let is_ge = |terms: &Context, t: TermId| {
+            matches!(
+                terms.term_node(t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::Ge),
+                    ..
+                }
+            )
+        };
+        let is_le = |terms: &Context, t: TermId| {
+            matches!(
+                terms.term_node(t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::Le),
+                    ..
+                }
+            )
+        };
+        let ge_splits: Vec<_> = splits
+            .iter()
+            .filter(|(a, g)| *g && a.len() == 1 && is_ge(cx.terms, a[0]))
+            .collect();
+        assert_eq!(
+            ge_splits.len(),
+            1,
+            "exactly one guarded [(>= len 2)] lower-bound clause"
+        );
+        assert!(
+            !splits
+                .iter()
+                .any(|(a, g)| *g && a.len() == 1 && is_le(cx.terms, a[0])),
+            "star tail has no finite upper bound — no guarded le clause"
+        );
+    }
+
+    #[test]
+    fn lone_leaf_finite_concat_emits_both_bounds() {
+        // Slice 26: x ∈ [a-c]·"b" — the shape the old Rule-S clause test
+        // used. Now a LEAF: two guarded single-atom bound clauses
+        // ([(>= len 2)] and [(<= len 2)]) across successive rounds, no
+        // S-splits, terminal Sat.
+        let mut ctx = Context::new();
+        let x = var(&mut ctx, "x");
+        let r = regex::concat(vec![
+            Rex::Range('a' as u32, 'c' as u32),
+            regex::lit_test("b"),
+        ]);
+        let m = memb_atom(&mut ctx, x, &r);
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), m);
+        s.test_force_memb_true(m, true);
+        let (splits, terminal) = run_rounds(&mut s, &mut cx, 16);
+        assert!(matches!(terminal, TCheck::Sat));
+        let is_memb = |terms: &Context, t: TermId| {
+            matches!(
+                terms.term_node(t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrInRe),
+                    ..
+                }
+            )
+        };
+        assert!(
+            splits
+                .iter()
+                .all(|(a, _)| !a.iter().any(|&t| is_memb(cx.terms, t))),
+            "finite lone-leaf membership must not unfold either"
+        );
+        let is_cmp = |terms: &Context, t: TermId| {
+            matches!(
+                terms.term_node(t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::Ge | BuiltinOp::Le),
+                    ..
+                }
+            )
+        };
+        let bound_splits: Vec<_> = splits
+            .iter()
+            .filter(|(a, g)| *g && a.len() == 1 && is_cmp(cx.terms, a[0]))
+            .collect();
+        assert_eq!(bound_splits.len(), 2, "ge + le bound clauses, one each");
+    }
+
+    #[test]
     fn empty_language_residual_conflicts() {
         // x ∈ re.none survives the pre-pass only when minted mid-search, but
         // the rule must still conflict on it directly.
@@ -862,9 +1098,20 @@ mod tests {
         // not here). Critically, saturation must not pollute the dedup
         // keys: a key minted for a never-emitted lemma would silently drop
         // that lemma forever.
+        //
+        // Slice 26 carrier truth-up: a LONE leaf `x` now takes the general
+        // leaf carve-out (and, for `[a-c]*`, `min_len=0`/`max_len=None`
+        // yields an empty bounds set, so the carve-out silently continues
+        // forever — see `lone_leaf_star_zero_bounds_carves_out_silently`),
+        // so this fuel/dedup-saturation pin rides a two-atom carrier `x·y`,
+        // which is not repair-eligible and still routes through Rule E.
         let mut ctx = Context::new();
         let x = var(&mut ctx, "x");
-        let m = memb_atom(&mut ctx, x, &regex::star_range_test('a', 'c'));
+        let y = var(&mut ctx, "y");
+        let xy = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
+        let m = memb_atom(&mut ctx, xy, &regex::star_range_test('a', 'c'));
         let (mut s, mut eq_e, atoms) = harness(&mut ctx);
         let mut cx = TheoryCtx {
             terms: &mut ctx,
@@ -897,6 +1144,126 @@ mod tests {
         assert!(
             matches!(s.check(&mut cx, Effort::Full), TCheck::Split { .. }),
             "the saturated round dropped nothing — the expansion now emits"
+        );
+    }
+
+    #[test]
+    fn lone_leaf_star_zero_bounds_carves_out_silently() {
+        // Slice 26: pins the EMPTY-bounds branch of the general leaf
+        // carve-out. x ∈ [a-c]* is a lone leaf whose `cur` is
+        // `Star(Range('a','c'))`: `min_len == 0` (no `Ge` bound) and
+        // `max_len == None` (no `Le` bound, unbounded tail) — so the
+        // carve-out's `bounds` vec is empty and it silently `continue`s
+        // every round, contributing NO fact and never falling through to
+        // Rule S/E. The atom is left entirely for model repair, and
+        // "" is nullable so the repair witness is immediate: terminal Sat,
+        // with NO splits of any kind and no length-axiom keys minted.
+        let mut ctx = Context::new();
+        let x = var(&mut ctx, "x");
+        let m = memb_atom(&mut ctx, x, &regex::star_range_test('a', 'c'));
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), m);
+        s.test_force_memb_true(m, true);
+        let (splits, terminal) = run_rounds(&mut s, &mut cx, 16);
+        assert!(
+            matches!(terminal, TCheck::Sat),
+            "empty-bounds leaf carve-out saturates straight to the model-repair path"
+        );
+        assert!(
+            splits.is_empty(),
+            "no bound to contribute (min_len=0, max_len=None) ⇒ no split of any kind"
+        );
+        assert!(
+            s.emitted_len_axioms.is_empty(),
+            "no length-axiom key minted when bounds is empty"
+        );
+    }
+
+    #[test]
+    fn equality_pinned_leaf_falls_back_to_unfolding() {
+        // Slice 26 Task 6b: pins the eligibility gap in the general leaf
+        // carve-out. Same nullable/unbounded shape as
+        // `lone_leaf_star_zero_bounds_carves_out_silently` (`x ∈ [a-c]*`,
+        // `cur = Star(Range('a','c'))`, empty `bounds`) — but here `x` is
+        // ALSO equality-merged with a concat over itself (`x = x·y·z`, the
+        // exact shape of the it194 regression repro,
+        // `s0 = s0·s1·s2` / `s0 ∈ ((b-c){0,2})*`). Deep NF still resolves
+        // `x`'s own read to the bare atom `x` (self-referential merges don't
+        // force expansion of the QUERIED term's own read), so the carve-out's
+        // NF-local `lone_leaf` check reads true — but `x`'s equality class
+        // now holds the concat `x·y·z`, which `memb_seeds` would reject as
+        // repair-ineligible (`pinned`). Pre-fix, this leaves the atom
+        // undecided by BOTH the carve-out (silent, empty bounds) and
+        // `memb_seeds` (correctly refuses to seed a pinned leaf) — the
+        // slice-26 root cause. Post-fix, the carve-out must defer to Rule
+        // S/E unfolding instead: a Rule-E expansion split (a `str.in_re`
+        // disjunct on `x`) is emitted, exactly `rule_e_expansion_shape`'s
+        // shape. NOTE the asserted equality `x = x·y·z` is itself a plain
+        // user equality — the word-equation loop's OWN F-split over it
+        // (unrelated to this fix) also contributes guarded splits, so the
+        // assertions below filter specifically for a MEMBERSHIP expansion
+        // (a `str.in_re` disjunct), not merely "some split happened".
+        let mut ctx = Context::new();
+        let x = var(&mut ctx, "x");
+        let y = var(&mut ctx, "y");
+        let z = var(&mut ctx, "z");
+        let xyz = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y, z])
+            .unwrap();
+        let eq = ctx.mk_eq(x, xyz).unwrap();
+        let m = memb_atom(&mut ctx, x, &regex::star_range_test('a', 'c'));
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), eq);
+        s.new_var(&mut cx, shinri_core::Var::new(1), m);
+        s.test_force_eq_true(eq);
+        // Unit tests drive the eq engine EXPLICITLY (the Combiner does this
+        // in production) — same incantation as `rule_g_ground_conflict_and_discharge`.
+        let (xn, cn) = (cx.eq.intern(x), cx.eq.intern(xyz));
+        let _ = cx
+            .eq
+            .merge(xn, cn, shinri_theory::types::EqJust::Definitional);
+        s.test_force_memb_true(m, true);
+        let (splits, terminal) = run_rounds(&mut s, &mut cx, 16);
+        let is_memb = |t: &TermId| {
+            matches!(
+                cx.terms.term_node(*t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrInRe),
+                    ..
+                }
+            )
+        };
+        let membership_expansions: Vec<_> = splits
+            .iter()
+            .filter(|(atoms, _)| atoms.iter().any(is_memb))
+            .collect();
+        assert_eq!(
+            membership_expansions.len(),
+            1,
+            "equality-pinned leaf must fall through to a Rule-E membership \
+             expansion, not the silent carve-out (memb_seeds would refuse \
+             to repair it) — pre-fix this is 0 (carve-out contributes \
+             nothing, every split observed here comes from the equality's \
+             OWN word-equation F-split, unrelated to this fix)"
+        );
+        let (disj, guarded) = membership_expansions[0];
+        assert!(*guarded, "Rule-E expansion must be guarded by ¬lit");
+        assert_eq!(disj.len(), 2, "ε disjunct + one live class disjunct");
+        assert!(
+            matches!(terminal, TCheck::Sat),
+            "the fallback unfolding reaches a Sat fixpoint on this \
+             satisfiable shape (x = \"\" ∧ y = z = \"\" is a model), \
+             never a fenced Unknown/Conflict"
         );
     }
 

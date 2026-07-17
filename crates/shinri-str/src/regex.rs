@@ -164,7 +164,27 @@ pub(crate) fn inter(parts: Vec<Rex>) -> Rex {
         // but be safe: the intersection of no languages is Σ*.
         0 => star(Rex::Range(0, MAX_CODE)),
         1 => out.pop().expect("len 1"),
-        _ => Rex::Inter(out),
+        _ => {
+            // Slice 26 Task 6a: collapse a BOUNDS-CERTIFIED empty
+            // intersection at construction. `min_len`/`max_len` are sound
+            // (resp. lower/upper) bounds on every word's length in the
+            // built Rex's language (see their doc comments); for `Inter`
+            // specifically, `min_len` = max of the arm min_lens and
+            // `max_len` = min of the FINITE arm max_lens are each derived
+            // from the very shape we just built, so if the lower bound
+            // exceeds a known finite upper bound, no length is
+            // simultaneously admissible by every arm: L = ∅. This is the
+            // structural counterpart of `comp()`'s universal/empty
+            // collapse (slice 25 task 5b) — a smart constructor catching
+            // an emptiness the naive shape would otherwise hide (here,
+            // from a surrounding `concat()`'s all-or-nothing Empty check,
+            // which only sees the per-arm bounds, not their combination).
+            let built = Rex::Inter(out);
+            match max_len(&built) {
+                Some(hi) if min_len(&built) > hi => Rex::Empty,
+                _ => built,
+            }
+        }
     }
 }
 
@@ -247,6 +267,61 @@ pub(crate) fn nullable(r: &Rex) -> bool {
         Rex::Union(ps) => ps.iter().any(nullable),
         Rex::Comp(inner) => !nullable(inner),
         Rex::Loop(inner, lo, _) => *lo == 0 || nullable(inner),
+    }
+}
+
+/// Sound LOWER bound on accepted-word length: every `w ∈ L(r)` has
+/// `|w| ≥ min_len(r)`. Exact for the range/concat/union/inter/star/loop
+/// shapes the membership pass mints; conservative (0) for `Comp`. `Empty`
+/// returns 0 — vacuously sound (L = ∅); the memb.rs leaf arm never consults
+/// it for `Empty` (excluded there so the Rule-E conflict path keeps firing).
+///
+/// Uses SATURATING arithmetic deliberately: unlike `max_len` (below), a
+/// lower bound stays sound even when the true value overflows `u32` and
+/// saturation caps it DOWN — a smaller-than-true lower bound is still a
+/// valid lower bound (`|w| ≥ min_len(r)` still holds; it's just not tight).
+/// Do not "fix" this to checked arithmetic — the asymmetry with `max_len`
+/// is intentional. Only an upper bound can be pushed the *wrong* direction
+/// by saturation, which is why `max_len` needs `None`-on-overflow instead.
+pub(crate) fn min_len(r: &Rex) -> u32 {
+    match r {
+        Rex::Empty | Rex::Eps | Rex::Star(_) | Rex::Comp(_) => 0,
+        Rex::Range(..) => 1,
+        Rex::Concat(ps) => ps.iter().map(min_len).fold(0u32, u32::saturating_add),
+        Rex::Union(ps) => ps.iter().map(min_len).min().unwrap_or(0),
+        Rex::Inter(ps) => ps.iter().map(min_len).max().unwrap_or(0),
+        Rex::Loop(inner, lo, _) => min_len(inner).saturating_mul(*lo),
+    }
+}
+
+/// Sound UPPER bound: `Some(k)` ⟹ every `w ∈ L(r)` has `|w| ≤ k`; `None`
+/// when no finite bound is known (star, comp, any unbounded part, OR the
+/// true bound overflows `u32`). For `Inter` the MIN of the finite arm
+/// bounds is sound (a word must satisfy every arm); for `Union`/`Concat`
+/// one unbounded arm forfeits the bound.
+///
+/// Uses CHECKED arithmetic: overflow must yield `None`, not a saturated
+/// `u32::MAX`. A saturated value SILENTLY UNDER-STATES the true maximum
+/// (e.g. `(_ re.loop 0 3000000000)` over a 2-char literal has a true max of
+/// 6·10⁹, but `u32::MAX` ≈ 4.3·10⁹ is smaller) — that would make the sound
+/// upper bound unsound. `None` (no known finite bound) is always safe here;
+/// a wrong-but-finite bound is not. See `min_len` above for why the lower
+/// bound doesn't need this.
+pub(crate) fn max_len(r: &Rex) -> Option<u32> {
+    match r {
+        Rex::Empty | Rex::Eps => Some(0),
+        Rex::Range(..) => Some(1),
+        Rex::Star(_) | Rex::Comp(_) => None,
+        Rex::Concat(ps) => ps
+            .iter()
+            .map(max_len)
+            .try_fold(0u32, |a, b| a.checked_add(b?)),
+        Rex::Union(ps) => ps
+            .iter()
+            .map(max_len)
+            .try_fold(0u32, |a, b| Some(a.max(b?))),
+        Rex::Inter(ps) => ps.iter().filter_map(max_len).min(),
+        Rex::Loop(inner, _, hi) => max_len(inner).and_then(|m| m.checked_mul(*hi)),
     }
 }
 
@@ -511,33 +586,142 @@ pub(crate) fn rex_to_term(ctx: &mut Context, r: &Rex) -> TermId {
 /// NON-SURROGATE code point (a pure-surrogate class has no Rust witness and
 /// is skipped — sound: skipping loses completeness only). `dead` memoizes
 /// (remaining, Rex) states with no word, preventing exponential re-search.
+/// The DFS carries an EXPLICIT frame stack: recursion would be one frame per
+/// character, and slice-26 length bounds legitimately request witnesses
+/// thousands of chars long — deep enough to overflow a 2 MiB test-thread
+/// stack in a debug build.
 pub(crate) fn search_word(r: &Rex, n: usize) -> Option<String> {
-    fn go(
-        r: &Rex,
-        n: usize,
-        steps: &mut usize,
-        dead: &mut FxHashSet<(usize, Rex)>,
-        out: &mut String,
-    ) -> bool {
+    /// Prologue of a DFS visit: terminal checks + memo lookup, no descent.
+    enum Visit {
+        /// The state completes a word (`n` hit 0 on a nullable state).
+        Word,
+        /// The state provably contributes no word — try the next sibling.
+        DeadEnd,
+        /// The state needs exploring: its next-character classes.
+        Explore(Vec<(u32, u32)>),
+    }
+    fn visit(state: &Rex, n: usize, steps: &mut usize, dead: &FxHashSet<(usize, Rex)>) -> Visit {
         if *steps >= MEMB_SEARCH_STEP_CAP {
-            return false;
+            return Visit::DeadEnd;
         }
         *steps += 1;
         if n == 0 {
-            return nullable(r);
+            return if nullable(state) {
+                Visit::Word
+            } else {
+                Visit::DeadEnd
+            };
         }
-        if matches!(r, Rex::Empty) {
-            return false;
+        if matches!(state, Rex::Empty) {
+            return Visit::DeadEnd;
         }
-        let key = (n, r.clone());
-        if dead.contains(&key) {
-            return false;
+        if dead.contains(&(n, state.clone())) {
+            return Visit::DeadEnd;
         }
-        if let Some(classes) = next_classes(r) {
+        Visit::Explore(next_classes(state).unwrap_or_default())
+    }
+
+    struct Frame {
+        /// Memo key: (remaining length, state). Inserted into `dead` once
+        /// every class is exhausted without a word.
+        key: (usize, Rex),
+        classes: Vec<(u32, u32)>,
+        /// Next class index to try.
+        idx: usize,
+    }
+
+    let mut steps = 0usize;
+    let mut dead: FxHashSet<(usize, Rex)> = FxHashSet::default();
+    let mut out = String::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    match visit(r, n, &mut steps, &dead) {
+        Visit::Word => return Some(out),
+        Visit::DeadEnd => return None,
+        Visit::Explore(classes) => stack.push(Frame {
+            key: (n, r.clone()),
+            classes,
+            idx: 0,
+        }),
+    }
+    'descend: while let Some(mut f) = stack.pop() {
+        while f.idx < f.classes.len() {
+            let (lo, hi) = f.classes[f.idx];
+            f.idx += 1;
+            // Smallest non-surrogate witness in the class (boundaries can
+            // only be 0xD800 / 0xDFFF, so lo either avoids the block or
+            // the block ends inside the class at 0xDFFF).
+            let c = if (SURR_LO..=SURR_HI).contains(&lo) {
+                if hi > SURR_HI {
+                    SURR_HI + 1
+                } else {
+                    continue; // pure-surrogate class: no Rust witness
+                }
+            } else {
+                lo
+            };
+            let d = deriv(c, &f.key.1);
+            if node_count(&d) > FUEL_NODE_CAP {
+                continue;
+            }
+            out.push(char::from_u32(c).expect("non-surrogate in-alphabet"));
+            let rem = f.key.0 - 1;
+            match visit(&d, rem, &mut steps, &dead) {
+                Visit::Word => return Some(out),
+                Visit::DeadEnd => {
+                    out.pop();
+                }
+                Visit::Explore(classes) => {
+                    stack.push(f);
+                    stack.push(Frame {
+                        key: (rem, d),
+                        classes,
+                        idx: 0,
+                    });
+                    continue 'descend;
+                }
+            }
+        }
+        // Every class exhausted without a word: memoize and backtrack. The
+        // char popped is the one pushed when this frame was entered; the
+        // root frame has no entering char and `out` is empty — pop is a
+        // no-op there.
+        dead.insert(f.key);
+        out.pop();
+    }
+    None
+}
+
+/// The SHORTEST word in L(r), or None if none is found within
+/// `MEMB_SEARCH_STEP_CAP` expanded states (an abort is NOT a verdict — the
+/// caller leaves the variable un-seeded and the post-solve self-check
+/// backstops, exactly like `search_word`). Breadth-first over
+/// next-character classes, so the first nullable state reached sits at the
+/// minimal length; per class the witness char is the smallest non-surrogate
+/// code point (pure-surrogate classes are skipped — sound: completeness
+/// only). Visited Rex states are memoized globally: re-reaching a state at
+/// a longer prefix can only yield longer words, so it is skipped.
+pub(crate) fn search_shortest(r: &Rex) -> Option<String> {
+    let mut steps = 0usize;
+    let mut seen: FxHashSet<Rex> = FxHashSet::default();
+    seen.insert(r.clone());
+    let mut frontier: Vec<(Rex, String)> = vec![(r.clone(), String::new())];
+    while !frontier.is_empty() {
+        let mut next: Vec<(Rex, String)> = Vec::new();
+        for (state, word) in frontier {
+            if nullable(&state) {
+                return Some(word);
+            }
+            if matches!(state, Rex::Empty) {
+                continue;
+            }
+            if steps >= MEMB_SEARCH_STEP_CAP {
+                return None;
+            }
+            steps += 1;
+            let Some(classes) = next_classes(&state) else {
+                continue;
+            };
             for (lo, hi) in classes {
-                // Smallest non-surrogate witness in the class (boundaries can
-                // only be 0xD800 / 0xDFFF, so lo either avoids the block or
-                // the block ends inside the class at 0xDFFF).
                 let c = if (SURR_LO..=SURR_HI).contains(&lo) {
                     if hi > SURR_HI {
                         SURR_HI + 1
@@ -547,28 +731,20 @@ pub(crate) fn search_word(r: &Rex, n: usize) -> Option<String> {
                 } else {
                     lo
                 };
-                let d = deriv(c, r);
+                let d = deriv(c, &state);
                 if node_count(&d) > FUEL_NODE_CAP {
                     continue;
                 }
-                out.push(char::from_u32(c).expect("non-surrogate in-alphabet"));
-                if go(&d, n - 1, steps, dead, out) {
-                    return true;
+                if seen.insert(d.clone()) {
+                    let mut w = word.clone();
+                    w.push(char::from_u32(c).expect("non-surrogate in-alphabet"));
+                    next.push((d, w));
                 }
-                out.pop();
             }
         }
-        dead.insert(key);
-        false
+        frontier = next;
     }
-    let mut out = String::new();
-    let mut steps = 0usize;
-    let mut dead = FxHashSet::default();
-    if go(r, n, &mut steps, &mut dead, &mut out) {
-        Some(out)
-    } else {
-        None
-    }
+    None
 }
 
 /// Ground membership of a CONCRETE string in the regex TERM `re_t`.
@@ -1240,6 +1416,33 @@ mod tests {
         );
         // Generic double-complement (pre-existing identity) still holds.
         assert_eq!(comp(comp(chr('a'))), chr('a'));
+    }
+
+    #[test]
+    fn inter_collapses_bounds_certified_empty_intersection() {
+        // Slice 26 task 6a: `re.inter (str.to_re "b") (str.to_re "")` (the
+        // it145 fuzz repro's shape) — two disjoint singletons {"b"} and
+        // {""}. Structurally: min_len(Inter) = max(1, 0) = 1, max_len(Inter)
+        // = min(Some(1), Some(0)) = Some(0). 1 > 0 is a sound emptiness
+        // certificate (no length is simultaneously admissible by both
+        // arms), so the smart constructor collapses to `Rex::Empty` instead
+        // of building `Inter([chr('b'), Eps])` and losing the
+        // contradiction to `concat()`'s all-or-nothing Empty check.
+        assert_eq!(inter(vec![chr('b'), Rex::Eps]), Rex::Empty);
+
+        // Negative: a·Σ* ∩ b·Σ* — the `targeted_leaf_membership_infinite_
+        // conflict_known_gap` shape. Both arms have min_len = 1, max_len =
+        // None (unbounded tail) — no FINITE upper bound exists on either
+        // arm, so `max_len(Inter)` is `None` and the collapse must NOT
+        // fire: no bounds certificate here, even though the languages are
+        // in fact disjoint (refuting that needs real intersection
+        // emptiness, banked as a known gap — see the pinned test).
+        let a_star = concat(vec![chr('a'), star(Rex::Range(0, MAX_CODE))]);
+        let b_star = concat(vec![chr('b'), star(Rex::Range(0, MAX_CODE))]);
+        assert_eq!(
+            inter(vec![a_star.clone(), b_star.clone()]),
+            Rex::Inter(vec![a_star, b_star])
+        );
     }
 
     #[test]
@@ -2083,6 +2286,119 @@ mod tests {
                 .collect(),
         );
         let _ = search_word(&hard, 40); // must terminate (None or Some) without hanging
+    }
+
+    #[test]
+    fn search_word_deep_witness_no_stack_overflow() {
+        // Regression pin (slice 26): `search_word` used to recurse once per
+        // character — a witness this deep overflowed the default 2 MiB
+        // test-thread stack, aborting the whole test binary. Σ* yields a
+        // single next-character class, so the 9000-char descent costs exactly
+        // 9001 visited states — inside MEMB_SEARCH_STEP_CAP with the
+        // explicit-stack DFS, and 9000 stack frames if the O(n) recursion
+        // ever returns.
+        let sigma_star = Rex::Star(Box::new(Rex::Range(0, MAX_CODE)));
+        let w = search_word(&sigma_star, 9000).expect("Σ* word of length 9000");
+        assert_eq!(w.chars().count(), 9000);
+    }
+
+    #[test]
+    fn search_shortest_finds_minimal_words() {
+        let sigma = Rex::Range(0, MAX_CODE);
+        let sigma_star = star(Rex::Range(0, MAX_CODE));
+        let b = Rex::Range('b' as u32, 'b' as u32);
+        let c = Rex::Range('c' as u32, 'c' as u32);
+        // b·Σ·Σ*: shortest word has exactly 2 chars and is a member.
+        let strict = concat(vec![b.clone(), sigma.clone(), sigma_star.clone()]);
+        let w = search_shortest(&strict).unwrap();
+        assert_eq!(w.chars().count(), 2);
+        assert_eq!(eval_membership(&w, &strict), Some(true));
+        // Union with a trivially-short arm: (bc·Σ* ∪ "q") → the length-1 arm.
+        let bc_star = concat(vec![b.clone(), c.clone(), sigma_star.clone()]);
+        let q = Rex::Range('q' as u32, 'q' as u32);
+        let u = union(vec![bc_star, q]);
+        let wq = search_shortest(&u).unwrap();
+        assert_eq!(wq, "q");
+        // Nullable goal: the shortest word is ε.
+        assert_eq!(search_shortest(&sigma_star), Some(String::new()));
+        // Empty intersection: no word at any length — None, terminating.
+        let empty = inter(vec![b.clone(), c.clone()]);
+        assert_eq!(search_shortest(&empty), None);
+        // Rex::Empty: None.
+        assert_eq!(search_shortest(&Rex::Empty), None);
+        // Pure-surrogate language: no Rust witness — None (skipped classes).
+        assert_eq!(search_shortest(&Rex::Range(0xD800, 0xDFFF)), None);
+    }
+
+    #[test]
+    fn min_max_len_bounds() {
+        let sigma = Rex::Range(0, MAX_CODE);
+        let sigma_star = star(Rex::Range(0, MAX_CODE));
+        let b = Rex::Range('b' as u32, 'b' as u32);
+        let c = Rex::Range('c' as u32, 'c' as u32);
+        // The strict-< gadget arm: b·Σ·Σ* — min 2, no upper bound.
+        let strict = concat(vec![b.clone(), sigma.clone(), sigma_star.clone()]);
+        assert_eq!(min_len(&strict), 2);
+        assert_eq!(max_len(&strict), None);
+        // The full order gadget: Range(c,MAX)·Σ* ∪ b·Σ·Σ* — min 1 (above arm).
+        let above = concat(vec![Rex::Range('c' as u32, MAX_CODE), sigma_star.clone()]);
+        let gadget = union(vec![above, strict.clone()]);
+        assert_eq!(min_len(&gadget), 1);
+        assert_eq!(max_len(&gadget), None);
+        // Finite concat: b·Σ·Σ — exactly [3,3].
+        let finite = concat(vec![b.clone(), sigma.clone(), sigma.clone()]);
+        assert_eq!(min_len(&finite), 3);
+        assert_eq!(max_len(&finite), Some(3));
+        // Bare range: the degenerate [1,1] (the sibling leaf arm's axiom).
+        assert_eq!(min_len(&b), 1);
+        assert_eq!(max_len(&b), Some(1));
+        // Word via concat of ranges: "bc" then Σ* — min 2, unbounded.
+        let bc_star = concat(vec![b.clone(), c.clone(), sigma_star.clone()]);
+        assert_eq!(min_len(&bc_star), 2);
+        assert_eq!(max_len(&bc_star), None);
+        // Nullable shapes: 0.
+        assert_eq!(min_len(&sigma_star), 0);
+        assert_eq!(max_len(&sigma_star), None);
+        assert_eq!(min_len(&Rex::Eps), 0);
+        assert_eq!(max_len(&Rex::Eps), Some(0));
+        // Comp is conservative: [0, None] — sound, not exact.
+        assert_eq!(min_len(&comp(b.clone())), 0);
+        assert_eq!(max_len(&comp(b.clone())), None);
+        // Inter: min is the MAX of arm minima; max is the MIN of finite arm maxima.
+        let i = inter(vec![strict.clone(), finite.clone()]);
+        assert_eq!(min_len(&i), 3);
+        assert_eq!(max_len(&i), Some(3));
+        // Loop: r{2,4} over a single char.
+        let l = loop_(b.clone(), 2, 4);
+        assert_eq!(min_len(&l), 2);
+        assert_eq!(max_len(&l), Some(4));
+        // Union with an unbounded arm has no finite max.
+        assert_eq!(max_len(&union(vec![b.clone(), sigma_star])), None);
+    }
+
+    // slice-26 final-review soundness fix: `max_len` must yield `None` (not
+    // a saturated, too-small `u32::MAX`) whenever the true upper bound
+    // overflows `u32`. A saturated value here would understate the true
+    // maximum and turn the memb.rs leaf `len ≤ max_len` axiom unsound
+    // (wrong Unsat). See the `max_len` doc comment for the full rationale.
+    #[test]
+    fn max_len_overflow_yields_none() {
+        let b = Rex::Range('b' as u32, 'b' as u32);
+        let c = Rex::Range('c' as u32, 'c' as u32);
+        // Loop: a 2-char literal "bc" looped up to 3e9 times has a true max
+        // of 6e9, which overflows u32 (max ~4.3e9) — must be None, not a
+        // saturated (and too-small) u32::MAX.
+        let bc = concat(vec![b.clone(), c.clone()]);
+        let looped = loop_(bc, 0, 3_000_000_000);
+        assert_eq!(max_len(&looped), None);
+        // Concat: sum of finite child maxima overflows u32 — must be None.
+        let big = loop_(b.clone(), 0, u32::MAX);
+        let overflowing_concat = concat(vec![big.clone(), big]);
+        assert_eq!(max_len(&overflowing_concat), None);
+        // Non-regression: a comfortably finite case still returns the exact
+        // Some value.
+        let finite = concat(vec![b.clone(), c.clone(), b]);
+        assert_eq!(max_len(&finite), Some(3));
     }
 
     #[test]
