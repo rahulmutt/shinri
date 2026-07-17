@@ -1,7 +1,7 @@
 # Slice 28 design — Rex intersection-emptiness refutation
 
 Date: 2026-07-17
-Status: DESIGN (2026-07-17) — awaiting implementation plan.
+Status: IMPLEMENTED (2026-07-17). See "Implementation notes (truth-up)" at the end.
 
 Predecessor: slice 27 (arith conflict-core sanitization seam, landed
 2026-07-17). Slice 27's truth-up ("Newly banked: nothing") names exactly
@@ -236,3 +236,55 @@ adjudicated flip, not a blocker (slice-25/26 precedent).
   fuels by raising `MEMB_SEARCH_STEP_CAP` / `CLASS_SPLIT_CAP` /
   `FUEL_NODE_CAP` is banked; whatever the dump-and-diff surfaces beyond the
   caps gets banked, not fixed here.
+
+## Implementation notes (truth-up)
+
+Implemented 2026-07-17 on branch `slice28-regex-intersection-emptiness`
+(base `a5e77f05` = plan commit; spec `1750e90c`).
+
+**Landed as designed:**
+
+- `7681cf49` — §3 emptiness certificate: `pub(crate) enum Emptiness
+  { Empty, NonEmpty, Unknown }` + `pub(crate) fn language_empty(&Rex) ->
+  Emptiness` in `regex.rs` (derivative BFS; taint → `Unknown` on
+  `MEMB_SEARCH_STEP_CAP` / `next_classes` `None` (`CLASS_SPLIT_CAP`) /
+  `FUEL_NODE_CAP` blowup; pure-surrogate classes explored via class `lo` as
+  raw-`u32` derivative representative). 5 unit tests incl. surrogate-only
+  NonEmpty and 70-range class-split taint. Code verbatim from plan.
+- `38920543` — §4 check-path aggregation at the tail of `memb::memb_check`
+  (`memb.rs`): live memberships grouped by raw string-side `TermId` (same
+  key as `memb_seeds`), polarity folded via `comp`, intersected via `inter`;
+  conflict `TCheck::Conflict` citing exactly the contributing
+  `EqLeaf::Asserted` literals, emitted ONLY on certified `Emptiness::Empty`;
+  `extract_const_regex` `None` fences the atom; `len < 2` groups skipped.
+  2 unit tests (empty-intersection conflict; negative-fold non-empty
+  no-conflict). Code verbatim from plan.
+- `80437b3e` — §7 pins: `targeted_leaf_membership_infinite_conflict_known_gap`
+  flipped to `..._now_decides` (Unsat, z3-adjudicated); new
+  `targeted_intersection_three_way_first_char_empty_unsat` and
+  `targeted_intersection_nonempty_stays_sat`.
+
+**Deviations:** none in code (all three code diffs verbatim from the plan,
+modulo rustfmt). Process note: the plan's Task-3/Task-4 bare
+`cargo test -p shinri-solver --test qfs_differential` commands are vacuous —
+the whole file is `#![cfg(feature = "oracle")]`; all runs used
+`--features oracle`.
+
+**Oracle dump-and-diff (base `a5e77f05` vs fix `80437b3e`):** fix side
+79 passed / 0 failed / **0 shinri-vs-z3 disagreements / 0 guard-bailouts**
+across all 13 fuzz families; base side 77/0/0/0. Per-iteration diff
+(3683 base vs 3685 fix dump lines, hash-keyed): **8 flips, ALL
+`unknown → unsat`** — 7 in `qfs_str_order_single_char_matches_z3` (matches
+its aggregate 18→25 unsat / 7→0 unknown exactly) + 1 = the headline re-pin
+(same query hash). The +2 line delta = the two brand-new targeted pins (no
+base counterpart). Zero `decided → unknown`, zero `sat ↔ unsat`, zero
+bailout increases. Tallies reconcile: +1 sat, +9 unsat, −8 unknown.
+
+**Full gate at `80437b3e`:** `shinri-str` 197/197; oracle differential as
+above; `script_e2e` 67/67 (no pin flips — nothing to adjudicate);
+`cargo clippy --workspace --all-targets` 0 warnings; `cargo fmt --check`
+clean.
+
+**Newly banked:** nothing new. Standing bank unchanged: §8 non-goals
+(core minimization, cross-term/eq-class-aware aggregation, cap-raising) and
+spec §5's typed-antecedent refactor (slice-27 bank).
