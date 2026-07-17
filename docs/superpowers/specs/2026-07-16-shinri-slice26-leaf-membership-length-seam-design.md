@@ -317,7 +317,9 @@ z3 time/memory; pow300 pin asserts shinri-only), `015340b6` (docs: fix stale
 `inter()` collapses bounds-certified empty intersections), `aadc95ad`
 (Task 6 fix: carve-out requires repair-eligibility — equality-pinned leaves
 fall back to unfolding), `624360a7` (Task 6: flip `script_e2e` `in_re`
-known-gap pins to decided).
+known-gap pins to decided), `ffba9ec8` (Task 6: this spec truth-up), and
+`71ccd965` (Task 6c: `max_len` overflow yields `None` — the final
+whole-branch review's soundness fix, deviation (l)).
 
 ### Post-slice oracle tallies vs. the `7ba55ed` pre-slice baseline (all 13 families)
 
@@ -442,6 +444,25 @@ k. **Methodology note**: aggregate family tallies masked both regressions
    recommended house convention for future slices touching fuzz-exercised
    paths; aggregate-only comparison is not sufficient to rule out
    regressions.
+
+l. **Final whole-branch review finding (Important), fixed in-slice**
+   (`71ccd965`): `max_len`'s saturating arithmetic (`saturating_add` in the
+   Concat arm, `saturating_mul` in the Loop arm) capped results DOWN past
+   `u32::MAX`, violating the "every accepted word has `len ≤ max_len`"
+   contract that the carve-out's guarded upper-bound axiom relies on —
+   a confirmed wrong Unsat on `(_ re.loop 0 3000000000)("ab") ∧
+   len(s) = 6·10⁹` (semantically Sat: the singleton word `(ab)^{3·10⁹}`
+   has exactly that length; pre-fix verdict was `unsat`). Fixed by
+   overflow-⇒-`None` (`checked_add` via `try_fold`, `checked_mul`), so no
+   upper-bound axiom is emitted in the overflow regime; the sound verdict
+   there is Unknown (repair cannot realize a witness beyond `usize`
+   search scale), pinned by `targeted_leaf_membership_maxlen_overflow_not_unsat`
+   and the `max_len_overflow_yields_none` unit test. `min_len` keeps
+   saturating arithmetic deliberately — under-reporting a lower bound is
+   sound — with the asymmetry documented at both functions. The `inter()`
+   emptiness collapse is unaffected (an overflow `None` simply never
+   certifies emptiness). Outside the fuzz families' reach (generators never
+   emit billion-scale loop bounds), hence found only by review.
 
 ### Retained known gap
 
