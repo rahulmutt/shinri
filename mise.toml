@@ -4,13 +4,45 @@ rust = "1.97.1"
 "cargo:cargo-deny" = "0.20.2"
 "cargo:cargo-fuzz" = "0.13.2"
 "cargo:cargo-mutants" = "27.1.0"
+gitleaks = "8.30.1"
 "github:Z3Prover/z3" = { version = "z3-4.16.0", exe = "z3", matching = "x64-glibc" }
 "github:cvc5/cvc5" = { version = "cvc5-1.3.4", exe = "cvc5", matching = "x86_64-static.zip" }
 
+[tasks.lint]
+description = "rustfmt check + clippy (deny warnings)"
+run = [
+  "cargo fmt --all --check",
+  "cargo clippy --workspace --all-targets -- -D warnings",
+]
+
+[tasks.deny]
+description = "Dependency policy: bans, advisories, licenses (cargo-deny)"
+run = "cargo deny check"
+
+[tasks.secrets]
+description = "Secret scan of the working tree (gitleaks)"
+run = "gitleaks dir . --no-banner --redact"
+
 [tasks.test]
-description = "Fast test suite — skips #[ignore]d slow tests"
-run = "cargo test --workspace"
+description = "Fast test suite — skips #[ignore]d slow tests (blocking CI tier)"
+run = "cargo nextest run --all"
 
 [tasks.test-full]
-description = "Full test suite — includes #[ignore]d slow tests (e.g. baseline-B&B diophantine termination)"
-run = "cargo test --workspace -- --include-ignored"
+description = "Full test suite — includes #[ignore]d exhaustive/slow tests (nightly tier)"
+run = "cargo nextest run --all --run-ignored all"
+
+[tasks.fuzz-smoke]
+description = "Short libFuzzer budget per fuzz target (nightly rustc via mise); FUZZ_SECONDS overrides 60s"
+shell = "bash -c"
+run = """
+set -euo pipefail
+for spec in shinri-num:integer_ops shinri-theory:classify shinri-sat:dimacs_parse shinri-sat:cnf_vs_oracle; do
+  crate="${spec%%:*}"; target="${spec##*:}"
+  echo "== fuzz $crate/$target =="
+  (cd "crates/$crate" && mise x rust@nightly -- cargo fuzz run "$target" -- -max_total_time="${FUZZ_SECONDS:-60}")
+done
+"""
+
+[tasks.ci]
+description = "Everything the blocking CI tier runs: lint, deny, secrets, test"
+depends = ["lint", "deny", "secrets", "test"]
