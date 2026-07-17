@@ -747,6 +747,60 @@ pub(crate) fn search_shortest(r: &Rex) -> Option<String> {
     None
 }
 
+/// Three-valued emptiness of `L(r)`. `Empty` / `NonEmpty` are DECISIONS;
+/// `Unknown` means a fuel/partition cap prevented a complete traversal (an
+/// abort, NOT a verdict — the caller keeps its prior sound Unknown). `Empty`
+/// is returned ONLY when the entire reachable derivative automaton was
+/// explored, no reachable state is nullable, and no taint occurred.
+///
+/// Unlike `search_shortest`, this EXPLORES pure-surrogate character classes:
+/// a surrogate is a valid SMT-LIB code point, so a state whose only accepting
+/// path runs through a surrogate class denotes a NON-empty language. The
+/// class's `lo` is a valid derivative representative (every code point in a
+/// `next_classes` interval has identical derivative behaviour), and `deriv`
+/// takes a raw `u32`, so no `char` is materialised.
+pub(crate) enum Emptiness {
+    Empty,
+    NonEmpty,
+    Unknown,
+}
+
+pub(crate) fn language_empty(r: &Rex) -> Emptiness {
+    let mut steps = 0usize;
+    let mut seen: FxHashSet<Rex> = FxHashSet::default();
+    seen.insert(r.clone());
+    let mut frontier: Vec<Rex> = vec![r.clone()];
+    while !frontier.is_empty() {
+        let mut next: Vec<Rex> = Vec::new();
+        for state in frontier {
+            if nullable(&state) {
+                return Emptiness::NonEmpty;
+            }
+            if matches!(state, Rex::Empty) {
+                continue;
+            }
+            if steps >= MEMB_SEARCH_STEP_CAP {
+                return Emptiness::Unknown;
+            }
+            steps += 1;
+            let Some(classes) = next_classes(&state) else {
+                return Emptiness::Unknown; // CLASS_SPLIT_CAP overflow — taint
+            };
+            for (lo, _hi) in classes {
+                let d = deriv(lo, &state);
+                if node_count(&d) > FUEL_NODE_CAP {
+                    return Emptiness::Unknown; // derivative blowup — taint
+                }
+                if seen.insert(d.clone()) {
+                    next.push(d);
+                }
+            }
+        }
+        frontier = next;
+    }
+    Emptiness::Empty
+}
+
 /// Ground membership of a CONCRETE string in the regex TERM `re_t`.
 /// 3-valued for the post-solve witness self-check: `Some(verdict)` iff `s`
 /// is in-alphabet, `re_t` extracts as a constant regex, and evaluation stays
@@ -2654,5 +2708,55 @@ mod tests {
             head_forced(&back),
             Some((('c' as u32, MAX_CODE), star(Rex::Range(0, MAX_CODE))))
         );
+    }
+
+    // ── Task 1 (slice 28): language_empty — three-valued emptiness certificate
+
+    #[test]
+    fn language_empty_basic_shapes() {
+        // ∅ is empty; ε and Σ* are non-empty (both nullable).
+        assert!(matches!(language_empty(&Rex::Empty), Emptiness::Empty));
+        assert!(matches!(language_empty(&Rex::Eps), Emptiness::NonEmpty));
+        let sigma_star = Rex::Star(Box::new(Rex::Range(0, MAX_CODE)));
+        assert!(matches!(language_empty(&sigma_star), Emptiness::NonEmpty));
+    }
+
+    #[test]
+    fn language_empty_disjoint_infinite_tails() {
+        // a·Σ* ∩ b·Σ* — first char must be both 'a' and 'b' ⇒ empty language.
+        let sigma_star = Rex::Star(Box::new(Rex::Range(0, MAX_CODE)));
+        let a_tail = concat(vec![Rex::Range('a' as u32, 'a' as u32), sigma_star.clone()]);
+        let b_tail = concat(vec![Rex::Range('b' as u32, 'b' as u32), sigma_star]);
+        let goal = inter(vec![a_tail, b_tail]);
+        assert!(matches!(language_empty(&goal), Emptiness::Empty));
+    }
+
+    #[test]
+    fn language_empty_r_inter_comp_r_is_empty() {
+        // R ∩ comp(R) = ∅ — exercises the derivative over `Comp` and confirms
+        // negative-polarity folding is decided empty.
+        let sigma_star = Rex::Star(Box::new(Rex::Range(0, MAX_CODE)));
+        let r = concat(vec![Rex::Range('a' as u32, 'a' as u32), sigma_star]);
+        let goal = inter(vec![r.clone(), comp(r)]);
+        assert!(matches!(language_empty(&goal), Emptiness::Empty));
+    }
+
+    #[test]
+    fn language_empty_explores_surrogate_only_path() {
+        // A single-surrogate range is NON-empty: `search_word` skips this class
+        // (no Rust char), but a surrogate is a valid SMT-LIB code point, so the
+        // emptiness certificate must EXPLORE it and report NonEmpty.
+        let surr = Rex::Range(0xD800, 0xD800);
+        assert!(matches!(language_empty(&surr), Emptiness::NonEmpty));
+    }
+
+    #[test]
+    fn language_empty_class_split_overflow_taints_to_unknown() {
+        // > CLASS_SPLIT_CAP (64) distinct, non-adjacent first-char classes ⇒
+        // `next_classes` returns None ⇒ the traversal cannot complete ⇒ Unknown
+        // (a taint, NOT a false Empty).
+        let ranges: Vec<Rex> = (0u32..70).map(|i| Rex::Range(2 * i, 2 * i)).collect();
+        let many = union(ranges);
+        assert!(matches!(language_empty(&many), Emptiness::Unknown));
     }
 }
