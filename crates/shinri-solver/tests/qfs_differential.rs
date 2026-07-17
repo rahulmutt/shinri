@@ -4005,6 +4005,31 @@ fn targeted_leaf_membership_min_len_conflict_unsat() {
 }
 
 #[test]
+fn targeted_leaf_membership_maxlen_overflow_not_unsat() {
+    // slice-26 final-review soundness fix: saturating `max_len` made the
+    // guarded upper-bound axiom unsound past u32::MAX (wrong Unsat — the
+    // verdict was `unsat` pre-fix). `(_ re.loop 0 3000000000)` over the
+    // 2-char literal "ab" has a true max length of 6e9, which overflows
+    // u32 (max ~4.3e9); saturating arithmetic capped the emitted `len ≤
+    // max_len` axiom down to u32::MAX, contradicting the asserted
+    // `len(s) = 6000000000` and yielding a wrong Unsat. `max_len` now
+    // yields `None` on overflow, so no upper-bound axiom is emitted, and
+    // repair cannot realize a 6e9-char witness (out of reach) — the sound
+    // verdict is Unknown. Semantically the query is sat: the word
+    // (ab)^3000000000 has length exactly 6000000000. No z3 cross-check
+    // (z3 on a 3-billion loop is not worth poking) — assert the shinri
+    // verdict directly.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (str.in_re s ((_ re.loop 0 3000000000) (str.to_re \"ab\"))))\
+             (assert (= (str.len s) 6000000000))(check-sat)"
+        ),
+        Verdict::Unknown,
+    );
+}
+
+#[test]
 fn targeted_str_order_two_gadget_conjunction_decides() {
     // Slice 26: two order gadgets on one leaf — memb_seeds intersects all
     // of the leaf's Rexes, so ("b" < s) ∧ (s < "d") finds "c". z3: sat.

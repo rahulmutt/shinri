@@ -275,6 +275,14 @@ pub(crate) fn nullable(r: &Rex) -> bool {
 /// shapes the membership pass mints; conservative (0) for `Comp`. `Empty`
 /// returns 0 — vacuously sound (L = ∅); the memb.rs leaf arm never consults
 /// it for `Empty` (excluded there so the Rule-E conflict path keeps firing).
+///
+/// Uses SATURATING arithmetic deliberately: unlike `max_len` (below), a
+/// lower bound stays sound even when the true value overflows `u32` and
+/// saturation caps it DOWN — a smaller-than-true lower bound is still a
+/// valid lower bound (`|w| ≥ min_len(r)` still holds; it's just not tight).
+/// Do not "fix" this to checked arithmetic — the asymmetry with `max_len`
+/// is intentional. Only an upper bound can be pushed the *wrong* direction
+/// by saturation, which is why `max_len` needs `None`-on-overflow instead.
 pub(crate) fn min_len(r: &Rex) -> u32 {
     match r {
         Rex::Empty | Rex::Eps | Rex::Star(_) | Rex::Comp(_) => 0,
@@ -287,9 +295,18 @@ pub(crate) fn min_len(r: &Rex) -> u32 {
 }
 
 /// Sound UPPER bound: `Some(k)` ⟹ every `w ∈ L(r)` has `|w| ≤ k`; `None`
-/// when no finite bound is known (star, comp, or any unbounded part). For
-/// `Inter` the MIN of the finite arm bounds is sound (a word must satisfy
-/// every arm); for `Union`/`Concat` one unbounded arm forfeits the bound.
+/// when no finite bound is known (star, comp, any unbounded part, OR the
+/// true bound overflows `u32`). For `Inter` the MIN of the finite arm
+/// bounds is sound (a word must satisfy every arm); for `Union`/`Concat`
+/// one unbounded arm forfeits the bound.
+///
+/// Uses CHECKED arithmetic: overflow must yield `None`, not a saturated
+/// `u32::MAX`. A saturated value SILENTLY UNDER-STATES the true maximum
+/// (e.g. `(_ re.loop 0 3000000000)` over a 2-char literal has a true max of
+/// 6·10⁹, but `u32::MAX` ≈ 4.3·10⁹ is smaller) — that would make the sound
+/// upper bound unsound. `None` (no known finite bound) is always safe here;
+/// a wrong-but-finite bound is not. See `min_len` above for why the lower
+/// bound doesn't need this.
 pub(crate) fn max_len(r: &Rex) -> Option<u32> {
     match r {
         Rex::Empty | Rex::Eps => Some(0),
@@ -298,13 +315,13 @@ pub(crate) fn max_len(r: &Rex) -> Option<u32> {
         Rex::Concat(ps) => ps
             .iter()
             .map(max_len)
-            .try_fold(0u32, |a, b| Some(a.saturating_add(b?))),
+            .try_fold(0u32, |a, b| a.checked_add(b?)),
         Rex::Union(ps) => ps
             .iter()
             .map(max_len)
             .try_fold(0u32, |a, b| Some(a.max(b?))),
         Rex::Inter(ps) => ps.iter().filter_map(max_len).min(),
-        Rex::Loop(inner, _, hi) => max_len(inner).map(|m| m.saturating_mul(*hi)),
+        Rex::Loop(inner, _, hi) => max_len(inner).and_then(|m| m.checked_mul(*hi)),
     }
 }
 
@@ -2357,6 +2374,31 @@ mod tests {
         assert_eq!(max_len(&l), Some(4));
         // Union with an unbounded arm has no finite max.
         assert_eq!(max_len(&union(vec![b.clone(), sigma_star])), None);
+    }
+
+    // slice-26 final-review soundness fix: `max_len` must yield `None` (not
+    // a saturated, too-small `u32::MAX`) whenever the true upper bound
+    // overflows `u32`. A saturated value here would understate the true
+    // maximum and turn the memb.rs leaf `len ≤ max_len` axiom unsound
+    // (wrong Unsat). See the `max_len` doc comment for the full rationale.
+    #[test]
+    fn max_len_overflow_yields_none() {
+        let b = Rex::Range('b' as u32, 'b' as u32);
+        let c = Rex::Range('c' as u32, 'c' as u32);
+        // Loop: a 2-char literal "bc" looped up to 3e9 times has a true max
+        // of 6e9, which overflows u32 (max ~4.3e9) — must be None, not a
+        // saturated (and too-small) u32::MAX.
+        let bc = concat(vec![b.clone(), c.clone()]);
+        let looped = loop_(bc, 0, 3_000_000_000);
+        assert_eq!(max_len(&looped), None);
+        // Concat: sum of finite child maxima overflows u32 — must be None.
+        let big = loop_(b.clone(), 0, u32::MAX);
+        let overflowing_concat = concat(vec![big.clone(), big]);
+        assert_eq!(max_len(&overflowing_concat), None);
+        // Non-regression: a comfortably finite case still returns the exact
+        // Some value.
+        let finite = concat(vec![b.clone(), c.clone(), b]);
+        assert_eq!(max_len(&finite), Some(3));
     }
 
     #[test]
