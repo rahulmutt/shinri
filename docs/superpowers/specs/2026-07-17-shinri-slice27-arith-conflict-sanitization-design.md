@@ -252,3 +252,22 @@ unchanged. The remaining two Unknown-with-bailout=0 iterations surfaced by
 the dump are ordinary incompleteness, per this spec's non-goal ("whatever
 the dump-and-diff surfaces gets banked, not fixed here") — no new solver
 work identified.
+
+**Final whole-branch review (amendment):** verdict "ready to merge, with
+fixes" — 0 Critical / 0 Important / 3 Minor. The reviewer independently
+verified: all seven conflict exits route through `sanitize_conflict` (no
+other boundary exit exists; `integer_check` never returns `Conflict`);
+all five `fresh_sentinel` mint sites carry the correct resolve/drop rule;
+`pop` atomicity (bounds undo + `iface_justs` removal + `iface_lit` retain
+in one step) leaves no stale-bound window; the change is verdict-monotone
+(guard-bailout Unknowns become analyzable conflicts — nothing else moves).
+Findings: (1) a claimed truth-up inaccuracy ("the e2e pin asserts
+`theory_guard_bailouts == 0`") was REFUTED on direct read — `expect` →
+`shinri_verdict` → the strict `shinri_lines`, which does assert the
+bailout count is zero, so the sentence above stands; (2) the
+`sanitize_conflict` inner else-branch (iface tag present, justification
+missing — unreachable while `pop` stays atomic, but silently under-citing
+if that sync ever broke) hardened with an invariant comment +
+`debug_assert!` in `2049d854`; (3) a dropped word in the e2e pin's doc
+comment fixed in `a8c657f1`. Post-fix: shinri-arith 59/59, targeted e2e
+pin green, fmt clean.
