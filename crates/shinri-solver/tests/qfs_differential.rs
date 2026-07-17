@@ -133,7 +133,12 @@ fn z3_run(script: &str) -> String {
     use std::io::Write;
     use std::process::{Command, Stdio};
     let mut child = Command::new("z3")
-        .args(["-smt2", "-in"])
+        // Hard caps: a divergent query (e.g. `(_ re.^ 300)` over a 30-char
+        // literal, which grows ~250 MB/s without bound) must degrade to
+        // `timeout` / `(error "out of memory")` — both parsed as Unknown —
+        // instead of filling the container's cgroup limit. Verified against
+        // z3 4.16.0.
+        .args(["-smt2", "-in", "-T:120", "-memory:4096"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -3794,12 +3799,17 @@ fn targeted_regex_symbolic_fences_now_decide() {
     // Slice 26 (controller-adjudicated, plan deviation): same mechanism —
     // `re.^` is also a const-cur lone leaf, so the carve-out emits the
     // guarded len = 9000 bound and repair/model-length search finds the
-    // witness (self-check verifies it). z3 times out (2min) on this query,
-    // but sat is semantically forced regardless: L = {a^9000} is a
-    // nonempty singleton, so shinri's self-check-verified sat is correct.
-    expect(
-        "(set-logic QF_S)(declare-fun s () String)\
-         (assert (str.in_re s ((_ re.^ 300) (str.to_re \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"))))(check-sat)",
+    // witness (self-check verifies it). shinri-only assert: z3 4.16 DIVERGES
+    // on this query (unbounded memory growth; it OOM-killed the test
+    // container before z3_run grew its caps, and capped it returns
+    // `unknown`), so there is no oracle verdict to cross-check. Sat is
+    // semantically forced regardless: L = {a^9000} is a nonempty singleton,
+    // so shinri's self-check-verified sat is correct.
+    assert_eq!(
+        shinri_verdict(
+            "(set-logic QF_S)(declare-fun s () String)\
+             (assert (str.in_re s ((_ re.^ 300) (str.to_re \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"))))(check-sat)"
+        ),
         Verdict::Sat,
     );
 }
