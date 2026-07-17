@@ -271,3 +271,16 @@ if that sync ever broke) hardened with an invariant comment +
 `debug_assert!` in `2049d854`; (3) a dropped word in the e2e pin's doc
 comment fixed in `a8c657f1`. Post-fix: shinri-arith 59/59, targeted e2e
 pin green, fmt clean.
+
+**CI amendment (post-PR):** the first CI run failed on exactly one test
+across the full workspace: `script_e2e::str_suffixof_and_contains_positive_decide`,
+whose tail pin locked the Task-7.6 sound-`unknown` on
+`str.contains s "b" ∧ len(s) = 2`. That `unknown` was itself the
+analyzability-guard bailout this slice removes; the solver now decides
+`sat` (witness `s = "bE"`, self-check-verified; z3 re-confirmed sat,
+capped). Deciding-direction pin flip per slice-25/26 precedent, committed
+`8a085939` with the mechanism recorded in the test comment; full
+`script_e2e` 67/67 locally. Gate-coverage lesson: the plan's Task-5 gate
+list (shinri-arith + qfs_differential) omitted `script_e2e` — a
+completeness-shifting arith change can flip string-side e2e pins; include
+`script_e2e` in the local gate list for future completeness slices.
