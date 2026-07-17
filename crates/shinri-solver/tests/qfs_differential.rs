@@ -4126,7 +4126,7 @@ fn targeted_leaf_membership_equality_pinned_leaf_decides() {
 #[test]
 fn targeted_arith_iface_sentinel_conflict_now_decides() {
     // Slice 27 Tasks 1-2 regression fix, found by per-iteration oracle diff
-    // (`qfs_predicates_matches_z3` it — seed stream `0x51_2A_0000_0001`, query
+    // (`qfs_predicates_matches_z3` iteration — seed stream `0x51_2A_0000_0001`, query
     // hash `d9788e5ca38388b1` in the Task 3 dump-and-diff, `verdict-flips.txt`
     // row `d9788e5ca38388b1 ... unknown bail=1 -> sat bail=0`): `s0 suffixof
     // s2` plus a length equation over `s1++s2++"bb"` drives the arith
