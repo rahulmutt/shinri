@@ -817,6 +817,20 @@ impl Arith {
                     if let Some(&tag) = self.iface_lit.get(&l.code()) {
                         if let Some(j) = self.iface_justs.get(&tag) {
                             out.push(EqLeaf::Interface(*j));
+                        } else {
+                            // Unreachable while `pop` stays atomic: it removes a
+                            // tag's `iface_justs` entry, its `iface_lit` mapping,
+                            // and the bounds it justified in one uninterrupted
+                            // step, so no core can cite an iface bound whose
+                            // justification is gone. If that sync ever breaks,
+                            // silently dropping the leaf here would under-cite
+                            // the core (a too-strong learnt clause — unsound),
+                            // so fail loudly in debug builds instead.
+                            debug_assert!(
+                                false,
+                                "sanitize_conflict: iface pseudo-lit has a tag but no \
+                                 justification — iface_lit/iface_justs out of sync"
+                            );
                         }
                     } else if !Self::is_sentinel(l) {
                         out.push(EqLeaf::Asserted(l));
