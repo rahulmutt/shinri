@@ -4036,7 +4036,7 @@ fn targeted_leaf_membership_infinite_conflict_known_gap() {
 #[test]
 fn targeted_str_order_single_char_left_free_len_pinned_decides() {
     // Slice 25 task 5b: the two (str.<= "b" s) + pinned-length sub-cases
-    // carved out of `targeted_str_order_single_char_left_free_known_gap` —
+    // carved out of `targeted_str_order_single_char_left_free_now_decides` —
     // the comp() fix (Part 1) lets the non-strict left-constant gadget's
     // derivative-driven unfolding reach a decisive Rule-E/model-repair path
     // once the length pin bounds the search. z3-confirmed Sat both ways.
