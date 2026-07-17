@@ -4041,20 +4041,48 @@ fn targeted_str_order_two_gadget_conjunction_decides() {
 }
 
 #[test]
-fn targeted_leaf_membership_infinite_conflict_known_gap() {
-    // KNOWN GAP (slice 26, banked): conflicting INFINITE leaf memberships
-    // — s ∈ a·Σ* ∧ s ∈ b·Σ* (z3: unsat). The carve-out leaves both for
-    // repair; the intersected goal is empty, no seed is found, and repair
-    // can never produce Unsat — sound Unknown, same verdict as pre-slice.
-    // Refutation needs Rex intersection-emptiness (banked non-goal §Non-
-    // goals). A future slice should flip this to Unsat deliberately.
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)\
-             (assert (str.in_re s (re.++ (str.to_re \"a\") (re.* re.allchar))))\
-             (assert (str.in_re s (re.++ (str.to_re \"b\") (re.* re.allchar))))(check-sat)"
-        ),
-        Verdict::Unknown,
+fn targeted_leaf_membership_infinite_conflict_now_decides() {
+    // Slice 28 CASHES the slice-26 banked gap: conflicting INFINITE leaf
+    // memberships s ∈ a·Σ* ∧ s ∈ b·Σ* require the first char to be both 'a'
+    // and 'b' ⇒ empty joint language ⇒ Unsat (z3: unsat). The per-term
+    // intersection-emptiness pass (memb.rs) now decides it via
+    // `regex::language_empty`; previously a sound Unknown (repair can never
+    // produce Unsat). `expect` cross-checks z3 agreement.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.++ (str.to_re \"a\") (re.* re.allchar))))\
+         (assert (str.in_re s (re.++ (str.to_re \"b\") (re.* re.allchar))))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_intersection_three_way_first_char_empty_unsat() {
+    // Three infinite memberships, pairwise NON-empty first-char sets
+    // ({a,b},{b,c},{a,c}) but empty three-way intersection (no char is in all
+    // three) ⇒ Unsat. Each Σ*-tailed regex is infinite, so none is
+    // finite-reduced to a ground equality — the emptiness pass is what
+    // decides it. z3: unsat.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.++ (re.union (str.to_re \"a\") (str.to_re \"b\")) (re.* re.allchar))))\
+         (assert (str.in_re s (re.++ (re.union (str.to_re \"b\") (str.to_re \"c\")) (re.* re.allchar))))\
+         (assert (str.in_re s (re.++ (re.union (str.to_re \"a\") (str.to_re \"c\")) (re.* re.allchar))))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_intersection_nonempty_stays_sat() {
+    // s ∈ Σ·Σ* ∧ s ∈ a·Σ* — both satisfied by any word starting with 'a'
+    // (e.g. "a"), so the intersection is NON-empty. The emptiness pass must
+    // NOT conflict; the verdict stays Sat. Guards against an over-eager
+    // `Empty`. z3: sat.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.++ re.allchar (re.* re.allchar))))\
+         (assert (str.in_re s (re.++ (str.to_re \"a\") (re.* re.allchar))))(check-sat)",
+        Verdict::Sat,
     );
 }
 
