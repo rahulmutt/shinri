@@ -71,6 +71,10 @@ pub struct Arith {
     /// One-shot guard: the a-priori box is seeded at the first level-0 Full check.
     apriori_seeded: bool,
     /// Sentinel lit codes used for a-priori box bounds, stripped from conflicts.
+    /// Since slice 27 this set has no production reader — `sanitize_conflict`
+    /// drops ALL non-iface sentinels without consulting it — but it stays for
+    /// the seeding-idempotence unit pin and as documentation of which
+    /// sentinels are a-priori/FBBT ones.
     apriori_lits: FxHashSet<u32>,
     /// Master gate for all Plan B2 optimizations (integer bound rounding, FBBT,
     /// GMI cuts). Default ON; the differential harness builds an OFF solver to
@@ -699,7 +703,7 @@ impl Arith {
     /// interface bound (installed by `assert_interface_equality`) also rides under
     /// a sentinel pseudo-lit that is NOT an input literal yet IS a real dependency:
     /// it must be RESOLVED to `EqLeaf::Interface(just)`, not silently dropped.
-    /// `resolve_iface_leaves` does exactly this split: interface pseudo-lits (in
+    /// `sanitize_conflict` does exactly this split: interface pseudo-lits (in
     /// `iface_lit`) → `Interface`; every other sentinel (incl. this probe's own
     /// and a numeral-pin Definitional sentinel) → dropped; input lits → `Asserted`.
     /// Does NOT restore state; the caller restores afterward.
@@ -714,11 +718,11 @@ impl Arith {
             TightenResult::Conflict { other } => {
                 // Immediate crossing: antecedent = resolve({sentinel, other}).
                 let leaves = vec![EqLeaf::Asserted(sentinel), EqLeaf::Asserted(other)];
-                Some(self.resolve_iface_leaves(leaves))
+                Some(self.sanitize_conflict(leaves))
             }
             TightenResult::Tightened => match self.check_full() {
                 TCheck::Sat => None,
-                TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
+                TCheck::Conflict(leaves) => Some(self.sanitize_conflict(leaves)),
                 TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
                 // The pivot cap tripped (degenerate system). Conservatively treat
                 // the probe as "feasible / not proven entailed": returning `None`
@@ -775,15 +779,15 @@ impl Arith {
         let zero = DeltaRational::from_rational(Rational::zero());
         // Install lower then upper; either may immediately conflict.
         if let Some(c) = self.apply_bound(s, BoundKind::Lower, zero.clone(), pseudo) {
-            return Some(self.resolve_iface_leaves(c));
+            return Some(self.sanitize_conflict(c));
         }
         if let Some(c) = self.apply_bound(s, BoundKind::Upper, zero, pseudo) {
-            return Some(self.resolve_iface_leaves(c));
+            return Some(self.sanitize_conflict(c));
         }
         // Surface any infeasibility the fixed bound introduces.
         match self.check_full() {
             TCheck::Sat => None,
-            TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
+            TCheck::Conflict(leaves) => Some(self.sanitize_conflict(leaves)),
             TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
             // Pivot cap tripped (degenerate). Report no conflict from this interface
             // equality: SOUND (we only forgo detecting a possible infeasibility — a
@@ -793,10 +797,19 @@ impl Arith {
         }
     }
 
-    /// Map a conflict's leaves back to real antecedents: an interface pseudo-lit
-    /// becomes `EqLeaf::Interface(just)`; an entailment sentinel is dropped; any
-    /// other lit stays as `EqLeaf::Asserted`.
-    fn resolve_iface_leaves(&self, leaves: Vec<EqLeaf>) -> Vec<EqLeaf> {
+    /// Sanitize a conflict core at the theory boundary. INVARIANT (owned
+    /// here, slice 27): no raw sentinel literal ever leaves `Arith` in a
+    /// conflict core. An interface pseudo-lit (in `iface_lit`) resolves to
+    /// `EqLeaf::Interface(just)` — interface-equality bounds are LIVE-level
+    /// facts whose justification the Combiner must expand recursively
+    /// (CRITICAL-1), so dropping them would under-cite the core (unsound).
+    /// Every OTHER sentinel (a-priori box, FBBT, probe assumption) drops:
+    /// those bounds are level-0-entailed facts, so the remaining core stays
+    /// valid (the slice-8 stripping argument). Real asserted lits pass
+    /// through. ALL conflict exits from this theory must route through this
+    /// function; the tail assert catches any future sentinel flavor added
+    /// without a resolution rule here.
+    fn sanitize_conflict(&self, leaves: Vec<EqLeaf>) -> Vec<EqLeaf> {
         let mut out = Vec::new();
         for leaf in leaves {
             match leaf {
@@ -804,6 +817,20 @@ impl Arith {
                     if let Some(&tag) = self.iface_lit.get(&l.code()) {
                         if let Some(j) = self.iface_justs.get(&tag) {
                             out.push(EqLeaf::Interface(*j));
+                        } else {
+                            // Unreachable while `pop` stays atomic: it removes a
+                            // tag's `iface_justs` entry, its `iface_lit` mapping,
+                            // and the bounds it justified in one uninterrupted
+                            // step, so no core can cite an iface bound whose
+                            // justification is gone. If that sync ever breaks,
+                            // silently dropping the leaf here would under-cite
+                            // the core (a too-strong learnt clause — unsound),
+                            // so fail loudly in debug builds instead.
+                            debug_assert!(
+                                false,
+                                "sanitize_conflict: iface pseudo-lit has a tag but no \
+                                 justification — iface_lit/iface_justs out of sync"
+                            );
                         }
                     } else if !Self::is_sentinel(l) {
                         out.push(EqLeaf::Asserted(l));
@@ -812,6 +839,11 @@ impl Arith {
                 other => out.push(other),
             }
         }
+        debug_assert!(
+            !out.iter()
+                .any(|leaf| matches!(leaf, EqLeaf::Asserted(l) if Self::is_sentinel(*l))),
+            "sanitize_conflict: raw sentinel survived — a sentinel flavor lacks a resolution rule"
+        );
         out
     }
 
@@ -1012,7 +1044,7 @@ impl Arith {
     }
 
     /// Seed `−M ≤ x ≤ M` on every Int problem var, once, at level 0. Bounds ride
-    /// under fresh sentinel lits (stripped from conflicts by `strip_apriori`).
+    /// under fresh sentinel lits (stripped from conflicts by `sanitize_conflict`).
     /// No-op if there are no Int problem vars (pure-Real path unchanged).
     fn seed_apriori_if_needed(&mut self) {
         if self.apriori_seeded {
@@ -1061,16 +1093,6 @@ impl Arith {
             self.apriori_lits.insert(lit.code());
             let _ = self.apply_bound(v, kind, val, lit);
         }
-    }
-
-    /// Drop a-priori box sentinel lits from a conflict core (see Soundness note).
-    fn strip_apriori(&self, leaves: Vec<EqLeaf>) -> Vec<EqLeaf> {
-        leaves
-            .into_iter()
-            .filter(|leaf| {
-                !matches!(leaf, EqLeaf::Asserted(l) if self.apriori_lits.contains(&l.code()))
-            })
-            .collect()
     }
 }
 
@@ -1132,18 +1154,17 @@ impl TheorySolver for Arith {
                 self.apply_bound(var, kind, val, lit)
             }
         };
-        // Strip a-priori-box / FBBT sentinels from an assert-time conflict, the
-        // same way the `check` path strips `check_full`'s conflict (~972). When
-        // `apply_bound` reports a crossing against a sentinel bound (`other`), the
-        // sentinel lit's var index lives in the reserved region (≥ 1<<30); left in
-        // the core it leaks into SAT `analyze`, which indexes `seen[var.index()]`
-        // sized to the real-var count → out-of-bounds panic. FBBT (Task 4) installs
-        // TIGHT level-0 sentinel bounds that asserted bounds routinely cross, which
-        // is what exposed this (B1's huge box was never crossed at assert time).
-        // Soundness: sentinel bounds are level-0–entailed facts, so dropping them
-        // yields a still-valid core of real asserted lits (the a-priori stripping
-        // argument; the differential oracle is the empirical net).
-        conflict.map(|leaves| self.strip_apriori(leaves))
+        // Sanitize an assert-time conflict the same way every other exit
+        // does (sanitize_conflict — see its INVARIANT comment). Two sentinel
+        // flavors can appear as the crossing bound's antecedent here: an
+        // a-priori-box / FBBT level-0 bound (dropped — slice 8, which first
+        // hit this exit: left in the core, a sentinel lit leaks into SAT
+        // `analyze`, which indexes `seen[var.index()]` sized to the real-var
+        // count → OOB panic), and an interface-equality fixed bound on a
+        // shared slack combination (resolved to EqLeaf::Interface — slice 27;
+        // previously leaked raw and tripped shinri-sat's analyzability guard
+        // to a sound-but-lossy Unknown).
+        conflict.map(|leaves| self.sanitize_conflict(leaves))
     }
 
     fn propagate(
@@ -1165,7 +1186,7 @@ impl TheorySolver for Arith {
         }
         self.seed_apriori_if_needed();
         match self.check_full() {
-            TCheck::Conflict(leaves) => return TCheck::Conflict(self.strip_apriori(leaves)),
+            TCheck::Conflict(leaves) => return TCheck::Conflict(self.sanitize_conflict(leaves)),
             TCheck::Split { .. } => unreachable!("check_full never emits Split"),
             TCheck::Sat => {}
             // The simplex pivot cap tripped (degenerate cycle); surface Unknown so
@@ -1959,6 +1980,144 @@ mod nelson_oppen_tests {
         }
     }
 
+    // ----- Slice 27: check-path sentinel leak (slice-26 banked issue i) -----
+    // Interface equality a = b is installed FIRST (feasible alone), then two
+    // real atoms a - c >= 1 and c - b >= 0 are asserted. Ge atoms normalize
+    // with a NEGATED comb (normalize.rs), so all three constraints live on
+    // three DISTINCT slack vars — no single-var bound crossing at assert
+    // time. The infeasibility (a - b >= 1 vs a - b = 0) is only visible to
+    // simplex: `check`'s Farkas core transitively cites the iface fixed
+    // bound, whose antecedent is the sentinel pseudo-lit. Pre-slice-27,
+    // `check` piped the core through `strip_apriori` only, leaking the raw
+    // pseudo-lit (var index >= 1<<30) to shinri-sat's analyzability guard —
+    // a sound-but-lossy Unknown. The core must instead resolve it to
+    // EqLeaf::Interface(just).
+    #[test]
+    fn check_conflict_through_iface_bound_resolves_no_sentinel() {
+        let mut ctx = Context::new();
+        let a = real_var(&mut ctx, "ia");
+        let b = real_var(&mut ctx, "ib");
+        let c = real_var(&mut ctx, "ic");
+        let one = num(&mut ctx, 1);
+        let zero = num(&mut ctx, 0);
+        let ac = ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[a, c]).unwrap();
+        let ge_ac = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[ac, one]).unwrap(); // a - c >= 1
+        let cb = ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[c, b]).unwrap();
+        let ge_cb = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[cb, zero]).unwrap(); // c - b >= 0
+
+        let mut arith = Arith::default();
+        let just = TheoryJust { theory: 1, tag: 27 };
+        assert!(
+            arith.assert_interface_equality(&ctx, a, b, just).is_none(),
+            "a = b alone is feasible"
+        );
+
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), ge_ac);
+        arith.new_var(&mut cx, Var::new(1), ge_cb);
+        assert!(
+            arith.assert(&mut cx, Lit::new(Var::new(0), true)).is_none(),
+            "a - c >= 1 must not cross any bound at assert time"
+        );
+        assert!(
+            arith.assert(&mut cx, Lit::new(Var::new(1), true)).is_none(),
+            "c - b >= 0 must not cross any bound at assert time"
+        );
+
+        let leaves = match arith.check(&mut cx, Effort::Full) {
+            TCheck::Conflict(leaves) => leaves,
+            _ => panic!("a-b >= 1 against iface a=b must conflict"),
+        };
+        assert!(
+            leaves.contains(&EqLeaf::Interface(just)),
+            "core must resolve the iface pseudo-lit to Interface(just), got {leaves:?}"
+        );
+        assert!(
+            leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(0), true))),
+            "core must cite the a-c>=1 lit, got {leaves:?}"
+        );
+        assert!(
+            leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(1), true))),
+            "core must cite the c-b>=0 lit, got {leaves:?}"
+        );
+        for leaf in &leaves {
+            if let EqLeaf::Asserted(l) = leaf {
+                assert!(
+                    (l.var().index() as u32) < SENTINEL_VAR_BASE,
+                    "raw sentinel leaked from check (slice-26 banked bug): {leaves:?}"
+                );
+            }
+        }
+    }
+
+    // ----- Slice 27: assert-path sentinel leak (same bug, second exit) -----
+    // The interface equality a = b installs fixed bounds [0,0] on the slack
+    // var of the difference combination a - b (diff_comb). A Le input atom
+    // `a - b <= -1` canonicalizes (normalize.rs) to the SAME combination —
+    // (a, +1), (b, -1), sorted by var — hence the SAME slack var, so
+    // `apply_bound` detects the crossing (upper -1 < lower 0) directly at
+    // assert time and cites the iface bound's sentinel pseudo-lit as the
+    // opposing antecedent. Pre-slice-27 `assert` piped this core through
+    // `strip_apriori` only — the same leak as the check exit. (A Ge atom
+    // would NOT work here: normalize negates its comb to b - a, a different
+    // slack var — which is exactly why the check-path test above uses Ge
+    // shapes to stay crossing-free.)
+    #[test]
+    fn assert_conflict_crossing_iface_bound_resolves_no_sentinel() {
+        let mut ctx = Context::new();
+        let a = real_var(&mut ctx, "ja");
+        let b = real_var(&mut ctx, "jb");
+        let neg_one = num(&mut ctx, -1);
+        let ab = ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[a, b]).unwrap();
+        let le = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[ab, neg_one])
+            .unwrap(); // a - b <= -1
+
+        let mut arith = Arith::default();
+        let just = TheoryJust {
+            theory: 1,
+            tag: 272,
+        };
+        assert!(
+            arith.assert_interface_equality(&ctx, a, b, just).is_none(),
+            "a = b alone is feasible"
+        );
+
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), le);
+        let leaves = arith
+            .assert(&mut cx, Lit::new(Var::new(0), true))
+            .expect("a-b <= -1 must cross the iface fixed bound a-b = 0 at assert time");
+        assert!(
+            leaves.contains(&EqLeaf::Interface(just)),
+            "core must resolve the iface pseudo-lit to Interface(just), got {leaves:?}"
+        );
+        assert!(
+            leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(0), true))),
+            "core must cite the asserted a-b<=-1 lit, got {leaves:?}"
+        );
+        for leaf in &leaves {
+            if let EqLeaf::Asserted(l) = leaf {
+                assert!(
+                    (l.var().index() as u32) < SENTINEL_VAR_BASE,
+                    "raw sentinel leaked from assert: {leaves:?}"
+                );
+            }
+        }
+    }
+
     // sanity: numeral fixed bound itself doesn't break feasibility check.
     #[test]
     fn numeral_pin_keeps_value() {
@@ -2263,7 +2422,8 @@ mod apriori_tests {
     /// sized to the real-var count → out-of-bounds panic.
     ///
     /// The fix captures the conflict from `apply_bound` and pipes it through
-    /// `strip_apriori` before returning. This test:
+    /// the exit sanitizer (`strip_apriori` at the time; `sanitize_conflict`
+    /// since slice 27) before returning. This test:
     ///   1. Sets up a system so FBBT will tighten an Int var's upper bound tightly.
     ///   2. Asserts a bound that crosses the FBBT-derived sentinel bound.
     ///   3. Captures the conflict returned by `assert`.

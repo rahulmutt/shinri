@@ -4124,6 +4124,37 @@ fn targeted_leaf_membership_equality_pinned_leaf_decides() {
 }
 
 #[test]
+fn targeted_arith_iface_sentinel_conflict_now_decides() {
+    // Slice 27 Tasks 1-2 regression fix, found by per-iteration oracle diff
+    // (`qfs_predicates_matches_z3` iteration — seed stream `0x51_2A_0000_0001`, query
+    // hash `d9788e5ca38388b1` in the Task 3 dump-and-diff, `verdict-flips.txt`
+    // row `d9788e5ca38388b1 ... unknown bail=1 -> sat bail=0`): `s0 suffixof
+    // s2` plus a length equation over `s1++s2++"bb"` drives the arith
+    // combiner into extra EUF/arith interface-exchange rounds — the exact
+    // "OUT OF SCOPE" arith sentinel-leak class flagged (and banked) by
+    // `targeted_leaf_membership_equality_pinned_leaf_decides` above. Pre-fix
+    // (branch point `ffc27248`), a raw interface pseudo-lit leaked out of the
+    // Arith conflict-exit path into `shinri-sat`'s theory conflict, tripping
+    // `theory_conflict_analyzable`'s Cluster-B guard and bailing the whole
+    // query out to `unknown` (`theory_guard_bailouts += 1`) instead of
+    // deciding it. Fixed by Tasks 1-2's `sanitize_conflict`: all Arith
+    // conflict exits now resolve interface pseudo-lits to
+    // `EqLeaf::Interface(just)` before they reach the SAT-side conflict
+    // consumer, so the same interface exchange now yields an analyzable
+    // conflict and the query decides `sat` with zero guard bailouts. z3: sat
+    // (instant — safe for the oracle cross-check; already cross-checked
+    // in-loop by Task 3's green oracle-differential run, 0 disagreements).
+    expect(
+        "(set-logic QF_S)(declare-fun s0 () String)(declare-fun s1 () String)\
+         (declare-fun s2 () String)\
+         (assert (str.suffixof s0 s2))\
+         (assert (= (str.len (str.++ \"a\" \"b\" \"b\")) (str.len (str.++ s1 s2 \"bb\"))))\
+         (check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
 fn targeted_str_order_single_char_left_free_len_pinned_decides() {
     // Slice 25 task 5b: the two (str.<= "b" s) + pinned-length sub-cases
     // carved out of `targeted_str_order_single_char_left_free_now_decides` —

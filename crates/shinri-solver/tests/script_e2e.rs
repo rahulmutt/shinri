@@ -550,11 +550,20 @@ fn str_suffixof_and_contains_positive_decide() {
     // what enabled the `sat`) AND reopens the repro1/repro2 wrong-SAT that 668bbfd
     // closed. z3 says sat; `unknown` is sound (a completeness loss, never a wrong
     // verdict). Pinned as `unknown` to lock the current behavior.
+    //
+    // Slice 27 RE-FLIPPED it to `sat`: the Task-7.6 `unknown` was the shinri-sat
+    // analyzability-guard bailout on an Arith conflict core that cited a raw
+    // interface-equality sentinel (the String↔Arith arrangement search's
+    // interface exchange). With every Arith conflict exit routed through
+    // `sanitize_conflict`, that core resolves to an analyzable `Interface`
+    // leaf, the search continues, and the solver decides `sat` (witness
+    // s = "bE", self-check-verified; z3 confirms sat, re-run capped
+    // -T:120 -memory:4096 at flip time).
     let out = run_script(
         r#"(set-logic QF_S)(declare-fun s () String)
            (assert (str.contains s "b"))(assert (= (str.len s) 2))(check-sat)"#,
     );
-    assert_eq!(out, vec!["unknown"]);
+    assert_eq!(out, vec!["sat"]);
 }
 
 #[test]
