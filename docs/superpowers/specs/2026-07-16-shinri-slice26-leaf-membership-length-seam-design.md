@@ -1,7 +1,7 @@
 # Slice 26 design — leaf-membership length-seam termination
 
 Date: 2026-07-16
-Status: APPROVED (design review 2026-07-16); implementation pending.
+Status: IMPLEMENTED (2026-07-17). See "Implementation notes (truth-up)" at the end.
 
 Predecessor: slice 25 (surrogate-straddling range round-trip, landed
 2026-07-16). Slice 25's truth-up banks this as the dominant follow-up,
@@ -301,3 +301,153 @@ gadgets are handled by the existing intersection.
 3. **Routing**: the ge/le atoms must actually reach Arith; the implementer
    verifies the minting path against `length.rs:9-12` before relying on the
    Unsat upgrade.
+
+## Implementation notes (truth-up)
+
+Commits (`git log --oneline main..HEAD`, oldest first): `4535522e`
+(Task 1: `min_len`/`max_len` sound length bounds on `Rex`), `04154e10`
+(Task 2: `search_shortest` — capped BFS for a shortest accepted word),
+`94a5f375` (Task 3: `memb_seeds` shortest-word fallback replaces the
+length-1 bump), `ed3f48dd` (Task 4: general const-`Rex` leaf carve-out — no
+S/E unfolding on repair-eligible leaves), `1f6647f7` ("recovery" — see
+deviation (e)), `50d28270` (Task 5 fix: de-recurse `search_word` — explicit-
+stack DFS for deep exact-length witnesses), `157d6b2f` (Task 5: cap oracle
+z3 time/memory; pow300 pin asserts shinri-only), `015340b6` (docs: fix stale
+`known_gap` cross-ref in the order-pin comment), `359c5153` (Task 6 fix:
+`inter()` collapses bounds-certified empty intersections), `aadc95ad`
+(Task 6 fix: carve-out requires repair-eligibility — equality-pinned leaves
+fall back to unfolding), `624360a7` (Task 6: flip `script_e2e` `in_re`
+known-gap pins to decided).
+
+### Post-slice oracle tallies vs. the `7ba55ed` pre-slice baseline (all 13 families)
+
+| Family | Baseline (sat/unsat/unknown[/bailout]) | Post-slice (sat/unsat/unknown[/bailout]) | Movement |
+|---|---|---|---|
+| `qfs_str_order` | 54/80/66 | 61/80/59 | 7× unknown→sat |
+| `qfs_str_order_single_char` | 81/18/101 | 175/18/7 | 94× unknown→sat |
+| `qfs_to_code_range` | 77/110/13 | 83/110/7 | 6× unknown→sat |
+| `qfs_regex_ground` | 74/113/13 | 77/113/10 | 3× unknown→sat |
+| `qfs_regex_unfold` | 94/88/18 | 102/88/10 | 8× unknown→sat |
+| `qfs_regex_symbolic` | 112/76/12/0 | 113/76/11/0 | 1× unknown→sat |
+| `qfs_matches` | 90/137/73 | 90/137/73 | identical |
+| `qfs_predicates` | 33/69/96/2 | 33/69/96/2 | identical |
+| `qfs_indexof_replace` | 44/85/71 | 44/85/71 | identical |
+| `qfs_replace_all` | 51/74/75 | 51/74/75 | identical |
+| `qfs_to_from_int` | 69/116/14/1 | 69/116/14/1 | identical |
+| `qfs_const_int_conv` | 59/57/84 | 59/57/84 | identical |
+| `qfs_code_conv` | 92/97/11 | 92/97/11 | identical |
+
+Verified by a per-iteration diff (not just aggregate tallies — see
+deviation (k)) at fixed LCG seeds across all 13 families, 2700 iterations
+total (`300 + 200×12`): query text confirmed byte-identical between baseline
+and post-slice at every iteration (zero seed mismatches); every observed
+movement is `unknown→decided` (sat or unsat); **zero** `decided→unknown`
+regressions; **zero** `sat↔unsat` inversions; zero new bailouts anywhere.
+Full method and per-family movement counts recorded in the task-6 rediff
+notes.
+
+### Deviations from the plan (controller-adjudicated; human-approved where noted)
+
+a. **Task 4**: the `fuel_exhaustion_saturates_to_model_path` unit test's
+   carrier was truthed up from a lone-leaf shape to a two-atom carrier
+   (`x·y`) — the general carve-out now intercepts the original lone-leaf
+   shape before fuel exhaustion is reachable, so the test's carrier had to
+   change to keep exercising fuel exhaustion at all. A new pin,
+   `lone_leaf_star_zero_bounds_carves_out_silently`, was added to cover the
+   carved-out lone-leaf case directly (`x ∈ [a-c]*` stays silent — zero
+   splits, `terminal == Sat` — deferring to `memb_seeds`).
+b. **Task 5**: `targeted_regex_symbolic_fences_unknown` renamed to
+   `..._now_decide`; the `loop300` and `pow300` pins flipped from Unknown to
+   Sat (`loop300` z3-confirmed; `pow300` semantically forced — its language
+   is the singleton `{a^9000}`, nonempty, so shinri's self-check-verified
+   sat is correct independent of what z3 reports).
+c. Two container OOM kills occurred during Task 5, root-caused: z3 4.16
+   diverges (unbounded memory growth, ~250 MB/s) on the `pow300` query. The
+   test harness's `z3_run` now caps `-T:120 -memory:4096` so divergence
+   degrades to a parsed Unknown instead of exhausting the cgroup; the
+   `pow300` pin (`157d6b2f`) asserts shinri's verdict only (no z3
+   cross-check), per the semantic-forcing argument in (b).
+d. `search_word` was de-recursed to an explicit-stack DFS (`50d28270`): the
+   original recursion was one stack frame per matched character, and
+   slice-26's length bounds legitimately request witnesses thousands of
+   characters long (e.g. the `pow300` leaf's `a^9000`), overflowing a 2 MiB
+   test-thread stack in a debug build. Semantics (visit order, step
+   accounting, dead-set memoization) preserved exactly; a regression pin
+   (`search_word_deep_witness_no_stack_overflow`, n=9000 over `Σ*`) was
+   added — `Σ*` was chosen over `a*` for the pin because it costs 1 visited
+   state per character versus `a*`'s 2, staying under
+   `MEMB_SEARCH_STEP_CAP=10_000` at that length. Note: the `pow300` e2e
+   witness itself is actually found by the iterative `search_shortest`
+   fallback, not `search_word`.
+e. Commit `1f6647f7` ("recovery") is a user salvage of the first
+   OOM-killed session's in-flight Task 5 work; its subject does not follow
+   house style, and it carries one benign unrelated hunk — the `mise.toml`
+   Rust toolchain bump `1.97.0` → `1.97.1`.
+f. **Task 3**: the union e2e case (`(bc·Σ* ∪ "q")`) already passed
+   pre-fix — the old length-1 witness bump found `"q"` on its own. Kept as
+   a pin (now exercising the shortest-word fallback path instead of the
+   bump it superseded).
+g. The `len=1` order-shape cell (`(str.< "b" s)` + `len(s)=1` → Sat) was
+   z3-adjudicated during planning; the spec correction landed on `main`
+   pre-slice (see the spec body's "z3-adjudicated during planning" note),
+   not as an in-slice deviation.
+h. **HUMAN-APPROVED in-slice additions**: Task 6's per-iteration oracle
+   diff (not the aggregate tallies, which masked both) found two genuine
+   `decided→unknown` regressions: `qfs_regex_unfold` iteration 145 and
+   `qfs_regex_symbolic` iteration 194. Fixed by:
+   - `359c5153` — `inter()` now collapses to the empty language when its
+     computed `min_len > max_len`, a sound emptiness certificate the
+     `Concat` bounds combination was previously discarding; the decisive
+     path is the pre-existing Rule-E "no ε, no live class" conflict, which
+     the general leaf carve-out explicitly excludes `Rex::Empty`/`Eps`
+     from, so it never shadows this once collapsed.
+   - `aadc95ad` — the carve-out's lone-leaf syntactic check missed
+     equality-engine pinning that `memb_seeds`'s own `pinned` check would
+     have rejected; the gate now shares `model.rs`'s `is_repair_pinned`
+     check, so equality-pinned leaves fall back to Rule S/E unfolding
+     instead of taking the (silently unproductive) carve-out.
+i. **BANKED KNOWN ISSUE (follow-up slice)**: a pre-existing, latent
+   `shinri-arith` bug was exposed (not caused) by this slice's trajectory
+   change and is banked for a follow-up slice. `Arith::check`'s
+   `strip_apriori` (`crates/shinri-arith/src/lib.rs:1067-1074`) filters
+   only literals registered in `self.apriori_lits` (the a-priori Int box +
+   FBBT bounds) — it does not also resolve/strip `iface_lit`-registered
+   pseudo-literals minted by `assert_interface_equality`
+   (`lib.rs:750-800`, sentinel minted via `fresh_sentinel`, `lib.rs:505-518`,
+   from the reserved `SENTINEL_VAR_BASE = 1 << 30` region, `lib.rs:36`). When
+   a later top-level `Arith::check` (`lib.rs:1162-1176`) independently finds
+   a Farkas conflict (`check_full`, `lib.rs:415`) that transitively cites a
+   still-live interface-equality bound, the leaked sentinel literal reaches
+   `shinri-sat`'s `theory_conflict_analyzable` guard
+   (`crates/shinri-sat/src/solver.rs:294-301`), which correctly rejects it
+   (its raw var index vastly exceeds `assign.num_vars()`) and bails out
+   (`solver.rs:658-660`) to a sound Unknown. This slice's carve-out changed
+   the search trajectory on the `qfs_regex_symbolic` it194 repro enough to
+   reach more rounds of EUF↔arith interface exchange than the pre-slice
+   S/E-driven trajectory ever did, tripping this dormant leak; it was
+   reproduced during root-causing and then re-hidden (not fixed) by the
+   `aadc95ad` fix in (h), which addresses the carve-out eligibility gap
+   that drove the extra rounds, not the underlying `shinri-arith` leak
+   itself. The leak remains generally reachable by any other query that
+   drives the same interface exchange far enough.
+j. `script_e2e`: three pre-slice known-gap pins now decide Sat
+   (z3-confirmed each, capped): `in_re_unfold_plus_with_length`,
+   `in_re_unfold_plus_with_length2`, `in_re_unfold_unknown_fuel_depth` —
+   renamed to `..._now_decides` forms and flipped, in `624360a7`.
+k. **Methodology note**: aggregate family tallies masked both regressions
+   in (h) via offsetting flips (a `decided→unknown` regression cancelled
+   against an unrelated `unknown→decided` movement, leaving the 5-tuple
+   counts bit-identical). Per-iteration dump-and-diff — enabled here by
+   fixed LCG seeds giving query-text identity across runs — is the
+   recommended house convention for future slices touching fuzz-exercised
+   paths; aggregate-only comparison is not sufficient to rule out
+   regressions.
+
+### Retained known gap
+
+Conflicting INFINITE leaf memberships (`s ∈ a·Σ* ∧ s ∈ b·Σ*`) remain a
+sound Unknown, pinned as `targeted_leaf_membership_infinite_conflict_known_gap`.
+Rex intersection-emptiness refutation remains a banked non-goal (repair can
+never produce Unsat by construction); the new bounds-certificate collapse
+in (h) only catches length-disjoint (finite bounds) cases, not infinite
+conflicting tails.
