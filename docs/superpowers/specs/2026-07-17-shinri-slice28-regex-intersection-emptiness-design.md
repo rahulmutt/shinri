@@ -125,10 +125,13 @@ existing per-atom loop (so Rule-G ground conflicts, dedup, and the leaf
 carve-out still fire first; the pass only inspects residual live
 memberships). Sketch:
 
-1. Group `s.memb_true` entries `(atom, lit, pos)` by the string-side term's
-   equality-class representative. Use `memb_sides` (memb.rs:20) for the
-   sides and the same class key the normal-form path uses, so two
-   memberships on equality-merged terms group together.
+1. Group `s.memb_true` entries `(atom, lit, pos)` by the string-side term
+   id (`memb_sides`, memb.rs:20) — the same raw-`TermId` key `memb_seeds`
+   uses (model.rs:470), not an equality-class representative. Two
+   memberships naming the *identical* term (the pinned `s ∈ … ∧ s ∈ …`
+   shape — hash-consed to one `TermId`) group together; memberships on
+   equality-merged but *syntactically distinct* terms are the banked
+   cross-term case (§8), consistent with the repair path.
 2. For each group with ≥2 members: extract each regex with
    `regex::extract_const_regex`, applying `regex::comp` for negative
    polarity (`!pos`) — the identical polarity folding `memb_seeds` uses
@@ -225,8 +228,10 @@ adjudicated flip, not a blocker (slice-25/26 precedent).
   intersection empty) is banked — improves clause reuse in the SAT layer,
   not soundness.
 - **Cross-term emptiness.** Emptiness that arises only through word
-  equations / concat structure tying *different* terms together (not a
-  single shared term's memberships) is out of scope — banked.
+  equations / concat structure tying *different* terms together, or
+  through memberships on equality-merged but syntactically distinct terms
+  (raw-`TermId` grouping does not canonicalize across the eq class), is
+  out of scope — banked.
 - **Cap-raising.** Deciding empties that currently exceed the derivative
   fuels by raising `MEMB_SEARCH_STEP_CAP` / `CLASS_SPLIT_CAP` /
   `FUEL_NODE_CAP` is banked; whatever the dump-and-diff surfaces beyond the
