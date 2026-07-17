@@ -4034,6 +4034,35 @@ fn targeted_leaf_membership_infinite_conflict_known_gap() {
 }
 
 #[test]
+fn targeted_leaf_membership_empty_intersection_unsat() {
+    // Slice-26 Task 6a regression fix, found by per-iteration oracle diff
+    // (qfs_regex_unfold it145): `re.inter (str.to_re "b") (str.to_re "")`
+    // denotes ∅ (the disjoint singletons {"b"} and {""}), so the whole
+    // `re.++` is ∅ and the query is unsat — decided pre-slice-26 (commit
+    // 7ba55ed) via S/E unfolding. The slice-26 leaf carve-out regressed
+    // this to a sound Unknown: the carve-out's Concat length-bounds
+    // combination (sum of child mins / sum of child maxes) discarded the
+    // child-level contradiction the Inter arm already had (min=1 > max=0),
+    // so the emitted axiom was merely `len(s1) >= 1` — no conflict, no
+    // witness. Fixed by collapsing bounds-certified empty intersections
+    // (`Inter` min_len > max_len) to `re.none` at CONSTRUCTION, in
+    // `inter()`'s smart constructor — `concat()` already collapses any
+    // Empty part to Empty, so the whole regex folds to `Rex::Empty`
+    // end-to-end, and the pre-existing Rule-E "no ε, no live class" path
+    // (the same path that decided bare `s ∈ re.none` before slice 26)
+    // conflicts directly, with no dependence on the bounds axiom at all.
+    // z3: unsat (instant — safe for the oracle cross-check).
+    expect(
+        "(set-logic QF_S)(declare-fun s0 () String)(declare-fun s1 () String)\
+         (declare-fun s2 () String)\
+         (assert (str.in_re s1 (re.++ (re.inter (str.to_re \"b\") (str.to_re \"\"))\
+         (re.comp (re.range \"a\" \"c\")))))\
+         (assert (>= (str.len s1) 4))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
 fn targeted_str_order_single_char_left_free_len_pinned_decides() {
     // Slice 25 task 5b: the two (str.<= "b" s) + pinned-length sub-cases
     // carved out of `targeted_str_order_single_char_left_free_now_decides` —

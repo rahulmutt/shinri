@@ -164,7 +164,27 @@ pub(crate) fn inter(parts: Vec<Rex>) -> Rex {
         // but be safe: the intersection of no languages is Σ*.
         0 => star(Rex::Range(0, MAX_CODE)),
         1 => out.pop().expect("len 1"),
-        _ => Rex::Inter(out),
+        _ => {
+            // Slice 26 Task 6a: collapse a BOUNDS-CERTIFIED empty
+            // intersection at construction. `min_len`/`max_len` are sound
+            // (resp. lower/upper) bounds on every word's length in the
+            // built Rex's language (see their doc comments); for `Inter`
+            // specifically, `min_len` = max of the arm min_lens and
+            // `max_len` = min of the FINITE arm max_lens are each derived
+            // from the very shape we just built, so if the lower bound
+            // exceeds a known finite upper bound, no length is
+            // simultaneously admissible by every arm: L = ∅. This is the
+            // structural counterpart of `comp()`'s universal/empty
+            // collapse (slice 25 task 5b) — a smart constructor catching
+            // an emptiness the naive shape would otherwise hide (here,
+            // from a surrounding `concat()`'s all-or-nothing Empty check,
+            // which only sees the per-arm bounds, not their combination).
+            let built = Rex::Inter(out);
+            match max_len(&built) {
+                Some(hi) if min_len(&built) > hi => Rex::Empty,
+                _ => built,
+            }
+        }
     }
 }
 
@@ -1379,6 +1399,33 @@ mod tests {
         );
         // Generic double-complement (pre-existing identity) still holds.
         assert_eq!(comp(comp(chr('a'))), chr('a'));
+    }
+
+    #[test]
+    fn inter_collapses_bounds_certified_empty_intersection() {
+        // Slice 26 task 6a: `re.inter (str.to_re "b") (str.to_re "")` (the
+        // it145 fuzz repro's shape) — two disjoint singletons {"b"} and
+        // {""}. Structurally: min_len(Inter) = max(1, 0) = 1, max_len(Inter)
+        // = min(Some(1), Some(0)) = Some(0). 1 > 0 is a sound emptiness
+        // certificate (no length is simultaneously admissible by both
+        // arms), so the smart constructor collapses to `Rex::Empty` instead
+        // of building `Inter([chr('b'), Eps])` and losing the
+        // contradiction to `concat()`'s all-or-nothing Empty check.
+        assert_eq!(inter(vec![chr('b'), Rex::Eps]), Rex::Empty);
+
+        // Negative: a·Σ* ∩ b·Σ* — the `targeted_leaf_membership_infinite_
+        // conflict_known_gap` shape. Both arms have min_len = 1, max_len =
+        // None (unbounded tail) — no FINITE upper bound exists on either
+        // arm, so `max_len(Inter)` is `None` and the collapse must NOT
+        // fire: no bounds certificate here, even though the languages are
+        // in fact disjoint (refuting that needs real intersection
+        // emptiness, banked as a known gap — see the pinned test).
+        let a_star = concat(vec![chr('a'), star(Rex::Range(0, MAX_CODE))]);
+        let b_star = concat(vec![chr('b'), star(Rex::Range(0, MAX_CODE))]);
+        assert_eq!(
+            inter(vec![a_star.clone(), b_star.clone()]),
+            Rex::Inter(vec![a_star, b_star])
+        );
     }
 
     #[test]
