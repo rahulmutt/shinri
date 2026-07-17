@@ -549,64 +549,109 @@ pub(crate) fn rex_to_term(ctx: &mut Context, r: &Rex) -> TermId {
 /// NON-SURROGATE code point (a pure-surrogate class has no Rust witness and
 /// is skipped — sound: skipping loses completeness only). `dead` memoizes
 /// (remaining, Rex) states with no word, preventing exponential re-search.
+/// The DFS carries an EXPLICIT frame stack: recursion would be one frame per
+/// character, and slice-26 length bounds legitimately request witnesses
+/// thousands of chars long — deep enough to overflow a 2 MiB test-thread
+/// stack in a debug build.
 pub(crate) fn search_word(r: &Rex, n: usize) -> Option<String> {
-    fn go(
-        r: &Rex,
-        n: usize,
-        steps: &mut usize,
-        dead: &mut FxHashSet<(usize, Rex)>,
-        out: &mut String,
-    ) -> bool {
+    /// Prologue of a DFS visit: terminal checks + memo lookup, no descent.
+    enum Visit {
+        /// The state completes a word (`n` hit 0 on a nullable state).
+        Word,
+        /// The state provably contributes no word — try the next sibling.
+        DeadEnd,
+        /// The state needs exploring: its next-character classes.
+        Explore(Vec<(u32, u32)>),
+    }
+    fn visit(state: &Rex, n: usize, steps: &mut usize, dead: &FxHashSet<(usize, Rex)>) -> Visit {
         if *steps >= MEMB_SEARCH_STEP_CAP {
-            return false;
+            return Visit::DeadEnd;
         }
         *steps += 1;
         if n == 0 {
-            return nullable(r);
+            return if nullable(state) {
+                Visit::Word
+            } else {
+                Visit::DeadEnd
+            };
         }
-        if matches!(r, Rex::Empty) {
-            return false;
+        if matches!(state, Rex::Empty) {
+            return Visit::DeadEnd;
         }
-        let key = (n, r.clone());
-        if dead.contains(&key) {
-            return false;
+        if dead.contains(&(n, state.clone())) {
+            return Visit::DeadEnd;
         }
-        if let Some(classes) = next_classes(r) {
-            for (lo, hi) in classes {
-                // Smallest non-surrogate witness in the class (boundaries can
-                // only be 0xD800 / 0xDFFF, so lo either avoids the block or
-                // the block ends inside the class at 0xDFFF).
-                let c = if (SURR_LO..=SURR_HI).contains(&lo) {
-                    if hi > SURR_HI {
-                        SURR_HI + 1
-                    } else {
-                        continue; // pure-surrogate class: no Rust witness
-                    }
+        Visit::Explore(next_classes(state).unwrap_or_default())
+    }
+
+    struct Frame {
+        /// Memo key: (remaining length, state). Inserted into `dead` once
+        /// every class is exhausted without a word.
+        key: (usize, Rex),
+        classes: Vec<(u32, u32)>,
+        /// Next class index to try.
+        idx: usize,
+    }
+
+    let mut steps = 0usize;
+    let mut dead: FxHashSet<(usize, Rex)> = FxHashSet::default();
+    let mut out = String::new();
+    let mut stack: Vec<Frame> = Vec::new();
+    match visit(r, n, &mut steps, &dead) {
+        Visit::Word => return Some(out),
+        Visit::DeadEnd => return None,
+        Visit::Explore(classes) => stack.push(Frame {
+            key: (n, r.clone()),
+            classes,
+            idx: 0,
+        }),
+    }
+    'descend: while let Some(mut f) = stack.pop() {
+        while f.idx < f.classes.len() {
+            let (lo, hi) = f.classes[f.idx];
+            f.idx += 1;
+            // Smallest non-surrogate witness in the class (boundaries can
+            // only be 0xD800 / 0xDFFF, so lo either avoids the block or
+            // the block ends inside the class at 0xDFFF).
+            let c = if (SURR_LO..=SURR_HI).contains(&lo) {
+                if hi > SURR_HI {
+                    SURR_HI + 1
                 } else {
-                    lo
-                };
-                let d = deriv(c, r);
-                if node_count(&d) > FUEL_NODE_CAP {
-                    continue;
+                    continue; // pure-surrogate class: no Rust witness
                 }
-                out.push(char::from_u32(c).expect("non-surrogate in-alphabet"));
-                if go(&d, n - 1, steps, dead, out) {
-                    return true;
+            } else {
+                lo
+            };
+            let d = deriv(c, &f.key.1);
+            if node_count(&d) > FUEL_NODE_CAP {
+                continue;
+            }
+            out.push(char::from_u32(c).expect("non-surrogate in-alphabet"));
+            let rem = f.key.0 - 1;
+            match visit(&d, rem, &mut steps, &dead) {
+                Visit::Word => return Some(out),
+                Visit::DeadEnd => {
+                    out.pop();
                 }
-                out.pop();
+                Visit::Explore(classes) => {
+                    stack.push(f);
+                    stack.push(Frame {
+                        key: (rem, d),
+                        classes,
+                        idx: 0,
+                    });
+                    continue 'descend;
+                }
             }
         }
-        dead.insert(key);
-        false
+        // Every class exhausted without a word: memoize and backtrack. The
+        // char popped is the one pushed when this frame was entered; the
+        // root frame has no entering char and `out` is empty — pop is a
+        // no-op there.
+        dead.insert(f.key);
+        out.pop();
     }
-    let mut out = String::new();
-    let mut steps = 0usize;
-    let mut dead = FxHashSet::default();
-    if go(r, n, &mut steps, &mut dead, &mut out) {
-        Some(out)
-    } else {
-        None
-    }
+    None
 }
 
 /// The SHORTEST word in L(r), or None if none is found within
@@ -2177,6 +2222,20 @@ mod tests {
                 .collect(),
         );
         let _ = search_word(&hard, 40); // must terminate (None or Some) without hanging
+    }
+
+    #[test]
+    fn search_word_deep_witness_no_stack_overflow() {
+        // Regression pin (slice 26): `search_word` used to recurse once per
+        // character — a witness this deep overflowed the default 2 MiB
+        // test-thread stack, aborting the whole test binary. Σ* yields a
+        // single next-character class, so the 9000-char descent costs exactly
+        // 9001 visited states — inside MEMB_SEARCH_STEP_CAP with the
+        // explicit-stack DFS, and 9000 stack frames if the O(n) recursion
+        // ever returns.
+        let sigma_star = Rex::Star(Box::new(Rex::Range(0, MAX_CODE)));
+        let w = search_word(&sigma_star, 9000).expect("Σ* word of length 9000");
+        assert_eq!(w.chars().count(), 9000);
     }
 
     #[test]
