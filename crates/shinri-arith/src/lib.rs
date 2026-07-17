@@ -699,7 +699,7 @@ impl Arith {
     /// interface bound (installed by `assert_interface_equality`) also rides under
     /// a sentinel pseudo-lit that is NOT an input literal yet IS a real dependency:
     /// it must be RESOLVED to `EqLeaf::Interface(just)`, not silently dropped.
-    /// `resolve_iface_leaves` does exactly this split: interface pseudo-lits (in
+    /// `sanitize_conflict` does exactly this split: interface pseudo-lits (in
     /// `iface_lit`) → `Interface`; every other sentinel (incl. this probe's own
     /// and a numeral-pin Definitional sentinel) → dropped; input lits → `Asserted`.
     /// Does NOT restore state; the caller restores afterward.
@@ -714,11 +714,11 @@ impl Arith {
             TightenResult::Conflict { other } => {
                 // Immediate crossing: antecedent = resolve({sentinel, other}).
                 let leaves = vec![EqLeaf::Asserted(sentinel), EqLeaf::Asserted(other)];
-                Some(self.resolve_iface_leaves(leaves))
+                Some(self.sanitize_conflict(leaves))
             }
             TightenResult::Tightened => match self.check_full() {
                 TCheck::Sat => None,
-                TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
+                TCheck::Conflict(leaves) => Some(self.sanitize_conflict(leaves)),
                 TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
                 // The pivot cap tripped (degenerate system). Conservatively treat
                 // the probe as "feasible / not proven entailed": returning `None`
@@ -775,15 +775,15 @@ impl Arith {
         let zero = DeltaRational::from_rational(Rational::zero());
         // Install lower then upper; either may immediately conflict.
         if let Some(c) = self.apply_bound(s, BoundKind::Lower, zero.clone(), pseudo) {
-            return Some(self.resolve_iface_leaves(c));
+            return Some(self.sanitize_conflict(c));
         }
         if let Some(c) = self.apply_bound(s, BoundKind::Upper, zero, pseudo) {
-            return Some(self.resolve_iface_leaves(c));
+            return Some(self.sanitize_conflict(c));
         }
         // Surface any infeasibility the fixed bound introduces.
         match self.check_full() {
             TCheck::Sat => None,
-            TCheck::Conflict(leaves) => Some(self.resolve_iface_leaves(leaves)),
+            TCheck::Conflict(leaves) => Some(self.sanitize_conflict(leaves)),
             TCheck::Split { .. } => unreachable!("arith check_full never emits Split"),
             // Pivot cap tripped (degenerate). Report no conflict from this interface
             // equality: SOUND (we only forgo detecting a possible infeasibility — a
@@ -793,10 +793,19 @@ impl Arith {
         }
     }
 
-    /// Map a conflict's leaves back to real antecedents: an interface pseudo-lit
-    /// becomes `EqLeaf::Interface(just)`; an entailment sentinel is dropped; any
-    /// other lit stays as `EqLeaf::Asserted`.
-    fn resolve_iface_leaves(&self, leaves: Vec<EqLeaf>) -> Vec<EqLeaf> {
+    /// Sanitize a conflict core at the theory boundary. INVARIANT (owned
+    /// here, slice 27): no raw sentinel literal ever leaves `Arith` in a
+    /// conflict core. An interface pseudo-lit (in `iface_lit`) resolves to
+    /// `EqLeaf::Interface(just)` — interface-equality bounds are LIVE-level
+    /// facts whose justification the Combiner must expand recursively
+    /// (CRITICAL-1), so dropping them would under-cite the core (unsound).
+    /// Every OTHER sentinel (a-priori box, FBBT, probe assumption) drops:
+    /// those bounds are level-0-entailed facts, so the remaining core stays
+    /// valid (the slice-8 stripping argument). Real asserted lits pass
+    /// through. ALL conflict exits from this theory must route through this
+    /// function; the tail assert catches any future sentinel flavor added
+    /// without a resolution rule here.
+    fn sanitize_conflict(&self, leaves: Vec<EqLeaf>) -> Vec<EqLeaf> {
         let mut out = Vec::new();
         for leaf in leaves {
             match leaf {
@@ -812,6 +821,11 @@ impl Arith {
                 other => out.push(other),
             }
         }
+        debug_assert!(
+            !out.iter()
+                .any(|leaf| matches!(leaf, EqLeaf::Asserted(l) if Self::is_sentinel(*l))),
+            "sanitize_conflict: raw sentinel survived — a sentinel flavor lacks a resolution rule"
+        );
         out
     }
 
@@ -1165,7 +1179,7 @@ impl TheorySolver for Arith {
         }
         self.seed_apriori_if_needed();
         match self.check_full() {
-            TCheck::Conflict(leaves) => return TCheck::Conflict(self.strip_apriori(leaves)),
+            TCheck::Conflict(leaves) => return TCheck::Conflict(self.sanitize_conflict(leaves)),
             TCheck::Split { .. } => unreachable!("check_full never emits Split"),
             TCheck::Sat => {}
             // The simplex pivot cap tripped (degenerate cycle); surface Unknown so
@@ -1956,6 +1970,82 @@ mod nelson_oppen_tests {
                 "must NOT cite a synthetic sentinel lit, got {:?}",
                 l
             );
+        }
+    }
+
+    // ----- Slice 27: check-path sentinel leak (slice-26 banked issue i) -----
+    // Interface equality a = b is installed FIRST (feasible alone), then two
+    // real atoms a - c >= 1 and c - b >= 0 are asserted. Ge atoms normalize
+    // with a NEGATED comb (normalize.rs), so all three constraints live on
+    // three DISTINCT slack vars — no single-var bound crossing at assert
+    // time. The infeasibility (a - b >= 1 vs a - b = 0) is only visible to
+    // simplex: `check`'s Farkas core transitively cites the iface fixed
+    // bound, whose antecedent is the sentinel pseudo-lit. Pre-slice-27,
+    // `check` piped the core through `strip_apriori` only, leaking the raw
+    // pseudo-lit (var index >= 1<<30) to shinri-sat's analyzability guard —
+    // a sound-but-lossy Unknown. The core must instead resolve it to
+    // EqLeaf::Interface(just).
+    #[test]
+    fn check_conflict_through_iface_bound_resolves_no_sentinel() {
+        let mut ctx = Context::new();
+        let a = real_var(&mut ctx, "ia");
+        let b = real_var(&mut ctx, "ib");
+        let c = real_var(&mut ctx, "ic");
+        let one = num(&mut ctx, 1);
+        let zero = num(&mut ctx, 0);
+        let ac = ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[a, c]).unwrap();
+        let ge_ac = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[ac, one]).unwrap(); // a - c >= 1
+        let cb = ctx.mk_app(Op::Builtin(BuiltinOp::Sub), &[c, b]).unwrap();
+        let ge_cb = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[cb, zero]).unwrap(); // c - b >= 0
+
+        let mut arith = Arith::default();
+        let just = TheoryJust { theory: 1, tag: 27 };
+        assert!(
+            arith.assert_interface_equality(&ctx, a, b, just).is_none(),
+            "a = b alone is feasible"
+        );
+
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        arith.new_var(&mut cx, Var::new(0), ge_ac);
+        arith.new_var(&mut cx, Var::new(1), ge_cb);
+        assert!(
+            arith.assert(&mut cx, Lit::new(Var::new(0), true)).is_none(),
+            "a - c >= 1 must not cross any bound at assert time"
+        );
+        assert!(
+            arith.assert(&mut cx, Lit::new(Var::new(1), true)).is_none(),
+            "c - b >= 0 must not cross any bound at assert time"
+        );
+
+        let leaves = match arith.check(&mut cx, Effort::Full) {
+            TCheck::Conflict(leaves) => leaves,
+            _ => panic!("a-b >= 1 against iface a=b must conflict"),
+        };
+        assert!(
+            leaves.contains(&EqLeaf::Interface(just)),
+            "core must resolve the iface pseudo-lit to Interface(just), got {leaves:?}"
+        );
+        assert!(
+            leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(0), true))),
+            "core must cite the a-c>=1 lit, got {leaves:?}"
+        );
+        assert!(
+            leaves.contains(&EqLeaf::Asserted(Lit::new(Var::new(1), true))),
+            "core must cite the c-b>=0 lit, got {leaves:?}"
+        );
+        for leaf in &leaves {
+            if let EqLeaf::Asserted(l) = leaf {
+                assert!(
+                    (l.var().index() as u32) < SENTINEL_VAR_BASE,
+                    "raw sentinel leaked from check (slice-26 banked bug): {leaves:?}"
+                );
+            }
         }
     }
 
