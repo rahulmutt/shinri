@@ -3,7 +3,7 @@
 
 use crate::regex::{self, Rex};
 use crate::{collect, model, normalize, side_clean, wordeq, StrSolver};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 use shinri_theory::types::{ENodeId, EqLeaf};
 use shinri_theory::{TCheck, TheoryCtx};
@@ -538,6 +538,40 @@ pub(crate) fn memb_check(
             if let Some(tc) = len_link_split(s, cx.terms, eps_eq) {
                 return Some(tc);
             }
+        }
+    }
+    // ── Slice 28: per-term intersection-emptiness conflict ───────────────
+    // The per-atom loop above never intersects two memberships on the same
+    // term, so a jointly-empty language (e.g. s ∈ a·Σ* ∧ s ∈ b·Σ*) escapes as
+    // a sound Unknown. Group the LIVE memberships by string-side term id (the
+    // same raw-`TermId` key `memb_seeds` uses), intersect their polarity-
+    // folded regexes, and if the joint language is PROVABLY empty emit a
+    // conflict citing exactly those literals. Sound for ANY term: L(∩ Rᵢ) = ∅
+    // means `t ∈ R₁ ∧ … ∧ t ∈ Rₖ` is unsatisfiable regardless of `t`'s
+    // structure (spec §5). A cap/fuel abort (`Emptiness::Unknown`) or a
+    // non-empty intersection falls through to the prior Sat/repair path.
+    let mut by_term: FxHashMap<TermId, Vec<(shinri_core::Lit, Rex)>> = FxHashMap::default();
+    for &(atom, lit, pos) in &s.memb_true {
+        let (t, re_t) = memb_sides(cx.terms, atom);
+        let Some(mut rex) = regex::extract_const_regex(cx.terms, re_t) else {
+            continue; // non-constant regex — fence, never guess
+        };
+        if !pos {
+            rex = regex::comp(rex); // t ∉ R ≡ t ∈ comp(R)
+        }
+        by_term.entry(t).or_default().push((lit, rex));
+    }
+    for members in by_term.into_values() {
+        if members.len() < 2 {
+            continue; // single-atom empties are already folded upstream
+        }
+        let goal = regex::inter(members.iter().map(|(_, r)| r.clone()).collect());
+        if matches!(regex::language_empty(&goal), regex::Emptiness::Empty) {
+            let just = members
+                .iter()
+                .map(|(lit, _)| EqLeaf::Asserted(*lit))
+                .collect();
+            return Some(TCheck::Conflict(just));
         }
     }
     None
@@ -1323,6 +1357,66 @@ mod tests {
         assert!(
             splits2.iter().any(|(a, g)| *g && a.len() == 3),
             "user-input concat equation still emits the 3-disjunct F-split"
+        );
+    }
+
+    #[test]
+    fn intersection_empty_infinite_tails_conflict() {
+        // Slice 28: s ∈ a·Σ* ∧ s ∈ b·Σ* — disjoint first chars ⇒ empty joint
+        // language. The per-term emptiness pass must Conflict (was sound Unknown;
+        // `run_rounds` panics on Unknown, so reaching Conflict is the assertion).
+        let mut ctx = Context::new();
+        let s_var = var(&mut ctx, "s");
+        let sigma_star = Rex::Star(Box::new(Rex::Range(0, regex::MAX_CODE)));
+        let a_tail = regex::concat(vec![Rex::Range('a' as u32, 'a' as u32), sigma_star.clone()]);
+        let b_tail = regex::concat(vec![Rex::Range('b' as u32, 'b' as u32), sigma_star]);
+        let ma = memb_atom(&mut ctx, s_var, &a_tail);
+        let mb = memb_atom(&mut ctx, s_var, &b_tail);
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), ma);
+        s.new_var(&mut cx, shinri_core::Var::new(1), mb);
+        s.test_force_memb_true(ma, true);
+        s.test_force_memb_true(mb, true);
+        let (_, terminal) = run_rounds(&mut s, &mut cx, 16);
+        assert!(
+            matches!(terminal, TCheck::Conflict(_)),
+            "empty intersection of two infinite tails must conflict"
+        );
+    }
+
+    #[test]
+    fn intersection_negative_fold_nonempty_no_conflict() {
+        // Negative-polarity folding is wired (s ∉ b·Σ* ≡ s ∈ comp(b·Σ*)), but the
+        // intersection a·Σ* ∩ comp(b·Σ*) is NON-empty (any a-starting word never
+        // starts with b), so NO conflict — the pass leaves the verdict to the
+        // existing Sat/repair flow. Reaching a non-Conflict terminal (Sat) is the
+        // assertion; `run_rounds` panics on Unknown.
+        let mut ctx = Context::new();
+        let s_var = var(&mut ctx, "s");
+        let sigma_star = Rex::Star(Box::new(Rex::Range(0, regex::MAX_CODE)));
+        let a_tail = regex::concat(vec![Rex::Range('a' as u32, 'a' as u32), sigma_star.clone()]);
+        let b_tail = regex::concat(vec![Rex::Range('b' as u32, 'b' as u32), sigma_star]);
+        let ma = memb_atom(&mut ctx, s_var, &a_tail);
+        let mb = memb_atom(&mut ctx, s_var, &b_tail);
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), ma);
+        s.new_var(&mut cx, shinri_core::Var::new(1), mb);
+        s.test_force_memb_true(ma, true);
+        s.test_force_memb_true(mb, false); // s ∉ b·Σ*  ⇒  comp(b·Σ*)
+        let (_, terminal) = run_rounds(&mut s, &mut cx, 16);
+        assert!(
+            !matches!(terminal, TCheck::Conflict(_)),
+            "non-empty intersection must NOT conflict"
         );
     }
 }
