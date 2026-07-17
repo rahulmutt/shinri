@@ -1,7 +1,7 @@
 # Slice 27 design — arith conflict-core sanitization seam
 
 Date: 2026-07-17
-Status: APPROVED (design). Not yet implemented.
+Status: IMPLEMENTED (2026-07-17). See "Implementation notes (truth-up)" at the end.
 
 Predecessor: slice 26 (leaf-membership length-seam termination, landed
 2026-07-17). Slice 26's truth-up banks this as its explicit follow-up
@@ -191,3 +191,64 @@ decided → unknown movement is a regression by definition (§4).
   residual Unknowns remain on interface-exchange-heavy queries once the
   leak is closed; whatever the dump-and-diff surfaces gets banked, not
   fixed here.
+
+## Implementation notes (truth-up)
+
+Implemented 2026-07-17 on branch `slice27-arith-conflict-sanitization`
+(base `ffc27248` = main with plan/spec docs pre-landed).
+
+**Landed as designed:**
+
+- `09c32459` — check-path pin + unified sanitizer. `resolve_iface_leaves`
+  renamed to `sanitize_conflict` (invariant doc comment + tail
+  `debug_assert!` choke point appended; body otherwise byte-identical),
+  all five call sites + probe doc-comment mention updated, the
+  `TheorySolver::check` conflict exit rerouted from `strip_apriori` to
+  `sanitize_conflict`. New TDD pin
+  `check_conflict_through_iface_bound_resolves_no_sentinel` (Ge shapes on
+  three distinct slack vars — infeasibility only visible to simplex at
+  check time; pre-fix run captured the raw leaked sentinel
+  `Asserted(Lit(2147483648))`).
+- `af7b53f3` — assert-path pin, `strip_apriori` deleted as subsumed, the
+  three mandated comment truth-ups (`apriori_lits` field doc, B&B level-0
+  comment, Bug-1 regression-test doc comment). New TDD pin
+  `assert_conflict_crossing_iface_bound_resolves_no_sentinel` (Le atom
+  canonicalizes onto the iface diff-comb slack var — crossing at assert
+  time; pre-fix leak captured). Full `shinri-arith` suite 59/59.
+- `aebb0f83` — Task 4's best-effort e2e pin turned out NOT to need the
+  revert-replay fallback: the Task 3 dump-and-diff surfaced natural
+  triggers, one of which is committed as
+  `targeted_arith_iface_sentinel_conflict_now_decides`
+  (qfs_differential.rs, house `expect(query, Verdict::Sat)` pattern; the
+  pin also asserts `theory_guard_bailouts == 0`, so it fails pre-fix).
+
+**Deviations (all minor):**
+
+- (a) Task 1's test replaces the plan's `other => panic!("… got
+  {other:?}")` arm with `_ => panic!("…")` — compiler-forced: `TCheck`
+  derives no `Debug`.
+- (b) No other code deviations; test/comment text otherwise verbatim from
+  the plan (modulo rustfmt rewrapping).
+
+**Task 3 dump-and-diff result (base `ffc27248` vs fix `af7b53f3`):**
+
+- Fix-side oracle differential: 76 passed / 0 failed, 0 shinri-vs-z3
+  disagreements, 0 guard bailouts across all 13 fuzz families.
+- Per-iteration diff (3680 base / 3682 fix DIFFDUMP lines; the +2 are
+  witness-fetch dumps newly reachable on iterations that became sat):
+  exactly THREE flips, all strict improvements —
+  `qfs_predicates` hash `d9788e5ca38388b1`: unknown bail=1 → sat bail=0
+  (committed as the Task-4 pin); `qfs_predicates` second flip: unknown
+  bail=1 → unknown bail=0 (bailout eliminated, verdict unchanged);
+  `qfs_to_from_int`: unknown bail=1 → sat bail=0. Zero decided→Unknown,
+  zero sat↔unsat, zero bailout increases. Spec §4 acceptance met.
+
+**Task 4 outcome:** natural-trigger pin committed (`aebb0f83`); the
+plan's Step-2 revert-replay confirmation was unnecessary and skipped.
+
+**Newly banked:** nothing. The slice-26 banked items other than this leak
+(Rex intersection-emptiness for infinite conflicting tails) remain banked
+unchanged. The remaining two Unknown-with-bailout=0 iterations surfaced by
+the dump are ordinary incompleteness, per this spec's non-goal ("whatever
+the dump-and-diff surfaces gets banked, not fixed here") — no new solver
+work identified.
