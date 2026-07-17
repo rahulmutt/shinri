@@ -424,6 +424,34 @@ fn concat_arity(terms: &Context, t: TermId) -> usize {
     }
 }
 
+/// True iff `v`'s equality class holds a constant or a concat OTHER than `v`
+/// itself — the repair-INELIGIBILITY condition. A pinned variable's value is
+/// dictated elsewhere (by the constant/concat merged into its class), so
+/// free-witness repair would fight that pin instead of realising it.
+///
+/// Shared by two callers that both need "is this leaf repair-eligible":
+/// `memb_seeds` below (its original owner) and `memb::memb_check`'s Slice-26
+/// leaf carve-out (Task 6b). The carve-out's OWN syntactic `lone_leaf` check
+/// (an NF-local read: is the residual exactly one bare uninterpreted atom?)
+/// is blind to this — a class merge introduced by an ENTIRELY DIFFERENT
+/// assertion (e.g. `x = x·y·z`) can pin `x` while `x`'s own normal form
+/// still reads atomic (deep NF doesn't need to expand through a
+/// self-referential merge to resolve `x`'s OWN read). Gating the carve-out
+/// on this same check closes that gap: a pinned lone leaf now falls back to
+/// Rule S/E unfolding (the pre-slice-26 behavior for that atom) instead of
+/// being silently un-decided by BOTH the carve-out and `memb_seeds`.
+pub(crate) fn is_repair_pinned(
+    terms: &Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    v: TermId,
+) -> bool {
+    class_member(terms, eq, known, v, |terms, mm| {
+        (terms.string_const_value(mm).is_some() || is_concat(terms, mm)) && mm != v
+    })
+    .is_some()
+}
+
 /// Slice 21: words for FREE string variables carrying membership atoms.
 /// A variable is repair-eligible iff it is a leaf (nullary uninterpreted)
 /// whose class holds no constant and no concat (the `value_of` free path) —
@@ -461,10 +489,7 @@ pub(crate) fn memb_seeds(
     let mut out = FxHashMap::default();
     for (v, rexes) in per_var {
         // Free check: no constant and no concat in v's class.
-        let pinned = class_member(terms, eq, known, v, |terms, mm| {
-            (terms.string_const_value(mm).is_some() || is_concat(terms, mm)) && mm != v
-        });
-        if pinned.is_some() {
+        if is_repair_pinned(terms, eq, known, v) {
             continue;
         }
         let n = class_len_in_model(terms, eq, known, m, v);

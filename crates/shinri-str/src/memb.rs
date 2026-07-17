@@ -2,7 +2,7 @@
 //! `str.in_re` atoms into word equations, run at the end of every Full check.
 
 use crate::regex::{self, Rex};
-use crate::{collect, normalize, side_clean, wordeq, StrSolver};
+use crate::{collect, model, normalize, side_clean, wordeq, StrSolver};
 use rustc_hash::FxHashSet;
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 use shinri_theory::types::{ENodeId, EqLeaf};
@@ -288,10 +288,13 @@ pub(crate) fn memb_check(
 
         // ── Slice 26: general const-Rex LEAF carve-out ───────────────────
         // A LONE repair-eligible leaf residual (single NF atom, nullary
-        // uninterpreted — the same shape `memb_seeds` requires; a class
-        // holding a constant or concat never reaches here, deep NF resolves
-        // it and Rule G consumes it) with any const `cur` is the GROUND-OUT
-        // point of the unfolding, exactly like the bare-`Range` arm above:
+        // uninterpreted — the same shape `memb_seeds` requires, and now
+        // ALSO gated below on `memb_seeds`'s own repair-eligibility check
+        // — Task 6b fixed a gap where a class holding a constant or concat
+        // could still reach here: deep NF resolving `nf[i]` to itself does
+        // NOT imply the class is unpinned, e.g. a self-referential merge
+        // `x = x·y·z`) with any const `cur` is the GROUND-OUT point of the
+        // unfolding, exactly like the bare-`Range` arm above:
         // Rule S/E on it mints fresh skolems whose `str.len` companions
         // flood the string↔arith seam every round until the shared fuel
         // dies in the length-axiom loop (`lib.rs::check`) — a hard Unknown
@@ -311,7 +314,22 @@ pub(crate) fn memb_check(
                 shinri_core::TermNode::App { op: Op::Uninterpreted(_), args, .. }
                     if cx.terms.children(*args).is_empty()
             );
-        if lone_leaf && !matches!(cur, Rex::Empty | Rex::Eps) {
+        // Task 6b (slice-26 regression fix): `lone_leaf` is an NF-LOCAL
+        // syntactic read — it says nothing about whether `nf[i]`'s equality
+        // CLASS also holds a constant or a concat merged in by some OTHER
+        // assertion (deep NF can resolve `nf[i]` to itself without ever
+        // needing to expand through that merge, e.g. a self-referential
+        // `x = x·y·z`). Such a leaf is EQUALITY-PINNED and `memb_seeds`
+        // (model.rs) — the carve-out's own stated repair-eligibility
+        // authority — would refuse to seed it. Carving out here anyway
+        // leaves NEITHER path deciding the atom (the it194 root cause: a
+        // hard `Unknown` bailout). Gate on the SAME check `memb_seeds` uses
+        // (`model::is_repair_pinned`, shared, not duplicated): a pinned lone
+        // leaf falls through to the pre-existing Rule-S/Rule-E unfolding
+        // below, exactly the pre-slice-26 behavior for that atom.
+        let carve_out_eligible =
+            lone_leaf && !model::is_repair_pinned(cx.terms, cx.eq, known, nf[i]);
+        if carve_out_eligible && !matches!(cur, Rex::Empty | Rex::Eps) {
             if !side_clean(cx.eq, cx.terms, t, input_cond_roots) {
                 continue;
             }
@@ -1163,6 +1181,89 @@ mod tests {
         assert!(
             s.emitted_len_axioms.is_empty(),
             "no length-axiom key minted when bounds is empty"
+        );
+    }
+
+    #[test]
+    fn equality_pinned_leaf_falls_back_to_unfolding() {
+        // Slice 26 Task 6b: pins the eligibility gap in the general leaf
+        // carve-out. Same nullable/unbounded shape as
+        // `lone_leaf_star_zero_bounds_carves_out_silently` (`x ∈ [a-c]*`,
+        // `cur = Star(Range('a','c'))`, empty `bounds`) — but here `x` is
+        // ALSO equality-merged with a concat over itself (`x = x·y·z`, the
+        // exact shape of the it194 regression repro,
+        // `s0 = s0·s1·s2` / `s0 ∈ ((b-c){0,2})*`). Deep NF still resolves
+        // `x`'s own read to the bare atom `x` (self-referential merges don't
+        // force expansion of the QUERIED term's own read), so the carve-out's
+        // NF-local `lone_leaf` check reads true — but `x`'s equality class
+        // now holds the concat `x·y·z`, which `memb_seeds` would reject as
+        // repair-ineligible (`pinned`). Pre-fix, this leaves the atom
+        // undecided by BOTH the carve-out (silent, empty bounds) and
+        // `memb_seeds` (correctly refuses to seed a pinned leaf) — the
+        // slice-26 root cause. Post-fix, the carve-out must defer to Rule
+        // S/E unfolding instead: a Rule-E expansion split (a `str.in_re`
+        // disjunct on `x`) is emitted, exactly `rule_e_expansion_shape`'s
+        // shape. NOTE the asserted equality `x = x·y·z` is itself a plain
+        // user equality — the word-equation loop's OWN F-split over it
+        // (unrelated to this fix) also contributes guarded splits, so the
+        // assertions below filter specifically for a MEMBERSHIP expansion
+        // (a `str.in_re` disjunct), not merely "some split happened".
+        let mut ctx = Context::new();
+        let x = var(&mut ctx, "x");
+        let y = var(&mut ctx, "y");
+        let z = var(&mut ctx, "z");
+        let xyz = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y, z])
+            .unwrap();
+        let eq = ctx.mk_eq(x, xyz).unwrap();
+        let m = memb_atom(&mut ctx, x, &regex::star_range_test('a', 'c'));
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), eq);
+        s.new_var(&mut cx, shinri_core::Var::new(1), m);
+        s.test_force_eq_true(eq);
+        // Unit tests drive the eq engine EXPLICITLY (the Combiner does this
+        // in production) — same incantation as `rule_g_ground_conflict_and_discharge`.
+        let (xn, cn) = (cx.eq.intern(x), cx.eq.intern(xyz));
+        let _ = cx
+            .eq
+            .merge(xn, cn, shinri_theory::types::EqJust::Definitional);
+        s.test_force_memb_true(m, true);
+        let (splits, terminal) = run_rounds(&mut s, &mut cx, 16);
+        let is_memb = |t: &TermId| {
+            matches!(
+                cx.terms.term_node(*t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrInRe),
+                    ..
+                }
+            )
+        };
+        let membership_expansions: Vec<_> = splits
+            .iter()
+            .filter(|(atoms, _)| atoms.iter().any(is_memb))
+            .collect();
+        assert_eq!(
+            membership_expansions.len(),
+            1,
+            "equality-pinned leaf must fall through to a Rule-E membership \
+             expansion, not the silent carve-out (memb_seeds would refuse \
+             to repair it) — pre-fix this is 0 (carve-out contributes \
+             nothing, every split observed here comes from the equality's \
+             OWN word-equation F-split, unrelated to this fix)"
+        );
+        let (disj, guarded) = membership_expansions[0];
+        assert!(*guarded, "Rule-E expansion must be guarded by ¬lit");
+        assert_eq!(disj.len(), 2, "ε disjunct + one live class disjunct");
+        assert!(
+            matches!(terminal, TCheck::Sat),
+            "the fallback unfolding reaches a Sat fixpoint on this \
+             satisfiable shape (x = \"\" ∧ y = z = \"\" is a model), \
+             never a fenced Unknown/Conflict"
         );
     }
 

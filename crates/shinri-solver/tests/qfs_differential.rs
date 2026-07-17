@@ -4063,6 +4063,42 @@ fn targeted_leaf_membership_empty_intersection_unsat() {
 }
 
 #[test]
+fn targeted_leaf_membership_equality_pinned_leaf_decides() {
+    // Slice-26 Task 6b regression fix, found by per-iteration oracle diff
+    // (qfs_regex_symbolic it194, sat→unknown vs 7ba55ed): `s0`'s membership
+    // string side is a LONE leaf (its own deep normal form reads atomic),
+    // but `s0` is ALSO equality-merged with the concat `s0·s1·s2` from the
+    // second assertion — an EQUALITY-PINNED leaf that `model.rs::memb_seeds`
+    // would refuse to repair-seed (its `pinned` check). The slice-26 leaf
+    // carve-out's `lone_leaf` gate is purely NF-local and missed this
+    // pinning, so it silently carved out the nullable/unbounded regex
+    // (`((b-c){0,2})*`, empty length bounds) instead of falling through to
+    // Rule S/E unfolding — leaving the atom undecided by BOTH the carve-out
+    // and `memb_seeds`, which pushed the search into extra EUF/arith
+    // interface-equality rounds and tripped an UNRELATED pre-existing
+    // sentinel-leak bug in `shinri-arith` (`strip_apriori` not filtering
+    // interface pseudo-literals), producing a malformed theory conflict
+    // that `shinri-sat`'s Cluster-B guard rejects → `Unknown`
+    // (`theory_guard_bailouts += 1`). Fixed by requiring repair-eligibility
+    // for the carve-out too — it now shares `memb_seeds`'s own
+    // `class_member`/pinned check (`model::is_repair_pinned`), so an
+    // equality-pinned leaf falls back to Rule-S/Rule-E unfolding, exactly
+    // the pre-slice-26 behavior for that atom, and the atom is decided
+    // before the arith interface exchange ever runs enough rounds to
+    // surface the sentinel leak. That exposed arith bug is real but
+    // OUT OF SCOPE here — banked for a follow-up slice against
+    // `shinri-arith` directly. z3: sat (instant — safe for the oracle
+    // cross-check).
+    expect(
+        "(set-logic QF_S)(declare-fun s0 () String)(declare-fun s1 () String)\
+         (declare-fun s2 () String)\
+         (assert (str.in_re s0 (re.* ((_ re.loop 0 2) (re.range \"b\" \"c\")))))\
+         (assert (not (distinct (str.++ s0 s1 s2) s0)))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
+#[test]
 fn targeted_str_order_single_char_left_free_len_pinned_decides() {
     // Slice 25 task 5b: the two (str.<= "b" s) + pinned-length sub-cases
     // carved out of `targeted_str_order_single_char_left_free_now_decides` —
