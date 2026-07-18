@@ -17,6 +17,12 @@ use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 
 use crate::regex::{concat, range_rex, rex_to_term, star, union, Rex, MAX_CODE};
 
+/// Max constant-word length that gets the order→membership rewrite. A length-k
+/// word builds an O(k)-branch regex; SMT-LIB literal text is untrusted input
+/// (threat model), so cap the blow-up. Above the cap ⇒ fence (sound Unknown).
+/// Mirrors `regex::ENUM_WORD_CAP`.
+const ORDER_CONST_LEN_CAP: usize = 256;
+
 /// One bottom-up, memoized equivalence rewrite over each assertion. Untouched
 /// subtrees keep their `TermId`s.
 pub fn rewrite_str_order(ctx: &mut Context, assertions: &[TermId]) -> Vec<TermId> {
@@ -108,30 +114,33 @@ fn try_order_atom(ctx: &mut Context, args: &[TermId], reflexive: bool) -> Option
                 Some(ctx.mk_const_bool(false))
             }
         }
-        // Single-character constant on the RIGHT: (str.< s c) / (str.<= s c).
-        (None, Some(y)) => match single_char_code(&y) {
-            Some(m) => order_const_right(ctx, a, m, reflexive),
-            None => None, // multi-char constant ⇒ banked (spec §5)
+        // Constant word on the RIGHT: (str.< s w) / (str.<= s w).
+        // (Empty y is handled by the empty-boundary arm above, so y is non-empty.)
+        (None, Some(y)) => match word_codes(&y) {
+            Some(cs) => order_const_right(ctx, a, &cs, reflexive),
+            None => None, // above-alphabet char or over cap ⇒ fence
         },
-        // Single-character constant on the LEFT: (str.< c s) / (str.<= c s).
-        (Some(x), None) => match single_char_code(&x) {
-            Some(m) => order_const_left(ctx, b, m, reflexive),
-            None => None, // multi-char constant ⇒ banked (spec §5)
+        // Constant word on the LEFT: (str.< w s) / (str.<= w s).
+        (Some(x), None) => match word_codes(&x) {
+            Some(cs) => order_const_left(ctx, b, &cs, reflexive),
+            None => None,
         },
         _ => None,
     }
 }
 
-/// The single code point of a one-character string, if it is within the
-/// SMT-LIB alphabet; None if empty, multi-char, or above `MAX_CODE`
-/// (above-alphabet constants are banked -> fence, like any other
-/// out-of-scope atom).
-fn single_char_code(s: &str) -> Option<i128> {
-    let mut it = s.chars();
-    match (it.next(), it.next()) {
-        (Some(c), None) if c as u32 <= MAX_CODE => Some(c as u32 as i128),
-        _ => None,
+/// The code points of a constant word, each within the SMT-LIB alphabet, or
+/// `None` if the word is empty, contains a char above `MAX_CODE`, or exceeds
+/// `ORDER_CONST_LEN_CAP` (all of which fall through to the fence — sound
+/// Unknown, never wrong). Generalizes slice 24's `single_char_code` to any
+/// length; the k=1 result reproduces the single-char arms exactly.
+fn word_codes(s: &str) -> Option<Vec<i128>> {
+    if s.is_empty() || s.chars().count() > ORDER_CONST_LEN_CAP {
+        return None;
     }
+    s.chars()
+        .map(|c| ((c as u32) <= MAX_CODE).then_some(c as u32 as i128))
+        .collect()
 }
 
 /// Σ* = re.all — any string (including empty).
@@ -151,40 +160,67 @@ fn membership(ctx: &mut Context, other: TermId, r: Rex) -> TermId {
         .expect("str.in_re well-sorted")
 }
 
-/// `(str.< s c)` / `(str.<= s c)` for a single-character constant `c` (code `m`)
-/// and symbolic `s`. `reflexive` = the `<=` case (adds the singleton `s = c`).
+/// The exact-word language `word(w) = Range(c₀,c₀)·…·Range(c_{k-1},c_{k-1})`
+/// as a `Rex` (empty slice ⇒ `Eps`). Every code is in-alphabet (guaranteed by
+/// `word_codes`), so each `Range` is expressible.
+fn word_rex(cs: &[i128]) -> Rex {
+    concat(cs.iter().map(|&c| Rex::Range(c as u32, c as u32)).collect())
+}
+
+/// `(str.< s w)` / `(str.<= s w)` for a constant word `w` (codes `cs`, k = |w| ≥ 1)
+/// and symbolic `s`. `reflexive` = the `<=` case (adds the word `w` itself).
 ///
-/// `s <  c` ≡ s ∈ Eps ∪ Range(0, m-1)·Σ*          (empty, or first char < m)
-/// `s <= c` ≡ s ∈ Eps ∪ Range(0, m-1)·Σ* ∪ word(c) (… or s = c)
+/// `s <  w` ≡ s ∈  ⋃_{j<k} word(w[0..j])                      (proper prefixes: ε, w[0..1], …)
+///                ∪ ⋃_{i<k} word(w[0..i])·Range(0, cᵢ-1)·Σ*   (first differ at i, sᵢ < cᵢ)
+/// `s <= w` ≡  … ∪ word(w)                                    (… or s = w)
 ///
-/// `m = 0` collapses `Range(0,-1)` to the empty interval, so `s < c` ⇒ `s = ""`.
-/// None on a surrogate-interior endpoint (unreachable for a valid char — spec §3).
-fn order_const_right(ctx: &mut Context, s: TermId, m: i128, reflexive: bool) -> Option<TermId> {
-    let below = concat(vec![range_rex(0, m - 1)?, sigma_star()]);
-    let mut branches = vec![Rex::Eps, below];
+/// k = 1 reproduces slice 24's `Eps ∪ Range(0,c₀-1)·Σ*` (+ word for `<=`).
+/// `None` only if a `range_rex` interior endpoint is an inexpressible surrogate
+/// — unreachable for an in-alphabet word (a valid char's neighbour is at worst a
+/// block edge), but propagated for totality.
+fn order_const_right(ctx: &mut Context, s: TermId, cs: &[i128], reflexive: bool) -> Option<TermId> {
+    let mut branches: Vec<Rex> = Vec::new();
+    for j in 0..cs.len() {
+        branches.push(word_rex(&cs[..j])); // proper prefix (j = 0 ⇒ Eps)
+    }
+    for i in 0..cs.len() {
+        branches.push(concat(vec![
+            word_rex(&cs[..i]),
+            range_rex(0, cs[i] - 1)?,
+            sigma_star(),
+        ]));
+    }
     if reflexive {
-        branches.push(Rex::Range(m as u32, m as u32)); // word(c)
+        branches.push(word_rex(cs)); // word(w)
     }
     Some(membership(ctx, s, union(branches)))
 }
 
-/// `(str.< c s)` / `(str.<= c s)` for a single-character constant `c` (code `m`)
+/// `(str.< w s)` / `(str.<= w s)` for a constant word `w` (codes `cs`, k ≥ 1)
 /// and symbolic `s`. `reflexive` = the `<=` case.
 ///
-/// `c <  s` ≡ s ∈ Range(m+1, MAX)·Σ* ∪ word(c)·Σ·Σ*  (first char > m, or c a
-///                                                     PROPER prefix of s)
-/// `c <= s` ≡ s ∈ Range(m+1, MAX)·Σ* ∪ word(c)·Σ*     (… or c a prefix incl. = c)
+/// `w <  s` ≡ s ∈  ⋃_{i<k} word(w[0..i])·Range(cᵢ+1, MAX)·Σ*  (first differ at i, sᵢ > cᵢ)
+///                ∪ word(w)·Σ·Σ*                              (w a PROPER prefix of s)
+/// `w <= s` ≡  ⋃ (differ) ∪ word(w)·Σ*                        (… or w a prefix incl. = w)
 ///
-/// `m = MAX` collapses `Range(MAX+1, MAX)` to empty, dropping the range branch.
-fn order_const_left(ctx: &mut Context, s: TermId, m: i128, reflexive: bool) -> Option<TermId> {
-    let above = concat(vec![range_rex(m + 1, MAX_CODE as i128)?, sigma_star()]);
-    let word_c = Rex::Range(m as u32, m as u32);
+/// k = 1 reproduces slice 24's `Range(c₀+1,MAX)·Σ* ∪ word(c₀)·(Σ·Σ* | Σ*)`.
+fn order_const_left(ctx: &mut Context, s: TermId, cs: &[i128], reflexive: bool) -> Option<TermId> {
+    let mut branches: Vec<Rex> = Vec::new();
+    for i in 0..cs.len() {
+        branches.push(concat(vec![
+            word_rex(&cs[..i]),
+            range_rex(cs[i] + 1, MAX_CODE as i128)?,
+            sigma_star(),
+        ]));
+    }
+    let word_w = word_rex(cs);
     let prefix = if reflexive {
-        concat(vec![word_c, sigma_star()]) // word(c)·Σ*
+        concat(vec![word_w, sigma_star()]) // word(w)·Σ*
     } else {
-        concat(vec![word_c, sigma(), sigma_star()]) // word(c)·Σ·Σ*
+        concat(vec![word_w, sigma(), sigma_star()]) // word(w)·Σ·Σ*
     };
-    Some(membership(ctx, s, union(vec![above, prefix])))
+    branches.push(prefix);
+    Some(membership(ctx, s, union(branches)))
 }
 
 /// Presence fence: `true` iff any `str.<`/`str.<=` application survives the
@@ -351,15 +387,45 @@ mod tests {
     }
 
     #[test]
-    fn multi_char_const_right_survives_to_fence() {
-        // A length-2 constant is out of scope (banked) ⇒ the atom survives ⇒ fence.
+    fn multi_char_const_right_now_rewrites() {
+        // Slice 30: a length-≥2 constant on the RIGHT now rewrites to membership
+        // (was fenced pre-slice-30). (str.< s "bc") ≡
+        //   s ∈ Eps ∪ "b" ∪ Range(0,'a')·Σ* ∪ "b"·Range(0,'b')·Σ*.
         let mut ctx = Context::new();
         let s = str_var(&mut ctx, "s");
-        let bc = ctx.mk_string_const("bc");
+        let bc = ctx.mk_string_const("bc"); // codes 98, 99
         let lt = order(&mut ctx, BuiltinOp::StrLt, s, bc);
         let out = rewrite_str_order(&mut ctx, &[lt]);
-        assert_eq!(out, vec![lt]);
-        assert!(has_unreduced_str_order(&ctx, &out));
+        let want_lang = union(vec![
+            Rex::Eps,                                                       // proper prefix j=0 (ε)
+            Rex::Range(98, 98), // proper prefix j=1 ("b")
+            concat(vec![Rex::Range(0, 97), star(Rex::Range(0, MAX_CODE))]), // differ i=0
+            concat(vec![
+                Rex::Range(98, 98),
+                Rex::Range(0, 98),
+                star(Rex::Range(0, MAX_CODE)),
+            ]), // differ i=1: "b"·Range(0,'b')·Σ*
+        ]);
+        let want = membership(&mut ctx, s, want_lang);
+        assert_eq!(out, vec![want]);
+        assert!(!has_unreduced_str_order(&ctx, &out));
+
+        // (str.<= s "bc") additionally admits the word "bc" itself.
+        let le = order(&mut ctx, BuiltinOp::StrLeq, s, bc);
+        let out = rewrite_str_order(&mut ctx, &[le]);
+        let want_lang = union(vec![
+            Rex::Eps,
+            Rex::Range(98, 98),
+            concat(vec![Rex::Range(0, 97), star(Rex::Range(0, MAX_CODE))]),
+            concat(vec![
+                Rex::Range(98, 98),
+                Rex::Range(0, 98),
+                star(Rex::Range(0, MAX_CODE)),
+            ]),
+            concat(vec![Rex::Range(98, 98), Rex::Range(99, 99)]), // word "bc"
+        ]);
+        let want = membership(&mut ctx, s, want_lang);
+        assert_eq!(out, vec![want]);
     }
 
     #[test]
@@ -467,5 +533,72 @@ mod tests {
         ]);
         let want = membership(&mut ctx, s, want_lang);
         assert_eq!(out, vec![want]);
+    }
+
+    #[test]
+    fn multi_char_const_left_now_rewrites() {
+        // (str.< "bc" s) ≡ s ∈ Range(99,MAX)·Σ* ∪ "b"·Range(100,MAX)·Σ* ∪ "bc"·Σ·Σ*.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let bc = ctx.mk_string_const("bc"); // codes 98, 99
+        let lt = order(&mut ctx, BuiltinOp::StrLt, bc, s);
+        let out = rewrite_str_order(&mut ctx, &[lt]);
+        let want_lang = union(vec![
+            concat(vec![
+                Rex::Range(99, MAX_CODE),
+                star(Rex::Range(0, MAX_CODE)),
+            ]), // differ i=0
+            concat(vec![
+                Rex::Range(98, 98),
+                Rex::Range(100, MAX_CODE),
+                star(Rex::Range(0, MAX_CODE)),
+            ]), // differ i=1
+            concat(vec![
+                Rex::Range(98, 98),
+                Rex::Range(99, 99),
+                Rex::Range(0, MAX_CODE),
+                star(Rex::Range(0, MAX_CODE)),
+            ]), // "bc"·Σ·Σ*
+        ]);
+        let want = membership(&mut ctx, s, want_lang);
+        assert_eq!(out, vec![want]);
+        assert!(!has_unreduced_str_order(&ctx, &out));
+    }
+
+    #[test]
+    fn const_word_over_cap_survives_to_fence() {
+        // A constant word longer than ORDER_CONST_LEN_CAP is banked ⇒ fence.
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let long = ctx.mk_string_const(&"a".repeat(ORDER_CONST_LEN_CAP + 1));
+        let lt = order(&mut ctx, BuiltinOp::StrLt, s, long);
+        let out = rewrite_str_order(&mut ctx, &[lt]);
+        assert_eq!(out, vec![lt]);
+        assert!(has_unreduced_str_order(&ctx, &out));
+        // Exactly at the cap still rewrites (does not fence).
+        let at = ctx.mk_string_const(&"a".repeat(ORDER_CONST_LEN_CAP));
+        let lt2 = order(&mut ctx, BuiltinOp::StrLt, s, at);
+        let out2 = rewrite_str_order(&mut ctx, &[lt2]);
+        assert!(
+            !has_unreduced_str_order(&ctx, &out2),
+            "at-cap word must rewrite"
+        );
+    }
+
+    #[test]
+    fn const_word_block_edge_interior_does_not_fence() {
+        // Multi-char word with a char at the surrogate block boundary: the interior
+        // class Range(0, 0xE000-1) = Range(0, 0xDFFF) is a block EDGE (expressible),
+        // so the word rewrites without fencing (generalizes
+        // single_char_const_block_edge_does_not_fence to an interior position).
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let w = ctx.mk_string_const("\u{E000}b"); // codes 0xE000, 98
+        let lt = order(&mut ctx, BuiltinOp::StrLt, s, w);
+        let out = rewrite_str_order(&mut ctx, &[lt]);
+        assert!(
+            !has_unreduced_str_order(&ctx, &out),
+            "block-edge interior must not fence"
+        );
     }
 }
