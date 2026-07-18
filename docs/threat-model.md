@@ -38,7 +38,7 @@ no environment-controlled behavior beyond standard cargo/CI variables.
 
 | Risk | Control |
 |---|---|
-| Memory unsafety on hostile input | Pure-Rust mandate: `deny.toml` bans native-link deps (`rug`, `gmp-mpfr-sys`, `z3-sys`, `cadical-rs`); exactly one audited `unsafe` block (`crates/shinri-sat/src/clause.rs`) |
+| Memory unsafety on hostile input | Pure-Rust mandate: `deny.toml` bans native-link deps (`rug`, `gmp-mpfr-sys`, `z3-sys`, `cadical-rs`); exactly one audited `unsafe` block in shipping code (`crates/shinri-sat/src/clause.rs`) — the only other `unsafe` is a feature-gated `setrlimit` in the oracle test harness (`crates/shinri-solver/tests/qfs_fuzz_corpus.rs`), never in the binary |
 | Parser crashes / panics | `parse_script` fuzz target (`crates/shinri-parser/fuzz`) on the nightly fuzz budget, alongside the num/theory/sat targets |
 | Dependency CVEs | `cargo deny check` (advisories, bans, licenses) on the blocking tier; Dependabot weekly grouped bumps |
 | Committed credentials | gitleaks: blocking-CI step + `mise run secrets`; opt-in per-clone pre-commit hook (`mise generate git-pre-commit --task=secrets-staged --write`) |
