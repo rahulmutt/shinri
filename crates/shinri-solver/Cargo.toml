@@ -21,7 +21,7 @@ shinri-frontend = { path = "../shinri-frontend" }
 rustc-hash = "2"
 
 [dev-dependencies]
-easy-smt = "0.2"
+easy-smt = "0.3"
 shinri-parser = { path = "../shinri-parser" }
 shinri-frontend = { path = "../shinri-frontend" }
 libc = "0.2"
