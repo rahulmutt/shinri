@@ -87,6 +87,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: z3/cvc5 differential oracle suite
         run: cargo nextest run -p shinri-solver --features oracle
+      - name: QF_S enumeration fuzzer (E1, differential vs z3)
+        # #[ignore]d + oracle-gated, so it runs in no other tier; vetted at the
+        # default 4000 iters (~3 min). Targeted --run-ignored only keeps the
+        # other ignored tests (lia_e2e runs in the differential job) single-run.
+        run: cargo nextest run -p shinri-solver --features oracle --run-ignored only -E 'test(e1_enumerate_wrong_verdicts)'
 
   fuzz:
     runs-on: ubuntu-latest
