@@ -3415,37 +3415,75 @@ fn targeted_regex_bare_range_multi_atom_residual_stays_unknown() {
     );
 }
 
-/// Slice 22 KNOWN GAP: a fused narrow range (`Range(48, 57)`, 10 words, under
-/// `ENUM_WORD_CAP`) enumerates fine on its own, but adding an independent
-/// length constraint of 2 on the SAME variable does not close — each
-/// enumerated disjunct is a length-1 word equation, and the seam between the
-/// enumerated word-equation disjunction and a separately-asserted `str.len`
-/// constraint does not resolve the resulting contradiction. Sound Unknown; z3
-/// says Unsat.
-///
-/// This is a pre-existing slice-20/21 enumeration-length seam gap, not a
-/// `to_code` artifact: the hand-written, `to_code`-free equivalent —
-/// `(str.in_re s (re.range "0" "9")) ∧ (str.len s) = 2` — is ALSO Unknown (z3:
-/// unsat), so the `to_code` gadget conversion is not implicated.
+/// Slice 29 FLIP (was `targeted_to_code_range_length_seam_known_gap`,
+/// slice 22): the finite-enumeration rewrite now conjoins the entailed
+/// exact-length companion (`s ∈ [0-9] ⇒ len(s) = 1`), so an
+/// independently-asserted `len(s) = 2` refutes in arith — fuel-free, no
+/// per-disjunct SAT churn (the old failure: refuting the 10 enumerated
+/// disjuncts one at a time exhausted the shared fuel of 40 at the ninth).
+/// Both the `to_code` gadget form and the `to_code`-free control decide
+/// Unsat; z3 agrees (cross-checked by `expect`).
 #[test]
-fn targeted_to_code_range_length_seam_known_gap() {
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)\
-             (assert (>= (str.to_code s) 48))(assert (<= (str.to_code s) 57))\
-             (assert (= (str.len s) 2))(check-sat)"
-        ),
-        Verdict::Unknown,
+fn targeted_to_code_range_length_seam_now_decides() {
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (>= (str.to_code s) 48))(assert (<= (str.to_code s) 57))\
+         (assert (= (str.len s) 2))(check-sat)",
+        Verdict::Unsat,
     );
-    // Control: the same language, `to_code`-free, shows the identical gap —
-    // this is not something the `to_code` gadget introduces.
-    assert_eq!(
-        shinri_verdict(
-            "(set-logic QF_S)(declare-fun s () String)\
-             (assert (str.in_re s (re.range \"0\" \"9\")))\
-             (assert (= (str.len s) 2))(check-sat)"
-        ),
-        Verdict::Unknown,
+    // Control: the same language, `to_code`-free.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.range \"0\" \"9\")))\
+         (assert (= (str.len s) 2))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+/// Slice 29: the companion is EXACT (distinct lengths), not min/max bounds:
+/// `s ∈ {"a","abc"} ∧ len(s) = 2` is Unsat even though 1 ≤ 2 ≤ 3 — a
+/// bounds-only companion could not decide this (the anti-alternative-B pin
+/// from the design).
+#[test]
+fn targeted_enum_gappy_length_set_unsat() {
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.union (str.to_re \"a\") (str.to_re \"abc\"))))\
+         (assert (= (str.len s) 2))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+/// Slice 29 guards: the companion must not over-fire.
+#[test]
+fn targeted_enum_length_companion_guards() {
+    // Consistent length: stays Sat.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.in_re s (re.range \"0\" \"9\")))\
+         (assert (= (str.len s) 1))(check-sat)",
+        Verdict::Sat,
+    );
+    // Negative polarity: the rewrite is an equivalence under Not, so
+    // ¬(s ∈ [0-9]) ∧ s = "3" refutes (the companion's conjuncts are both
+    // true at s = "3", so the negation is false).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (not (str.in_re s (re.range \"0\" \"9\"))))\
+         (assert (= s \"3\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // A bare re.range is matched by enum_lang first, so this is still the
+    // finite branch under Not: the companion does not cause a spurious
+    // Unsat — ¬(disj ∧ fact) is Sat at length 2. The co-finite no-companion
+    // guarantee is pinned separately by the unchanged unit test
+    // symbolic_cofinite_atom_rewrites_to_negated_disjunction in
+    // crates/shinri-str/src/regex.rs.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (not (str.in_re s (re.range \"0\" \"9\"))))\
+         (assert (= (str.len s) 2))(check-sat)",
+        Verdict::Sat,
     );
 }
 

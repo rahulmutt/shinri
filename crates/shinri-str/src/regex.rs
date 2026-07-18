@@ -1197,7 +1197,8 @@ fn try_rewrite_symbolic_in_re(ctx: &mut Context, kids: &[TermId]) -> Option<Term
     }
     let rex = extract_const_regex(ctx, kids[1])?;
     if let Some(ws) = enum_lang(&rex) {
-        return Some(mk_eq_disjunction(ctx, kids[0], &ws, false));
+        let disj = mk_eq_disjunction(ctx, kids[0], &ws, false);
+        return Some(conjoin_len_fact(ctx, kids[0], &ws, disj));
     }
     let exceptions = enum_comp(&rex)?;
     Some(mk_eq_disjunction(ctx, kids[0], &exceptions, true))
@@ -1229,6 +1230,53 @@ fn mk_eq_disjunction(ctx: &mut Context, t: TermId, words: &Words, negate: bool) 
     } else {
         core
     }
+}
+
+/// Slice 29: max distinct word lengths for which the entailed exact-length
+/// companion is conjoined onto the finite-enumeration rewrite. Beyond the
+/// cap the companion is skipped entirely — it is an implied fact, so
+/// skipping is always sound (merely today's behavior); the cap bounds the
+/// added SAT burden.
+const LEN_FACT_DISTINCT_CAP: usize = 4;
+
+/// Slice 29: conjoin the entailed exact-length fact onto the finite
+/// enumeration rewrite: `t ∈ W ≡ (⋁ t = wᵢ) ∧ (⋁ len(t) = ℓⱼ)` over the
+/// DISTINCT word lengths `ℓⱼ` of `W`, counted in code points (`chars()` —
+/// every enumerated character is in-alphabet by the `enum_lang` (surrogate
+/// ranges) and `lit_to_rex` (above-alphabet literals) fences, so Rust
+/// chars = SMT-LIB code points). The companion is entailed by the
+/// disjunction, so the conjunction preserves the slice-20 equivalence at
+/// any polarity. It closes the enumeration↔length seam WITHOUT fuel:
+/// refuting an independent `str.len` constraint no longer requires the SAT
+/// layer to refute wᵢ-disjuncts one at a time, each costing length-axiom
+/// emissions from the shared fuel (the slice-22 known-gap cliff: fuel 40
+/// dies at 9 disjuncts; `[0-9]` has 10). The co-finite branch gets no
+/// companion (a complement has min length 0 and no finite max).
+fn conjoin_len_fact(ctx: &mut Context, t: TermId, ws: &Words, disj: TermId) -> TermId {
+    if ws.is_empty() {
+        return disj; // already folded to `false` — nothing to strengthen
+    }
+    let lens: BTreeSet<usize> = ws.iter().map(|w| w.chars().count()).collect();
+    if lens.len() > LEN_FACT_DISTINCT_CAP {
+        return disj;
+    }
+    let lt = crate::wordeq::len_of(ctx, t);
+    let int_s = ctx.int_sort();
+    let eqs: Vec<TermId> = lens
+        .into_iter()
+        .map(|l| {
+            let n = ctx.mk_numeral(shinri_core::Rational::from_int((l as i128).into()), int_s);
+            ctx.mk_eq(lt, n).expect("well-sorted length equality")
+        })
+        .collect();
+    let fact = if eqs.len() == 1 {
+        eqs[0]
+    } else {
+        ctx.mk_app(Op::Builtin(BuiltinOp::Or), &eqs)
+            .expect("well-sorted disjunction")
+    };
+    ctx.mk_app(Op::Builtin(BuiltinOp::And), &[disj, fact])
+        .expect("well-sorted conjunction")
 }
 
 /// Any literal character above the SMT-LIB alphabet anywhere in `t`?
@@ -2061,6 +2109,21 @@ mod tests {
             .collect()
     }
 
+    /// Unwrap the slice-29 `(and disj len-fact)` companion wrapper.
+    fn unwrap_len_companion(ctx: &Context, t: TermId) -> (TermId, TermId) {
+        let TermNode::App {
+            op: Op::Builtin(BuiltinOp::And),
+            args,
+            ..
+        } = ctx.term_node(t)
+        else {
+            panic!("expected (and disj len-fact), got {:?}", ctx.term_node(t));
+        };
+        let kids = ctx.children(*args).to_vec();
+        assert_eq!(kids.len(), 2, "companion And must be binary");
+        (kids[0], kids[1])
+    }
+
     #[test]
     fn symbolic_finite_atom_rewrites_to_eq_disjunction() {
         let mut ctx = Context::new();
@@ -2076,14 +2139,25 @@ mod tests {
         let atom = in_re(&mut ctx, s, un);
         let out = rewrite_ground_in_re(&mut ctx, &[atom]);
         assert!(!has_unreduced_regex(&ctx, &out), "atom must be rewritten");
-        let mut vals = eq_disjunct_values(&ctx, out[0]);
+        // Slice 29: the finite rewrite is `(and (⋁ s = wᵢ) len-fact)`.
+        let (disj, fact) = unwrap_len_companion(&ctx, out[0]);
+        let mut vals = eq_disjunct_values(&ctx, disj);
         vals.sort();
         assert_eq!(vals, vec!["a".to_owned(), "b".to_owned()]);
+        // Both words have length 1 → the fact is the bare `(= (str.len s) 1)`
+        // (hash-consing makes the expected term id an identity check).
+        let lt = crate::wordeq::len_of(&mut ctx, s);
+        let int_s = ctx.int_sort();
+        let one = ctx.mk_numeral(shinri_core::Rational::from_int(1i128.into()), int_s);
+        let expected = ctx.mk_eq(lt, one).unwrap();
+        assert_eq!(fact, expected);
 
-        // Singleton language: a bare equality, no Or wrapper.
+        // Singleton language: bare equality inside the companion, no Or.
         let atom = in_re(&mut ctx, s, re_a);
         let out = rewrite_ground_in_re(&mut ctx, &[atom]);
-        assert_eq!(eq_disjunct_values(&ctx, out[0]), vec!["a".to_owned()]);
+        let (disj, fact) = unwrap_len_companion(&ctx, out[0]);
+        assert_eq!(eq_disjunct_values(&ctx, disj), vec!["a".to_owned()]);
+        assert_eq!(fact, expected);
     }
 
     #[test]
@@ -2186,6 +2260,89 @@ mod tests {
         let out = rewrite_ground_in_re(&mut ctx, &[eq, atom]);
         assert_eq!(out[0], eq, "unrelated assertion must keep its TermId");
         assert_ne!(out[1], atom, "membership atom must be rewritten");
+    }
+
+    // ── Task 1 (slice 29): exact-length companion ────────────────────────
+
+    #[test]
+    fn gappy_length_set_emits_or_of_length_eqs() {
+        // {"a", "abc"} → distinct lengths {1, 3} → `(or (= len 1) (= len 3))`
+        // in BTreeSet (ascending) order.
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let a = slit(&mut ctx, "a");
+        let abc = slit(&mut ctx, "abc");
+        let re_a = to_re(&mut ctx, a);
+        let re_abc = to_re(&mut ctx, abc);
+        let un = ctx
+            .mk_app(Op::Builtin(BuiltinOp::ReUnion), &[re_a, re_abc])
+            .unwrap();
+        let atom = in_re(&mut ctx, s, un);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        let (_disj, fact) = unwrap_len_companion(&ctx, out[0]);
+        let lt = crate::wordeq::len_of(&mut ctx, s);
+        let int_s = ctx.int_sort();
+        let n1 = ctx.mk_numeral(shinri_core::Rational::from_int(1i128.into()), int_s);
+        let n3 = ctx.mk_numeral(shinri_core::Rational::from_int(3i128.into()), int_s);
+        let e1 = ctx.mk_eq(lt, n1).unwrap();
+        let e3 = ctx.mk_eq(lt, n3).unwrap();
+        let expected = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[e1, e3]).unwrap();
+        assert_eq!(fact, expected);
+    }
+
+    #[test]
+    fn companion_length_counted_in_code_points() {
+        // "\u{2FFFF}b" is 2 SMT-LIB code points (and 5 UTF-8 bytes): the
+        // companion must say len = 2, never a byte count. U+2FFFF == MAX_CODE
+        // is in-alphabet, so no fence fires.
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let w = slit(&mut ctx, "\u{2FFFF}b");
+        let re_w = to_re(&mut ctx, w);
+        let atom = in_re(&mut ctx, s, re_w);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        let (_disj, fact) = unwrap_len_companion(&ctx, out[0]);
+        let lt = crate::wordeq::len_of(&mut ctx, s);
+        let int_s = ctx.int_sort();
+        let two = ctx.mk_numeral(shinri_core::Rational::from_int(2i128.into()), int_s);
+        let expected = ctx.mk_eq(lt, two).unwrap();
+        assert_eq!(fact, expected);
+    }
+
+    #[test]
+    fn distinct_length_cap_skips_companion() {
+        // {"a","aa","aaa","aaaa","aaaaa"} → 5 distinct lengths >
+        // LEN_FACT_DISTINCT_CAP (4) → NO companion: the rewrite keeps the
+        // pre-slice-29 bare-disjunction shape (skipping the implied fact is
+        // always sound — today's behavior).
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = nullary(&mut ctx, "s", str_s);
+        let res: Vec<TermId> = ["a", "aa", "aaa", "aaaa", "aaaaa"]
+            .iter()
+            .map(|w| {
+                let l = slit(&mut ctx, w);
+                to_re(&mut ctx, l)
+            })
+            .collect();
+        let un = ctx.mk_app(Op::Builtin(BuiltinOp::ReUnion), &res).unwrap();
+        let atom = in_re(&mut ctx, s, un);
+        let out = rewrite_ground_in_re(&mut ctx, &[atom]);
+        // Directly a disjunction — `eq_disjunct_values` panics on And.
+        let mut vals = eq_disjunct_values(&ctx, out[0]);
+        vals.sort();
+        assert_eq!(
+            vals,
+            vec![
+                "a".to_owned(),
+                "aa".to_owned(),
+                "aaa".to_owned(),
+                "aaaa".to_owned(),
+                "aaaaa".to_owned()
+            ]
+        );
     }
 
     // ── Task 1 (slice 21): classes, reverse translation, word search ────────
