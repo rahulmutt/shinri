@@ -1242,8 +1242,9 @@ const LEN_FACT_DISTINCT_CAP: usize = 4;
 /// Slice 29: conjoin the entailed exact-length fact onto the finite
 /// enumeration rewrite: `t ∈ W ≡ (⋁ t = wᵢ) ∧ (⋁ len(t) = ℓⱼ)` over the
 /// DISTINCT word lengths `ℓⱼ` of `W`, counted in code points (`chars()` —
-/// every enumerated character is in-alphabet by the `enum_lang` fences, so
-/// Rust chars = SMT-LIB code points). The companion is entailed by the
+/// every enumerated character is in-alphabet by the `enum_lang` (surrogate
+/// ranges) and `lit_to_rex` (above-alphabet literals) fences, so Rust
+/// chars = SMT-LIB code points). The companion is entailed by the
 /// disjunction, so the conjunction preserves the slice-20 equivalence at
 /// any polarity. It closes the enumeration↔length seam WITHOUT fuel:
 /// refuting an independent `str.len` constraint no longer requires the SAT

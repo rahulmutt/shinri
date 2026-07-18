@@ -3473,7 +3473,12 @@ fn targeted_enum_length_companion_guards() {
          (assert (= s \"3\"))(check-sat)",
         Verdict::Unsat,
     );
-    // Co-finite side untouched: ¬(s ∈ [0-9]) ∧ len(s) = 2 is Sat.
+    // A bare re.range is matched by enum_lang first, so this is still the
+    // finite branch under Not: the companion does not cause a spurious
+    // Unsat — ¬(disj ∧ fact) is Sat at length 2. The co-finite no-companion
+    // guarantee is pinned separately by the unchanged unit test
+    // symbolic_cofinite_atom_rewrites_to_negated_disjunction in
+    // crates/shinri-str/src/regex.rs.
     expect(
         "(set-logic QF_S)(declare-fun s () String)\
          (assert (not (str.in_re s (re.range \"0\" \"9\"))))\
