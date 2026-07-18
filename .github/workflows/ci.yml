@@ -28,7 +28,34 @@ jobs:
       - name: Tests (fast tier)
         run: mise run test
 
-  # Nightly tier — exhaustive/#[ignore]d tests, extended differential, oracle, fuzz.
+  # Nightly tier — fanned out across parallel jobs so wall-clock ≈ the slowest
+  # single test (~55 min div exhaustive) instead of the ~2 h serial chain.
+  # One job per exhaustive #[ignore]d shinri-fp test (the >5 min suites).
+  exhaustive:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        test:
+          - fp_div_tiny_exhaustive_all_modes
+          - fp_mul_tiny_exhaustive_all_modes
+          - fp_add_tiny_exhaustive_all_modes
+          - to_fp_fp_tiny_exhaustive_both_directions
+          - rem_tiny_exhaustive
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Exhaustive test (nightly tier)
+        run: mise run test-exhaustive
+        env:
+          EXHAUSTIVE_TEST: ${{ matrix.test }}
+
+  # Everything else in the full suite (incl. the other #[ignore]d tests),
+  # plus the extended property runs (seconds at 4000 cases).
   differential:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
@@ -38,8 +65,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
-      - name: Full test suite (includes #[ignore]d exhaustive tier)
-        run: mise run test-full
+      - name: Full test suite minus the exhaustive matrix
+        run: mise run test-full-rest
       - name: Extended differential (more cases)
         run: cargo nextest run -p shinri-sat --test oracle
         env:
@@ -48,7 +75,27 @@ jobs:
         run: cargo nextest run -p shinri-theory --test props
         env:
           PROPTEST_CASES: '4000'
+
+  oracle:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: Swatinem/rust-cache@v2
       - name: z3/cvc5 differential oracle suite
         run: cargo nextest run -p shinri-solver --features oracle
+
+  fuzz:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: Swatinem/rust-cache@v2
       - name: Fuzz smoke (60s per target)
         run: mise run fuzz-smoke
