@@ -104,3 +104,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Fuzz smoke (60s per target)
         run: mise run fuzz-smoke
+
+  # Mutation audit — one crate per night, rotated by day-of-year (full
+  # 15-crate cycle ≈ every two weeks). Report-only for now: missed mutants
+  # (exit 2) and timeouts (exit 3) surface via the mutants.out artifact,
+  # not a red job — a first pass over an unaudited suite would pin the
+  # nightly red permanently. Baseline/usage failures (other codes) still
+  # fail. Revisit fail-on-regression once a baseline exists.
+  mutants:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Pick tonight's crate (day-of-year rotation)
+        id: pick
+        run: |
+          crates=(shinri-num shinri-core shinri-frontend shinri-sat shinri-theory shinri-euf shinri-solver shinri-arith shinri-parser shinri-cli shinri-arrays shinri-bv shinri-abv shinri-str shinri-fp)
+          idx=$(( 10#$(date -u +%j) % ${#crates[@]} ))
+          echo "crate=${crates[$idx]}" >> "$GITHUB_OUTPUT"
+          echo "Tonight's crate: ${crates[$idx]}"
+      - name: Mutation-test ${{ steps.pick.outputs.crate }}
+        run: |
+          set +e
+          MUTANTS_PACKAGE='${{ steps.pick.outputs.crate }}' mise run mutants
+          code=$?
+          case "$code" in
+            0|2|3) exit 0 ;;  # clean / missed mutants / timeouts: report-only
+            *) exit "$code" ;;
+          esac
+      - name: Upload mutants.out
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mutants-${{ steps.pick.outputs.crate }}
+          path: target/mutants/mutants.out

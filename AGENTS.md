@@ -29,6 +29,11 @@ tasks, so never duplicate their command lines elsewhere.
 - `cargo clippy --workspace --all-targets -- -D warnings` must be clean
   (`mise run lint` covers both).
 
+## Security
+
+- Threat model: [docs/threat-model.md](docs/threat-model.md) — read it
+  before touching `shinri-parser` or any input-handling code.
+
 ## Conventions
 
 - Specs: `docs/superpowers/specs/YYYY-MM-DD-<topic>-design.md`; plans:

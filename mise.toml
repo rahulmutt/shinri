@@ -23,6 +23,10 @@ run = "cargo deny check"
 description = "Secret scan of the working tree (gitleaks)"
 run = "gitleaks dir . --no-banner --redact"
 
+[tasks.secrets-staged]
+description = "Secret scan of staged changes only (pre-commit hook body)"
+run = "gitleaks git --pre-commit --staged --no-banner --redact"
+
 [tasks.test]
 description = "Fast test suite — skips #[ignore]d slow tests (blocking CI tier)"
 run = "cargo nextest run --all"
@@ -44,12 +48,16 @@ description = "Short libFuzzer budget per fuzz target (nightly rustc via mise); 
 shell = "bash -c"
 run = """
 set -euo pipefail
-for spec in shinri-num:integer_ops shinri-theory:classify shinri-sat:dimacs_parse shinri-sat:cnf_vs_oracle; do
+for spec in shinri-num:integer_ops shinri-theory:classify shinri-sat:dimacs_parse shinri-sat:cnf_vs_oracle shinri-parser:parse_script; do
   crate="${spec%%:*}"; target="${spec##*:}"
   echo "== fuzz $crate/$target =="
   (cd "crates/$crate" && mise x rust@nightly -- cargo fuzz run "$target" -- -max_total_time="${FUZZ_SECONDS:-60}")
 done
 """
+
+[tasks.mutants]
+description = "Mutation-test one crate (cargo-mutants); pick it via MUTANTS_PACKAGE, e.g. MUTANTS_PACKAGE=shinri-num mise run mutants"
+run = "mkdir -p target/mutants && cargo mutants --package \"$MUTANTS_PACKAGE\" --timeout 300 --output target/mutants"
 
 [tasks.ci]
 description = "Everything the blocking CI tier runs: lint, deny, secrets, test"
