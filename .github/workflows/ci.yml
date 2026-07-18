@@ -3,40 +3,43 @@ on:
   push:
   pull_request:
   schedule:
-    - cron: '0 3 * * *' # nightly differential/fuzz budget
-  workflow_dispatch: # on-demand smoke test of the differential job
+    - cron: '0 3 * * *' # nightly full/differential/fuzz budget
+  workflow_dispatch: # on-demand run of the nightly-tier job
 permissions:
   contents: read
 jobs:
+  # Blocking tier — budget 10–15 min wall-clock, hard-capped below.
+  # Any test >5 min belongs in the nightly tier via #[ignore] (see AGENTS.md).
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
-        with:
-          components: clippy, rustfmt
+      - uses: jdx/mise-action@v2 # single source of toolchain+tools: mise.toml
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # mise github backend → avoid API rate limits resolving z3/cvc5 releases
       - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-nextest,cargo-deny
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: Lint
+        run: mise run lint
       - name: Dependency policy
-        run: cargo deny check
-      - name: Tests
-        run: cargo nextest run --all
+        run: mise run deny
+      - name: Secret scan
+        run: mise run secrets
+      - name: Tests (fast tier)
+        run: mise run test
 
+  # Nightly tier — exhaustive/#[ignore]d tests, extended differential, oracle, fuzz.
   differential:
     runs-on: ubuntu-latest
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2 # installs mise.toml tools: rust, nextest, z3, cvc5 (also deny/fuzz/mutants)
+      - uses: jdx/mise-action@v2
         env:
-          GITHUB_TOKEN: ${{ github.token }} # mise github backend → avoid API rate limits resolving z3/cvc5 releases
+          GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
+      - name: Full test suite (includes #[ignore]d exhaustive tier)
+        run: mise run test-full
       - name: Extended differential (more cases)
         run: cargo nextest run -p shinri-sat --test oracle
         env:
@@ -47,3 +50,5 @@ jobs:
           PROPTEST_CASES: '4000'
       - name: z3/cvc5 differential oracle suite
         run: cargo nextest run -p shinri-solver --features oracle
+      - name: Fuzz smoke (60s per target)
+        run: mise run fuzz-smoke

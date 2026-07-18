@@ -476,6 +476,7 @@ mod tests {
     ];
 
     #[test]
+    #[ignore = "exhaustive: nightly tier (~18 min in CI)"]
     fn to_fp_fp_tiny_exhaustive_both_directions() {
         // (5,11) <-> (3,5), every source value, all five modes, bit-identical vs golden.
         for &(core_rm, ref_rm) in &MODES {

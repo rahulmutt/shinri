@@ -181,6 +181,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "exhaustive: nightly tier (~54 min in CI)"]
     fn fp_div_tiny_exhaustive_all_modes() {
         let (eb, sb) = (3u32, 5u32);
         let modes = [

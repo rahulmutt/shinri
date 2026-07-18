@@ -220,6 +220,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "exhaustive: nightly tier (~13 min in CI)"]
     fn rem_tiny_exhaustive() {
         // Format (3,5): all 256x256 operand pairs, bit-identical vs the golden.
         let (eb, sb) = (3u32, 5u32);
