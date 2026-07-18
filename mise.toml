@@ -23,6 +23,10 @@ run = "cargo deny check"
 description = "Secret scan of the working tree (gitleaks)"
 run = "gitleaks dir . --no-banner --redact"
 
+[tasks.secrets-staged]
+description = "Secret scan of staged changes only (pre-commit hook body)"
+run = "gitleaks git --pre-commit --staged --no-banner --redact"
+
 [tasks.test]
 description = "Fast test suite — skips #[ignore]d slow tests (blocking CI tier)"
 run = "cargo nextest run --all"

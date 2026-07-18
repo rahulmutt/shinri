@@ -9,6 +9,7 @@ Install [mise](https://mise.jdx.dev), then from the repo root:
 ```sh
 mise install   # pinned toolchain + tools: rust, nextest, cargo-deny, gitleaks, z3, cvc5, …
 mise run ci    # lint + dependency policy + secret scan + fast test suite
+mise generate git-pre-commit --task=secrets-staged --write   # optional: block staged secrets at commit time
 ```
 
 ## Common tasks
@@ -20,6 +21,7 @@ Defined in `mise.toml` (CI runs these same tasks — they cannot drift):
 | `mise run lint` | rustfmt check + clippy (deny warnings) |
 | `mise run deny` | dependency policy: bans, advisories, licenses |
 | `mise run secrets` | gitleaks secret scan of the working tree |
+| `mise run secrets-staged` | gitleaks scan of staged changes only (pre-commit hook body) |
 | `mise run test` | fast test suite (skips `#[ignore]`d slow tests) |
 | `mise run test-full` | full suite including exhaustive/slow tests (nightly tier) |
 | `mise run fuzz-smoke` | short libFuzzer run per fuzz target (`FUZZ_SECONDS` overrides 60s) |
