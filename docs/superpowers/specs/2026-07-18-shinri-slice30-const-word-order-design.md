@@ -1,7 +1,7 @@
 # Slice 30 design — constant-word lexicographic order
 
 Date: 2026-07-18
-Status: DESIGN
+Status: IMPLEMENTED (2026-07-18)
 
 Predecessor: slice 29 (enumeration↔length exact-length companion, landed
 2026-07-18). Slice 29 cashed slice 22's enumeration-length seam gap. The
@@ -189,3 +189,125 @@ string change can flip string-side e2e pins; any z3-confirmed
   propagation, distinct-length sets > `LEN_FACT_DISTINCT_CAP`, co-finite
   memberships, slice-28 §8 conflict-core work, slice-27 typed-antecedent
   refactor).
+
+## Implementation notes (truth-up)
+
+Implemented 2026-07-18 on branch `slice30-const-word-order` (base
+`0997e22e` = plan commit; spec `966289ec`).
+
+**Landed as designed:**
+
+- `d2b21d07` — §2 rewrite (`crates/shinri-str/src/order.rs`).
+  `single_char_code(&str) -> Option<i128>` replaced by
+  `word_codes(&str) -> Option<Vec<i128>>` (`None` on empty, any char
+  `> MAX_CODE`, or length `> ORDER_CONST_LEN_CAP`); new
+  `word_rex(&[i128]) -> Rex`; `order_const_right`/`order_const_left`
+  re-signatured `m: i128 → cs: &[i128]` and generalized to the
+  proper-prefix + first-differ + reflexive/proper-prefix-tail unions of
+  §2; the two single-char `try_order_atom` arms collapsed into one
+  constant-word arm each (right passes `a`, left passes `b`); `const
+  ORDER_CONST_LEN_CAP: usize = 256` (mirrors `regex::ENUM_WORD_CAP`). k=1
+  collapses to slice 24's arms exactly — `word_rex(&cs[..0]) =
+  concat(vec![]) = Eps`, dropped by `concat` — so the seven single-char
+  unit tests pass unchanged (the strict-generalization regression guard).
+  `multi_char_const_right_survives_to_fence` flipped to
+  `multi_char_const_right_now_rewrites` (asserts the exact `s<"bc"` and
+  `s<="bc"` unions, both ops); three new tests
+  (`multi_char_const_left_now_rewrites`,
+  `const_word_over_cap_survives_to_fence` — 257-char fences, 256-char
+  rewrites, `const_word_block_edge_interior_does_not_fence` — interior
+  `\u{E000}` neighbour is the `0xDFFF` block edge, expressible, no fence).
+  `order::` 17/17; full `shinri-str` 203/203. Code verbatim from plan.
+- `c19b0eb8` — §4 e2e pins (`qfs_differential.rs`).
+  `targeted_str_order_const_word_decides`: six z3-cross-checked `expect`
+  pins covering all six routes — right-const strict Unsat (`"bd"≮"bc"`),
+  right-const Sat (`"az"<"bc"`), left-const strict Unsat (`"bc"≮"ba"`),
+  left-const proper-prefix Sat (`"bc"<"bca"`), `<=` equality-boundary Sat
+  (`s="bc"`), strict-`<` excludes-equality Unsat. Ran foreground under
+  `--features oracle` (both the pin and the `_known_gap` non-regression
+  PASS). Code verbatim from plan.
+- `9d8b35fa` — §4 oracle family (`qfs_differential.rs`).
+  `Gen::finish_str_order_const_word` (2–4 char ASCII constants from
+  `ALPHABET = ["a","b","c"]`, either side, ~1/4 negated, plus a forcing
+  equality/length constraint) + `qfs_str_order_const_word_matches_z3`
+  (`SOCW_SEED = 0x53_00_0000_0005`, 200 iters). Foreground tally:
+  170 sat / 29 unsat / 1 shinri-unknown / 0 z3-unknown / 0 bailout;
+  **0 disagreements** (n_sat>0, n_unsat>0 met). Code verbatim from plan.
+
+**Testing refinement (deliberate, plan Task 3 note vs spec §4).** Spec §4
+said "extend the `qfs_str_order_matches_z3` generator." Instead a dedicated
+multi-char family was added, mirroring slice 24's single-char family — the
+house pattern (one family per decided fragment) that also gives forced
+Sat+Unsat coverage the general family cannot target. The general family
+*also* shows unknowns-down for free (its `lit()` emits 2-char literals that
+now decide), which is the primary dump-and-diff signal below.
+
+**Dump-and-diff (verdict monotonicity, base `0997e22e` vs fix `9d8b35fa`).**
+This repo's `qfs_differential.rs` has **no** per-iteration `DIFFDUMP`
+env-var recipe (unlike the mechanism slice 29's plan assumed), so the
+soundness invariant was checked by comparing the printed family tallies,
+which is the plan's documented fallback. General family
+`qfs_str_order_matches_z3`: base 61 sat / 80 unsat / **59 shinri-unknown**
+→ fix 82 / 95 / **23**. The 36 vanished unknowns land exactly as +21 sat
+and +15 unsat (36 = 21 + 15): every flip is **Unknown → decided**, zero
+`decided → Unknown`, zero `sat ↔ unsat`. A `sat ↔ unsat` flip is in fact
+impossible here — the generator is unchanged base↔fix and z3's verdict per
+body is fixed, so with **0 disagreements on both sides** any both-sides-
+decided verdict equals z3 on both. The single-char family is byte-identical
+both sides (175 / 25 / 0), confirming the k=1 path is untouched. The new
+const-word family exists only on fix (170 / 29 / 1, 0 disagreements).
+Acceptance invariant (spec §3) satisfied.
+
+**Full local gate (pre-push).** `shinri-str` 203/203; oracle
+`qfs_differential` FULL **83/83, 0 disagreements** anywhere; `script_e2e`
+67/67 — **no e2e pin flips** (same count as slice 29; nothing to
+adjudicate); `cargo clippy --workspace --all-targets -- -D warnings`
+exit 0; `cargo fmt --check` clean.
+
+**Final whole-branch review (opus): Ready to merge — Yes**, 0 Critical /
+0 Important / 2 Minor. Independently re-derived both builders against §2
+for k≥2 (both polarities, both relations, endpoints, strict/reflexive
+tail), the k=1 collapse, and the surrogate-fence totality argument
+(`range_rex` never returns `None` for an in-alphabet word — neighbours are
+at worst block edges); cleared the cross-cutting shape risk (the only
+downstream consumer of a surviving order atom is `has_unreduced_str_order`,
+the fence itself; multi-char constants now route to the same membership
+engine single-char already used). Both Minors carried as **DEFER**: (1) the
+O(k²) `word_rex(&cs[..i])` prefix recomputation in `order_const_*` —
+preprocessing-only, hard-bounded by the 256 cap (~65k trivial `Range`
+allocs worst case), never on a hot path, and **verbatim plan code** (a fix
+would deviate from the plan for no measurable gain; an incremental prefix
+accumulator is the revisit if the file is touched again); (2) the new
+family's doc comment omits the small-var-pool→UNSAT rationale its sibling
+states inline (verbatim brief text, cosmetic — behaviour is covered by the
+`n_unsat>0` assert).
+
+**Deviations (plan-text defects, corrected in execution; none affect what
+was measured or shipped):**
+
+1. The plan's `cargo nextest run … qfs_differential::<name>` positional
+   filter fails on this repo's nextest `0.9.140` ("no tests to run"); the
+   `-E 'test(<name>)'` expression filter was used instead (test discovery
+   confirmed with `cargo nextest list`, so no silent 0-tests run).
+2. `qfs_differential.rs` has no `DIFFDUMP` mechanism, so Task 4 Step 1's
+   dump-and-diff used the printed-tally comparison (the plan's documented
+   fallback), not a per-iteration hash-keyed diff.
+3. Task 4 Step 1's scratchpad path carried a stale session id (substituted
+   at execution).
+4. Under `--features oracle` `cargo clippy -p shinri-solver --all-targets`
+   reports ~16 **pre-existing** errors in the oracle test files
+   (`qfbv_oracle.rs`/`fp_oracle.rs`), byte-identical base↔fix and none
+   referencing slice30 code. CI's clippy gate is
+   `cargo clippy --workspace --all-targets -- -D warnings` (no `oracle`
+   feature), under which the `#![cfg(feature = "oracle")]` test files are
+   not compiled — so these are outside both the CI gate and slice30's
+   scope. Noted here as a discovered repo-wide pre-existing condition, not
+   a slice30 regression.
+
+**Banked / oldest live gap.** The two-free-var symbolic pair
+(`targeted_str_order_symbolic_pair_known_gap`, `(str.< s u)` over two free
+vars → sound `Unknown`, z3 `Sat`) stays banked as spec §6 mandates — it
+needs the first-differing-position existential over a shared symbolic
+prefix (word-equation-engine work, the standing non-goal). With slice 22's
+enumeration-length seam cashed by slice 29, this pin is now **the oldest
+live known gap.** Slice-29 standing bank unchanged.
