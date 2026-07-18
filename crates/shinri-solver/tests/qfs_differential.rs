@@ -3924,6 +3924,49 @@ fn targeted_str_order_symbolic_pair_known_gap() {
     );
 }
 
+/// Slice 30: constant-word (length ≥ 2) lexicographic comparison against a
+/// symbolic var now DECIDES end-to-end (generalizes slice 24's single-char
+/// arms; was fenced to Unknown). z3 cross-checked by `expect`.
+#[test]
+fn targeted_str_order_const_word_decides() {
+    // Right constant, strict — "bd" ≮ "bc" (differ at pos 1, 'd' > 'c').
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.< s \"bc\"))(assert (= s \"bd\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Right constant, decided Sat — "az" < "bc" ('a' < 'b' at pos 0).
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.< s \"bc\"))(assert (= s \"az\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // Left constant, strict — "bc" ≮ "ba" (differ at pos 1, 'c' > 'a').
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.< \"bc\" s))(assert (= s \"ba\"))(check-sat)",
+        Verdict::Unsat,
+    );
+    // Left constant, proper-prefix Sat — "bc" < "bca".
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.< \"bc\" s))(assert (= s \"bca\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // `<=` admits equality — s = "bc" satisfies (str.<= s "bc") …
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.<= s \"bc\"))(assert (= s \"bc\"))(check-sat)",
+        Verdict::Sat,
+    );
+    // … but strict `<` excludes it.
+    expect(
+        "(set-logic QF_S)(declare-fun s () String)\
+         (assert (str.< s \"bc\"))(assert (= s \"bc\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
 #[test]
 fn targeted_str_order_single_char_right_decides() {
     // (str.< s "b"): decided end-to-end (was fenced pre-slice-24).
