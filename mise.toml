@@ -31,6 +31,14 @@ run = "cargo nextest run --all"
 description = "Full test suite — includes #[ignore]d exhaustive/slow tests (nightly tier)"
 run = "cargo nextest run --all --run-ignored all"
 
+[tasks.test-exhaustive]
+description = "One #[ignore]d exhaustive shinri-fp test, named via EXHAUSTIVE_TEST (nightly CI matrix helper)"
+run = "cargo nextest run -p shinri-fp --run-ignored only -E \"test($EXHAUSTIVE_TEST)\""
+
+[tasks.test-full-rest]
+description = "Full suite minus the five exhaustive shinri-fp tests (they run as a nightly CI matrix)"
+run = "cargo nextest run --all --run-ignored all -E 'not (test(fp_div_tiny_exhaustive_all_modes) + test(fp_mul_tiny_exhaustive_all_modes) + test(fp_add_tiny_exhaustive_all_modes) + test(to_fp_fp_tiny_exhaustive_both_directions) + test(rem_tiny_exhaustive))'"
+
 [tasks.fuzz-smoke]
 description = "Short libFuzzer budget per fuzz target (nightly rustc via mise); FUZZ_SECONDS overrides 60s"
 shell = "bash -c"
