@@ -173,3 +173,56 @@ existing blocking CI tier.
 4. mutants task + nightly rotation job.
 5. End-to-end verification (fresh clone, nightly dispatch), PR, merge on
    green.
+
+## Implementation notes (truth-up)
+
+Landed 2026-07-18 as PR #26 (merge commit `3016bba5`, branch
+`devkit-alignment-2`, 7 commits + 1 CI fix). Everything in this spec shipped
+as designed except the deviations below.
+
+**Acceptance results:**
+1. Blocking tier green and unchanged: `test` job 14m33s cold at `4c15fc08`
+   (nightly-only jobs correctly skipped on push/PR).
+2. Fresh-clone onboard: `mise install && mise run ci` exit 0 with
+   `devenv.nix` absent (1088 passed / 6 skipped, 342 s).
+3. Nightly dispatch run 29644654228 at `4c15fc08`: ALL 10 jobs green,
+   wall-clock 41m05s. (a) fuzz job ran all five targets incl.
+   `== fuzz shinri-parser/parse_script ==` (1,717,461 runs / 61 s on the
+   pre-fix dispatch; green again on the final run). (b) `mutants` job:
+   `Tonight's crate: shinri-theory`, 245 mutants tested in 29 m —
+   118 caught, 86 missed, 36 unviable, 5 timeouts — report-only exit 0 as
+   designed (job 35 m, well under the 180-min cap). (c) artifact
+   `mutants-shinri-theory` attached.
+4. Hook verified locally (blocks a staged non-EXAMPLE dummy key, exit 1;
+   clean tree exit 0) and live-validated: it ran on the branch's own
+   commits after installation.
+5. `dependabot.yml` accepted on main. CLI-side confirmation is limited:
+   the Dependabot *alerts* feature is disabled for the repo (403 on the
+   alerts API) but version updates from `dependabot.yml` are independent
+   of it. Remaining human check: Insights → Dependency graph → Dependabot
+   showing both ecosystems, and the first weekly PR wave.
+6. `docs/threat-model.md` committed; AGENTS.md `## Security` points to it.
+
+**Deviations from the spec/plan text:**
+- Threat model's "exactly one audited `unsafe` block" was factually wrong:
+  a second, `#[cfg(feature = "oracle")]`-gated `unsafe` (`libc::setrlimit`)
+  lives in the differential test harness
+  (`crates/shinri-solver/tests/qfs_fuzz_corpus.rs`). Claim scoped to
+  shipping code in `0cf49349`.
+- The plan's gitleaks drill key (`AKIA…EXAMPLE`) is allowlisted by gitleaks
+  8.30.1's built-in `.+EXAMPLE$` stopword, so the drill as written
+  false-negatives. Detection/blocking was proven with a non-EXAMPLE dummy
+  key instead.
+- The plan's `[tasks.mutants]` failed on a fresh CI checkout: cargo-mutants
+  does not create the `--output` parent directory and CI has no `target/`.
+  Fixed with `mkdir -p target/mutants &&` in the task (`4c15fc08`); the
+  report-only exit-code guard correctly surfaced the failure as red (exit 1
+  is not in the tolerated 0|2|3 set).
+- Plumbing smoke on `shinri-frontend` legitimately found "0 mutants"
+  (pure-enum IR crate); plumbing was verified via the artifact tree and the
+  real CI run above.
+
+**Banked:** first mutation baseline exists (shinri-theory: 86 missed
+mutants in the artifact — future test-strengthening material); the
+day-of-year rotation (`10#` radix guard) and report-only policy validated
+in production.
