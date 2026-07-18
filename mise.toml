@@ -48,7 +48,7 @@ description = "Short libFuzzer budget per fuzz target (nightly rustc via mise); 
 shell = "bash -c"
 run = """
 set -euo pipefail
-for spec in shinri-num:integer_ops shinri-theory:classify shinri-sat:dimacs_parse shinri-sat:cnf_vs_oracle; do
+for spec in shinri-num:integer_ops shinri-theory:classify shinri-sat:dimacs_parse shinri-sat:cnf_vs_oracle shinri-parser:parse_script; do
   crate="${spec%%:*}"; target="${spec##*:}"
   echo "== fuzz $crate/$target =="
   (cd "crates/$crate" && mise x rust@nightly -- cargo fuzz run "$target" -- -max_total_time="${FUZZ_SECONDS:-60}")
