@@ -36,7 +36,8 @@ pub fn parse_dimacs(src: &str) -> Result<Cnf, String> {
             } else {
                 let var0 = n.unsigned_abs() - 1;
                 if var0 as usize >= num_vars {
-                    return Err(format!("variable {} out of range", n.abs()));
+                    // unsigned_abs: `n.abs()` panics on i64::MIN (negate overflow).
+                    return Err(format!("variable {} out of range", n.unsigned_abs()));
                 }
                 cur.push(Lit::new(Var::new(var0 as u32), n > 0));
             }
@@ -74,6 +75,15 @@ mod tests {
     #[test]
     fn rejects_var_out_of_range() {
         let src = "p cnf 1 1\n2 0\n";
+        assert!(parse_dimacs(src).is_err());
+    }
+
+    #[test]
+    fn i64_min_literal_is_an_error_not_a_panic() {
+        // i64::MIN parses as a literal (leading zeros allowed), and the
+        // out-of-range error path must not negate it (libFuzzer
+        // crash-4457e096, nightly run 29632648168).
+        let src = "p cnf 1 1\n-9223372036854775808 0\n";
         assert!(parse_dimacs(src).is_err());
     }
 }
