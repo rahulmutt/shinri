@@ -1,0 +1,18 @@
+# Weekly CI-gated dependency bumps. Deliberately NOT configured for
+# mise.toml: rust/z3/cvc5 pins are adjudicated choices (the differential
+# oracle in particular must not drift under our feet).
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
