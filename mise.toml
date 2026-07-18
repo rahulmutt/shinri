@@ -57,7 +57,7 @@ done
 
 [tasks.mutants]
 description = "Mutation-test one crate (cargo-mutants); pick it via MUTANTS_PACKAGE, e.g. MUTANTS_PACKAGE=shinri-num mise run mutants"
-run = "cargo mutants --package \"$MUTANTS_PACKAGE\" --timeout 300 --output target/mutants"
+run = "mkdir -p target/mutants && cargo mutants --package \"$MUTANTS_PACKAGE\" --timeout 300 --output target/mutants"
 
 [tasks.ci]
 description = "Everything the blocking CI tier runs: lint, deny, secrets, test"
