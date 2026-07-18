@@ -25,6 +25,7 @@ Defined in `mise.toml` (CI runs these same tasks — they cannot drift):
 | `mise run test` | fast test suite (skips `#[ignore]`d slow tests) |
 | `mise run test-full` | full suite including exhaustive/slow tests (nightly tier) |
 | `mise run fuzz-smoke` | short libFuzzer run per fuzz target (`FUZZ_SECONDS` overrides 60s) |
+| `mise run mutants` | mutation-test one crate (`MUTANTS_PACKAGE=shinri-num mise run mutants`) |
 | `mise run ci` | everything the blocking CI tier runs |
 
 ## Test tiers
@@ -34,7 +35,9 @@ Defined in `mise.toml` (CI runs these same tasks — they cannot drift):
   smoke companion here.
 - **Nightly / on-demand (`workflow_dispatch`):** full suite including
   `#[ignore]`d exhaustive tests, extended differential/property runs, the
-  z3/cvc5 oracle suite, and a fuzz smoke budget.
+  z3/cvc5 oracle suite, a fuzz smoke budget, and a one-crate
+  mutation-audit rotation (report-only; results as a `mutants-<crate>`
+  artifact).
 - **Oracle differential:** `cargo nextest run -p shinri-solver --features
   oracle` — requires `z3`/`cvc5` on PATH (mise provides them). Without
   `--features oracle` the suite compiles to **zero tests**; a green run

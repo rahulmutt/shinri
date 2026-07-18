@@ -55,6 +55,10 @@ for spec in shinri-num:integer_ops shinri-theory:classify shinri-sat:dimacs_pars
 done
 """
 
+[tasks.mutants]
+description = "Mutation-test one crate (cargo-mutants); pick it via MUTANTS_PACKAGE, e.g. MUTANTS_PACKAGE=shinri-num mise run mutants"
+run = "cargo mutants --package \"$MUTANTS_PACKAGE\" --timeout 300 --output target/mutants"
+
 [tasks.ci]
 description = "Everything the blocking CI tier runs: lint, deny, secrets, test"
 depends = ["lint", "deny", "secrets", "test"]
