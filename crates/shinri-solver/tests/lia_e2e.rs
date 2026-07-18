@@ -61,12 +61,16 @@ fn int_diseq_is_a_split() {
 }
 
 #[test]
-#[ignore = "terminates and is sound, but baseline B&B (cuts OFF) explores O(M) diagonal nodes \
-            on 3x−3y=1 with the sound a-priori bound (~85k), taking minutes; \
-            re-enable after Plan B2 adds Gomory cuts"]
+#[ignore = "nightly tier (~4 min in CI): pins termination + the soundness floor on 3x−3y=1. \
+            The cumulative arith branch/pivot budgets bail the ~85k-node diagonal B&B to a \
+            sound Unknown before Unsat is proved (stage-B Gomory cuts do not decide it \
+            either); tighten back to Unsat when an LIA completeness slice decides this"]
 fn unbounded_infeasible_terminates() {
-    // 3x − 3y = 1 has no integer solution; the a-priori box makes the search
-    // terminate (unsat) instead of branching forever.
+    // 3x − 3y = 1 has no integer solution. Pinned: the solve TERMINATES and never
+    // claims Sat (Sat would be a soundness bug). Today the verdict is a sound
+    // Unknown — the cumulative branch/pivot budgets exhaust before the diagonal
+    // walk proves Unsat (adjudicated decided→Unknown, PR #22); Unsat remains the
+    // target verdict for a future LIA completeness slice.
     let mut s = Solver::new();
     let x = int_const(&mut s, "x");
     let y = int_const(&mut s, "y");
@@ -77,7 +81,12 @@ fn unbounded_infeasible_terminates() {
     let lhs = s.app(Op::Builtin(BuiltinOp::Sub), &[tx, ty]);
     let atom = s.eq(lhs, one);
     s.assert(atom);
-    assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    let outcome = s.check_sat();
+    assert_ne!(
+        outcome,
+        SolveOutcome::Sat,
+        "3x−3y=1 is infeasible; Sat is unsound"
+    );
 }
 
 /// Regression test for Bug 2 (GMI orientation via full DeltaRational match).
