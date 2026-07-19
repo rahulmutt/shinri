@@ -1665,34 +1665,63 @@ mod tests {
         };
         let s_var = mk(&mut ctx, "s");
         let u_var = mk(&mut ctx, "u");
-        let atom = ctx
+        let lt_atom = ctx
             .mk_app(Op::Builtin(BuiltinOp::StrLt), &[s_var, u_var])
+            .unwrap();
+        let leq_atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrLeq), &[s_var, u_var])
             .unwrap();
         let mut solver = StrSolver::default();
         let mut eq = EqualityEngine::default();
         let mut areg = AtomRegistry::default();
-        let v = Var::new(0);
-        areg.register(v, atom, Owner::String);
-        let lit = Lit::new(v, true);
+        let lt_var = Var::new(0);
+        areg.register(lt_var, lt_atom, Owner::String);
+        let leq_var = Var::new(1);
+        areg.register(leq_var, leq_atom, Owner::String);
+        // Both literals are POSITIVE. The StrLeq case is what discriminates
+        // the correct relation-based `is_lt` from the buggy
+        // `lit.is_positive()` implementation: a positive StrLeq atom must
+        // record is_lt = false, whereas the polarity bug would record true.
+        let lt_lit = Lit::new(lt_var, true);
+        let leq_lit = Lit::new(leq_var, true);
         let mut cx = TheoryCtx {
             terms: &mut ctx,
             eq: &mut eq,
             atoms: &areg,
         };
-        solver.new_var(&mut cx, v, atom);
-        solver.assert(&mut cx, lit);
+        solver.new_var(&mut cx, lt_var, lt_atom);
+        solver.new_var(&mut cx, leq_var, leq_atom);
+        solver.assert(&mut cx, lt_lit);
+        solver.assert(&mut cx, leq_lit);
         assert_eq!(
             solver.order_true.len(),
-            1,
-            "assert must record exactly one order atom"
+            2,
+            "assert must record exactly one order atom per assertion"
         );
-        let (recorded_atom, recorded_lit, is_lt) = solver.order_true[0];
-        assert_eq!(recorded_atom, atom, "recorded atom must be the StrLt atom");
+        let (recorded_lt_atom, recorded_lt_lit, lt_is_lt) = solver.order_true[0];
         assert_eq!(
-            recorded_lit, lit,
-            "recorded literal must be the asserted Lit"
+            recorded_lt_atom, lt_atom,
+            "recorded atom must be the StrLt atom"
         );
-        assert!(is_lt, "StrLt atom must record is_lt = true");
-        assert_eq!(solver.order_levels, vec![0]);
+        assert_eq!(
+            recorded_lt_lit, lt_lit,
+            "recorded literal must be the asserted StrLt Lit"
+        );
+        assert!(lt_is_lt, "positive StrLt atom must record is_lt = true");
+
+        let (recorded_leq_atom, recorded_leq_lit, leq_is_lt) = solver.order_true[1];
+        assert_eq!(
+            recorded_leq_atom, leq_atom,
+            "recorded atom must be the StrLeq atom"
+        );
+        assert_eq!(
+            recorded_leq_lit, leq_lit,
+            "recorded literal must be the asserted StrLeq Lit"
+        );
+        assert!(
+            !leq_is_lt,
+            "positive StrLeq atom must record is_lt = false (relation, not polarity)"
+        );
+        assert_eq!(solver.order_levels, vec![0, 0]);
     }
 }
