@@ -66,6 +66,17 @@ pub struct StrSolver {
     /// of the residual Rex, rule tag 0=E / 1..=4=S1..S4). Monotone, like
     /// `emitted_splits` — a dedup hit means the clause is already learnt.
     emitted_memb: FxHashSet<(TermId, TermId, u8)>,
+    /// Per-atom set of already-emitted order-clause atom-lists (slice 31),
+    /// keyed by `(order atom, stable hash of the clause's atom TermIds)`.
+    /// Monotone (never cleared on backtrack) — a dedup hit means the guarded
+    /// clause is already learnt.
+    emitted_order: FxHashSet<(TermId, u64)>,
+    /// Memoized order-clause families (slice 31), keyed by the polarity-
+    /// normalized `(a, b, use_lt)` triple. The family mints its fresh heads
+    /// `hA/hB` (and code handles) ONCE and is reused every round, so EUF
+    /// congruence relates the SAME head terms across rounds (the code-bridge
+    /// premise). Monotone.
+    order_clauses: FxHashMap<(TermId, TermId, bool), order_engine::OrderFamily>,
     /// Fresh witnesses minted by head splits, keyed by (x, residual regex
     /// term) so clauses S2..S4 reuse S1's h/z across rounds. Monotone.
     memb_wits: FxHashMap<(TermId, TermId), (TermId, TermId)>,
@@ -1154,6 +1165,20 @@ impl TheorySolver for StrSolver {
         // the Sat fixpoint below is then backstopped by the model self-check.
         if let Some(res) = memb::memb_check(self, cx, &known, &input_cond_roots) {
             return res;
+        }
+
+        // ── Slice 31: order pass (str.< / str.<= head-peel) ──────────────────
+        // After membership: for each asserted order literal, emit the next
+        // un-emitted clause of its head-peel family (polarity-normalized,
+        // guarded by ¬lit, fuel-gated). Each emitted clause is the valid
+        // implication `assertedLit → clause`. No symbolic-pair order atom
+        // reaches StrSolver until Task 7's fence lift, so this loop is inert
+        // on existing inputs (order_true stays empty).
+        let orders: Vec<(TermId, Lit, bool)> = self.order_true.clone();
+        for (atom, lit, is_lt) in orders {
+            if let Some(res) = order_engine::order_check(self, cx, atom, lit, is_lt) {
+                return res;
+            }
         }
 
         TCheck::Sat
