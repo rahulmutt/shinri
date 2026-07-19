@@ -327,6 +327,7 @@ pub(crate) fn order_check(
         return Some(TCheck::Split {
             atoms: clause.clone(),
             guard: Some(lit.negate()),
+            phases: Vec::new(),
         });
     }
     None
@@ -481,6 +482,7 @@ pub(crate) fn order_fold_check(
             return Some(TCheck::Split {
                 atoms: vec![comp],
                 guard: Some(lit.negate()),
+                phases: Vec::new(),
             });
         }
     }
@@ -739,7 +741,7 @@ mod tests {
         let (mut saw_ge, mut saw_le) = (false, false);
         for _ in 0..8 {
             match order_fold_check(&mut solver, &mut cx, lt_atom, pos_lit, true, &empty_roots) {
-                Some(TCheck::Split { atoms, guard }) => {
+                Some(TCheck::Split { atoms, guard, .. }) => {
                     assert_eq!(
                         guard,
                         Some(pos_lit.negate()),

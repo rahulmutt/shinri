@@ -71,6 +71,13 @@ impl Assignment {
         self.phase[v.index()]
     }
 
+    /// Set the saved decision phase of `v` WITHOUT assigning it. Used to seed a
+    /// theory-preferred first-decision direction for a freshly minted split atom.
+    /// Sound: only affects which branch `pick_branch` tries first, never legality.
+    pub fn set_phase(&mut self, v: Var, p: bool) {
+        self.phase[v.index()] = p;
+    }
+
     /// Record an assignment making `l` true at `level` with antecedent `reason`.
     #[inline]
     pub fn assign(&mut self, l: Lit, level: u32, reason: Reason) {
@@ -103,6 +110,17 @@ impl Assignment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_phase_overrides_default_without_assigning() {
+        let mut a = Assignment::default();
+        let v = a.new_var();
+        assert!(!a.phase(v)); // default
+        a.set_phase(v, true);
+        assert!(a.phase(v));
+        // set_phase must NOT assign the variable (value stays Unset).
+        assert_eq!(a.value(v), LBool::Unset);
+    }
 
     #[test]
     fn assign_sets_value_level_phase_then_unassign_clears_value_keeps_phase() {

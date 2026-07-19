@@ -691,7 +691,11 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                         self.backtrack_to(dl - 1);
                                     }
                                 }
-                                TheoryResult::SplitAtoms { atoms, guard } => {
+                                TheoryResult::SplitAtoms {
+                                    atoms,
+                                    guard,
+                                    phases,
+                                } => {
                                     debug_assert!(
                                         !atoms.is_empty(),
                                         "a theory must not emit an empty SplitAtoms clause (would livelock)"
@@ -713,7 +717,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     if let Some(g) = guard {
                                         lits.push(g);
                                     }
-                                    for atom in atoms {
+                                    for (i, atom) in atoms.iter().copied().enumerate() {
                                         // Reuse the existing SAT var if the theory already
                                         // registered this atom (e.g. an MBTC `(= u v)` that was
                                         // previously asserted, or a length atom shared by
@@ -727,6 +731,14 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                             None => {
                                                 let v = self.new_var();
                                                 self.theory.bind_fresh(v, atom);
+                                                // Seed the theory-preferred first-decision phase
+                                                // (only on a freshly minted var; a reused var
+                                                // keeps its saved phase). Empty `phases` (or a
+                                                // `None` entry) means no preference — behaviour
+                                                // is byte-identical to before this field existed.
+                                                if let Some(Some(p)) = phases.get(i) {
+                                                    self.assign.set_phase(v, *p);
+                                                }
                                                 v
                                             }
                                         };
@@ -1408,6 +1420,7 @@ mod tests {
                     TheoryResult::SplitAtoms {
                         atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
                         guard: None,
+                        phases: Vec::new(),
                     }
                 } else {
                     TheoryResult::Sat
@@ -1502,6 +1515,7 @@ mod tests {
                     TheoryResult::SplitAtoms {
                         atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
                         guard: Some(Lit::new(eqn, false)),
+                        phases: Vec::new(),
                     }
                 } else {
                     TheoryResult::Sat

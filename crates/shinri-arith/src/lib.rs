@@ -909,6 +909,7 @@ impl Arith {
                 return TCheck::Split {
                     atoms: vec![cut_atom],
                     guard: None,
+                    phases: Vec::new(),
                 };
             }
         }
@@ -932,6 +933,7 @@ impl Arith {
         TCheck::Split {
             atoms: vec![le, ge],
             guard: None,
+            phases: Vec::new(),
         }
     }
 

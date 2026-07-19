@@ -935,7 +935,7 @@ mod tests {
         let mut saw_split = false;
         for _ in 0..32 {
             match s.check(&mut cx, Effort::Full) {
-                TCheck::Split { atoms, guard } => {
+                TCheck::Split { atoms, guard, .. } => {
                     if atoms.len() >= 2 {
                         // The F-split MUST be guarded by the negated word equation
                         // (sound Nielsen lemma), never a bare disjunction.
@@ -987,7 +987,7 @@ mod tests {
         for _ in 0..32 {
             match s.check(&mut cx, Effort::Full) {
                 TCheck::Conflict(_) => panic!("x = \"ab\" is satisfiable — must not conflict"),
-                TCheck::Split { atoms, guard } => {
+                TCheck::Split { atoms, guard, .. } => {
                     // The specialized split must contain the empty-branch atom (= x "").
                     // Check that at least one atom is an equality of x with the empty string.
                     let has_empty_branch = atoms.iter().any(|&a| {

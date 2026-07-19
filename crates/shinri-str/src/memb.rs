@@ -86,7 +86,11 @@ fn emit_split(
         had_fuel,
         "emit_split without fuel — memb_check's per-atom peek must run first"
     );
-    TCheck::Split { atoms, guard }
+    TCheck::Split {
+        atoms,
+        guard,
+        phases: Vec::new(),
+    }
 }
 
 /// Length link for a PASS-MINTED string equality `l = r`: the pure tautology
@@ -617,7 +621,7 @@ mod tests {
         let mut splits = Vec::new();
         for _ in 0..max {
             match s.check(cx, Effort::Full) {
-                TCheck::Split { atoms, guard } => splits.push((atoms, guard.is_some())),
+                TCheck::Split { atoms, guard, .. } => splits.push((atoms, guard.is_some())),
                 other => return (splits, other),
             }
         }

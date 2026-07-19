@@ -31,6 +31,8 @@ pub enum TCheck {
     Split {
         atoms: Vec<TermId>,
         guard: Option<Lit>,
+        /// Optional per-atom preferred decision phase (empty = none).
+        phases: Vec<Option<bool>>,
     },
     /// The theory's fuel budget was exhausted; the result is unknown (neither
     /// sat nor unsat). The solver must propagate this to `SolveOutcome::Unknown`
@@ -205,9 +207,10 @@ mod tests {
         let c = TCheck::Split {
             atoms: vec![t],
             guard: None,
+            phases: Vec::new(),
         };
         match c {
-            TCheck::Split { atoms, guard } => {
+            TCheck::Split { atoms, guard, .. } => {
                 assert_eq!(atoms, vec![t]);
                 assert_eq!(guard, None);
             }

@@ -453,6 +453,7 @@ impl TheorySolver for StrSolver {
                     return TCheck::Split {
                         atoms: vec![comp],
                         guard: Some(lit.negate()),
+                        phases: Vec::new(),
                     };
                 }
             }
@@ -497,6 +498,7 @@ impl TheorySolver for StrSolver {
                 return TCheck::Split {
                     atoms: vec![axiom],
                     guard: None,
+                    phases: Vec::new(),
                 };
             }
         }
@@ -649,6 +651,7 @@ impl TheorySolver for StrSolver {
                             return TCheck::Split {
                                 atoms: vec![le_atom],
                                 guard: Some(lit.negate()),
+                                phases: Vec::new(),
                             };
                         }
                     }
@@ -776,6 +779,7 @@ impl TheorySolver for StrSolver {
                         return TCheck::Split {
                             atoms,
                             guard: Some(guard),
+                            phases: Vec::new(),
                         };
                     }
                     crate::wordeq::StepResult::Done => {}
@@ -1059,6 +1063,7 @@ impl TheorySolver for StrSolver {
                         return TCheck::Split {
                             atoms: vec![ge_l, ge_r],
                             guard: Some(lit.negate()),
+                            phases: Vec::new(),
                         };
                     }
                 }
@@ -1561,7 +1566,7 @@ mod tests {
         let (mut saw_ge, mut saw_le) = (false, false);
         for _ in 0..64 {
             match solver.check(&mut cx, Effort::Full) {
-                TCheck::Split { atoms, guard } => {
+                TCheck::Split { atoms, guard, .. } => {
                     for a in atoms {
                         if a == expected_ge {
                             saw_ge = true;

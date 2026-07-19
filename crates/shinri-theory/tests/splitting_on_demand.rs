@@ -88,6 +88,7 @@ impl TheorySolver for OneShotSplitter {
             TCheck::Split {
                 atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
                 guard: None,
+                phases: Vec::new(),
             }
         } else {
             TCheck::Sat
@@ -101,6 +102,137 @@ impl TheorySolver for OneShotSplitter {
     fn push(&mut self) {}
 
     fn pop(&mut self, _level: usize) {}
+}
+
+// ── PhaseSeededSplitter ───────────────────────────────────────────────────────
+// Arith slot: on the FIRST Full check returns `TCheck::Split([a1, a2])` with a
+// configurable per-atom `phases` preference, then always returns `TCheck::Sat`.
+// Used to observe the SplitAtoms phase-seeding effect end-to-end (Task 7.1):
+// Vmtf decides never-bumped vars in creation order (see
+// `shinri-sat/src/heuristic/vmtf.rs` doc comment), so the FIRST fresh split
+// var (bound to atom 100) is always decided before the second (atom 101).
+// With `phases = [Some(true), None]` the solver must try that first var TRUE
+// on its very first decision, immediately satisfying the (guardless,
+// tautological) split clause — so the SECOND var is then decided independently
+// with its own (unseeded, default-FALSE) phase, yielding a model of
+// (v1=true, v2=false). With `phases = []` (no preference — old behaviour) the
+// first var is decided FALSE (default phase), which makes the split clause a
+// unit clause forcing the second var TRUE by propagation — yielding
+// (v1=false, v2=true). The two phases configurations are thus deterministically
+// DISTINGUISHABLE via the final model, without needing to observe the decision
+// trace directly.
+#[derive(Default)]
+struct PhaseSeededSplitter {
+    fired: bool,
+    phases: Vec<Option<bool>>,
+}
+
+impl TheorySolver for PhaseSeededSplitter {
+    const THEORY_ID: u16 = 8;
+
+    fn new_var(&mut self, _cx: &mut TheoryCtx, v: Var, atom: TermId) {
+        BOUND.with(|b| b.borrow_mut().push((v, atom)));
+    }
+
+    fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<shinri_theory::EqLeaf>> {
+        None
+    }
+
+    fn propagate(
+        &mut self,
+        _cx: &mut TheoryCtx,
+        _out: &mut Vec<(Lit, shinri_core::TheoryJust)>,
+    ) -> Option<Vec<shinri_theory::EqLeaf>> {
+        None
+    }
+
+    fn check(&mut self, _cx: &mut TheoryCtx, _effort: Effort) -> TCheck {
+        if !self.fired {
+            self.fired = true;
+            TCheck::Split {
+                atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                guard: None,
+                phases: self.phases.clone(),
+            }
+        } else {
+            TCheck::Sat
+        }
+    }
+
+    fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut shinri_theory::Explainer) {}
+
+    fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+
+    fn push(&mut self) {}
+
+    fn pop(&mut self, _level: usize) {}
+}
+
+// Runs a PhaseSeededSplitter-backed solve with the given `phases` preference
+// and returns (value_of(v1), value_of(v2)) for the two freshly minted split
+// vars (indices 1 and 2, since `a` at index 0 is minted first).
+fn run_phase_seeded_split(phases: Vec<Option<bool>>) -> (Option<bool>, Option<bool>) {
+    BOUND.with(|b| b.borrow_mut().clear());
+
+    let mut s: Solver<
+        Combiner<NullTheory, PhaseSeededSplitter, NullTheory, NullTheory>,
+        NoProof,
+        Vmtf,
+    > = Solver::new(SolverConfig::default());
+    s.theory_mut().arith_mut().phases = phases;
+
+    let a = s.new_var();
+    s.add_clause(&[Lit::new(a, true)]);
+
+    let res = s.solve();
+    assert!(
+        matches!(res, SolveResult::Sat),
+        "expected SolveResult::Sat, got {:?}",
+        res
+    );
+
+    let v1 = Var::new(1);
+    let v2 = Var::new(2);
+    (s.value_of(v1), s.value_of(v2))
+}
+
+#[test]
+fn split_atoms_phases_seed_first_var_true_when_preferred() {
+    // Some(true) on atom 100 (first-minted var, index 1): Vmtf decides it
+    // FIRST (never-bumped, creation order), and the seed makes that decision
+    // TRUE — instantly satisfying the guardless split clause. The second var
+    // is then decided independently with its own default-FALSE phase.
+    let (v1, v2) = run_phase_seeded_split(vec![Some(true), None]);
+    assert_eq!(
+        v1,
+        Some(true),
+        "phases[0] = Some(true) must seed the first-decided fresh var TRUE"
+    );
+    assert_eq!(
+        v2,
+        Some(false),
+        "the second var is unseeded (None) and must keep the default FALSE phase"
+    );
+}
+
+#[test]
+fn split_atoms_empty_phases_is_a_true_no_op() {
+    // Empty phases = no preference = old behaviour: the first-decided var
+    // (index 1) keeps the default FALSE phase, which forces the split clause
+    // to unit-propagate the SECOND var TRUE — the mirror image of the seeded
+    // case above, proving the seed (not incidental decision order) drives the
+    // difference.
+    let (v1, v2) = run_phase_seeded_split(Vec::new());
+    assert_eq!(
+        v1,
+        Some(false),
+        "with no phase preference the first-decided var keeps the default FALSE phase"
+    );
+    assert_eq!(
+        v2,
+        Some(true),
+        "the split clause unit-propagates the second var TRUE off the first's default FALSE"
+    );
 }
 
 // ── Integration test ──────────────────────────────────────────────────────────
