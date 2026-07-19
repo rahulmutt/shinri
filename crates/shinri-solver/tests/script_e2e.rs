@@ -1392,3 +1392,23 @@ fn to_code_digit_range_get_value_witness() {
         out[1]
     );
 }
+
+/// Slice 31 Task 6 (DEFERRED to Task 7). The constant-interaction UNSAT:
+/// `str.< s u ∧ s="b" ∧ u="a"` is UNSAT because "b" > "a" lexicographically.
+/// The on-demand code-constant fold pins `code(hA)=98`, `code(hB)=97`, so arith
+/// derives `98 < 97 → false → UNSAT` (without folding, the uninterpreted
+/// `!strcode` handle would let arith pick a bogus `code("b") < code("a")` and
+/// answer a spurious SAT).
+///
+/// `#[ignore]`d because a two-symbolic-var `str.<` atom does not ROUTE to the
+/// slice-31 order engine until Task 7 lifts the presence fence. Task 7 MUST
+/// remove this `#[ignore]` line and confirm the assertion holds end-to-end.
+#[test]
+#[ignore = "enabled in Task 7 (fence lift)"]
+fn lt_with_constant_pins_is_unsat_via_folding() {
+    let out = run_script(
+        "(set-logic QF_S)(declare-fun s () String)(declare-fun u () String)\
+         (assert (str.< s u))(assert (= s \"b\"))(assert (= u \"a\"))(check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}

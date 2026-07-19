@@ -98,6 +98,7 @@ impl TheorySolver for Arrays {
                         return TCheck::Split {
                             atoms: vec![lemma],
                             guard: None,
+                            phases: Vec::new(),
                         };
                     }
                 } else {
@@ -113,6 +114,7 @@ impl TheorySolver for Arrays {
                         return TCheck::Split {
                             atoms: vec![eqij, eqsel],
                             guard: None,
+                            phases: Vec::new(),
                         };
                     }
                 }

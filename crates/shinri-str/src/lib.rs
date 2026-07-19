@@ -8,6 +8,7 @@ mod memb;
 pub mod model;
 pub mod normalize;
 pub mod order;
+mod order_engine;
 pub mod predicates;
 pub mod reduce;
 pub mod regex;
@@ -44,7 +45,17 @@ pub struct StrSolver {
     memb_true: Vec<(TermId, Lit, bool)>,
     /// SAT decision level per memb_true entry (lock-step; truncated on pop).
     memb_levels: Vec<u32>,
+    /// Asserted order atoms (slice 31): (atom, literal, is_lt). `is_lt` is the
+    /// atom's relation (`true` = str.<, `false` = str.<=); the literal's
+    /// polarity is handled in `check` (negative ⇒ swapped sibling relation).
+    order_true: Vec<(TermId, Lit, bool)>,
+    /// SAT decision level per order_true entry (lock-step; truncated on pop).
+    order_levels: Vec<u32>,
     len_terms: FxHashSet<TermId>,
+    /// Code-point handle terms `(!strcode h)` minted by the order engine
+    /// (slice 31). Exposed to the arith theory alongside `len_terms` so the
+    /// N-O seam makes them shared arith variables.
+    code_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
     emitted_len_axioms: FxHashSet<TermId>,
     /// Dedup set for F-splits: keyed on the canonical (unordered) head pair.
@@ -55,6 +66,22 @@ pub struct StrSolver {
     /// of the residual Rex, rule tag 0=E / 1..=4=S1..S4). Monotone, like
     /// `emitted_splits` — a dedup hit means the clause is already learnt.
     emitted_memb: FxHashSet<(TermId, TermId, u8)>,
+    /// Per-atom set of already-emitted order-clause atom-lists (slice 31),
+    /// keyed by `(order atom, stable hash of the clause's atom TermIds)`.
+    /// Monotone (never cleared on backtrack) — a dedup hit means the guarded
+    /// clause is already learnt.
+    emitted_order: FxHashSet<(TermId, u64)>,
+    /// Dedup for on-demand code-constant FOLDS (slice 31 Task 6): the Ge/Le
+    /// arith companion TermIds of an emitted `(= (code h) k)` fold. Monotone
+    /// (never cleared on backtrack) — a dedup hit means the guarded pin is
+    /// already learnt, so the same fold is never re-emitted.
+    emitted_code_folds: FxHashSet<TermId>,
+    /// Memoized order-clause families (slice 31), keyed by the polarity-
+    /// normalized `(a, b, use_lt)` triple. The family mints its fresh heads
+    /// `hA/hB` (and code handles) ONCE and is reused every round, so EUF
+    /// congruence relates the SAME head terms across rounds (the code-bridge
+    /// premise). Monotone.
+    order_clauses: FxHashMap<(TermId, TermId, bool), order_engine::OrderFamily>,
     /// Fresh witnesses minted by head splits, keyed by (x, residual regex
     /// term) so clauses S2..S4 reuse S1's h/z across rounds. Monotone.
     memb_wits: FxHashMap<(TermId, TermId), (TermId, TermId)>,
@@ -136,6 +163,14 @@ impl TheorySolver for StrSolver {
             if matches!(op, Op::Builtin(BuiltinOp::StrInRe)) {
                 self.memb_true.push((atom, lit, lit.is_positive()));
                 self.memb_levels.push(lvl);
+            }
+            // Slice 31: record order atoms (str.< / str.<=) at their asserted
+            // literal. `is_lt` is the RELATION (StrLt vs StrLeq), NOT the
+            // literal's polarity — polarity is handled later in `check`.
+            if let Op::Builtin(sub_op @ (BuiltinOp::StrLt | BuiltinOp::StrLeq)) = op {
+                self.order_true
+                    .push((atom, lit, matches!(sub_op, BuiltinOp::StrLt)));
+                self.order_levels.push(lvl);
             }
         }
         None
@@ -418,6 +453,7 @@ impl TheorySolver for StrSolver {
                     return TCheck::Split {
                         atoms: vec![comp],
                         guard: Some(lit.negate()),
+                        phases: Vec::new(),
                     };
                 }
             }
@@ -462,6 +498,7 @@ impl TheorySolver for StrSolver {
                 return TCheck::Split {
                     atoms: vec![axiom],
                     guard: None,
+                    phases: Vec::new(),
                 };
             }
         }
@@ -614,6 +651,7 @@ impl TheorySolver for StrSolver {
                             return TCheck::Split {
                                 atoms: vec![le_atom],
                                 guard: Some(lit.negate()),
+                                phases: Vec::new(),
                             };
                         }
                     }
@@ -741,6 +779,7 @@ impl TheorySolver for StrSolver {
                         return TCheck::Split {
                             atoms,
                             guard: Some(guard),
+                            phases: Vec::new(),
                         };
                     }
                     crate::wordeq::StepResult::Done => {}
@@ -1024,6 +1063,7 @@ impl TheorySolver for StrSolver {
                         return TCheck::Split {
                             atoms: vec![ge_l, ge_r],
                             guard: Some(lit.negate()),
+                            phases: Vec::new(),
                         };
                     }
                 }
@@ -1137,6 +1177,37 @@ impl TheorySolver for StrSolver {
             return res;
         }
 
+        // ── Slice 31: order pass (str.< / str.<= head-peel) ──────────────────
+        // After membership: for each asserted order literal, emit the next
+        // un-emitted clause of its head-peel family (polarity-normalized,
+        // guarded by ¬lit, fuel-gated). Each emitted clause is the valid
+        // implication `assertedLit → clause`. No symbolic-pair order atom
+        // reaches StrSolver until Task 7's fence lift, so this loop is inert
+        // on existing inputs (order_true stays empty).
+        let orders: Vec<(TermId, Lit, bool)> = self.order_true.clone();
+        for &(atom, lit, is_lt) in &orders {
+            if let Some(res) = order_engine::order_check(self, cx, atom, lit, is_lt) {
+                return res;
+            }
+        }
+        // On-demand code-constant FOLD (slice 31 Task 6, SOUNDNESS-critical):
+        // once every clause of an order family is emitted (order_check above
+        // returned None for all), pin `code(h)=eval_to_code(c)` for any minted
+        // head `h` currently EUF-equal to a single-char string constant `c`.
+        // Guarded by the triggering order literal's negation and gated on
+        // `input_cond_roots` (so the read of the `h≈c` merge is not branch-local
+        // w.r.t. a conditional INPUT disjunction — the same discipline the
+        // separation / empty-residual lemmas above use). Pins the uninterpreted
+        // `!strcode` handle to the REAL code point so arith cannot pick a bogus
+        // `code("b") < code("a")` → spurious SAT.
+        for &(atom, lit, is_lt) in &orders {
+            if let Some(res) =
+                order_engine::order_fold_check(self, cx, atom, lit, is_lt, &input_cond_roots)
+            {
+                return res;
+            }
+        }
+
         TCheck::Sat
     }
 
@@ -1156,11 +1227,12 @@ impl TheorySolver for StrSolver {
             self.eq_true.len(),
             self.diseq_true.len(),
             self.memb_true.len(),
+            self.order_true.len(),
         );
     }
 
     fn pop(&mut self, level: usize) {
-        if let Some((e, d, mb)) = self.trail.pop_to(level) {
+        if let Some((e, d, mb, ob)) = self.trail.pop_to(level) {
             self.eq_true.truncate(e);
             self.diseq_true.truncate(d);
             // Keep the parallel assertion-level records in lock-step (E1 gate).
@@ -1168,6 +1240,8 @@ impl TheorySolver for StrSolver {
             self.diseq_levels.truncate(d);
             self.memb_true.truncate(mb);
             self.memb_levels.truncate(mb);
+            self.order_true.truncate(ob);
+            self.order_levels.truncate(ob);
         }
     }
 
@@ -1180,6 +1254,11 @@ impl TheorySolver for StrSolver {
 
     fn shared_arith_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
         let mut out: Vec<TermId> = self.len_terms.iter().copied().collect();
+        for &t in &self.code_terms {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
         // Empty-length link, robust (arith-entailed) direction: if any disequality
         // has an empty-literal side, expose the Int numeral `0` as a shared term.
         // The N-O exchange then ENTAILS `len(s) = 0` (merging it into the shared
@@ -1241,7 +1320,7 @@ impl StrSolver {
 /// branch-local, so the global lemma is skipped (or the trigger cited). Sound over-
 /// approximation: it flags a class touched by a conditional equality even if `t`'s
 /// own rep is reachable by a dl0 sub-path — never the reverse.
-fn side_clean(
+pub(crate) fn side_clean(
     eq: &mut EqualityEngine,
     terms: &Context,
     t: TermId,
@@ -1383,7 +1462,7 @@ mod tests {
     use shinri_sat::Effort;
     use shinri_theory::types::ModelVal;
     use shinri_theory::{
-        AtomRegistry, EqualityEngine, ModelBuilder, TCheck, TheoryCtx, TheorySolver,
+        AtomRegistry, EqualityEngine, ModelBuilder, Owner, TCheck, TheoryCtx, TheorySolver,
     };
 
     #[test]
@@ -1487,7 +1566,7 @@ mod tests {
         let (mut saw_ge, mut saw_le) = (false, false);
         for _ in 0..64 {
             match solver.check(&mut cx, Effort::Full) {
-                TCheck::Split { atoms, guard } => {
+                TCheck::Split { atoms, guard, .. } => {
                     for a in atoms {
                         if a == expected_ge {
                             saw_ge = true;
@@ -1624,5 +1703,77 @@ mod tests {
         s.pop(0);
         assert_eq!(s.memb_true.len(), 1);
         assert_eq!(s.memb_levels.len(), 1);
+    }
+
+    // ── Task 3 (slice 31): order-atom intake bookkeeping ─────────────────────
+
+    #[test]
+    fn assert_records_order_atoms() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mk = |c: &mut Context, n: &str| {
+            let sym = c.declare_fun(n, &[], str_s);
+            c.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
+        };
+        let s_var = mk(&mut ctx, "s");
+        let u_var = mk(&mut ctx, "u");
+        let lt_atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrLt), &[s_var, u_var])
+            .unwrap();
+        let leq_atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrLeq), &[s_var, u_var])
+            .unwrap();
+        let mut solver = StrSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut areg = AtomRegistry::default();
+        let lt_var = Var::new(0);
+        areg.register(lt_var, lt_atom, Owner::String);
+        let leq_var = Var::new(1);
+        areg.register(leq_var, leq_atom, Owner::String);
+        // Both literals are POSITIVE. The StrLeq case is what discriminates
+        // the correct relation-based `is_lt` from the buggy
+        // `lit.is_positive()` implementation: a positive StrLeq atom must
+        // record is_lt = false, whereas the polarity bug would record true.
+        let lt_lit = Lit::new(lt_var, true);
+        let leq_lit = Lit::new(leq_var, true);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        solver.new_var(&mut cx, lt_var, lt_atom);
+        solver.new_var(&mut cx, leq_var, leq_atom);
+        solver.assert(&mut cx, lt_lit);
+        solver.assert(&mut cx, leq_lit);
+        assert_eq!(
+            solver.order_true.len(),
+            2,
+            "assert must record exactly one order atom per assertion"
+        );
+        let (recorded_lt_atom, recorded_lt_lit, lt_is_lt) = solver.order_true[0];
+        assert_eq!(
+            recorded_lt_atom, lt_atom,
+            "recorded atom must be the StrLt atom"
+        );
+        assert_eq!(
+            recorded_lt_lit, lt_lit,
+            "recorded literal must be the asserted StrLt Lit"
+        );
+        assert!(lt_is_lt, "positive StrLt atom must record is_lt = true");
+
+        let (recorded_leq_atom, recorded_leq_lit, leq_is_lt) = solver.order_true[1];
+        assert_eq!(
+            recorded_leq_atom, leq_atom,
+            "recorded atom must be the StrLeq atom"
+        );
+        assert_eq!(
+            recorded_leq_lit, leq_lit,
+            "recorded literal must be the asserted StrLeq Lit"
+        );
+        assert!(
+            !leq_is_lt,
+            "positive StrLeq atom must record is_lt = false (relation, not polarity)"
+        );
+        assert_eq!(solver.order_levels, vec![0, 0]);
     }
 }

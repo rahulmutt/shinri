@@ -60,6 +60,10 @@ pub enum TheoryResult {
     SplitAtoms {
         atoms: Vec<TermId>,
         guard: Option<Lit>,
+        /// Optional per-atom preferred decision phase. Empty = no preference.
+        /// Otherwise `phases.len() == atoms.len()`; `Some(p)` seeds that atom's
+        /// var phase to `p` when the var is freshly minted.
+        phases: Vec<Option<bool>>,
     },
     /// A theory's fuel budget was exhausted; the result is unknown. The SAT
     /// solver must propagate this to `SolveResult::Unknown` without treating
@@ -122,9 +126,10 @@ mod tests {
         let r = TheoryResult::SplitAtoms {
             atoms: vec![t],
             guard: None,
+            phases: Vec::new(),
         };
         match r {
-            TheoryResult::SplitAtoms { atoms, guard } => {
+            TheoryResult::SplitAtoms { atoms, guard, .. } => {
                 assert_eq!(atoms, vec![t]);
                 assert_eq!(guard, None);
             }

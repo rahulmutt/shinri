@@ -21,6 +21,7 @@ enum FinalCheck {
     Split {
         atoms: Vec<TermId>,
         guard: Option<Lit>,
+        phases: Vec<Option<bool>>,
     },
     /// A sub-theory exhausted its fuel budget; the overall result is unknown.
     Unknown,
@@ -299,7 +300,15 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory
         match self.drive_final_check() {
             FinalCheck::Sat => TheoryResult::Sat,
             FinalCheck::Conflict(leaves) => TheoryResult::Conflict(self.expand_conflict(leaves)),
-            FinalCheck::Split { atoms, guard } => TheoryResult::SplitAtoms { atoms, guard },
+            FinalCheck::Split {
+                atoms,
+                guard,
+                phases,
+            } => TheoryResult::SplitAtoms {
+                atoms,
+                guard,
+                phases,
+            },
             FinalCheck::Unknown => TheoryResult::Unknown,
         }
     }
@@ -524,7 +533,17 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                 }
                 match self.arith.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
+                    TCheck::Split {
+                        atoms,
+                        guard,
+                        phases,
+                    } => {
+                        return FinalCheck::Split {
+                            atoms,
+                            guard,
+                            phases,
+                        }
+                    }
                     TCheck::Sat => {}
                     // Arith now returns Unknown when its simplex pivot cap trips on a
                     // degenerate system (the String↔Arith substr seam). Propagate it
@@ -533,14 +552,34 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                 }
                 match self.arrays.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
+                    TCheck::Split {
+                        atoms,
+                        guard,
+                        phases,
+                    } => {
+                        return FinalCheck::Split {
+                            atoms,
+                            guard,
+                            phases,
+                        }
+                    }
                     TCheck::Sat => {}
                     TCheck::Unknown => unreachable!("Arrays never returns Unknown"),
                 }
                 // String checks last (lowest priority).
                 match self.string.check(&mut cx, Effort::Full) {
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
-                    TCheck::Split { atoms, guard } => return FinalCheck::Split { atoms, guard },
+                    TCheck::Split {
+                        atoms,
+                        guard,
+                        phases,
+                    } => {
+                        return FinalCheck::Split {
+                            atoms,
+                            guard,
+                            phases,
+                        }
+                    }
                     TCheck::Sat => {}
                     TCheck::Unknown => return FinalCheck::Unknown,
                 }
@@ -693,6 +732,7 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Combine
                     return FinalCheck::Split {
                         atoms: vec![eq, lt, gt],
                         guard: None,
+                        phases: Vec::new(),
                     };
                 }
                 return FinalCheck::Sat;
@@ -1332,6 +1372,7 @@ mod tests {
                 TCheck::Split {
                     atoms: vec![atom],
                     guard: None,
+                    phases: Vec::new(),
                 }
             } else {
                 TCheck::Sat
@@ -1361,7 +1402,7 @@ mod tests {
 
         // First Full check lifts the arith Split into SplitAtoms.
         match Theory::check(&mut comb, Effort::Full) {
-            TheoryResult::SplitAtoms { atoms, guard } => {
+            TheoryResult::SplitAtoms { atoms, guard, .. } => {
                 assert_eq!(atoms, vec![le]);
                 assert_eq!(guard, None);
             }
@@ -1486,7 +1527,7 @@ mod tests {
         c.arith.t1 = Some(u);
         c.arith.t2 = Some(v);
         match Theory::check(&mut c, Effort::Full) {
-            TheoryResult::SplitAtoms { atoms, guard } => {
+            TheoryResult::SplitAtoms { atoms, guard, .. } => {
                 assert_eq!(guard, None, "MBTC trichotomy is a tautology, no guard");
                 assert_eq!(atoms.len(), 3, "integer trichotomy = 3 atoms");
                 assert_eq!(classify(&c.terms, atoms[0]), Ok(Owner::Euf)); // (= u v)
@@ -1527,6 +1568,7 @@ mod tests {
                 TCheck::Split {
                     atoms: vec![self.atom.unwrap()],
                     guard: None,
+                    phases: Vec::new(),
                 }
             } else {
                 TCheck::Sat
@@ -1586,7 +1628,7 @@ mod tests {
 
         // First Full check: arrays.check returns Split — must be lifted to SplitAtoms.
         match Theory::check(&mut comb, Effort::Full) {
-            TheoryResult::SplitAtoms { atoms, guard } => {
+            TheoryResult::SplitAtoms { atoms, guard, .. } => {
                 assert_eq!(atoms, vec![sel_atom], "split atom must round-trip");
                 assert_eq!(guard, None);
             }
