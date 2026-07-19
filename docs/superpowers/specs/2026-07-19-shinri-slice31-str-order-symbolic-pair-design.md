@@ -142,12 +142,16 @@ core, arrays/BV/FP, or the `str.at`/`substr` fence (`lib.rs:507–512`).
 
 The head-peel (§5) must assert `code(hs) < code(hu)` where `hs`, `hu` are
 symbolic single characters. `code(·)` is a **congruent, range-bounded integer
-handle** on a single-char string, realized as a dedicated unary function so
-the congruence-closure (EUF) treats it as a function of its string argument
-(an uninterpreted `String→Int` symbol, or `str.to_code` **iff** EUF congruence
-covers that builtin — a T-2 verification decides which). It needs **three**
-sound-making properties, established at planning by the failing-scenario
-analysis:
+handle** on a single-char string, realized as a **dedicated uninterpreted
+`String→Int` function** (declared once, e.g. `!strcode`). It must be
+uninterpreted, *not* `str.to_code`: EUF congruence-closes only
+`Op::Uninterpreted` applications (`crates/shinri-euf/src/solver.rs:41,294`,
+`register_arith_uf_terms`), so a `str.to_code` (Builtin) handle would get no
+congruence. When `code(h)` appears in the emitted arith comparison, the
+`Owner::Arith` bind path calls `euf.register_arith_uf_terms` (`combiner.rs`)
+which interns the `code(h)` application into EUF for congruence. It needs
+**three** sound-making properties, established at planning by the
+failing-scenario analysis:
 
 - **(a) Congruence** — `hs = hu ⇒ code(hs) = code(hu)`. Load-bearing for
   soundness, *not merely completeness*: because each order atom mints its
