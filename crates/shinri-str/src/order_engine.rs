@@ -85,6 +85,30 @@ pub(crate) struct OrderFamily {
     pub clauses: Vec<Vec<TermId>>,
     pub code_ha: TermId,
     pub code_hb: TermId,
+    /// `(= A "")` base-case atom and `(< code(hA) code(hB))` compare atom —
+    /// tagged preferred-TRUE at emit so the SAT search tries the base /
+    /// code-compare disjuncts before the recursion tail (spec §10).
+    pub(crate) a_eps: TermId,
+    pub(crate) clt: TermId,
+}
+
+impl OrderFamily {
+    /// Per-atom preferred decision phase for a clause: `Some(true)` for atoms
+    /// equal to this family's `a_eps` or `clt` handle, `None` otherwise.
+    /// Always `clause.len()` long (positional, aligned with `TCheck::Split`'s
+    /// `atoms`).
+    pub(crate) fn phases_for(&self, clause: &[TermId]) -> Vec<Option<bool>> {
+        clause
+            .iter()
+            .map(|&t| {
+                if t == self.a_eps || t == self.clt {
+                    Some(true)
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
 }
 
 /// Build the ordered head-peel clause family for the POSITIVE relation `R` on
@@ -213,6 +237,8 @@ pub(crate) fn build_order_family(
         clauses,
         code_ha,
         code_hb,
+        a_eps,
+        clt,
     }
 }
 
@@ -324,10 +350,16 @@ pub(crate) fn order_check(
         s.code_terms.insert(code_hb);
         // Dedup, then emit the guarded implication `assertedLit → clause`.
         s.emitted_order.insert(dedup_key);
+        // Preferred-TRUE phases for this clause's a_eps/clt atoms (Task 7.2) —
+        // re-fetch the memoized family (a disjoint borrow of `s.order_clauses`
+        // from the fields mutated above) to compute them positionally.
+        let fam = &s.order_clauses[&key];
+        let phases = fam.phases_for(clause);
+        debug_assert!(phases.is_empty() || phases.len() == clause.len());
         return Some(TCheck::Split {
             atoms: clause.clone(),
             guard: Some(lit.negate()),
-            phases: Vec::new(),
+            phases,
         });
     }
     None
@@ -676,6 +708,27 @@ mod tests {
             !fam.clauses.iter().flatten().any(|&a| is_strlt_app(&ctx, a)),
             "swapped family must not contain any str.< atom"
         );
+    }
+
+    /// Task 7.2: the emitted CMP2 clause `[a_eps, clt, r_tail]` must carry
+    /// preferred-TRUE phases for `a_eps`/`clt` and no preference for the
+    /// recursion-tail atom — this is what steers the SAT search away from
+    /// unit-propagating the tail (spec §10).
+    #[test]
+    fn cmp_clause_emits_prefer_true_phases_for_a_eps_and_clt() {
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let u = str_var(&mut ctx, "u");
+        let mut ctr = 0u32;
+        let fam = build_order_family(&mut ctx, s, u, true, &mut ctr);
+        // Find the CMP2 clause: 3 atoms [a_eps, clt, r_tail] where r_tail is str.<.
+        let cmp = fam
+            .clauses
+            .iter()
+            .find(|c| c.len() == 3 && is_strlt_app(&ctx, c[2]))
+            .expect("CMP2 clause present");
+        let phases = fam.phases_for(cmp);
+        assert_eq!(phases, vec![Some(true), Some(true), None]);
     }
 
     /// Task 6 folding mechanism (runs GREEN pre-fence). Build an order family,
