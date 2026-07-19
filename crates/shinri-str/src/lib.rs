@@ -45,6 +45,12 @@ pub struct StrSolver {
     memb_true: Vec<(TermId, Lit, bool)>,
     /// SAT decision level per memb_true entry (lock-step; truncated on pop).
     memb_levels: Vec<u32>,
+    /// Asserted order atoms (slice 31): (atom, literal, is_lt). `is_lt` is the
+    /// atom's relation (`true` = str.<, `false` = str.<=); the literal's
+    /// polarity is handled in `check` (negative ⇒ swapped sibling relation).
+    order_true: Vec<(TermId, Lit, bool)>,
+    /// SAT decision level per order_true entry (lock-step; truncated on pop).
+    order_levels: Vec<u32>,
     len_terms: FxHashSet<TermId>,
     /// Code-point handle terms `(!strcode h)` minted by the order engine
     /// (slice 31). Exposed to the arith theory alongside `len_terms` so the
@@ -141,6 +147,14 @@ impl TheorySolver for StrSolver {
             if matches!(op, Op::Builtin(BuiltinOp::StrInRe)) {
                 self.memb_true.push((atom, lit, lit.is_positive()));
                 self.memb_levels.push(lvl);
+            }
+            // Slice 31: record order atoms (str.< / str.<=) at their asserted
+            // literal. `is_lt` is the RELATION (StrLt vs StrLeq), NOT the
+            // literal's polarity — polarity is handled later in `check`.
+            if let Op::Builtin(sub_op @ (BuiltinOp::StrLt | BuiltinOp::StrLeq)) = op {
+                self.order_true
+                    .push((atom, lit, matches!(sub_op, BuiltinOp::StrLt)));
+                self.order_levels.push(lvl);
             }
         }
         None
@@ -1161,11 +1175,12 @@ impl TheorySolver for StrSolver {
             self.eq_true.len(),
             self.diseq_true.len(),
             self.memb_true.len(),
+            self.order_true.len(),
         );
     }
 
     fn pop(&mut self, level: usize) {
-        if let Some((e, d, mb)) = self.trail.pop_to(level) {
+        if let Some((e, d, mb, ob)) = self.trail.pop_to(level) {
             self.eq_true.truncate(e);
             self.diseq_true.truncate(d);
             // Keep the parallel assertion-level records in lock-step (E1 gate).
@@ -1173,6 +1188,8 @@ impl TheorySolver for StrSolver {
             self.diseq_levels.truncate(d);
             self.memb_true.truncate(mb);
             self.memb_levels.truncate(mb);
+            self.order_true.truncate(ob);
+            self.order_levels.truncate(ob);
         }
     }
 
@@ -1393,7 +1410,7 @@ mod tests {
     use shinri_sat::Effort;
     use shinri_theory::types::ModelVal;
     use shinri_theory::{
-        AtomRegistry, EqualityEngine, ModelBuilder, TCheck, TheoryCtx, TheorySolver,
+        AtomRegistry, EqualityEngine, ModelBuilder, Owner, TCheck, TheoryCtx, TheorySolver,
     };
 
     #[test]
@@ -1634,5 +1651,48 @@ mod tests {
         s.pop(0);
         assert_eq!(s.memb_true.len(), 1);
         assert_eq!(s.memb_levels.len(), 1);
+    }
+
+    // ── Task 3 (slice 31): order-atom intake bookkeeping ─────────────────────
+
+    #[test]
+    fn assert_records_order_atoms() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mk = |c: &mut Context, n: &str| {
+            let sym = c.declare_fun(n, &[], str_s);
+            c.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
+        };
+        let s_var = mk(&mut ctx, "s");
+        let u_var = mk(&mut ctx, "u");
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrLt), &[s_var, u_var])
+            .unwrap();
+        let mut solver = StrSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut areg = AtomRegistry::default();
+        let v = Var::new(0);
+        areg.register(v, atom, Owner::String);
+        let lit = Lit::new(v, true);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        solver.new_var(&mut cx, v, atom);
+        solver.assert(&mut cx, lit);
+        assert_eq!(
+            solver.order_true.len(),
+            1,
+            "assert must record exactly one order atom"
+        );
+        let (recorded_atom, recorded_lit, is_lt) = solver.order_true[0];
+        assert_eq!(recorded_atom, atom, "recorded atom must be the StrLt atom");
+        assert_eq!(
+            recorded_lit, lit,
+            "recorded literal must be the asserted Lit"
+        );
+        assert!(is_lt, "StrLt atom must record is_lt = true");
+        assert_eq!(solver.order_levels, vec![0]);
     }
 }
