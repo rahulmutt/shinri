@@ -229,7 +229,7 @@ pub fn build_strlt_clauses(
 }
 
 /// The `(str.<= a b)` sibling of [`build_strlt_clauses`].
-#[allow(dead_code)] // deliverable sibling; core path uses build_order_family
+#[allow(dead_code)] // deliverable sibling; core path uses build_order_family; exercised by tests
 pub fn build_strleq_clauses(
     terms: &mut Context,
     a: TermId,
@@ -385,6 +385,16 @@ mod tests {
         )
     }
 
+    fn is_strleq_app(ctx: &Context, t: TermId) -> bool {
+        matches!(
+            ctx.term_node(t),
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrLeq),
+                ..
+            }
+        )
+    }
+
     #[test]
     fn strlt_family_emits_neq_bne_and_decomposition() {
         let mut ctx = Context::new();
@@ -403,6 +413,111 @@ mod tests {
             .any(|c| c.len() == 1 && is_distinct(&ctx, c[0], u, eps)));
         // CMP2 recursion tail is a fresh (str.< tA tB) order atom.
         assert!(clauses.iter().flatten().any(|&a| is_strlt_app(&ctx, a)));
+    }
+
+    #[test]
+    fn strleq_family_has_no_neq_and_leq_recursion_tail() {
+        let mut ctx = Context::new();
+        let s = str_var(&mut ctx, "s");
+        let u = str_var(&mut ctx, "u");
+        let mut ctr = 0u32;
+        let clauses = build_strleq_clauses(&mut ctx, s, u, &mut ctr);
+        // `str.<=` admits equality: no NEQ singleton `(distinct s u)`.
+        assert!(
+            !clauses
+                .iter()
+                .any(|c| c.len() == 1 && is_distinct(&ctx, c[0], s, u)),
+            "str.<= family must not contain a NEQ singleton"
+        );
+        // BNE_cond : [ (= s eps), (distinct u eps) ] — the conditional sibling of
+        // strlt's unconditional BNE singleton.
+        let eps = ctx.mk_string_const("");
+        let s_eps = ctx.mk_eq(s, eps).expect("(= s eps) well-sorted");
+        assert!(
+            clauses
+                .iter()
+                .any(|c| c.len() == 2 && c[0] == s_eps && is_distinct(&ctx, c[1], u, eps)),
+            "must contain BNE_cond [(= s eps), (distinct u eps)]"
+        );
+        // CMP2 recursion tail is a fresh (str.<= tA tB) order atom, never str.<.
+        assert!(
+            clauses.iter().flatten().any(|&a| is_strleq_app(&ctx, a)),
+            "CMP2 recursion tail must be str.<="
+        );
+        assert!(
+            !clauses.iter().flatten().any(|&a| is_strlt_app(&ctx, a)),
+            "str.<= family must not contain any str.< atom"
+        );
+    }
+
+    /// Discriminates the `(neg, lt)` arm of `order_check`'s polarity
+    /// normalization: `¬(str.< s u)` must build the `str.<=` family on the
+    /// SWAPPED pair `(u, s)`, not the `str.<` family on `(s, u)`. Drives
+    /// `order_check` directly with a synthesized NEGATIVE `Lit` (mirroring the
+    /// scaffold of `assert_records_order_atoms` in lib.rs, but calling
+    /// `order_check` directly rather than going through `assert`/`check`).
+    ///
+    /// This would FAIL if the `(false, true)` arm built `build_order_family`
+    /// on `(arg0, arg1, true)` (StrLt on the un-swapped pair) instead of
+    /// `(arg1, arg0, false)` (StrLeq on the swapped pair): the memo would then
+    /// be keyed `(s, u, true)` instead of `(u, s, false)`, and the family
+    /// would contain a NEQ singleton and a `str.<` recursion tail instead of
+    /// neither.
+    #[test]
+    fn negative_lt_maps_to_swapped_leq() {
+        let mut ctx = Context::new();
+        let s_var = str_var(&mut ctx, "s");
+        let u_var = str_var(&mut ctx, "u");
+        let lt_atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrLt), &[s_var, u_var])
+            .unwrap();
+        let mut solver = StrSolver::default();
+        let mut eq = shinri_theory::EqualityEngine::default();
+        let atoms = shinri_theory::AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        // NEGATIVE literal over the (str.< s u) atom: ¬(s < u) ≡ (u <= s).
+        let neg_lit = Lit::new(shinri_core::Var::new(0), false);
+        let res = order_check(&mut solver, &mut cx, lt_atom, neg_lit, /*is_lt=*/ true);
+        assert!(
+            res.is_some(),
+            "order_check must emit a split for a fresh family"
+        );
+
+        let swapped_leq_key = (u_var, s_var, false);
+        let wrong_lt_key = (s_var, u_var, true);
+        assert!(
+            solver.order_clauses.contains_key(&swapped_leq_key),
+            "¬(str.< s u) must build the str.<= family on the swapped (u, s) pair"
+        );
+        assert!(
+            !solver.order_clauses.contains_key(&wrong_lt_key),
+            "¬(str.< s u) must NOT build the str.< family on the un-swapped (s, u) pair"
+        );
+
+        let fam = &solver.order_clauses[&swapped_leq_key];
+        // No NEQ singleton `[(distinct u s)]` — str.<= admits equality.
+        assert!(
+            !fam.clauses
+                .iter()
+                .any(|c| c.len() == 1 && is_distinct(&ctx, c[0], u_var, s_var)),
+            "swapped family must not contain a NEQ singleton"
+        );
+        // Recursion tail is (str.<= ...), never (str.< ...).
+        assert!(
+            fam.clauses
+                .iter()
+                .flatten()
+                .any(|&a| is_strleq_app(&ctx, a)),
+            "swapped family's CMP2 recursion tail must be str.<="
+        );
+        assert!(
+            !fam.clauses.iter().flatten().any(|&a| is_strlt_app(&ctx, a)),
+            "swapped family must not contain any str.< atom"
+        );
     }
 
     #[test]
