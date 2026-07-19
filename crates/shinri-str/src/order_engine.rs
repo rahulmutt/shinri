@@ -8,6 +8,7 @@
 use crate::{collect, wordeq, StrSolver};
 use rustc_hash::FxHashSet;
 use shinri_core::{BuiltinOp, Context, Integer, Lit, Op, Rational, SymbolId, TermId, TermNode};
+use shinri_theory::types::ENodeId;
 use shinri_theory::{TCheck, TheoryCtx};
 
 /// Arith-facing largest code point (mirror of `code_conv::MAX_CODE`).
@@ -331,6 +332,161 @@ pub(crate) fn order_check(
     None
 }
 
+/// Extract the argument `h` of a `(!strcode h)` application (an entry of
+/// `code_terms`). `None` for anything that is not a unary uninterpreted app.
+fn arg_of_code(terms: &Context, code_t: TermId) -> Option<TermId> {
+    match terms.term_node(code_t) {
+        TermNode::App {
+            op: Op::Uninterpreted(_),
+            args,
+            ..
+        } => {
+            let ch = terms.children(*args);
+            (ch.len() == 1).then(|| ch[0])
+        }
+        _ => None,
+    }
+}
+
+/// On-demand CODE-CONSTANT FOLD (slice 31 Task 6, SOUNDNESS-critical).
+///
+/// For the order literal `lit` on `atom`, look up its (already-built) head-peel
+/// family and, for each minted head `h` whose code handle `code(h)=(!strcode h)`
+/// is a shared arith var, check whether `h` is currently EUF-equal to a
+/// SINGLE-CHARACTER string constant `c`. If so, emit the pin
+/// `code(h) = eval_to_code(c)` — the REAL code point — split into its arith
+/// `Ge`/`Le` companions (never a bare Int `Eq`, which would route to EUF not
+/// Arith), one companion per call, deduped in `emitted_code_folds`, fuel-spent,
+/// GUARDED by `lit.negate()` (the valid implication `L → code(h)=k`).
+///
+/// ## Why this is sound (self-review against the Task-6 invariants)
+/// * **Single-char gate.** `code_conv::eval_to_code` returns `Some(-1)` for the
+///   empty / multi-char case (NOT `None`), so we FIRST require `c` to be a
+///   single char and only then trust `eval_to_code`'s `Some(k)`. A head
+///   EUF-equal to a multi-char constant is left to the `|h|=1` length clause,
+///   which contradicts it via arith — folding must NOT fire (safe fallthrough).
+/// * **Domain / surrogate consistency.** `c` is a `Box<str>`-backed constant, so
+///   its one char is a valid Unicode scalar value: never a surrogate
+///   (`0xD800..=0xDFFF`), and `eval_to_code` returns `None` above
+///   `MAX_CODE=0x2FFFF`. Hence `k ∈ [0, MAX_CODE] \ surrogates` — exactly the
+///   set the family's range / surrogate-hole clauses admit, so the pin can never
+///   contradict them (which would be a spurious UNSAT).
+/// * **Merge is not branch-local.** The pin is a global clause `¬L ∨ code(h)=k`
+///   that READS the `h≈c` merge; per this file's E1 discipline we emit it only
+///   when `side_clean(h, input_cond_roots)` holds — i.e. `h`'s class was not
+///   merged by a CONDITIONAL (dl>0) INPUT (dis)equality. The family's own
+///   decomposition merges (minted, `¬L`-guarded) are deliberately NOT in
+///   `input_cond_roots`, so the intended dl0-constant case still folds.
+pub(crate) fn order_fold_check(
+    s: &mut StrSolver,
+    cx: &mut TheoryCtx,
+    atom: TermId,
+    lit: Lit,
+    is_lt: bool,
+    input_cond_roots: &FxHashSet<ENodeId>,
+) -> Option<TCheck> {
+    // Re-derive the polarity-normalized family key (identical to order_check).
+    let (arg0, arg1) = match cx.terms.term_node(atom) {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrLt | BuiltinOp::StrLeq),
+            args,
+            ..
+        } => {
+            let ch = cx.terms.children(*args);
+            (ch[0], ch[1])
+        }
+        _ => return None,
+    };
+    let (a, b, use_lt) = match (lit.is_positive(), is_lt) {
+        (true, true) => (arg0, arg1, true),
+        (true, false) => (arg0, arg1, false),
+        (false, true) => (arg1, arg0, false),
+        (false, false) => (arg1, arg0, true),
+    };
+    let key = (a, b, use_lt);
+    // Fold only over an ALREADY-BUILT family (order_check mints/memoizes it).
+    let (code_ha, code_hb) = {
+        let fam = s.order_clauses.get(&key)?;
+        (fam.code_ha, fam.code_hb)
+    };
+
+    // Candidate constants to probe against a head's EUF class.
+    let str_terms: Vec<TermId> = s.str_terms.iter().copied().collect();
+
+    for code_h in [code_ha, code_hb] {
+        let Some(h) = arg_of_code(cx.terms, code_h) else {
+            continue;
+        };
+        // Find a single-char string constant `c` EUF-equal to `h`.
+        let hn = cx.eq.intern(h);
+        let mut hit: Option<(TermId, Integer)> = None;
+        for c in &str_terms {
+            let Some(cs) = cx.terms.string_const_value(*c).map(str::to_owned) else {
+                continue;
+            };
+            // Single-char gate FIRST (eval_to_code returns Some(-1) for
+            // empty/multi-char, which must never be folded).
+            let mut chit = cs.chars();
+            if !matches!((chit.next(), chit.next()), (Some(_), None)) {
+                continue;
+            }
+            let cn = cx.eq.intern(*c);
+            if !cx.eq.are_equal(hn, cn) {
+                continue;
+            }
+            // Genuine single char: eval_to_code yields the REAL code point in
+            // [0, MAX_CODE]\surrogates (None above the alphabet ⇒ no fold).
+            if let Some(k) = crate::code_conv::eval_to_code(&cs) {
+                hit = Some((*c, k));
+                break;
+            }
+        }
+        let Some((_c, k)) = hit else {
+            continue;
+        };
+        // SOUNDNESS gate: the `h≈c` merge must not be branch-local w.r.t. a
+        // conditional INPUT disjunction (else the global `¬L ∨ code(h)=k` clause
+        // is unsound on a sibling branch → spurious UNSAT).
+        if !crate::side_clean(cx.eq, cx.terms, h, input_cond_roots) {
+            continue;
+        }
+
+        // Build `(= code(h) k)` and split into arith Ge/Le companions.
+        let int_s = cx.terms.int_sort();
+        let kt = cx.terms.mk_numeral(Rational::from_int(k), int_s);
+        let eqn = cx
+            .terms
+            .mk_eq(code_h, kt)
+            .expect("(= code(h) k) well-sorted");
+        let (ge, le) = crate::length::arith_eq_companions(cx.terms, eqn)
+            .expect("code(h)=k is an Int equality");
+
+        for comp in [ge, le] {
+            if s.emitted_code_folds.contains(&comp) {
+                continue;
+            }
+            // Fuel BEFORE marking emitted (deliver-only accounting).
+            if !s.fuel.spend() {
+                return Some(TCheck::Unknown);
+            }
+            s.emitted_code_folds.insert(comp);
+            let mut seen = FxHashSet::default();
+            collect::collect(
+                cx.terms,
+                comp,
+                &mut s.len_terms,
+                &mut s.str_terms,
+                &mut seen,
+            );
+            return Some(TCheck::Split {
+                atoms: vec![comp],
+                guard: Some(lit.negate()),
+            });
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -517,6 +673,95 @@ mod tests {
         assert!(
             !fam.clauses.iter().flatten().any(|&a| is_strlt_app(&ctx, a)),
             "swapped family must not contain any str.< atom"
+        );
+    }
+
+    /// Task 6 folding mechanism (runs GREEN pre-fence). Build an order family,
+    /// force its A-head `hA` EUF-equal to the single-char constant `"b"`, then
+    /// drive `order_fold_check` directly and assert it emits BOTH `Ge`/`Le`
+    /// companions pinning `code(hA)` to `98` (the code point of `'b'`), each
+    /// guarded by `¬L`. This is the SOUNDNESS pin that stops arith from picking a
+    /// bogus `code("b") < code("a")`.
+    #[test]
+    fn fold_pins_code_of_head_equal_to_single_char_constant() {
+        use shinri_theory::types::EqJust;
+
+        let mut ctx = Context::new();
+        let s_var = str_var(&mut ctx, "s");
+        let u_var = str_var(&mut ctx, "u");
+        let b_const = ctx.mk_string_const("b");
+        let lt_atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrLt), &[s_var, u_var])
+            .unwrap();
+
+        let mut solver = StrSolver::default();
+        let mut eq = shinri_theory::EqualityEngine::default();
+        let areg = shinri_theory::AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+
+        // Positive `(str.< s u)` literal → family key (s, u, true). One
+        // order_check call mints hA/hB + their code handles and memoizes the
+        // family (the fold consumes an ALREADY-BUILT family).
+        let pos_lit = Lit::new(shinri_core::Var::new(0), true);
+        let _ = order_check(&mut solver, &mut cx, lt_atom, pos_lit, /*is_lt=*/ true);
+
+        let key = (s_var, u_var, true);
+        let code_ha = solver.order_clauses[&key].code_ha;
+        let ha = arg_of_code(cx.terms, code_ha).expect("code_ha is (!strcode hA)");
+
+        // Force hA ≈ "b" in EUF and expose "b" as a candidate constant.
+        let hn = cx.eq.intern(ha);
+        let cn = cx.eq.intern(b_const);
+        cx.eq
+            .merge(hn, cn, EqJust::Definitional)
+            .expect("merge hA≈\"b\"");
+        solver.test_force_str_term(b_const);
+
+        // Expected companions of `(= code(hA) 98)` ('b' = 98).
+        let int_s = cx.terms.int_sort();
+        let k98 = cx
+            .terms
+            .mk_numeral(Rational::from_int(Integer::from(98i128)), int_s);
+        let expected_ge = cx
+            .terms
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[code_ha, k98])
+            .unwrap();
+        let expected_le = cx
+            .terms
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[code_ha, k98])
+            .unwrap();
+
+        let empty_roots: FxHashSet<ENodeId> = FxHashSet::default();
+        let (mut saw_ge, mut saw_le) = (false, false);
+        for _ in 0..8 {
+            match order_fold_check(&mut solver, &mut cx, lt_atom, pos_lit, true, &empty_roots) {
+                Some(TCheck::Split { atoms, guard }) => {
+                    assert_eq!(
+                        guard,
+                        Some(pos_lit.negate()),
+                        "fold split must be guarded by ¬L (the valid implication L → code(h)=k)"
+                    );
+                    for a in atoms {
+                        if a == expected_ge {
+                            saw_ge = true;
+                        } else if a == expected_le {
+                            saw_le = true;
+                        } else {
+                            panic!("fold emitted a non-companion atom");
+                        }
+                    }
+                }
+                None => break,
+                Some(_) => panic!("fold must return a Split or None, never a verdict"),
+            }
+        }
+        assert!(
+            saw_ge && saw_le,
+            "fold must emit BOTH Ge/Le companions pinning code(hA) to 98"
         );
     }
 

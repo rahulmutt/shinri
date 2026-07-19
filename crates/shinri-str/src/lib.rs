@@ -71,6 +71,11 @@ pub struct StrSolver {
     /// Monotone (never cleared on backtrack) — a dedup hit means the guarded
     /// clause is already learnt.
     emitted_order: FxHashSet<(TermId, u64)>,
+    /// Dedup for on-demand code-constant FOLDS (slice 31 Task 6): the Ge/Le
+    /// arith companion TermIds of an emitted `(= (code h) k)` fold. Monotone
+    /// (never cleared on backtrack) — a dedup hit means the guarded pin is
+    /// already learnt, so the same fold is never re-emitted.
+    emitted_code_folds: FxHashSet<TermId>,
     /// Memoized order-clause families (slice 31), keyed by the polarity-
     /// normalized `(a, b, use_lt)` triple. The family mints its fresh heads
     /// `hA/hB` (and code handles) ONCE and is reused every round, so EUF
@@ -1175,8 +1180,25 @@ impl TheorySolver for StrSolver {
         // reaches StrSolver until Task 7's fence lift, so this loop is inert
         // on existing inputs (order_true stays empty).
         let orders: Vec<(TermId, Lit, bool)> = self.order_true.clone();
-        for (atom, lit, is_lt) in orders {
+        for &(atom, lit, is_lt) in &orders {
             if let Some(res) = order_engine::order_check(self, cx, atom, lit, is_lt) {
+                return res;
+            }
+        }
+        // On-demand code-constant FOLD (slice 31 Task 6, SOUNDNESS-critical):
+        // once every clause of an order family is emitted (order_check above
+        // returned None for all), pin `code(h)=eval_to_code(c)` for any minted
+        // head `h` currently EUF-equal to a single-char string constant `c`.
+        // Guarded by the triggering order literal's negation and gated on
+        // `input_cond_roots` (so the read of the `h≈c` merge is not branch-local
+        // w.r.t. a conditional INPUT disjunction — the same discipline the
+        // separation / empty-residual lemmas above use). Pins the uninterpreted
+        // `!strcode` handle to the REAL code point so arith cannot pick a bogus
+        // `code("b") < code("a")` → spurious SAT.
+        for &(atom, lit, is_lt) in &orders {
+            if let Some(res) =
+                order_engine::order_fold_check(self, cx, atom, lit, is_lt, &input_cond_roots)
+            {
                 return res;
             }
         }
@@ -1293,7 +1315,7 @@ impl StrSolver {
 /// branch-local, so the global lemma is skipped (or the trigger cited). Sound over-
 /// approximation: it flags a class touched by a conditional equality even if `t`'s
 /// own rep is reachable by a dl0 sub-path — never the reverse.
-fn side_clean(
+pub(crate) fn side_clean(
     eq: &mut EqualityEngine,
     terms: &Context,
     t: TermId,

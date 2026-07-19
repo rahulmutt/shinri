@@ -47,7 +47,13 @@ fn char_of_code(k: i128) -> Option<char> {
 /// Concrete `str.to_code(s)` per SMT-LIB 2.6: the code point for a singleton,
 /// `-1` otherwise. None (no fold) for a singleton ABOVE the SMT-LIB alphabet
 /// — such a literal is not a valid String value; leave it to the fence.
-fn eval_to_code(s: &str) -> Option<Integer> {
+///
+/// NOTE (slice 31 Task 6): this returns `Some(-1)` for the empty or multi-char
+/// case — NOT `None`. So a caller that wants to fold ONLY on genuine single
+/// characters (the order engine's code-constant fold) must gate on the string
+/// being a single char BEFORE trusting the returned code point; `Some(-1)` here
+/// does not mean "single char" and must never be folded into `code(h)`.
+pub(crate) fn eval_to_code(s: &str) -> Option<Integer> {
     let mut it = s.chars();
     match (it.next(), it.next()) {
         (Some(c), None) => {
