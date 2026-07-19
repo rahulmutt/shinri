@@ -373,3 +373,108 @@ string change can flip string-side e2e pins; any z3-confirmed
 - Slice 27/28/29 standing bank unchanged (approach-C fuel-free
   constant-length propagation, distinct-length sets, co-finite memberships,
   slice-28 §8 conflict-core work, slice-27 typed-antecedent refactor).
+
+## 10. Addendum (2026-07-19) — base-case decision-phase preference
+
+**Surfaced at the Task 7 integration gate.** Tasks 1–6 landed sound and
+unit-reviewed: ownership routing, the congruent `!strcode` bridge,
+`order_true` recording, the head-peel clause families, polarity mapping, and
+on-demand constant folding (including a `side_clean(input_cond_roots)` guard
+added to close a conditional-merge spurious-UNSAT hazard). But when Task 7
+lifted the fence and ran the acceptance pins end-to-end for the first time,
+**4 of 5 intended-decidable pins returned `Unknown`, including both soundness
+gates** — no *wrong* verdict, but the slice did not decide the idioms it
+claims. This section specifies the missing piece.
+
+### 10.1 Root cause — the recursion is forced, not chosen
+
+`§5`'s claim "the bare pin decides at depth 0 — the `s=""` base disjunct is
+immediately Sat" is **false as built**. In `CMP2 = [a_eps, clt, r_tail]`
+(where `a_eps = (= A "")`, `clt = (< code(hA) code(hB))`, `r_tail = (str.< tA
+tB)`), every fresh atom takes the SAT solver's **default-FALSE** decision
+phase (`shinri-sat` `Assignment::new_var` pushes `phase = false`, and the vec
+order of `atoms` is *inert* — clause literal order does not bias decisions).
+So `a_eps=false ∧ clt=false` **unit-propagates `r_tail=true`**: the recursion
+tail is *forced*, never chosen. `order_true` grows unboundedly (instrumented:
+1→2 for the bare pin, 2→3 for the antisymmetry gate), the shallow model /
+bounded refutation is never reached, and the pass fuel-exhausts to sound
+`Unknown`. This is **not** a fuel bug — bumping fuel *diverges* (>60s /
+timeout, per-round N-O cost × unbounded rounds) — and **not** a wiring bug
+(`code(h)` reaches shared arith; congruence interning is present).
+
+Why the other candidate fixes fail: a **finite depth/length measure alone**
+cannot decide the *Sat* cases — when the theory returns `Unknown`, DPLL(T)
+returns `Unknown`; it does not backtrack to hunt the base-case model — and
+dropping `r_tail` at a depth cap is unsound (spuriously refutes `s="aa",
+u="ab"`). **`propagate`** forces only *entailed* literals; `s=""` is a
+preference, not a consequence, so forcing it is unsound. The `str.<`/`str.<=`
+recursion also lacks the finite measure `memb.rs` (Brzozowski-derivative state
+space) and `wordeq.rs` (repeatable head-pair dedup) use to converge — it mints
+a fresh clause family per fresh tail pair, so its dedup key never repeats and
+fuel is its only bound.
+
+### 10.2 Fix — an optional preferred decision phase on emitted split atoms
+
+Add a **decision-phase preference** channel so a theory can mark specific
+atoms of an emitted `Split` as preferred-TRUE (or preferred-FALSE):
+
+1. **`shinri-sat`:** extend the `Split`/`SplitAtoms` payload (and the
+   `bind_fresh` / fresh-var path) to carry, per atom, an optional preferred
+   phase. When a fresh variable is minted for such an atom, **seed
+   `Assignment::phase[v]`** with the preferred value so `pick_branch` decides
+   it in that direction first. Absent a preference, behaviour is unchanged
+   (default FALSE + phase-saving). This is a small, reusable SAT capability;
+   nothing else about the decision heuristic changes.
+2. **`shinri-theory` combiner:** thread the per-atom phase preference through
+   the `TCheck::Split → TheoryResult::SplitAtoms` lift (`combiner.rs`),
+   carrying no other change.
+3. **`shinri-str` order engine (first client):** when `build_order_family`
+   emits `CMP1`/`CMP2` (and the `DEC/LEN` clauses that gate on `a_eps`), mark
+   **`a_eps` and `clt` as preferred-TRUE**. Then:
+   - **Bare pin** (`s<u`): `a_eps` tried TRUE → `s=""` model → **Sat at depth
+     0**, no recursion.
+   - **Antisymmetry with `|s|=|u|=1`** (`s<u ∧ u<s`): `a_eps` tried TRUE then
+     refuted by `|s|=1`; `clt` preferred TRUE satisfies `CMP2` **without
+     forcing `r_tail`**, landing both atoms on the code-compare disjunct →
+     congruence (`hs=hs'` via the word equations) forces
+     `code(hs)<code(hu)<code(hs)` → arith **UNSAT**.
+   - **Constant pins** (`s<u ∧ s="b" ∧ u="a"`): same `clt` path; folding pins
+     `98 < 97` → **UNSAT**.
+   - **`len(u)=0`**, `s=u`, and the deep/unbounded shapes decide or stay sound
+     `Unknown` exactly as before.
+
+### 10.3 Soundness
+
+A decision-phase preference **only reorders the search** — it changes which
+branch the solver explores first, never which assignments are legal, never a
+learnt clause, never a verdict. Every model found is still a real model; every
+refutation is still a real conflict. So the preference is **unconditionally
+sound** and cannot regress any of Tasks 1–6. It strictly changes *when* (and
+whether, within fuel) a decidable case is decided — completeness, not
+soundness.
+
+### 10.4 Validation and residual caveat
+
+The phase preference is *necessary*; sufficiency rests additionally on the
+length coupling (`|s|=1 → |hA|=1 → tA=""`) reaching arith/EUF — machinery
+Tasks 4/6 already built. Therefore the **acceptance criterion is the 5-pin
+gate itself**, run end-to-end after the hint lands:
+`bare_symbolic_lt_is_sat` (Sat), `lt_and_eq_is_unsat` /
+`lt_and_lt_swapped_bounded_len_is_unsat` (congruence) /
+`lt_with_constant_pins_is_unsat_via_folding` (folding) /
+`(str.< s u) ∧ (= (str.len u) 0)` (Unsat), `lt_with_len1_is_sat` (Sat), plus
+the `qfs_str_order_symbolic_pair_matches_z3` oracle family with **0
+disagreements** and acceptable wall-clock. If a gate is still `Unknown` after
+the hint, it is a second-order length-coupling defect (diagnosable via
+systematic-debugging), **not** a reason to weaken a gate. The
+unbounded-antisymmetry pin (`s<u ∧ u<s`, free lengths) remains the recorded
+sound-`Unknown` slice-32 residual.
+
+### 10.5 Scope delta
+
+This inserts, before the fence-lift/acceptance task, the phase-preference
+capability (`shinri-sat` + `shinri-theory`) and its order-engine client
+wiring. Non-goals unchanged. The general phase-hint is deliberately minimal —
+one optional field, seeded once at fresh-var creation — not a full
+decision-strategy framework (YAGNI); other theories may adopt it later but
+none is required to.
