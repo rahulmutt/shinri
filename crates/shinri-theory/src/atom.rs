@@ -82,6 +82,16 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
     {
         return Ok(Owner::String);
     }
+    // String routing: a surviving str.< / str.<= order atom (both operands
+    // symbolic — the constant-side cases are rewritten away in preprocessing)
+    // belongs to the String theory's word-equation engine.
+    if let TermNode::App {
+        op: Op::Builtin(BuiltinOp::StrLt | BuiltinOp::StrLeq),
+        ..
+    } = terms.term_node(atom)
+    {
+        return Ok(Owner::String);
+    }
     match terms.term_node(atom) {
         TermNode::App { op, args, .. } => {
             let children = terms.children(*args);
@@ -320,6 +330,24 @@ mod tests {
         let y = real_var(&mut ctx, "y");
         let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[x, y]).unwrap();
         assert_eq!(classify(&ctx, le), Ok(Owner::Arith));
+    }
+
+    #[test]
+    fn str_order_atoms_route_to_string_owner() {
+        let mut terms = Context::new();
+        let ss = terms.string_sort();
+        let s_sym = terms.declare_fun("s", &[], ss);
+        let s = terms.mk_app(Op::Uninterpreted(s_sym), &[]).unwrap();
+        let u_sym = terms.declare_fun("u", &[], ss);
+        let u = terms.mk_app(Op::Uninterpreted(u_sym), &[]).unwrap();
+        let lt = terms
+            .mk_app(Op::Builtin(BuiltinOp::StrLt), &[s, u])
+            .unwrap();
+        let leq = terms
+            .mk_app(Op::Builtin(BuiltinOp::StrLeq), &[s, u])
+            .unwrap();
+        assert_eq!(classify(&terms, lt), Ok(Owner::String));
+        assert_eq!(classify(&terms, leq), Ok(Owner::String));
     }
 
     #[test]
