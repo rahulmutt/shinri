@@ -8,6 +8,7 @@ mod memb;
 pub mod model;
 pub mod normalize;
 pub mod order;
+mod order_engine;
 pub mod predicates;
 pub mod reduce;
 pub mod regex;
@@ -45,6 +46,10 @@ pub struct StrSolver {
     /// SAT decision level per memb_true entry (lock-step; truncated on pop).
     memb_levels: Vec<u32>,
     len_terms: FxHashSet<TermId>,
+    /// Code-point handle terms `(!strcode h)` minted by the order engine
+    /// (slice 31). Exposed to the arith theory alongside `len_terms` so the
+    /// N-O seam makes them shared arith variables.
+    code_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
     emitted_len_axioms: FxHashSet<TermId>,
     /// Dedup set for F-splits: keyed on the canonical (unordered) head pair.
@@ -1180,6 +1185,11 @@ impl TheorySolver for StrSolver {
 
     fn shared_arith_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
         let mut out: Vec<TermId> = self.len_terms.iter().copied().collect();
+        for &t in &self.code_terms {
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        }
         // Empty-length link, robust (arith-entailed) direction: if any disequality
         // has an empty-literal side, expose the Int numeral `0` as a shared term.
         // The N-O exchange then ENTAILS `len(s) = 0` (merging it into the shared
