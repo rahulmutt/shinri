@@ -3,6 +3,17 @@
 Date: 2026-07-19
 Status: DESIGN
 
+**Delivered across two slices** (decomposed at planning, 2026-07-19, once the
+encoding size became concrete — see §2a):
+- **Slice 31 (the spine):** ownership routing + assert path + the
+  code-handle bridge primitive (with congruence) + the head-peel spine that
+  cashes the bare pin (Sat) and the shallow Unsat idioms, fuel-bounded; the
+  symbolic-pair oracle family. This is what the plan
+  `docs/superpowers/plans/2026-07-19-shinri-slice31-str-order-symbolic-pair.md`
+  implements.
+- **Slice 32 (the deepening):** deep recursion / length-coupling to full
+  order-reduction completeness, fuel tuning, and the exhaustive oracle sweep.
+
 Predecessor: slice 30 (constant-word lexicographic order, landed 2026-07-18).
 Slice 30 took the last *pure-rewrite* step adjacent to the string-order
 fence — generalizing the constant side to any-length words — and, per its
@@ -55,22 +66,60 @@ fundamental fuel bound, shared with all word-equation reasoning, not from a
 special order fence. This strictly *shrinks* the incomplete region and lifts
 the two-variable order fence.
 
+**Where slice 31 lands within that goal.** Slice 31 builds the *spine* of the
+reduction — the ownership/assert wiring, the congruent code-handle bridge,
+and the head-peel clause family — and validates it end-to-end on the bare
+pin (Sat via the empty-prefix base case) and the shallow Unsat idioms
+(`s<u ∧ u<s`, `s<u ∧ s=u`, `s<u ∧ u<=s`). Deep recursion and tight
+length-coupling — pushing to full order-reduction completeness — are
+slice 32. Everything slice 31 does is *sound at every depth*; slice 32 only
+*decides more* (fewer fuel-bounded `Unknown`s), never changes an answer.
+
+## 2a. Two encoding realities that shaped the split (surfaced at planning)
+
+1. **`TCheck::Split` atoms must be flat theory atoms.** `classify`
+   (`crates/shinri-theory/src/atom.rs:16–103`) routes a compound
+   `(and …)`/`(or …)` atom to `Err(Unsupported)`. So the nested head-peel
+   formula below cannot be one atom — it is hand-Tseitin'd into a **family of
+   flat guarded CNF clauses emitted incrementally across solver rounds**,
+   the exact pattern the membership pass already uses (`memb.rs`, the keyed
+   S1..S4 witnesses). This is the intricate, soundness-critical core, and the
+   reason the completeness push is its own slice.
+2. **The code handle needs congruence, not literal `to_code` value
+   semantics.** For soundness (refuting e.g. `s<u ∧ u<s` requires that equal
+   head-skolems force equal codes), the "code of a single char" must be a
+   **functional, range-bounded integer** with congruence — realized as an
+   uninterpreted, ranged code term (§4), *not* general online `str.to_code`
+   (which stays a non-goal). Congruence + range + order-consistency is
+   sufficient and sound; literal char↔code value binding is neither needed
+   nor introduced for the pure two-symbolic-var fragment (the head-skolems
+   are fresh and appear only in these lemmas, so no other path constrains
+   their code).
+
 ## 3. Fix — four wiring changes plus one new capability
 
 All four wiring changes reuse existing infrastructure (the generic
 `TCheck::Split` seam, the Combiner lift, the SAT split-on-demand loop, the
 `fresh_str` skolem mint, the `emitted` dedup set, and the `Fuel` budget).
 
-1. **Fence lift.** `has_unreduced_str_order` (`order.rs:229`) stops fencing
-   the two-symbolic-side case. `order.rs`'s constant-side rewrites (slices
-   23/24/30) are untouched and still fire first in `try_order_atom`; only
-   the surviving *symbolic-pair* atom now flows through to the theory layer
-   instead of `→ Unknown` at `lib.rs:483`.
-2. **Ownership routing.** Extend `classify` / `theory_of`
-   (`crates/shinri-theory/src/combiner.rs:100`,
-   `crates/shinri-theory/src/interface.rs:43`) so a surviving
-   `StrLt`/`StrLeq` atom is owned by `StrSolver`. Today no owner claims it
-   because it never survives preprocessing.
+1. **Fence lift (narrowed, not removed).** `has_unreduced_str_order`
+   (`order.rs:229`) stops firing *only* for the two-symbolic-side case (a
+   surviving `StrLt`/`StrLeq` where **neither** operand is a string
+   constant). It **still fences** a surviving order atom with a constant
+   operand — those are the over-cap / above-alphabet constant words
+   `try_order_atom` rejected (`word_codes → None`), which stay `Unknown` by
+   design (§9 non-goal). `order.rs`'s constant-side rewrites (slices 23/24/30)
+   are untouched and still fire first in `try_order_atom`; only the surviving
+   *symbolic-pair* atom now flows through to the theory layer instead of
+   `→ Unknown` at `lib.rs:483`.
+2. **Ownership routing.** Extend `classify`
+   (`crates/shinri-theory/src/atom.rs:16–103`) to return `Owner::String`
+   for a surviving `StrLt`/`StrLeq` atom — a `str.in_re`-style early return
+   alongside the existing string-routing blocks (today such an atom falls to
+   `_ => Err(Unsupported)` at `atom.rs:98`). The `Owner::String` enum variant
+   and its dual EUF+String dispatch (`combiner.rs:173–181` / `256–260` /
+   `354–357`) already exist, so no Combiner or `Owner`-enum change is needed.
+   Today no owner ever sees the atom because it never survives preprocessing.
 3. **Assert path.** `StrSolver.assert` (`crates/shinri-str/src/lib.rs:100`)
    records order literals into a new `order_true: Vec<(atom, lit,
    polarity)>` list with decision levels — parallel to the existing
@@ -90,55 +139,73 @@ core, arrays/BV/FP, or the `str.at`/`substr` fence (`lib.rs:507–512`).
 ## 4. The symbolic-character ↔ code-point bridge
 
 The head-peel (§5) must assert `code(hs) < code(hu)` where `hs`, `hu` are
-symbolic single characters. Because `str.to_code` is preprocessing-only and
-fenced, the bridge **replaces** `to_code` with a pinned integer at mint
-time rather than emitting a `to_code` application that would survive to a
-fence.
+symbolic single characters. `str.to_code` is preprocessing-only and fenced,
+so the bridge does **not** use real `to_code` value semantics. Instead
+`code(·)` is a **functional, range-bounded integer handle** on a single-char
+string: an application `code(h)` that is (a) *congruent* — `hs = hu ⇒
+code(hs) = code(hu)` — and (b) *ranged*, nothing more. This is exactly what
+soundness needs and no more (see below); the literal char↔code value binding
+(`"z" ↦ 122`) is deliberately **not** introduced.
 
 Whenever the head-peel mints a single-char head `h`, it emits (once per `h`,
-deduped) a bridge axiom binding a fresh integer `k_h`:
+deduped) these bridge axioms (each guarded by `¬L`, as flat arith/length
+atoms — never a bare `Eq`, which routes to EUF not arith; `|h|=1` and the
+range are emitted as their `Ge`/`Le` companions per
+`length::arith_eq_companions`):
 
 ```
-|h| = 1                          (h is exactly one character)
-0 ≤ k_h ≤ MAX_CODE               (MAX_CODE = 0x2FFFF)
-k_h ∉ [0xD800, 0xDFFF]           (surrogate block — unrepresentable, code_conv policy)
-k_h  is the code point of  h     (the single-char ↔ code binding)
+|h| = 1                          → (>= len(h) 1), (<= len(h) 1)
+0 ≤ code(h) ≤ MAX_CODE           → (>= code(h) 0), (<= code(h) MAX_CODE),  MAX_CODE = 0x2FFFF
+code(h) ∉ [0xD800, 0xDFFF]       → (<= code(h) 0xD7FF) ∨ (>= code(h) 0xE000)   [a 2-atom clause]
 ```
 
-`k_h` enters the **shared String↔Arith set** — the same channel `str.len`
-skolems already use (`crates/shinri-str/src/fuel.rs` docs). The order
-comparison then becomes an ordinary arith atom `k_hs < k_hu`, decided by the
-LIA solver. Character equality `hs = hu` in the recurse-branch is an ordinary
-string equation the engine already handles (and is entailed by `k_hs = k_hu`
-plus single-char, giving the string-view and arith-view a consistent join).
+`code(h)` enters the **shared String↔Arith set** — the same channel `str.len`
+skolems use: it lands in `len_terms`/a sibling set exposed by
+`shared_arith_terms` (`lib.rs:1181–1207`), which the Combiner pulls into arith
+via `ensure_shared_var` (`combiner.rs:475–489`). The comparison `code(hs) <
+code(hu)` is a `BuiltinOp::Lt` atom, which `classify` routes unconditionally
+to `Owner::Arith` (`atom.rs:89–91`) — the LIA solver decides it.
 
-**Soundness.** Every `k_h` is pinned to a representable, non-surrogate code
-point, so any satisfying arith assignment induces a genuine single-char
-string whose SMT-LIB `str.<` agrees with code-point `<` (UTF-8 is byte-wise
-code-point-order-preserving, as slices 23/30 established). Surrogate and
-`MAX_CODE` edges are excluded exactly as `code_conv` / `order.rs` already do,
-so no interior-surrogate endpoint arises. No `to_code` term ever survives to
-a fence because the bridge pins an integer instead of emitting a `to_code`
-application.
+**Congruence is the load-bearing property.** `code(·)` must be *functional*
+so that when the word-equation engine forces two head-skolems equal (e.g.
+both are the first char of the same `s`), their codes are forced equal too —
+this is what refutes `s<u ∧ u<s` and `s<u ∧ s=u`. Realize `code(·)` as a
+term the congruence-closure (EUF) treats as a function of its string
+argument (an uninterpreted unary `String→Int` symbol, or `str.to_code` **iff**
+EUF congruence covers that builtin — a T-2 verification decides which). No
+*value* binding is needed: the head-skolems are fresh and occur only inside
+these lemmas, so nothing else constrains their code.
 
-**Open detail for the plan (implementation, not architecture).** The exact
-call path that injects `k_h` and its bounds into the shared arith set —
-whether to reuse the precise machinery that lifts `str.len(skolem)` into
-shared arith, or add a small sibling emitter — is nailed during planning.
-The reuse target (the `str.len` skolem channel) is fixed.
+**Soundness.** Each emitted clause is a **valid** implication `L → (…)`
+entailed by string theory under the interpretation `code = real code-point
+function` (`code(·)` is uninterpreted, and everything asserted about it —
+functionality, `[0,MAX_CODE]\surrogate` range — holds of the real function),
+so adding it preserves both SAT and UNSAT. On a SAT verdict the arith model
+gives each `code(h)` a concrete value in the representable, non-surrogate
+range; assigning `h = char(code(h))` (order-consistent with the `<`
+constraints arith found satisfiable) realizes a genuine model — SMT-LIB
+`str.<` agrees with code-point `<` (UTF-8 is byte-wise
+code-point-order-preserving, slices 23/30). Surrogate/`MAX_CODE` edges are
+excluded exactly as `code_conv`/`order.rs` already do.
 
 ## 5. The order head-peel lemma, recursion, and fuel
 
-When `StrLt(s, u)` is asserted **true** (literal `L`), `check` emits the
-guarded disjunction — guard `¬L`, so the learnt clause is the valid
-implication `L → (…)`, the same posture the existing wordeq F-split uses
+When `StrLt(s, u)` is asserted **true** (literal `L`), `check` drives the
+following **logical** target — guard `¬L` throughout, so every emitted clause
+is the valid implication `L → (…)`, the same posture the wordeq F-split uses
 (`wordeq.rs:730`, the sole `guard = Some(…)` user):
 
 ```
 L →  (s = "" ∧ u ≠ "")                                        [base: empty s < nonempty u]
    ∨ ( s = hs·ss ∧ u = hu·su ∧ bridge(hs) ∧ bridge(hu)        [heads exist, |hs|=|hu|=1]
-       ∧ ( k_hs < k_hu  ∨  (hs = hu ∧ StrLt(ss, su)) ) )       [differ here, or recurse]
+       ∧ ( code(hs) < code(hu)  ∨  (hs = hu ∧ StrLt(ss, su)) ) )  [differ here, or recurse]
 ```
+
+Per §2a this nested formula is **not** one atom — it is realized as a
+**family of flat guarded CNF clauses emitted incrementally across rounds**
+(disjuncts are positive theory atoms; a "≠"/negation is expressed as its own
+`distinct`/`not` atom), keyed and deduped like the membership pass's S1..S4.
+The plan pins the exact clause set and its per-clause validity.
 
 `hs, ss, hu, su` are fresh (`fresh_str`, `wordeq.rs:27`); `bridge(·)` is §4.
 The tail `StrLt(ss, su)` is a **fresh order atom** — it flows back through
@@ -182,8 +249,9 @@ refutation — no new order-specific conflict logic.
   clause is a **guarded implication** `L → (…)`, valid at any
   polarity/nesting/occurrence — no eager (unguarded) order clause is ever
   learnt, so no spurious UNSAT (the hazard `wordeq.rs:700` guards against).
-- **Bridge soundness.** §4 — `k_h` pinned into `[0, MAX_CODE]` minus
-  surrogates; code-point `<` agrees with SMT-LIB `str.<`.
+- **Bridge soundness.** §4 — `code(·)` congruent + ranged into
+  `[0, MAX_CODE]` minus surrogates; each clause valid under `code = real
+  code-point function`; code-point `<` agrees with SMT-LIB `str.<`.
 - **Termination.** Emission deduped per `(s, u)`; recursion depth
   fuel-bounded to a sound `Unknown`. The engine stays **sound, terminating,
   incomplete**; this slice strictly shrinks the incomplete region without
@@ -196,9 +264,13 @@ refutation — no new order-specific conflict logic.
 - Fence-lift regression: `symbolic_pair_survives_to_fence` (`order.rs:308`)
   flips to a *now-routed* assertion — the atom reaches `StrSolver`, no
   longer `Unknown` at preprocessing.
-- Bridge unit: a minted single-char head pins `|h| = 1` and the `k_h`
-  bounds including surrogate exclusion.
-- Head-peel shape: assert the exact guarded disjunction for `StrLt` and
+- Bridge unit: a minted single-char head emits `|h| = 1` (Ge/Le companions)
+  and the `code(h)` range/surrogate-exclusion atoms.
+- **Congruence unit (T-2 crux):** a small solver-level test that forcing two
+  head-skolems equal forces their codes equal — i.e. `code(hs) < code(hu) ∧
+  hs = hu` is refuted. This validates the code-handle mechanism choice
+  (uninterpreted symbol vs `str.to_code`).
+- Head-peel shape: assert the exact guarded flat CNF clauses for `StrLt` and
   `StrLeq`, both polarities (negated maps to the swapped sibling).
 - All constant-side slice 23/24/30 tests pass **unchanged** — the
   constant path is untouched (regression guard).
@@ -219,7 +291,9 @@ with captured output — see AGENTS.md / oracle-gate memory). New family
 force decided verdicts on both sides. Expect: **shinri-unknowns down**,
 **0 shinri-vs-z3 disagreements**, both `n_sat > 0` and `n_unsat > 0`. The
 other string/regex families re-run with tallies **unchanged** — any movement
-is a finding to adjudicate.
+is a finding to adjudicate. (Slice 31's family exercises the *spine* — the
+bare/shallow shapes; the exhaustive deep-recursion sweep that would prove
+order-reduction completeness is slice 32.)
 
 Per-iteration verdict monotonicity via the printed-tally comparison
 (base vs fix): this repo's `qfs_differential.rs` has **no** `DIFFDUMP`
