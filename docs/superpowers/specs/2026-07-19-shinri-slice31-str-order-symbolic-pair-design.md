@@ -478,3 +478,71 @@ wiring. Non-goals unchanged. The general phase-hint is deliberately minimal —
 one optional field, seeded once at fresh-var creation — not a full
 decision-strategy framework (YAGNI); other theories may adopt it later but
 none is required to.
+
+## 11. Status: DEFERRED (2026-07-19) — the online spine cannot decide the pins; four-wall analysis
+
+**Outcome.** Slice 31's infrastructure landed and is reviewed sound (Tasks
+1–6 = ownership routing, the congruent `!strcode` bridge, `order_true`
+recording, head-peel clause families, polarity mapping, on-demand folding with
+the `side_clean` guard; slice-31b Tasks 7.1–7.2 = the SAT phase-hint channel
+and the order-engine `a_eps`/`clt` tagging). But the **acceptance bar was
+never met**: end-to-end, four of the five order pins return `Unknown` (only
+`lt_and_eq_is_unsat` decides, via the EUF `NEQ` singleton — it never enters the
+recursion). The two-symbolic-variable order capability is therefore **deferred**
+and the gap re-banked. This section records *why*, so a future attempt starts
+from the real obstacle, not from §10's (disproven) premise.
+
+**The §10 premise was wrong.** §10 claimed a base-case decision-phase
+preference would make the bare pin "decide at depth 0." It does not. Four
+*independent* walls block the online spine, found in order by
+experiment/spike:
+
+1. **Total-assignment CDCL.** `pick_branch` stops only when every var is
+   assigned, so the recursion-tail atom `r_tail = (str.< tA tB)` is always
+   assigned (either polarity), `assert` records it as an order atom, and
+   `order_check` *unconditionally* emits its child family → an unbounded tower
+   cut off only by fuel → `Unknown`. The phase hint (7.1/7.2) provably fires
+   (`a_eps` is decided TRUE) but cannot help: the tower forms regardless of
+   decision *order*, because it is driven by decision *existence*.
+2. **No relevance signal.** The clean fix — expand `r_tail` only when its
+   parent `CMP2` clause is not already satisfied by `a_eps`/`clt` — is
+   **not implementable**: a theory sees only `TheoryCtx = {terms, eq, atoms}`,
+   with no view of the SAT assignment or of sibling literals' truth values.
+   Membership avoids the tower not by relevance but by a *finite measure*
+   (Brzozowski-derivative dedup) that order lacks (fresh tails, no repeating
+   key).
+3. **The N–O length seam.** Grounding the recursion needs `|tail|=0 ⇒
+   tail=""`, but that fact lives only in arith and never reaches the string
+   theory's EUF in time — there is no `len=0 ⇒ empty` rule in `cx.eq`
+   (deliberately absent, `length.rs:157/254`). A spike confirmed the emptiness
+   is invisible at expansion time. *This wall is fixable* — emitting the
+   tautology `(or (= x "") (>= (str.len x) 1))` per skolem lets arith's
+   `len(x)=0` propagate `x=""` into EUF, and it worked in the spike.
+4. **Code-point arithmetic is intractable (the blocker).** Once the len seam
+   is fixed and the tail grounds, the wall moves to the `!strcode` semantics:
+   the range + surrogate-hole constraints over the 196,607-wide domain
+   `[0, 0x2FFFF]` (×2 heads ×recursion) exhaust arith's string-path simplex
+   pivot budget (2000) → `Unknown` (`shinri-arith/src/lib.rs:386`); raising the
+   budget makes even a single bare `(str.< s u)` livelock (>3 min). The
+   code comparison, as a full-alphabet LIA constraint on an uninterpreted
+   handle, is simply too heavy on the string arith path.
+
+**What a real attempt needs (prerequisites, not a slice).** The decisive
+missing piece is a **tractable symbolic-character order comparison** — one of:
+a bounded/bit-vector encoding of the code point; a dedicated non-string-path
+arith budget (or lazy range instantiation) for `!strcode`; or an EUF-level
+total order on the `!strcode` handle that avoids materializing the full LIA
+range. Plus a **finite measure or relevance discipline** for the recursion
+(wall 1/2) — which, per wall 2, likely requires extending the DPLL(T)
+`TheoryCtx` seam with an assignment/value view, or giving order a
+membership-style finite dedup measure. The len-seam tautology (wall 3) is the
+one cheap, reusable win and can be lifted out independently. Until the
+code-comparison prerequisite exists, two-symbolic-variable `str.<`/`str.<=`
+stays a sound `Unknown` and remains the oldest live known gap.
+
+**Disposition.** Tasks 1–6 + 7.1–7.2 are committed and reviewed sound but
+**dormant** — the preprocessing fence was never lifted, so no symbolic-pair
+atom reaches the engine; behaviour is unchanged from before the slice
+(symbolic pairs → `Unknown` at preprocessing). The phase-hint channel
+(`shinri-sat`/`shinri-theory`, 7.1) is a general, independently-useful
+capability. The banked non-goals (§9) are unchanged.
