@@ -85,16 +85,18 @@ slice 32. Everything slice 31 does is *sound at every depth*; slice 32 only
    the exact pattern the membership pass already uses (`memb.rs`, the keyed
    S1..S4 witnesses). This is the intricate, soundness-critical core, and the
    reason the completeness push is its own slice.
-2. **The code handle needs congruence, not literal `to_code` value
-   semantics.** For soundness (refuting e.g. `s<u ∧ u<s` requires that equal
-   head-skolems force equal codes), the "code of a single char" must be a
-   **functional, range-bounded integer** with congruence — realized as an
-   uninterpreted, ranged code term (§4), *not* general online `str.to_code`
-   (which stays a non-goal). Congruence + range + order-consistency is
-   sufficient and sound; literal char↔code value binding is neither needed
-   nor introduced for the pure two-symbolic-var fragment (the head-skolems
-   are fresh and appear only in these lemmas, so no other path constrains
-   their code).
+2. **The code handle needs congruence *and* on-demand constant folding *and*
+   range — all three for soundness, not completeness.** Two concrete
+   spurious-SAT scenarios (found while deriving the clause family) pin this
+   down: `s<u ∧ u<s ∧ |s|=1 ∧ |u|=1` needs **congruence** (each atom mints
+   its own head-skolem for `s`, so only `hs=hs' ⇒ code(hs)=code(hs')` yields
+   the conflict); `s<u ∧ s="b" ∧ u="a"` needs **on-demand folding** (pin
+   `code(head)` to the real value of a constant-forced head, else the solver
+   picks a bogus code order). §4 gives the mechanism. This is a *bounded*
+   online `str.to_code` capability (constant-fold + congruence + range on
+   single-char heads), deliberately short of general online `to_code` (still
+   a non-goal). It is more than the abstract-code sketch the first spec draft
+   assumed — the correction that most shaped the spine.
 
 ## 3. Fix — four wiring changes plus one new capability
 
@@ -139,13 +141,33 @@ core, arrays/BV/FP, or the `str.at`/`substr` fence (`lib.rs:507–512`).
 ## 4. The symbolic-character ↔ code-point bridge
 
 The head-peel (§5) must assert `code(hs) < code(hu)` where `hs`, `hu` are
-symbolic single characters. `str.to_code` is preprocessing-only and fenced,
-so the bridge does **not** use real `to_code` value semantics. Instead
-`code(·)` is a **functional, range-bounded integer handle** on a single-char
-string: an application `code(h)` that is (a) *congruent* — `hs = hu ⇒
-code(hs) = code(hu)` — and (b) *ranged*, nothing more. This is exactly what
-soundness needs and no more (see below); the literal char↔code value binding
-(`"z" ↦ 122`) is deliberately **not** introduced.
+symbolic single characters. `code(·)` is a **congruent, range-bounded integer
+handle** on a single-char string, realized as a dedicated unary function so
+the congruence-closure (EUF) treats it as a function of its string argument
+(an uninterpreted `String→Int` symbol, or `str.to_code` **iff** EUF congruence
+covers that builtin — a T-2 verification decides which). It needs **three**
+sound-making properties, established at planning by the failing-scenario
+analysis:
+
+- **(a) Congruence** — `hs = hu ⇒ code(hs) = code(hu)`. Load-bearing for
+  soundness, *not merely completeness*: because each order atom mints its
+  *own* fresh head-skolems, `s<u ∧ u<s ∧ |s|=1 ∧ |u|=1` mints two distinct
+  heads for `s`; only congruence (via the word equation `hs = hs'`) forces
+  their codes equal and yields the arith conflict. Without it the abstract
+  codes satisfy both comparisons → spurious SAT.
+- **(b) Range** — `0 ≤ code(h) ≤ MAX_CODE`, `code(h) ∉ [0xD800,0xDFFF]`.
+- **(c) On-demand constant folding** — when a head `h` is forced EUF-equal to
+  a **single-character constant** `c`, emit `code(h) = eval_to_code(c)`
+  (reusing `code_conv::eval_to_code`) as `Ge`/`Le` companions. Also a
+  soundness requirement, *not* completeness: `s<u ∧ s="b" ∧ u="a"` would
+  otherwise let the solver pick `code("b") < code("a")` → spurious SAT;
+  folding pins `98 < 97 → false → UNSAT`. A head can only ever equal a
+  *single-char* constant (its `|h|=1` companion refutes any longer literal),
+  so folding is well-defined and bounded.
+
+Congruence + range + folding is exactly sufficient: a head's real order is
+pinned only by equalling a constant (c) or another head (a); an otherwise-free
+head is genuinely unconstrained and any in-range code realizes a real char.
 
 Whenever the head-peel mints a single-char head `h`, it emits (once per `h`,
 deduped) these bridge axioms (each guarded by `¬L`, as flat arith/length
@@ -166,27 +188,17 @@ via `ensure_shared_var` (`combiner.rs:475–489`). The comparison `code(hs) <
 code(hu)` is a `BuiltinOp::Lt` atom, which `classify` routes unconditionally
 to `Owner::Arith` (`atom.rs:89–91`) — the LIA solver decides it.
 
-**Congruence is the load-bearing property.** `code(·)` must be *functional*
-so that when the word-equation engine forces two head-skolems equal (e.g.
-both are the first char of the same `s`), their codes are forced equal too —
-this is what refutes `s<u ∧ u<s` and `s<u ∧ s=u`. Realize `code(·)` as a
-term the congruence-closure (EUF) treats as a function of its string
-argument (an uninterpreted unary `String→Int` symbol, or `str.to_code` **iff**
-EUF congruence covers that builtin — a T-2 verification decides which). No
-*value* binding is needed: the head-skolems are fresh and occur only inside
-these lemmas, so nothing else constrains their code.
-
 **Soundness.** Each emitted clause is a **valid** implication `L → (…)`
 entailed by string theory under the interpretation `code = real code-point
-function` (`code(·)` is uninterpreted, and everything asserted about it —
-functionality, `[0,MAX_CODE]\surrogate` range — holds of the real function),
-so adding it preserves both SAT and UNSAT. On a SAT verdict the arith model
-gives each `code(h)` a concrete value in the representable, non-surrogate
-range; assigning `h = char(code(h))` (order-consistent with the `<`
-constraints arith found satisfiable) realizes a genuine model — SMT-LIB
-`str.<` agrees with code-point `<` (UTF-8 is byte-wise
-code-point-order-preserving, slices 23/30). Surrogate/`MAX_CODE` edges are
-excluded exactly as `code_conv`/`order.rs` already do.
+function` (everything asserted about `code(·)` — functionality, range, and
+the constant folds — holds of the real code-point function), so adding it
+preserves both SAT and UNSAT. On a SAT verdict the arith model gives each
+`code(h)` a concrete value in the representable, non-surrogate range;
+assigning `h = char(code(h))` (order-consistent with the `<` constraints arith
+found satisfiable, and equal to the pinned constant wherever folding fired)
+realizes a genuine model — SMT-LIB `str.<` agrees with code-point `<` (UTF-8
+is byte-wise code-point-order-preserving, slices 23/30). Surrogate/`MAX_CODE`
+edges are excluded exactly as `code_conv`/`order.rs` already do.
 
 ## 5. The order head-peel lemma, recursion, and fuel
 
@@ -233,12 +245,15 @@ measure whether the default 40 (`fuel.rs:21`) needs a bump or an
 order-specific sub-budget, tuned against the oracle family — flagged, not
 pre-decided.
 
-**Conflict citation.** Unsat idioms (`s<u ∧ u<s`, `s<u ∧ s=u`,
-`s<u ∧ u<=s`) resolve through the normal SAT/arith conflict path: the
-head-peel drives both sides to comparable heads, the `k` comparisons plus
+**Conflict citation.** The bounded Unsat idioms (§7) resolve through the
+normal SAT/arith conflict path: the head-peel drives both sides to comparable
+heads, the `code` comparisons (plus congruence and folding, §4) and
 word-equation tails contradict, and the existing conflict-citation machinery
-(`nf_equal_explain`, `lib.rs:1101`; arith conflicts) produces the
-refutation — no new order-specific conflict logic.
+(`nf_equal_explain`, `lib.rs:1101`; arith conflicts) produces the refutation —
+no new order-specific conflict logic. *Unbounded* antisymmetry (`s<u ∧ u<s`
+with free lengths) instead exhausts fuel to a sound `Unknown` in the spine
+(the all-heads-equal branch has no length floor) — that is the slice-32
+deepening target, not a spine regression.
 
 ## 6. Soundness (summary)
 
@@ -278,11 +293,23 @@ refutation — no new order-specific conflict logic.
 **e2e pins (`qfs_differential.rs`, z3-cross-checked via `expect`).**
 
 - Headline flip: `targeted_str_order_symbolic_pair_known_gap` → **decides
-  Sat** (renamed off `_known_gap`, z3-confirmed witness).
-- Unsat idioms: `(str.< s u) ∧ (str.< u s)`; `(str.< s u) ∧ (= s u)`;
-  `(str.< s u) ∧ (str.<= u s)` → Unsat.
+  Sat** (renamed off `_known_gap`, z3-confirmed witness — the empty-prefix
+  base case).
+- Unsat idioms the **spine** decides at bounded depth:
+  - `(str.< s u) ∧ (= s u)` → Unsat (the `A≠B` clause, depth 0).
+  - `(str.< s u) ∧ (= s "b") ∧ (= u "a")` → Unsat (on-demand folding:
+    `98 < 97` is false).
+  - `(str.< s u) ∧ (str.< u s) ∧ (= (str.len s) 1) ∧ (= (str.len u) 1)` →
+    Unsat (bounded antisymmetry via congruence on the equal single-char
+    heads).
+  - `(str.< s u) ∧ (= (str.len u) 0)` → Unsat (nothing is `< ""`).
 - Decided Sat with a length coupling:
   `(str.< s u) ∧ (= (str.len s) 1)` → Sat.
+- **New residual pin (slice-32 target, sound `Unknown`):** the *unbounded*
+  antisymmetry `(str.< s u) ∧ (str.< u s)` stays `Unknown` in the spine — the
+  all-heads-equal branch recurses without a length bound and fuel-exhausts.
+  Pinned `Unknown` (z3 says Unsat) so the slice-32 deepening trips a test
+  when it flips.
 
 **Differential oracle** (house cadence: `--features oracle`, run foreground
 with captured output — see AGENTS.md / oracle-gate memory). New family
