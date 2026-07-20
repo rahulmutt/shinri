@@ -19,7 +19,7 @@ pub use fuel::Fuel;
 use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
-use shinri_theory::types::{ENodeId, EqLeaf};
+use shinri_theory::types::{ENodeId, EqJust, EqLeaf};
 use shinri_theory::{EqualityEngine, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
 #[derive(Default)]
@@ -528,8 +528,14 @@ impl TheorySolver for StrSolver {
             // an UNFLATTENED concat class representative (it Saturates instead — the
             // opaque-concat split is the F1 divergence that yielded a spurious
             // UNSAT). Model reconstruction uses the deep view in model.rs.
-            let lhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, l);
-            let rhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, r);
+            // Slice 33: the normal forms substitute EUF class representatives,
+            // and a PROPAGATION merge derives a ground fact from exactly that
+            // substituted material. So the antecedents must be captured — see
+            // the revised comment below. Mirrors lib.rs' disequality path, where
+            // the same-word conflict already cites its substitution antecedents.
+            let mut nf_ante: Vec<EqLeaf> = Vec::new();
+            let lhs = crate::normalize::normal_form_cited(cx.terms, cx.eq, &known, l, &mut nf_ante);
+            let rhs = crate::normalize::normal_form_cited(cx.terms, cx.eq, &known, r, &mut nf_ante);
 
             // Empty-residual lemma (sound, model-preserving). After cancelling the
             // common prefix/suffix, if ONE side's residual is empty and the other is
@@ -692,10 +698,17 @@ impl TheorySolver for StrSolver {
             {
                 // Build the EqLeaf justification from the asserted equality literal.
                 // This feeds `expand_conflict` so the conflict clause cites the right
-                // input literal. `resolve_equation` never derives a ground conflict from
-                // a variable it substituted by a concat class representative (it
-                // Saturates on a concat residual head instead — see wordeq.rs), so no
-                // extra merge-antecedent citation is needed here.
+                // input literal.
+                //
+                // SLICE 33 REVISION. This comment used to read: "`resolve_equation`
+                // never derives a ground conflict from a variable it substituted by a
+                // concat class representative (it Saturates on a concat residual head
+                // instead), so no extra merge-antecedent citation is needed here."
+                // That premise is now FALSE. `StepResult::Propagate` derives a ground
+                // FACT precisely from substituted material, so its merge cites
+                // `Asserted(lit)` PLUS `nf_ante` (the normal-form substitution
+                // antecedents) under an `EqJust::Interface` tag. The Conflict and
+                // Split paths below are unchanged and still rely on the E1 gates.
                 let just = vec![EqLeaf::Asserted(lit)];
                 match crate::wordeq::resolve_equation(
                     cx.terms,
@@ -797,10 +810,77 @@ impl TheorySolver for StrSolver {
                     // witness self-check in `Solver::solve` (model-substitution re-check),
                     // which downgrades an unrealisable SAT to a SOUND `Unknown`.
                     crate::wordeq::StepResult::Saturated => {}
-                    // Slice 33 T5 wires this properly. Treating it as a no-op here
-                    // is SOUND (it is exactly the pre-slice-33 behaviour) but gains
-                    // nothing — the propagated fact is discarded.
-                    crate::wordeq::StepResult::Propagate { .. } => {}
+                    crate::wordeq::StepResult::Propagate {
+                        var,
+                        word,
+                        mut just,
+                    } => {
+                        // Cite the normal-form substitution antecedents ALONGSIDE the
+                        // asserted equation literal. Under-citing here is the ce2
+                        // wrong-UNSAT shape (spec §4) — the merge would survive as a
+                        // fact on branches where the substitution that produced it is
+                        // no longer active.
+                        just.extend(nf_ante.iter().copied());
+                        just.sort_unstable_by_key(|l| match l {
+                            EqLeaf::Asserted(x) => (0u8, x.code() as u64),
+                            EqLeaf::Interface(j) => (1u8, ((j.theory as u64) << 32) | j.tag as u64),
+                        });
+                        just.dedup();
+
+                        let tag = self.alloc_prop_tag(just);
+                        let vn = cx.eq.intern(var);
+                        let wn = cx.eq.intern(word);
+                        // NO ATOM IS MINTED AND NO CLAUSE IS LEARNT, so E1's
+                        // input_cond_roots / all_cond_roots gates do not apply — that
+                        // gate is what halted slice 32. Branch-locality is structural:
+                        // the merge is scoped by EqualityEngine::push/pop, and the tag
+                        // by the str trail (Task 2).
+                        match cx.eq.merge(
+                            vn,
+                            wn,
+                            EqJust::Interface(TheoryJust {
+                                theory: <StrSolver as TheorySolver>::THEORY_ID,
+                                tag,
+                            }),
+                        ) {
+                            Ok(()) => {}
+                            Err(conflict) => {
+                                // The merge united a KNOWN-DISEQUAL pair — e.g.
+                                // `y ≈ "ab"` against an asserted `distinct y "ab"`.
+                                // Assemble the conflict in the SAME three parts as
+                                // `Egraph::conflict_leaves` (shinri-euf/src/egraph.rs:441-479);
+                                // this is that pattern specialised to a merge whose
+                                // justification is a single Interface tag.
+                                let mut cf: Vec<EqLeaf> = Vec::new();
+                                // Part 1: why `var = word` was being merged. Our
+                                // justification IS the interface tag, which the
+                                // Combiner expands via StrSolver::explain back to
+                                // `just` (the antecedent set we just allocated).
+                                cf.push(EqLeaf::Interface(TheoryJust {
+                                    theory: <StrSolver as TheorySolver>::THEORY_ID,
+                                    tag,
+                                }));
+                                // Part 2: bridge the merged nodes to the disequality's
+                                // ASSERTED endpoints. Orient by representative — pair
+                                // `a` with whichever endpoint is already in a's class.
+                                let ra = cx.eq.find(conflict.a);
+                                let (a_end, b_end) = if cx.eq.find(conflict.diseq_lhs) == ra {
+                                    (conflict.diseq_lhs, conflict.diseq_rhs)
+                                } else {
+                                    (conflict.diseq_rhs, conflict.diseq_lhs)
+                                };
+                                cx.eq.explain(conflict.a, a_end, &mut cf);
+                                cx.eq.explain(conflict.b, b_end, &mut cf);
+                                // Part 3: the disequality that was violated.
+                                match conflict.diseq {
+                                    EqJust::Asserted(l) => cf.push(EqLeaf::Asserted(l)),
+                                    EqJust::Interface(j) => cf.push(EqLeaf::Interface(j)),
+                                    EqJust::Congruence(_) | EqJust::Definitional => {}
+                                }
+                                return TCheck::Conflict(cf);
+                            }
+                        }
+                    }
                 }
             } // end antecedent-precise word-eq resolution gate (E1 iter 3)
         }
@@ -1336,7 +1416,6 @@ impl StrSolver {
     /// Slice 33: record an antecedent set and return its tag. The tag indexes
     /// `prop_tags`, which is trail-scoped, so the tag is valid only within the
     /// branch that minted it.
-    #[allow(dead_code)] // slice33 T5 wires the caller; drop this then.
     fn alloc_prop_tag(&mut self, leaves: Vec<EqLeaf>) -> u32 {
         let tag = self.prop_tags.len() as u32;
         self.prop_tags.push(leaves);

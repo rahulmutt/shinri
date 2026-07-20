@@ -828,7 +828,7 @@ mod tests {
     use crate::wordeq::{resolve_equation, StepResult};
     use crate::StrSolver;
     use rustc_hash::FxHashSet;
-    use shinri_core::{BuiltinOp, Context, Lit, Op, TermNode, Var};
+    use shinri_core::{BuiltinOp, Context, Lit, Op, Var};
     use shinri_sat::Effort;
     use shinri_theory::types::EqLeaf;
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
@@ -1079,25 +1079,27 @@ mod tests {
         );
     }
 
-    // ── Task 13: variable-vs-constant head split ─────────────────────────────
-    // x = "ab" with x a variable → must NOT conflict; must emit a GUARDED split
-    // whose atoms include the empty-branch `(= x "")`.
+    // ── Task 13 / Slice 33: variable-vs-constant pure assignment ─────────────
+    // `x = "ab"` with `x` a variable is the CORE pure-assignment shape (single
+    // variable vs. single all-constant word). Pre-slice-33 this shape reached
+    // SAT by emitting a GUARDED char-peel split whose atoms included the
+    // empty-branch `(= x "")`. Slice 33 replaces that with a DIRECT outcome:
+    // `resolve_equation` reports `StepResult::Propagate { var: x, word: "ab" }`,
+    // and `check()` (Task 5) merges `x ≈ "ab"` into EUF under an
+    // `EqJust::Interface` tag BEFORE any char-peel/F-split path runs (that
+    // interception is the whole point of slice 33; see
+    // `pure_assignment_propagates_constant_word` above).
     //
-    // SLICE 33 (T4): `x = "ab"` is now the CORE pure-assignment shape (single
-    // variable vs. single all-constant word) — the propagation block in
-    // `resolve_equation` intercepts it BEFORE this test's char-peel split is
-    // ever reached (that interception, before the char-peel/F-split paths, is
-    // the whole point of slice 33; see `pure_assignment_propagates_constant_word`
-    // above). At this Task-4 stage `lib.rs` still discards `Propagate` as a
-    // temporary no-op (Task 5 replaces it with a real cited EUF merge), so
-    // `check()` now reaches a bare `Sat` here without ever emitting the
-    // specialized split this test asserts on. Ignored pending Task 5, which
-    // wires the merge and must decide this test's replacement shape (e.g. a
-    // residual the propagation scope fence excludes, such as `x = "ab" ++ y`,
-    // so the char-peel split this test targets stays exercised).
+    // Renamed from `variable_equals_constant_splits_then_sat`: this shape no
+    // longer splits. The test now proves the STRONGER post-slice-33 property —
+    // the equation decides SAT with NO conflict and NO split, AND the outcome is
+    // self-consistent: `x` and `"ab"` are EUF-equal afterwards (the propagated
+    // merge actually landed, so any model read off EUF satisfies the equation).
+    // The char-peel var-vs-const split machinery is still exercised by
+    // `constant_prefix_mismatch_is_conflict` and the residual-headed split tests
+    // below, whose residuals the pure-assignment fence does not intercept.
     #[test]
-    #[ignore = "slice33: superseded by Propagate interception at this shape; Task 5 to fix/replace"]
-    fn variable_equals_constant_splits_then_sat() {
+    fn variable_equals_constant_propagates_then_sat() {
         let mut ctx = Context::new();
         let str_s = ctx.string_sort();
         let x = {
@@ -1116,73 +1118,35 @@ mod tests {
         };
         s.new_var(&mut cx, shinri_core::Var::new(0), atom);
         s.test_force_eq_true(atom);
-        // Must not conflict; must emit a split (or be Sat).
-        let mut ok = false;
-        let mut saw_guarded_split_with_empty_branch = false;
+        // Must NOT conflict and must reach Sat via propagation — no split needed.
+        let mut reached_sat = false;
         for _ in 0..32 {
             match s.check(&mut cx, Effort::Full) {
                 TCheck::Conflict(_) => panic!("x = \"ab\" is satisfiable — must not conflict"),
-                TCheck::Split { atoms, guard, .. } => {
-                    // The specialized split must contain the empty-branch atom (= x "").
-                    // Check that at least one atom is an equality of x with the empty string.
-                    let has_empty_branch = atoms.iter().any(|&a| {
-                        if let TermNode::App {
-                            op: Op::Builtin(BuiltinOp::Eq),
-                            args,
-                            ..
-                        } = cx.terms.term_node(a)
-                        {
-                            let ch = cx.terms.children(*args);
-                            let (lhs, rhs) = (ch[0], ch[1]);
-                            // Either side equals x and the other equals "".
-                            (lhs == x
-                                && cx
-                                    .terms
-                                    .string_const_value(rhs)
-                                    .is_some_and(|s| s.is_empty()))
-                                || (rhs == x
-                                    && cx
-                                        .terms
-                                        .string_const_value(lhs)
-                                        .is_some_and(|s| s.is_empty()))
-                        } else {
-                            false
-                        }
-                    });
-                    if has_empty_branch {
-                        // The specialized var-vs-const split MUST be guarded (sound).
-                        assert!(
-                            guard.is_some(),
-                            "var-vs-const split with empty branch must carry a guard (¬eqn)"
-                        );
-                        let g = guard.unwrap();
-                        // test_force_eq_true uses Lit::new(Var::new(0), true) as the
-                        // asserting literal; the guard must be its negation.
-                        let expected_guard = Lit::new(Var::new(0), true).negate();
-                        assert_eq!(
-                            g, expected_guard,
-                            "guard must be ¬eqn (negation of the asserting literal)"
-                        );
-                        saw_guarded_split_with_empty_branch = true;
-                        ok = true;
-                        break;
-                    }
-                    // Non-empty-branch splits (e.g. length axioms) may be unguarded tautologies.
+                TCheck::Split { .. } => {
+                    // A length/axiom split may still fire; keep pumping to a verdict.
+                    continue;
                 }
                 TCheck::Sat => {
-                    ok = true;
+                    reached_sat = true;
                     break;
                 }
                 TCheck::Unknown => panic!("default fuel is large; unexpected Unknown"),
             }
         }
         assert!(
-            ok,
-            "x = \"ab\" must reach Sat or emit a split without conflict"
+            reached_sat,
+            "x = \"ab\" must decide Sat (pure-assignment propagation)"
         );
+        // Self-consistency: the propagated fact actually landed in EUF, so `x`
+        // and `"ab"` are now in the same class. A model read off EUF therefore
+        // assigns `x = "ab"`, satisfying the equation (this is what the old
+        // empty-branch split was a proxy for — here we assert the merge directly).
+        let xn = cx.eq.intern(x);
+        let abn = cx.eq.intern(ab);
         assert!(
-            saw_guarded_split_with_empty_branch,
-            "specialized var-vs-const split must emit an empty-branch atom (= x \"\") with a guard"
+            cx.eq.are_equal(xn, abn),
+            "propagation must merge x ≈ \"ab\" in EUF (self-consistent SAT)"
         );
     }
 
