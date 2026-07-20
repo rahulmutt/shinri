@@ -12,18 +12,25 @@ pub enum StepResult {
     /// witness — the (B′) premature-SAT hazard), and instead returns a SOUND
     /// `Unknown`. Distinct from `Done` (which means trivially resolved / consumed).
     Saturated,
-    /// SLICE 33. The equation entails the pure assignment `var ≈ word`, where
-    /// the residual is a single variable on one side and an ALL-CONSTANT word on
-    /// the other. `word` is a SINGLE interned string constant — a multi-atom
-    /// constant side is folded before it is reported, so the caller's merge never
-    /// depends on a CONCAT term's own normal form.
+    /// SLICE 33 (widened in SLICE 34). The equation entails the single-atom
+    /// propagation `var ≈ word`. Two residual shapes report it:
     ///
-    /// This is NOT the deleted E1 probe (see the comment further down this file).
-    /// That probe returned `Done` — it claimed the equation was RESOLVED and
-    /// cited nothing. This reports a FACT together with `just`, its full
-    /// antecedent set, which the caller merges into EUF under an
-    /// `EqJust::Interface` tag. Nothing is emitted and nothing is learnt, so the
-    /// E1 branch-locality gate has no clause to reject.
+    /// - slice 33: a single variable vs an ALL-CONSTANT word. `word` is a
+    ///   SINGLE interned string constant — a multi-atom constant side is
+    ///   folded before it is reported, so the caller's merge never depends on
+    ///   a CONCAT term's own normal form.
+    /// - slice 34: BOTH residuals a single free variable (`[v] = [u]`;
+    ///   stripping guarantees the classes are distinct). `word` is the other
+    ///   VARIABLE's term; the merge is a var–var class union and may create a
+    ///   string class with NO constant member.
+    ///
+    /// This is NOT the deleted E1 probe (see the comment further down this
+    /// file). That probe returned `Done` — it claimed the equation was
+    /// RESOLVED and cited nothing. This reports a FACT together with `just`,
+    /// its full antecedent set, which the caller merges into EUF under an
+    /// `EqJust::Interface` tag. Nothing is emitted and nothing is learnt, so
+    /// the E1 branch-locality gate has no clause to reject. The MULTI-ATOM
+    /// variable-bearing word stays fenced (slice-34 spec §2).
     Propagate {
         var: TermId,
         word: TermId,
@@ -622,15 +629,17 @@ fn resolve_inner(
         }
     }
 
-    // ── SLICE 33: pure-assignment propagation ────────────────────────────────
-    // A residual `[v] = [constant word]` ENTAILS `v ≈ W`. Before slice 33 this
-    // fell through to the variable-headed F-split below, hit the dedup, and
-    // returned `Saturated` → a sound but needless `Unknown`. Reporting it here,
-    // BEFORE the F-split, is the whole fix.
+    // ── SLICE 33/34: single-atom propagation ─────────────────────────────────
+    // SLICE 33: a residual `[v] = [constant word]` ENTAILS `v ≈ W` (multi-atom
+    // constant sides folded to one interned term). SLICE 34: a residual
+    // `[v] = [u]` (free variable each side) ENTAILS `v ≈ u` by cancellation.
+    // Before these, both shapes fell through to the variable-headed F-split
+    // below, hit the dedup, and returned `Saturated` → a sound but needless
+    // `Unknown`. Reporting the fact here, BEFORE the F-split, is the whole fix.
     //
-    // Scope (spec §2): the constant side must be ENTIRELY constant. The wider
-    // rule (`W` containing other variables) is the deleted E1 probe's shape and
-    // is deliberately out of scope.
+    // Scope (slice-34 spec §2): the MULTI-ATOM variable-bearing word stays
+    // fenced — it is the deleted E1 probe's shape (needs a CONCAT merge target
+    // and an in-word occurs-check) and is deliberately out of scope.
     //
     // The `is_concat` guard fixes the probe's other defect: it tested
     // `string_const_value(..).is_none()`, which matches an unflattened CONCAT
@@ -656,6 +665,30 @@ fn resolve_inner(
         let all_const = |sl: &[TermId], terms: &Context| {
             sl.iter().all(|&a| terms.string_const_value(a).is_some())
         };
+
+        // SLICE 34: alias case — BOTH residuals are a single free variable.
+        // `[v] = [u]` entails `v ≈ u` by cancellation in the free monoid.
+        // No occurs-check is needed here, structurally: head/tail stripping
+        // removed every same-class pair, so a SURVIVING var–var residual
+        // proves the two classes are distinct — the merge is never `v ≈ v`,
+        // and a one-atom variable side cannot contain `v` any other way
+        // (contrast the fenced multi-atom shape, where `v` can occur inside
+        // the word). Left residual is `var`, fixed, for determinism; the EUF
+        // merge is symmetric. `word` here is the other VARIABLE's TermId —
+        // the driver's merge is a var–var class union and may create a string
+        // class with NO constant member (spec §5); the driver and model paths
+        // are shape-agnostic.
+        if l_res.len() == 1
+            && r_res.len() == 1
+            && is_free_var(terms, l_res[0])
+            && is_free_var(terms, r_res[0])
+        {
+            return StepResult::Propagate {
+                var: l_res[0],
+                word: r_res[0],
+                just,
+            };
+        }
 
         let pair = if l_res.len() == 1 && is_free_var(terms, l_res[0]) && all_const(r_res, terms) {
             Some((l_res[0], r_res))
@@ -1409,11 +1442,13 @@ mod tests {
         );
     }
 
-    /// SCOPE FENCE (spec §2): a constant side is required. `v = w ++ "a"` with a
-    /// second VARIABLE must NOT propagate — that is the wider rule the deleted
-    /// E1 probe got wrong, and it is explicitly out of scope for slice 33.
+    /// SCOPE FENCE (slice-34 spec §2): a MULTI-ATOM variable-bearing word must
+    /// NOT propagate — `v = w ++ "a"` needs a CONCAT merge target and an
+    /// in-word occurs-check; it is the deleted E1 probe's shape and stays
+    /// fenced. (The SINGLE-variable alias residual `[v] = [u]` DOES propagate
+    /// as of slice 34 — see `alias_residual_propagates`.)
     #[test]
-    fn variable_bearing_word_does_not_propagate() {
+    fn multi_atom_variable_bearing_word_does_not_propagate() {
         let (mut terms, mut eq, y, _ab, just, eqn_lit) = setup_pure_assignment("y", "ab");
         let w = declare_str_var(&mut terms, "w");
         let a = terms.mk_string_const("a");
@@ -1431,7 +1466,109 @@ mod tests {
         );
         assert!(
             !matches!(r, StepResult::Propagate { .. }),
-            "a variable-bearing word must NOT propagate in slice 33 (spec §2)"
+            "a MULTI-ATOM variable-bearing word must NOT propagate (slice-34 spec §2)"
+        );
+    }
+
+    // ── Slice 34: alias propagation ──────────────────────────────────────────
+    // A residual `[v] = [u]` (free variable each side, distinct classes — the
+    // stripping loop guarantees distinctness) entails `v ≈ u` by cancellation
+    // and must PROPAGATE, not fall to the F-split → dedup → Saturated path.
+
+    /// The core shape: `[x] = [y]` reports `x ≈ y`, left residual as `var`.
+    #[test]
+    fn alias_residual_propagates() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_al");
+        let y = declare_str_var(&mut ctx, "y_al");
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[x],
+            &[y],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        match r {
+            StepResult::Propagate { var, word, just } => {
+                assert_eq!(var, x, "left residual must be reported as `var`");
+                assert_eq!(word, y, "right residual must be reported as `word`");
+                assert!(
+                    just.iter()
+                        .any(|l| matches!(l, EqLeaf::Asserted(a) if *a == lit)),
+                    "alias propagation must cite the asserting equation literal"
+                );
+            }
+            _ => panic!("expected Propagate for an alias residual"),
+        }
+    }
+
+    /// The real e2e path: `"a"·x = "a"·y` strips the shared constant head,
+    /// leaving the alias residual.
+    #[test]
+    fn alias_after_head_strip_propagates() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_hs");
+        let y = declare_str_var(&mut ctx, "y_hs");
+        let a = ctx.mk_string_const("a");
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[a, x],
+            &[a, y],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Propagate { var, word, .. } if var == x && word == y),
+            "shared head must strip, then the alias residual must propagate"
+        );
+    }
+
+    /// A single CONCAT atom is NOT a free variable (`is_free_var` excludes it,
+    /// the deleted E1 probe's other defect): `[x] = [concat(w, z)]` must NOT
+    /// propagate.
+    #[test]
+    fn single_concat_atom_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_cc");
+        let w = declare_str_var(&mut ctx, "w_cc");
+        let z = declare_str_var(&mut ctx, "z_cc");
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[w, z])
+            .unwrap();
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[x],
+            &[concat],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(r, StepResult::Propagate { .. }),
+            "an unflattened CONCAT atom must never be treated as a variable"
         );
     }
 
