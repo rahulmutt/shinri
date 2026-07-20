@@ -179,3 +179,111 @@ Stays `Unknown`, by design:
 - **`script_e2e`** run locally pre-push — this slice shifts completeness, and
   z3-confirmed `Unknown → decided` pin flips are adjudicated flips, not
   blockers.
+
+---
+
+## Implementation notes (truth-up) — HALTED, mechanism does not work
+
+**Status: NOT IMPLEMENTED. The design's emission mechanism is structurally
+incompatible with the E1 branch-locality discipline.** Branch
+`slice32-empty-length-seam`, base `d1af2154`. What landed is the clause
+*builder* only, DORMANT (`#[allow(dead_code)]`, no caller). The emission
+channel of §1.1 was implemented, measured, and **reverted**.
+
+### What landed
+
+- `length::empty_length_tautology` + 3 unit tests (`d83e5aa2`). Builds the two
+  disjuncts for a bare nullary uninterpreted string symbol; declines concat
+  lengths, literal lengths, and non-`str.len` terms. `shinri-str` 211 → 214
+  tests, all passing. `script_e2e` unchanged at 67/67 — the builder has no
+  caller, so it shifts no verdict.
+
+### Why the emission channel was reverted
+
+Wiring it into the axiom pump (per plan Task 2, verbatim) regressed
+`str_replace_all_symbolic_replacement_decides` from `unsat` to `unknown` on
+`(= (str.replace_all "aza" "a" u) "bzc")` — a `decided → Unknown` move, a
+blocker under this project's soundness posture.
+
+Root cause, established by A/B trace with identical instrumentation:
+
+1. The `Unknown` does **not** originate in the string theory. `StrSolver`
+   returns `Sat` and never a `Conflict`; the `Unknown` is the solver-layer
+   witness self-check at `shinri-solver/src/lib.rs:1004`
+   (`string_model_satisfies`) soundly downgrading a spurious SAT.
+2. The tautology mints `(= u "")` as a **new SAT atom**. Because the clause is
+   two-literal, neither literal is unit at dl0, so the SAT layer must *decide*
+   it — at decision level 1.
+3. The `cond_roots` loop (`lib.rs:253-274`) collects every `eq_true`/
+   `diseq_true` entry at level > 0. This atom qualifies and is not in
+   `minted_eqs`, so both EUF roots (`u` and `""`) enter `input_cond_roots`.
+4. `side_clean(...)` therefore returns false, and the E1 guard at
+   `lib.rs:735` **skips `resolve_equation` entirely** — permanently, in every
+   branch. The word equation saturates to `Sat`, the SAT layer picks
+   `u = "b"`, and the witness check catches it.
+
+This is a **gate, not a budget**, and it is not query-specific. Any bare
+string variable the channel fires on has its `input_cond_roots` poisoned,
+disabling word-equation resolution, the empty-residual lemma (`lib.rs:651`),
+`memb_check` (`lib.rs:1227`), and `order_fold_check` (`lib.rs:1256`) for that
+variable.
+
+### Hypotheses ruled out by direct experiment
+
+- **Fuel starvation.** `Fuel::default()` raised 40 → 4000: still fails. It is
+  a gate, not a budget.
+- **Phase-hint polarity.** `phases` set to `vec![None, None]`: still fails.
+  *Both* polarities poison the set (`= u ""` true → `eq_true` at level 1;
+  false → `diseq_true` at level 1), so no hint can help.
+- **Flood / dedup.** Instrumented: emitted **exactly once**, for a single
+  `str.len` term. Not a flood. §2's flood hazard never materialized — it is
+  simply not the failure mode.
+- **Engine-minted vs user-written provenance.** A red herring. The query
+  contains no user-written `str.len`; the term is minted by the `replace_all`
+  expansion. But the damage comes from the undecided-at-dl0 *equality atom*,
+  which a user-written `str.len` would produce identically.
+
+### The narrow fix, tested and rejected
+
+Registering `eq_empty` in `self.minted_eqs` at emission — the existing "our own
+branching, keep resolving over it" discipline documented at `lib.rs:720` — is
+the obvious candidate. It **does not work**: `replace_all` still regresses
+(`all_cond_roots` still gates the global word-equation conflict at
+`lib.rs:772`), *and* it introduces a second regression,
+`str_var_eq_concat_length_link_model_is_self_consistent` flipping
+`sat → unknown`. It trades one `decided → Unknown` for another.
+
+### Why the slice-31 spike misled
+
+Slice-31 §11 called wall 3 "fixable … and it worked in the spike." The spike
+emitted the tautology for **skolems inside an already-resolving recursion**,
+where the E1 gate had already been passed for the enclosing equation. This
+slice widened it to *all bare string variables* at the axiom pump — upstream of
+the gate — which is exactly where the dl>0 atom poisons `input_cond_roots`.
+The spike's success did not generalize, and the widening is what broke it.
+
+### One adjudicated flip observed (informational)
+
+With the channel wired, `str_input_var_concat_length_decides`'s third query
+flipped `unknown → sat`; z3 confirms `sat`, and the model passed the
+`lib.rs:1004` witness gate. That is an allowed `Unknown → decided`
+completeness gain, and the test's own comment says its load-bearing assertion
+is merely "not `unsat`". It is recorded here only as evidence that the
+mechanism does deliver real grounding when it is not gated out — the pin was
+**not** updated, since the channel did not land.
+
+### Newly banked
+
+- **Wall 3 is NOT closed.** It is now better understood: closing it by an
+  *emitted clause* requires reconciling a fresh dl>0 string equality with the
+  E1 branch-locality discipline. Two directions remain, neither costed:
+  (a) close the seam by a **direct read** of arith's `len = 0` entailment, in
+  the `len_class_zero` style the comment at `lib.rs:546-548` already
+  describes — introduces no new atom, so no E1 interaction; or (b) extend E1
+  with a third root category exempting tautology-minted equalities from both
+  `input_cond_roots` and `all_cond_roots`, which needs its own soundness
+  argument and oracle validation.
+- Slice-31 §11 walls 1, 2, and 4 remain open, unchanged. The order
+  preprocessing fence stays **down**.
+- The standing bank (slice-28 §8, slice-27 typed-antecedent refactor,
+  slice-29 approach-C) carries forward unchanged.
