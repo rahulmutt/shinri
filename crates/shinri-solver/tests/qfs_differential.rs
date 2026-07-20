@@ -2956,6 +2956,68 @@ fn targeted_probe_c_len_zero_var_unsat() {
     );
 }
 
+// ── Slice 34: alias-propagation probes — oracle-confirmed pins ───────────────
+// The resolver now propagates the alias residual `[v] = [u]` (slice-34 spec
+// §3): a var–var EUF merge with cited antecedents instead of a sound
+// `Unknown`. These probes measured `unknown → unsat` at Task 3; `expect`
+// cross-checks z3 on every call, so a shinri/z3 disagreement is a hard fail.
+
+#[test]
+fn targeted_probe_a1_prefix_alias_unsat() {
+    // Probe A1 (spec §7). `"a"·x = "a"·y` strips the shared head to the alias
+    // residual `[x] = [y]`, which propagates `x ≈ y` against `distinct x y`.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
+         (assert (= (str.++ \"a\" x) (str.++ \"a\" y)))\
+         (assert (distinct x y))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_probe_a2_suffix_alias_unsat() {
+    // Probe A2 (spec §7). Suffix twin: tail-stripping, same propagation path.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
+         (assert (= (str.++ x \"a\") (str.++ y \"a\")))\
+         (assert (distinct x y))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_probe_a4_chain_unsat() {
+    // Probe A4 (spec §7). Chained alias merges `x ≈ y`, `y ≈ z` compose in
+    // EUF; `distinct x z` conflicts. Exercises per-merge eager cond_roots
+    // re-insertion (slice-33 §11.6) on chained propagations.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
+         (declare-fun z () String)\
+         (assert (= (str.++ \"a\" x) (str.++ \"a\" y)))\
+         (assert (= (str.++ \"b\" y) (str.++ \"b\" z)))\
+         (assert (distinct x z))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_probe_c1_charpeel_skolem_sat() {
+    // T4b regression fix (task-4-blocker-diagnosis.md, 2026-07-20). The
+    // un-narrowed slice-34 alias case fired on a char-peel-derived
+    // skolem-skolem residual (`[!strk1] = [!strk0]`, from peeling the
+    // literal head "ab" of `s2 = "ab" ++ s0`), merging the two internal
+    // skolems into EUF and replacing the F-split the model builder needed —
+    // downgrading a genuine `sat` to `unknown`. Fixed by excluding minted
+    // `!strk*` skolems from the alias guard. z3-confirmed `sat` (witness
+    // s0="", s2="ab").
+    expect(
+        "(set-logic QF_S)(declare-fun s0 () String)(declare-fun s2 () String)\
+         (assert (str.in_re s2 (re.comp (str.to_re \"c\"))))\
+         (assert (= s2 (str.++ \"ab\" s0)))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // str.substr / str.at targeted cases — LIVE and passing.
 //

@@ -12,18 +12,25 @@ pub enum StepResult {
     /// witness — the (B′) premature-SAT hazard), and instead returns a SOUND
     /// `Unknown`. Distinct from `Done` (which means trivially resolved / consumed).
     Saturated,
-    /// SLICE 33. The equation entails the pure assignment `var ≈ word`, where
-    /// the residual is a single variable on one side and an ALL-CONSTANT word on
-    /// the other. `word` is a SINGLE interned string constant — a multi-atom
-    /// constant side is folded before it is reported, so the caller's merge never
-    /// depends on a CONCAT term's own normal form.
+    /// SLICE 33 (widened in SLICE 34). The equation entails the single-atom
+    /// propagation `var ≈ word`. Two residual shapes report it:
     ///
-    /// This is NOT the deleted E1 probe (see the comment further down this file).
-    /// That probe returned `Done` — it claimed the equation was RESOLVED and
-    /// cited nothing. This reports a FACT together with `just`, its full
-    /// antecedent set, which the caller merges into EUF under an
-    /// `EqJust::Interface` tag. Nothing is emitted and nothing is learnt, so the
-    /// E1 branch-locality gate has no clause to reject.
+    /// - slice 33: a single variable vs an ALL-CONSTANT word. `word` is a
+    ///   SINGLE interned string constant — a multi-atom constant side is
+    ///   folded before it is reported, so the caller's merge never depends on
+    ///   a CONCAT term's own normal form.
+    /// - slice 34: BOTH residuals a single free variable (`[v] = [u]`;
+    ///   stripping guarantees the classes are distinct). `word` is the other
+    ///   VARIABLE's term; the merge is a var–var class union and may create a
+    ///   string class with NO constant member.
+    ///
+    /// This is NOT the deleted E1 probe (see the comment further down this
+    /// file). That probe returned `Done` — it claimed the equation was
+    /// RESOLVED and cited nothing. This reports a FACT together with `just`,
+    /// its full antecedent set, which the caller merges into EUF under an
+    /// `EqJust::Interface` tag. Nothing is emitted and nothing is learnt, so
+    /// the E1 branch-locality gate has no clause to reject. The MULTI-ATOM
+    /// variable-bearing word stays fenced (slice-34 spec §2).
     Propagate {
         var: TermId,
         word: TermId,
@@ -41,6 +48,11 @@ pub enum StepResult {
 }
 
 /// Mint a fresh string constant `!strk<N>` and return its term ID.
+///
+/// BRANDING CONTRACT (load-bearing): the `!strk` name prefix is how
+/// `is_minted_skolem` below recognizes a term minted here. If this prefix
+/// ever changes, `is_minted_skolem` MUST change with it — keep the two in
+/// sync.
 pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
     let name = format!("!strk{}", *ctr);
     *ctr += 1;
@@ -49,6 +61,32 @@ pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
     terms
         .mk_app(Op::Uninterpreted(sym), &[])
         .expect("well-sorted")
+}
+
+/// True iff `t` is a MINTED char-peel/F-split skolem — a nullary symbol whose
+/// name carries the `!strk` prefix branded by `fresh_str` above (branding
+/// contract: keep the two in sync). Used to EXCLUDE skolem atoms from the
+/// slice-34 alias-propagation guard: a skolem is purely internal bookkeeping
+/// for the char-peel/F-split machinery and never appears in a user-asserted
+/// `distinct` or constant constraint, so merging two skolems can never
+/// produce a useful conflict — it can only bypass the F-split the model
+/// builder relies on (task-4-blocker-diagnosis.md, T4b, slice 34).
+///
+/// This is a NAME check, not a tracked-TermId check, so it is a heuristic: a
+/// user symbol literally declared as `|!strkN|` would false-positive here.
+/// That is harmless for soundness — a false positive only SKIPS an alias
+/// propagation that would otherwise fire, falling through to the pre-existing
+/// F-split path (i.e. it can only narrow completeness, never introduce an
+/// unsound merge).
+fn is_minted_skolem(terms: &Context, t: TermId) -> bool {
+    match terms.term_node(t) {
+        TermNode::App {
+            op: Op::Uninterpreted(sym),
+            args,
+            ..
+        } if args.len == 0 => terms.symbol_name(*sym).starts_with("!strk"),
+        _ => false,
+    }
 }
 
 /// Build `(str.len t)`.
@@ -622,15 +660,17 @@ fn resolve_inner(
         }
     }
 
-    // ── SLICE 33: pure-assignment propagation ────────────────────────────────
-    // A residual `[v] = [constant word]` ENTAILS `v ≈ W`. Before slice 33 this
-    // fell through to the variable-headed F-split below, hit the dedup, and
-    // returned `Saturated` → a sound but needless `Unknown`. Reporting it here,
-    // BEFORE the F-split, is the whole fix.
+    // ── SLICE 33/34: single-atom propagation ─────────────────────────────────
+    // SLICE 33: a residual `[v] = [constant word]` ENTAILS `v ≈ W` (multi-atom
+    // constant sides folded to one interned term). SLICE 34: a residual
+    // `[v] = [u]` (free variable each side) ENTAILS `v ≈ u` by cancellation.
+    // Before these, both shapes fell through to the variable-headed F-split
+    // below, hit the dedup, and returned `Saturated` → a sound but needless
+    // `Unknown`. Reporting the fact here, BEFORE the F-split, is the whole fix.
     //
-    // Scope (spec §2): the constant side must be ENTIRELY constant. The wider
-    // rule (`W` containing other variables) is the deleted E1 probe's shape and
-    // is deliberately out of scope.
+    // Scope (slice-34 spec §2): the MULTI-ATOM variable-bearing word stays
+    // fenced — it is the deleted E1 probe's shape (needs a CONCAT merge target
+    // and an in-word occurs-check) and is deliberately out of scope.
     //
     // The `is_concat` guard fixes the probe's other defect: it tested
     // `string_const_value(..).is_none()`, which matches an unflattened CONCAT
@@ -656,6 +696,48 @@ fn resolve_inner(
         let all_const = |sl: &[TermId], terms: &Context| {
             sl.iter().all(|&a| terms.string_const_value(a).is_some())
         };
+
+        // SLICE 34: alias case — BOTH residuals are a single free variable.
+        // `[v] = [u]` entails `v ≈ u` by cancellation in the free monoid.
+        // No occurs-check is needed here, structurally: head/tail stripping
+        // removed every same-class pair, so a SURVIVING var–var residual
+        // proves the two classes are distinct — the merge is never `v ≈ v`,
+        // and a one-atom variable side cannot contain `v` any other way
+        // (contrast the fenced multi-atom shape, where `v` can occur inside
+        // the word). Left residual is `var`, fixed, for determinism; the EUF
+        // merge is symmetric. `word` here is the other VARIABLE's TermId —
+        // the driver's merge is a var–var class union and may create a string
+        // class with NO constant member (spec §5); the driver and model paths
+        // are shape-agnostic.
+        //
+        // SKOLEM EXCLUSION (task-4-blocker-diagnosis.md, T4b fix, slice 34,
+        // 2026-07-20): neither atom may be a MINTED `!strk*` char-peel/F-split
+        // skolem (`is_minted_skolem` above). A char-peel of a literal head
+        // (e.g. `"ab" ++ s0` peeling to `"a" ++ !strk0`) can produce a
+        // residual `[!strk1] = [!strk0]` that satisfies the shape above but
+        // whose atoms are both fresh internal remainders, not the user's
+        // input variables. Merging such a pair directly into EUF REPLACES the
+        // F-split the model builder needs to realise the length-alignment
+        // between the peeled head and the anchoring original concat — the
+        // merged class free-fills to a garbage, too-short value and the
+        // post-solve witness self-check soundly downgrades a genuine `sat` to
+        // `unknown` (a completeness regression, not an unsoundness). A
+        // skolem never appears in a user `distinct` or constant constraint,
+        // so excluding it here loses no useful conflict: the fallback is
+        // exactly the pre-slice-34 F-split path.
+        if l_res.len() == 1
+            && r_res.len() == 1
+            && is_free_var(terms, l_res[0])
+            && is_free_var(terms, r_res[0])
+            && !is_minted_skolem(terms, l_res[0])
+            && !is_minted_skolem(terms, r_res[0])
+        {
+            return StepResult::Propagate {
+                var: l_res[0],
+                word: r_res[0],
+                just,
+            };
+        }
 
         let pair = if l_res.len() == 1 && is_free_var(terms, l_res[0]) && all_const(r_res, terms) {
             Some((l_res[0], r_res))
@@ -1409,11 +1491,13 @@ mod tests {
         );
     }
 
-    /// SCOPE FENCE (spec §2): a constant side is required. `v = w ++ "a"` with a
-    /// second VARIABLE must NOT propagate — that is the wider rule the deleted
-    /// E1 probe got wrong, and it is explicitly out of scope for slice 33.
+    /// SCOPE FENCE (slice-34 spec §2): a MULTI-ATOM variable-bearing word must
+    /// NOT propagate — `v = w ++ "a"` needs a CONCAT merge target and an
+    /// in-word occurs-check; it is the deleted E1 probe's shape and stays
+    /// fenced. (The SINGLE-variable alias residual `[v] = [u]` DOES propagate
+    /// as of slice 34 — see `alias_residual_propagates`.)
     #[test]
-    fn variable_bearing_word_does_not_propagate() {
+    fn multi_atom_variable_bearing_word_does_not_propagate() {
         let (mut terms, mut eq, y, _ab, just, eqn_lit) = setup_pure_assignment("y", "ab");
         let w = declare_str_var(&mut terms, "w");
         let a = terms.mk_string_const("a");
@@ -1431,7 +1515,209 @@ mod tests {
         );
         assert!(
             !matches!(r, StepResult::Propagate { .. }),
-            "a variable-bearing word must NOT propagate in slice 33 (spec §2)"
+            "a MULTI-ATOM variable-bearing word must NOT propagate (slice-34 spec §2)"
+        );
+    }
+
+    // ── Slice 34: alias propagation ──────────────────────────────────────────
+    // A residual `[v] = [u]` (free variable each side, distinct classes — the
+    // stripping loop guarantees distinctness) entails `v ≈ u` by cancellation
+    // and must PROPAGATE, not fall to the F-split → dedup → Saturated path.
+
+    /// The core shape: `[x] = [y]` reports `x ≈ y`, left residual as `var`.
+    #[test]
+    fn alias_residual_propagates() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_al");
+        let y = declare_str_var(&mut ctx, "y_al");
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[x],
+            &[y],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        match r {
+            StepResult::Propagate { var, word, just } => {
+                assert_eq!(var, x, "left residual must be reported as `var`");
+                assert_eq!(word, y, "right residual must be reported as `word`");
+                assert!(
+                    just.iter()
+                        .any(|l| matches!(l, EqLeaf::Asserted(a) if *a == lit)),
+                    "alias propagation must cite the asserting equation literal"
+                );
+            }
+            _ => panic!("expected Propagate for an alias residual"),
+        }
+    }
+
+    /// The real e2e path: `"a"·x = "a"·y` strips the shared constant head,
+    /// leaving the alias residual.
+    #[test]
+    fn alias_after_head_strip_propagates() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_hs");
+        let y = declare_str_var(&mut ctx, "y_hs");
+        let a = ctx.mk_string_const("a");
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[a, x],
+            &[a, y],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Propagate { var, word, .. } if var == x && word == y),
+            "shared head must strip, then the alias residual must propagate"
+        );
+    }
+
+    /// A single CONCAT atom is NOT a free variable (`is_free_var` excludes it,
+    /// the deleted E1 probe's other defect): `[x] = [concat(w, z)]` must NOT
+    /// propagate.
+    #[test]
+    fn single_concat_atom_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_cc");
+        let w = declare_str_var(&mut ctx, "w_cc");
+        let z = declare_str_var(&mut ctx, "z_cc");
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[w, z])
+            .unwrap();
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[x],
+            &[concat],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(r, StepResult::Propagate { .. }),
+            "an unflattened CONCAT atom must never be treated as a variable"
+        );
+    }
+
+    /// T4b regression test (task-4-blocker-diagnosis.md, 2026-07-20): a
+    /// residual `[!strk1] = [!strk0]` — BOTH atoms MINTED char-peel/F-split
+    /// skolems, named exactly the way `fresh_str` brands them — must NOT
+    /// propagate. Merging two skolems directly into EUF replaces the F-split
+    /// the model builder needs and corrupts model construction (see the
+    /// skolem-exclusion comment on the alias case above). Before the T4b fix
+    /// this fired `Propagate`; after, it must fall through to the F-split
+    /// (i.e. NOT `Propagate`).
+    #[test]
+    fn skolem_skolem_residual_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        // Declared the same way `fresh_str` mints them: nullary symbols named
+        // `!strk<N>`.
+        let strk1 = declare_str_var(&mut ctx, "!strk1");
+        let strk0 = declare_str_var(&mut ctx, "!strk0");
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[strk1],
+            &[strk0],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(r, StepResult::Propagate { .. }),
+            "a skolem-skolem residual must NOT propagate — it must fall through \
+             to the F-split (T4b: propagating it corrupts model construction)"
+        );
+    }
+
+    /// Final-review pin: a MIXED residual — one input variable, one minted
+    /// `!strk*` skolem — must NOT propagate either. The T4b guard
+    /// (`!is_minted_skolem(l) && !is_minted_skolem(r)`) excludes a residual
+    /// as soon as EITHER atom is a minted skolem, not only the skolem-skolem
+    /// shape `skolem_skolem_residual_does_not_propagate` above pins. This is
+    /// a deliberate scope decision — the T4b diagnosis only demonstrated
+    /// corruption for skolem-skolem residuals, so the mixed pair's exclusion
+    /// was a choice, not something the diagnosis forced. Pins both
+    /// orientations.
+    #[test]
+    fn mixed_var_skolem_residual_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        // Input variable, declared the same way every other test in this
+        // module declares one.
+        let x = declare_str_var(&mut ctx, "x_mixed");
+        // Minted skolem, named exactly the way `fresh_str` brands one —
+        // mirrors `skolem_skolem_residual_does_not_propagate` above.
+        let strk0 = declare_str_var(&mut ctx, "!strk0");
+        let lit = dummy_eqn_lit();
+
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r1 = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[x],
+            &[strk0],
+            vec![EqLeaf::Asserted(lit)],
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(r1, StepResult::Propagate { .. }),
+            "a mixed var-skolem residual [x] = [!strk0] must NOT propagate — \
+             mixed pairs are deliberately excluded by the T4b guard (either \
+             atom being a minted skolem is enough), not just the skolem-skolem \
+             shape"
+        );
+
+        // Symmetric orientation: the EUF merge is symmetric, so the guard
+        // must reject the pair regardless of which side the skolem lands on.
+        let mut ctr2 = 0u32;
+        let mut emitted2 = FxHashSet::default();
+        let r2 = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[strk0],
+            &[x],
+            vec![EqLeaf::Asserted(lit)],
+            lit,
+            &mut ctr2,
+            &mut emitted2,
+        );
+        assert!(
+            !matches!(r2, StepResult::Propagate { .. }),
+            "the symmetric orientation [!strk0] = [x] must NOT propagate \
+             either — mixed pairs are deliberately excluded, not forced by \
+             the T4b diagnosis"
         );
     }
 
