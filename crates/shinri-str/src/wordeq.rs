@@ -48,6 +48,11 @@ pub enum StepResult {
 }
 
 /// Mint a fresh string constant `!strk<N>` and return its term ID.
+///
+/// BRANDING CONTRACT (load-bearing): the `!strk` name prefix is how
+/// `is_minted_skolem` below recognizes a term minted here. If this prefix
+/// ever changes, `is_minted_skolem` MUST change with it — keep the two in
+/// sync.
 pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
     let name = format!("!strk{}", *ctr);
     *ctr += 1;
@@ -56,6 +61,32 @@ pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
     terms
         .mk_app(Op::Uninterpreted(sym), &[])
         .expect("well-sorted")
+}
+
+/// True iff `t` is a MINTED char-peel/F-split skolem — a nullary symbol whose
+/// name carries the `!strk` prefix branded by `fresh_str` above (branding
+/// contract: keep the two in sync). Used to EXCLUDE skolem atoms from the
+/// slice-34 alias-propagation guard: a skolem is purely internal bookkeeping
+/// for the char-peel/F-split machinery and never appears in a user-asserted
+/// `distinct` or constant constraint, so merging two skolems can never
+/// produce a useful conflict — it can only bypass the F-split the model
+/// builder relies on (task-4-blocker-diagnosis.md, T4b, slice 34).
+///
+/// This is a NAME check, not a tracked-TermId check, so it is a heuristic: a
+/// user symbol literally declared as `|!strkN|` would false-positive here.
+/// That is harmless for soundness — a false positive only SKIPS an alias
+/// propagation that would otherwise fire, falling through to the pre-existing
+/// F-split path (i.e. it can only narrow completeness, never introduce an
+/// unsound merge).
+fn is_minted_skolem(terms: &Context, t: TermId) -> bool {
+    match terms.term_node(t) {
+        TermNode::App {
+            op: Op::Uninterpreted(sym),
+            args,
+            ..
+        } if args.len == 0 => terms.symbol_name(*sym).starts_with("!strk"),
+        _ => false,
+    }
 }
 
 /// Build `(str.len t)`.
@@ -678,10 +709,28 @@ fn resolve_inner(
         // the driver's merge is a var–var class union and may create a string
         // class with NO constant member (spec §5); the driver and model paths
         // are shape-agnostic.
+        //
+        // SKOLEM EXCLUSION (task-4-blocker-diagnosis.md, T4b fix, slice 34,
+        // 2026-07-20): neither atom may be a MINTED `!strk*` char-peel/F-split
+        // skolem (`is_minted_skolem` above). A char-peel of a literal head
+        // (e.g. `"ab" ++ s0` peeling to `"a" ++ !strk0`) can produce a
+        // residual `[!strk1] = [!strk0]` that satisfies the shape above but
+        // whose atoms are both fresh internal remainders, not the user's
+        // input variables. Merging such a pair directly into EUF REPLACES the
+        // F-split the model builder needs to realise the length-alignment
+        // between the peeled head and the anchoring original concat — the
+        // merged class free-fills to a garbage, too-short value and the
+        // post-solve witness self-check soundly downgrades a genuine `sat` to
+        // `unknown` (a completeness regression, not an unsoundness). A
+        // skolem never appears in a user `distinct` or constant constraint,
+        // so excluding it here loses no useful conflict: the fallback is
+        // exactly the pre-slice-34 F-split path.
         if l_res.len() == 1
             && r_res.len() == 1
             && is_free_var(terms, l_res[0])
             && is_free_var(terms, r_res[0])
+            && !is_minted_skolem(terms, l_res[0])
+            && !is_minted_skolem(terms, r_res[0])
         {
             return StepResult::Propagate {
                 var: l_res[0],
@@ -1569,6 +1618,43 @@ mod tests {
         assert!(
             !matches!(r, StepResult::Propagate { .. }),
             "an unflattened CONCAT atom must never be treated as a variable"
+        );
+    }
+
+    /// T4b regression test (task-4-blocker-diagnosis.md, 2026-07-20): a
+    /// residual `[!strk1] = [!strk0]` — BOTH atoms MINTED char-peel/F-split
+    /// skolems, named exactly the way `fresh_str` brands them — must NOT
+    /// propagate. Merging two skolems directly into EUF replaces the F-split
+    /// the model builder needs and corrupts model construction (see the
+    /// skolem-exclusion comment on the alias case above). Before the T4b fix
+    /// this fired `Propagate`; after, it must fall through to the F-split
+    /// (i.e. NOT `Propagate`).
+    #[test]
+    fn skolem_skolem_residual_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        // Declared the same way `fresh_str` mints them: nullary symbols named
+        // `!strk<N>`.
+        let strk1 = declare_str_var(&mut ctx, "!strk1");
+        let strk0 = declare_str_var(&mut ctx, "!strk0");
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[strk1],
+            &[strk0],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(r, StepResult::Propagate { .. }),
+            "a skolem-skolem residual must NOT propagate — it must fall through \
+             to the F-split (T4b: propagating it corrupts model construction)"
         );
     }
 

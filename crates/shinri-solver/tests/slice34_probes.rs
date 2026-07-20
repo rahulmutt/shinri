@@ -102,3 +102,28 @@ fn probe_b1_multi_atom_fence() {
         "banked shape: must NOT flip in slice 34"
     );
 }
+
+/// Probe C1 — T4b REGRESSION PIN (task-4-blocker-diagnosis.md, 2026-07-20).
+/// This is the minimized dump-and-diff regression: a NEGATIVE (complement)
+/// membership on `s2` plus the literal-PREFIX concat `s2 = "ab" ++ s0`. At
+/// the slice-34 branch base this was `sat`; the un-narrowed alias case
+/// introduced by this slice fired on the char-peel-derived skolem–skolem
+/// residual `[!strk1] = [!strk0]` (from peeling the literal head "ab"),
+/// merging the two skolems directly into EUF and replacing the F-split the
+/// model builder needed — the resulting corrupt model failed the post-solve
+/// witness self-check and downgraded to `unknown`. z3 confirms `sat` with
+/// witness `s0 = ""`, `s2 = "ab"`. Fixed by excluding minted `!strk*`
+/// skolems from the alias guard (T4b); must be `sat` after the fix.
+#[test]
+fn probe_c1_charpeel_skolem_sat() {
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s0 () String)(declare-fun s2 () String)
+           (assert (str.in_re s2 (re.comp (str.to_re "c"))))
+           (assert (= s2 (str.++ "ab" s0)))(check-sat)"#,
+    );
+    assert_eq!(
+        out,
+        vec!["sat"],
+        "T4b: char-peel skolem-skolem residual must not corrupt the model"
+    );
+}

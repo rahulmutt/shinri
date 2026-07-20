@@ -3000,6 +3000,24 @@ fn targeted_probe_a4_chain_unsat() {
     );
 }
 
+#[test]
+fn targeted_probe_c1_charpeel_skolem_sat() {
+    // T4b regression fix (task-4-blocker-diagnosis.md, 2026-07-20). The
+    // un-narrowed slice-34 alias case fired on a char-peel-derived
+    // skolem-skolem residual (`[!strk1] = [!strk0]`, from peeling the
+    // literal head "ab" of `s2 = "ab" ++ s0`), merging the two internal
+    // skolems into EUF and replacing the F-split the model builder needed —
+    // downgrading a genuine `sat` to `unknown`. Fixed by excluding minted
+    // `!strk*` skolems from the alias guard. z3-confirmed `sat` (witness
+    // s0="", s2="ab").
+    expect(
+        "(set-logic QF_S)(declare-fun s0 () String)(declare-fun s2 () String)\
+         (assert (str.in_re s2 (re.comp (str.to_re \"c\"))))\
+         (assert (= s2 (str.++ \"ab\" s0)))(check-sat)",
+        Verdict::Sat,
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // str.substr / str.at targeted cases — LIVE and passing.
 //
