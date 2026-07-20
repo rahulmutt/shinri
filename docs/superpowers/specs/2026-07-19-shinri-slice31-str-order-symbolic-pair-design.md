@@ -518,6 +518,19 @@ experiment/spike:
    is invisible at expansion time. *This wall is fixable* — emitting the
    tautology `(or (= x "") (>= (str.len x) 1))` per skolem lets arith's
    `len(x)=0` propagate `x=""` into EUF, and it worked in the spike.
+
+   > **CORRECTION (2026-07-20).** "This wall is fixable … it worked in the
+   > spike" is **withdrawn**. Slice 32 attempted the tautology at the axiom
+   > pump and HALTED (the dl>0 minted equality poisons `input_cond_roots`);
+   > the follow-up measurement then showed the diagnosis itself was wrong.
+   > Supplying the emptiness fact by *any* means — an explicit
+   > `(= (str.len x) 0)` literal, a hand-asserted `x = ""`, or writing `""`
+   > directly into the query with no variable at all — leaves the target
+   > `unknown`. The gap is not the N–O length seam; it is that the
+   > word-equation resolver does not propagate `y ≈ "ab"` from a ground-prefix
+   > equation. See the RETRACTED block in the slice-32 spec's "Newly banked"
+   > for the probe table and the two reverted spikes. Wall 3 is **not** a
+   > cheap reusable win and should not be scheduled as one.
 4. **Code-point arithmetic is intractable (the blocker).** Once the len seam
    is fixed and the tail grounds, the wall moves to the `!strcode` semantics:
    the range + surrogate-hole constraints over the 196,607-wide domain
@@ -535,8 +548,10 @@ total order on the `!strcode` handle that avoids materializing the full LIA
 range. Plus a **finite measure or relevance discipline** for the recursion
 (wall 1/2) — which, per wall 2, likely requires extending the DPLL(T)
 `TheoryCtx` seam with an assignment/value view, or giving order a
-membership-style finite dedup measure. The len-seam tautology (wall 3) is the
-one cheap, reusable win and can be lifted out independently. Until the
+membership-style finite dedup measure. ~~The len-seam tautology (wall 3) is the
+one cheap, reusable win and can be lifted out independently.~~ (Withdrawn
+2026-07-20 — see the correction on wall 3 above; there is no cheap win here.)
+Until the
 code-comparison prerequisite exists, two-symbolic-variable `str.<`/`str.<=`
 stays a sound `Unknown` and remains the oldest live known gap.
 

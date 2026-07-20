@@ -283,6 +283,62 @@ mechanism does deliver real grounding when it is not gated out — the pin was
   with a third root category exempting tautology-minted equalities from both
   `input_cond_roots` and `all_cond_roots`, which needs its own soundness
   argument and oracle validation.
+
+  **RETRACTED 2026-07-20 — the acceptance pin is unreachable by either
+  direction, and by any grounding mechanism at all.** Directions (a) and (b)
+  both target *access to* the `len = 0` fact. Measurement on `614cfbf2` shows
+  access was never the binding constraint:
+
+  | Probe | Query | Verdict |
+  |---|---|---|
+  | C | `(= (str.len x) 0) ∧ (= (str.++ x y) "ab") ∧ (distinct y "ab")` | `unknown` |
+  | E | `(= (str.++ "" y) "ab") ∧ (distinct y "ab")` | `unknown` |
+  | G | `(= x "") ∧ (= (str.++ x y) "ab") ∧ (distinct y "ab")` | `unknown` |
+  | F | `(= y "ab") ∧ (distinct y "ab")` | `unsat` |
+
+  Probe **C** supplies `len(x) = 0` as an explicit literal, which routes to EUF
+  and merges `len(x) ≈ 0` directly (§ the doc at `lib.rs:1356-1358`) — the
+  entailment direction (a) would deliver is already present, and the pin still
+  does not decide. Probe **E** removes `x` entirely: the empty string is a
+  source-level literal, so there is nothing to ground, and it still does not
+  decide. Probe **G** asserts `x = ""` by hand — strictly more than any
+  mechanism could achieve — and still does not decide. Probe **F** confirms the
+  contradiction machinery is intact once the equality exists.
+
+  **The real gap is downstream of the seam, and it is structural.**
+  `StepResult` (`wordeq.rs:6-24`) has exactly four variants — `Done`,
+  `Saturated`, `Conflict`, `Split`. **There is no propagation outcome.** The
+  resolver cannot express "this equation entails `y ≈ "ab"`", so a residual
+  pure assignment `[y] = ["ab"]` does not merge: it falls through the
+  strip/occurs-check/all-constant cases to the variable-headed F-split path,
+  and on a dedup hit returns `Saturated` → sound `Unknown`. That is precisely
+  what probes E and G observe. Note the removed "E1 PROBE" comment
+  (`wordeq.rs:~505`) records that a pure assignment `v = W` *used* to
+  short-circuit to `Done`; that path was deliberately deleted, so today it
+  F-splits. Emptiness, length, arith, and the N–O seam are all uninvolved.
+
+  Two further mechanisms were spiked and reverted, both confirming the ceiling:
+
+  - *Widening the shared-numeral qualifier.* Relaxing `has_empty_diseq`
+    (`lib.rs:1272-1276`) so the Int numeral `0` joins the shared set whenever
+    `len_terms` is non-empty — the cheapest form of direction (a) — leaves the
+    pin `unknown`.
+  - *Grounding inside normalization.* Extending the `""`-drop in
+    `normal_form_cited` (`normalize.rs:140-144`) to also drop an atom whose
+    length is EUF-equal to `0`, citing the length-merge antecedents into
+    `ante`. The rule **fires correctly** (observed `len_eq_zero = true` on the
+    target atom) and the SAT control stays `sat`, but the pin remains
+    `unknown`: the resolver receives `[y] = ["ab"]` and does nothing with it.
+    Recorded as evidence that this mechanism is sound-and-insufficient, not
+    that it is wrong.
+
+  **Consequence for the bank.** Do not resume wall 3 as a seam problem. The
+  next investigation is the resolver's missing propagation outcome — whether
+  `StepResult` should gain a variant that merges an entailed pure assignment
+  `v = W` (and under what antecedent-citation discipline, given that the
+  deleted E1 probe's `Done` short-circuit was itself unsound-shaped). That
+  lives in a different subsystem from the N–O seam and needs its own pin
+  chosen by measurement rather than inherited from slice-31 §11.
 - Slice-31 §11 walls 1, 2, and 4 remain open, unchanged. The order
   preprocessing fence stays **down**.
 - The standing bank (slice-28 §8, slice-27 typed-antecedent refactor,
