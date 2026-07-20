@@ -47,6 +47,68 @@ fn ge_zero(terms: &mut Context, len_term: TermId) -> TermId {
         .expect("well-sorted")
 }
 
+/// For `str.len(a)` where `a` is a bare string VARIABLE, build the two
+/// disjuncts of the emptiness tautology `(or (= a "") (>= (str.len a) 1))`.
+/// Returns `None` for any other shape.
+///
+/// The clause is VALID in the SMT-LIB String theory for every string term: a
+/// string is either empty or has length at least one. Being a tautology, it is
+/// entailed at level 0 unconditionally and needs NO guard — unlike the
+/// merge-derived length lemmas in this module, it has no antecedents that a
+/// backtracked branch could invalidate.
+///
+/// Its purpose is to close the one-way N–O seam: arith owns lengths and the
+/// string theory owns word equations, so when arith derives `len(a) = 0`
+/// nothing today tells the string theory that `a = ""`. Under `len(a) ≤ 0` the
+/// arith disjunct is false and unit propagation forces `a = ""` into EUF.
+///
+/// **Qualifier — bare leaf variables only.** `a` must be an uninterpreted
+/// NULLARY symbol and not a string constant. Concat lengths, literal lengths,
+/// and any compound are declined. This is the flood control: emission is then
+/// bounded by the number of string variables rather than the number of
+/// `str.len` terms, and concat lengths — the terms that multiply as the
+/// word-equation engine rewrites — contribute nothing. Emitting an empty-link
+/// for EVERY `str.len` term is the shape documented at the bottom of this file
+/// as livelocking concat+length queries; do not widen this qualifier without
+/// re-running the timing gate.
+#[allow(dead_code)]
+pub fn empty_length_tautology(terms: &mut Context, len_term: TermId) -> Option<(TermId, TermId)> {
+    // Extract the single argument of the str.len application.
+    let arg = match terms.term_node(len_term).clone() {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrLen),
+            args,
+            ..
+        } => terms.children(args)[0],
+        _ => return None,
+    };
+
+    // Qualifier: a bare uninterpreted nullary symbol, not a string constant.
+    // Mirrors the `all_var` predicate the empty-residual lemma uses
+    // (lib.rs:577-586) rather than inventing a second notion of leafness.
+    let is_bare_var = terms.string_const_value(arg).is_none()
+        && match terms.term_node(arg) {
+            TermNode::App {
+                op: Op::Uninterpreted(_),
+                args,
+                ..
+            } => terms.children(*args).is_empty(),
+            _ => false,
+        };
+    if !is_bare_var {
+        return None;
+    }
+
+    let empty = terms.mk_string_const("");
+    let eq_empty = terms.mk_eq(arg, empty).expect("(= a \"\") well-sorted");
+    let int_s = terms.int_sort();
+    let one = terms.mk_numeral(shinri_core::Rational::from_int(1i128.into()), int_s);
+    let ge_one = terms
+        .mk_app(Op::Builtin(BuiltinOp::Ge), &[len_term, one])
+        .expect("(>= (str.len a) 1) well-sorted");
+    Some((eq_empty, ge_one))
+}
+
 /// For `str.len(arg)`, the defining equation atom, or None if `arg` is an opaque variable.
 fn defining_eq(terms: &mut Context, len_term: TermId, arg: TermId) -> Option<TermId> {
     // Clone the node to avoid borrow conflict with later mut calls.
@@ -386,6 +448,93 @@ mod tests {
         assert!(
             matches!(s.check(&mut cx, Effort::Full), TCheck::Sat),
             "fixpoint after all axioms emitted"
+        );
+    }
+
+    #[test]
+    fn tautology_offered_for_bare_string_variable() {
+        use super::empty_length_tautology;
+        use shinri_core::{BuiltinOp, ConstVal, Context, Op, TermNode};
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let sym = ctx.declare_fun("x", &[], str_s);
+        let x = ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap();
+        let len_x = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
+
+        let (eq_empty, ge_one) =
+            empty_length_tautology(&mut ctx, len_x).expect("bare variable qualifies");
+
+        // eq_empty must be (= x "").
+        let empty = ctx.mk_string_const("");
+        let expected_eq = ctx.mk_eq(x, empty).unwrap();
+        assert_eq!(eq_empty, expected_eq, "first disjunct is (= x \"\")");
+
+        // ge_one must be (>= (str.len x) 1).
+        let int_s = ctx.int_sort();
+        let one = ctx.mk_numeral(shinri_core::Rational::from_int(1i128.into()), int_s);
+        let expected_ge = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[len_x, one])
+            .unwrap();
+        assert_eq!(ge_one, expected_ge, "second disjunct is (>= (str.len x) 1)");
+
+        // Sanity: the empty constant really is the empty string.
+        assert!(matches!(
+            ctx.term_node(empty),
+            TermNode::Const {
+                val: ConstVal::String(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tautology_declined_for_concat_and_literal_lengths() {
+        use super::empty_length_tautology;
+        use shinri_core::{BuiltinOp, Context, Op};
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mk = |c: &mut Context, n: &str| {
+            let s = c.declare_fun(n, &[], str_s);
+            c.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let x = mk(&mut ctx, "x");
+        let y = mk(&mut ctx, "y");
+
+        // Concat length: len(x ++ y) must NOT qualify — a concat carries hidden
+        // mandatory constant length and multiplies as the engine rewrites; this
+        // is exactly the per-str.len flood the length.rs:254 note warns about.
+        let cc = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
+        let len_cc = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[cc]).unwrap();
+        assert!(
+            empty_length_tautology(&mut ctx, len_cc).is_none(),
+            "concat length must not qualify"
+        );
+
+        // Literal length: len("ab") must NOT qualify — its length is already
+        // pinned by the structural defining equation.
+        let lit = ctx.mk_string_const("ab");
+        let len_lit = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[lit]).unwrap();
+        assert!(
+            empty_length_tautology(&mut ctx, len_lit).is_none(),
+            "literal length must not qualify"
+        );
+    }
+
+    #[test]
+    fn tautology_declined_for_non_len_term() {
+        use super::empty_length_tautology;
+        use shinri_core::{BuiltinOp, Context, Op};
+        let mut ctx = Context::new();
+        let int_s = ctx.int_sort();
+        let sym = ctx.declare_fun("n", &[], int_s);
+        let n = ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap();
+        let zero = ctx.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
+        let ge = ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[n, zero]).unwrap();
+        assert!(
+            empty_length_tautology(&mut ctx, ge).is_none(),
+            "a non-str.len term must not qualify"
         );
     }
 }
