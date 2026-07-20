@@ -409,6 +409,10 @@ pub(crate) fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: T
 ///    citation that over-approximates and trips the SAT conflict-analyzability
 ///    guard). Purely structural conflicts on words that had NO concat atom are
 ///    unaffected — every b10bd27 constant-length exemplar still Conflicts.
+/// 3. Symmetrically, if a concat atom WAS flattened and the inner resolver
+///    reports a PROPAGATE, downgrades it to `Saturated` for the same
+///    under-citation reason: the merge it would land could depend on an
+///    uncited `eq.are_equal` strip (slice 35).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_equation(
     terms: &mut Context,
@@ -440,6 +444,14 @@ pub fn resolve_equation(
     ) {
         // A conflict off a flattened concat rep would be under-cited → Saturate.
         StepResult::Conflict(_) => StepResult::Saturated,
+        // A Propagate off a flattened concat rep is under-cited the same way:
+        // the strips over flattened inner atoms (never rep-substituted by
+        // normal_form) can consume via `eq.are_equal` on class equalities
+        // cited in neither `just` nor `nf_ante`, so the EUF merge this would
+        // land is under-justified — a wrong-UNSAT shape. Saturate,
+        // symmetrically with Conflict (slice 35; approach B in the spec is
+        // the banked completeness-restoring alternative).
+        StepResult::Propagate { .. } => StepResult::Saturated,
         other => other,
     }
 }
@@ -1618,6 +1630,80 @@ mod tests {
         assert!(
             !matches!(r, StepResult::Propagate { .. }),
             "an unflattened CONCAT atom must never be treated as a variable"
+        );
+    }
+
+    /// Slice 35: a pure-assignment residual reached only by FLATTENING a
+    /// concat class-rep must NOT propagate. The strip loops over flattened
+    /// atoms can consume via `eq.are_equal` on class equalities cited in
+    /// neither `just` nor `nf_ante`, so a `Propagate` here would land an
+    /// under-justified EUF merge (wrong-UNSAT shape) — the same reason the
+    /// wrapper downgrades `Conflict`. Must be `Saturated`.
+    /// Control: `pure_assignment_folds_multi_atom_constant_side` pins that
+    /// the identical residual WITHOUT a concat atom still propagates.
+    #[test]
+    fn flattened_pure_assignment_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_fpa");
+        let a = ctx.mk_string_const("a");
+        let b = ctx.mk_string_const("b");
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[a, b])
+            .unwrap();
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[x],
+            &[concat],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Saturated),
+            "a Propagate off a flattened concat rep is under-cited and must \
+             be downgraded to Saturated"
+        );
+    }
+
+    /// Slice 35: the alias variant of the case above — flattening exposes a
+    /// strippable constant head, leaving a var–var residual that slice 34
+    /// would merge. Same under-citation hazard, same downgrade: `Saturated`.
+    /// Control: `alias_residual_propagates` pins the no-concat alias shape.
+    #[test]
+    fn flattened_alias_residual_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_far");
+        let y = declare_str_var(&mut ctx, "y_far");
+        let a = ctx.mk_string_const("a");
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[a, x])
+            .unwrap();
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[concat],
+            &[a, y],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Saturated),
+            "an alias residual off a flattened concat rep must be downgraded \
+             to Saturated"
         );
     }
 
