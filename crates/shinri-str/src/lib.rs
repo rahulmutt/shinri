@@ -51,6 +51,12 @@ pub struct StrSolver {
     order_true: Vec<(TermId, Lit, bool)>,
     /// SAT decision level per order_true entry (lock-step; truncated on pop).
     order_levels: Vec<u32>,
+    /// Slice 33: antecedent sets for propagation merges, indexed by tag. Entry
+    /// `i` is the antecedent set of `TheoryJust { theory: THEORY_ID, tag: i }`.
+    /// Trail-scoped (truncated on `pop`) — a tag MUST NOT outlive the branch
+    /// that minted it, or `explain` would expand it to antecedents that are no
+    /// longer asserted (a stale-antecedent wrong-UNSAT).
+    prop_tags: Vec<Vec<EqLeaf>>,
     len_terms: FxHashSet<TermId>,
     /// Code-point handle terms `(!strcode h)` minted by the order engine
     /// (slice 31). Exposed to the arith theory alongside `len_terms` so the
@@ -1228,11 +1234,12 @@ impl TheorySolver for StrSolver {
             self.diseq_true.len(),
             self.memb_true.len(),
             self.order_true.len(),
+            self.prop_tags.len(),
         );
     }
 
     fn pop(&mut self, level: usize) {
-        if let Some((e, d, mb, ob)) = self.trail.pop_to(level) {
+        if let Some((e, d, mb, ob, pt)) = self.trail.pop_to(level) {
             self.eq_true.truncate(e);
             self.diseq_true.truncate(d);
             // Keep the parallel assertion-level records in lock-step (E1 gate).
@@ -1242,6 +1249,8 @@ impl TheorySolver for StrSolver {
             self.memb_levels.truncate(mb);
             self.order_true.truncate(ob);
             self.order_levels.truncate(ob);
+            // Slice 33: drop propagation tags minted inside the closed scopes.
+            self.prop_tags.truncate(pt);
         }
     }
 
@@ -1250,6 +1259,16 @@ impl TheorySolver for StrSolver {
         out.extend(self.eq_true.iter().map(|&(_, l)| (l, "str.eq_true")));
         out.extend(self.diseq_true.iter().map(|&(_, l)| (l, "str.diseq_true")));
         out.extend(self.memb_true.iter().map(|&(_, l, _)| (l, "str.memb_true")));
+        // Slice 33: sweep propagation-tag antecedents too. Without this the
+        // retraction-leak net does not see interface justifications at all
+        // (combiner.rs:442) — exactly the mechanism this slice adds.
+        for leaves in &self.prop_tags {
+            for leaf in leaves {
+                if let EqLeaf::Asserted(l) = leaf {
+                    out.push((*l, "str.prop_tags"));
+                }
+            }
+        }
     }
 
     fn shared_arith_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
