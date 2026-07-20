@@ -439,9 +439,12 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver> Theory
         }
         self.eq.debug_cited_lits(out);
         self.string.cited_lits(out);
-        // Not yet swept: arith bound/antecedent stores and EqJust::Interface
-        // justifications (they also feed conflicts) — an arith-side retraction
-        // leak would pass silently. Slice-11 follow-up.
+        // Slice 33: string-side Interface (prop_tag) antecedents ARE now swept —
+        // `StrSolver::cited_lits` walks live propagation tags and surfaces their
+        // `Asserted` leaves. The unswept remainder is the ARITH-side bound/antecedent
+        // stores and their `EqJust::Interface` justifications (they also feed
+        // conflicts) — an arith-side retraction leak would pass silently. Slice-11
+        // follow-up.
     }
 }
 

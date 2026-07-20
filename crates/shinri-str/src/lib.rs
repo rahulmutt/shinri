@@ -300,6 +300,17 @@ impl TheorySolver for StrSolver {
             // merge derives from INPUT literals (it mints no atom), so classify it
             // like a non-minted atom: it enters BOTH `all_cond_roots` and
             // `input_cond_roots` (the conservative choice).
+            // COVERAGE (slice33 §11.6, final review): this fold-in runs at check()
+            // ENTRY, so it covers only propagation merges ALREADY in `prop_merge_info`
+            // when the sets are built — i.e. merges recorded on PRIOR check rounds.
+            // Propagation is also the first mechanism that merges into `cx.eq` MID-
+            // invocation, and such an intra-check merge is minted AFTER these sets
+            // exist, so it is NOT covered here. That gap is closed EAGERLY at the merge
+            // site: the `Ok(())` arm of the propagation merge inserts its POST-merge
+            // root into both sets when level > 0 (see below, ~`cx.eq.merge` call).
+            // Together: fold-in = check-entry state; Ok-arm insertion = intra-check
+            // merges. Every branch-local propagation root is therefore in `cond_roots`
+            // by the time any later gated channel in this same loop reads it.
             for &(var, word, level) in &self.prop_merge_info {
                 if level > 0 {
                     for side in [var, word] {
@@ -323,9 +334,12 @@ impl TheorySolver for StrSolver {
         //       and `lit` is level-known via `lit_lvl`; or
         //   (2) a slice-33 PROPAGATION merge (`var ≈ word`), which mints no atom and backs
         //       no (dis)equality literal, but is tracked in `prop_merge_info` and folded
-        //       into `cond_roots` when its level > 0. Its antecedent surfaces here as an
-        //       `EqLeaf::Interface(j)` with `j.theory == THEORY_ID` and a LIVE (trail-
-        //       scoped, in-range) tag — a level-checkable, self-theory merge.
+        //       into `cond_roots` when its level > 0 — the check-entry fold-in covers
+        //       merges from prior rounds, and the merge site's `Ok(())` arm eagerly
+        //       inserts the post-merge root for merges minted within THIS invocation, so
+        //       BOTH the pre-entry and intra-check cases are accounted for. Its antecedent
+        //       surfaces here as an `EqLeaf::Interface(j)` with `j.theory == THEORY_ID` and
+        //       a LIVE (trail-scoped, in-range) tag — a level-checkable, self-theory merge.
         // The load-bearing premise is therefore: every `EqLeaf::Asserted` antecedent of a
         // string leaf's merge-to-root is a literal we track in `lit_lvl` (level known,
         // hence cond_roots membership when dl>0 is known), AND every `EqLeaf::Interface`
@@ -920,7 +934,26 @@ impl TheorySolver for StrSolver {
                                 tag,
                             }),
                         ) {
-                            Ok(()) => {}
+                            Ok(()) => {
+                                // Final-review hardening (slice33 §11.6). The T5b
+                                // `prop_merge_info` fold-in above runs at check() ENTRY, so
+                                // it only covers propagation merges already present when the
+                                // `cond_roots` sets were built. THIS merge is minted MID-
+                                // check() — the first mechanism to merge into `cx.eq` during
+                                // an invocation — so a level>0 merge creates a class whose
+                                // root is in NEITHER set for the remainder of this same loop,
+                                // and a later gated channel (e.g. the word-eq conflict path)
+                                // could read it as branch-independent. Insert the POST-merge
+                                // root (find(vn) == find(wn), covering the whole class) into
+                                // BOTH sets eagerly — the SAME conservative classification the
+                                // fold-in applies, just applied intra-check. Chained
+                                // propagations each re-insert their own current root.
+                                if level > 0 {
+                                    let r = cx.eq.find(vn);
+                                    all_cond_roots.insert(r);
+                                    input_cond_roots.insert(r);
+                                }
+                            }
                             Err(conflict) => {
                                 // The merge united a KNOWN-DISEQUAL pair — e.g.
                                 // `y ≈ "ab"` against an asserted `distinct y "ab"`.
@@ -1560,8 +1593,7 @@ impl StrSolver {
                     exp.push_leaf(leaf);
                 }
             }
-            None => debug_assert!(
-                false,
+            None => panic!(
                 "slice33: propagation tag {tag} expanded after its scope was popped \
                  — a stale tag means the trail truncation is broken"
             ),

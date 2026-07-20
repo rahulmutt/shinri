@@ -317,9 +317,13 @@ The fix (`440a70eb`, T5b) tracks the mechanism instead of weakening the net:
 - `prop_merge_info: Vec<(TermId, TermId, u32)>` — (var, word, merge level via
   `trail.level()`, the same source as `eq_levels`) — 1:1 with `prop_tags` and
   truncated to the same fifth trail mark on `pop`;
-- the cond_roots computation folds in every level>0 propagation merge
-  (both roots into `input_cond_roots` and `all_cond_roots`, classified like a
-  non-minted input atom — the conservative choice);
+- the cond_roots computation (run at check() **entry**) folds in every level>0
+  propagation merge recorded on a PRIOR check round (both roots into
+  `input_cond_roots` and `all_cond_roots`, classified like a non-minted input
+  atom — the conservative choice). This fold-in alone covers only the
+  check-entry state; merges minted *during* the same invocation are handled by
+  the eager Ok-arm insertion added in §11.6 — together they restore the premise
+  for both the pre-entry and intra-check cases;
 - `side_clean` accepts an `Interface` antecedent on a string leaf **only** for
   a live self-theory tag, and walks the tag's antecedent DAG
   (visited-guarded) asserting every reached `Asserted` literal is
@@ -329,4 +333,57 @@ After T5b the full oracle suite is green (486 run, 0 failed) and every pin in
 §11.1 holds unchanged. The corrected §5 claim: E1's *clause gates* have
 nothing to reject, but the *tracking premise* applies to any string-leaf
 merge — the propagation is sound because it is scoped by `push`/`pop`, fully
-cited via `explain`, **and now visible to cond_roots**.
+cited via `explain`, **and now visible to cond_roots** (at check entry via the
+fold-in, and intra-check via the §11.6 Ok-arm insertion).
+
+### 11.6 Final review: intra-check merge staleness — eager cond_roots insertion
+
+The whole-branch final review flagged a residual **Critical** in the T5b
+coverage above. The check-entry fold-in reads `prop_merge_info` once, at the
+top of `check()`. But the slice-33 propagation merge (the `StepResult::Propagate`
+arm, `cx.eq.merge(...)`) is *the first mechanism that merges into `cx.eq`
+MID-invocation*. A dl>0 propagation merge minted during the loop therefore
+creates a class whose root is in **neither** `cond_roots` set for the remainder
+of that same invocation — the sets were built before the merge existed. In
+principle a later gated channel in the same loop (the reviewer's concern: the
+word-eq `Conflict` path, which cites only `Asserted(lit)` and relies on the
+`side_clean` gate rather than citing substitution antecedents) could derive a
+conflict *through* the freshly-merged class, pass the now-stale gate, and learn
+an under-cited global conflict → wrong UNSAT on a SAT input.
+
+**Repro attempt (measured).** The reviewer predicted a wrong UNSAT for
+(z3/cvc5: **sat**, model x="a", y="b", w=""):
+
+```
+(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)(declare-fun w () String)
+(assert (= (str.++ x y) "ab"))(assert (= (str.++ y w) "b"))(check-sat)
+```
+
+Added as `probe_h_same_check_composition` (asserts `sat`). Measured verdict on
+the pre-fix tip (`f9267da0`): **`sat`** — NOT a wrong UNSAT. z3 confirms `sat`.
+Eleven variations (assertion-order swaps, alternate second equations, added
+disequalities, three-equation chains forcing the merged class through a later
+same-word/constant-head conflict) were run against the engine with z3 ground
+truth: every one returned either `sat` (matching z3) or a conservative
+`unknown` — **no wrong UNSAT was reproduced**. The exact composition the
+reviewer traced does not, at this tip, drive the merged class through a
+stale-gated global conflict (the gated channels either decline or the conflict
+stays branch-local and only backtracks).
+
+**Fix (commissioned hardening regardless).** The gap is real in principle even
+though unreached in practice, and closing it is cheap and structural. The
+`Ok(())` arm of the propagation merge now, when `level > 0`, eagerly inserts the
+POST-merge class root (`cx.eq.find(vn)` == `find(wn)`) into BOTH `all_cond_roots`
+and `input_cond_roots` — the same conservative classification the entry fold-in
+applies, applied intra-check. Chained propagations each re-insert their own
+current root. This makes every branch-local propagation root visible to
+`side_clean` at the moment the merge happens, before any later gated channel in
+the loop can read it. Verdicts are unchanged (all probes and the full oracle
+suite stay green); the change is pure hardening of the soundness net.
+
+Two accepted ride-alongs landed with the fix: (a) `expand_prop_tag`'s stale-tag
+`None` arm is now a hard `panic!` (was `debug_assert!(false, …)`) — a stale tag
+expanding in release is under-explanation (a wrong-UNSAT class) and must fail
+loud on a cold path; (b) the `combiner.rs` `cited_lits` comment now records that
+string-side Interface (prop_tag) antecedents ARE swept by `StrSolver::cited_lits`
+as of slice 33, leaving only the arith-side stores as the unswept remainder.

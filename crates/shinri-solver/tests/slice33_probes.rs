@@ -86,3 +86,23 @@ fn probe_f_control_direct_contradiction() {
     );
     assert_eq!(out, vec!["unsat"], "control: must never regress");
 }
+
+/// Probe H — PIN (slice 33, final review). Same-check composition of a mid-check
+/// propagation merge with a LATER gated conflict channel. The first equation
+/// F-splits; in the branch deciding minted `x=""` (dl 1), eq-a's residual
+/// `[y]=["ab"]` propagates `y ≈ "ab"` (a merge into `cx.eq` MID-invocation — the
+/// first mechanism to do so). eq-b then normalizes through that merged class to a
+/// constant-head-mismatch. The merged class root is created AFTER the
+/// `cond_roots` sets are built at check() entry, so without eager insertion its
+/// root is in NEITHER set for the rest of the invocation, and the later gated
+/// word-eq conflict path could pass a stale `side_clean` gate and learn an
+/// under-cited global conflict → wrong UNSAT. z3 + cvc5: sat (x="a", y="b", w="").
+#[test]
+fn probe_h_same_check_composition() {
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)
+           (declare-fun w () String)
+           (assert (= (str.++ x y) "ab"))(assert (= (str.++ y w) "b"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["sat"]);
+}
