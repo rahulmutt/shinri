@@ -53,14 +53,27 @@ pub enum StepResult {
 /// `is_minted_skolem` below recognizes a term minted here. If this prefix
 /// ever changes, `is_minted_skolem` MUST change with it — keep the two in
 /// sync.
+///
+/// FRESHNESS (slice 35, mirrors word_norm's `ite!` mint): user-owned names
+/// are skipped (a pre-declared `|!strkN|` is never adopted as a skolem),
+/// and the minted name is reserved so a later user `declare-fun` naming it
+/// is rejected at parse time — otherwise the user's app hash-conses to the
+/// skolem and inherits its internal identity (wrong-verdict shape; see the
+/// slice-5 `ite!` finding).
 pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
-    let name = format!("!strk{}", *ctr);
-    *ctr += 1;
     let str_s = terms.string_sort();
-    let sym = terms.declare_fun(&name, &[], str_s);
-    terms
-        .mk_app(Op::Uninterpreted(sym), &[])
-        .expect("well-sorted")
+    loop {
+        let name = format!("!strk{}", *ctr);
+        *ctr += 1;
+        if terms.lookup_symbol(&name).is_some() {
+            continue; // user (or an earlier check) owns this name
+        }
+        let sym = terms.declare_fun(&name, &[], str_s);
+        terms.reserve_symbol(sym);
+        return terms
+            .mk_app(Op::Uninterpreted(sym), &[])
+            .expect("well-sorted");
+    }
 }
 
 /// True iff `t` is a MINTED char-peel/F-split skolem — a nullary symbol whose
@@ -74,10 +87,10 @@ pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
 ///
 /// This is a NAME check, not a tracked-TermId check, so it is a heuristic: a
 /// user symbol literally declared as `|!strkN|` would false-positive here.
-/// That is harmless for soundness — a false positive only SKIPS an alias
-/// propagation that would otherwise fire, falling through to the pre-existing
-/// F-split path (i.e. it can only narrow completeness, never introduce an
-/// unsound merge).
+/// Since slice 35, `fresh_str` skips user-owned names and reserves minted
+/// ones, so such a term is never ALSO a skolem — the false positive only
+/// narrows completeness (the slice-34 guard declines to propagate), never
+/// soundness. The tracked-TermId-set upgrade remains banked.
 fn is_minted_skolem(terms: &Context, t: TermId) -> bool {
     match terms.term_node(t) {
         TermNode::App {
@@ -919,7 +932,7 @@ fn resolve_inner(
 
 #[cfg(test)]
 mod tests {
-    use crate::wordeq::{resolve_equation, StepResult};
+    use crate::wordeq::{fresh_str, resolve_equation, StepResult};
     use crate::StrSolver;
     use rustc_hash::FxHashSet;
     use shinri_core::{BuiltinOp, Context, Lit, Op, Var};
@@ -1704,6 +1717,47 @@ mod tests {
             matches!(r, StepResult::Saturated),
             "an alias residual off a flattened concat rep must be downgraded \
              to Saturated"
+        );
+    }
+
+    /// Slice 35: a user-declared `|!strk0|` that predates minting must NOT be
+    /// adopted as a skolem — `fresh_str` skips user-owned names, so the
+    /// minted term is a distinct TermId under the next free name.
+    #[test]
+    fn fresh_str_skips_user_owned_name() {
+        let mut ctx = Context::new();
+        let user = declare_str_var(&mut ctx, "!strk0");
+        let mut ctr = 0u32;
+        let minted = fresh_str(&mut ctx, &mut ctr);
+        assert_ne!(
+            minted, user,
+            "minting must never hash-cons onto a pre-declared user |!strk0|"
+        );
+        assert!(
+            ctx.lookup_symbol("!strk1").is_some(),
+            "the mint must have landed on the next free name !strk1"
+        );
+        assert_eq!(ctr, 2, "counter passed the taken name and the minted one");
+    }
+
+    /// Slice 35: a minted `!strk` name is reserved, so a later user
+    /// declaration is rejected at parse time (same regime as word_norm's
+    /// `ite!` names). The user-owned name from the skip case is NOT reserved.
+    #[test]
+    fn fresh_str_reserves_minted_name_only() {
+        let mut ctx = Context::new();
+        let _user = declare_str_var(&mut ctx, "!strk0");
+        let mut ctr = 0u32;
+        let _minted = fresh_str(&mut ctx, &mut ctr);
+        let user_sym = ctx.lookup_symbol("!strk0").unwrap();
+        let minted_sym = ctx.lookup_symbol("!strk1").unwrap();
+        assert!(
+            !ctx.is_reserved(user_sym),
+            "the user-owned name must stay a normal free constant"
+        );
+        assert!(
+            ctx.is_reserved(minted_sym),
+            "the minted name must be reserved against later user declaration"
         );
     }
 
