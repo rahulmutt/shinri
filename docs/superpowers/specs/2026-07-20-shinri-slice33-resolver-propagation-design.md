@@ -223,3 +223,110 @@ must be oracle-confirmed before it is pinned.
 - Slice-31 §11 walls 1, 2, and 4.
 - The standing bank (slice-28 §8, slice-27 typed-antecedent refactor,
   slice-29 approach-C) carries forward unchanged.
+
+## 11. Outcome — measured
+
+This section records what happened, not what §7 predicted. Where a §7
+prediction and the measurement disagree, the measurement is authoritative.
+
+### 11.1 Measured probe verdicts
+
+| Probe | Query | Before (Task 1) | After (Task 5) | §7 predicted | Held? |
+|---|---|---|---|---|---|
+| E | `(= (str.++ "" y) "ab") ∧ (distinct y "ab")` | `unknown` | `unsat` | `unsat` | yes |
+| G | `(= x "") ∧ (= (str.++ x y) "ab") ∧ (distinct y "ab")` | `unknown` | `unsat` | `unsat` | yes |
+| C | `(= (str.len x) 0) ∧ (= (str.++ x y) "ab") ∧ (distinct y "ab")` | `unknown` | `unsat` | **`unknown`** | **NO — falsified** |
+| F | `(= y "ab") ∧ (distinct y "ab")` | `unsat` | `unsat` | `unsat` (control) | yes |
+
+Before-values are the Task 1 baseline; after-values are the Task 5
+full-workspace measurement (failure set was exactly E, G, C — the three
+`unknown → unsat` flips — with F holding).
+
+### 11.2 §7 predictions: E and G held, C was falsified
+
+Probes E and G flipped to `unsat` exactly as §7 predicted, by the mechanism it
+described (the constant-word residual `[y] = ["ab"]` propagates `y ≈ "ab"`,
+which collides with the asserted `distinct`).
+
+**§7's probe-C prediction was falsified.** §7 listed probe C as a stated
+non-goal that would remain `unknown` because deciding it "needs the retracted
+wall-3 `len(x) = 0 → x ≈ ""` grounding seam". It did not remain `unknown`: it
+decides `unsat`, and it does **not** use that seam. The real behaviour is
+compositional. The word equation `x·y = "ab"` F-splits; the asserted
+`len(x) = 0` closes every non-empty branch through the existing arith length
+seam; on the single surviving branch the residual reduces to the pure
+assignment `y = "ab"`, and there the new propagation (§3) fires and collides
+with `distinct y "ab"`. The propagation itself only ever fired on the designed
+constant-word residual shape — the §2 scope fence held; no
+variable-bearing word propagated. The reach is wider than §7's model only
+because the mechanism **composes** with the pre-existing F-split and length
+branching, not because the mechanism widened. The flip was
+controller-adjudicated as a sound completeness gain.
+
+### 11.3 Oracle confirmation
+
+Every flipped pin was confirmed against z3 before being written, and each was
+additionally cross-checked against cvc5 out of band:
+
+| Probe | shinri | z3 | cvc5 |
+|---|---|---|---|
+| E | `unsat` | `unsat` | `unsat` |
+| G | `unsat` | `unsat` | `unsat` |
+| C | `unsat` | `unsat` | `unsat` |
+
+The three probes are pinned in `tests/slice33_probes.rs` and mirrored as
+z3-cross-checked oracle cases (`targeted_probe_{e,g,c}_*`) in
+`tests/qfs_differential.rs`, which run under
+`cargo nextest run -p shinri-solver --features oracle`. No shinri/z3
+disagreement arose on any query — the flips are decisions, not soundness bugs.
+
+### 11.4 What remains open
+
+- **The wider variable-bearing rule (§2).** The scope fence still holds: only
+  constant-word residuals propagate. Lifting it to variable-bearing words
+  reintroduces the deleted E1 probe's failure mode and is a separate slice with
+  its own measurement.
+- **The retracted wall-3 seam is still unlanded.** `len(x) = 0 → x ≈ ""` as a
+  *general* grounding mechanism did not land in this slice. Probe C now decides
+  only because its specific shape composes through F-split and the arith length
+  seam; the general seam remains retracted (see the slice-32 wall-3 retraction).
+- **Slice-31 §11 walls 1, 2, and 4** remain research-tier and unaddressed here.
+- **The standing bank** (slice-28 §8, slice-27 typed-antecedent refactor,
+  slice-29 approach-C) carries forward unchanged.
+
+### 11.5 §5 was also incomplete: the merge had to become *tracked* (T5b)
+
+The full oracle gate (486 tests) initially failed: `qfs_predicates_matches_z3`
+and `qfs_regex_symbolic_matches_z3` panicked at the slice-12 `side_clean`
+debug invariant — "string leaf merged via a cross-theory Interface
+antecedent". No engine/z3 verdict ever disagreed; the debug-only net fired,
+exactly the §9.2 risk.
+
+§5 argued E1 does not apply because the propagation "mints no atom and learns
+no clause". That argument was incomplete. The `side_clean`/cond_roots net
+rests on a broader premise: *every* string-leaf merge is caused by a tracked
+`eq_true`/`diseq_true` entry, so the per-check cond_roots computation catches
+every conditionally (dl>0) merged class and the guard-free channels decline
+for it. The propagation merge is a new merge mechanism with no tracked entry,
+and it demonstrably fires at dl>0 (probe C fires it inside an F-split
+branch) — so cond_roots could miss a branch-local merge: a real wrong-UNSAT
+hazard for the gated channels, not a stale assert.
+
+The fix (`440a70eb`, T5b) tracks the mechanism instead of weakening the net:
+
+- `prop_merge_info: Vec<(TermId, TermId, u32)>` — (var, word, merge level via
+  `trail.level()`, the same source as `eq_levels`) — 1:1 with `prop_tags` and
+  truncated to the same fifth trail mark on `pop`;
+- the cond_roots computation folds in every level>0 propagation merge
+  (both roots into `input_cond_roots` and `all_cond_roots`, classified like a
+  non-minted input atom — the conservative choice);
+- `side_clean` accepts an `Interface` antecedent on a string leaf **only** for
+  a live self-theory tag, and walks the tag's antecedent DAG
+  (visited-guarded) asserting every reached `Asserted` literal is
+  level-tracked; foreign-theory and dead tags still assert-fail.
+
+After T5b the full oracle suite is green (486 run, 0 failed) and every pin in
+§11.1 holds unchanged. The corrected §5 claim: E1's *clause gates* have
+nothing to reject, but the *tracking premise* applies to any string-leaf
+merge — the propagation is sound because it is scoped by `push`/`pop`, fully
+cited via `explain`, **and now visible to cond_roots**.

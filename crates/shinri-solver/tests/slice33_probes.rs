@@ -1,8 +1,12 @@
 //! Slice 33 probes (spec §7). These pin the resolver-propagation frontier.
 //!
-//! Written BEFORE the implementation as a measured baseline: every probe here
-//! records what the engine does TODAY. Task 6 updates the ones that actually
-//! flip, and only after z3 confirms the new verdict.
+//! Written BEFORE the implementation as a measured baseline; now (Task 6) each
+//! probe records what the engine does with the propagation mechanism landed,
+//! after the new verdict was oracle-confirmed. Measured flips: probes E, G, AND
+//! C all moved `unknown → unsat`; the control probe F held `unsat`. Spec §7
+//! predicted E and G would flip and predicted C would STAY `unknown`; the
+//! probe-C prediction was FALSIFIED (see `probe_c_len_zero_var` below). Every
+//! pin here is confirmed by BOTH z3 and cvc5.
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
 
@@ -26,20 +30,19 @@ fn run_script(src: &str) -> Vec<String> {
     out
 }
 
-/// Probe E — the empty string is a SOURCE-LEVEL literal, so there is nothing to
-/// ground. Predicted (spec §7) to flip to `unsat` once the resolver can
-/// propagate `[y] = ["ab"]`.
+/// Probe E — PIN (slice 33). The residual `[y] = ["ab"]` now propagates
+/// `y ≈ "ab"`, which contradicts the asserted `distinct`. z3 + cvc5: unsat.
 #[test]
 fn probe_e_empty_literal_concat() {
     let out = run_script(
         r#"(set-logic QF_S)(declare-fun y () String)
            (assert (= (str.++ "" y) "ab"))(assert (distinct y "ab"))(check-sat)"#,
     );
-    assert_eq!(out, vec!["unknown"], "BASELINE (pre-slice-33)");
+    assert_eq!(out, vec!["unsat"]);
 }
 
-/// Probe G — `x = ""` asserted by hand, strictly more than any grounding
-/// mechanism could achieve. Predicted to flip to `unsat`.
+/// Probe G — PIN (slice 33). The `x = ""` merge rewrites the normal form to
+/// `[y]`; same propagation path as probe E. z3 + cvc5: unsat.
 #[test]
 fn probe_g_asserted_empty_var() {
     let out = run_script(
@@ -47,12 +50,22 @@ fn probe_g_asserted_empty_var() {
            (assert (= x ""))(assert (= (str.++ x y) "ab"))
            (assert (distinct y "ab"))(check-sat)"#,
     );
-    assert_eq!(out, vec!["unknown"], "BASELINE (pre-slice-33)");
+    assert_eq!(out, vec!["unsat"]);
 }
 
-/// Probe C — needs `len(x) = 0 → x ≈ ""` grounding, i.e. the RETRACTED wall-3
-/// seam. Predicted to stay `unknown`. That is a STATED NON-GOAL (spec §7), not
-/// a failure: this assertion must still read `unknown` at the end of slice 33.
+/// Probe C — PIN (slice 33). Spec §7 PREDICTED this would STAY `unknown` (it
+/// was listed as a stated non-goal needing the retracted wall-3 `len(x) = 0 →
+/// x ≈ ""` grounding seam). That prediction was FALSIFIED by measurement: C
+/// flips to `unsat`, and NOT via the retracted seam. Mechanism: the word
+/// equation `x·y = "ab"` F-splits; the asserted `len(x) = 0` closes every
+/// non-empty branch through the arith length seam; on the surviving branch the
+/// residual reduces to the pure assignment `y = "ab"`, where the new
+/// propagation (spec §3) fires and collides with `distinct y "ab"`. The
+/// propagation itself only ever fired on the designed constant-word residual
+/// shape — the §2 scope fence held — so the REACH here is wider than §7's model
+/// only because the mechanism COMPOSES with existing F-split/length branching,
+/// not because it widened. The flip is a sound completeness gain: z3 + cvc5
+/// both confirm `unsat`. Controller-adjudicated ACCEPTED.
 #[test]
 fn probe_c_len_zero_var() {
     let out = run_script(
@@ -60,7 +73,7 @@ fn probe_c_len_zero_var() {
            (assert (= (str.len x) 0))(assert (= (str.++ x y) "ab"))
            (assert (distinct y "ab"))(check-sat)"#,
     );
-    assert_eq!(out, vec!["unknown"], "NON-GOAL: out of scope for slice 33");
+    assert_eq!(out, vec!["unsat"]);
 }
 
 /// Probe F — control. The contradiction machinery is intact once the equality
