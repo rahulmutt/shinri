@@ -162,5 +162,164 @@ fence's e2e witness: if it flips, the fence broke.
   measurement (`unknown` at base, z3 `unsat`), so the future slice starts
   from data. Its two open designs: the CONCAT merge target's normal-form
   dependency, and the in-word occurs-check.
+
+## 11. Outcome
+
+This section records what actually happened, in the order it happened,
+including a completeness regression that was caught, diagnosed, and fixed
+mid-slice. Every value below is measured, not predicted.
+
+### T1 — baseline (commit `6661b492`)
+
+The §7 table's "before" column, measured directly against the branch base
+(`17ef967e`), matched the prediction exactly: A1/A2/A4 → `unknown` (z3:
+`unsat` for all three — the needless-incompleteness gap is real); A3 → `sat`
+(control); B1 → `unknown` (z3: `unsat` — the banked multi-atom gap is also
+real).
+
+### T3 — alias propagation lands (commits `a8008dcc`, `ab717f1a`)
+
+After the `resolve_inner` alias case landed and was pinned: A1, A2, A4 all
+flipped `unknown → unsat`, each z3-confirmed **before** the pin was written.
+A3 held `sat` (SAT control intact — a var–var merge creates a constant-free
+string class and model construction still produces a self-check-passing
+witness, confirming spec §5). B1 held `unknown` — the scope fence (§2, the
+multi-atom variable-bearing shape) did not flip, confirmed at both the unit
+tier (`skolem`-independent multi-atom fence test) and e2e (`probe_b1_multi_atom_fence`).
+Oracle: the three new `targeted_probe_a{1,2,4}_*` cases plus the existing A3
+control were added to `qfs_differential.rs`, 6/6 green (the T3 brief's own
+tally).
+
+### T4 first run — dump-and-diff CAUGHT a forbidden flip
+
+Running the Step 1–4 dump-and-diff against `ab717f1a` (before the T4b fix)
+surfaced a **forbidden** `sat → unknown` flip at hash `267be3752621a073`.
+Minimized repro (`task-4-blocker-diagnosis.md`): a NEGATIVE (complement)
+regex membership on `s2` combined with a literal-PREFIX concat
+`s2 = "ab" ++ s0`. z3: `sat`, witness `s0 = ""`, `s2 = "ab"`.
+
+Root cause: spec §3's implicit assumption — "any surviving var–var residual
+is safe to merge, structurally guaranteed distinct-class by the stripping
+step" — was **FALSIFIED** for a residual whose atoms are internal char-peel
+skolems, not input variables. Peeling the literal head `"ab"` off `s2`'s
+concat mints fresh remainders and eventually produces a residual
+`[!strk1] = [!strk0]` — both atoms are minted skolems, and the slice-34
+guard (shape-only: single free var each side) accepted it, propagating
+`!strk1 ≈ !strk0` directly into EUF and **replacing the F-split** the model
+builder needed. The model builder then resolved `s2`'s value through the
+char-peel skolem concat (`t40 = "a" ++ !strk0`, `!strk0` free-filling to `""`
+for zero class-length) instead of the anchoring original concat
+(`t9 = "a"·"b"... = "ab" ++ s0`), producing a too-short value that
+disagreed with `s2`'s class length; the length-consistency guard discarded
+it and free-filled `s2` to a garbage value that failed the asserted
+equation. The post-solve witness self-check correctly rejected that model
+and downgraded `sat → unknown`. **The verdict was sound at every step** —
+the bug was a lost decision (completeness regression), never an
+unsoundness. Say this plainly: the slice-34 mechanism as first landed was
+over-general, and the dump-and-diff gate that spec §8/§9 called for is
+exactly what caught it before merge.
+
+### T4b — fix (commit `4338040b`)
+
+Fix: exclude minted `!strk*` skolems from the alias guard
+(`is_minted_skolem`, a name-prefix check on the `fresh_str` branding
+contract) — neither atom of the propagated pair may be a minted skolem; a
+skolem-involving residual now falls through to the pre-existing F-split
+path (exactly base behavior for that residual, no new merge, no new
+citation/`cond_roots` concern). Regression pinned at three tiers: a unit
+test (`skolem_skolem_residual_does_not_propagate`, both atoms named
+`!strk*` exactly as `fresh_str` brands them, asserts the residual does NOT
+propagate), an e2e probe (`probe_c1_charpeel_skolem_sat`, the minimized T4
+repro, asserts `sat`), and an oracle case
+(`targeted_probe_c1_charpeel_skolem_sat`). Reviewer-verified reasoning
+(diagnosis doc, Option A): reduction-minted term families that DO carry
+user-visible structure (`!pre`/`!mid`/`!post`/`!pfx`/`!sfx`/`!ctnl`/`!ctnr`/
+`!ite`) are anchored like input variables and remain legitimately
+propagatable — only `!strk` is minted purely as internal char-peel/F-split
+bookkeeping during word-equation solving, and it is the only family excluded.
+
+### T4 resumed — dump-and-diff against the FIXED code
+
+Reused the base dump (`dump-base.txt`, 3901 `DIFFDUMP` lines from
+`17ef967e` — unchanged, so no new worktree was needed) and re-dumped the
+fix side against `4338040b` (90 tests, 0 failed — 89 pre-existing + the new
+T4b oracle case; 3905 `DIFFDUMP` lines). Sorted diff, base vs fix:
+
+```
+283a284
+> DIFFDUMP 1267c004253c1848 Some("sat") bail=0
+333a335
+> DIFFDUMP 14ff5e5dc4551055 Some("unsat") bail=0
+3199a3202
+> DIFFDUMP d0dc21629c9c905c Some("unsat") bail=0
+3322a3326
+> DIFFDUMP d9a3304b27bdcd35 Some("unsat") bail=0
+```
+
+**Final tally: exactly 4 lines of difference, all pure additions (0 lines
+removed, 0 lines changed in place)** — the four new targeted test cases
+(A1/A2/A4 from T3 + C1 from T4b), each a `src` string that literally does
+not exist in the base test file. Zero hash-keyed flips of any direction on
+shared cases: zero `decided → unknown`, zero `sat ↔ unsat`, zero bailout
+increases. The invariant holds, with one notable and expected detail:
+hash `267be3752621a073` (the forbidden-flip case) now reads `Some("sat")`
+identically on **both** sides — the regression is fully closed, not merely
+masked. Hash `74c5d57da2094bbc` (and its base-side bookkeeping companion
+`c822a44df2057c87`), which showed an *allowed* `unknown → sat` flip in the
+first (pre-fix) dump-and-diff run, now reads identically on both sides too
+(`unknown`/`unknown` and `sat`/`sat` respectively) — it no longer appears
+in the diff at all. That bonus win was itself a side effect of the
+over-general (unfixed) alias guard firing on a skolem-involving residual
+that happened not to corrupt that particular model; T4b's fix is a strict
+narrowing back to base behavior on every skolem-involving residual, so this
+incidental win reverted along with the regression. This is expected and
+correct per Option A's design (a pure restriction of when `Propagate`
+fires), not a new problem.
+
+### Step 6 — completeness-shifting gate (`script_e2e`)
+
+The plan's literal filter `test(script_e2e)` finds 0 tests on this nextest
+version (a recorded harness gotcha); `-E 'binary(script_e2e)'` discovered
+67 tests. Result: **67 passed, 1 skipped, 0 failed** — no pin flips at all,
+so no adjudication was needed.
+
+### Step 7 — full gate
+
+- `cargo fmt --all -- --check`: clean.
+- `cargo clippy --workspace --all-targets -- -D warnings`: clean, 0 warnings.
+- `cargo nextest run --workspace`: **1131 passed, 0 failed, 7 skipped**
+  (the `#[ignore]`d nightly-tier `shinri-fp` exhaustives, per
+  `AGENTS.md`), ~265s.
+- `cargo nextest run -p shinri-solver --features oracle`: **497 passed, 0
+  failed, 3 skipped**, ~1175s. Non-zero confirmed (this count covers every
+  oracle-gated binary in the crate — `qfs_differential`, `fp_oracle`,
+  `qfabv_oracle`, etc. — not only the `qfs_differential` subset the plan's
+  "~489" estimate was scoped to; the `qfs_differential` binary alone ran 90
+  of these, matching the dump-and-diff run above).
+
+### Fence and scope, final status
+
+The scope fence held throughout: probe B1 (`unknown`, unchanged) and the
+unit fence test (renamed from "variable-bearing does not propagate" to
+"**multi-atom** variable-bearing does not propagate" per §3's naming
+truth-up) both still pin the multi-atom shape as banked, untouched by this
+slice. The dump-and-diff and full-gate results above are the drift check
+called for in §9; no drift was found beyond the two expected additions/
+reversions discussed above.
+
+### Open
+
+Multi-atom variable-bearing propagation remains banked exactly as §10
+describes, now WITH the T1/T4 B1 measurement reconfirmed unchanged. One
+new item for future hardening, surfaced by the T4 regression itself: the
+skolem exclusion in `resolve_inner` is a **name-prefix check** on the
+`!strk` branding contract (`is_minted_skolem`), not a tracked-TermId set —
+documented as a heuristic in the fix's own comment (a false positive only
+narrows completeness, never introduces unsoundness, so this is safe but not
+maximally precise). A tracked set of minted skolem `TermId`s would be the
+principled version; noted as future hardening, not required for this
+slice. The standing bank (slice-28 §8, slice-27 typed-antecedent refactor,
+slice-29 approach-C, slice-31 §11 walls 1/2/4, the retracted wall-3 seam)
+is otherwise unchanged.
 - Standing bank unchanged: slice-28 §8, slice-27 typed-antecedent refactor,
   slice-29 approach-C, slice-31 §11 walls 1/2/4, the retracted wall-3 seam.
