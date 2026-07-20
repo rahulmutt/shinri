@@ -2956,6 +2956,50 @@ fn targeted_probe_c_len_zero_var_unsat() {
     );
 }
 
+// ── Slice 34: alias-propagation probes — oracle-confirmed pins ───────────────
+// The resolver now propagates the alias residual `[v] = [u]` (slice-34 spec
+// §3): a var–var EUF merge with cited antecedents instead of a sound
+// `Unknown`. These probes measured `unknown → unsat` at Task 3; `expect`
+// cross-checks z3 on every call, so a shinri/z3 disagreement is a hard fail.
+
+#[test]
+fn targeted_probe_a1_prefix_alias_unsat() {
+    // Probe A1 (spec §7). `"a"·x = "a"·y` strips the shared head to the alias
+    // residual `[x] = [y]`, which propagates `x ≈ y` against `distinct x y`.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
+         (assert (= (str.++ \"a\" x) (str.++ \"a\" y)))\
+         (assert (distinct x y))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_probe_a2_suffix_alias_unsat() {
+    // Probe A2 (spec §7). Suffix twin: tail-stripping, same propagation path.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
+         (assert (= (str.++ x \"a\") (str.++ y \"a\")))\
+         (assert (distinct x y))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_probe_a4_chain_unsat() {
+    // Probe A4 (spec §7). Chained alias merges `x ≈ y`, `y ≈ z` compose in
+    // EUF; `distinct x z` conflicts. Exercises per-merge eager cond_roots
+    // re-insertion (slice-33 §11.6) on chained propagations.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
+         (declare-fun z () String)\
+         (assert (= (str.++ \"a\" x) (str.++ \"a\" y)))\
+         (assert (= (str.++ \"b\" y) (str.++ \"b\" z)))\
+         (assert (distinct x z))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // str.substr / str.at targeted cases — LIVE and passing.
 //

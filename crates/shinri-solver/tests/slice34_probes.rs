@@ -4,8 +4,9 @@
 //! the engine's current sound-but-needless `unknown` (z3 says `unsat` for all
 //! three), A3 is the SAT control, and B1 pins the §2 scope fence (the
 //! multi-atom variable-bearing shape, banked — must NOT flip this slice).
-//! Task 3 re-measures after the mechanism lands and flips A1/A2/A4 only after
-//! oracle confirmation.
+//! Task 3 re-measured after the mechanism landed: A1/A2/A4 flipped
+//! `unknown → unsat` (each z3-confirmed before the pin was written); A3 held
+//! `sat`; B1 held `unknown` (the fence held).
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
 
@@ -29,9 +30,10 @@ fn run_script(src: &str) -> Vec<String> {
     out
 }
 
-/// Probe A1 — BASELINE. `"a"·x = "a"·y` strips the shared head to the alias
-/// residual `[x] = [y]`, which today falls through to F-split → dedup →
-/// `Saturated` → a sound `unknown`. z3: unsat (cancellation entails x = y).
+/// Probe A1 — PIN (slice 34). `"a"·x = "a"·y` strips the shared head to the
+/// alias residual `[x] = [y]`, which now propagates `x ≈ y` (spec §3) and
+/// collides with the asserted `distinct`. Measured `unknown → unsat` at
+/// Task 3; z3 confirms unsat.
 #[test]
 fn probe_a1_prefix_alias() {
     let out = run_script(
@@ -39,11 +41,12 @@ fn probe_a1_prefix_alias() {
            (assert (= (str.++ "a" x) (str.++ "a" y)))
            (assert (distinct x y))(check-sat)"#,
     );
-    assert_eq!(out, vec!["unknown"], "baseline; Task 3 flips this pin");
+    assert_eq!(out, vec!["unsat"]);
 }
 
-/// Probe A2 — BASELINE. Suffix twin of A1: tail-stripping produces the same
-/// alias residual. z3: unsat.
+/// Probe A2 — PIN (slice 34). Suffix twin of A1: tail-stripping produces the
+/// same alias residual; same propagation path. Measured `unknown → unsat` at
+/// Task 3; z3 confirms unsat.
 #[test]
 fn probe_a2_suffix_alias() {
     let out = run_script(
@@ -51,7 +54,7 @@ fn probe_a2_suffix_alias() {
            (assert (= (str.++ x "a") (str.++ y "a")))
            (assert (distinct x y))(check-sat)"#,
     );
-    assert_eq!(out, vec!["unknown"], "baseline; Task 3 flips this pin");
+    assert_eq!(out, vec!["unsat"]);
 }
 
 /// Probe A3 — SAT CONTROL. The alias equation alone. A var–var merge creates
@@ -66,9 +69,10 @@ fn probe_a3_sat_control() {
     assert_eq!(out, vec!["sat"], "control: must never regress");
 }
 
-/// Probe A4 — BASELINE. Chained aliasing: two alias merges (`x ≈ y`, `y ≈ z`)
-/// must compose so `distinct x z` conflicts. Exercises the §11.6 per-merge
-/// eager cond_roots re-insertion on chained propagations (spec §9). z3: unsat.
+/// Probe A4 — PIN (slice 34). Chained aliasing: `x ≈ y` and `y ≈ z` compose
+/// in EUF; `distinct x z` conflicts. Each propagation eagerly re-inserts its
+/// own post-merge root into cond_roots (slice-33 §11.6). Measured
+/// `unknown → unsat`; z3 confirms.
 #[test]
 fn probe_a4_chain() {
     let out = run_script(
@@ -78,7 +82,7 @@ fn probe_a4_chain() {
            (assert (= (str.++ "b" y) (str.++ "b" z)))
            (assert (distinct x z))(check-sat)"#,
     );
-    assert_eq!(out, vec!["unknown"], "baseline; Task 3 flips this pin");
+    assert_eq!(out, vec!["unsat"]);
 }
 
 /// Probe B1 — SCOPE FENCE (spec §2, banked shape). After stripping, the
