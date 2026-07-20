@@ -186,9 +186,12 @@ string class and model construction still produces a self-check-passing
 witness, confirming spec §5). B1 held `unknown` — the scope fence (§2, the
 multi-atom variable-bearing shape) did not flip, confirmed at both the unit
 tier (`skolem`-independent multi-atom fence test) and e2e (`probe_b1_multi_atom_fence`).
-Oracle: the three new `targeted_probe_a{1,2,4}_*` cases plus the existing A3
-control were added to `qfs_differential.rs`, 6/6 green (the T3 brief's own
-tally).
+Oracle: the three new `targeted_probe_a{1,2,4}_*` cases were added to
+`qfs_differential.rs`, 3/3 green. A3 has no oracle case of its own — it is
+an e2e-only SAT control that lives solely in `slice34_probes.rs`; it was
+never mirrored into `qfs_differential.rs`. (T4b, below, adds a fourth oracle
+case, `targeted_probe_c1_charpeel_skolem_sat`, bringing the branch's total
+oracle additions to 4: A1/A2/A4 here plus C1.)
 
 ### T4 first run — dump-and-diff CAUGHT a forbidden flip
 
@@ -310,16 +313,33 @@ reversions discussed above.
 ### Open
 
 Multi-atom variable-bearing propagation remains banked exactly as §10
-describes, now WITH the T1/T4 B1 measurement reconfirmed unchanged. One
-new item for future hardening, surfaced by the T4 regression itself: the
-skolem exclusion in `resolve_inner` is a **name-prefix check** on the
-`!strk` branding contract (`is_minted_skolem`), not a tracked-TermId set —
-documented as a heuristic in the fix's own comment (a false positive only
-narrows completeness, never introduces unsoundness, so this is safe but not
-maximally precise). A tracked set of minted skolem `TermId`s would be the
-principled version; noted as future hardening, not required for this
-slice. The standing bank (slice-28 §8, slice-27 typed-antecedent refactor,
-slice-29 approach-C, slice-31 §11 walls 1/2/4, the retracted wall-3 seam)
-is otherwise unchanged.
-- Standing bank unchanged: slice-28 §8, slice-27 typed-antecedent refactor,
-  slice-29 approach-C, slice-31 §11 walls 1/2/4, the retracted wall-3 seam.
+describes, now WITH the T1/T4 B1 measurement reconfirmed unchanged. Items
+banked for future hardening, surfaced by this slice's own review:
+
+- The skolem exclusion in `resolve_inner` is a **name-prefix check** on the
+  `!strk` branding contract (`is_minted_skolem`), not a tracked-TermId set —
+  documented as a heuristic in the fix's own comment (a false positive only
+  narrows completeness, never introduces unsoundness, so this is safe but
+  not maximally precise). A tracked set of minted skolem `TermId`s would be
+  the principled version; noted as future hardening, not required for this
+  slice.
+- (Important, inherited from slice 33, empirically clean across 3901 dump
+  hashes + 497 oracle tests) Uncited EUF-strip window for `Propagate` off
+  wrapper-flattened words: when a class rep is itself a CONCAT, the wrapper
+  structurally flattens it and inner atoms are never rep-substituted, so the
+  strip loops (wordeq.rs ~506-515) can fire via `same()`'s `eq.are_equal`
+  branch on a class equality cited in neither `just` nor `nf_ante`, so a tag
+  reached through such a strip is under-cited — the wrapper downgrades
+  `Conflict` for exactly this reason (~line 442) but passes `Propagate`
+  through unguarded (wrong-UNSAT shape, narrow reachability). Candidate
+  fixes: append `eq.explain(a,b)` leaves into `just` on EUF-branch strips, or
+  downgrade `Propagate` off flattened words symmetrically with `Conflict`.
+- (Minor, pre-existing) `fresh_str` freshness gap: it interns via
+  `declare_fun` by name without `reserve_symbol`, so a user-declared
+  `|!strk0|` hash-conses with a later-minted skolem — for the slice-34 guard
+  this is the documented harmless false positive, but the minted-skolem-as-
+  user-term collision is a standing freshness hazard; follow-up = reserve
+  minted `!strk` symbols (mechanism exists for word_norm).
+
+Standing bank unchanged: slice-28 §8, slice-27 typed-antecedent refactor,
+slice-29 approach-C, slice-31 §11 walls 1/2/4, the retracted wall-3 seam.

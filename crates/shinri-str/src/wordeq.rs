@@ -1658,6 +1658,69 @@ mod tests {
         );
     }
 
+    /// Final-review pin: a MIXED residual — one input variable, one minted
+    /// `!strk*` skolem — must NOT propagate either. The T4b guard
+    /// (`!is_minted_skolem(l) && !is_minted_skolem(r)`) excludes a residual
+    /// as soon as EITHER atom is a minted skolem, not only the skolem-skolem
+    /// shape `skolem_skolem_residual_does_not_propagate` above pins. This is
+    /// a deliberate scope decision — the T4b diagnosis only demonstrated
+    /// corruption for skolem-skolem residuals, so the mixed pair's exclusion
+    /// was a choice, not something the diagnosis forced. Pins both
+    /// orientations.
+    #[test]
+    fn mixed_var_skolem_residual_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        // Input variable, declared the same way every other test in this
+        // module declares one.
+        let x = declare_str_var(&mut ctx, "x_mixed");
+        // Minted skolem, named exactly the way `fresh_str` brands one —
+        // mirrors `skolem_skolem_residual_does_not_propagate` above.
+        let strk0 = declare_str_var(&mut ctx, "!strk0");
+        let lit = dummy_eqn_lit();
+
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r1 = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[x],
+            &[strk0],
+            vec![EqLeaf::Asserted(lit)],
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(r1, StepResult::Propagate { .. }),
+            "a mixed var-skolem residual [x] = [!strk0] must NOT propagate — \
+             mixed pairs are deliberately excluded by the T4b guard (either \
+             atom being a minted skolem is enough), not just the skolem-skolem \
+             shape"
+        );
+
+        // Symmetric orientation: the EUF merge is symmetric, so the guard
+        // must reject the pair regardless of which side the skolem lands on.
+        let mut ctr2 = 0u32;
+        let mut emitted2 = FxHashSet::default();
+        let r2 = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[strk0],
+            &[x],
+            vec![EqLeaf::Asserted(lit)],
+            lit,
+            &mut ctr2,
+            &mut emitted2,
+        );
+        assert!(
+            !matches!(r2, StepResult::Propagate { .. }),
+            "the symmetric orientation [!strk0] = [x] must NOT propagate \
+             either — mixed pairs are deliberately excluded, not forced by \
+             the T4b diagnosis"
+        );
+    }
+
     // ── Slice 14 root-fix: single-variable forced-length analysis ────────────
     // When one side is fully constant and the other is a single (possibly
     // repeated) variable interleaved with constants, the variable length is
