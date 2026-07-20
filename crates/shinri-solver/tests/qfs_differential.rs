@@ -2909,6 +2909,53 @@ fn targeted_disequality_witness_sat() {
     );
 }
 
+// ── Slice 33: resolver-propagation probes — oracle-confirmed pins ────────────
+// The word-equation resolver now propagates an entailed pure assignment
+// `v ≈ W` (constant `W`) into EUF instead of falling through to a sound
+// `Unknown` (spec §3). These three probes each measured `unknown → unsat` at
+// Task 5; z3 (and cvc5, checked out of band) agree `unsat` on all three. `expect`
+// cross-checks z3 on every call, so a shinri/z3 disagreement here is a hard fail.
+
+#[test]
+fn targeted_probe_e_empty_literal_concat_unsat() {
+    // Probe E (spec §7). `(str.++ "" y) = "ab"` normalizes to `[y] = ["ab"]`,
+    // which propagates `y ≈ "ab"` and collides with `distinct y "ab"`.
+    expect(
+        "(set-logic QF_S)(declare-fun y () String)\
+         (assert (= (str.++ \"\" y) \"ab\"))(assert (distinct y \"ab\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_probe_g_asserted_empty_var_unsat() {
+    // Probe G (spec §7). The asserted `x = ""` merge rewrites the normal form to
+    // `[y]`; same propagation path as probe E.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
+         (assert (= x \"\"))(assert (= (str.++ x y) \"ab\"))\
+         (assert (distinct y \"ab\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
+#[test]
+fn targeted_probe_c_len_zero_var_unsat() {
+    // Probe C (spec §7). Spec §7 PREDICTED `unknown` (retracted wall-3 seam,
+    // stated non-goal); that prediction was FALSIFIED. The verdict is `unsat`,
+    // reached NOT via the seam but by composition: `x·y = "ab"` F-splits, the
+    // asserted `len(x) = 0` closes every non-empty branch via the arith length
+    // seam, and on the surviving branch the residual reduces to `y = "ab"`,
+    // where the new propagation fires against `distinct y "ab"`. Sound
+    // completeness gain — z3 and cvc5 both confirm `unsat`.
+    expect(
+        "(set-logic QF_S)(declare-fun x () String)(declare-fun y () String)\
+         (assert (= (str.len x) 0))(assert (= (str.++ x y) \"ab\"))\
+         (assert (distinct y \"ab\"))(check-sat)",
+        Verdict::Unsat,
+    );
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // str.substr / str.at targeted cases — LIVE and passing.
 //

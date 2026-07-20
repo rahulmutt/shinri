@@ -19,7 +19,7 @@ pub use fuel::Fuel;
 use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
-use shinri_theory::types::{ENodeId, EqLeaf};
+use shinri_theory::types::{ENodeId, EqJust, EqLeaf};
 use shinri_theory::{EqualityEngine, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
 #[derive(Default)]
@@ -51,6 +51,22 @@ pub struct StrSolver {
     order_true: Vec<(TermId, Lit, bool)>,
     /// SAT decision level per order_true entry (lock-step; truncated on pop).
     order_levels: Vec<u32>,
+    /// Slice 33: antecedent sets for propagation merges, indexed by tag. Entry
+    /// `i` is the antecedent set of `TheoryJust { theory: THEORY_ID, tag: i }`.
+    /// Trail-scoped (truncated on `pop`) — a tag MUST NOT outlive the branch
+    /// that minted it, or `explain` would expand it to antecedents that are no
+    /// longer asserted (a stale-antecedent wrong-UNSAT).
+    prop_tags: Vec<Vec<EqLeaf>>,
+    /// Slice 33 (T5b): parallel to `prop_tags`, one entry per propagation merge —
+    /// `(var, word, level)`, where `level` is the decision level at which the merge
+    /// was performed (same source as `eq_levels`: `self.trail.level()`). Used by
+    /// `check` to fold propagation merges into `cond_roots`: a propagation merge is
+    /// an UNTRACKED merge mechanism w.r.t. `eq_true`/`diseq_true`, so without this
+    /// fold-in the slice-12 `side_clean` net would miss a branch-local (level>0)
+    /// merged class. 1:1 with `prop_tags` (each `Propagate` allocates exactly one
+    /// tag), and truncated to the SAME fifth trail mark on `pop` — so `level > 0`
+    /// ⟺ the merge is undone by a backtrack below it.
+    prop_merge_info: Vec<(TermId, TermId, u32)>,
     len_terms: FxHashSet<TermId>,
     /// Code-point handle terms `(!strcode h)` minted by the order engine
     /// (slice 31). Exposed to the arith theory alongside `len_terms` so the
@@ -247,6 +263,10 @@ impl TheorySolver for StrSolver {
         //     over a minted-skolem merge is not guaranteed complete.
         // (An unconditional (dl0) equality contributes to NEITHER — its merge is
         // globally entailed, so terms it touches stay resolvable.)
+        // Slice 33 (T5b): the block below ALSO folds in slice-33 PROPAGATION merges
+        // (`var ≈ word`), which back no (dis)equality literal — a conditional (dl>0)
+        // propagation merge classifies like a non-minted input atom (BOTH sets), so
+        // `side_clean` sees its branch-local class just like a tracked merge's.
         let mut input_cond_roots: FxHashSet<ENodeId> = FxHashSet::default();
         let mut all_cond_roots: FxHashSet<ENodeId> = FxHashSet::default();
         {
@@ -272,25 +292,67 @@ impl TheorySolver for StrSolver {
                     }
                 }
             }
+            // Slice 33 (T5b): propagation merges (`var ≈ word`) are a NEW, UNTRACKED
+            // merge mechanism — they leave NO `eq_true`/`diseq_true` entry, so the
+            // loops above miss them. A propagation merge performed at level > 0 is
+            // branch-local, so its endpoints' class root must join `cond_roots` or
+            // `side_clean` would wrongly pass over a conditionally-merged class. The
+            // merge derives from INPUT literals (it mints no atom), so classify it
+            // like a non-minted atom: it enters BOTH `all_cond_roots` and
+            // `input_cond_roots` (the conservative choice).
+            // COVERAGE (slice33 §11.6, final review): this fold-in runs at check()
+            // ENTRY, so it covers only propagation merges ALREADY in `prop_merge_info`
+            // when the sets are built — i.e. merges recorded on PRIOR check rounds.
+            // Propagation is also the first mechanism that merges into `cx.eq` MID-
+            // invocation, and such an intra-check merge is minted AFTER these sets
+            // exist, so it is NOT covered here. That gap is closed EAGERLY at the merge
+            // site: the `Ok(())` arm of the propagation merge inserts its POST-merge
+            // root into both sets when level > 0 (see below, ~`cx.eq.merge` call).
+            // Together: fold-in = check-entry state; Ok-arm insertion = intra-check
+            // merges. Every branch-local propagation root is therefore in `cond_roots`
+            // by the time any later gated channel in this same loop reads it.
+            for &(var, word, level) in &self.prop_merge_info {
+                if level > 0 {
+                    for side in [var, word] {
+                        let n = cx.eq.intern(side);
+                        let r = cx.eq.find(n);
+                        all_cond_roots.insert(r);
+                        input_cond_roots.insert(r);
+                    }
+                }
+            }
         }
 
         // ── E1 (iter 3) side_clean / cond_roots SOUNDNESS INVARIANT (debug-only) ──
-        // Antecedent precision is sound because: a conditional (dl>0) merge of a string
-        // LEAF variable is caused by a TRACKED (dis)equality — an `eq_true`/`diseq_true`
-        // entry — whose sides we just added to `cond_roots`; since every member of an
-        // EUF class shares one root, a conditionally-merged leaf's root is therefore in
-        // `cond_roots`, so `side_clean` flags it. The load-bearing premise is that a
-        // string leaf is NEVER merged by an UNTRACKED mechanism (a merge with no
-        // corresponding `eq_true`/`diseq_true` literal): if it were AND that merge were
-        // branch-local, `cond_roots` would miss it and `side_clean` could wrongly pass.
-        // We pin the WEAKEST sound approximation that catches such a violation: every
-        // `EqLeaf::Asserted` antecedent of any string leaf's merge-to-root is a literal
-        // we track in `lit_lvl` (so its decision level — hence its cond_roots membership
-        // when dl>0 — is known). `Interface` leaves would signal a cross-theory merge of
-        // a string leaf, which does not occur in this fragment (the N-O seam exchanges
-        // only Int length terms, never string-leaf equalities); we assert their absence
-        // too, so a future seam change that violates the premise trips here rather than
-        // silently at a later wrong-UNSAT. Debug-only: no release cost, no verdict change.
+        // Antecedent precision is sound because a conditional (dl>0) merge of a string
+        // LEAF variable is caused by one of TWO now-tracked mechanisms, whose endpoints'
+        // roots we just added to `cond_roots`; since every member of an EUF class shares
+        // one root, a conditionally-merged leaf's root is therefore in `cond_roots`, so
+        // `side_clean` flags it:
+        //   (1) a TRACKED (dis)equality — an `eq_true`/`diseq_true` entry whose sides we
+        //       folded into `cond_roots` above; its antecedent is `EqLeaf::Asserted(lit)`
+        //       and `lit` is level-known via `lit_lvl`; or
+        //   (2) a slice-33 PROPAGATION merge (`var ≈ word`), which mints no atom and backs
+        //       no (dis)equality literal, but is tracked in `prop_merge_info` and folded
+        //       into `cond_roots` when its level > 0 — the check-entry fold-in covers
+        //       merges from prior rounds, and the merge site's `Ok(())` arm eagerly
+        //       inserts the post-merge root for merges minted within THIS invocation, so
+        //       BOTH the pre-entry and intra-check cases are accounted for. Its antecedent
+        //       surfaces here as an `EqLeaf::Interface(j)` with `j.theory == THEORY_ID` and
+        //       a LIVE (trail-scoped, in-range) tag — a level-checkable, self-theory merge.
+        // The load-bearing premise is therefore: every `EqLeaf::Asserted` antecedent of a
+        // string leaf's merge-to-root is a literal we track in `lit_lvl` (level known,
+        // hence cond_roots membership when dl>0 is known), AND every `EqLeaf::Interface`
+        // antecedent is a self-theory (`THEORY_ID`) leaf with a live tag — i.e. a tracked
+        // propagation merge that `prop_merge_info`/`cond_roots` already accounts for. A
+        // FOREIGN-theory Interface leaf on a string leaf (e.g. a future N-O seam that
+        // exchanged string-leaf equalities, not just Int length terms) or a DEAD/out-of-
+        // range self-theory tag would be a merge `cond_roots` cannot level-check, so both
+        // remain forbidden — a violation trips here rather than silently at a later
+        // wrong-UNSAT. We pin the WEAKEST sound approximation: for a live self-theory tag
+        // we additionally walk its antecedent leaves (visited-guarded) and assert every
+        // reached `Asserted` lit is in `lit_lvl` and every nested `Interface` is again a
+        // live self-theory tag. Debug-only: no release cost, no verdict change.
         #[cfg(debug_assertions)]
         {
             let leaves: Vec<TermId> = self
@@ -321,11 +383,32 @@ impl TheorySolver for StrSolver {
                             "side_clean invariant violated: string leaf {t:?} is merged by \
                              UNTRACKED literal {l:?} — cond_roots may miss a conditional merge",
                         ),
-                        EqLeaf::Interface(_) => debug_assert!(
-                            false,
-                            "side_clean invariant violated: string leaf {t:?} merged via a \
-                             cross-theory Interface antecedent — cond_roots cannot level-check it",
-                        ),
+                        EqLeaf::Interface(j) => {
+                            // LEGAL iff this is a live, trail-scoped self-theory
+                            // propagation tag (T5b): the merge is tracked in
+                            // `prop_merge_info` and folded into `cond_roots`. A foreign
+                            // theory, or a dead/out-of-range tag, is a merge `cond_roots`
+                            // cannot level-check — still forbidden.
+                            let is_self_theory = j.theory == <StrSolver as TheorySolver>::THEORY_ID;
+                            let live_tag = (j.tag as usize) < self.prop_tags.len();
+                            debug_assert!(
+                                is_self_theory && live_tag,
+                                "side_clean invariant violated: string leaf {t:?} merged via {} \
+                                 — cond_roots cannot level-check it",
+                                if !is_self_theory {
+                                    "a FOREIGN-theory Interface antecedent"
+                                } else {
+                                    "a DEAD/out-of-range self-theory propagation tag"
+                                },
+                            );
+                            if is_self_theory && live_tag {
+                                // Weakest-sound extension to the new mechanism: walk the
+                                // live tag's antecedent leaves, asserting every reached
+                                // Asserted lit is level-known and every nested Interface
+                                // is again a live self-theory tag.
+                                self.debug_check_prop_tag_leaves(j.tag, &lit_lvl);
+                            }
+                        }
                     }
                 }
             }
@@ -522,8 +605,14 @@ impl TheorySolver for StrSolver {
             // an UNFLATTENED concat class representative (it Saturates instead — the
             // opaque-concat split is the F1 divergence that yielded a spurious
             // UNSAT). Model reconstruction uses the deep view in model.rs.
-            let lhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, l);
-            let rhs = crate::normalize::normal_form(cx.terms, cx.eq, &known, r);
+            // Slice 33: the normal forms substitute EUF class representatives,
+            // and a PROPAGATION merge derives a ground fact from exactly that
+            // substituted material. So the antecedents must be captured — see
+            // the revised comment below. Mirrors lib.rs' disequality path, where
+            // the same-word conflict already cites its substitution antecedents.
+            let mut nf_ante: Vec<EqLeaf> = Vec::new();
+            let lhs = crate::normalize::normal_form_cited(cx.terms, cx.eq, &known, l, &mut nf_ante);
+            let rhs = crate::normalize::normal_form_cited(cx.terms, cx.eq, &known, r, &mut nf_ante);
 
             // Empty-residual lemma (sound, model-preserving). After cancelling the
             // common prefix/suffix, if ONE side's residual is empty and the other is
@@ -686,10 +775,17 @@ impl TheorySolver for StrSolver {
             {
                 // Build the EqLeaf justification from the asserted equality literal.
                 // This feeds `expand_conflict` so the conflict clause cites the right
-                // input literal. `resolve_equation` never derives a ground conflict from
-                // a variable it substituted by a concat class representative (it
-                // Saturates on a concat residual head instead — see wordeq.rs), so no
-                // extra merge-antecedent citation is needed here.
+                // input literal.
+                //
+                // SLICE 33 REVISION. This comment used to read: "`resolve_equation`
+                // never derives a ground conflict from a variable it substituted by a
+                // concat class representative (it Saturates on a concat residual head
+                // instead), so no extra merge-antecedent citation is needed here."
+                // That premise is now FALSE. `StepResult::Propagate` derives a ground
+                // FACT precisely from substituted material, so its merge cites
+                // `Asserted(lit)` PLUS `nf_ante` (the normal-form substitution
+                // antecedents) under an `EqJust::Interface` tag. The Conflict and
+                // Split paths below are unchanged and still rely on the E1 gates.
                 let just = vec![EqLeaf::Asserted(lit)];
                 match crate::wordeq::resolve_equation(
                     cx.terms,
@@ -791,6 +887,110 @@ impl TheorySolver for StrSolver {
                     // witness self-check in `Solver::solve` (model-substitution re-check),
                     // which downgrades an unrealisable SAT to a SOUND `Unknown`.
                     crate::wordeq::StepResult::Saturated => {}
+                    crate::wordeq::StepResult::Propagate {
+                        var,
+                        word,
+                        mut just,
+                    } => {
+                        // Cite the normal-form substitution antecedents ALONGSIDE the
+                        // asserted equation literal. Under-citing here is the ce2
+                        // wrong-UNSAT shape (spec §4) — the merge would survive as a
+                        // fact on branches where the substitution that produced it is
+                        // no longer active.
+                        just.extend(nf_ante.iter().copied());
+                        just.sort_unstable_by_key(|l| match l {
+                            EqLeaf::Asserted(x) => (0u8, x.code() as u64),
+                            EqLeaf::Interface(j) => (1u8, ((j.theory as u64) << 32) | j.tag as u64),
+                        });
+                        just.dedup();
+
+                        // T5b: record the merge at its decision level so `check` can
+                        // fold it into `cond_roots`. Same level source as `eq_levels`
+                        // (`self.trail.level()`), so `level > 0` ⟺ the merge is undone
+                        // by a backtrack below it. `prop_merge_info` stays 1:1 with
+                        // `prop_tags` (each `Propagate` allocates exactly one tag) and
+                        // is truncated to the SAME fifth trail mark on `pop`.
+                        let level = self.trail.level();
+                        let tag = self.alloc_prop_tag(just);
+                        self.prop_merge_info.push((var, word, level));
+                        debug_assert_eq!(
+                            self.prop_tags.len(),
+                            self.prop_merge_info.len(),
+                            "slice33 T5b: prop_tags and prop_merge_info must stay 1:1",
+                        );
+                        let vn = cx.eq.intern(var);
+                        let wn = cx.eq.intern(word);
+                        // NO ATOM IS MINTED AND NO CLAUSE IS LEARNT, but the merge is
+                        // itself an UNTRACKED merge mechanism (no `eq_true`/`diseq_true`
+                        // entry backs it), so T5b folds its conditional (dl>0) endpoints
+                        // into `cond_roots` above via `prop_merge_info`. Branch-locality
+                        // is structural: the merge is scoped by EqualityEngine::push/pop,
+                        // and the tag by the str trail (Task 2).
+                        match cx.eq.merge(
+                            vn,
+                            wn,
+                            EqJust::Interface(TheoryJust {
+                                theory: <StrSolver as TheorySolver>::THEORY_ID,
+                                tag,
+                            }),
+                        ) {
+                            Ok(()) => {
+                                // Final-review hardening (slice33 §11.6). The T5b
+                                // `prop_merge_info` fold-in above runs at check() ENTRY, so
+                                // it only covers propagation merges already present when the
+                                // `cond_roots` sets were built. THIS merge is minted MID-
+                                // check() — the first mechanism to merge into `cx.eq` during
+                                // an invocation — so a level>0 merge creates a class whose
+                                // root is in NEITHER set for the remainder of this same loop,
+                                // and a later gated channel (e.g. the word-eq conflict path)
+                                // could read it as branch-independent. Insert the POST-merge
+                                // root (find(vn) == find(wn), covering the whole class) into
+                                // BOTH sets eagerly — the SAME conservative classification the
+                                // fold-in applies, just applied intra-check. Chained
+                                // propagations each re-insert their own current root.
+                                if level > 0 {
+                                    let r = cx.eq.find(vn);
+                                    all_cond_roots.insert(r);
+                                    input_cond_roots.insert(r);
+                                }
+                            }
+                            Err(conflict) => {
+                                // The merge united a KNOWN-DISEQUAL pair — e.g.
+                                // `y ≈ "ab"` against an asserted `distinct y "ab"`.
+                                // Assemble the conflict in the SAME three parts as
+                                // `Egraph::conflict_leaves` (shinri-euf/src/egraph.rs:441-479);
+                                // this is that pattern specialised to a merge whose
+                                // justification is a single Interface tag.
+                                let mut cf: Vec<EqLeaf> = Vec::new();
+                                // Part 1: why `var = word` was being merged. Our
+                                // justification IS the interface tag, which the
+                                // Combiner expands via StrSolver::explain back to
+                                // `just` (the antecedent set we just allocated).
+                                cf.push(EqLeaf::Interface(TheoryJust {
+                                    theory: <StrSolver as TheorySolver>::THEORY_ID,
+                                    tag,
+                                }));
+                                // Part 2: bridge the merged nodes to the disequality's
+                                // ASSERTED endpoints. Orient by representative — pair
+                                // `a` with whichever endpoint is already in a's class.
+                                let ra = cx.eq.find(conflict.a);
+                                let (a_end, b_end) = if cx.eq.find(conflict.diseq_lhs) == ra {
+                                    (conflict.diseq_lhs, conflict.diseq_rhs)
+                                } else {
+                                    (conflict.diseq_rhs, conflict.diseq_lhs)
+                                };
+                                cx.eq.explain(conflict.a, a_end, &mut cf);
+                                cx.eq.explain(conflict.b, b_end, &mut cf);
+                                // Part 3: the disequality that was violated.
+                                match conflict.diseq {
+                                    EqJust::Asserted(l) => cf.push(EqLeaf::Asserted(l)),
+                                    EqJust::Interface(j) => cf.push(EqLeaf::Interface(j)),
+                                    EqJust::Congruence(_) | EqJust::Definitional => {}
+                                }
+                                return TCheck::Conflict(cf);
+                            }
+                        }
+                    }
                 }
             } // end antecedent-precise word-eq resolution gate (E1 iter 3)
         }
@@ -1211,11 +1411,11 @@ impl TheorySolver for StrSolver {
         TCheck::Sat
     }
 
-    fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {
-        // String theory does not mint self-tagged interface (theory:4) leaves:
-        // string conflicts use EqLeaf::Asserted / resolve through EUF tags.
-        // This guard makes a future invariant break fail loud in debug.
-        debug_assert!(false, "StrSolver::explain reached — string theory should not mint self-tagged interface (theory:4) leaves");
+    fn explain(&mut self, _cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
+        // Slice 33: the string theory now DOES mint self-tagged interface
+        // (theory:4) leaves — the propagation merge's justification (spec §4.1).
+        // Before slice 33 this was a `debug_assert!(false)` stub.
+        self.expand_prop_tag(tag, exp);
     }
 
     fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
@@ -1228,11 +1428,12 @@ impl TheorySolver for StrSolver {
             self.diseq_true.len(),
             self.memb_true.len(),
             self.order_true.len(),
+            self.prop_tags.len(),
         );
     }
 
     fn pop(&mut self, level: usize) {
-        if let Some((e, d, mb, ob)) = self.trail.pop_to(level) {
+        if let Some((e, d, mb, ob, pt)) = self.trail.pop_to(level) {
             self.eq_true.truncate(e);
             self.diseq_true.truncate(d);
             // Keep the parallel assertion-level records in lock-step (E1 gate).
@@ -1242,6 +1443,12 @@ impl TheorySolver for StrSolver {
             self.memb_levels.truncate(mb);
             self.order_true.truncate(ob);
             self.order_levels.truncate(ob);
+            // Slice 33: drop propagation tags minted inside the closed scopes.
+            self.prop_tags.truncate(pt);
+            // T5b: `prop_merge_info` is 1:1 with `prop_tags`, so the SAME fifth
+            // trail mark scopes it — a leaked merge-info entry would leave a
+            // conditional class in `cond_roots` after its merge was undone.
+            self.prop_merge_info.truncate(pt);
         }
     }
 
@@ -1250,6 +1457,16 @@ impl TheorySolver for StrSolver {
         out.extend(self.eq_true.iter().map(|&(_, l)| (l, "str.eq_true")));
         out.extend(self.diseq_true.iter().map(|&(_, l)| (l, "str.diseq_true")));
         out.extend(self.memb_true.iter().map(|&(_, l, _)| (l, "str.memb_true")));
+        // Slice 33: sweep propagation-tag antecedents too. Without this the
+        // retraction-leak net does not see interface justifications at all
+        // (combiner.rs:442) — exactly the mechanism this slice adds.
+        for leaves in &self.prop_tags {
+            for leaf in leaves {
+                if let EqLeaf::Asserted(l) = leaf {
+                    out.push((*l, "str.prop_tags"));
+                }
+            }
+        }
     }
 
     fn shared_arith_terms(&self, cx: &mut TheoryCtx) -> Vec<TermId> {
@@ -1308,6 +1525,79 @@ impl StrSolver {
         let membs: Vec<(TermId, bool)> = self.memb_true.iter().map(|&(a, _, p)| (a, p)).collect();
         let seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
         model::assign(cx.terms, cx.eq, &known, &str_terms, m, &seeds);
+    }
+
+    /// Slice 33 (T5b): walk a propagation tag's antecedent DAG (visited-guarded),
+    /// asserting the side_clean net's extended premise holds for the new mechanism —
+    /// every reached `Asserted` lit is level-known (`lit_lvl`), every nested
+    /// `Interface` is again a live self-theory tag. Debug-only.
+    #[cfg(debug_assertions)]
+    fn debug_check_prop_tag_leaves(&self, start_tag: u32, lit_lvl: &FxHashMap<Lit, u32>) {
+        let mut stack = vec![start_tag];
+        let mut visited: FxHashSet<u32> = FxHashSet::default();
+        while let Some(tag) = stack.pop() {
+            if !visited.insert(tag) {
+                continue;
+            }
+            let leaves = match self.prop_tags.get(tag as usize) {
+                Some(l) => l,
+                None => {
+                    debug_assert!(
+                        false,
+                        "side_clean invariant violated: propagation tag {start_tag} reaches \
+                         out-of-range nested tag {tag}",
+                    );
+                    continue;
+                }
+            };
+            for leaf in leaves {
+                match leaf {
+                    EqLeaf::Asserted(l) => debug_assert!(
+                        lit_lvl.contains_key(l),
+                        "side_clean invariant violated: propagation tag {start_tag} cites \
+                         UNTRACKED literal {l:?} — cond_roots may miss a conditional merge",
+                    ),
+                    EqLeaf::Interface(j) => {
+                        debug_assert!(
+                            j.theory == <StrSolver as TheorySolver>::THEORY_ID
+                                && (j.tag as usize) < self.prop_tags.len(),
+                            "side_clean invariant violated: propagation tag {start_tag} cites a \
+                             foreign/dead nested Interface antecedent — cond_roots cannot \
+                             level-check it",
+                        );
+                        stack.push(j.tag);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Slice 33: record an antecedent set and return its tag. The tag indexes
+    /// `prop_tags`, which is trail-scoped, so the tag is valid only within the
+    /// branch that minted it.
+    fn alloc_prop_tag(&mut self, leaves: Vec<EqLeaf>) -> u32 {
+        let tag = self.prop_tags.len() as u32;
+        self.prop_tags.push(leaves);
+        tag
+    }
+
+    /// Slice 33: expand a propagation tag into `exp`. Split out from the
+    /// `TheorySolver::explain` impl so it is unit-testable without a TheoryCtx.
+    fn expand_prop_tag(&self, tag: u32, exp: &mut Explainer) {
+        match self.prop_tags.get(tag as usize) {
+            Some(leaves) => {
+                // `push_leaf` routes Asserted → lits and Interface → pending, so a
+                // nested interface antecedent keeps expanding in the Combiner's
+                // visited-guarded loop (combiner.rs:882-906).
+                for &leaf in leaves {
+                    exp.push_leaf(leaf);
+                }
+            }
+            None => panic!(
+                "slice33: propagation tag {tag} expanded after its scope was popped \
+                 — a stale tag means the trail truncation is broken"
+            ),
+        }
     }
 }
 
@@ -1775,5 +2065,43 @@ mod tests {
             "positive StrLeq atom must record is_lt = false (relation, not polarity)"
         );
         assert_eq!(solver.order_levels, vec![0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod slice33_explain_tests {
+    use super::*;
+    use shinri_theory::Explainer;
+
+    /// A minted tag expands to exactly the leaves it was allocated with. Under-
+    /// expansion here is the ce2 wrong-UNSAT shape (spec §4).
+    #[test]
+    fn explain_expands_prop_tag_to_its_leaves() {
+        let mut s = StrSolver::default();
+        let a = Lit::new(Var::new(7), true);
+        let b = Lit::new(Var::new(9), false);
+        let tag = s.alloc_prop_tag(vec![EqLeaf::Asserted(a), EqLeaf::Asserted(b)]);
+
+        let mut exp = Explainer::default();
+        s.expand_prop_tag(tag, &mut exp);
+
+        let mut got = exp.lits.clone();
+        got.sort_unstable_by_key(|l| l.code());
+        let mut want = vec![a, b];
+        want.sort_unstable_by_key(|l| l.code());
+        assert_eq!(
+            got, want,
+            "explain must expand a tag to all its antecedents"
+        );
+    }
+
+    /// Tags are allocated densely from 0 so the trail length IS the tag count.
+    #[test]
+    fn prop_tags_are_dense_and_sequential() {
+        let mut s = StrSolver::default();
+        let t0 = s.alloc_prop_tag(vec![]);
+        let t1 = s.alloc_prop_tag(vec![]);
+        assert_eq!((t0, t1), (0, 1));
+        assert_eq!(s.prop_tags.len(), 2);
     }
 }
