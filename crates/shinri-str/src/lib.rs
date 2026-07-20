@@ -797,6 +797,10 @@ impl TheorySolver for StrSolver {
                     // witness self-check in `Solver::solve` (model-substitution re-check),
                     // which downgrades an unrealisable SAT to a SOUND `Unknown`.
                     crate::wordeq::StepResult::Saturated => {}
+                    // Slice 33 T5 wires this properly. Treating it as a no-op here
+                    // is SOUND (it is exactly the pre-slice-33 behaviour) but gains
+                    // nothing — the propagated fact is discarded.
+                    crate::wordeq::StepResult::Propagate { .. } => {}
                 }
             } // end antecedent-precise word-eq resolution gate (E1 iter 3)
         }

@@ -12,6 +12,23 @@ pub enum StepResult {
     /// witness — the (B′) premature-SAT hazard), and instead returns a SOUND
     /// `Unknown`. Distinct from `Done` (which means trivially resolved / consumed).
     Saturated,
+    /// SLICE 33. The equation entails the pure assignment `var ≈ word`, where
+    /// the residual is a single variable on one side and an ALL-CONSTANT word on
+    /// the other. `word` is a SINGLE interned string constant — a multi-atom
+    /// constant side is folded before it is reported, so the caller's merge never
+    /// depends on a CONCAT term's own normal form.
+    ///
+    /// This is NOT the deleted E1 probe (see the comment further down this file).
+    /// That probe returned `Done` — it claimed the equation was RESOLVED and
+    /// cited nothing. This reports a FACT together with `just`, its full
+    /// antecedent set, which the caller merges into EUF under an
+    /// `EqJust::Interface` tag. Nothing is emitted and nothing is learnt, so the
+    /// E1 branch-locality gate has no clause to reject.
+    Propagate {
+        var: TermId,
+        word: TermId,
+        just: Vec<EqLeaf>,
+    },
     Conflict(Vec<EqLeaf>),
     /// A GUARDED F-split. `atoms` are the fresh-positive disjuncts
     /// `[len_eq, a_pref, b_pref]`; `guard` is the NEGATION of the triggering
@@ -605,6 +622,65 @@ fn resolve_inner(
         }
     }
 
+    // ── SLICE 33: pure-assignment propagation ────────────────────────────────
+    // A residual `[v] = [constant word]` ENTAILS `v ≈ W`. Before slice 33 this
+    // fell through to the variable-headed F-split below, hit the dedup, and
+    // returned `Saturated` → a sound but needless `Unknown`. Reporting it here,
+    // BEFORE the F-split, is the whole fix.
+    //
+    // Scope (spec §2): the constant side must be ENTIRELY constant. The wider
+    // rule (`W` containing other variables) is the deleted E1 probe's shape and
+    // is deliberately out of scope.
+    //
+    // The `is_concat` guard fixes the probe's other defect: it tested
+    // `string_const_value(..).is_none()`, which matches an unflattened CONCAT
+    // rep as if it were a free variable. The wrapper flattens, but we do not
+    // rely on that here — an atom that is still a CONCAT is never treated as a
+    // variable.
+    {
+        let l_res = &lhs[i..le];
+        let r_res = &rhs[j..re];
+
+        let is_concat = |terms: &Context, t: TermId| {
+            matches!(
+                terms.term_node(t),
+                TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrConcat),
+                    ..
+                }
+            )
+        };
+        let is_free_var = |terms: &Context, t: TermId| {
+            terms.string_const_value(t).is_none() && !is_concat(terms, t)
+        };
+        let all_const = |sl: &[TermId], terms: &Context| {
+            sl.iter().all(|&a| terms.string_const_value(a).is_some())
+        };
+
+        let pair = if l_res.len() == 1 && is_free_var(terms, l_res[0]) && all_const(r_res, terms) {
+            Some((l_res[0], r_res))
+        } else if r_res.len() == 1 && is_free_var(terms, r_res[0]) && all_const(l_res, terms) {
+            Some((r_res[0], l_res))
+        } else {
+            None
+        };
+
+        if let Some((var, const_side)) = pair {
+            // Fold the constant side to ONE interned constant. The empty side
+            // folds to "" — `v ≈ ""` is a legitimate propagation.
+            let mut w = String::new();
+            for &a in const_side {
+                w.push_str(
+                    terms
+                        .string_const_value(a)
+                        .expect("all_const checked every atom"),
+                );
+            }
+            let word = terms.mk_string_const(&w);
+            return StepResult::Propagate { var, word, just };
+        }
+    }
+
     // Single-variable forced-length analysis: one side fully constant, the other
     // a single (possibly repeated) variable interleaved with constants. The
     // variable's length is FORCED (k·|v| + C = L); tiling `vw` over the constant
@@ -754,6 +830,7 @@ mod tests {
     use rustc_hash::FxHashSet;
     use shinri_core::{BuiltinOp, Context, Lit, Op, TermNode, Var};
     use shinri_sat::Effort;
+    use shinri_theory::types::EqLeaf;
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
 
     /// A dummy positive equation literal for `resolve_equation` calls whose guard
@@ -767,6 +844,37 @@ mod tests {
         let str_s = ctx.string_sort();
         let s = ctx.declare_fun(name, &[], str_s);
         ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    // Slice 33: same shape as `mk_var`, named to match the pure-assignment
+    // fixture below.
+    fn declare_str_var(ctx: &mut Context, name: &str) -> shinri_core::TermId {
+        mk_var(ctx, name)
+    }
+
+    // Slice 33: shared fixture for the pure-assignment propagation tests below,
+    // factored out of the `occurs_*` setup style (mirrors
+    // `occurs_nonempty_const_flank_is_conflict`'s `Context`/`EqualityEngine`
+    // construction and its non-trivial `just` citing the asserting word-equation
+    // literal). Returns `(terms, eq, var, word, just, eqn_lit)`.
+    fn setup_pure_assignment(
+        var_name: &str,
+        const_value: &str,
+    ) -> (
+        Context,
+        EqualityEngine,
+        shinri_core::TermId,
+        shinri_core::TermId,
+        Vec<EqLeaf>,
+        Lit,
+    ) {
+        let mut ctx = Context::new();
+        let eq = EqualityEngine::default();
+        let var = declare_str_var(&mut ctx, var_name);
+        let word = ctx.mk_string_const(const_value);
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        (ctx, eq, var, word, just, lit)
     }
 
     // ── Non-conflict case 1: prefix-of-constant ───────────────────────────────
@@ -874,9 +982,15 @@ mod tests {
     // ── Non-conflict case 4: one side empty, other is all-variable ────────────
     // Normal forms: lhs = [],  rhs = [Y]
     // lhs is exhausted; rhs has only a variable Y.  Y = "" is a valid
-    // assignment, so this is NOT a conflict.  Must return Done.
+    // assignment, so this is NOT a conflict.
+    //
+    // SLICE 33: this is itself a pure assignment (`Y ≈ ""`, the empty constant
+    // side folds to the empty string — see the propagation block's comment).
+    // Before slice 33 this fell through unreported to `Done`; now it PROPAGATES,
+    // same as any other single-variable-vs-all-constant residual. Renamed from
+    // `empty_vs_single_variable_is_done_not_conflict` to match.
     #[test]
-    fn empty_vs_single_variable_is_done_not_conflict() {
+    fn empty_vs_single_variable_propagates_empty_word() {
         let mut ctx = Context::new();
         let mut eq = EqualityEngine::default();
         let y = mk_var(&mut ctx, "y_emp");
@@ -894,10 +1008,17 @@ mod tests {
             &mut ctr,
             &mut emitted,
         );
-        assert!(
-            matches!(result, StepResult::Done),
-            "empty lhs vs single-variable rhs must be Done (Y could be \"\")"
-        );
+        match result {
+            StepResult::Propagate { var, word, .. } => {
+                assert_eq!(var, y, "the variable side must be reported as `var`");
+                assert_eq!(
+                    ctx.string_const_value(word),
+                    Some(""),
+                    "the empty constant side must fold to the empty string"
+                );
+            }
+            _ => panic!("empty lhs vs single-variable rhs must Propagate `Y ≈ \"\"`"),
+        }
     }
 
     // ── Task 12: variable-headed word equation emits an F-split ──────────────
@@ -961,7 +1082,21 @@ mod tests {
     // ── Task 13: variable-vs-constant head split ─────────────────────────────
     // x = "ab" with x a variable → must NOT conflict; must emit a GUARDED split
     // whose atoms include the empty-branch `(= x "")`.
+    //
+    // SLICE 33 (T4): `x = "ab"` is now the CORE pure-assignment shape (single
+    // variable vs. single all-constant word) — the propagation block in
+    // `resolve_equation` intercepts it BEFORE this test's char-peel split is
+    // ever reached (that interception, before the char-peel/F-split paths, is
+    // the whole point of slice 33; see `pure_assignment_propagates_constant_word`
+    // above). At this Task-4 stage `lib.rs` still discards `Propagate` as a
+    // temporary no-op (Task 5 replaces it with a real cited EUF merge), so
+    // `check()` now reaches a bare `Sat` here without ever emitting the
+    // specialized split this test asserts on. Ignored pending Task 5, which
+    // wires the merge and must decide this test's replacement shape (e.g. a
+    // residual the propagation scope fence excludes, such as `x = "ab" ++ y`,
+    // so the char-peel split this test targets stays exercised).
     #[test]
+    #[ignore = "slice33: superseded by Propagate interception at this shape; Task 5 to fix/replace"]
     fn variable_equals_constant_splits_then_sat() {
         let mut ctx = Context::new();
         let str_s = ctx.string_sort();
@@ -1221,6 +1356,119 @@ mod tests {
             }
             _ => panic!("s = \"b\"++t++s is UNSAT (non-empty constant flank); expected Conflict"),
         }
+    }
+
+    // ── Slice 33: propagation outcome ────────────────────────────────────────
+    // A residual pure assignment `v = W` (W all-constant) must PROPAGATE, not
+    // fall through to the variable-headed F-split → dedup → Saturated path.
+
+    /// The core shape: `[y] = ["ab"]` reports `y ≈ "ab"`.
+    #[test]
+    fn pure_assignment_propagates_constant_word() {
+        // Build `y = "ab"` as a residual and resolve it.
+        // (setup mirrors occurs_distinct_vars_not_conflict)
+        let (mut terms, mut eq, y, ab, just, eqn_lit) = setup_pure_assignment("y", "ab");
+        let mut fresh_ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut terms,
+            &mut eq,
+            &[y],
+            &[ab],
+            just,
+            eqn_lit,
+            &mut fresh_ctr,
+            &mut emitted,
+        );
+        match r {
+            StepResult::Propagate { var, word, .. } => {
+                assert_eq!(var, y, "the variable side must be reported as `var`");
+                assert_eq!(
+                    terms.string_const_value(word),
+                    Some("ab"),
+                    "`word` must be a single interned constant"
+                );
+            }
+            _ => panic!("expected Propagate for a pure assignment, got a different outcome"),
+        }
+    }
+
+    /// A MULTI-ATOM constant side folds to ONE constant. Merging against a
+    /// multi-atom CONCAT term would make the merge depend on that term's own
+    /// normal form (spec §3).
+    #[test]
+    fn pure_assignment_folds_multi_atom_constant_side() {
+        let (mut terms, mut eq, y, _unused, just, eqn_lit) = setup_pure_assignment("y", "ab");
+        let a = terms.mk_string_const("a");
+        let b = terms.mk_string_const("b");
+        let mut fresh_ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut terms,
+            &mut eq,
+            &[y],
+            &[a, b],
+            just,
+            eqn_lit,
+            &mut fresh_ctr,
+            &mut emitted,
+        );
+        match r {
+            StepResult::Propagate { word, .. } => assert_eq!(
+                terms.string_const_value(word),
+                Some("ab"),
+                "['a','b'] must fold to the single constant \"ab\""
+            ),
+            _ => panic!("expected Propagate for a multi-atom constant side"),
+        }
+    }
+
+    /// Orientation-independent: the variable may sit on either side.
+    #[test]
+    fn pure_assignment_propagates_with_variable_on_right() {
+        let (mut terms, mut eq, y, ab, just, eqn_lit) = setup_pure_assignment("y", "ab");
+        let mut fresh_ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut terms,
+            &mut eq,
+            &[ab],
+            &[y],
+            just,
+            eqn_lit,
+            &mut fresh_ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Propagate { var, .. } if var == y),
+            "the variable must be found on either side"
+        );
+    }
+
+    /// SCOPE FENCE (spec §2): a constant side is required. `v = w ++ "a"` with a
+    /// second VARIABLE must NOT propagate — that is the wider rule the deleted
+    /// E1 probe got wrong, and it is explicitly out of scope for slice 33.
+    #[test]
+    fn variable_bearing_word_does_not_propagate() {
+        let (mut terms, mut eq, y, _ab, just, eqn_lit) = setup_pure_assignment("y", "ab");
+        let w = declare_str_var(&mut terms, "w");
+        let a = terms.mk_string_const("a");
+        let mut fresh_ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut terms,
+            &mut eq,
+            &[y],
+            &[w, a],
+            just,
+            eqn_lit,
+            &mut fresh_ctr,
+            &mut emitted,
+        );
+        assert!(
+            !matches!(r, StepResult::Propagate { .. }),
+            "a variable-bearing word must NOT propagate in slice 33 (spec §2)"
+        );
     }
 
     // ── Slice 14 root-fix: single-variable forced-length analysis ────────────
