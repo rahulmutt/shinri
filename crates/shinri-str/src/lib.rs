@@ -1217,11 +1217,11 @@ impl TheorySolver for StrSolver {
         TCheck::Sat
     }
 
-    fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {
-        // String theory does not mint self-tagged interface (theory:4) leaves:
-        // string conflicts use EqLeaf::Asserted / resolve through EUF tags.
-        // This guard makes a future invariant break fail loud in debug.
-        debug_assert!(false, "StrSolver::explain reached — string theory should not mint self-tagged interface (theory:4) leaves");
+    fn explain(&mut self, _cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
+        // Slice 33: the string theory now DOES mint self-tagged interface
+        // (theory:4) leaves — the propagation merge's justification (spec §4.1).
+        // Before slice 33 this was a `debug_assert!(false)` stub.
+        self.expand_prop_tag(tag, exp);
     }
 
     fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
@@ -1327,6 +1327,36 @@ impl StrSolver {
         let membs: Vec<(TermId, bool)> = self.memb_true.iter().map(|&(a, _, p)| (a, p)).collect();
         let seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
         model::assign(cx.terms, cx.eq, &known, &str_terms, m, &seeds);
+    }
+
+    /// Slice 33: record an antecedent set and return its tag. The tag indexes
+    /// `prop_tags`, which is trail-scoped, so the tag is valid only within the
+    /// branch that minted it.
+    #[allow(dead_code)] // slice33 T5 wires the caller; drop this then.
+    fn alloc_prop_tag(&mut self, leaves: Vec<EqLeaf>) -> u32 {
+        let tag = self.prop_tags.len() as u32;
+        self.prop_tags.push(leaves);
+        tag
+    }
+
+    /// Slice 33: expand a propagation tag into `exp`. Split out from the
+    /// `TheorySolver::explain` impl so it is unit-testable without a TheoryCtx.
+    fn expand_prop_tag(&self, tag: u32, exp: &mut Explainer) {
+        match self.prop_tags.get(tag as usize) {
+            Some(leaves) => {
+                // `push_leaf` routes Asserted → lits and Interface → pending, so a
+                // nested interface antecedent keeps expanding in the Combiner's
+                // visited-guarded loop (combiner.rs:882-906).
+                for &leaf in leaves {
+                    exp.push_leaf(leaf);
+                }
+            }
+            None => debug_assert!(
+                false,
+                "slice33: propagation tag {tag} expanded after its scope was popped \
+                 — a stale tag means the trail truncation is broken"
+            ),
+        }
     }
 }
 
@@ -1794,5 +1824,43 @@ mod tests {
             "positive StrLeq atom must record is_lt = false (relation, not polarity)"
         );
         assert_eq!(solver.order_levels, vec![0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod slice33_explain_tests {
+    use super::*;
+    use shinri_theory::Explainer;
+
+    /// A minted tag expands to exactly the leaves it was allocated with. Under-
+    /// expansion here is the ce2 wrong-UNSAT shape (spec §4).
+    #[test]
+    fn explain_expands_prop_tag_to_its_leaves() {
+        let mut s = StrSolver::default();
+        let a = Lit::new(Var::new(7), true);
+        let b = Lit::new(Var::new(9), false);
+        let tag = s.alloc_prop_tag(vec![EqLeaf::Asserted(a), EqLeaf::Asserted(b)]);
+
+        let mut exp = Explainer::default();
+        s.expand_prop_tag(tag, &mut exp);
+
+        let mut got = exp.lits.clone();
+        got.sort_unstable_by_key(|l| l.code());
+        let mut want = vec![a, b];
+        want.sort_unstable_by_key(|l| l.code());
+        assert_eq!(
+            got, want,
+            "explain must expand a tag to all its antecedents"
+        );
+    }
+
+    /// Tags are allocated densely from 0 so the trail length IS the tag count.
+    #[test]
+    fn prop_tags_are_dense_and_sequential() {
+        let mut s = StrSolver::default();
+        let t0 = s.alloc_prop_tag(vec![]);
+        let t1 = s.alloc_prop_tag(vec![]);
+        assert_eq!((t0, t1), (0, 1));
+        assert_eq!(s.prop_tags.len(), 2);
     }
 }
