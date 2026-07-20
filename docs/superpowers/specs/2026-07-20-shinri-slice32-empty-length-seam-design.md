@@ -159,8 +159,16 @@ Stays `Unknown`, by design:
   literal's length, or a second time for the same variable. The `phases`
   payload carries the preferred-TRUE hint on the `≥ 1` disjunct.
 - **Integration.** A pin where an arith-derived zero length must ground the
-  variable — e.g. `(<= (str.len x) 0) ∧ (= (str.++ x "a") "b")` — decides
-  `unsat`, where today it returns `Unknown`.
+  variable inside a *word equation*:
+  `(<= (str.len x) 0) ∧ (= (str.++ x y) "ab") ∧ (distinct y "ab")` decides
+  `unsat`, where today it returns `Unknown` (measured on `fc717c63`; z3
+  confirms `unsat`).
+
+  Simpler candidates are **not** valid acceptance pins — measurement shows
+  they already decide via other channels and would pass without the change:
+  `(<= (str.len x) 0) ∧ (= (str.++ x "a") "b")` is closed by head-peeling, and
+  `(<= (str.len x) 0) ∧ (distinct x "")` is closed by the `len_class_zero`
+  read in the disequality loop (`lib.rs:506-508`).
 - **Regression (the load-bearing one).** The concat+length queries behind the
   `length.rs` livelock note, timed before and after; no wall-clock regression
   beyond noise, and the blocking tier stays inside its 10–15 min budget.
