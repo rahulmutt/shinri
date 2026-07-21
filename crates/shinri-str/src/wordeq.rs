@@ -30,8 +30,9 @@ pub enum StepResult {
     /// its full antecedent set, which the caller merges into EUF under an
     /// `EqJust::Interface` tag. `just` includes not only the asserting
     /// word-equation literal and any `normal_form` antecedents but, as of
-    /// slice 37, every EUF-door strip merge the flattened-path strip loops
-    /// consumed (via `same_explain`) — so the interface merge is fully
+    /// slice 37, every EUF-door strip merge the strip loops consumed (via
+    /// `same_explain`, on BOTH the flattened and non-flattened paths — the
+    /// pass is shared) — so the interface merge is fully
     /// justified even when a strip cancelled through a live EUF class rather
     /// than same-TermId or literal-value identity. Nothing is emitted and
     /// nothing is learnt, so the E1 branch-locality gate has no clause to
