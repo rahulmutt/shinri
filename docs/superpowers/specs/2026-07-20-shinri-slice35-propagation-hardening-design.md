@@ -67,6 +67,25 @@ widens `Propagate`'s reachability over exactly this path.
   narrowing, never unsound. Stays banked.
 - **Multi-atom variable-bearing propagation** (slice-34 §10): untouched;
   probe B1 stays `unknown`.
+- **Sibling skolem mints outside the `fresh_str` freshness fix**
+  (pre-existing, surfaced by this final review): `fresh_str_var` in
+  `crates/shinri-str/src/predicates.rs:176-181` (mints `!pfx/!sfx/!ctnl/
+  !ctnr`) and `reduce.rs`'s `encode_substr`/ite mints (`!pre/!mid/!post/
+  !ite`, global `FRESH_CTR`) all bare-`declare_fun` with NO lookup-skip and
+  NO `reserve_symbol` — and, unlike `fresh_str`, they run on the LIVE
+  `self.ctx` (`crates/shinri-solver/src/lib.rs:515`, pre-clone), exactly
+  the parser-visible position where hash-cons aliasing persists across
+  check-sats. A user `(declare-const !pfx0 String)` colliding with the
+  counter would alias the decomposition skolem; `declare_fun` silently
+  overwrites `fun_sigs` for a differently-sorted user declaration. This is
+  the more exposed sibling of the hazard §1b/§3b closed for `fresh_str`.
+  Future slice candidate.
+- **`Split` passthrough off flattened reps**: §3a discharges `Split` with
+  "guarded by ¬eqn", but the learnt clause `eqn → (residual-head
+  disjunction)` can depend on an uncited `eq.are_equal` strip the same way
+  `Conflict`/`Propagate` did — the model gate backstops SAT, not learnt
+  clauses. Pre-slice-33 vintage, never observed firing, out of scope
+  here — banked for an explicit look.
 - Standing bank unchanged: slice-28 §8, slice-27 typed-antecedent
   refactor, slice-29 approach-C, slice-31 §11 walls 1/2/4, the retracted
   wall-3 seam.
@@ -258,10 +277,15 @@ regression gate (Task-4 script_e2e run, folded into the count below):
 
 **Oracle gate (Step 1).** `cargo nextest run -p shinri-solver --features
 oracle`: **499 passed, 0 failed, 3 skipped**, confirmed non-zero,
-~1202 s (~20 min). (The slice-34 baseline quoted 497 passed; this
-slice's own 2 new e2e pins land in the `script_e2e` binary, not the
-oracle-gated suites, so the +2 is pre-existing drift between slice-34's
-measurement and this run, not new-in-this-slice tests. Not a concern.)
+~1202 s (~20 min). (The slice-34 baseline quoted 497 passed.
+**Final-review correction:** `cargo nextest run -p shinri-solver
+--features oracle` runs every test binary in the package — the `oracle`
+feature only gates `qfs_differential`'s own tests, it does not scope the
+invocation to that binary. `script_e2e` is one of the binaries this
+command runs, and it went 67→69 in this same window (§ "`script_e2e` gate
+(Step 7)" below). So the +2 IS this slice's two new e2e pins, counted by
+the package-wide `--features oracle` invocation: 497 + 2 = 499. Not
+pre-existing drift.)
 
 **Dump-and-diff (Steps 2–6), base `6fc62643` vs fix `b7ff6cb1`.** Both
 runs required `--nocapture` (the first fix-side attempt without it

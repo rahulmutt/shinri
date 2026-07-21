@@ -178,6 +178,14 @@ fn user_ite_name_declared_before_any_mint_still_works() {
 // The next solve's `fresh_str` lookup-skip (it re-mints against a fresh clone
 // derived from the now-updated live context, so it sees the user's `!strk0`
 // and skips it) keeps this sound going forward too.
+//
+// Final-review note: the post-mint test below cannot observe whether the
+// `!strk` mint actually fired — clone isolation makes the mint invisible to
+// the live context by design, so the assertions only pin the (accepted,
+// no-error, no-aliasing) outcome, not the mint itself. If a future change
+// decides this probe's verdict without ever F-splitting (and so without
+// minting at all), this test still passes unchanged — don't over-read a
+// green run here as confirmation that a mint happened.
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]

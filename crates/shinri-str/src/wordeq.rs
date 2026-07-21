@@ -60,6 +60,21 @@ pub enum StepResult {
 /// is rejected at parse time — otherwise the user's app hash-conses to the
 /// skolem and inherits its internal identity (wrong-verdict shape; see the
 /// slice-5 `ite!` finding).
+///
+/// **Slice-35 final-review correction:** the "rejected at parse time" claim
+/// above does not hold for `fresh_str` mints reached via `check_sat`.
+/// `Solver::check_sat` clones `self.ctx` into the theory Combiner before
+/// search (`crates/shinri-solver/src/lib.rs:711`), so every mint (and its
+/// `reserve_symbol` call) here runs on that clone; the clone — and the
+/// reservation with it — is discarded when `check_sat` returns, and a
+/// subsequent user `declare-fun` naming the minted symbol is accepted, not
+/// rejected. This is unlike word_norm's `ite!` mint, which runs on
+/// `self.ctx` itself, pre-clone (`lib.rs:384`), so its reservation genuinely
+/// reaches the parser. The `reserve_symbol` call here is retained as
+/// unit-level defense-in-depth — it protects a future refactor that moves
+/// this mint to run pre-clone — not as the mechanism that currently
+/// prevents aliasing (that is clone isolation itself: the skolem never
+/// exists in the parser-visible context a later `declare-fun` runs against).
 pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
     let str_s = terms.string_sort();
     loop {
@@ -1740,9 +1755,20 @@ mod tests {
         assert_eq!(ctr, 2, "counter passed the taken name and the minted one");
     }
 
-    /// Slice 35: a minted `!strk` name is reserved, so a later user
-    /// declaration is rejected at parse time (same regime as word_norm's
-    /// `ite!` names). The user-owned name from the skip case is NOT reserved.
+    /// Slice 35: a minted `!strk` name is reserved. The user-owned name from
+    /// the skip case is NOT reserved.
+    ///
+    /// **Final-review caveat:** the reservation does NOT reject a later user
+    /// declaration at parse time for this mint — that overstates it. Every
+    /// `fresh_str` mint reached via `check_sat` runs on a CLONE of the
+    /// context (`Solver::check_sat` clones `self.ctx` into the theory
+    /// Combiner, `crates/shinri-solver/src/lib.rs:711`), so the reservation
+    /// dies with the discarded clone before the parser ever sees it — unlike
+    /// word_norm's `ite!` regime, which genuinely rejects because it mints
+    /// on `self.ctx` pre-clone (`lib.rs:384`). Here `reserve_symbol` is
+    /// defense-in-depth guarding a future refactor that moves this mint to
+    /// run pre-clone, not the mechanism that currently blocks aliasing (see
+    /// `fresh_str`'s doc comment above for the full correction).
     #[test]
     fn fresh_str_reserves_minted_name_only() {
         let mut ctx = Context::new();
