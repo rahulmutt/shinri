@@ -24,7 +24,7 @@
 //!
 //! `(str.at s i)` is syntactic sugar for `(str.substr s i 1)`.
 
-use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
+use shinri_core::{BuiltinOp, Context, Op, SortId, TermId, TermNode};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 /// If `t` is an integer numeral, return its value as `i128`. Non-integer
@@ -69,6 +69,40 @@ static FRESH_CTR: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn next_fresh() -> u32 {
     FRESH_CTR.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Mint a GROUP of fresh reserved skolems sharing one counter suffix.
+///
+/// Slice 36: every skolem mint outside `fresh_str` **in this crate** routes
+/// through here (word_norm's `ite!` mint in `shinri-solver` has its own,
+/// equivalent lookup-skip/reserve loop — see `word_norm.rs`).
+/// The `lookup_symbol` skip closes the pre-mint collision direction (a
+/// user-declared `!pfx0` is never adopted as a skolem — pre-fix this was
+/// a measured wrong-unsat); `reserve_symbol` closes the post-mint
+/// direction (a later user declaration of the minted name is rejected at
+/// parse time, the `ite!` regime). Group atomicity: if any name in the
+/// group is taken at `n`, the whole group skips — no member is minted at
+/// a suffix another member couldn't use, so no-collision naming stays
+/// byte-identical to the pre-slice-36 one-draw-per-group scheme.
+pub(crate) fn fresh_reserved_group(ctx: &mut Context, group: &[(&str, SortId)]) -> Vec<TermId> {
+    loop {
+        let n = next_fresh();
+        if group
+            .iter()
+            .any(|(p, _)| ctx.lookup_symbol(&format!("{p}{n}")).is_some())
+        {
+            continue; // user (or an earlier check) owns a name at this n
+        }
+        return group
+            .iter()
+            .map(|(p, sort)| {
+                let sym = ctx.declare_fun(&format!("{p}{n}"), &[], *sort);
+                ctx.reserve_symbol(sym);
+                ctx.mk_app(Op::Uninterpreted(sym), &[])
+                    .expect("nullary app of a declared symbol is well-sorted")
+            })
+            .collect();
+    }
 }
 
 /// Returns `true` if `t` (or any subterm) is a `str.at`/`str.substr` application
@@ -209,25 +243,13 @@ fn encode_substr(
     l: TermId,
     guards: &mut Vec<TermId>,
 ) -> TermId {
-    let n = next_fresh();
-
-    // Declare fresh String variables.
+    // Declare fresh reserved String skolems (slice 36: lookup-skip +
+    // reserve_symbol via the shared group mint — one suffix per trio).
     let str_s = ctx.string_sort();
     let int_s = ctx.int_sort();
 
-    let pre_sym = ctx.declare_fun(&format!("!pre{n}"), &[], str_s);
-    let mid_sym = ctx.declare_fun(&format!("!mid{n}"), &[], str_s);
-    let post_sym = ctx.declare_fun(&format!("!post{n}"), &[], str_s);
-
-    let pre = ctx
-        .mk_app(Op::Uninterpreted(pre_sym), &[])
-        .expect("pre well-sorted");
-    let mid = ctx
-        .mk_app(Op::Uninterpreted(mid_sym), &[])
-        .expect("mid well-sorted");
-    let post = ctx
-        .mk_app(Op::Uninterpreted(post_sym), &[])
-        .expect("post well-sorted");
+    let minted = fresh_reserved_group(ctx, &[("!pre", str_s), ("!mid", str_s), ("!post", str_s)]);
+    let (pre, mid, post) = (minted[0], minted[1], minted[2]);
 
     // len(s), len(pre), len(mid)
     let len_s = ctx
@@ -434,11 +456,7 @@ fn elim_term_ite(
                 let then_b = new_children[1];
                 let else_b = new_children[2];
                 let sort = ctx.sort_of(t);
-                let n = next_fresh();
-                let w_sym = ctx.declare_fun(&format!("!ite{n}"), &[], sort);
-                let w = ctx
-                    .mk_app(Op::Uninterpreted(w_sym), &[])
-                    .expect("fresh ite var");
+                let w = fresh_reserved_group(ctx, &[("!ite", sort)])[0];
                 let eq_then = ctx.mk_eq(w, then_b).expect("w = then");
                 let eq_else = ctx.mk_eq(w, else_b).expect("w = else");
                 let not_cond = ctx
@@ -473,9 +491,162 @@ fn elim_term_ite(
 
 #[cfg(test)]
 mod tests {
-    use shinri_core::{BuiltinOp, Context, Op};
+    use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 
     use crate::reduce::reduce_assertions;
+
+    /// Name of the uninterpreted symbol a minted nullary app points at.
+    fn sym_name(ctx: &Context, t: TermId) -> String {
+        match ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Uninterpreted(sym),
+                ..
+            } => ctx.symbol_name(*sym).to_string(),
+            other => panic!("expected nullary uninterpreted app, got {other:?}"),
+        }
+    }
+
+    fn sym_id(ctx: &Context, t: TermId) -> shinri_core::SymbolId {
+        match ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Uninterpreted(sym),
+                ..
+            } => *sym,
+            other => panic!("expected nullary uninterpreted app, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fresh_reserved_group_mints_shared_suffix_and_reserves() {
+        // Relative-suffix pattern (spec §5): `base + 1` is the next value
+        // the helper will draw. Deterministic single-threaded; nextest's
+        // process-per-test isolation keeps it deterministic in CI.
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let base = crate::reduce::next_fresh();
+        let minted = crate::reduce::fresh_reserved_group(
+            &mut ctx,
+            &[("!pre", str_s), ("!mid", str_s), ("!post", str_s)],
+        );
+        assert_eq!(minted.len(), 3);
+        let n = base + 1;
+        assert_eq!(sym_name(&ctx, minted[0]), format!("!pre{n}"));
+        assert_eq!(sym_name(&ctx, minted[1]), format!("!mid{n}"));
+        assert_eq!(sym_name(&ctx, minted[2]), format!("!post{n}"));
+        for &t in &minted {
+            assert!(
+                ctx.is_reserved(sym_id(&ctx, t)),
+                "minted skolems must be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_reserved_group_skips_user_owned_names_atomically() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let base = crate::reduce::next_fresh();
+        // User owns !mid{base+1}: the WHOLE trio must skip to base+2 —
+        // no member may be minted at a suffix another member couldn't use.
+        let user_name = format!("!mid{}", base + 1);
+        let user_sym = ctx.declare_fun(&user_name, &[], str_s);
+        let user = ctx.mk_app(Op::Uninterpreted(user_sym), &[]).unwrap();
+        let minted = crate::reduce::fresh_reserved_group(
+            &mut ctx,
+            &[("!pre", str_s), ("!mid", str_s), ("!post", str_s)],
+        );
+        let n = base + 2;
+        assert_eq!(sym_name(&ctx, minted[0]), format!("!pre{n}"));
+        assert_eq!(sym_name(&ctx, minted[1]), format!("!mid{n}"));
+        assert_eq!(sym_name(&ctx, minted[2]), format!("!post{n}"));
+        // The user's term is untouched: distinct TermId, not reserved.
+        assert!(minted.iter().all(|&t| t != user));
+        assert!(!ctx.is_reserved(user_sym), "user symbol must stay usable");
+        // Group atomicity: !pre{base+1} was never claimed by the failed round.
+        assert!(
+            ctx.lookup_symbol(&format!("!pre{}", base + 1)).is_none(),
+            "skipped round must not declare partial groups"
+        );
+    }
+
+    /// Collect every nullary uninterpreted symbol in `t` whose name starts
+    /// with `prefix`.
+    fn collect_minted(
+        ctx: &Context,
+        t: TermId,
+        prefix: &str,
+        out: &mut Vec<(String, shinri_core::SymbolId)>,
+    ) {
+        if let TermNode::App { op, args, .. } = ctx.term_node(t) {
+            if let Op::Uninterpreted(sym) = op {
+                let name = ctx.symbol_name(*sym).to_string();
+                if name.starts_with(prefix) && !out.iter().any(|(n, _)| *n == name) {
+                    out.push((name, *sym));
+                }
+            }
+            let children = ctx.children(*args).to_vec();
+            for c in children {
+                collect_minted(ctx, c, prefix, out);
+            }
+        }
+    }
+
+    #[test]
+    fn substr_and_ite_mints_are_reserved_with_shared_substr_suffix() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let s = {
+            let f = ctx.declare_fun("s_res", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+        };
+        let i = ctx.mk_numeral(
+            shinri_core::Rational::from_int(1i128.into()),
+            ctx.int_sort(),
+        );
+        let one = ctx.mk_numeral(
+            shinri_core::Rational::from_int(1i128.into()),
+            ctx.int_sort(),
+        );
+        let ss = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrSubstr), &[s, i, one])
+            .unwrap();
+        let lit = ctx.mk_string_const("b");
+        let atom = ctx.mk_eq(ss, lit).unwrap();
+        let out = reduce_assertions(&mut ctx, &[atom]);
+        let mut minted = Vec::new();
+        for &a in &out {
+            for p in ["!pre", "!mid", "!post", "!ite"] {
+                collect_minted(&ctx, a, p, &mut minted);
+            }
+        }
+        // One substr encoding mints the trio; its guards' ITEs mint !ite vars.
+        assert!(
+            minted.iter().any(|(n, _)| n.starts_with("!pre"))
+                && minted.iter().any(|(n, _)| n.starts_with("!mid"))
+                && minted.iter().any(|(n, _)| n.starts_with("!post"))
+                && minted.iter().any(|(n, _)| n.starts_with("!ite")),
+            "expected pre/mid/post + ite mints, got {minted:?}"
+        );
+        for (name, sym) in &minted {
+            assert!(ctx.is_reserved(*sym), "{name} must be reserved");
+        }
+        // The trio shares ONE suffix (today's grouped naming, pinned
+        // relatively per spec §4/§5).
+        let suffix = |n: &str, p: &str| n[p.len()..].to_string();
+        let pre_sfx = minted
+            .iter()
+            .find(|(n, _)| n.starts_with("!pre"))
+            .map(|(n, _)| suffix(n, "!pre"))
+            .unwrap();
+        for p in ["!mid", "!post"] {
+            let s = minted
+                .iter()
+                .find(|(n, _)| n.starts_with(p))
+                .map(|(n, _)| suffix(n, p))
+                .unwrap();
+            assert_eq!(s, pre_sfx, "substr trio must share one suffix");
+        }
+    }
 
     #[test]
     fn substr_is_replaced_by_fresh_var_with_guards() {

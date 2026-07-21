@@ -223,3 +223,143 @@ instead. Recorded here so the omission is an explicit decision.
   (skip behavior, group alignment), not absolute values, except where the
   test controls the counter. (The existing control test shape at
   `reduce.rs:481` already lives with this.)
+
+## 6. Outcome
+
+Implementation landed as three commits on `slice36-sibling-skolem-mints`:
+
+- `3f0bc909` — T1: `fresh_reserved_group` helper (§3), adopted by
+  `encode_substr` and the `!ite` lift in `reduce.rs`.
+- `69e6dc7e` — T2: `predicates.rs` (`!pfx/!sfx/!ctnl/!ctnr`) adopts the
+  helper; closes the measured live `!pfx0` aliasing wrong-unsat from §1.
+- `740f10f1` — T3: three `script_e2e` pins (post-mint rejection,
+  pre-declared-alias sat, fence-dead `!pre` documentation pin).
+- this commit (truth-up) — gates run and this section appended.
+
+**Gate results (all measured, foreground, captured output).**
+
+1. Oracle differential gate —
+   `cargo nextest run -p shinri-solver --features oracle`:
+   **502 tests run: 502 passed (9 slow), 3 skipped**, 0 failed, wall
+   1236.451s (~20.6 min). Matches the plan's ~502 exactly (499 at
+   slice-35 close + 3 new e2e pins). No sat/unsat disagreement with z3
+   in any test in the run — no BLOCKER.
+2. Dump-and-diff — skipped as adjudicated in §4 (not run; this is the
+   deliberate omission, not an oversight).
+3. Workspace gates:
+   - `cargo fmt --all -- --check` — clean (exit 0).
+   - `cargo clippy --workspace --all-targets -- -D warnings` — 0
+     warnings (exit 0).
+   - `cargo nextest run --workspace` — **1146 tests run: 1146 passed (5
+     slow), 7 skipped**, 0 failed, wall 281.508s. The plan predicted
+     ~1143 (1138 at slice-35 close + 2 reduce + 2 predicates + 3 e2e);
+     measured is **1146, a delta of +3** over the stated estimate (and
+     +1 over the arithmetic sum 1138+2+2+3=1145) — recorded as-measured,
+     not adjusted to match. 0 failed either way; the 7 skipped are
+     exactly the `#[ignore]`d fp exhaustives (untouched, per policy).
+4. Fence-pin confirmation — re-ran
+   `post_fence_declaration_of_pre_name_is_accepted_no_mint_occurred` in
+   isolation (`cargo nextest run -p shinri-solver -E
+   'test(post_fence_declaration_of_pre_name_is_accepted_no_mint_occurred)'`):
+   **1 passed**, asserting `out == vec!["unknown", "unknown"]` at
+   `script_e2e.rs:339-343`. Confirms §1's plan-time correction: the
+   `reduce.rs` family's fence-dead status holds — the substr fence fires
+   before any `!pre` mint, so both check-sats in that script answer
+   `unknown` and the later `!pre0` declaration is silently accepted, as
+   documented.
+5. Wrong-unsat repro (§1's measured hazard) — re-ran exactly:
+
+   ```
+   printf '(set-logic QF_S)(declare-const !pfx0 String)(declare-fun s () String)(assert (= !pfx0 "z"))(assert (str.prefixof "ab" s))(assert (= (str.len s) 2))(check-sat)\n' > /tmp/pfx-alias.smt2
+   cargo run -q -p shinri-cli -- /tmp/pfx-alias.smt2
+   ```
+
+   Output's final line: **`sat`** (six `success` lines from the prior
+   `assert`/`declare` commands precede it). Pre-fix this answered
+   `unsat` against z3's `sat` — a live wrong-unsat. Post-fix (T2,
+   `69e6dc7e`) it answers `sat`, agreeing with z3. The hazard is closed.
+
+**Summary.** All gates green, all measured counts non-zero and in the
+expected ballpark (one workspace-count delta noted above, no failures
+either side of it), the fence-pin behavior measured exactly as `§1`/`§4`
+predicted, and the plan-time wrong-unsat repro now answers `sat`. No
+soundness regressions observed. Ready for PR.
+
+## 7. Final-review correction — `!ite` is live, not fence-dead
+
+The final whole-branch review (z3 cross-checked) found §1's fence-dead
+claim over-broad. It is **correct for `!pre`/`!mid`/`!post`** — those
+mint only inside `encode_substr`, which fires only on unfoldable
+substr/at, and the substr soundness fence (`lib.rs:507-512`) returns
+`Unknown` for exactly those queries before `reduce_assertions` ever runs
+(confirmed by gate 4 in §6). It is **falsified for `!ite`**.
+
+**(a) Why `!ite` is live.** §1's plan-time correction reasoned that "user
+non-Boolean ITEs are lifted earlier by word_norm on `self.ctx`
+(`lib.rs:384`)", implying no user `ite` could reach `reduce.rs`'s
+`elim_term_ite` outside the substr-guard path. This misses that
+word_norm's ite lift explicitly **excludes String-sorted ites**
+(`crates/shinri-solver/src/word_norm.rs:80-82`,
+`eliminates_ite_sort`: `!matches!(ctx.sort_node(s), SortNode::Bool |
+SortNode::String)`). A String-sorted user `ite` therefore survives
+word_norm untouched and reaches three later passes that mint `!ite` via
+`elim_term_ite` on the **live**, pre-clone `self.ctx`
+(`lib.rs:516`)  —  not the discarded Combiner clone:
+
+- indexof with a symbolic start position → bounded Int-ite chain
+  (`lib.rs:429-430`);
+- `str.to_int(str.from_int(n))` roundtrip → `ite(n≥0,n,-1)`
+  (`lib.rs:446-447`);
+- the `str.to_code`/`str.from_code` roundtrip rewrites
+  (`lib.rs:464-467`).
+
+None of these require the substr fence to have fired, so `!ite` mints
+are reachable on ordinary scripts that never touch `str.substr`/`str.at`
+— including the simplest case, a bare user `(ite b "x" "yy")` assigned
+to a string variable, which trivially exercises `elim_term_ite` once
+word_norm has declined to touch it.
+
+**(b) Measured repro.** At base `32739ef0` (pre-slice-36):
+
+```
+(set-logic QF_S)(declare-const !ite0 String)(declare-fun s () String)(declare-fun b () Bool)
+(assert (= !ite0 "zzz"))
+(assert (= s (ite b "x" "yy")))
+(check-sat)
+```
+
+answered **`unsat`** — wrong; z3 confirms **`sat`** (`!ite0 = "zzz"`,
+`b = true`, `s = "x"`, or symmetric). The pre-declared, constrained
+`!ite0` was adopted by the mint via hash-consing (same genus as the
+`!pfx0` hazard in §1), forcing `s` to equal both ite branches through
+the aliased skolem. At `HEAD` (post-T1, `fresh_reserved_group`'s
+lookup-skip) the same script answers **`sat`**, re-measured foreground
+during this final-review fix wave. So slice 36's Task 1 closed a
+**second** live wrong-unsat beyond the one §1 documented for `!pfx0` —
+Task 1's `!ite` adoption was defense-in-depth only in the sense that it
+predated recognizing this route; the fix itself was already load-bearing
+at the time it landed.
+
+**(c) New coverage.** `crates/shinri-solver/tests/script_e2e.rs` gains
+`user_str_ite_name_declared_before_any_mint_still_works`, pinning the
+repro in (b): asserts the script answers `["sat"]`. The slice-36 banner
+comment and the `post_fence_declaration_of_pre_name_is_accepted_no_mint_occurred`
+doc comment are rescoped to name only `!pre`/`!mid`/`!post` as
+fence-dead, with `!ite`'s live routes cited and cross-referenced to the
+new pin.
+
+**(d) Bank entries for future slices.**
+
+- (i) `order_engine.rs:20-24`'s `!strcode` is a fixed-name
+  declare-or-fetch uninterpreted function, never reserved — currently
+  dormant behind the slice-31 fence (`shinri-slice31-str-order-deferred`
+  memory: two-free-var `str.<` order is banked, infra dormant). If the
+  order engine goes live, a user pre-declaring `!strcode` is silently
+  adopted into EUF congruence via the same `declare_fun`-overwrites-
+  `fun_sigs` mechanism (`context.rs:166-170`) — same hazard genus as
+  this slice, unaddressed. Worth a look the day that fence lifts.
+- (ii) Unchanged reminder (spec §2, out of scope): user→user
+  `declare_fun` silent overwrite remains adjudicated-out — a
+  parser-facing SMT-LIB-conformance question with a blast radius over
+  every declare path, not a skolem-specific hazard. Still banked, not
+  fixed here.

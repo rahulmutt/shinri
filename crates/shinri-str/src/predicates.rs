@@ -173,13 +173,6 @@ fn collect_polarities(
     }
 }
 
-fn fresh_str_var(ctx: &mut Context, name: &str) -> TermId {
-    let str_s = ctx.string_sort();
-    let sym = ctx.declare_fun(name, &[], str_s);
-    ctx.mk_app(Op::Uninterpreted(sym), &[])
-        .expect("fresh string var")
-}
-
 /// Stage 3: rewrite every remaining (positive-only — the caller must have
 /// fenced otherwise via [`has_unrewritable_str_predicate`]) predicate atom to
 /// its existential concat decomposition:
@@ -214,8 +207,8 @@ fn rewrite_pred(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermI
             match op {
                 Op::Builtin(BuiltinOp::StrPrefixOf) => {
                     let (p, s) = (new_children[0], new_children[1]);
-                    let n = crate::reduce::next_fresh();
-                    let k = fresh_str_var(ctx, &format!("!pfx{n}"));
+                    let str_s = ctx.string_sort();
+                    let k = crate::reduce::fresh_reserved_group(ctx, &[("!pfx", str_s)])[0];
                     let cat = ctx
                         .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[p, k])
                         .expect("p ++ k");
@@ -223,8 +216,8 @@ fn rewrite_pred(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermI
                 }
                 Op::Builtin(BuiltinOp::StrSuffixOf) => {
                     let (p, s) = (new_children[0], new_children[1]);
-                    let n = crate::reduce::next_fresh();
-                    let k = fresh_str_var(ctx, &format!("!sfx{n}"));
+                    let str_s = ctx.string_sort();
+                    let k = crate::reduce::fresh_reserved_group(ctx, &[("!sfx", str_s)])[0];
                     let cat = ctx
                         .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[k, p])
                         .expect("k ++ p");
@@ -232,9 +225,12 @@ fn rewrite_pred(ctx: &mut Context, t: TermId, memo: &mut FxHashMap<TermId, TermI
                 }
                 Op::Builtin(BuiltinOp::StrContains) => {
                     let (s, sub) = (new_children[0], new_children[1]);
-                    let n = crate::reduce::next_fresh();
-                    let kl = fresh_str_var(ctx, &format!("!ctnl{n}"));
-                    let kr = fresh_str_var(ctx, &format!("!ctnr{n}"));
+                    let str_s = ctx.string_sort();
+                    let minted = crate::reduce::fresh_reserved_group(
+                        ctx,
+                        &[("!ctnl", str_s), ("!ctnr", str_s)],
+                    );
+                    let (kl, kr) = (minted[0], minted[1]);
                     let cat = ctx
                         .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[kl, sub, kr])
                         .expect("kl ++ sub ++ kr");
@@ -271,6 +267,85 @@ mod tests {
 
     fn pred(ctx: &mut Context, op: BuiltinOp, a: TermId, b: TermId) -> TermId {
         ctx.mk_app(Op::Builtin(op), &[a, b]).unwrap()
+    }
+
+    /// Destructure `(= s (str.++ a b))` and return the concat's LAST child
+    /// (the minted skolem for prefixof).
+    fn last_concat_child(ctx: &Context, eq: TermId) -> TermId {
+        let TermNode::App { args, .. } = ctx.term_node(eq) else {
+            panic!("expected eq app");
+        };
+        let eq_children = ctx.children(*args).to_vec();
+        let concat = eq_children[1];
+        let TermNode::App { args, .. } = ctx.term_node(concat) else {
+            panic!("expected concat app");
+        };
+        *ctx.children(*args).last().expect("concat has children")
+    }
+
+    fn sym_of(ctx: &Context, t: TermId) -> shinri_core::SymbolId {
+        let TermNode::App {
+            op: Op::Uninterpreted(sym),
+            ..
+        } = ctx.term_node(t)
+        else {
+            panic!("expected nullary uninterpreted app");
+        };
+        *sym
+    }
+
+    #[test]
+    fn pre_declared_pfx_name_is_never_adopted_as_skolem() {
+        // The measured wrong-unsat shape (spec §1 plan-time correction):
+        // pre-fix, the mint's declare_fun re-interned the user's `!pfx{n}`
+        // and the skolem hash-consed onto the user's constrained constant.
+        let mut ctx = Context::new();
+        let base = crate::reduce::next_fresh();
+        let user = str_var(&mut ctx, &format!("!pfx{}", base + 1));
+        let ab = ctx.mk_string_const("ab");
+        let s = str_var(&mut ctx, "s");
+        let atom = pred(&mut ctx, BuiltinOp::StrPrefixOf, ab, s);
+        let out = rewrite_str_predicates(&mut ctx, &[atom]);
+        let k = last_concat_child(&ctx, out[0]);
+        assert_ne!(k, user, "skolem must not alias the user's !pfx term");
+        assert_eq!(
+            ctx.symbol_name(sym_of(&ctx, k)),
+            format!("!pfx{}", base + 2),
+            "mint must skip the user-owned suffix"
+        );
+        assert!(ctx.is_reserved(sym_of(&ctx, k)));
+        assert!(!ctx.is_reserved(sym_of(&ctx, user)));
+    }
+
+    #[test]
+    fn contains_pair_shares_one_suffix_and_is_reserved() {
+        let mut ctx = Context::new();
+        let abc = ctx.mk_string_const("b");
+        let s = str_var(&mut ctx, "s");
+        let atom = pred(&mut ctx, BuiltinOp::StrContains, s, abc);
+        let out = rewrite_str_predicates(&mut ctx, &[atom]);
+        // out[0] is (= s (str.++ kl sub kr)).
+        let TermNode::App { args, .. } = ctx.term_node(out[0]) else {
+            panic!("expected eq app");
+        };
+        let eq_children = ctx.children(*args).to_vec();
+        let TermNode::App { args, .. } = ctx.term_node(eq_children[1]) else {
+            panic!("expected concat app");
+        };
+        let cat = ctx.children(*args).to_vec();
+        let (kl, kr) = (cat[0], cat[2]);
+        let (nl, nr) = (
+            ctx.symbol_name(sym_of(&ctx, kl)).to_string(),
+            ctx.symbol_name(sym_of(&ctx, kr)).to_string(),
+        );
+        assert!(nl.starts_with("!ctnl") && nr.starts_with("!ctnr"));
+        assert_eq!(
+            nl["!ctnl".len()..],
+            nr["!ctnr".len()..],
+            "ctnl/ctnr must share one suffix"
+        );
+        assert!(ctx.is_reserved(sym_of(&ctx, kl)));
+        assert!(ctx.is_reserved(sym_of(&ctx, kr)));
     }
 
     #[test]
