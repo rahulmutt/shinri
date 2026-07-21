@@ -39,6 +39,26 @@ check-sats, so both collision directions are user-reachable:
 Both are wrong-verdict shapes. This is the "more exposed sibling" of the
 hazard slice 35 closed for `fresh_str`.
 
+> **Plan-time correction (reachability).** The `reduce.rs` mint families
+> are currently **solver-path-dead**: `encode_substr` fires only for
+> *unfoldable* substr/at, but the substr soundness fence
+> (`lib.rs:507-512`) returns `Unknown` for exactly those queries
+> *before* `reduce_assertions` runs — and `elim_term_ite`'s `!ite`
+> mints only trigger on the ITEs the substr guards introduce (user
+> non-Boolean ITEs are lifted earlier by word_norm on `self.ctx`,
+> `lib.rs:384`). So today only the `predicates.rs` family
+> (`!pfx/!sfx/!ctnl/!ctnr`, via `rewrite_str_predicates` at
+> `lib.rs:515`) mints live-context skolems reachable from a script.
+> The `reduce.rs` hardening is defense-in-depth that becomes load-
+> bearing the day the substr fence lifts; its collision behavior is
+> pinned at unit level (§4), not e2e. The pre-declared-alias hazard for
+> `!pfx` is script-reachable and produces a measured **wrong unsat**
+> today (a user `(declare-const !pfx0 String)` + `(= !pfx0 "z")` +
+> `(str.prefixof "ab" s)` + `(= (str.len s) 2)`: the decomposition
+> skolem hash-conses onto the user constant, forcing `s = "abz"` —
+> z3: sat). This upgrades the slice from prophylactic to a live
+> soundness fix.
+
 ## 2. Scope
 
 **In scope.**
@@ -150,17 +170,23 @@ close).
   shared across parallel tests, per §5).
 
 **e2e (`script_e2e`).** Mirror the two `ite!` reservation cases
-(`script_e2e.rs:118-166`) for two families (one `predicates.rs` family,
-one `reduce.rs` family):
+(`script_e2e.rs:118-166`) for the script-reachable `predicates.rs`
+family, plus one documentation pin for the fence-dead `reduce.rs`
+family:
 
-- Post-mint: a script whose first `(check-sat)` triggers the mint, then
+- Post-mint: a script whose first `(check-sat)` mints `!pfx0`, then
   `(declare-const !pfx0 String)` — **rejected** with the
-  "reserved for solver-internal use" error. Same shape for `!pre0` via a
-  substr script. (Expected to be a true parse-time rejection here,
-  unlike the `!strk` pins — see §3.)
-- Pre-declared: `(declare-const !pfx0 String)` before any use — stays a
-  usable free constant, the mint skips past it, and the script keeps its
-  verdict.
+  "reserved for solver-internal use" error. (A true parse-time
+  rejection here, unlike the `!strk` pins — see §3.)
+- Pre-declared: `(declare-const !pfx0 String)` + `(= !pfx0 "z")` before
+  a prefixof assertion — stays a usable free constant, the mint skips
+  past it, and the script keeps its z3-agreeing `sat` (pre-fix: wrong
+  unsat via aliasing — the §1 correction's measured hazard).
+- Fence documentation pin (`reduce.rs` family): an unfoldable-substr
+  script fences to `unknown` *before* any `!pre` mint, so a later
+  `(declare-const !pre0 String)` is **accepted** — pinning why the
+  `reduce.rs` family has no e2e rejection case (spec §1 plan-time
+  correction; the collision regime is pinned at unit level instead).
 
 **Gates** (in order):
 
