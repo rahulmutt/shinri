@@ -249,3 +249,153 @@ Base = slice-36 HEAD (`acf1bea5`), fix = this slice.
 4. Full gate green within the blocking-tier budget; fmt/clippy clean.
 5. The one lifted arm is the Propagate arm only; the Conflict downgrade is
    demonstrably untouched (its pins unchanged).
+
+## 8. Measured outcomes
+
+Measured 2026-07-21 (Task 2). Base commit `3f069ce0` (HEAD^ of the fix,
+string-resolver-identical to slice-36 HEAD `acf1bea5` — only doc commits
+sit between them). Fix commit `e19e55d1` (Task 1).
+
+### 8a. Instrumentation and dump-and-diff
+
+Temporary, byte-identical `DIFFDUMP {:016x} {:?}` blocks (a
+`DefaultHasher` of the exact `body` string) were inserted immediately after
+`ours` is computed and before any `continue`, in exactly the two functions
+named in §4b: `qfs_matches_z3` and `qfs_predicates_matches_z3`. Applied on
+the fix tree, run, reverted (`git checkout --`); applied identically in a
+worktree at base `3f069ce0` (confirmed identical insertion line numbers
+and identical resulting git blob hash on both sides), run, torn down.
+
+Both runs used `cargo nextest run -p shinri-solver --features oracle
+-E 'test(qfs_matches_z3) + test(qfs_predicates_matches_z3)' --no-capture`
+(2 tests discovered and run — confirms the oracle feature gate engaged,
+not a 0-test false-green).
+
+- Fix-side dump: `grep -c '^DIFFDUMP '` = **500** (300 `qfs_matches_z3` +
+  200 `qfs_predicates_matches_z3` iterations; non-zero).
+- Base-side dump: `grep -c '^DIFFDUMP '` = **500** (same, non-zero, equal
+  count).
+
+Sorted base vs sorted fix, full diff (verified complete — no truncation,
+no duplicate hashes in either 500-line file):
+
+```
+349c349
+< DIFFDUMP acbc7be6a8998bd2 Unknown
+---
+> DIFFDUMP acbc7be6a8998bd2 Sat
+```
+
+That is the entire diff: **exactly one of 500 lines differs.**
+
+- Hash `acbc7be6a8998bd2`, family `qfs_predicates_matches_z3` (identified
+  by the tally shift below; `qfs_matches_z3`'s tallies are byte-identical
+  90 sat / 137 unsat / 73 skipped on both sides).
+- Movement: `Unknown` (base) → `Sat` (fix) — the trigger flip, in the
+  completeness-**gaining** direction only.
+- Tallies: base `34 sat / 69 unsat / 97 shinri-unknown / 0 z3-unknown /
+  0 guard-bailout`; fix `35 sat / 69 unsat / 96 shinri-unknown / 0
+  z3-unknown / 0 guard-bailout` — exactly `+1 sat / −1 unknown`, consistent
+  with a single isolated flip.
+- `n_witness`: base `34` → fix `35`, moving in lockstep with `n_sat` — the
+  newly-decided instance's model witness re-solve ran and passed (no
+  `WITNESS FAILURE` assertion fired; both runs report `ok`).
+- z3 agreement: **`0 disagreements`** on both sides for both families.
+- No `decided → unknown` flip anywhere in either 500-line dump.
+- No other hash movement of any kind.
+
+**Bail tallies (both paths, both sides):** `n_guard_bailout` = **0 (base)
+and 0 (fix)** — explicitly equal, no increase (§3c's analyzability-guard
+signal did not fire).
+
+### 8b. Hash-provenance discrepancy (stated plainly)
+
+§1 and §7 criterion 1 of this spec, and the plan, pinned the literal
+`8e950d0d36e258cb` as the trigger hash, sourced from slice 35's
+dump-and-diff record. This Task 2 run measured the trigger flip at a
+**different** literal, `acbc7be6a8998bd2`, for what is the same underlying
+case. Investigated and resolved as follows:
+
+- `crates/shinri-solver/tests/qfs_differential.rs`'s production code
+  (`gen_predicates_body`, the LCG seed, `N_ITERS`/`PRED_N_ITERS`) is
+  unchanged since slice 34 — confirmed by the insertion line numbers being
+  identical between the base worktree (`3f069ce0`) and the fix tree before
+  any edit, and by `qfs_matches_z3`'s tallies being byte-identical across
+  both runs. The generated predicate bodies for a given iteration are
+  therefore byte-identical to slice 35's run — this **is** the same
+  underlying test case slice 35 recorded.
+- Slice 35's own (temporary, since-reverted) instrumentation was broader:
+  it dumped across all ~10 `qfs_*_matches_z3` families (~3904 total dump
+  lines, not this task's 500) and additionally instrumented a separate
+  witness re-solve call site. Hashing a different, longer string (or a
+  different call site) than this task's narrower body-only hash produces a
+  different `DefaultHasher` digest for the *same* logical test case — this
+  is expected: `DefaultHasher`'s output depends on exactly what bytes are
+  fed to it, and slice 35's instrumentation fed it more/different bytes.
+  `36069f2398aeda7e` (slice 35's recorded witness-sub-query hash) is that
+  broader instrumentation's digest of the witness re-solve string; this
+  task's narrower instrumentation does not hash that string at all (per
+  §4b/Task-2-brief's scope: only the two named `ours` sites), so no
+  analogous second line was ever going to appear in this task's diff — the
+  witness event is instead visible indirectly via `n_witness` moving 34→35
+  in lockstep with `n_sat`, confirming it ran and passed.
+- **Human adjudication (2026-07-21):** the executing agent halted at Step 6
+  per the brief's explicit HALT-AND-ADJUDICATE PROTOCOL (a hash-literal
+  mismatch from the spec's pinned value is one of the listed tripwires) and
+  escalated. The coordinator/human adjudicated and accepted
+  `acbc7be6a8998bd2` as the same trigger the plan pinned as
+  `8e950d0d36e258cb`, per the provenance explanation above. This section
+  records that acceptance; the hash literal is not silently substituted
+  without this explanation.
+
+Going forward, `acbc7be6a8998bd2` is this repository's DIFFDUMP-format
+(body-only hash) identifier for the trigger case; `8e950d0d36e258cb` and
+`36069f2398aeda7e` remain valid as slice 35's broader-instrumentation
+digests of the same case and its witness sub-query, respectively — the two
+are not interchangeable across differently-scoped instrumentation runs.
+
+### 8c. Clean gates (after adjudication)
+
+- **Oracle suite, clean tree, foreground** (`cargo nextest run -p
+  shinri-solver --features oracle`, no instrumentation): **503 tests run,
+  503 passed (8 slow), 3 skipped** — non-zero, confirms the oracle feature
+  gate engaged. Wall-clock ≈ 1305s (~21.75 min), consistent with the
+  documented ~20 min oracle-suite runtime. Re-ran `qfs_matches_z3` +
+  `qfs_predicates_matches_z3` alone with `--no-capture` on this same clean
+  tree to directly confirm the tally lines: both report **`0
+  disagreements`**, tallies matching the fix-side dump exactly (`35 sat /
+  69 unsat / 96 shinri-unknown / 0 guard-bailout` for the predicate
+  family).
+- **`script_e2e`** (`cargo nextest run -p shinri-solver -E
+  'binary(script_e2e)'`): **73 tests run, 73 passed, 1 skipped** — non-zero
+  discovery confirmed, all pass. No `sat`/`unsat` disagreement; no pin
+  flip required adjudication beyond the one already covered in §8a/§8b.
+- **Full workspace gate:**
+  - `cargo fmt --all -- --check` — clean, exit 0.
+  - `cargo clippy --workspace --all-targets -- -D warnings` — clean, 0
+    warnings.
+  - `cargo nextest run --workspace` — **1149 tests run, 1149 passed (5
+    slow), 7 skipped** (the expected `#[ignore]`d nightly `shinri-fp`
+    exhaustives). Wall-clock: **real 4m41.6s** — well within the 10–15 min
+    blocking-tier budget.
+
+### 8d. Adjudication verdict
+
+**Clear to merge.** The measured outcome is exactly the predicted shape of
+§4b/§7-criterion-1 (a single, isolated `unknown → sat` flip in the
+`qfs_predicates_matches_z3` family, z3-agreeing, `0 disagreements`, no bail
+increase, no other movement, witness re-solve ran and passed) — the only
+deviation is the literal hash digest, fully explained and adjudicated in
+§8b. All success criteria (§7.1–§7.5) are satisfied:
+
+1. The trigger case (recorded as `acbc7be6a8998bd2` under this task's
+   instrumentation; `8e950d0d36e258cb` under slice 35's) answers `sat`,
+   z3-agreeing, at fix. ✓
+2. Zero new `sat ↔ unsat` disagreements; zero `bail` increase on either
+   path (`0 = 0`). ✓
+3. Zero `decided → unknown` flips introduced. ✓
+4. Full gate green within budget (fmt/clippy clean; 4m41.6s workspace
+   run). ✓
+5. Only the Propagate arm was lifted; the Conflict downgrade is untouched
+   (Task 1's diff scope; unit pins for it still pass in the full-gate run
+   above). ✓
