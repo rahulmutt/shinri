@@ -295,13 +295,12 @@ passing tests — re-run per the known gotcha before trusting any count).
     for: *"any `decided → unknown` is approach A's measured completeness
     cost: record it in the truth-up, adjudicate, and it becomes the
     trigger for un-banking approach B."*
-  - **Adjudication status: OPEN, not resolved in this slice.** Per the
-    controlling task instructions for this run, a `decided → unknown`
-    flip is a stop-before-push condition — the branch's oracle/gate work
-    is complete and green in every other respect, but push/PR/merge is
-    deliberately withheld pending a human decision on whether this
-    single-hash cost is acceptable as-is or triggers un-banking approach
-    B (§2) before merge.
+  - **Adjudication status: RESOLVED — accepted, merge as-is.** The human
+    partner accepted the single-hash completeness cost: soundness is
+    intact (no `sat ↔ unsat` disagreement, clean z3 agreement) and the
+    cost is 1 of ~3900 hashes. The flip stands as the recorded trigger
+    for un-banking approach B (§2) in a future slice — it is not
+    un-banked by this decision, only logged as the qualifying event.
 
 Instrumentation reverted (`git checkout --
 crates/shinri-solver/tests/qfs_differential.rs`) and the base worktree
@@ -323,6 +322,7 @@ except the one measured completeness cost above, which is a known,
 anticipated, non-blocking-by-design-but-adjudication-gated outcome per
 this spec's own §4/§5 language. The §3b architecture-truth correction is
 independent of that cost and does not change the hazard-closed
-conclusion (see the inline notes at §3b/§4/§5 above). Push/PR/merge is
-withheld pending adjudication of the completeness-cost item; nothing
-else in this slice is blocked.
+conclusion (see the inline notes at §3b/§4/§5 above). **Adjudicated:**
+the human partner accepted the single-hash completeness cost as-is
+(soundness intact, z3 agreement clean, 1 of ~3900 hashes); it stands as
+the recorded un-banking trigger for approach B (§2). Cleared to merge.
