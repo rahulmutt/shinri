@@ -284,3 +284,82 @@ expected ballpark (one workspace-count delta noted above, no failures
 either side of it), the fence-pin behavior measured exactly as `§1`/`§4`
 predicted, and the plan-time wrong-unsat repro now answers `sat`. No
 soundness regressions observed. Ready for PR.
+
+## 7. Final-review correction — `!ite` is live, not fence-dead
+
+The final whole-branch review (z3 cross-checked) found §1's fence-dead
+claim over-broad. It is **correct for `!pre`/`!mid`/`!post`** — those
+mint only inside `encode_substr`, which fires only on unfoldable
+substr/at, and the substr soundness fence (`lib.rs:507-512`) returns
+`Unknown` for exactly those queries before `reduce_assertions` ever runs
+(confirmed by gate 4 in §6). It is **falsified for `!ite`**.
+
+**(a) Why `!ite` is live.** §1's plan-time correction reasoned that "user
+non-Boolean ITEs are lifted earlier by word_norm on `self.ctx`
+(`lib.rs:384`)", implying no user `ite` could reach `reduce.rs`'s
+`elim_term_ite` outside the substr-guard path. This misses that
+word_norm's ite lift explicitly **excludes String-sorted ites**
+(`crates/shinri-solver/src/word_norm.rs:80-82`,
+`eliminates_ite_sort`: `!matches!(ctx.sort_node(s), SortNode::Bool |
+SortNode::String)`). A String-sorted user `ite` therefore survives
+word_norm untouched and reaches three later passes that mint `!ite` via
+`elim_term_ite` on the **live**, pre-clone `self.ctx`
+(`lib.rs:516`)  —  not the discarded Combiner clone:
+
+- indexof with a symbolic start position → bounded Int-ite chain
+  (`lib.rs:429-430`);
+- `str.to_int(str.from_int(n))` roundtrip → `ite(n≥0,n,-1)`
+  (`lib.rs:446-447`);
+- the `str.to_code`/`str.from_code` roundtrip rewrites
+  (`lib.rs:464-467`).
+
+None of these require the substr fence to have fired, so `!ite` mints
+are reachable on ordinary scripts that never touch `str.substr`/`str.at`
+— including the simplest case, a bare user `(ite b "x" "yy")` assigned
+to a string variable, which trivially exercises `elim_term_ite` once
+word_norm has declined to touch it.
+
+**(b) Measured repro.** At base `32739ef0` (pre-slice-36):
+
+```
+(set-logic QF_S)(declare-const !ite0 String)(declare-fun s () String)(declare-fun b () Bool)
+(assert (= !ite0 "zzz"))
+(assert (= s (ite b "x" "yy")))
+(check-sat)
+```
+
+answered **`unsat`** — wrong; z3 confirms **`sat`** (`!ite0 = "zzz"`,
+`b = true`, `s = "x"`, or symmetric). The pre-declared, constrained
+`!ite0` was adopted by the mint via hash-consing (same genus as the
+`!pfx0` hazard in §1), forcing `s` to equal both ite branches through
+the aliased skolem. At `HEAD` (post-T1, `fresh_reserved_group`'s
+lookup-skip) the same script answers **`sat`**, re-measured foreground
+during this final-review fix wave. So slice 36's Task 1 closed a
+**second** live wrong-unsat beyond the one §1 documented for `!pfx0` —
+Task 1's `!ite` adoption was defense-in-depth only in the sense that it
+predated recognizing this route; the fix itself was already load-bearing
+at the time it landed.
+
+**(c) New coverage.** `crates/shinri-solver/tests/script_e2e.rs` gains
+`user_str_ite_name_declared_before_any_mint_still_works`, pinning the
+repro in (b): asserts the script answers `["sat"]`. The slice-36 banner
+comment and the `post_fence_declaration_of_pre_name_is_accepted_no_mint_occurred`
+doc comment are rescoped to name only `!pre`/`!mid`/`!post` as
+fence-dead, with `!ite`'s live routes cited and cross-referenced to the
+new pin.
+
+**(d) Bank entries for future slices.**
+
+- (i) `order_engine.rs:20-24`'s `!strcode` is a fixed-name
+  declare-or-fetch uninterpreted function, never reserved — currently
+  dormant behind the slice-31 fence (`shinri-slice31-str-order-deferred`
+  memory: two-free-var `str.<` order is banked, infra dormant). If the
+  order engine goes live, a user pre-declaring `!strcode` is silently
+  adopted into EUF congruence via the same `declare_fun`-overwrites-
+  `fun_sigs` mechanism (`context.rs:166-170`) — same hazard genus as
+  this slice, unaddressed. Worth a look the day that fence lifts.
+- (ii) Unchanged reminder (spec §2, out of scope): user→user
+  `declare_fun` silent overwrite remains adjudicated-out — a
+  parser-facing SMT-LIB-conformance question with a blast radius over
+  every declare path, not a skolem-specific hazard. Still banked, not
+  fixed here.

@@ -73,7 +73,9 @@ pub(crate) fn next_fresh() -> u32 {
 
 /// Mint a GROUP of fresh reserved skolems sharing one counter suffix.
 ///
-/// Slice 36: every skolem mint outside `fresh_str` routes through here.
+/// Slice 36: every skolem mint outside `fresh_str` **in this crate** routes
+/// through here (word_norm's `ite!` mint in `shinri-solver` has its own,
+/// equivalent lookup-skip/reserve loop — see `word_norm.rs`).
 /// The `lookup_symbol` skip closes the pre-mint collision direction (a
 /// user-declared `!pfx0` is never adopted as a skolem — pre-fix this was
 /// a measured wrong-unsat); `reserve_symbol` closes the post-mint

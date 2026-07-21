@@ -257,7 +257,14 @@ fn user_strk_name_declared_before_any_mint_still_works() {
 // (!pfx/!sfx/!ctnl/!ctnr) mints on the LIVE parser-visible ctx
 // (crates/shinri-solver/src/lib.rs:515, pre-clone), so BOTH collision
 // directions are script-reachable — unlike !strk (clone-isolated, slice 35)
-// and unlike !pre/!mid/!post/!ite (fence-dead, third pin below).
+// and unlike !pre/!mid/!post (fence-dead, third pin below: the substr fence
+// at lib.rs:507-512 fires before encode_substr can ever mint). `!ite` is
+// NOT fence-dead: word_norm's ite lift excludes String-sorted ites
+// (word_norm.rs:80-82), so a String-sorted user `ite` survives to the
+// indexof-symbolic-start / to_int-roundtrip / code_conv-roundtrip routes
+// (lib.rs:429-430, 446-447, 464-467) and mints `!ite{n}` via
+// reduce_assertions' elim_term_ite on this same live ctx — see the
+// dedicated pin below (§7 of the spec, final-review correction).
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[test]
@@ -321,13 +328,19 @@ fn user_pfx_name_declared_before_any_mint_still_works() {
 
 #[test]
 fn post_fence_declaration_of_pre_name_is_accepted_no_mint_occurred() {
-    // Documentation pin (spec §1 plan-time correction): an unfoldable
-    // substr fences to `unknown` at lib.rs:507-512 BEFORE reduce_assertions
-    // runs, so no !pre/!mid/!post/!ite skolem is ever minted on the live
-    // ctx — a later user `declare-const !pre0` is ACCEPTED (nothing to
-    // collide with). This pins WHY the reduce.rs family has no e2e
-    // rejection case; its collision regime is unit-pinned (reduce.rs
-    // tests, slice 36 T1) as defense-in-depth for a future fence lift.
+    // Documentation pin (spec §1 plan-time correction, rescoped by the
+    // final review — spec §7): an unfoldable substr fences to `unknown` at
+    // lib.rs:507-512 BEFORE reduce_assertions runs, so no !pre/!mid/!post
+    // skolem is ever minted on the live ctx — a later user
+    // `declare-const !pre0` is ACCEPTED (nothing to collide with). This
+    // pins WHY that trio has no e2e rejection case; its collision regime
+    // is unit-pinned (reduce.rs tests, slice 36 T1) as defense-in-depth for
+    // a future fence lift. `!ite` is NOT part of this fence-dead set — it
+    // is live via the indexof/to_int/code_conv routes (see the banner
+    // comment above) and is pinned separately in
+    // `user_str_ite_name_declared_before_any_mint_still_works` below (not
+    // to be confused with word_norm's unrelated `ite!<n>` naming scheme,
+    // pinned near the top of this file, which excludes String sort).
     let out = run_script(
         r#"(set-logic QF_S)(declare-fun s () String)(declare-fun i () Int)
            (assert (= (str.at s i) "a"))
@@ -340,6 +353,32 @@ fn post_fence_declaration_of_pre_name_is_accepted_no_mint_occurred() {
         out,
         vec!["unknown", "unknown"],
         "fence fires pre-mint both times; the declaration is silently accepted"
+    );
+}
+
+#[test]
+fn user_str_ite_name_declared_before_any_mint_still_works() {
+    // Final-review correction (spec §7): unlike !pre/!mid/!post, `!ite` is
+    // NOT fence-dead. word_norm's ite lift excludes String-sorted ites
+    // (word_norm.rs:80-82), so a String-sorted `ite` survives to the
+    // indexof-symbolic-start / to_int-roundtrip / code_conv-roundtrip
+    // routes (lib.rs:429-430, 446-447, 464-467), which reach
+    // reduce_assertions' elim_term_ite on the LIVE pre-clone ctx
+    // (lib.rs:516). This is a SECOND measured wrong-unsat at base
+    // 32739ef0: `!ite0` pre-declared and constrained to "zzz" is adopted
+    // by the mint via hash-consing, forcing `s` to equal both branches of
+    // the ite through the aliased skolem — z3 says sat, base said unsat.
+    // Closed by the same fresh_reserved_group lookup-skip (slice36 T1).
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-const !ite0 String)(declare-fun s () String)(declare-fun b () Bool)
+           (assert (= !ite0 "zzz"))
+           (assert (= s (ite b "x" "yy")))
+           (check-sat)"#,
+    );
+    assert_eq!(
+        out,
+        vec!["sat"],
+        "was a second measured wrong unsat pre-fix (z3: sat)"
     );
 }
 
