@@ -163,6 +163,88 @@ fn user_ite_name_declared_before_any_mint_still_works() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Slice 35 — str skolem freshness (spec §3b, as-built): `fresh_str` mints and
+// reserves `!strk<n>` (crates/shinri-str/src/wordeq.rs:63), but that mint runs
+// INSIDE `Solver::check_sat`'s search, which operates on a CLONE of the
+// context (`crates/shinri-solver/src/lib.rs:711`, `self.ctx.clone()` into the
+// Combiner) — unlike `word_norm`'s `ite!` mint, which runs on `self.ctx`
+// directly, before that clone (`crates/shinri-solver/src/lib.rs:384`). The
+// clone is discarded when `check_sat` returns, so the reservation never
+// reaches the live, parser-visible `Context`. A user `declare-const !strk0`
+// AFTER the mint is therefore ACCEPTED, not rejected — and this is sound: the
+// user's declaration lands in the live context as a genuinely fresh constant,
+// distinct from the search-clone's discarded skolem, so there is no aliasing
+// and no risk of the wrong-UNSAT shape the `ite!` guard exists to prevent.
+// The next solve's `fresh_str` lookup-skip (it re-mints against a fresh clone
+// derived from the now-updated live context, so it sees the user's `!strk0`
+// and skips it) keeps this sound going forward too.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn post_mint_declaration_of_strk_name_is_accepted_no_aliasing() {
+    // check-sat #1 F-splits the variable-headed equation and mints !strk
+    // skolems starting at !strk0 — but only inside the discarded search
+    // clone (see banner above). The later user declaration of !strk0 lands
+    // on the LIVE context untouched by that clone, so it is accepted as an
+    // ordinary fresh constant: no rejection error, no aliasing, and the
+    // second check-sat's verdict is unaffected (both measured "unknown",
+    // z3: sat on the full combined script including the !strk0 constraint).
+    let out = run_script(
+        "(declare-const x String)(declare-const y String)\
+         (assert (= (str.++ x \"ab\") (str.++ \"a\" y)))\
+         (check-sat)\
+         (declare-const !strk0 String)\
+         (assert (= !strk0 \"z\"))\
+         (check-sat)",
+    );
+    assert_eq!(
+        out.len(),
+        2,
+        "verdict / verdict — declare and assert produce no output on acceptance, got {out:?}"
+    );
+    assert_eq!(
+        out[0], "unknown",
+        "measured base verdict for the probe query"
+    );
+    assert_eq!(
+        out[1], "unknown",
+        "measured verdict after the accepted !strk0 declaration"
+    );
+    assert!(
+        !out.iter().any(|s| s.starts_with("(error")),
+        "the declaration of !strk0 must be genuinely accepted (clone isolation), got {out:?}"
+    );
+    assert!(
+        !out.contains(&"unsat".to_string()),
+        "no wrong UNSAT anywhere (z3: sat on the full combined script), got {out:?}"
+    );
+}
+
+#[test]
+fn user_strk_name_declared_before_any_mint_still_works() {
+    // A user who owns !strk0 before any mint keeps a normal free constant:
+    // fresh_str's probe skips the taken name and never reserves it. The
+    // verdict must match the mint-free measurement — no aliasing, no
+    // wrong UNSAT.
+    let out = run_script(
+        "(declare-const !strk0 String)\
+         (declare-const x String)(declare-const y String)\
+         (assert (= (str.++ x \"ab\") (str.++ \"a\" y)))\
+         (assert (= !strk0 \"q\"))\
+         (check-sat)",
+    );
+    assert_eq!(out.len(), 1, "single verdict, got {out:?}");
+    assert_eq!(
+        out[0], "unknown",
+        "user !strk0 must not perturb the probe verdict"
+    );
+    assert!(
+        !out.contains(&"unsat".to_string()),
+        "no wrong UNSAT (z3: sat with !strk0 = \"q\"), got {out:?}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Slice 5 final review — Finding 2 (test gap): ABV × word-level BV-sorted ite.
 // The slice changed the ABV path for a BV-sorted `ite` from panic to a correct,
 // sound verdict, previously with zero coverage. Scripts below were cross-checked
