@@ -253,6 +253,97 @@ fn user_strk_name_declared_before_any_mint_still_works() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Slice 36 — sibling skolem mints (spec §4): the predicates.rs family
+// (!pfx/!sfx/!ctnl/!ctnr) mints on the LIVE parser-visible ctx
+// (crates/shinri-solver/src/lib.rs:515, pre-clone), so BOTH collision
+// directions are script-reachable — unlike !strk (clone-isolated, slice 35)
+// and unlike !pre/!mid/!post/!ite (fence-dead, third pin below).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn post_mint_declaration_of_pfx_name_is_rejected() {
+    // First check-sat rewrites prefixof → (= s (str.++ "ab" !pfx0)), minting
+    // and reserving !pfx0 on the live ctx (the global FRESH_CTR starts at 0
+    // in this test's process — nextest runs one process per test). The
+    // user's later declaration of the minted name must be REJECTED (ite!
+    // regime), the aliased use is an undeclared-symbol error, and the final
+    // check-sat re-mints at a fresh suffix and stays sat. No wrong verdict.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)
+           (assert (str.prefixof "ab" s))(assert (= (str.len s) 2))
+           (check-sat)
+           (declare-const !pfx0 String)
+           (assert (= !pfx0 "z"))
+           (check-sat)"#,
+    );
+    assert_eq!(
+        out.len(),
+        4,
+        "sat / declare-error / aliased-use-error / sat"
+    );
+    assert_eq!(out[0], "sat");
+    assert!(
+        out[1].contains("reserved for solver-internal use"),
+        "declaration of the minted name must be rejected, got {:?}",
+        out[1]
+    );
+    assert!(
+        out[2].starts_with("(error"),
+        "aliased use is undeclared, got {:?}",
+        out[2]
+    );
+    assert_eq!(out[3], "sat", "must NOT be a wrong verdict");
+}
+
+#[test]
+fn user_pfx_name_declared_before_any_mint_still_works() {
+    // The measured plan-time wrong-unsat (spec §1 correction), now fixed:
+    // pre-fix, the mint adopted the user's !pfx0 (= "z"), forcing
+    // s = "ab" ++ "z" against len(s) = 2 → shinri unsat vs z3 sat. The
+    // lookup-skip mints !pfx1 instead; the user constant stays free and
+    // the script is SAT with s = "ab".
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-const !pfx0 String)(declare-fun s () String)
+           (assert (= !pfx0 "z"))
+           (assert (str.prefixof "ab" s))(assert (= (str.len s) 2))
+           (check-sat)(get-value (s))"#,
+    );
+    assert_eq!(
+        out.first().map(String::as_str),
+        Some("sat"),
+        "was a wrong unsat pre-fix"
+    );
+    assert!(
+        out.get(1).is_some_and(|v| v.contains("\"ab\"")),
+        "s must be \"ab\", got {out:?}"
+    );
+}
+
+#[test]
+fn post_fence_declaration_of_pre_name_is_accepted_no_mint_occurred() {
+    // Documentation pin (spec §1 plan-time correction): an unfoldable
+    // substr fences to `unknown` at lib.rs:507-512 BEFORE reduce_assertions
+    // runs, so no !pre/!mid/!post/!ite skolem is ever minted on the live
+    // ctx — a later user `declare-const !pre0` is ACCEPTED (nothing to
+    // collide with). This pins WHY the reduce.rs family has no e2e
+    // rejection case; its collision regime is unit-pinned (reduce.rs
+    // tests, slice 36 T1) as defense-in-depth for a future fence lift.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-fun s () String)(declare-fun i () Int)
+           (assert (= (str.at s i) "a"))
+           (check-sat)
+           (declare-const !pre0 String)
+           (assert (= !pre0 "z"))
+           (check-sat)"#,
+    );
+    assert_eq!(
+        out,
+        vec!["unknown", "unknown"],
+        "fence fires pre-mint both times; the declaration is silently accepted"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Slice 5 final review — Finding 2 (test gap): ABV × word-level BV-sorted ite.
 // The slice changed the ABV path for a BV-sorted `ite` from panic to a correct,
 // sound verdict, previously with zero coverage. Scripts below were cross-checked
