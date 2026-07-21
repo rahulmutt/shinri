@@ -28,9 +28,16 @@ pub enum StepResult {
     /// file). That probe returned `Done` — it claimed the equation was
     /// RESOLVED and cited nothing. This reports a FACT together with `just`,
     /// its full antecedent set, which the caller merges into EUF under an
-    /// `EqJust::Interface` tag. Nothing is emitted and nothing is learnt, so
-    /// the E1 branch-locality gate has no clause to reject. The MULTI-ATOM
-    /// variable-bearing word stays fenced (slice-34 spec §2).
+    /// `EqJust::Interface` tag. `just` includes not only the asserting
+    /// word-equation literal and any `normal_form` antecedents but, as of
+    /// slice 37, every EUF-door strip merge the strip loops consumed (via
+    /// `same_explain`, on BOTH the flattened and non-flattened paths — the
+    /// pass is shared) — so the interface merge is fully
+    /// justified even when a strip cancelled through a live EUF class rather
+    /// than same-TermId or literal-value identity. Nothing is emitted and
+    /// nothing is learnt, so the E1 branch-locality gate has no clause to
+    /// reject. The MULTI-ATOM variable-bearing word stays fenced (slice-34
+    /// spec §2).
     Propagate {
         var: TermId,
         word: TermId,
@@ -416,6 +423,37 @@ pub(crate) fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: T
     eq.are_equal(an, bn)
 }
 
+/// Like [`same`], but on the EUF-class door (the pair is equal only because a
+/// MERGE placed both atoms in one class) it appends the merge's antecedent
+/// leaves to `out` via `eq.explain`. The same-TermId and equal-literal-value
+/// doors are self-justifying and contribute no leaf (mirroring
+/// `nf_equal_explain`'s two `continue` guards). Used by the strip loops so a
+/// residual propagation cites every class equality a strip consumed — the
+/// citation slice 35 lacked, which forced the flattened-path `Propagate`
+/// downgrade.
+pub(crate) fn same_explain(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    a: TermId,
+    b: TermId,
+    out: &mut Vec<EqLeaf>,
+) -> bool {
+    if a == b {
+        return true; // identity: no merge, no leaf
+    }
+    if let (Some(x), Some(y)) = (terms.string_const_value(a), terms.string_const_value(b)) {
+        return x == y; // literal-value equality: no merge antecedent
+    }
+    let an = eq.intern(a);
+    let bn = eq.intern(b);
+    if eq.are_equal(an, bn) {
+        eq.explain(an, bn, out); // EUF door: cite the merge path
+        true
+    } else {
+        false
+    }
+}
+
 /// Resolve one word equation between two normal forms.
 ///
 /// A single-level `normal_form` can leave a CONCAT atom in a word — an unflattened
@@ -429,18 +467,18 @@ pub(crate) fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: T
 ///    minted concat every round — the F1 divergence whose Nielsen clause, guarded
 ///    only by `¬eqn`, drove a spurious UNSAT.
 /// 2. If a concat atom WAS flattened and the inner resolver reports a CONFLICT,
-///    downgrades it to `Saturated` (→ a sound Unknown / witness-checked SAT). Such
-///    a conflict is derived from constant/structure surfaced by the merge-driven
-///    substitution, yet `resolve_inner` cites only the word-equation literal — an
-///    under-cited (unsound) global exclusion. Suppressing exactly these conflicts
-///    keeps the single-level regime sound WITHOUT threading merge antecedents (a
-///    citation that over-approximates and trips the SAT conflict-analyzability
-///    guard). Purely structural conflicts on words that had NO concat atom are
-///    unaffected — every b10bd27 constant-length exemplar still Conflicts.
-/// 3. Symmetrically, if a concat atom WAS flattened and the inner resolver
-///    reports a PROPAGATE, downgrades it to `Saturated` for the same
-///    under-citation reason: the merge it would land could depend on an
-///    uncited `eq.are_equal` strip (slice 35).
+///    downgrades it to `Saturated`. Such a conflict cites only the word-equation
+///    literal, an under-cited global exclusion. This downgrade STAYS (slice 37
+///    lifted only the Propagate sibling; the Conflict lift is separately banked
+///    behind its own measured trigger). Purely structural conflicts on words
+///    with NO concat atom are unaffected.
+/// 3. If a concat atom WAS flattened and the inner resolver reports a PROPAGATE,
+///    it is now PASSED THROUGH (slice 37, un-banking approach B). The strip
+///    loops cite every EUF-class merge they consume into `just` via
+///    `same_explain`, so the residual merge the caller lands is fully justified
+///    — no longer the under-citation slice 35 fenced by downgrading to
+///    `Saturated`. This restores the one measured completeness cost slice 35
+///    logged (hash 8e950d0d, `qfs_predicates_matches_z3`).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_equation(
     terms: &mut Context,
@@ -471,15 +509,13 @@ pub fn resolve_equation(
         terms, eq, &lhs_flat, &rhs_flat, just, eqn_lit, fresh_ctr, emitted,
     ) {
         // A conflict off a flattened concat rep would be under-cited → Saturate.
+        // (Lifting THIS arm is separately banked — no qualifying trigger yet.)
         StepResult::Conflict(_) => StepResult::Saturated,
-        // A Propagate off a flattened concat rep is under-cited the same way:
-        // the strips over flattened inner atoms (never rep-substituted by
-        // normal_form) can consume via `eq.are_equal` on class equalities
-        // cited in neither `just` nor `nf_ante`, so the EUF merge this would
-        // land is under-justified — a wrong-UNSAT shape. Saturate,
-        // symmetrically with Conflict (slice 35; approach B in the spec is
-        // the banked completeness-restoring alternative).
-        StepResult::Propagate { .. } => StepResult::Saturated,
+        // A Propagate is now passed through: the strip loops cite every
+        // EUF-door merge into `just` (slice 37, un-banking approach B), so the
+        // EUF merge the caller lands is fully justified. The one measured cost
+        // slice 35 logged (hash 8e950d0d, qfs_predicates_matches_z3) is bought
+        // back here.
         other => other,
     }
 }
@@ -534,7 +570,7 @@ fn resolve_inner(
     eq: &mut EqualityEngine,
     lhs: &[TermId],
     rhs: &[TermId],
-    just: Vec<EqLeaf>,
+    mut just: Vec<EqLeaf>,
     eqn_lit: Lit,
     fresh_ctr: &mut u32,
     emitted: &mut FxHashSet<(TermId, TermId)>,
@@ -542,14 +578,14 @@ fn resolve_inner(
     let (mut i, mut j) = (0usize, 0usize);
     let (mut le, mut re) = (lhs.len(), rhs.len());
 
-    // Strip equal heads.
-    while i < le && j < re && same(terms, eq, lhs[i], rhs[j]) {
+    // Strip equal heads (citing any EUF-class merge each cancellation consumes).
+    while i < le && j < re && same_explain(terms, eq, lhs[i], rhs[j], &mut just) {
         i += 1;
         j += 1;
     }
 
-    // Strip equal tails.
-    while le > i && re > j && same(terms, eq, lhs[le - 1], rhs[re - 1]) {
+    // Strip equal tails (same citation).
+    while le > i && re > j && same_explain(terms, eq, lhs[le - 1], rhs[re - 1], &mut just) {
         le -= 1;
         re -= 1;
     }
@@ -1661,16 +1697,14 @@ mod tests {
         );
     }
 
-    /// Slice 35: a pure-assignment residual reached only by FLATTENING a
-    /// concat class-rep must NOT propagate. The strip loops over flattened
-    /// atoms can consume via `eq.are_equal` on class equalities cited in
-    /// neither `just` nor `nf_ante`, so a `Propagate` here would land an
-    /// under-justified EUF merge (wrong-UNSAT shape) — the same reason the
-    /// wrapper downgrades `Conflict`. Must be `Saturated`.
-    /// Control: `pure_assignment_folds_multi_atom_constant_side` pins that
-    /// the identical residual WITHOUT a concat atom still propagates.
+    /// Slice 37 (was slice 35's `..._does_not_propagate`): a pure-assignment
+    /// residual reached by FLATTENING a concat rep now PROPAGATES. This fixture's
+    /// only cancellation is none at all (`x` vs the constant word), so no EUF-door
+    /// strip runs and `just` is unchanged; the wrapper no longer downgrades it.
+    /// Control: `flattened_alias_residual_cites_euf_strip_merge` covers the case
+    /// where a strip DOES consume a merge and the leaf must appear.
     #[test]
-    fn flattened_pure_assignment_does_not_propagate() {
+    fn flattened_pure_assignment_now_propagates() {
         let mut ctx = Context::new();
         let mut eq = EqualityEngine::default();
         let x = declare_str_var(&mut ctx, "x_fpa");
@@ -1693,19 +1727,26 @@ mod tests {
             &mut ctr,
             &mut emitted,
         );
-        assert!(
-            matches!(r, StepResult::Saturated),
-            "a Propagate off a flattened concat rep is under-cited and must \
-             be downgraded to Saturated"
-        );
+        match r {
+            StepResult::Propagate { var, word, .. } => {
+                assert_eq!(var, x, "the variable side is reported as `var`");
+                assert_eq!(
+                    ctx.string_const_value(word),
+                    Some("ab"),
+                    "the flattened constant side folds to \"ab\""
+                );
+            }
+            _ => panic!("a flattened pure assignment must now Propagate, not Saturate"),
+        }
     }
 
-    /// Slice 35: the alias variant of the case above — flattening exposes a
-    /// strippable constant head, leaving a var–var residual that slice 34
-    /// would merge. Same under-citation hazard, same downgrade: `Saturated`.
-    /// Control: `alias_residual_propagates` pins the no-concat alias shape.
+    /// Slice 37 (was slice 35's `..._does_not_propagate`): the alias variant now
+    /// PROPAGATES. Flattening exposes a strippable constant head `"a"` that cancels
+    /// via the identity/literal door (no merge, no leaf), leaving the var–var
+    /// residual `[x] = [y]` that slice 34 merges. `just` is unchanged; the wrapper
+    /// passes the propagation through.
     #[test]
-    fn flattened_alias_residual_does_not_propagate() {
+    fn flattened_alias_residual_now_propagates() {
         let mut ctx = Context::new();
         let mut eq = EqualityEngine::default();
         let x = declare_str_var(&mut ctx, "x_far");
@@ -1729,10 +1770,103 @@ mod tests {
             &mut emitted,
         );
         assert!(
-            matches!(r, StepResult::Saturated),
-            "an alias residual off a flattened concat rep must be downgraded \
-             to Saturated"
+            matches!(r, StepResult::Propagate { var, word, .. } if var == x && word == y),
+            "an alias residual off a flattened concat rep must now Propagate `x ≈ y`"
         );
+    }
+
+    /// Slice 37: a strip through the identity/literal door must NOT enrich `just`
+    /// (the two self-justifying `same_explain` doors add no leaf). `[a, x] = [a, y]`
+    /// has no concat atom (non-flattened path) and its shared `"a"` head strips by
+    /// identity — the propagated `just` must be byte-identical to the input.
+    #[test]
+    fn non_flattened_literal_strip_leaves_just_unchanged() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_inv");
+        let y = declare_str_var(&mut ctx, "y_inv");
+        let a = ctx.mk_string_const("a");
+        let eqn_lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(eqn_lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[a, x],
+            &[a, y],
+            just,
+            eqn_lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        match r {
+            StepResult::Propagate { just, .. } => {
+                assert_eq!(
+                    just,
+                    vec![EqLeaf::Asserted(eqn_lit)],
+                    "a self-justifying strip must leave `just` unchanged"
+                );
+            }
+            _ => panic!("expected Propagate for the alias residual"),
+        }
+    }
+
+    /// Slice 37: the flattened alias residual that slice 35 downgraded now
+    /// PROPAGATES — and cites the EUF-door strip merge. `p ≈ q` is merged with
+    /// antecedent `merge_lit`; the flattened head strip cancels `p` against `q`
+    /// through the `eq.are_equal` door, so the propagated `x ≈ y` MUST carry
+    /// `merge_lit` in its justification (the under-citation slice 35 fenced).
+    #[test]
+    fn flattened_alias_residual_cites_euf_strip_merge() {
+        use shinri_theory::types::EqJust;
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let p = declare_str_var(&mut ctx, "p_cite");
+        let q = declare_str_var(&mut ctx, "q_cite");
+        let x = declare_str_var(&mut ctx, "x_cite");
+        let y = declare_str_var(&mut ctx, "y_cite");
+        // Merge p ≈ q via a genuine EUF merge whose antecedent is `merge_lit`.
+        let merge_lit = Lit::new(Var::new(1), true);
+        let pn = eq.intern(p);
+        let qn = eq.intern(q);
+        let _ = eq.merge(pn, qn, EqJust::Asserted(merge_lit));
+        // lhs carries a concat atom → flattened path; the head strip cancels p
+        // against q via the EUF door (not same-TermId, not literal value).
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[p, x])
+            .unwrap();
+        let eqn_lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(eqn_lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[concat],
+            &[q, y],
+            just,
+            eqn_lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        match r {
+            StepResult::Propagate { var, word, just } => {
+                assert_eq!(var, x, "left residual must be reported as `var`");
+                assert_eq!(word, y, "right residual must be reported as `word`");
+                assert!(
+                    just.iter()
+                        .any(|l| matches!(l, EqLeaf::Asserted(a) if *a == eqn_lit)),
+                    "must retain the asserting equation literal"
+                );
+                assert!(
+                    just.iter()
+                        .any(|l| matches!(l, EqLeaf::Asserted(a) if *a == merge_lit)),
+                    "must CITE the EUF-door strip merge antecedent (slice-37 fix)"
+                );
+            }
+            _ => panic!("expected Propagate carrying the cited strip merge"),
+        }
     }
 
     /// Slice 35: a user-declared `|!strk0|` that predates minting must NOT be
