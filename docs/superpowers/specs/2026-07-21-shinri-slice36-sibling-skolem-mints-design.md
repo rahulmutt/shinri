@@ -223,3 +223,64 @@ instead. Recorded here so the omission is an explicit decision.
   (skip behavior, group alignment), not absolute values, except where the
   test controls the counter. (The existing control test shape at
   `reduce.rs:481` already lives with this.)
+
+## 6. Outcome
+
+Implementation landed as three commits on `slice36-sibling-skolem-mints`:
+
+- `3f0bc909` — T1: `fresh_reserved_group` helper (§3), adopted by
+  `encode_substr` and the `!ite` lift in `reduce.rs`.
+- `69e6dc7e` — T2: `predicates.rs` (`!pfx/!sfx/!ctnl/!ctnr`) adopts the
+  helper; closes the measured live `!pfx0` aliasing wrong-unsat from §1.
+- `740f10f1` — T3: three `script_e2e` pins (post-mint rejection,
+  pre-declared-alias sat, fence-dead `!pre` documentation pin).
+- this commit (truth-up) — gates run and this section appended.
+
+**Gate results (all measured, foreground, captured output).**
+
+1. Oracle differential gate —
+   `cargo nextest run -p shinri-solver --features oracle`:
+   **502 tests run: 502 passed (9 slow), 3 skipped**, 0 failed, wall
+   1236.451s (~20.6 min). Matches the plan's ~502 exactly (499 at
+   slice-35 close + 3 new e2e pins). No sat/unsat disagreement with z3
+   in any test in the run — no BLOCKER.
+2. Dump-and-diff — skipped as adjudicated in §4 (not run; this is the
+   deliberate omission, not an oversight).
+3. Workspace gates:
+   - `cargo fmt --all -- --check` — clean (exit 0).
+   - `cargo clippy --workspace --all-targets -- -D warnings` — 0
+     warnings (exit 0).
+   - `cargo nextest run --workspace` — **1146 tests run: 1146 passed (5
+     slow), 7 skipped**, 0 failed, wall 281.508s. The plan predicted
+     ~1143 (1138 at slice-35 close + 2 reduce + 2 predicates + 3 e2e);
+     measured is **1146, a delta of +3** over the stated estimate (and
+     +1 over the arithmetic sum 1138+2+2+3=1145) — recorded as-measured,
+     not adjusted to match. 0 failed either way; the 7 skipped are
+     exactly the `#[ignore]`d fp exhaustives (untouched, per policy).
+4. Fence-pin confirmation — re-ran
+   `post_fence_declaration_of_pre_name_is_accepted_no_mint_occurred` in
+   isolation (`cargo nextest run -p shinri-solver -E
+   'test(post_fence_declaration_of_pre_name_is_accepted_no_mint_occurred)'`):
+   **1 passed**, asserting `out == vec!["unknown", "unknown"]` at
+   `script_e2e.rs:339-343`. Confirms §1's plan-time correction: the
+   `reduce.rs` family's fence-dead status holds — the substr fence fires
+   before any `!pre` mint, so both check-sats in that script answer
+   `unknown` and the later `!pre0` declaration is silently accepted, as
+   documented.
+5. Wrong-unsat repro (§1's measured hazard) — re-ran exactly:
+
+   ```
+   printf '(set-logic QF_S)(declare-const !pfx0 String)(declare-fun s () String)(assert (= !pfx0 "z"))(assert (str.prefixof "ab" s))(assert (= (str.len s) 2))(check-sat)\n' > /tmp/pfx-alias.smt2
+   cargo run -q -p shinri-cli -- /tmp/pfx-alias.smt2
+   ```
+
+   Output's final line: **`sat`** (six `success` lines from the prior
+   `assert`/`declare` commands precede it). Pre-fix this answered
+   `unsat` against z3's `sat` — a live wrong-unsat. Post-fix (T2,
+   `69e6dc7e`) it answers `sat`, agreeing with z3. The hazard is closed.
+
+**Summary.** All gates green, all measured counts non-zero and in the
+expected ballpark (one workspace-count delta noted above, no failures
+either side of it), the fence-pin behavior measured exactly as `§1`/`§4`
+predicted, and the plan-time wrong-unsat repro now answers `sat`. No
+soundness regressions observed. Ready for PR.
