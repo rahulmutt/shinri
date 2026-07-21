@@ -67,6 +67,25 @@ widens `Propagate`'s reachability over exactly this path.
   narrowing, never unsound. Stays banked.
 - **Multi-atom variable-bearing propagation** (slice-34 §10): untouched;
   probe B1 stays `unknown`.
+- **Sibling skolem mints outside the `fresh_str` freshness fix**
+  (pre-existing, surfaced by this final review): `fresh_str_var` in
+  `crates/shinri-str/src/predicates.rs:176-181` (mints `!pfx/!sfx/!ctnl/
+  !ctnr`) and `reduce.rs`'s `encode_substr`/ite mints (`!pre/!mid/!post/
+  !ite`, global `FRESH_CTR`) all bare-`declare_fun` with NO lookup-skip and
+  NO `reserve_symbol` — and, unlike `fresh_str`, they run on the LIVE
+  `self.ctx` (`crates/shinri-solver/src/lib.rs:515`, pre-clone), exactly
+  the parser-visible position where hash-cons aliasing persists across
+  check-sats. A user `(declare-const !pfx0 String)` colliding with the
+  counter would alias the decomposition skolem; `declare_fun` silently
+  overwrites `fun_sigs` for a differently-sorted user declaration. This is
+  the more exposed sibling of the hazard §1b/§3b closed for `fresh_str`.
+  Future slice candidate.
+- **`Split` passthrough off flattened reps**: §3a discharges `Split` with
+  "guarded by ¬eqn", but the learnt clause `eqn → (residual-head
+  disjunction)` can depend on an uncited `eq.are_equal` strip the same way
+  `Conflict`/`Propagate` did — the model gate backstops SAT, not learnt
+  clauses. Pre-slice-33 vintage, never observed firing, out of scope
+  here — banked for an explicit look.
 - Standing bank unchanged: slice-28 §8, slice-27 typed-antecedent
   refactor, slice-29 approach-C, slice-31 §11 walls 1/2/4, the retracted
   wall-3 seam.
@@ -134,6 +153,16 @@ pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
 - `reserve_symbol` closes the post-mint direction: a later user
   `declare-fun` of the minted name is rejected at parse time, exactly as
   for `ite!` names.
+  > **Slice-35-measured correction (see §6):** this claim is
+  > architecturally FALSE for `fresh_str` mints reached via
+  > `Solver::check_sat`. `check_sat` clones `self.ctx` into the theory
+  > Combiner *before* search (`lib.rs:711`); `fresh_str`'s mint +
+  > `reserve_symbol` run inside that discarded clone, so the reservation
+  > never reaches the parser-visible context. A post-mint
+  > `declare-const !strk0` is accepted, not rejected. `word_norm`'s
+  > `ite!` regime is unaffected because it mints on `self.ctx`
+  > pre-clone (`lib.rs:384`). The hazard is still closed by other means
+  > — see §6 for the full mechanism and adjudication.
 - The `!strk` BRANDING CONTRACT with `is_minted_skolem` is unchanged; the
   doc comments on both (`wordeq.rs:52-55`, `wordeq.rs:66-81`) are updated
   to note the freshness guarantee and the narrowed false-positive story
@@ -160,6 +189,13 @@ one site.
   declaration rejected with the "reserved for solver-internal use" error;
   pre-declared name stays a usable free constant and the script stays
   SAT).
+  > **Slice-35-measured correction (see §6):** FALSIFIED for the
+  > post-mint case. The actual e2e test is
+  > `post_mint_declaration_of_strk_name_is_accepted_no_aliasing` — both
+  > verdicts `unknown`, z3-sat-confirmed, no error. The pre-declared-name
+  > case (`user_strk_name_declared_before_any_mint_still_works`) is
+  > unaffected and passes as designed. Human-adjudicated: pin real
+  > behavior rather than the spec's assumption.
 
 **e2e pins.** Slice-33 probes (C/E/G/F/H) and slice-34 probes (A1–A4, B1)
 all read unchanged — the downgrade must not touch non-flattened
@@ -196,3 +232,121 @@ propagation, and B1 stays `unknown`.
   aliasing a skolem. This is the fix, not a regression (identical to the
   `ite!` regime), and such inputs are already outside any documented
   contract.
+  > **Slice-35-measured correction (see §6):** FALSIFIED — no parse-time
+  > error occurs post-mint; `check_sat`'s pre-search context clone
+  > (`lib.rs:711`) discards the mint-time `reserve_symbol` before the
+  > parser ever sees it. No "surprise" rejection ships in this slice.
+  > The hazard this bullet worried about is closed by clone isolation
+  > instead (the skolem never exists in the parser-visible context) plus
+  > the Task-2 lookup-skip (no pre-mint adoption on the next solve).
+
+## 6. Outcome
+
+Measured, in gate order. Task commits: `e9264cae` (T1, downgrade),
+`4cb491c9` (T2, `fresh_str` freshness), `b7ff6cb1` (T3, e2e pins).
+
+**Unit fences (T1).** Two new `wordeq.rs` unit tests (TDD red → green: a
+concat-class-rep residual returns `Saturated` not `Propagate`, plus an
+alias variant; control case with no concat atom still returns
+`Propagate`, pinning slice-33/34 behavior). `shinri-solver` crate suite:
+228/228 after T1.
+
+**`fresh_str` freshness (T2).** Two new unit tests (pre-declared
+`|!strk0|` skips the mint to `!strk1` with distinct `TermId`s; post-mint
+re-declaration rejected via `reserve_symbol`, mirroring the `ite!`
+cases). Crate suite: 230/230 after T2.
+
+**e2e pins (T3).** Both new `script_e2e` pins measured `unknown`/`unknown`
+verdicts, z3-sat-confirmed on both scripts, no error either way. Per the
+§3b/§5 truth-up above, the post-mint case is `unknown` — not rejected at
+parse time — because `check_sat`'s pre-search `self.ctx` clone
+(`lib.rs:711`) discards the mint's `reserve_symbol` before the parser
+ever observes it; `word_norm`'s `ite!` mint avoids this because it runs
+on `self.ctx` pre-clone (`lib.rs:384`). Human-adjudicated (Option A): pin
+the real, architecturally-explained behavior rather than rewrite it to
+match the spec's (false) assumption. The hazard §1b worried about
+(minted-skolem identity aliasing a later user term) is still closed:
+clone isolation makes post-mint aliasing impossible (the skolem never
+exists in the parser-visible context the user's `declare-const` runs
+against), and the Task-2 lookup-skip prevents pre-mint adoption on the
+solve after that. `reserve_symbol` is retained as unit-level
+defense-in-depth against a future refactor of the clone discipline, not
+as the mechanism that currently protects the e2e case. Slice-33/34 probe
+regression gate (Task-4 script_e2e run, folded into the count below):
+80 passed / 1 skipped, `B1` held `unknown` as expected.
+
+**Oracle gate (Step 1).** `cargo nextest run -p shinri-solver --features
+oracle`: **499 passed, 0 failed, 3 skipped**, confirmed non-zero,
+~1202 s (~20 min). (The slice-34 baseline quoted 497 passed.
+**Final-review correction:** `cargo nextest run -p shinri-solver
+--features oracle` runs every test binary in the package — the `oracle`
+feature only gates `qfs_differential`'s own tests, it does not scope the
+invocation to that binary. `script_e2e` is one of the binaries this
+command runs, and it went 67→69 in this same window (§ "`script_e2e` gate
+(Step 7)" below). So the +2 IS this slice's two new e2e pins, counted by
+the package-wide `--features oracle` invocation: 497 + 2 = 499. Not
+pre-existing drift.)
+
+**Dump-and-diff (Steps 2–6), base `6fc62643` vs fix `b7ff6cb1`.** Both
+runs required `--nocapture` (the first fix-side attempt without it
+produced 0 `DIFFDUMP` lines — the harness swallows `eprintln!` on
+passing tests — re-run per the known gotcha before trusting any count).
+
+- Base side: 3905 `DIFFDUMP` lines, 90/90 tests passed.
+- Fix side: 3904 `DIFFDUMP` lines, 90/90 tests passed.
+- Sorted diff (`base-sorted.txt` vs `fix-sorted.txt`): **not empty** —
+  two lines differ, both explained by one underlying case:
+  - `DIFFDUMP 8e950d0d36e258cb Some("sat")` (base) →
+    `DIFFDUMP 8e950d0d36e258cb Some("unknown")` (fix) — a **decided →
+    unknown** flip. Same source hash both sides (deterministic LCG
+    seeds), so this is the identical query deciding differently under
+    the T1 downgrade.
+  - `DIFFDUMP 36069f2398aeda7e Some("sat")` present only at base,
+    absent at fix — this is the derived witness-check sub-query for the
+    same case (`qfs_predicates_matches_z3` only re-solves a
+    model-substituted script when the primary verdict is `Sat`); once
+    the primary verdict became `unknown` at fix, the witness check never
+    ran, so its hash simply never appears. Not a second flip.
+  - Family: `qfs_predicates_matches_z3` (the flip is visible directly in
+    that test's own printed tally — base `35 sat / 96 shinri-unknown`,
+    fix `34 sat / 97 shinri-unknown`; re-run in isolation on the fix side
+    reproduced `34 sat / 97 shinri-unknown` exactly, confirming
+    determinism, not flakiness).
+  - No `sat ↔ unsat` disagreement (both commits report `0 disagreements`
+    against z3 for this family) and no bailout increase (`bail=0` both
+    sides) — this is **not** a soundness regression. It is exactly the
+    completeness cost spec §4/§5 anticipated and gave an escape valve
+    for: *"any `decided → unknown` is approach A's measured completeness
+    cost: record it in the truth-up, adjudicate, and it becomes the
+    trigger for un-banking approach B."*
+  - **Adjudication status: RESOLVED — accepted, merge as-is.** The human
+    partner accepted the single-hash completeness cost: soundness is
+    intact (no `sat ↔ unsat` disagreement, clean z3 agreement) and the
+    cost is 1 of ~3900 hashes. The flip stands as the recorded trigger
+    for un-banking approach B (§2) in a future slice — it is not
+    un-banked by this decision, only logged as the qualifying event.
+
+Instrumentation reverted (`git checkout --
+crates/shinri-solver/tests/qfs_differential.rs`) and the base worktree
+removed (`git worktree remove --force`) before proceeding; working tree
+confirmed clean.
+
+**`script_e2e` gate (Step 7).** `cargo nextest run -p shinri-solver -E
+'binary(script_e2e)'`: **69 tests run, 69 passed, 1 skipped** (67 prior +
+2 new pins; the skip is pre-existing and unrelated to this slice). No
+`decided → unknown` or `sat`/`unsat` disagreement.
+
+**Full gate (Step 8).** `cargo fmt --all -- --check`: clean.
+`cargo clippy --workspace --all-targets -- -D warnings`: 0 warnings.
+`cargo nextest run --workspace`: **1138 passed, 0 failed, 7 skipped**
+(the `#[ignore]`d nightly `shinri-fp` exhaustives), ~268 s (~4.5 min).
+
+**Net.** T1–T3 are soundness-neutral-or-better and gate-green everywhere
+except the one measured completeness cost above, which is a known,
+anticipated, non-blocking-by-design-but-adjudication-gated outcome per
+this spec's own §4/§5 language. The §3b architecture-truth correction is
+independent of that cost and does not change the hazard-closed
+conclusion (see the inline notes at §3b/§4/§5 above). **Adjudicated:**
+the human partner accepted the single-hash completeness cost as-is
+(soundness intact, z3 agreement clean, 1 of ~3900 hashes); it stands as
+the recorded un-banking trigger for approach B (§2). Cleared to merge.

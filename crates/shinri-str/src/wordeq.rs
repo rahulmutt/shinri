@@ -53,14 +53,42 @@ pub enum StepResult {
 /// `is_minted_skolem` below recognizes a term minted here. If this prefix
 /// ever changes, `is_minted_skolem` MUST change with it — keep the two in
 /// sync.
+///
+/// FRESHNESS (slice 35, mirrors word_norm's `ite!` mint): user-owned names
+/// are skipped (a pre-declared `|!strkN|` is never adopted as a skolem),
+/// and the minted name is reserved so a later user `declare-fun` naming it
+/// is rejected at parse time — otherwise the user's app hash-conses to the
+/// skolem and inherits its internal identity (wrong-verdict shape; see the
+/// slice-5 `ite!` finding).
+///
+/// **Slice-35 final-review correction:** the "rejected at parse time" claim
+/// above does not hold for `fresh_str` mints reached via `check_sat`.
+/// `Solver::check_sat` clones `self.ctx` into the theory Combiner before
+/// search (`crates/shinri-solver/src/lib.rs:711`), so every mint (and its
+/// `reserve_symbol` call) here runs on that clone; the clone — and the
+/// reservation with it — is discarded when `check_sat` returns, and a
+/// subsequent user `declare-fun` naming the minted symbol is accepted, not
+/// rejected. This is unlike word_norm's `ite!` mint, which runs on
+/// `self.ctx` itself, pre-clone (`lib.rs:384`), so its reservation genuinely
+/// reaches the parser. The `reserve_symbol` call here is retained as
+/// unit-level defense-in-depth — it protects a future refactor that moves
+/// this mint to run pre-clone — not as the mechanism that currently
+/// prevents aliasing (that is clone isolation itself: the skolem never
+/// exists in the parser-visible context a later `declare-fun` runs against).
 pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
-    let name = format!("!strk{}", *ctr);
-    *ctr += 1;
     let str_s = terms.string_sort();
-    let sym = terms.declare_fun(&name, &[], str_s);
-    terms
-        .mk_app(Op::Uninterpreted(sym), &[])
-        .expect("well-sorted")
+    loop {
+        let name = format!("!strk{}", *ctr);
+        *ctr += 1;
+        if terms.lookup_symbol(&name).is_some() {
+            continue; // user (or an earlier check) owns this name
+        }
+        let sym = terms.declare_fun(&name, &[], str_s);
+        terms.reserve_symbol(sym);
+        return terms
+            .mk_app(Op::Uninterpreted(sym), &[])
+            .expect("well-sorted");
+    }
 }
 
 /// True iff `t` is a MINTED char-peel/F-split skolem — a nullary symbol whose
@@ -74,10 +102,10 @@ pub fn fresh_str(terms: &mut Context, ctr: &mut u32) -> TermId {
 ///
 /// This is a NAME check, not a tracked-TermId check, so it is a heuristic: a
 /// user symbol literally declared as `|!strkN|` would false-positive here.
-/// That is harmless for soundness — a false positive only SKIPS an alias
-/// propagation that would otherwise fire, falling through to the pre-existing
-/// F-split path (i.e. it can only narrow completeness, never introduce an
-/// unsound merge).
+/// Since slice 35, `fresh_str` skips user-owned names and reserves minted
+/// ones, so such a term is never ALSO a skolem — the false positive only
+/// narrows completeness (the slice-34 guard declines to propagate), never
+/// soundness. The tracked-TermId-set upgrade remains banked.
 fn is_minted_skolem(terms: &Context, t: TermId) -> bool {
     match terms.term_node(t) {
         TermNode::App {
@@ -409,6 +437,10 @@ pub(crate) fn same(terms: &mut Context, eq: &mut EqualityEngine, a: TermId, b: T
 ///    citation that over-approximates and trips the SAT conflict-analyzability
 ///    guard). Purely structural conflicts on words that had NO concat atom are
 ///    unaffected — every b10bd27 constant-length exemplar still Conflicts.
+/// 3. Symmetrically, if a concat atom WAS flattened and the inner resolver
+///    reports a PROPAGATE, downgrades it to `Saturated` for the same
+///    under-citation reason: the merge it would land could depend on an
+///    uncited `eq.are_equal` strip (slice 35).
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_equation(
     terms: &mut Context,
@@ -440,6 +472,14 @@ pub fn resolve_equation(
     ) {
         // A conflict off a flattened concat rep would be under-cited → Saturate.
         StepResult::Conflict(_) => StepResult::Saturated,
+        // A Propagate off a flattened concat rep is under-cited the same way:
+        // the strips over flattened inner atoms (never rep-substituted by
+        // normal_form) can consume via `eq.are_equal` on class equalities
+        // cited in neither `just` nor `nf_ante`, so the EUF merge this would
+        // land is under-justified — a wrong-UNSAT shape. Saturate,
+        // symmetrically with Conflict (slice 35; approach B in the spec is
+        // the banked completeness-restoring alternative).
+        StepResult::Propagate { .. } => StepResult::Saturated,
         other => other,
     }
 }
@@ -907,7 +947,7 @@ fn resolve_inner(
 
 #[cfg(test)]
 mod tests {
-    use crate::wordeq::{resolve_equation, StepResult};
+    use crate::wordeq::{fresh_str, resolve_equation, StepResult};
     use crate::StrSolver;
     use rustc_hash::FxHashSet;
     use shinri_core::{BuiltinOp, Context, Lit, Op, Var};
@@ -1618,6 +1658,132 @@ mod tests {
         assert!(
             !matches!(r, StepResult::Propagate { .. }),
             "an unflattened CONCAT atom must never be treated as a variable"
+        );
+    }
+
+    /// Slice 35: a pure-assignment residual reached only by FLATTENING a
+    /// concat class-rep must NOT propagate. The strip loops over flattened
+    /// atoms can consume via `eq.are_equal` on class equalities cited in
+    /// neither `just` nor `nf_ante`, so a `Propagate` here would land an
+    /// under-justified EUF merge (wrong-UNSAT shape) — the same reason the
+    /// wrapper downgrades `Conflict`. Must be `Saturated`.
+    /// Control: `pure_assignment_folds_multi_atom_constant_side` pins that
+    /// the identical residual WITHOUT a concat atom still propagates.
+    #[test]
+    fn flattened_pure_assignment_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_fpa");
+        let a = ctx.mk_string_const("a");
+        let b = ctx.mk_string_const("b");
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[a, b])
+            .unwrap();
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[x],
+            &[concat],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Saturated),
+            "a Propagate off a flattened concat rep is under-cited and must \
+             be downgraded to Saturated"
+        );
+    }
+
+    /// Slice 35: the alias variant of the case above — flattening exposes a
+    /// strippable constant head, leaving a var–var residual that slice 34
+    /// would merge. Same under-citation hazard, same downgrade: `Saturated`.
+    /// Control: `alias_residual_propagates` pins the no-concat alias shape.
+    #[test]
+    fn flattened_alias_residual_does_not_propagate() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_far");
+        let y = declare_str_var(&mut ctx, "y_far");
+        let a = ctx.mk_string_const("a");
+        let concat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[a, x])
+            .unwrap();
+        let lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[concat],
+            &[a, y],
+            just,
+            lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Saturated),
+            "an alias residual off a flattened concat rep must be downgraded \
+             to Saturated"
+        );
+    }
+
+    /// Slice 35: a user-declared `|!strk0|` that predates minting must NOT be
+    /// adopted as a skolem — `fresh_str` skips user-owned names, so the
+    /// minted term is a distinct TermId under the next free name.
+    #[test]
+    fn fresh_str_skips_user_owned_name() {
+        let mut ctx = Context::new();
+        let user = declare_str_var(&mut ctx, "!strk0");
+        let mut ctr = 0u32;
+        let minted = fresh_str(&mut ctx, &mut ctr);
+        assert_ne!(
+            minted, user,
+            "minting must never hash-cons onto a pre-declared user |!strk0|"
+        );
+        assert!(
+            ctx.lookup_symbol("!strk1").is_some(),
+            "the mint must have landed on the next free name !strk1"
+        );
+        assert_eq!(ctr, 2, "counter passed the taken name and the minted one");
+    }
+
+    /// Slice 35: a minted `!strk` name is reserved. The user-owned name from
+    /// the skip case is NOT reserved.
+    ///
+    /// **Final-review caveat:** the reservation does NOT reject a later user
+    /// declaration at parse time for this mint — that overstates it. Every
+    /// `fresh_str` mint reached via `check_sat` runs on a CLONE of the
+    /// context (`Solver::check_sat` clones `self.ctx` into the theory
+    /// Combiner, `crates/shinri-solver/src/lib.rs:711`), so the reservation
+    /// dies with the discarded clone before the parser ever sees it — unlike
+    /// word_norm's `ite!` regime, which genuinely rejects because it mints
+    /// on `self.ctx` pre-clone (`lib.rs:384`). Here `reserve_symbol` is
+    /// defense-in-depth guarding a future refactor that moves this mint to
+    /// run pre-clone, not the mechanism that currently blocks aliasing (see
+    /// `fresh_str`'s doc comment above for the full correction).
+    #[test]
+    fn fresh_str_reserves_minted_name_only() {
+        let mut ctx = Context::new();
+        let _user = declare_str_var(&mut ctx, "!strk0");
+        let mut ctr = 0u32;
+        let _minted = fresh_str(&mut ctx, &mut ctr);
+        let user_sym = ctx.lookup_symbol("!strk0").unwrap();
+        let minted_sym = ctx.lookup_symbol("!strk1").unwrap();
+        assert!(
+            !ctx.is_reserved(user_sym),
+            "the user-owned name must stay a normal free constant"
+        );
+        assert!(
+            ctx.is_reserved(minted_sym),
+            "the minted name must be reserved against later user declaration"
         );
     }
 
