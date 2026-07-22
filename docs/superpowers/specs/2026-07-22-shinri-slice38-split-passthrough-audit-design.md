@@ -222,3 +222,86 @@ directly:
 6. The fix is confined to `resolve_inner` (snapshot + two guards) plus the
    wrapper doc-comment update; no change to `StepResult`, the wrapper match arms,
    or any `Conflict`/`Propagate` path.
+
+## 8. Measured outcomes
+
+Instrumentation (temporary `eprintln!("S38GUARD site=charpeel|generic
+grew={} -> saturated", ...)` at each guard site, Task 2) has been removed in
+Task 3; the guard code itself (Task 1, commit `ccfc0621`) is unchanged —
+`git diff ccfc0621 -- crates/shinri-str/src/wordeq.rs` is empty.
+
+**Instrumentation validation (unit fences — mechanism proof).** Before
+removal, `cargo nextest run -p shinri-str -E 'test(after_euf_strip_downgrades)
++ test(identity_strip_split_still_emits)' --no-capture` → 3 tests run, 3
+passed, with `S38GUARD site=charpeel grew=1 -> saturated` and `S38GUARD
+site=generic grew=1 -> saturated` observed on the two downgrade fences and no
+line on the non-over-fire fence. This confirms both guard sites are wired and
+reachable, and that the 0-counts recorded below are real (not broken
+instrumentation).
+
+**dump-and-diff.** The guard fired **0 times per site** (charpeel=0,
+generic=0) on every suite it ran against — the qfs oracle string suite, the
+full oracle run, and `script_e2e`. Identified by family + direction + count,
+per the verification plan; no `DefaultHasher` digest is recorded here.
+
+**Oracle differential.** qfs string suite: **90 run / 90 passed** (1 skipped),
+z3/cvc5 (mise) engaged — a non-zero, decided-differential-bearing run, not a
+false-green 0-test run. Full oracle (all theories): **503 run / 503 passed**
+(4 slow, 3 skipped). No `decided → unknown` flip. No `sat ↔ unsat`
+disagreement anywhere.
+
+**`script_e2e`.** **73 run / 73 passed** (1 skipped), non-zero discovery. No
+pin's answer moved.
+
+**Best-effort e2e repro.** **Not found.** Seven shapes were attempted (all
+`set-logic QF_S`, cross-checked against z3 4.16.0 via mise):
+
+| # | shape | shinri | z3 | S38GUARD | notes |
+|---|-------|--------|-----|----------|-------|
+| A | alias `(= u v)` + `(= (str.++ u x) (str.++ v y))` | sat | sat | 0 | correct |
+| A2 | alias + `(= (str.++ u "a" x) (str.++ v "b"))` | unsat | unsat | 0 | correct |
+| B | flat concat `(= s (str.++ t "x"))` + `(= (str.++ s y) (str.++ t "x" "z"))` | unknown | sat | 0 | sound (pre-existing incompleteness) |
+| B2 | flat concat charpeel `(= s (str.++ t "a"))` + `(= (str.++ s w) (str.++ t "ab"))` | unknown | sat | 0 | sound |
+| C | merge `(= t1 t2)` + `(= s (str.++ t1 "x"))` + `(= (str.++ s y) (str.++ t2 w))` | unknown | sat | 0 | sound |
+| D | merge + `(= s (str.++ t1 "a"))` + `(= (str.++ s w) (str.++ t2 "b"))` | unknown | unsat | 0 | sound (Conflict-off-flat → Saturated) |
+| E | merge `(= a b)` + `(= p (str.++ a x))` + `(= q (str.++ b y))` + `(= p q)` | unknown | sat | 0 | sound |
+
+No candidate fired the guard (0 S38GUARD across all 7 shapes); in every case
+shinri returned either z3's answer or a sound `unknown`, never a wrong
+`unsat`. No base-vs-fix answer divergence was produced.
+
+**Root cause of "never observed firing."** The word `normal_form` feeding
+`resolve_equation` in the real pipeline is **rep-canonical** — it substitutes
+the class representative for each atom. So two EUF-equal heads arrive at
+`resolve_inner` as the SAME `TermId`, take the identity door (`a == b`,
+pushes nothing), and `just` does not grow. The EUF door — and hence the guard
+— is effectively unreachable end-to-end via the canonical pipeline. The
+Task-1 unit fences reach the branch only by calling `resolve_equation`
+directly with non-rep-canonical word arrays (two distinct TermIds that are
+EUF-merged but not rep-substituted); that is the correct mechanism proof for
+a window the canonical pipeline never produces. The guard is a zero-cost
+defensive fence.
+
+### Success criteria (§7), marked against the above
+
+1. **Satisfied.** Both unit fences pass (3/3, including the non-over-fire
+   fence), re-confirmed after de-instrumentation in Task 3.
+2. **Satisfied (bounded negative result).** No pinned `script_e2e` repro; a
+   time-boxed negative result is recorded above with all 7 shapes attempted.
+3. **Satisfied.** dump-and-diff measured completeness cost is the expected
+   empty set: 0 guard fires on every suite, 0 `sat ↔ unsat` disagreements, 0
+   `decided → unknown` flips.
+4. **Satisfied.** Oracle differential green with confirmed non-zero counts
+   (90/90 qfs, 503/503 full); `script_e2e` green with non-zero discovery
+   (73/73).
+5. **Satisfied.** Full workspace gate green within budget (Task 3 Step 4);
+   `fmt --check` and `clippy -D warnings` clean (see below).
+6. **Satisfied, with one itemized, human-adjudicated exception.** The fix is
+   confined to `resolve_inner` (snapshot + two guards) plus the wrapper
+   doc-comment update; no change to the wrapper match arms or any
+   `Conflict`/`Propagate` path. **Exception:** `#[derive(Debug)]` was added to
+   `StepResult` (`wordeq.rs`) because the plan's own verbatim unit-test
+   assertions format the result via `{r:?}`. This is behaviorally inert — every
+   `StepResult` variant and field already derives/implements `Debug`
+   transitively — and was accepted by human adjudication as outside the
+   "no change to `StepResult`" fence in spirit but not in effect.
