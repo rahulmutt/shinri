@@ -3,6 +3,7 @@ use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode};
 use shinri_theory::types::EqLeaf;
 use shinri_theory::EqualityEngine;
 
+#[derive(Debug)]
 pub enum StepResult {
     Done,
     /// The word equation has a variable-headed residual whose F-split was ALREADY
@@ -479,6 +480,14 @@ pub(crate) fn same_explain(
 ///    — no longer the under-citation slice 35 fenced by downgrading to
 ///    `Saturated`. This restores the one measured completeness cost slice 35
 ///    logged (hash 8e950d0d, `qfs_predicates_matches_z3`).
+/// 4. `Split` (both the char-peel and generic F-split) is now guarded INSIDE
+///    `resolve_inner` (slice 38): a split reached through a non-identity
+///    EUF-door strip downgrades to `Saturated`, because its `¬eqn`-only learnt
+///    clause omits the stripped class equality (an under-guarded, wrong-UNSAT
+///    shape a learnt clause — unlike a `Propagate` merge — is not backstopped by
+///    the model gate). The guard lives in the inner resolver, so it covers BOTH
+///    this flattened path and the direct non-flattened path; the wrapper needs
+///    no `Split` arm of its own.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_equation(
     terms: &mut Context,
@@ -577,6 +586,15 @@ fn resolve_inner(
 ) -> StepResult {
     let (mut i, mut j) = (0usize, 0usize);
     let (mut le, mut re) = (lhs.len(), rhs.len());
+
+    // SLICE 38: snapshot the citation count BEFORE the strip loops. `same_explain`
+    // grows `just` only on the EUF door (identity/equal-literal doors push
+    // nothing — see `same_explain`), and nothing between here and the F-split
+    // emission sites below pushes to `just` except the strip loops. So
+    // `just.len() > incoming_just` at an F-split site means a non-identity class
+    // equality was load-bearing for the residual — the F-split's `¬eqn`-only
+    // clause would omit it (under-guarded, wrong-UNSAT shape). Guard both sites.
+    let incoming_just = just.len();
 
     // Strip equal heads (citing any EUF-class merge each cancellation consumes).
     while i < le && j < re && same_explain(terms, eq, lhs[i], rhs[j], &mut just) {
@@ -909,6 +927,14 @@ fn resolve_inner(
                 _ => None,
             };
         if let Some((var, cst)) = vc_pair {
+            // SLICE 38: under-guard check — a residual reached through an EUF-door
+            // strip makes this char-peel clause depend on the stripped class
+            // equality, which the `¬eqn` guard omits. Wait for SAT instead. Do
+            // NOT record the dedup key: a later round whose class state no longer
+            // needs the strip can emit the split cleanly.
+            if just.len() > incoming_just {
+                return StepResult::Saturated;
+            }
             // Extract first character of the constant (guaranteed non-empty above by
             // the `!s.is_empty()` guard in the match arm that produced `vc_pair`).
             let cs = terms.string_const_value(cst).unwrap().to_owned();
@@ -955,6 +981,10 @@ fn resolve_inner(
         let var_head =
             terms.string_const_value(ha).is_none() || terms.string_const_value(hb).is_none();
         if var_head {
+            // SLICE 38: same under-guard check as the char-peel site above.
+            if just.len() > incoming_just {
+                return StepResult::Saturated;
+            }
             // Canonical (unordered) key for dedup.
             let key = if ha.index() <= hb.index() {
                 (ha, hb)
@@ -1867,6 +1897,124 @@ mod tests {
             }
             _ => panic!("expected Propagate carrying the cited strip merge"),
         }
+    }
+
+    /// Slice 38: a char-peel F-split reached through a NON-IDENTITY EUF-door
+    /// strip is under-guarded (its `¬eqn`-only clause omits the strip's class
+    /// equality `p≈q`). It must downgrade to `Saturated`, not emit `Split`.
+    /// `p ≈ q` is merged (antecedent `merge_lit`); the head strip cancels p
+    /// against q via the EUF door, growing `just`; the residual `[x, x2] = ["b"]`
+    /// would otherwise char-peel-split on the (x, "b") pair.
+    #[test]
+    fn charpeel_split_after_euf_strip_downgrades_to_saturated() {
+        use shinri_theory::types::EqJust;
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let p = mk_var(&mut ctx, "p_s38a");
+        let q = mk_var(&mut ctx, "q_s38a");
+        let x = mk_var(&mut ctx, "x_s38a");
+        let x2 = mk_var(&mut ctx, "x2_s38a");
+        let b = ctx.mk_string_const("b");
+        let merge_lit = Lit::new(Var::new(1), true);
+        let pn = eq.intern(p);
+        let qn = eq.intern(q);
+        let _ = eq.merge(pn, qn, EqJust::Asserted(merge_lit));
+        let eqn_lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(eqn_lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[p, x, x2],
+            &[q, b],
+            just,
+            eqn_lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Saturated),
+            "char-peel split reached through an EUF-door strip must downgrade to Saturated, got {r:?}"
+        );
+        assert!(
+            emitted.is_empty(),
+            "downgrade must NOT record the dedup key (a later clean round must be able to split)"
+        );
+    }
+
+    /// Slice 38: same under-guard, generic (two-variable-head) F-split site.
+    /// Residual `[x, x2] = [w]` would otherwise emit the generic Nielsen split.
+    #[test]
+    fn generic_fsplit_after_euf_strip_downgrades_to_saturated() {
+        use shinri_theory::types::EqJust;
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let p = mk_var(&mut ctx, "p_s38b");
+        let q = mk_var(&mut ctx, "q_s38b");
+        let x = mk_var(&mut ctx, "x_s38b");
+        let x2 = mk_var(&mut ctx, "x2_s38b");
+        let w = mk_var(&mut ctx, "w_s38b");
+        let merge_lit = Lit::new(Var::new(1), true);
+        let pn = eq.intern(p);
+        let qn = eq.intern(q);
+        let _ = eq.merge(pn, qn, EqJust::Asserted(merge_lit));
+        let eqn_lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(eqn_lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[p, x, x2],
+            &[q, w],
+            just,
+            eqn_lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Saturated),
+            "generic F-split reached through an EUF-door strip must downgrade to Saturated, got {r:?}"
+        );
+        assert!(
+            emitted.is_empty(),
+            "downgrade must NOT record the dedup key"
+        );
+    }
+
+    /// Slice 38: the guard keys on the EUF door specifically, NOT on stripping
+    /// in general. An IDENTITY strip (same TermId `x` cancels against `x`) pushes
+    /// no leaf, so `just` does not grow and the residual char-peel split still
+    /// fires. Pins that the guard does not over-fire (correct at base AND fix).
+    #[test]
+    fn identity_strip_split_still_emits() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = mk_var(&mut ctx, "x_s38c");
+        let y = mk_var(&mut ctx, "y_s38c");
+        let y2 = mk_var(&mut ctx, "y2_s38c");
+        let b = ctx.mk_string_const("b");
+        let eqn_lit = dummy_eqn_lit();
+        let just = vec![EqLeaf::Asserted(eqn_lit)];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        // Head strip cancels x against x (identity door → no `just` growth);
+        // residual [y, y2] = ["b"] char-peels on (y, "b").
+        let r = resolve_equation(
+            &mut ctx,
+            &mut eq,
+            &[x, y, y2],
+            &[x, b],
+            just,
+            eqn_lit,
+            &mut ctr,
+            &mut emitted,
+        );
+        assert!(
+            matches!(r, StepResult::Split { .. }),
+            "an identity-strip F-split must still emit Split (guard must not over-fire), got {r:?}"
+        );
     }
 
     /// Slice 35: a user-declared `|!strk0|` that predates minting must NOT be
