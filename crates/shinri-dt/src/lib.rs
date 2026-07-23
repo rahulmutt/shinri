@@ -157,6 +157,94 @@ impl DtSolver {
         None
     }
 
+    /// Two DISTINCT constructor applications in one class are contradictory.
+    /// The explanation is the merge path that made them equal.
+    fn constructor_clash(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
+        let ctors: Vec<TermId> = self.ctor_apps.iter().copied().collect();
+        for (i, &p) in ctors.iter().enumerate() {
+            let Some((psym, _)) = Self::uapp(cx.terms, p) else {
+                continue;
+            };
+            let pn = cx.eq.intern(p);
+            let Some(rest) = ctors.get(i + 1..) else {
+                continue;
+            };
+            for &q in rest {
+                let Some((qsym, _)) = Self::uapp(cx.terms, q) else {
+                    continue;
+                };
+                if psym == qsym {
+                    continue;
+                }
+                let qn = cx.eq.intern(q);
+                if !cx.eq.are_equal(pn, qn) {
+                    continue;
+                }
+                let mut leaves = Vec::new();
+                cx.eq.explain(pn, qn, &mut leaves);
+                return Some(TCheck::Conflict(leaves));
+            }
+        }
+        None
+    }
+
+    /// `is-C(t)` where `t`'s class holds `C(a1..an)` is a valid UNIT tautology.
+    /// (The negative direction `¬is-D(t)` cannot ride `Split`, whose atoms are
+    /// positive; it is handled at assert time instead — see `assert`.)
+    fn tester_lemma(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
+        let testers: Vec<TermId> = self.testers.iter().copied().collect();
+        let ctors: Vec<TermId> = self.ctor_apps.iter().copied().collect();
+        for tst in testers {
+            let Some((tsym, targs)) = Self::uapp(cx.terms, tst) else {
+                continue;
+            };
+            let Some(DtRole::Tester { ctor }) = cx.terms.dt_role(tsym) else {
+                continue;
+            };
+            let Some(&t) = targs.first() else {
+                continue;
+            };
+            let tn = cx.eq.intern(t);
+            for &capp in &ctors {
+                let Some((csym, _)) = Self::uapp(cx.terms, capp) else {
+                    continue;
+                };
+                if csym != ctor {
+                    continue;
+                }
+                let cn = cx.eq.intern(capp);
+                if !cx.eq.are_equal(tn, cn) {
+                    continue;
+                }
+                if !self.emitted.insert(tst) {
+                    continue;
+                }
+                return Some(TCheck::Split {
+                    atoms: vec![tst],
+                    guard: None,
+                    phases: Vec::new(),
+                });
+            }
+        }
+        None
+    }
+
+    /// The constructor application in `t`'s class, if any: `(symbol, app)`.
+    fn ctor_of_class(&self, cx: &mut TheoryCtx, t: TermId) -> Option<(SymbolId, TermId)> {
+        let tn = cx.eq.intern(t);
+        let ctors: Vec<TermId> = self.ctor_apps.iter().copied().collect();
+        for capp in ctors {
+            let Some((csym, _)) = Self::uapp(cx.terms, capp) else {
+                continue;
+            };
+            let cn = cx.eq.intern(capp);
+            if cx.eq.are_equal(tn, cn) {
+                return Some((csym, capp));
+            }
+        }
+        None
+    }
+
     #[cfg(test)]
     pub(crate) fn watches_ctor(&self, t: TermId) -> bool {
         self.ctor_apps.contains(&t)
@@ -187,8 +275,45 @@ impl TheorySolver for DtSolver {
         self.collect(cx.terms, atom, &mut seen);
     }
 
-    fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> {
-        None
+    /// Tester disjointness: an asserted `is-D(t)` whose class already holds a
+    /// `C(..)` with `C != D` is an immediate conflict. Handled here rather
+    /// than in `check` because the consequence `¬is-D(t)` is a NEGATIVE
+    /// literal and `TCheck::Split` carries only positive atoms.
+    ///
+    /// House style bans `?` in this file (it would silently abandon the rest
+    /// of an in-progress loop elsewhere in this impl); `assert` is
+    /// straight-line, not a loop, so the hazard the ban guards against does
+    /// not apply here, but the file-wide `let..else { return None; }` idiom
+    /// is kept for consistency — hence the explicit lint override below.
+    #[allow(
+        clippy::question_mark,
+        reason = "house style: let..else, not ?, throughout this file"
+    )]
+    fn assert(&mut self, cx: &mut TheoryCtx, lit: Lit) -> Option<Vec<EqLeaf>> {
+        if !lit.is_positive() {
+            return None; // ¬is-D(t) constrains nothing in slice 39
+        }
+        let atom = cx.atoms.atom(lit.var());
+        let Some((tsym, targs)) = Self::uapp(cx.terms, atom) else {
+            return None;
+        };
+        let Some(DtRole::Tester { ctor }) = cx.terms.dt_role(tsym) else {
+            return None;
+        };
+        let Some(&t) = targs.first() else {
+            return None;
+        };
+        let Some((csym, capp)) = self.ctor_of_class(cx, t) else {
+            return None;
+        };
+        if csym == ctor {
+            return None; // agrees
+        }
+        let tn = cx.eq.intern(t);
+        let cn = cx.eq.intern(capp);
+        let mut leaves = vec![EqLeaf::Asserted(lit)];
+        cx.eq.explain(tn, cn, &mut leaves);
+        Some(leaves)
     }
 
     fn propagate(
@@ -203,7 +328,13 @@ impl TheorySolver for DtSolver {
         if effort != Effort::Full {
             return TCheck::Sat;
         }
+        if let Some(conflict) = self.constructor_clash(cx) {
+            return conflict;
+        }
         if let Some(split) = self.collapse_lemma(cx) {
+            return split;
+        }
+        if let Some(split) = self.tester_lemma(cx) {
             return split;
         }
         TCheck::Sat
@@ -222,7 +353,7 @@ impl TheorySolver for DtSolver {
 #[cfg(test)]
 mod tests {
     use crate::DtSolver;
-    use shinri_core::{Context, Op, SortId, SymbolId, TermId, TermNode, Var};
+    use shinri_core::{Context, Lit, Op, SortId, SymbolId, TermId, TermNode, Var};
     use shinri_sat::Effort;
     use shinri_theory::{AtomRegistry, EqJust, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
 
@@ -552,5 +683,133 @@ mod tests {
             cx.eq.are_equal(an, bn),
             "injectivity must emerge: a ≡ b after collapse + congruence"
         );
+    }
+
+    #[test]
+    fn constructor_clash_is_a_conflict() {
+        let mut ctx = Context::new();
+        let (list, nil, cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let int_sort = ctx.int_sort();
+        let one = uconst(&mut ctx, "one", int_sort);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let cons_t = ctx.mk_app(Op::Uninterpreted(cons), &[one, nil_t]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let a1 = ctx.mk_eq(x, nil_t).unwrap();
+        let a2 = ctx.mk_eq(x, cons_t).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), a1);
+        dt.new_var(&mut cx, Var::new(1), a2);
+
+        let (xn, nn, cn) = (cx.eq.intern(x), cx.eq.intern(nil_t), cx.eq.intern(cons_t));
+        let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
+        let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
+
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Conflict(_) => {}
+            other => panic!("expected Conflict, got {}", tcheck_name(&other)),
+        }
+    }
+
+    #[test]
+    fn tester_over_constructor_emits_unit_tautology() {
+        // `is-cons(cons(1,nil))` is a valid unit lemma.
+        let mut ctx = Context::new();
+        let (_list, nil, cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let int_sort = ctx.int_sort();
+        let one = uconst(&mut ctx, "one", int_sort);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let cons_t = ctx.mk_app(Op::Uninterpreted(cons), &[one, nil_t]).unwrap();
+        let is_cons_c = ctx.mk_app(Op::Uninterpreted(is_cons), &[cons_t]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), is_cons_c);
+
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Split { atoms, guard, .. } => {
+                assert_eq!(guard, None);
+                assert_eq!(atoms, vec![is_cons_c]);
+            }
+            other => panic!("expected Split, got {}", tcheck_name(&other)),
+        }
+    }
+
+    #[test]
+    fn asserted_tester_conflicting_with_constructor_is_rejected_at_assert() {
+        // is-nil(x) asserted true while x ≡ cons(1,nil) ⇒ conflict.
+        let mut ctx = Context::new();
+        let (list, nil, cons, _head, _tail, is_nil, _is_cons) = list_dt(&mut ctx);
+        let int_sort = ctx.int_sort();
+        let one = uconst(&mut ctx, "one", int_sort);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let cons_t = ctx.mk_app(Op::Uninterpreted(cons), &[one, nil_t]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let is_nil_x = ctx.mk_app(Op::Uninterpreted(is_nil), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        // TODO(slice39 T9): switch to Owner::Datatypes once it lands; DT atoms
+        // are not yet routed through the combiner, so Owner::Euf is a harmless
+        // stand-in for this direct-call test.
+        atoms.register(v, is_nil_x, shinri_theory::types::Owner::Euf);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_nil_x);
+        dt.new_var(&mut cx, Var::new(1), cons_t);
+        let (xn, cn) = (cx.eq.intern(x), cx.eq.intern(cons_t));
+        let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
+
+        let conflict = dt.assert(&mut cx, Lit::new(v, true));
+        assert!(
+            conflict.is_some(),
+            "is-nil(x) with x ≡ cons(..) must conflict at assert time"
+        );
+    }
+
+    #[test]
+    fn asserted_tester_agreeing_with_constructor_is_fine() {
+        let mut ctx = Context::new();
+        let (list, nil, _cons, _head, _tail, is_nil, _is_cons) = list_dt(&mut ctx);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let is_nil_x = ctx.mk_app(Op::Uninterpreted(is_nil), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        // TODO(slice39 T9): switch to Owner::Datatypes once it lands; see note
+        // in the conflicting-tester test above.
+        atoms.register(v, is_nil_x, shinri_theory::types::Owner::Euf);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_nil_x);
+        dt.new_var(&mut cx, Var::new(1), nil_t);
+        let (xn, nn) = (cx.eq.intern(x), cx.eq.intern(nil_t));
+        let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
+
+        assert!(dt.assert(&mut cx, Lit::new(v, true)).is_none());
     }
 }
