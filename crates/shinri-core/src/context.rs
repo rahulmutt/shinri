@@ -6,6 +6,40 @@ use crate::term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
 use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_num::{Integer, Rational};
 
+/// The datatype role of a symbol (slice 39). Constructors, selectors, and
+/// testers are ordinary uninterpreted functions; this table is what makes them
+/// datatype-aware without new `Op` variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DtRole {
+    /// `index` is the constructor's position in its datatype's constructor list.
+    Constructor {
+        dt: SortId,
+        index: u32,
+    },
+    /// `index` is the selector's argument position within `ctor`.
+    Selector {
+        ctor: SymbolId,
+        index: u32,
+    },
+    Tester {
+        ctor: SymbolId,
+    },
+}
+
+/// Side-table describing every declared datatype. Lives on `Context` so it is
+/// carried by `Context::clone` into the Combiner.
+#[derive(Clone, Default)]
+pub struct DatatypeRegistry {
+    /// datatype sort -> constructors, in declaration order
+    ctors: FxHashMap<SortId, Vec<SymbolId>>,
+    /// constructor -> its selectors, in argument order
+    sels: FxHashMap<SymbolId, Vec<SymbolId>>,
+    /// constructor -> its tester
+    testers: FxHashMap<SymbolId, SymbolId>,
+    /// any datatype-related symbol -> its role
+    roles: FxHashMap<SymbolId, DtRole>,
+}
+
 /// The single owning arena for all interned sorts (and, after Task 4, terms).
 #[derive(Clone)]
 pub struct Context {
@@ -35,6 +69,8 @@ pub struct Context {
     real_sort: SortId,
     string_sort: SortId,
     reglan_sort: SortId,
+    /// Datatype declarations (slice 39). Empty for non-datatype queries.
+    datatypes: DatatypeRegistry,
 }
 
 impl Default for Context {
@@ -64,6 +100,7 @@ impl Context {
             real_sort: SortId::from_index(0),
             string_sort: SortId::from_index(0),
             reglan_sort: SortId::from_index(0),
+            datatypes: DatatypeRegistry::default(),
         };
         ctx.bool_sort = ctx.intern_sort(SortNode::Bool);
         ctx.int_sort = ctx.intern_sort(SortNode::Int);
@@ -1098,6 +1135,74 @@ impl Context {
     }
 }
 
+impl Context {
+    /// Declare (and intern) a fresh datatype sort named `name`.
+    pub fn declare_datatype_sort(&mut self, name: &str) -> SortId {
+        let sym = self.symbols.intern(name);
+        self.intern_sort(SortNode::Datatype(sym))
+    }
+
+    /// Register `ctor` as a constructor of datatype sort `dt`, with `selectors`
+    /// in argument order and tester `tester`. Signatures must already have been
+    /// installed via `declare_fun`.
+    pub fn dt_add_constructor(
+        &mut self,
+        dt: SortId,
+        ctor: SymbolId,
+        selectors: &[SymbolId],
+        tester: SymbolId,
+    ) {
+        let list = self.datatypes.ctors.entry(dt).or_default();
+        let index = list.len() as u32;
+        list.push(ctor);
+        self.datatypes
+            .roles
+            .insert(ctor, DtRole::Constructor { dt, index });
+        for (i, &sel) in selectors.iter().enumerate() {
+            self.datatypes.roles.insert(
+                sel,
+                DtRole::Selector {
+                    ctor,
+                    index: i as u32,
+                },
+            );
+        }
+        self.datatypes.sels.insert(ctor, selectors.to_vec());
+        self.datatypes.roles.insert(tester, DtRole::Tester { ctor });
+        self.datatypes.testers.insert(ctor, tester);
+    }
+
+    pub fn dt_role(&self, sym: SymbolId) -> Option<DtRole> {
+        self.datatypes.roles.get(&sym).copied()
+    }
+
+    pub fn dt_constructors(&self, dt: SortId) -> Option<&[SymbolId]> {
+        self.datatypes.ctors.get(&dt).map(|v| v.as_slice())
+    }
+
+    pub fn dt_selectors(&self, ctor: SymbolId) -> Option<&[SymbolId]> {
+        self.datatypes.sels.get(&ctor).map(|v| v.as_slice())
+    }
+
+    pub fn dt_tester(&self, ctor: SymbolId) -> Option<SymbolId> {
+        self.datatypes.testers.get(&ctor).copied()
+    }
+
+    pub fn is_datatype_sort(&self, s: SortId) -> bool {
+        matches!(self.sort_node(s), SortNode::Datatype(_))
+    }
+
+    /// Declared parameter sorts of `sym`, if it has a signature.
+    pub fn fun_params(&self, sym: SymbolId) -> Option<&[SortId]> {
+        self.fun_sigs.get(&sym).map(|(p, _)| p.as_slice())
+    }
+
+    /// True iff any declared datatype exists (cheap gate for the DT theory).
+    pub fn has_datatypes(&self) -> bool {
+        !self.datatypes.ctors.is_empty()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1892,5 +1997,53 @@ mod tests {
         assert!(!ctx.any_fun_sig_mentions(re_s));
         ctx.declare_fun("r", &[], re_s);
         assert!(ctx.any_fun_sig_mentions(re_s));
+    }
+
+    #[test]
+    fn datatype_registry_records_roles() {
+        let mut ctx = Context::new();
+        let list = ctx.declare_datatype_sort("List");
+        let int = ctx.int_sort();
+        // nil : () List
+        let nil = ctx.declare_fun("nil", &[], list);
+        let is_nil = ctx.declare_fun("is-nil", &[list], ctx.bool_sort());
+        ctx.dt_add_constructor(list, nil, &[], is_nil);
+        // cons : (Int, List) List, selectors head/tail
+        let cons = ctx.declare_fun("cons", &[int, list], list);
+        let head = ctx.declare_fun("head", &[list], int);
+        let tail = ctx.declare_fun("tail", &[list], list);
+        let is_cons = ctx.declare_fun("is-cons", &[list], ctx.bool_sort());
+        ctx.dt_add_constructor(list, cons, &[head, tail], is_cons);
+
+        assert!(ctx.is_datatype_sort(list));
+        assert_eq!(ctx.dt_constructors(list), Some(&[nil, cons][..]));
+        assert_eq!(ctx.dt_selectors(cons), Some(&[head, tail][..]));
+        assert_eq!(ctx.dt_tester(cons), Some(is_cons));
+        assert!(matches!(
+            ctx.dt_role(cons),
+            Some(DtRole::Constructor { dt, index: 1 }) if dt == list
+        ));
+        assert!(matches!(
+            ctx.dt_role(tail),
+            Some(DtRole::Selector { ctor, index: 1 }) if ctor == cons
+        ));
+        assert!(matches!(
+            ctx.dt_role(is_cons),
+            Some(DtRole::Tester { ctor }) if ctor == cons
+        ));
+        assert!(ctx.dt_role(head).is_some());
+        assert_eq!(ctx.fun_params(cons), Some(&[int, list][..]));
+    }
+
+    #[test]
+    fn datatype_registry_survives_clone() {
+        let mut ctx = Context::new();
+        let list = ctx.declare_datatype_sort("List");
+        let nil = ctx.declare_fun("nil", &[], list);
+        let is_nil = ctx.declare_fun("is-nil", &[list], ctx.bool_sort());
+        ctx.dt_add_constructor(list, nil, &[], is_nil);
+        let cloned = ctx.clone();
+        assert_eq!(cloned.dt_constructors(list), Some(&[nil][..]));
+        assert!(cloned.is_datatype_sort(list));
     }
 }
