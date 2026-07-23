@@ -154,3 +154,30 @@ fn qfdt_oracle_uf_over_datatype() {
          (assert (= x y))(assert (distinct (f x) (f y)))",
     );
 }
+
+// slice-39 soundness fix: an arith relation directly over a selector term.
+// These are the shapes that previously returned a confident wrong `sat`.
+#[test]
+fn qfdt_oracle_lt_over_selector() {
+    agree("(assert (< (head (cons 10 nil)) 5))");
+}
+
+#[test]
+fn qfdt_oracle_le_over_selector() {
+    agree("(assert (<= (head (cons 10 nil)) 5))");
+}
+
+#[test]
+fn qfdt_oracle_gt_over_selector() {
+    agree("(assert (> (head (cons 10 nil)) 5))");
+}
+
+#[test]
+fn qfdt_oracle_ge_over_selector() {
+    agree("(assert (>= (head (cons 10 nil)) 20))");
+}
+
+#[test]
+fn qfdt_oracle_arith_wrapped_selector() {
+    agree("(assert (< (+ (head (cons 10 nil)) 1) 5))");
+}

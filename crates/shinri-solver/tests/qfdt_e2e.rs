@@ -167,3 +167,65 @@ fn mixed_datatype_and_arith_unsat() {
     ));
     assert_eq!(out, vec!["unsat"]);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// slice-39 soundness fix: an arith RELATION whose operand IS the selector term.
+// Before the fix `classify`'s blanket `contains_dt_op → Owner::Datatypes`
+// deep-walk stole these atoms from the simplex (Datatypes dispatches to EUF+DT
+// only, never Arith), so the inequality went unevaluated and shinri returned a
+// confident WRONG `sat`. The selector is now an ordinary Int UF-app: the
+// relation is Arith-owned, DT-collapse merges `head(cons(10,nil)) = 10` into
+// EUF, N-O exchanges it to Arith, and the simplex derives the conflict.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn arith_lt_over_selector_unsat() {
+    // head(cons(10, nil)) = 10, so 10 < 5 is FALSE → unsat.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}\
+         (assert (< (head (cons 10 nil)) 5))(check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn arith_le_over_selector_unsat() {
+    // 10 <= 5 is FALSE → unsat.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}\
+         (assert (<= (head (cons 10 nil)) 5))(check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn arith_gt_over_selector_sat() {
+    // 10 > 5 is TRUE → sat (a satisfiable relation over a selector still routes
+    // through Arith and is decided, not fenced).
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}\
+         (assert (> (head (cons 10 nil)) 5))(check-sat)"
+    ));
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn arith_ge_over_selector_unsat() {
+    // 10 >= 20 is FALSE → unsat.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}\
+         (assert (>= (head (cons 10 nil)) 20))(check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn arith_wrapped_selector_unsat() {
+    // (+ head(cons(10,nil)) 1) = 11, so 11 < 5 is FALSE → unsat. Confirms the
+    // selector rides the arith path even when nested under an arithmetic op.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}\
+         (assert (< (+ (head (cons 10 nil)) 1) 5))(check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}

@@ -118,19 +118,22 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
             return Ok(Owner::Datatypes);
         }
     }
-    // Datatype routing (deep): a constructor/selector/tester application
-    // ANYWHERE in the atom, even nested under a non-datatype-sorted top level
-    // (e.g. `(distinct (head (cons 1 nil)) 1)`, where `head` returns Int).
-    // The two checks above only see datatype-sorted top-level structure, so a
-    // selector buried under arithmetic would otherwise fall through to
-    // `Owner::Euf`/`Owner::Arith` and DtSolver would never learn about it —
-    // silently losing selector-collapse/injectivity/clash for that atom.
-    // Mirrors `contains_array_op`'s unconditional deep-walk routing for
-    // Arrays; the Combiner's `Owner::Datatypes` arm still notifies EUF too, so
-    // congruence over the buried applications is unaffected.
-    if contains_dt_op(terms, atom) {
-        return Ok(Owner::Datatypes);
-    }
+    // NOTE (slice-39 soundness fix): there is deliberately NO blanket
+    // `contains_dt_op → Owner::Datatypes` deep-walk here. A constructor/
+    // selector/tester is an ordinary uninterpreted function symbol, so an atom
+    // that merely MENTIONS one (e.g. `(< (head (cons 10 nil)) 5)`, or an Int
+    // `(distinct (head (cons 1 nil)) 1)`) must be classified EXACTLY as if that
+    // symbol were any other uninterpreted function of the same sort — Arith for
+    // a `< <= > >=` relation, EUF for an Int (dis)equality. An earlier version
+    // routed ALL such atoms to `Owner::Datatypes`, which dispatches to EUF+DT
+    // only and NEVER to Arith, so a relational atom whose operand was a buried
+    // selector was stolen from the simplex and the inequality went unevaluated
+    // (a wrong-SAT). DtSolver still learns about the buried applications: the
+    // Combiner notifies `dt.new_var` ownership-independently (guarded by
+    // `contains_dt_op`) in the EUF/Arith/Shared arms, mirroring the String
+    // theory's `atom_contains_str_len` notification. The two Datatypes clauses
+    // above (a tester application, or a datatype-SORTED (dis)equality) genuinely
+    // belong to DT+EUF and are kept.
     match terms.term_node(atom) {
         TermNode::App { op, args, .. } => {
             let children = terms.children(*args);
@@ -257,7 +260,11 @@ fn is_array_sorted(terms: &Context, t: TermId) -> bool {
 }
 
 /// True if any subterm of `t` is a constructor, selector, or tester
-/// application — see the deep-DT-routing comment at its call site.
+/// application. Used by the Combiner to notify `DtSolver` ownership-
+/// independently: an atom owned by EUF/Arith/Shared that nonetheless mentions a
+/// datatype application must still be watched by DT so collapse/clash/tester/
+/// injectivity rules fire over the buried applications (mirrors the String
+/// theory's `atom_contains_str_len` notification for `str.len`).
 ///
 /// The walk is memoized with a `seen` set: on a shared term DAG (nested
 /// lists/trees, `let`-shared subtrees) an unguarded recursion is exponential
@@ -265,9 +272,16 @@ fn is_array_sorted(terms: &Context, t: TermId) -> bool {
 /// `string_under_uf` guard against. (`contains_array_op` / `array_touches_arith`
 /// in this file are NOT guarded — a pre-existing latent issue for QF_A inputs,
 /// left untouched here; this function is guarded regardless.)
-fn contains_dt_op(terms: &Context, t: TermId) -> bool {
+pub(crate) fn contains_dt_op(terms: &Context, t: TermId) -> bool {
     fn walk(terms: &Context, t: TermId, seen: &mut FxHashSet<TermId>) -> bool {
         if !seen.insert(t) {
+            return false;
+        }
+        // Synthetic split TermIds (from a sub-theory using its own Context) are
+        // not interned here; treat them as dt-free (they cannot mention a
+        // datatype application registered in this Context). Mirrors the guard in
+        // `atom_contains_str_len`.
+        if !terms.contains_term(t) {
             return false;
         }
         match terms.term_node(t) {

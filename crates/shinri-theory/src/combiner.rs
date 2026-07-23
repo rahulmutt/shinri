@@ -2,7 +2,7 @@
 //! (`euf`, `arith`, `arrays`) until shinri-euf/shinri-arith/shinri-arrays exist;
 //! a fixed-arity, enum-routed, fully monomorphized struct — not a variadic tuple.
 
-use crate::atom::{classify, AtomRegistry, Unsupported};
+use crate::atom::{classify, contains_dt_op, AtomRegistry, Unsupported};
 use crate::eq_engine::EqualityEngine;
 use crate::interface::InterfaceSet;
 use crate::model::ModelBuilder;
@@ -131,6 +131,14 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                 if atom_contains_str_len(cx.terms, atom) {
                     self.string.new_var(&mut cx, v, atom);
                 }
+                // DT boundary (slice-39): an Int (dis)equality with a buried
+                // constructor/selector/tester (e.g. `(distinct (head (cons 1
+                // nil)) 1)`) is EUF-owned, but DtSolver must still watch the
+                // applications so collapse/clash/tester/injectivity fire.
+                // Ownership-independent, mirroring the str.len notify above.
+                if contains_dt_op(cx.terms, atom) {
+                    self.dt.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Arith => {
                 let mut cx = TheoryCtx {
@@ -150,6 +158,17 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                 // seam to detect contradictions such as `len(x)=1 ∧ x=""`.
                 if atom_contains_str_len(cx.terms, atom) {
                     self.string.new_var(&mut cx, v, atom);
+                }
+                // DT boundary (slice-39): an arith relation over a buried
+                // selector (e.g. `(< (head (cons 10 nil)) 5)`) is Arith-owned so
+                // the simplex evaluates the relation; DtSolver must ALSO watch
+                // the applications so selector-collapse merges the value into
+                // EUF, which N-O then exchanges to Arith. Ownership-independent,
+                // mirroring the str.len notify above. `register_arith_uf_terms`
+                // already interned the selector app into EUF (it is an ordinary
+                // Int UF-app), so it joins the shared set for the exchange.
+                if contains_dt_op(cx.terms, atom) {
+                    self.dt.new_var(&mut cx, v, atom);
                 }
             }
             Owner::Shared => {
@@ -174,6 +193,12 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                 self.euf.new_var(&mut cx, v, atom);
                 self.arith.new_var(&mut cx, v, atom);
                 self.euf.register_arith_uf_terms(&mut cx, atom);
+                // DT boundary (slice-39): a mixed arith/non-arith atom with a
+                // buried datatype application must also reach DtSolver. Mirrors
+                // the EUF/Arith arms above.
+                if contains_dt_op(cx.terms, atom) {
+                    self.dt.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Arrays => {
                 let mut cx = TheoryCtx {
@@ -374,6 +399,13 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                 if atom_contains_str_len(cx.terms, atom) {
                     self.string.new_var(&mut cx, v, atom);
                 }
+                // DT boundary (slice-39): mirror register_atom's Euf arm — a
+                // split atom (e.g. a collapse tautology `(= (head (cons 10 nil))
+                // 10)`, Int-equality, EUF-owned) with a buried datatype
+                // application must still be watched by DtSolver.
+                if contains_dt_op(cx.terms, atom) {
+                    self.dt.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Arith => {
                 self.arith.new_var(&mut cx, v, atom);
@@ -381,11 +413,19 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                 if atom_contains_str_len(cx.terms, atom) {
                     self.string.new_var(&mut cx, v, atom);
                 }
+                // DT boundary (slice-39): mirror register_atom's Arith arm.
+                if contains_dt_op(cx.terms, atom) {
+                    self.dt.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Shared => {
                 self.euf.new_var(&mut cx, v, atom);
                 self.arith.new_var(&mut cx, v, atom);
                 self.euf.register_arith_uf_terms(&mut cx, atom);
+                // DT boundary (slice-39): mirror register_atom's Shared arm.
+                if contains_dt_op(cx.terms, atom) {
+                    self.dt.new_var(&mut cx, v, atom);
+                }
             }
             Owner::Arrays => {
                 self.euf.new_var(&mut cx, v, atom);
