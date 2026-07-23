@@ -76,11 +76,14 @@ fn reject_reserved(ctx: &Context, name: &str, sp: &Span) -> Result<(), Diagnosti
 /// Reject `name` when it already resolves to a declared symbol (a signature or
 /// a datatype role). Declaring it again would hash-cons onto the same symbol
 /// and silently overwrite the existing declaration.
+///
+/// The wording is deliberately distinct from the `sort {n} already declared`
+/// check in `parse_declare_datatypes`, so a test can tell which gate fired.
 fn reject_collision(ctx: &Context, name: &str, sp: &Span) -> Result<(), Diagnostic> {
     if ctx.name_is_declared(name) {
         return Err(Diagnostic::new(
             sp.clone(),
-            format!("cannot declare '{name}': the name is already declared"),
+            format!("cannot declare '{name}': collides with an existing declaration"),
         ));
     }
     Ok(())
@@ -1089,8 +1092,12 @@ impl<'a> Parser<'a> {
                 self.env.add_sort(&name, s);
                 Command::DeclareSort { name, arity }
             }
-            "declare-datatype" => self.parse_declare_datatypes(ctx, hsp, false)?,
-            "declare-datatypes" => self.parse_declare_datatypes(ctx, hsp, true)?,
+            // These two consume their own closing ')' (it has to be validated
+            // inside their rollback ledger — see `parse_declare_datatypes`), so
+            // they return directly rather than falling through to the shared
+            // `expect_token(RParen)` below.
+            "declare-datatype" => return Ok(Some(self.parse_declare_datatypes(ctx, hsp, false)?)),
+            "declare-datatypes" => return Ok(Some(self.parse_declare_datatypes(ctx, hsp, true)?)),
             "declare-const" => {
                 let (name, nsp) = self.expect_symbol()?;
                 reject_reserved(ctx, &name, &nsp)?;
@@ -1199,8 +1206,12 @@ impl<'a> Parser<'a> {
     /// resolves. Every malformed shape is rejected with a `Diagnostic`.
     ///
     /// Registration is *transactional*: everything the command installs into
-    /// `ctx` and `self.env` is recorded in a `DtStaging` ledger, and any error
+    /// `ctx` and `self.env` is recorded in a `DtStaging` ledger, and every error
     /// exit unwinds it, so a rejected declaration leaves no reachable trace.
+    /// That includes the command's own closing `)`, which this function
+    /// consumes itself (the dispatcher's shared close would run after the
+    /// ledger was dropped, leaving a "rejected" command's declarations
+    /// installed).
     fn parse_declare_datatypes(
         &mut self,
         ctx: &mut Context,
@@ -1320,6 +1331,21 @@ impl<'a> Parser<'a> {
             ));
         }
 
+        // ---- 5. close the command, INSIDE the staged region -----------------
+        // The shared `expect_token(RParen)` at the end of `parse_command_body`
+        // runs after this function has returned and the ledger has been
+        // dropped, so a truncated or trailing-garbage command would be reported
+        // as rejected while its declarations stayed installed. Consuming the
+        // paren here keeps every failure mode under the rollback; the
+        // dispatcher therefore skips its own close for this command.
+        //
+        // It must be the LAST step. `next_command` calls
+        // `recover_to_command_end` on error with a paren depth of 1, i.e. it
+        // assumes the command's closing ')' is still unconsumed. Every error
+        // exit above leaves it unconsumed, and this one fails without
+        // consuming anything, so that assumption holds on every path.
+        self.expect_token(&Token::RParen)?;
+
         Ok(Command::DeclareDatatypes { sorts })
     }
 
@@ -1372,9 +1398,21 @@ impl<'a> Parser<'a> {
         self.bump(); // ')'
 
         // The tester is minted, not user-written; it must not land on a name a
-        // user already took (e.g. `(declare-datatype D ((is-c) (c)))`).
+        // user already took. `name_is_declared` covers earlier commands and
+        // earlier constructors of this one; the two command-scoped sets close
+        // the same-constructor window, where this constructor's own name and
+        // selectors have been *parsed* but not yet installed into `ctx`
+        // (e.g. `(declare-datatype D ((c (is-c Int))))`).
         let tname = format!("is-{cname}");
-        reject_collision(ctx, &tname, &csp)?;
+        if ctx.name_is_declared(&tname) || seen_ctor.contains(&tname) || seen_sel.contains(&tname) {
+            return Err(Diagnostic::new(
+                csp.clone(),
+                format!(
+                    "cannot declare constructor {cname}: \
+                     its tester {tname} collides with an existing declaration"
+                ),
+            ));
+        }
 
         let ctor = ctx.declare_fun(&cname, &sel_sorts, dt);
         self.env.add_fun(&cname, ctor);
@@ -1672,19 +1710,72 @@ mod tests {
         assert!(errs[0].contains("well-founded"), "message was: {}", errs[0]);
     }
 
-    /// The same holds for the other rejection paths: zero constructors,
-    /// duplicate constructor, duplicate selector.
+    /// The same holds for the other rejection paths. Each case pins the
+    /// diagnostic the bad input must produce, so the test cannot pass by the
+    /// bad input being *accepted* and the retry being the sole error.
     #[test]
     fn other_rejection_paths_also_roll_back() {
-        for bad in [
-            "(declare-datatype T ())",
-            "(declare-datatype T ((c) (c)))",
-            "(declare-datatype T ((c (f Int) (f Int))))",
+        for (bad, want) in [
+            ("(declare-datatype T ())", "at least one constructor"),
+            ("(declare-datatype T ((c) (c)))", "duplicate constructor"),
+            (
+                "(declare-datatype T ((c (f Int) (f Int))))",
+                "duplicate selector",
+            ),
+            ("(declare-datatype T ((c (f T))))", "well-founded"),
         ] {
             let src = format!("{bad}(declare-datatype T ((base)))");
             let errs = all_errors(&src);
             assert_eq!(errs.len(), 1, "for {bad}: errors were {errs:?}");
+            assert!(
+                errs[0].contains(want),
+                "for {bad}: wanted {want:?}, got {:?}",
+                errs[0]
+            );
         }
+    }
+
+    // ---- the closing paren is inside the staged region (re-review 1) --------
+
+    /// The command's own `)` is validated by `parse_declare_datatypes`, not by
+    /// the dispatcher's shared close — otherwise the ledger would already be
+    /// dropped and a "rejected" command's declarations would stay installed.
+    #[test]
+    fn trailing_garbage_rolls_the_declaration_back() {
+        let errs = all_errors("(declare-datatype L ((nil)) junk)(declare-fun x () L)");
+        assert_eq!(errs.len(), 2, "errors were: {errs:?}");
+        assert!(
+            errs[1].contains("unknown sort L"),
+            "message was: {}",
+            errs[1]
+        );
+    }
+
+    /// Same for EOF before the closing `)`: a Diagnostic, never a panic, and
+    /// the truncated declaration must not survive.
+    #[test]
+    fn truncated_command_rolls_the_declaration_back() {
+        let errs = all_errors("(declare-datatype L ((nil))");
+        assert_eq!(errs.len(), 1, "errors were: {errs:?}");
+        // And the name is free again for a later, complete command.
+        let errs = all_errors("(declare-datatype L ((nil)) junk)(declare-datatype L ((nil)))");
+        assert_eq!(errs.len(), 1, "errors were: {errs:?}");
+    }
+
+    /// The plural form rolls back too: the body list here is one entry short,
+    /// so `B`'s constructor list is never reached and `A` must be released.
+    #[test]
+    fn plural_declaration_rolls_back_the_whole_group() {
+        let errs = all_errors(
+            "(declare-datatypes ((A 0) (B 0)) (((mkA (getB B)))))\
+             (declare-datatype A ((base)))(declare-fun x () B)",
+        );
+        assert_eq!(errs.len(), 2, "errors were: {errs:?}");
+        assert!(
+            errs[1].contains("unknown sort B"),
+            "message was: {}",
+            errs[1]
+        );
     }
 
     /// Constructor/selector/tester symbols minted by a rejected declaration
@@ -1721,7 +1812,10 @@ mod tests {
     fn declare_datatypes_rejects_constructor_reused_across_commands() {
         let e = first_error("(declare-datatype A ((c)))(declare-datatype B ((c)))")
             .expect("must error");
-        assert!(e.contains("already declared"), "message was: {e}");
+        assert!(
+            e.contains("cannot declare 'c': collides with an existing declaration"),
+            "message was: {e}"
+        );
     }
 
     /// A constructor colliding with a plain `declare-fun` is equally fatal.
@@ -1729,14 +1823,50 @@ mod tests {
     fn declare_datatypes_rejects_constructor_colliding_with_declare_fun() {
         let e =
             first_error("(declare-fun c () Int)(declare-datatype D ((c)))").expect("must error");
-        assert!(e.contains("already declared"), "message was: {e}");
+        assert!(
+            e.contains("cannot declare 'c': collides with an existing declaration"),
+            "message was: {e}"
+        );
     }
 
     /// A minted tester must not land on a user-written constructor name.
     #[test]
     fn declare_datatypes_rejects_tester_colliding_with_constructor() {
         let e = first_error("(declare-datatype D ((is-c) (c)))").expect("must error");
-        assert!(e.contains("is-c"), "message was: {e}");
+        assert!(
+            e.contains("its tester is-c collides with an existing declaration"),
+            "message was: {e}"
+        );
+    }
+
+    /// The same-constructor window: `is-c` is parsed as a selector of `c`, so
+    /// it is not yet in `fun_sigs` when the tester name is checked. Only the
+    /// command-scoped `seen_sel` set catches it. Without the check, the
+    /// selector's Int signature and Selector role are overwritten by the
+    /// tester's Bool signature and Tester role.
+    #[test]
+    fn declare_datatypes_rejects_tester_colliding_with_own_selector() {
+        let e = first_error("(declare-datatype D ((c (is-c Int))))").expect("must error");
+        assert!(
+            e.contains("its tester is-c collides with an existing declaration"),
+            "message was: {e}"
+        );
+    }
+
+    /// The same window for the constructor's own name: `is-is-c` would be the
+    /// tester of a constructor literally named `is-c`. Sanity check that the
+    /// self-collision `(c)` whose tester is `is-c` is only rejected when `is-c`
+    /// is actually taken — a plain constructor named `is` is fine.
+    #[test]
+    fn declare_datatypes_rejects_tester_colliding_with_a_constructor_in_the_same_command() {
+        // `is-a` is a constructor of the same command; `a`'s tester wants it.
+        let e = first_error("(declare-datatype D ((is-a) (a)))").expect("must error");
+        assert!(
+            e.contains("its tester is-a collides with an existing declaration"),
+            "message was: {e}"
+        );
+        // A non-colliding tester name must still be accepted.
+        assert!(first_error("(declare-datatype D ((is) (a)))").is_none());
     }
 
     /// The reverse order is caught by the reserved-symbol fence.

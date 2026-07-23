@@ -1162,6 +1162,24 @@ impl Context {
     /// a rejected `declare-datatype(s)` command. The interned symbol itself
     /// stays in the hash-cons table — that is inert, since nothing can reach it
     /// without a signature, a role, or a name binding.
+    ///
+    /// # Preconditions
+    ///
+    /// This is the one removal path into otherwise append-only declaration
+    /// state; two invariants must hold at every call site.
+    ///
+    /// 1. **No live references.** `sym` must not be the head of any already
+    ///    interned term. The term tables are append-only — a term cannot be
+    ///    withdrawn — so undeclaring a symbol still used as a head would leave
+    ///    a term whose operator has no `fun_sigs` entry, breaking sort lookup
+    ///    downstream. The parser satisfies this because it only undeclares
+    ///    symbols minted by the command currently being rejected, and that
+    ///    command builds no terms.
+    /// 2. **Reservation ownership.** `reserved_syms` is cleared
+    ///    unconditionally, which is only sound because every `reserve_symbol`
+    ///    call site pairs the reservation with a `declare_fun` of the same
+    ///    symbol. If a symbol were ever reserved *without* being declared, this
+    ///    would silently un-reserve it.
     pub fn undeclare_fun(&mut self, sym: SymbolId) {
         self.fun_sigs.remove(&sym);
         self.reserved_syms.remove(&sym);
@@ -1173,6 +1191,15 @@ impl Context {
     /// Drop the constructor list of datatype sort `dt`. Companion to
     /// `undeclare_fun` when unwinding a rejected declaration; the `SortId`
     /// itself remains interned but is no longer a declared datatype.
+    ///
+    /// # Precondition
+    ///
+    /// Same "no live references" rule as `undeclare_fun`: no interned term may
+    /// have sort `dt`, and no surviving constructor may take `dt` as an
+    /// argument or result — otherwise `dt_first_ill_founded` would classify a
+    /// datatype against a sort with no constructors. The parser satisfies this
+    /// because it clears the whole rejected group together, and only that
+    /// group's own constructors could mention its sorts.
     pub fn dt_clear_sort(&mut self, dt: SortId) {
         self.datatypes.ctors.remove(&dt);
     }
