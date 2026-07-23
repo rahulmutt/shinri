@@ -1,6 +1,8 @@
 //! End-to-end QF_DT witnesses: SMT-LIB text -> parser -> solver.
-//! Covers selector-collapse, injectivity (an emergent consequence), constructor
-//! disjointness, tester consistency, and the slice-39 completeness fence.
+//! Covers selector-collapse, injectivity (a dedicated selector-instantiation
+//! rule plants the field selectors, and collapse + EUF congruence close over
+//! them), constructor disjointness, tester consistency, and the slice-39
+//! completeness fence.
 
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
@@ -52,7 +54,10 @@ fn constructor_disjointness_unsat() {
 #[test]
 fn injectivity_unsat() {
     // cons(a, nil) = cons(b, nil)  and  a != b  is UNSAT.
-    // No dedicated injectivity rule: collapse lemmas + congruence deliver it.
+    // The dedicated injectivity rule (`instantiate_injectivity_selectors`)
+    // plants the head/tail selector applications on both constructor apps;
+    // collapse lemmas + EUF congruence over cons(a,nil) = cons(b,nil) then
+    // close over them to derive a = b, contradicting a != b.
     let out = run_script(&format!(
         "(set-logic QF_UFDTLIA){LIST}\
          (declare-fun a () Int)(declare-fun b () Int)\
