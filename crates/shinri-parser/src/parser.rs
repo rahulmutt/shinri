@@ -1,5 +1,6 @@
 use crate::env::Env;
 use crate::lexer::{Lexer, Span, Token};
+use rustc_hash::FxHashSet;
 use shinri_core::{Context, Rational, SortId, TermId};
 use shinri_frontend::Command;
 use shinri_num::Integer;
@@ -1061,6 +1062,8 @@ impl<'a> Parser<'a> {
                 self.env.add_sort(&name, s);
                 Command::DeclareSort { name, arity }
             }
+            "declare-datatype" => self.parse_declare_datatypes(ctx, hsp, false)?,
+            "declare-datatypes" => self.parse_declare_datatypes(ctx, hsp, true)?,
             "declare-const" => {
                 let (name, nsp) = self.expect_symbol()?;
                 reject_reserved(ctx, &name, &nsp)?;
@@ -1159,6 +1162,151 @@ impl<'a> Parser<'a> {
         };
         self.expect_token(&Token::RParen)?; // close the command
         Ok(Some(cmd))
+    }
+
+    /// `(declare-datatype T (<ctor>...))` and
+    /// `(declare-datatypes ((T 0)...) ((<ctor>...)...))`.
+    ///
+    /// A `<ctor>` is `(<name> (<sel> <Sort>)...)`. All declared sorts are
+    /// interned BEFORE any constructor body is parsed so mutual recursion
+    /// resolves. Every malformed shape is rejected with a `Diagnostic`.
+    fn parse_declare_datatypes(
+        &mut self,
+        ctx: &mut Context,
+        hsp: Span,
+        plural: bool,
+    ) -> Result<Command, Diagnostic> {
+        // ---- 1. names -------------------------------------------------------
+        let mut names: Vec<(String, Span)> = Vec::new();
+        if plural {
+            self.expect_token(&Token::LParen)?;
+            while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+                self.expect_token(&Token::LParen)?;
+                let (n, nsp) = self.expect_symbol()?;
+                let arity = self.expect_numeral_u32()?;
+                if arity != 0 {
+                    return Err(Diagnostic::new(
+                        nsp,
+                        "declare-datatypes: parametric datatype arity > 0 unsupported",
+                    ));
+                }
+                self.expect_token(&Token::RParen)?;
+                names.push((n, nsp));
+            }
+            self.bump(); // ')'
+        } else {
+            let (n, nsp) = self.expect_symbol()?;
+            names.push((n, nsp));
+        }
+        if names.is_empty() {
+            return Err(Diagnostic::new(hsp, "declare-datatypes: no sorts declared"));
+        }
+
+        // ---- 2. intern every sort first (mutual recursion) ------------------
+        let mut sorts: Vec<(String, SortId)> = Vec::new();
+        for (n, nsp) in &names {
+            if self.env.lookup_sort(n).is_some() {
+                return Err(Diagnostic::new(
+                    nsp.clone(),
+                    format!("sort {n} already declared"),
+                ));
+            }
+            let s = ctx.declare_datatype_sort(n);
+            self.env.add_sort(n, s);
+            sorts.push((n.clone(), s));
+        }
+
+        // ---- 3. constructor bodies -----------------------------------------
+        let mut seen_ctor: FxHashSet<String> = FxHashSet::default();
+        if plural {
+            self.expect_token(&Token::LParen)?;
+        }
+        for (name, dt) in &sorts {
+            let dt = *dt;
+            self.expect_token(&Token::LParen)?;
+            let mut n_ctors = 0usize;
+            while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+                self.parse_one_constructor(ctx, dt, &mut seen_ctor)?;
+                n_ctors += 1;
+            }
+            self.bump(); // ')'
+            if n_ctors == 0 {
+                return Err(Diagnostic::new(
+                    hsp,
+                    format!("datatype {name} must have at least one constructor"),
+                ));
+            }
+        }
+        if plural {
+            self.expect_token(&Token::RParen)?;
+        }
+
+        // ---- 4. well-foundedness -------------------------------------------
+        let group: Vec<SortId> = sorts.iter().map(|(_, s)| *s).collect();
+        if let Some(bad) = ctx.dt_first_ill_founded(&group) {
+            let name = sorts
+                .iter()
+                .find(|(_, s)| *s == bad)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| "<datatype>".to_string());
+            return Err(Diagnostic::new(
+                hsp,
+                format!("datatype {name} is not well-founded (no finite value exists)"),
+            ));
+        }
+
+        Ok(Command::DeclareDatatypes { sorts })
+    }
+
+    /// One `(<ctor> (<sel> <Sort>)...)` form, registered into `ctx`.
+    fn parse_one_constructor(
+        &mut self,
+        ctx: &mut Context,
+        dt: SortId,
+        seen_ctor: &mut FxHashSet<String>,
+    ) -> Result<(), Diagnostic> {
+        self.expect_token(&Token::LParen)?;
+        let (cname, csp) = self.expect_symbol()?;
+        reject_reserved(ctx, &cname, &csp)?;
+        if !seen_ctor.insert(cname.clone()) {
+            return Err(Diagnostic::new(
+                csp,
+                format!("duplicate constructor {cname}"),
+            ));
+        }
+        let mut sel_names: Vec<(String, Span)> = Vec::new();
+        let mut sel_sorts: Vec<SortId> = Vec::new();
+        let mut seen_sel: FxHashSet<String> = FxHashSet::default();
+        while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+            self.expect_token(&Token::LParen)?;
+            let (sname, ssp) = self.expect_symbol()?;
+            reject_reserved(ctx, &sname, &ssp)?;
+            if !seen_sel.insert(sname.clone()) {
+                return Err(Diagnostic::new(ssp, format!("duplicate selector {sname}")));
+            }
+            let s = self.parse_sort(ctx)?;
+            self.expect_token(&Token::RParen)?;
+            sel_names.push((sname, ssp));
+            sel_sorts.push(s);
+        }
+        self.bump(); // ')'
+
+        let ctor = ctx.declare_fun(&cname, &sel_sorts, dt);
+        self.env.add_fun(&cname, ctor);
+        let mut sels = Vec::with_capacity(sel_names.len());
+        for (i, (sname, _)) in sel_names.iter().enumerate() {
+            let sym = ctx.declare_fun(sname, &[dt], sel_sorts[i]);
+            self.env.add_fun(sname, sym);
+            sels.push(sym);
+        }
+        // The tester is minted, not user-written: reserve it so a later
+        // `declare-fun is-C` cannot hash-cons onto the same symbol.
+        let tname = format!("is-{cname}");
+        let bool_s = ctx.bool_sort();
+        let tester = ctx.declare_fun(&tname, &[dt], bool_s);
+        ctx.reserve_symbol(tester);
+        ctx.dt_add_constructor(dt, ctor, &sels, tester);
+        Ok(())
     }
 
     /// `(define-fun f ((x S)…) R body)` — intern body against fresh formal
@@ -1305,6 +1453,118 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse a script and return the first error message, or None if all commands parsed.
+    fn first_error(src: &str) -> Option<String> {
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        while let Some(r) = p.next_command(&mut ctx) {
+            if let Err(d) = r {
+                return Some(d.message);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn declare_datatype_singular_registers_constructors() {
+        let mut ctx = Context::new();
+        let mut p = Parser::new("(declare-datatype List ((nil) (cons (head Int) (tail List))))");
+        let cmd = p.next_command(&mut ctx).unwrap().unwrap();
+        let sorts = match cmd {
+            Command::DeclareDatatypes { sorts } => sorts,
+            other => panic!("expected DeclareDatatypes, got {other:?}"),
+        };
+        assert_eq!(sorts.len(), 1);
+        assert_eq!(sorts[0].0, "List");
+        let list = sorts[0].1;
+        assert!(ctx.is_datatype_sort(list));
+        let ctors = ctx.dt_constructors(list).expect("constructors");
+        assert_eq!(ctors.len(), 2);
+        assert_eq!(ctx.symbol_name(ctors[0]), "nil");
+        assert_eq!(ctx.symbol_name(ctors[1]), "cons");
+        let sels = ctx.dt_selectors(ctors[1]).expect("selectors");
+        assert_eq!(sels.len(), 2);
+        assert_eq!(ctx.symbol_name(sels[0]), "head");
+        assert_eq!(
+            ctx.dt_tester(ctors[1]).map(|t| ctx.symbol_name(t)),
+            Some("is-cons")
+        );
+    }
+
+    #[test]
+    fn declare_datatypes_plural_mutually_recursive() {
+        let mut ctx = Context::new();
+        let src = "(declare-datatypes ((A 0) (B 0)) \
+                   (((mkA (getB B))) ((base) (mkB (getA A)))))";
+        let mut p = Parser::new(src);
+        let cmd = p.next_command(&mut ctx).unwrap().unwrap();
+        let sorts = match cmd {
+            Command::DeclareDatatypes { sorts } => sorts,
+            other => panic!("expected DeclareDatatypes, got {other:?}"),
+        };
+        assert_eq!(sorts.len(), 2);
+        assert!(ctx.dt_constructors(sorts[0].1).is_some());
+        assert_eq!(ctx.dt_constructors(sorts[1].1).map(|c| c.len()), Some(2));
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_nonzero_arity() {
+        let e = first_error("(declare-datatypes ((L 1)) (((nil))))").expect("must error");
+        assert!(e.contains("arity"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_zero_constructors() {
+        let e = first_error("(declare-datatype E ())").expect("must error");
+        assert!(e.contains("at least one constructor"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_duplicate_constructor() {
+        let e = first_error("(declare-datatype D ((c) (c)))").expect("must error");
+        assert!(e.contains("duplicate"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_duplicate_selector() {
+        let e = first_error("(declare-datatype D ((c (f Int) (f Int))))").expect("must error");
+        assert!(e.contains("duplicate"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_non_well_founded() {
+        let e = first_error("(declare-datatype T ((c (f T))))").expect("must error");
+        assert!(e.contains("well-founded"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_duplicate_sort_name() {
+        let e = first_error("(declare-datatype L ((nil)))(declare-datatype L ((nil2)))")
+            .expect("must error");
+        assert!(e.contains("already declared"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_deep_nesting_does_not_overflow() {
+        // 5000 nested datatypes, each referring to the next; the last is a base
+        // case. Must produce a decision (ok or Diagnostic), never a stack overflow.
+        let mut src = String::new();
+        src.push_str("(declare-datatype D5000 ((base5000)))");
+        for i in (0..5000).rev() {
+            src.push_str(&format!(
+                "(declare-datatype D{i} ((mk{i} (get{i} D{})))) ",
+                i + 1
+            ));
+        }
+        let _ = first_error(&src); // must return, not crash
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_unbalanced_input() {
+        let e = first_error("(declare-datatype List ((nil) (cons (head Int)");
+        assert!(e.is_some(), "truncated input must produce a Diagnostic");
+    }
 
     #[test]
     fn parses_real_decimal_to_rational() {

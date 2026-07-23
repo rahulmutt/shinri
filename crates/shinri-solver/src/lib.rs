@@ -312,6 +312,7 @@ impl Solver {
             }
             Command::SetLogic(_)
             | Command::DeclareSort { .. }
+            | Command::DeclareDatatypes { .. }
             | Command::DeclareFun { .. }
             | Command::SetOption { .. }
             | Command::SetInfo { .. }

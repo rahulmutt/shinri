@@ -28,6 +28,12 @@ pub enum Command {
         params: Vec<SortId>,
         result: SortId,
     },
+    /// One `declare-datatype`/`declare-datatypes` command. Carries the declared
+    /// sorts by name; the constructor/selector/tester symbols and their roles
+    /// live in the `Context` datatype registry.
+    DeclareDatatypes {
+        sorts: Vec<(String, SortId)>,
+    },
     Assert(TermId),
     CheckSat,
     CheckSatAssuming(Vec<TermId>),
