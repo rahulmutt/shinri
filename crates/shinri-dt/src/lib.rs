@@ -27,15 +27,32 @@ pub struct DtSolver {
     /// re-emitting the same tautology forever.
     #[allow(dead_code)]
     emitted: FxHashSet<TermId>,
+    /// Test-only instrumentation: total `collect` invocations (including
+    /// early returns on an already-seen term), so a test can pin that the
+    /// `seen` guard keeps the walk linear in DAG size instead of exponential
+    /// in sharing depth.
+    #[cfg(test)]
+    collect_calls: u32,
 }
 
 impl DtSolver {
     /// Walk an atom's term DAG, indexing every datatype-relevant application
-    /// and every datatype-sorted term. Does not guard against revisiting
-    /// shared subterms — matches `shinri-arrays::collect`, which re-walks
-    /// shared subterms too; insertion into an `FxHashSet` is idempotent so
-    /// this is a performance concern only, not a correctness one.
-    fn collect(&mut self, terms: &Context, t: TermId) {
+    /// and every datatype-sorted term. `seen` guards against re-walking a
+    /// shared subterm reachable via multiple paths — mirroring
+    /// `shinri-str::collect::collect` (`crates/shinri-str/src/collect.rs`),
+    /// not `shinri-arrays::collect` (which has no such guard). Datatype terms
+    /// are the one domain here where deep, naturally-recursive, heavily-shared
+    /// structure is the norm (nested lists/trees, `let`-shared subtrees), so
+    /// an unmemoized walk is exponential in sharing depth rather than linear
+    /// in DAG size.
+    fn collect(&mut self, terms: &Context, t: TermId, seen: &mut FxHashSet<TermId>) {
+        #[cfg(test)]
+        {
+            self.collect_calls += 1;
+        }
+        if !seen.insert(t) {
+            return;
+        }
         if terms.is_datatype_sort(terms.sort_of(t)) {
             self.dt_terms.insert(t);
         }
@@ -58,7 +75,7 @@ impl DtSolver {
             }
         }
         for k in kids {
-            self.collect(terms, k);
+            self.collect(terms, k, seen);
         }
     }
 
@@ -91,13 +108,18 @@ impl DtSolver {
     pub(crate) fn watches_dt_term(&self, t: TermId) -> bool {
         self.dt_terms.contains(&t)
     }
+    #[cfg(test)]
+    pub(crate) fn collect_calls(&self) -> u32 {
+        self.collect_calls
+    }
 }
 
 impl TheorySolver for DtSolver {
     const THEORY_ID: u16 = 5;
 
     fn new_var(&mut self, cx: &mut TheoryCtx, _v: Var, atom: TermId) {
-        self.collect(cx.terms, atom);
+        let mut seen = FxHashSet::default();
+        self.collect(cx.terms, atom, &mut seen);
     }
 
     fn assert(&mut self, _cx: &mut TheoryCtx, _lit: Lit) -> Option<Vec<EqLeaf>> {
@@ -200,6 +222,83 @@ mod tests {
         assert!(
             dt.watches_dt_term(cons_t),
             "datatype-sorted constructor application must be indexed"
+        );
+
+        // Negative assertions: non-datatype-sorted terms must NOT land in
+        // dt_terms, and head_x/is_cons_x must not be misclassified into the
+        // wrong role set either.
+        assert!(
+            !dt.watches_dt_term(one),
+            "Int-sorted term must not be indexed as a dt_term"
+        );
+        assert!(
+            !dt.watches_dt_term(head_x),
+            "Int-sorted selector output must not be indexed as a dt_term"
+        );
+        assert!(
+            !dt.watches_ctor(head_x),
+            "selector output must not be a ctor_app"
+        );
+        assert!(
+            !dt.watches_tester(head_x),
+            "selector output must not be a tester"
+        );
+        assert!(
+            !dt.watches_dt_term(is_cons_x),
+            "Bool-sorted tester application must not be indexed as a dt_term"
+        );
+    }
+
+    /// The `seen` guard in `collect` must keep the walk linear in DAG size,
+    /// not exponential in sharing depth. Build a chain of N `and`-doublings
+    /// over `is-cons(x)`: `level_i = and(level_{i-1}, level_{i-1})`. Every
+    /// level's two children are literally the SAME term, so each level is a
+    /// diamond join. With the guard, `collect` on `level_N` makes exactly
+    /// `2 + 2*N` calls (each level contributes one fresh recursive descent
+    /// plus one immediate "already seen" return); without it, the same walk
+    /// would make on the order of `2^N` calls (verified by hand: N=10 gives
+    /// 22 guarded calls vs. 3071 unguarded — see task-5-report.md Fix 1).
+    #[test]
+    fn collect_seen_guard_keeps_shared_subterm_walk_linear() {
+        let mut ctx = Context::new();
+        let (list, _nil, _cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        const N: u32 = 10;
+        let mut level = is_cons_x;
+        for _ in 0..N {
+            level = ctx
+                .mk_app(
+                    shinri_core::Op::Builtin(shinri_core::BuiltinOp::And),
+                    &[level, level],
+                )
+                .unwrap();
+        }
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), level);
+
+        assert_eq!(
+            dt.collect_calls(),
+            2 + 2 * N,
+            "seen guard must keep the walk linear (2 + 2N), not exponential in sharing depth"
+        );
+        // Correctness survives the guard: the shared leaves are still indexed.
+        assert!(
+            dt.watches_tester(is_cons_x),
+            "shared tester subterm still indexed once"
+        );
+        assert!(
+            dt.watches_dt_term(x),
+            "shared datatype var still indexed once"
         );
     }
 }
