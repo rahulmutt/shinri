@@ -30,12 +30,20 @@ impl Env {
     pub fn lookup_sort(&self, name: &str) -> Option<SortId> {
         self.sorts.get(name).copied()
     }
+    /// Unbind a sort name. Used to unwind a rejected `declare-datatype(s)`.
+    pub fn remove_sort(&mut self, name: &str) {
+        self.sorts.remove(name);
+    }
 
     pub fn add_fun(&mut self, name: &str, sym: SymbolId) {
         self.funs.insert(name.to_owned(), sym);
     }
     pub fn lookup_fun(&self, name: &str) -> Option<SymbolId> {
         self.funs.get(name).copied()
+    }
+    /// Unbind a function name. Used to unwind a rejected `declare-datatype(s)`.
+    pub fn remove_fun(&mut self, name: &str) {
+        self.funs.remove(name);
     }
 
     pub fn add_macro(&mut self, name: &str, formals: Vec<TermId>, body: TermId) {

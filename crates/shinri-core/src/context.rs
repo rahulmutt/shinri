@@ -1142,6 +1142,41 @@ impl Context {
         self.intern_sort(SortNode::Datatype(sym))
     }
 
+    /// True iff `name` already resolves to a symbol that carries a declared
+    /// signature or a datatype role. Never interns: an unseen name is `false`.
+    ///
+    /// The parser uses this to reject a constructor/selector/tester name that
+    /// would otherwise hash-cons onto an existing declaration and silently
+    /// overwrite its signature or role.
+    pub fn name_is_declared(&self, name: &str) -> bool {
+        match self.symbols.lookup(name) {
+            Some(sym) => {
+                self.fun_sigs.contains_key(&sym) || self.datatypes.roles.contains_key(&sym)
+            }
+            None => false,
+        }
+    }
+
+    /// Drop every registry entry keyed on `sym`: its signature, its reserved
+    /// mark, and any datatype role/selector-list/tester it owns. Used to unwind
+    /// a rejected `declare-datatype(s)` command. The interned symbol itself
+    /// stays in the hash-cons table — that is inert, since nothing can reach it
+    /// without a signature, a role, or a name binding.
+    pub fn undeclare_fun(&mut self, sym: SymbolId) {
+        self.fun_sigs.remove(&sym);
+        self.reserved_syms.remove(&sym);
+        self.datatypes.roles.remove(&sym);
+        self.datatypes.sels.remove(&sym);
+        self.datatypes.testers.remove(&sym);
+    }
+
+    /// Drop the constructor list of datatype sort `dt`. Companion to
+    /// `undeclare_fun` when unwinding a rejected declaration; the `SortId`
+    /// itself remains interned but is no longer a declared datatype.
+    pub fn dt_clear_sort(&mut self, dt: SortId) {
+        self.datatypes.ctors.remove(&dt);
+    }
+
     /// Register `ctor` as a constructor of datatype sort `dt`, with `selectors`
     /// in argument order and tester `tester`. Signatures must already have been
     /// installed via `declare_fun`.
@@ -2198,14 +2233,14 @@ mod tests {
         assert!(ctx.dt_first_ill_founded(&[a, bs]).is_some());
     }
 
-    /// Tractability + correctness guard for the inhabitance worklist.
+    /// Correctness guard for the inhabitance worklist at scale.
     ///
     /// A 2000-long dependency chain `D0 -> D1 -> ... -> D2000`. Declaration
-    /// order is deliberately the reverse of the dependency order and the scan
-    /// order inside the fixpoint is hash-map order, so a round-based rescan
-    /// degrades to O(V*E) here; the worklist stays O(V+E). Runs in a few
-    /// milliseconds — a regression to the quadratic form makes it visibly slow
-    /// and the 5000-deep parser test hang outright.
+    /// order is deliberately the reverse of the dependency order, and the scan
+    /// order inside the fixpoint is hash-map order, so the worst-case
+    /// propagation direction is exercised: every classification below must hold
+    /// no matter how many rounds the fixpoint needs to reach it. (This test
+    /// asserts results only — it carries no timing bound.)
     #[test]
     fn long_datatype_chain_is_linear_and_correctly_classified() {
         const N: usize = 2000;

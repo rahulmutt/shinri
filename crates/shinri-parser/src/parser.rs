@@ -1,7 +1,7 @@
 use crate::env::Env;
 use crate::lexer::{Lexer, Span, Token};
 use rustc_hash::FxHashSet;
-use shinri_core::{Context, Rational, SortId, TermId};
+use shinri_core::{Context, Rational, SortId, SymbolId, TermId};
 use shinri_frontend::Command;
 use shinri_num::Integer;
 
@@ -71,6 +71,33 @@ fn reject_reserved(ctx: &Context, name: &str, sp: &Span) -> Result<(), Diagnosti
         }
     }
     Ok(())
+}
+
+/// Reject `name` when it already resolves to a declared symbol (a signature or
+/// a datatype role). Declaring it again would hash-cons onto the same symbol
+/// and silently overwrite the existing declaration.
+fn reject_collision(ctx: &Context, name: &str, sp: &Span) -> Result<(), Diagnostic> {
+    if ctx.name_is_declared(name) {
+        return Err(Diagnostic::new(
+            sp.clone(),
+            format!("cannot declare '{name}': the name is already declared"),
+        ));
+    }
+    Ok(())
+}
+
+/// Ledger of everything a single `declare-datatype(s)` command installed, so an
+/// error exit can unwind it. Sort ids and symbol ids stay interned (the
+/// hash-cons tables are append-only); removing the name bindings and registry
+/// entries is what makes a rejected declaration unreachable.
+#[derive(Default)]
+struct DtStaging {
+    /// Datatype sorts added to `env` and `ctx.datatypes`.
+    sorts: Vec<(String, SortId)>,
+    /// Constructor and selector symbols, with the `env` name they were bound to.
+    funs: Vec<(String, SymbolId)>,
+    /// Minted testers — reserved in `ctx`, never bound in `env`.
+    minted: Vec<SymbolId>,
 }
 
 pub struct Parser<'a> {
@@ -1170,11 +1197,44 @@ impl<'a> Parser<'a> {
     /// A `<ctor>` is `(<name> (<sel> <Sort>)...)`. All declared sorts are
     /// interned BEFORE any constructor body is parsed so mutual recursion
     /// resolves. Every malformed shape is rejected with a `Diagnostic`.
+    ///
+    /// Registration is *transactional*: everything the command installs into
+    /// `ctx` and `self.env` is recorded in a `DtStaging` ledger, and any error
+    /// exit unwinds it, so a rejected declaration leaves no reachable trace.
     fn parse_declare_datatypes(
         &mut self,
         ctx: &mut Context,
         hsp: Span,
         plural: bool,
+    ) -> Result<Command, Diagnostic> {
+        let mut staged = DtStaging::default();
+        match self.parse_declare_datatypes_inner(ctx, hsp, plural, &mut staged) {
+            Ok(cmd) => Ok(cmd),
+            Err(d) => {
+                // Unwind: name bindings first (they are what makes a rejected
+                // declaration reachable), then the context registries.
+                for (name, sort) in &staged.sorts {
+                    self.env.remove_sort(name);
+                    ctx.dt_clear_sort(*sort);
+                }
+                for (name, sym) in &staged.funs {
+                    self.env.remove_fun(name);
+                    ctx.undeclare_fun(*sym);
+                }
+                for sym in &staged.minted {
+                    ctx.undeclare_fun(*sym);
+                }
+                Err(d)
+            }
+        }
+    }
+
+    fn parse_declare_datatypes_inner(
+        &mut self,
+        ctx: &mut Context,
+        hsp: Span,
+        plural: bool,
+        staged: &mut DtStaging,
     ) -> Result<Command, Diagnostic> {
         // ---- 1. names -------------------------------------------------------
         let mut names: Vec<(String, Span)> = Vec::new();
@@ -1213,11 +1273,16 @@ impl<'a> Parser<'a> {
             }
             let s = ctx.declare_datatype_sort(n);
             self.env.add_sort(n, s);
+            staged.sorts.push((n.clone(), s));
             sorts.push((n.clone(), s));
         }
 
         // ---- 3. constructor bodies -----------------------------------------
+        // Both sets are COMMAND-scoped: a constructor or selector name may be
+        // introduced at most once per `declare-datatype(s)`, across all the
+        // group's members and all their constructors.
         let mut seen_ctor: FxHashSet<String> = FxHashSet::default();
+        let mut seen_sel: FxHashSet<String> = FxHashSet::default();
         if plural {
             self.expect_token(&Token::LParen)?;
         }
@@ -1226,7 +1291,7 @@ impl<'a> Parser<'a> {
             self.expect_token(&Token::LParen)?;
             let mut n_ctors = 0usize;
             while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
-                self.parse_one_constructor(ctx, dt, &mut seen_ctor)?;
+                self.parse_one_constructor(ctx, dt, &mut seen_ctor, &mut seen_sel, staged)?;
                 n_ctors += 1;
             }
             self.bump(); // ')'
@@ -1259,11 +1324,19 @@ impl<'a> Parser<'a> {
     }
 
     /// One `(<ctor> (<sel> <Sort>)...)` form, registered into `ctx`.
+    ///
+    /// `seen_ctor`/`seen_sel` are command-scoped; `reject_collision` additionally
+    /// fences every minted name against declarations already in `ctx` (from an
+    /// earlier command, an earlier constructor of this command, or an earlier
+    /// `declare-fun`). Without that fence a colliding name hash-conses onto the
+    /// existing symbol and silently overwrites its signature and datatype role.
     fn parse_one_constructor(
         &mut self,
         ctx: &mut Context,
         dt: SortId,
         seen_ctor: &mut FxHashSet<String>,
+        seen_sel: &mut FxHashSet<String>,
+        staged: &mut DtStaging,
     ) -> Result<(), Diagnostic> {
         self.expect_token(&Token::LParen)?;
         let (cname, csp) = self.expect_symbol()?;
@@ -1274,15 +1347,22 @@ impl<'a> Parser<'a> {
                 format!("duplicate constructor {cname}"),
             ));
         }
+        reject_collision(ctx, &cname, &csp)?;
         let mut sel_names: Vec<(String, Span)> = Vec::new();
         let mut sel_sorts: Vec<SortId> = Vec::new();
-        let mut seen_sel: FxHashSet<String> = FxHashSet::default();
         while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
             self.expect_token(&Token::LParen)?;
             let (sname, ssp) = self.expect_symbol()?;
             reject_reserved(ctx, &sname, &ssp)?;
             if !seen_sel.insert(sname.clone()) {
                 return Err(Diagnostic::new(ssp, format!("duplicate selector {sname}")));
+            }
+            reject_collision(ctx, &sname, &ssp)?;
+            if seen_ctor.contains(&sname) {
+                return Err(Diagnostic::new(
+                    ssp,
+                    format!("duplicate selector {sname}: name is already a constructor"),
+                ));
             }
             let s = self.parse_sort(ctx)?;
             self.expect_token(&Token::RParen)?;
@@ -1291,20 +1371,27 @@ impl<'a> Parser<'a> {
         }
         self.bump(); // ')'
 
+        // The tester is minted, not user-written; it must not land on a name a
+        // user already took (e.g. `(declare-datatype D ((is-c) (c)))`).
+        let tname = format!("is-{cname}");
+        reject_collision(ctx, &tname, &csp)?;
+
         let ctor = ctx.declare_fun(&cname, &sel_sorts, dt);
         self.env.add_fun(&cname, ctor);
+        staged.funs.push((cname.clone(), ctor));
         let mut sels = Vec::with_capacity(sel_names.len());
         for (i, (sname, _)) in sel_names.iter().enumerate() {
             let sym = ctx.declare_fun(sname, &[dt], sel_sorts[i]);
             self.env.add_fun(sname, sym);
+            staged.funs.push((sname.clone(), sym));
             sels.push(sym);
         }
-        // The tester is minted, not user-written: reserve it so a later
-        // `declare-fun is-C` cannot hash-cons onto the same symbol.
-        let tname = format!("is-{cname}");
+        // Reserve the tester so a later `declare-fun is-C` cannot hash-cons
+        // onto the same symbol.
         let bool_s = ctx.bool_sort();
         let tester = ctx.declare_fun(&tname, &[dt], bool_s);
         ctx.reserve_symbol(tester);
+        staged.minted.push(tester);
         ctx.dt_add_constructor(dt, ctor, &sels, tester);
         Ok(())
     }
@@ -1466,6 +1553,21 @@ mod tests {
         None
     }
 
+    /// Parse a whole script, collecting every error. The driver continues past
+    /// a `Diagnostic` (see the solver's script_e2e), so state a rejected
+    /// command left behind is observable by the commands that follow.
+    fn all_errors(src: &str) -> Vec<String> {
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        let mut out = Vec::new();
+        while let Some(r) = p.next_command(&mut ctx) {
+            if let Err(d) = r {
+                out.push(d.message);
+            }
+        }
+        out
+    }
+
     #[test]
     fn declare_datatype_singular_registers_constructors() {
         let mut ctx = Context::new();
@@ -1543,6 +1645,114 @@ mod tests {
         let e = first_error("(declare-datatype L ((nil)))(declare-datatype L ((nil2)))")
             .expect("must error");
         assert!(e.contains("already declared"), "message was: {e}");
+    }
+
+    // ---- rollback of a rejected declaration (review finding 1) -------------
+
+    /// The well-foundedness rejection must leave `T` unusable: before the fix
+    /// the sort binding survived and `x` was admitted with an empty sort.
+    #[test]
+    fn rejected_datatype_leaves_no_usable_sort() {
+        let errs = all_errors("(declare-datatype T ((c (f T))))(declare-fun x () T)(check-sat)");
+        assert_eq!(errs.len(), 2, "errors were: {errs:?}");
+        assert!(errs[0].contains("well-founded"), "message was: {}", errs[0]);
+        assert!(
+            errs[1].contains("unknown sort T"),
+            "message was: {}",
+            errs[1]
+        );
+    }
+
+    /// A rejected declaration must not burn its own name: a corrected retry
+    /// with the same sort name has to succeed.
+    #[test]
+    fn rejected_datatype_name_can_be_redeclared() {
+        let errs = all_errors("(declare-datatype T ((c (f T))))(declare-datatype T ((base)))");
+        assert_eq!(errs.len(), 1, "errors were: {errs:?}");
+        assert!(errs[0].contains("well-founded"), "message was: {}", errs[0]);
+    }
+
+    /// The same holds for the other rejection paths: zero constructors,
+    /// duplicate constructor, duplicate selector.
+    #[test]
+    fn other_rejection_paths_also_roll_back() {
+        for bad in [
+            "(declare-datatype T ())",
+            "(declare-datatype T ((c) (c)))",
+            "(declare-datatype T ((c (f Int) (f Int))))",
+        ] {
+            let src = format!("{bad}(declare-datatype T ((base)))");
+            let errs = all_errors(&src);
+            assert_eq!(errs.len(), 1, "for {bad}: errors were {errs:?}");
+        }
+    }
+
+    /// Constructor/selector/tester symbols minted by a rejected declaration
+    /// must be released too — the names are free for a later `declare-fun`.
+    #[test]
+    fn rejected_datatype_releases_its_function_names() {
+        let errs = all_errors(
+            "(declare-datatype T ((c (f T))))\
+             (declare-fun c () Int)(declare-fun f () Int)(declare-fun is-c () Int)",
+        );
+        assert_eq!(errs.len(), 1, "errors were: {errs:?}");
+    }
+
+    // ---- name collisions (review finding 2) --------------------------------
+
+    /// A selector reused across two constructors of the SAME datatype: the
+    /// duplicate check is command-scoped, not per-constructor.
+    #[test]
+    fn declare_datatypes_rejects_selector_reused_across_constructors() {
+        let e = first_error("(declare-datatype D ((a (f Int)) (b (f Bool))))").expect("must error");
+        assert!(e.contains("duplicate"), "message was: {e}");
+    }
+
+    /// A selector may not reuse a constructor name from the same command.
+    #[test]
+    fn declare_datatypes_rejects_selector_named_like_a_constructor() {
+        let e = first_error("(declare-datatype D ((c (c Int))))").expect("must error");
+        assert!(e.contains("duplicate selector c"), "message was: {e}");
+    }
+
+    /// A constructor reused across two commands would leave the first
+    /// datatype's constructor list pointing at a symbol owned by the second.
+    #[test]
+    fn declare_datatypes_rejects_constructor_reused_across_commands() {
+        let e = first_error("(declare-datatype A ((c)))(declare-datatype B ((c)))")
+            .expect("must error");
+        assert!(e.contains("already declared"), "message was: {e}");
+    }
+
+    /// A constructor colliding with a plain `declare-fun` is equally fatal.
+    #[test]
+    fn declare_datatypes_rejects_constructor_colliding_with_declare_fun() {
+        let e =
+            first_error("(declare-fun c () Int)(declare-datatype D ((c)))").expect("must error");
+        assert!(e.contains("already declared"), "message was: {e}");
+    }
+
+    /// A minted tester must not land on a user-written constructor name.
+    #[test]
+    fn declare_datatypes_rejects_tester_colliding_with_constructor() {
+        let e = first_error("(declare-datatype D ((is-c) (c)))").expect("must error");
+        assert!(e.contains("is-c"), "message was: {e}");
+    }
+
+    /// The reverse order is caught by the reserved-symbol fence.
+    #[test]
+    fn declare_datatypes_rejects_constructor_named_like_an_earlier_tester() {
+        let e = first_error("(declare-datatype D ((c) (is-c)))").expect("must error");
+        assert!(e.contains("reserved"), "message was: {e}");
+    }
+
+    /// The minted tester is reserved, so a later user `declare-fun` naming it
+    /// is rejected rather than silently overwriting the tester's signature.
+    #[test]
+    fn minted_tester_name_is_reserved_against_later_declare_fun() {
+        let e = first_error("(declare-datatype L ((nil)))(declare-fun is-nil (L) Bool)")
+            .expect("must error");
+        assert!(e.contains("reserved"), "message was: {e}");
     }
 
     #[test]
