@@ -382,9 +382,21 @@ min blocking-PR budget. The slowest individual test in the run was
 at **22.0s** (the 5000-deep nested datatype declaration named in the task
 brief); the next-slowest DT-adjacent test was `qfbv_witnesses
 bvmul_commutativity_unsat` at 16.1s (pre-existing, unrelated to this slice).
-No DT test required an `#[ignore]` exhaustive tier. Wall-clock is effectively
-unchanged from pre-slice-39 baselines (the added DT suites total well under a
-second).
+No DT test required an `#[ignore]` exhaustive tier.
+
+No pre-slice-39 baseline number was measured (this task did not check out
+`b93d3393` or an earlier commit to time it), so no before/after comparison is
+claimed. What *is* measured: the new DT work added by this slice is small —
+`qfdt_e2e` (10 tests) and `shinri-dt`'s unit suite (14 tests) both run in
+single-digit milliseconds each in the log above, so their combined
+contribution to the 262.1s total is well under a second. The one
+double-digit-second cost adjacent to this slice,
+`declare_datatypes_deep_nesting_does_not_overflow` at 22.0s, is a
+*pre-existing* parser test (not new DT-solver work) exercising the 5000-deep
+declaration named in the task brief. On that basis it is a reasonable
+*inference*, not a measured fact, that this slice did not materially move the
+blocking-tier wall-clock — the hard number on record is simply: **262.1s /
+1218 tests, post-slice-39, comfortably inside the 10–15 min budget**.
 
 **Lint.** `cargo fmt --all --check` and `cargo clippy --workspace
 --all-targets -- -D warnings` (i.e. `mise run lint`) are both clean.
@@ -428,8 +440,10 @@ QF_DT).
    not a silent claim of full compliance — a cvc5 leg is future work, not
    landed here.
 5. **MET.** `mise run lint` (fmt --check + workspace clippy, no oracle
-   feature) is clean. Blocking-tier wall-clock is 262.1s / 4m22.7s,
-   unchanged in substance from pre-slice-39 (the added suites are
-   sub-second). The one caveat is the pre-existing, unrelated
-   `--features oracle --all-targets` clippy failure noted above, which this
-   task did not introduce and does not fix.
+   feature) is clean. Blocking-tier wall-clock is **262.1s / 1218 tests**,
+   measured post-slice-39 — comfortably inside the 10–15 min budget. No
+   pre-slice-39 baseline was measured, so "unchanged" is not asserted as
+   fact; the new DT suites themselves (sub-second, see above) are too small
+   to plausibly have moved the total. The one caveat is the pre-existing,
+   unrelated `--features oracle --all-targets` clippy failure noted above,
+   which this task did not introduce and does not fix.
