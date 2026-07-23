@@ -15,7 +15,7 @@ type Sat = shinri_sat::Solver<
         shinri_arith::Arith,
         shinri_arrays::Arrays,
         shinri_str::StrSolver,
-        shinri_theory::EmptyTheory,
+        shinri_dt::DtSolver,
     >,
     shinri_core::NoProof,
     shinri_sat::Vmtf,
@@ -288,11 +288,13 @@ impl<'a> Encoder<'a> {
                     self.saw_euf = true;
                     self.saw_euf_nonreal = true;
                 }
-                // Datatypes: shinri-solver does not wire a real DT theory slot
-                // yet (that lands in a later slice); the Combiner's `D` slot is
-                // an inert `EmptyTheory` stand-in here, so there is no
-                // mixed-theory fence bookkeeping to do for this owner.
-                Ok(shinri_theory::types::Owner::Datatypes) => {}
+                Ok(shinri_theory::types::Owner::Datatypes) => {
+                    // Datatype atoms are EUF-adjacent (constructor/selector/
+                    // tester applications congruence-close in EUF); treat them
+                    // like EUF for the mixed-theory fence.
+                    self.saw_euf = true;
+                    self.saw_euf_nonreal = true;
+                }
                 Err(_) => {}
             }
         }

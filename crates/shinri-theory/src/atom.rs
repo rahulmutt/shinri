@@ -118,6 +118,19 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
             return Ok(Owner::Datatypes);
         }
     }
+    // Datatype routing (deep): a constructor/selector/tester application
+    // ANYWHERE in the atom, even nested under a non-datatype-sorted top level
+    // (e.g. `(distinct (head (cons 1 nil)) 1)`, where `head` returns Int).
+    // The two checks above only see datatype-sorted top-level structure, so a
+    // selector buried under arithmetic would otherwise fall through to
+    // `Owner::Euf`/`Owner::Arith` and DtSolver would never learn about it —
+    // silently losing selector-collapse/injectivity/clash for that atom.
+    // Mirrors `contains_array_op`'s unconditional deep-walk routing for
+    // Arrays; the Combiner's `Owner::Datatypes` arm still notifies EUF too, so
+    // congruence over the buried applications is unaffected.
+    if contains_dt_op(terms, atom) {
+        return Ok(Owner::Datatypes);
+    }
     match terms.term_node(atom) {
         TermNode::App { op, args, .. } => {
             let children = terms.children(*args);
@@ -241,6 +254,43 @@ fn contains_array_op(terms: &Context, t: TermId) -> bool {
 
 fn is_array_sorted(terms: &Context, t: TermId) -> bool {
     matches!(terms.sort_node(terms.sort_of(t)), SortNode::Array(_, _))
+}
+
+/// True if any subterm of `t` is a constructor, selector, or tester
+/// application — see the deep-DT-routing comment at its call site.
+///
+/// The walk is memoized with a `seen` set: on a shared term DAG (nested
+/// lists/trees, `let`-shared subtrees) an unguarded recursion is exponential
+/// in sharing depth, the exact hazard `DtSolver::collect` (Task 5) and
+/// `string_under_uf` guard against. (`contains_array_op` / `array_touches_arith`
+/// in this file are NOT guarded — a pre-existing latent issue for QF_A inputs,
+/// left untouched here; this function is guarded regardless.)
+fn contains_dt_op(terms: &Context, t: TermId) -> bool {
+    fn walk(terms: &Context, t: TermId, seen: &mut FxHashSet<TermId>) -> bool {
+        if !seen.insert(t) {
+            return false;
+        }
+        match terms.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                if let Op::Uninterpreted(sym) = op {
+                    if matches!(
+                        terms.dt_role(*sym),
+                        Some(
+                            DtRole::Constructor { .. }
+                                | DtRole::Selector { .. }
+                                | DtRole::Tester { .. }
+                        )
+                    ) {
+                        return true;
+                    }
+                }
+                terms.children(*args).iter().any(|&c| walk(terms, c, seen))
+            }
+            TermNode::Const { .. } => false,
+        }
+    }
+    let mut seen = FxHashSet::default();
+    walk(terms, t, &mut seen)
 }
 
 /// True if any select/store subterm touches an arith (Int/Real) index or element

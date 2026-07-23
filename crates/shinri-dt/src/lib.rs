@@ -157,6 +157,82 @@ impl DtSolver {
         None
     }
 
+    /// Injectivity, via ON-DEMAND SELECTOR INSTANTIATION. Two SAME-constructor
+    /// applications `p = C(a1..an)` and `q = C(b1..bn)` in one class entail
+    /// `a_i = b_i` for every field (constructor injectivity) — the pair
+    /// `constructor_clash` deliberately skips. Rather than emit that consequence
+    /// directly (it is CONDITIONAL on `p ≡ q`, which may hold only on the current
+    /// branch, so pinning it as a guard-free level-0 unit would be a wrong-UNSAT
+    /// hazard — the same trap `tester_lemma` was fixed for), instantiate the
+    /// selector applications `sel_i(p)` and `sel_i(q)` and register them as
+    /// watched selector apps.
+    ///
+    /// The existing, already-proven machinery then closes the loop, and every
+    /// fact it pins is unconditional:
+    ///   - `collapse_lemma` emits the TAUTOLOGIES `sel_i(p) = a_i` and
+    ///     `sel_i(q) = b_i` (the selector axiom, guard-free, sound to pin — Task
+    ///     6). Registering those split atoms adds `sel_i(p)`/`sel_i(q)` to EUF's
+    ///     egraph (Combiner routes DT atoms to BOTH EUF and DT).
+    ///   - EUF congruence over `p ≡ q` derives `sel_i(p) ≡ sel_i(q)`.
+    ///   - Transitivity `a_i ≡ sel_i(p) ≡ sel_i(q) ≡ b_i` yields `a_i ≡ b_i`
+    ///     INSIDE EUF — so it is retracted automatically when the `p ≡ q` merge
+    ///     is retracted on backtrack. No conditional fact is ever level-0 pinned.
+    ///
+    /// This mutates watch state and returns nothing; `check` falls through to
+    /// `collapse_lemma` in the same call to emit the tautologies. Idempotent:
+    /// `sel_apps` is a set, so re-running at fixpoint adds nothing.
+    fn instantiate_injectivity_selectors(&mut self, cx: &mut TheoryCtx) {
+        let ctors: Vec<TermId> = self.ctor_apps.iter().copied().collect();
+        for (i, &p) in ctors.iter().enumerate() {
+            let Some((psym, _)) = Self::uapp(cx.terms, p) else {
+                continue;
+            };
+            let pn = cx.eq.intern(p);
+            let Some(rest) = ctors.get(i + 1..) else {
+                continue;
+            };
+            for &q in rest {
+                let Some((qsym, _)) = Self::uapp(cx.terms, q) else {
+                    continue;
+                };
+                // Different constructors in one class are a clash, not
+                // injectivity — `constructor_clash` owns that case.
+                if psym != qsym {
+                    continue;
+                }
+                let qn = cx.eq.intern(q);
+                if !cx.eq.are_equal(pn, qn) {
+                    continue;
+                }
+                // Same constructor, same class: instantiate every field
+                // selector on BOTH applications. `collapse_lemma` + congruence
+                // then surface `a_i = b_i`.
+                // Own the selector list so the immutable borrow of `cx.terms`
+                // is released before the `mk_app` mutable borrow below.
+                let Some(sels) = cx.terms.dt_selectors(psym).map(<[SymbolId]>::to_vec) else {
+                    continue;
+                };
+                for sel in sels {
+                    for capp in [p, q] {
+                        let app = cx
+                            .terms
+                            .mk_app(Op::Uninterpreted(sel), &[capp])
+                            .expect("selector applies to its own datatype sort");
+                        self.sel_apps.insert(app);
+                        // Mirror `collect`: a datatype-sorted selector app is
+                        // also a watched dt_term. (Its class always joins an
+                        // existing field's — collapse merges `sel_i(p) = a_i` —
+                        // so this adds no NEW constructor-undetermined class the
+                        // fence could trip on.)
+                        if cx.terms.is_datatype_sort(cx.terms.sort_of(app)) {
+                            self.dt_terms.insert(app);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Two DISTINCT constructor applications in one class are contradictory.
     /// The explanation is the merge path that made them equal.
     fn constructor_clash(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
@@ -414,6 +490,14 @@ impl TheorySolver for DtSolver {
         if let Some(conflict) = self.constructor_clash(cx) {
             return conflict;
         }
+        // Injectivity: for same-constructor pairs in one class, instantiate the
+        // field selectors so `collapse_lemma` (next) emits the selector-axiom
+        // tautologies and EUF congruence derives `a_i = b_i`. This MUST precede
+        // collapse in the SAME call and MUST precede the fence: the fence would
+        // otherwise short-circuit to Sat on a state where a pending injectivity
+        // consequence (surfaced only after the collapse tautologies round-trip
+        // through EUF) would produce a conflict — the wrong-SAT this rule fixes.
+        self.instantiate_injectivity_selectors(cx);
         if let Some(split) = self.collapse_lemma(cx) {
             return split;
         }
@@ -736,8 +820,15 @@ mod tests {
 
     #[test]
     fn injectivity_is_a_consequence_of_collapse_and_congruence() {
-        // cons(a, nil) ≡ cons(b, nil)  ⇒  a ≡ b, with NO dedicated injectivity
-        // rule: the two collapse lemmas plus congruence on `head` suffice.
+        // cons(a, nil) ≡ cons(b, nil)  ⇒  a ≡ b. The dedicated injectivity rule
+        // (`instantiate_injectivity_selectors`) instantiates head/tail on both
+        // constructor apps; `collapse_lemma` then emits the selector-axiom
+        // tautologies (head(ca)=a, head(cb)=b, tail(ca)=nil, tail(cb)=nil) and
+        // congruence on `head` (simulated here) closes a ≡ b. The engine in this
+        // bare harness has no congruence closure of its own, so the head-app
+        // congruence merge is simulated below; instantiation now creates the
+        // head/tail apps, so we drain collapse to a fixpoint rather than a fixed
+        // count.
         let mut ctx = Context::new();
         let (_list, nil, cons, head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
         let int = ctx.int_sort();
@@ -769,8 +860,10 @@ mod tests {
         let (hca, hcb) = (cx.eq.intern(head_ca), cx.eq.intern(head_cb));
         let _ = cx.eq.merge(hca, hcb, EqJust::Definitional);
 
-        // Drain both collapse lemmas, installing each as the SAT layer would.
-        for _ in 0..2 {
+        // Drain every collapse lemma to a fixpoint, installing each as the SAT
+        // layer would. The count is bounded (head/tail on ca and cb), so a
+        // generous cap guards against a regression looping forever.
+        for _ in 0..16 {
             match dt.check(&mut cx, Effort::Full) {
                 TCheck::Split { atoms: lemma, .. } => {
                     let (l, r) = match cx.terms.term_node(lemma[0]) {
@@ -783,7 +876,12 @@ mod tests {
                     let (ln, rn) = (cx.eq.intern(l), cx.eq.intern(r));
                     let _ = cx.eq.merge(ln, rn, EqJust::Definitional);
                 }
-                other => panic!("expected Split, got {}", tcheck_name(&other)),
+                // Fixpoint: all collapse tautologies installed. (Unknown is
+                // expected here — tail(ca)≡nil is determined, but the harness
+                // has no exhaustiveness, so any remaining undetermined class
+                // yields Unknown; either Sat or Unknown ends the drain.)
+                TCheck::Sat | TCheck::Unknown => break,
+                TCheck::Conflict(_) => panic!("no clash expected: same constructor"),
             }
         }
 
