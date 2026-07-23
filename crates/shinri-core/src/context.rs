@@ -1207,40 +1207,77 @@ impl Context {
     /// or `None` when every member is inhabited.
     ///
     /// A non-datatype sort is always inhabited. A datatype is inhabited once
-    /// some constructor has all argument sorts inhabited. Marking is monotone,
-    /// so iterating to saturation terminates in at most `|datatypes|` rounds.
+    /// some constructor has all argument sorts inhabited.
     ///
-    /// Deliberately iterative (worklist, not recursion): the sort graph comes
-    /// from untrusted input and may be arbitrarily deep (threat model).
+    /// Implemented as a genuine worklist over a reverse-dependency index
+    /// (datatype sort -> the constructors that take it as an argument), with a
+    /// per-constructor count of its still-un-inhabited datatype arguments. Each
+    /// constructor is enqueued at most once per distinct datatype argument, so
+    /// the whole fixpoint is O(V + E) and independent of hash-map scan order.
+    /// (The previous round-based rescan was O(V * E) when the map order ran
+    /// counter to the dependency chain.)
+    ///
+    /// Deliberately iterative (explicit worklist, no recursion): the sort graph
+    /// comes from untrusted input and may be arbitrarily deep (threat model).
     pub fn dt_first_ill_founded(&self, group: &[SortId]) -> Option<SortId> {
+        // Constructor records: (owning datatype, count of distinct datatype
+        // argument sorts not yet known inhabited).
+        let mut owner: Vec<SortId> = Vec::new();
+        let mut remaining: Vec<usize> = Vec::new();
+        // Reverse dependency index: datatype sort -> indices of constructor
+        // records that are still waiting on it.
+        let mut waiters: FxHashMap<SortId, Vec<usize>> = FxHashMap::default();
+        // Scratch set to de-duplicate a constructor's datatype arguments.
+        let mut seen: FxHashSet<SortId> = FxHashSet::default();
+        let mut queue: Vec<SortId> = Vec::new();
         let mut inhabited: FxHashSet<SortId> = FxHashSet::default();
-        let all: Vec<SortId> = self.datatypes.ctors.keys().copied().collect();
-        loop {
-            let mut changed = false;
-            for &dt in &all {
-                if inhabited.contains(&dt) {
+
+        for (&dt, ctors) in &self.datatypes.ctors {
+            for &c in ctors {
+                // A constructor with no declared signature can never be applied;
+                // it contributes nothing (matches the previous `is_some_and`).
+                let Some(params) = self.fun_params(c) else {
                     continue;
-                }
-                let ctors = match self.dt_constructors(dt) {
-                    Some(c) => c,
-                    None => continue,
                 };
-                let any_ctor_ok = ctors.iter().any(|&c| {
-                    self.fun_params(c).is_some_and(|params| {
-                        params
-                            .iter()
-                            .all(|&p| !self.is_datatype_sort(p) || inhabited.contains(&p))
-                    })
-                });
-                if any_ctor_ok {
-                    inhabited.insert(dt);
-                    changed = true;
+                let idx = owner.len();
+                seen.clear();
+                let mut pending = 0usize;
+                for &p in params {
+                    if self.is_datatype_sort(p) && seen.insert(p) {
+                        pending += 1;
+                        waiters.entry(p).or_default().push(idx);
+                    }
                 }
-            }
-            if !changed {
-                break;
+                owner.push(dt);
+                remaining.push(pending);
+                if pending == 0 && inhabited.insert(dt) {
+                    queue.push(dt);
+                }
             }
         }
+
+        // Worklist propagation. Every datatype is pushed at most once (guarded
+        // by `inhabited.insert`), and each pop walks its waiter list once, so
+        // the loop performs at most |V| pops and |E| decrements.
+        while let Some(dt) = queue.pop() {
+            let Some(ws) = waiters.get(&dt) else {
+                continue;
+            };
+            for &idx in ws {
+                let r = &mut remaining[idx];
+                if *r == 0 {
+                    continue;
+                }
+                *r -= 1;
+                if *r == 0 {
+                    let target = owner[idx];
+                    if inhabited.insert(target) {
+                        queue.push(target);
+                    }
+                }
+            }
+        }
+
         group
             .iter()
             .copied()
@@ -2159,5 +2196,57 @@ mod tests {
         let is_mk_b = ctx.declare_fun("is-mkB", &[bs], b);
         ctx.dt_add_constructor(bs, mk_b, &[get_a], is_mk_b);
         assert!(ctx.dt_first_ill_founded(&[a, bs]).is_some());
+    }
+
+    /// Tractability + correctness guard for the inhabitance worklist.
+    ///
+    /// A 2000-long dependency chain `D0 -> D1 -> ... -> D2000`. Declaration
+    /// order is deliberately the reverse of the dependency order and the scan
+    /// order inside the fixpoint is hash-map order, so a round-based rescan
+    /// degrades to O(V*E) here; the worklist stays O(V+E). Runs in a few
+    /// milliseconds — a regression to the quadratic form makes it visibly slow
+    /// and the 5000-deep parser test hang outright.
+    #[test]
+    fn long_datatype_chain_is_linear_and_correctly_classified() {
+        const N: usize = 2000;
+
+        // Well-founded: the tail of the chain has a nullary constructor.
+        let mut ctx = Context::new();
+        let b = ctx.bool_sort();
+        let base = ctx.declare_datatype_sort(&format!("D{N}"));
+        let nil = ctx.declare_fun(&format!("base{N}"), &[], base);
+        let is_nil = ctx.declare_fun(&format!("is-base{N}"), &[base], b);
+        ctx.dt_add_constructor(base, nil, &[], is_nil);
+        let mut prev = base;
+        let mut chain = vec![base];
+        for i in (0..N).rev() {
+            let s = ctx.declare_datatype_sort(&format!("D{i}"));
+            let c = ctx.declare_fun(&format!("mk{i}"), &[prev], s);
+            let g = ctx.declare_fun(&format!("get{i}"), &[s], prev);
+            let t = ctx.declare_fun(&format!("is-mk{i}"), &[s], b);
+            ctx.dt_add_constructor(s, c, &[g], t);
+            chain.push(s);
+            prev = s;
+        }
+        // Head of the chain, and the whole chain at once, are all inhabited.
+        assert_eq!(ctx.dt_first_ill_founded(&[prev]), None);
+        assert_eq!(ctx.dt_first_ill_founded(&chain), None);
+
+        // Same chain without the base case: nothing in it is inhabited, and the
+        // first member of `group` (in `group`'s order) is the one reported.
+        let mut ctx = Context::new();
+        let b = ctx.bool_sort();
+        let tail = ctx.declare_datatype_sort(&format!("E{N}"));
+        let mut prev = tail;
+        for i in (0..N).rev() {
+            let s = ctx.declare_datatype_sort(&format!("E{i}"));
+            let c = ctx.declare_fun(&format!("mkE{i}"), &[prev], s);
+            let g = ctx.declare_fun(&format!("getE{i}"), &[s], prev);
+            let t = ctx.declare_fun(&format!("is-mkE{i}"), &[s], b);
+            ctx.dt_add_constructor(s, c, &[g], t);
+            prev = s;
+        }
+        assert_eq!(ctx.dt_first_ill_founded(&[prev]), Some(prev));
+        assert_eq!(ctx.dt_first_ill_founded(&[tail, prev]), Some(tail));
     }
 }
