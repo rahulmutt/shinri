@@ -107,7 +107,9 @@ impl DtSolver {
             let Some(DtRole::Selector { ctor, index }) = cx.terms.dt_role(sel_sym) else {
                 continue;
             };
-            let t = sel_args[0];
+            let Some(&t) = sel_args.first() else {
+                continue;
+            };
             let tn = cx.eq.intern(t);
             for &capp in &ctors {
                 let Some((csym, cargs)) = Self::uapp(cx.terms, capp) else {
@@ -121,7 +123,9 @@ impl DtSolver {
                 if !cx.eq.are_equal(tn, cn) {
                     continue;
                 }
-                let arg = cargs[index as usize];
+                let Some(&arg) = cargs.get(index as usize) else {
+                    continue;
+                };
                 let sel_on_ctor = cx
                     .terms
                     .mk_app(Op::Uninterpreted(sel_sym), &[capp])
@@ -136,7 +140,12 @@ impl DtSolver {
                     .mk_eq(sel_on_ctor, arg)
                     .expect("selector result sort matches the field sort");
                 if !self.emitted.insert(lemma) {
-                    continue; // emitted before and not yet installed; avoid a loop
+                    // Unreachable while unit splits are level-0 pinned (shinri-sat
+                    // solver.rs backtracks and pins guard-free unit SplitAtoms). If
+                    // installation is ever deferred, exhausting `emitted` makes
+                    // `check` return Sat with the fact uninstalled — a spurious-SAT
+                    // hazard, not merely a duplicate clause.
+                    continue;
                 }
                 return Some(TCheck::Split {
                     atoms: vec![lemma],
