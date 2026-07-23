@@ -10,7 +10,13 @@ use shinri_euf::Euf;
 use shinri_theory::Combiner;
 
 type Sat = shinri_sat::Solver<
-    Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays, shinri_str::StrSolver>,
+    Combiner<
+        Euf,
+        shinri_arith::Arith,
+        shinri_arrays::Arrays,
+        shinri_str::StrSolver,
+        shinri_theory::EmptyTheory,
+    >,
     shinri_core::NoProof,
     shinri_sat::Vmtf,
 >;
@@ -282,6 +288,11 @@ impl<'a> Encoder<'a> {
                     self.saw_euf = true;
                     self.saw_euf_nonreal = true;
                 }
+                // Datatypes: shinri-solver does not wire a real DT theory slot
+                // yet (that lands in a later slice); the Combiner's `D` slot is
+                // an inert `EmptyTheory` stand-in here, so there is no
+                // mixed-theory fence bookkeeping to do for this owner.
+                Ok(shinri_theory::types::Owner::Datatypes) => {}
                 Err(_) => {}
             }
         }

@@ -928,10 +928,7 @@ mod tests {
         let mut eq = EqualityEngine::default();
         let mut atoms = AtomRegistry::default();
         let v = Var::new(0);
-        // TODO(slice39 T9): switch to Owner::Datatypes once it lands; DT atoms
-        // are not yet routed through the combiner, so Owner::Euf is a harmless
-        // stand-in for this direct-call test.
-        atoms.register(v, is_nil_x, shinri_theory::types::Owner::Euf);
+        atoms.register(v, is_nil_x, shinri_theory::types::Owner::Datatypes);
         let mut cx = TheoryCtx {
             terms: &mut ctx,
             eq: &mut eq,
@@ -1042,9 +1039,7 @@ mod tests {
         let mut eq = EqualityEngine::default();
         let mut atoms = AtomRegistry::default();
         let v = Var::new(0);
-        // TODO(slice39 T9): switch to Owner::Datatypes once it lands; see note
-        // in the conflicting-tester test above.
-        atoms.register(v, is_nil_x, shinri_theory::types::Owner::Euf);
+        atoms.register(v, is_nil_x, shinri_theory::types::Owner::Datatypes);
         let mut cx = TheoryCtx {
             terms: &mut ctx,
             eq: &mut eq,

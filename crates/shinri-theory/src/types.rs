@@ -26,6 +26,7 @@ pub enum Owner {
     Shared,
     Arrays,
     String,
+    Datatypes,
 }
 
 /// A range into `EqualityEngine`'s congruence-pair arena (keeps `EqJust` `Copy`).

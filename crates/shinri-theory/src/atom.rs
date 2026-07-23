@@ -4,7 +4,7 @@
 
 use crate::types::Owner;
 use rustc_hash::{FxHashMap, FxHashSet};
-use shinri_core::{BuiltinOp, Context, Op, SortId, SortNode, TermId, TermNode, Var};
+use shinri_core::{BuiltinOp, Context, DtRole, Op, SortId, SortNode, TermId, TermNode, Var};
 
 /// An atom this solver cannot handle exactly (e.g. nonlinear). Refusing it at
 /// registration makes the whole query return `unknown` upstream.
@@ -91,6 +91,32 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
     } = terms.term_node(atom)
     {
         return Ok(Owner::String);
+    }
+    // Datatype routing: a tester application, or a (dis)equality over
+    // datatype-sorted operands, belongs to the DT theory. EUF still interns the
+    // terms for congruence (see the Owner::Datatypes routing in the Combiner).
+    if let TermNode::App {
+        op: Op::Uninterpreted(sym),
+        ..
+    } = terms.term_node(atom)
+    {
+        if matches!(terms.dt_role(*sym), Some(DtRole::Tester { .. })) {
+            return Ok(Owner::Datatypes);
+        }
+    }
+    if let TermNode::App {
+        op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct),
+        args,
+        ..
+    } = terms.term_node(atom)
+    {
+        if terms
+            .children(*args)
+            .iter()
+            .any(|&c| terms.is_datatype_sort(terms.sort_of(c)))
+        {
+            return Ok(Owner::Datatypes);
+        }
     }
     match terms.term_node(atom) {
         TermNode::App { op, args, .. } => {
@@ -469,6 +495,25 @@ mod tests {
             classify(&ctx, atom).is_err(),
             "string under a UF is out of scope in v1"
         );
+    }
+
+    #[test]
+    fn datatype_equality_and_tester_route_to_datatypes() {
+        let mut ctx = Context::new();
+        let list = ctx.declare_datatype_sort("List");
+        let b = ctx.bool_sort();
+        let nil = ctx.declare_fun("nil", &[], list);
+        let is_nil = ctx.declare_fun("is-nil", &[list], b);
+        ctx.dt_add_constructor(list, nil, &[], is_nil);
+        let xs = ctx.declare_fun("x", &[], list);
+        let x = ctx.mk_app(Op::Uninterpreted(xs), &[]).unwrap();
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+
+        let eq_atom = ctx.mk_eq(x, nil_t).unwrap();
+        assert_eq!(classify(&ctx, eq_atom), Ok(Owner::Datatypes));
+
+        let tester = ctx.mk_app(Op::Uninterpreted(is_nil), &[x]).unwrap();
+        assert_eq!(classify(&ctx, tester), Ok(Owner::Datatypes));
     }
 
     #[test]

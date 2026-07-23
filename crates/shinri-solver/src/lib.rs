@@ -367,7 +367,13 @@ impl Solver {
         use shinri_theory::Combiner;
 
         type Sat = shinri_sat::Solver<
-            Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays, shinri_str::StrSolver>,
+            Combiner<
+                Euf,
+                shinri_arith::Arith,
+                shinri_arrays::Arrays,
+                shinri_str::StrSolver,
+                shinri_theory::EmptyTheory,
+            >,
             NoProof,
             Vmtf,
         >;
@@ -1992,7 +1998,13 @@ impl Solver {
         use shinri_theory::Combiner;
 
         type Sat = shinri_sat::Solver<
-            Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays, shinri_str::StrSolver>,
+            Combiner<
+                Euf,
+                shinri_arith::Arith,
+                shinri_arrays::Arrays,
+                shinri_str::StrSolver,
+                shinri_theory::EmptyTheory,
+            >,
             NoProof,
             Vmtf,
         >;
