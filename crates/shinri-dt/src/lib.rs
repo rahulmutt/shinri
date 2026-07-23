@@ -257,6 +257,87 @@ impl DtSolver {
         None
     }
 
+    /// Every datatype-sorted term this theory watches. `dt_terms` (populated
+    /// by `collect`, Task 5) is already the full set — every term reachable
+    /// while walking a registered atom's DAG whose sort is a datatype sort.
+    /// Selector and tester arguments are datatype-sorted themselves, so
+    /// `collect`'s unconditional recursion into every child already puts them
+    /// in `dt_terms` too (see `new_var_indexes_constructor_selector_and_tester_apps`,
+    /// which pins `watches_dt_term(x)` where `x` is both a selector and a
+    /// tester argument). There is nothing left to add on top of `dt_terms`.
+    fn watched_dt_terms(&self) -> Vec<TermId> {
+        self.dt_terms.iter().copied().collect()
+    }
+
+    /// True iff some watched datatype term's class has no constructor
+    /// application in it — the class is not (yet) constructor-determined.
+    /// Spec §5.2: the completeness fence in `check` uses this to keep a
+    /// possibly-wrong `Sat` from ever being reported before slice 40's
+    /// exhaustiveness case split exists.
+    fn has_undetermined_class(&self, cx: &mut TheoryCtx) -> bool {
+        for t in self.watched_dt_terms() {
+            if self.ctor_of_class(cx, t).is_some() {
+                continue;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Render the ground constructor term for `t`'s class as an SMT-LIB
+    /// string (e.g. `nil`, `(cons 1 nil)`), or `None` when the class is not
+    /// constructor-determined — unreachable when `check` has returned `Sat`,
+    /// since the fence guarantees every watched term is determined by then.
+    ///
+    /// `depth` bounds recursion defensively: real recursion is bounded by the
+    /// well-foundedness of the datatype (a finite ground term has finite
+    /// depth), so `depth > 64` should never trigger on a sound registry. It
+    /// exists only so a corrupt/cyclic registry produces a missing model
+    /// entry instead of a stack overflow — the same "fail safe, don't crash"
+    /// posture as the rest of this theory.
+    fn render_value(&self, cx: &mut TheoryCtx, t: TermId, depth: u32) -> Option<String> {
+        if depth > 64 {
+            return None;
+        }
+        let (csym, capp) = self.ctor_of_class(cx, t)?;
+        let (_, cargs) = Self::uapp(cx.terms, capp)?;
+        let name = cx.terms.symbol_name(csym).to_string();
+        if cargs.is_empty() {
+            return Some(name);
+        }
+        // A field failing to render means the whole ground term cannot be
+        // rendered either — there is no valid partial result to fall back
+        // to. The house style's loop `continue` idiom doesn't apply here:
+        // these iterations are not independent candidates where skipping one
+        // and trying the next is meaningful, they are mandatory positions in
+        // one ground term, so dropping a field would silently print a
+        // malformed term rather than a correct partial one. `collect`ing
+        // into `Option<Vec<_>>` expresses "abort on the first failure"
+        // without a manual `for` loop containing an early `return`/`?`.
+        let parts: Option<Vec<String>> = cargs
+            .iter()
+            .map(|&a| {
+                if cx.terms.is_datatype_sort(cx.terms.sort_of(a)) {
+                    self.render_value(cx, a, depth + 1)
+                } else {
+                    // Non-datatype fields are owned by other theories, which
+                    // this solver has no visibility into. Render a plain
+                    // nullary constant by its symbol name; anything else is
+                    // unsupported here (fields of non-nullary, non-datatype
+                    // shape are not exercised by slice 39 and are left for
+                    // the combined model to fill in).
+                    match Self::uapp(cx.terms, a) {
+                        Some((s, kids)) if kids.is_empty() => {
+                            Some(cx.terms.symbol_name(s).to_string())
+                        }
+                        _ => Some("?".to_string()),
+                    }
+                }
+            })
+            .collect();
+        Some(format!("({} {})", name, parts?.join(" ")))
+    }
+
     #[cfg(test)]
     pub(crate) fn watches_ctor(&self, t: TermId) -> bool {
         self.ctor_apps.contains(&t)
@@ -339,6 +420,18 @@ impl TheorySolver for DtSolver {
         if let Some(split) = self.tester_lemma(cx) {
             return split;
         }
+        // Slice-39 completeness fence (spec §5.2): this MUST be the last
+        // step — every rule above must be saturated first, or the fence
+        // could fire on a state that a pending lemma (a collapse, a tester
+        // tautology, or a clash) would otherwise have resolved on this same
+        // call. Exhaustiveness — that every datatype term IS some
+        // constructor — needs the case split that lands in slice 40. Until
+        // then, a class whose constructor is undetermined must NOT be
+        // reported Sat: slice 39 decides `unsat` fully but must never answer
+        // a possibly-wrong `sat`.
+        if self.has_undetermined_class(cx) {
+            return TCheck::Unknown;
+        }
         TCheck::Sat
     }
 
@@ -346,7 +439,17 @@ impl TheorySolver for DtSolver {
         // DT conflicts cite EqLeafs directly; no tags of its own yet.
     }
 
-    fn model(&mut self, _cx: &mut TheoryCtx, _m: &mut ModelBuilder) {}
+    fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
+        for t in self.watched_dt_terms() {
+            if m.get(t).is_some() {
+                continue;
+            }
+            let Some(v) = self.render_value(cx, t, 0) else {
+                continue;
+            };
+            m.assign(t, shinri_theory::types::ModelVal::Datatype(v));
+        }
+    }
 
     fn push(&mut self) {}
     fn pop(&mut self, _level: usize) {}
@@ -539,8 +642,12 @@ mod tests {
         dt.new_var(&mut cx, Var::new(0), atom);
         dt.new_var(&mut cx, Var::new(1), cons_t);
 
-        // Before x ≡ cons(1,nil) there is nothing to collapse.
-        assert!(matches!(dt.check(&mut cx, Effort::Full), TCheck::Sat));
+        // Before x ≡ cons(1,nil), x's class is not constructor-determined, so
+        // the completeness fence (spec §5.2, Task 8) returns Unknown — NOT a
+        // possibly-wrong Sat. The collapse itself has still not fired:
+        // Unknown ≠ Split, which is what this pre-merge check pins. After
+        // the merge below it fires.
+        assert!(matches!(dt.check(&mut cx, Effort::Full), TCheck::Unknown));
 
         // Merge x with the constructor application.
         let xn = cx.eq.intern(x);
@@ -840,6 +947,87 @@ mod tests {
             conflict.is_some(),
             "is-nil(x) with x ≡ cons(..) must conflict at assert time"
         );
+    }
+
+    #[test]
+    fn undetermined_datatype_class_yields_unknown_not_sat() {
+        // `x` is a List with no constructor in its class and no tester pinning
+        // it. Exhaustiveness (slice 40) is what would decide this, so slice 39
+        // must fence to Unknown rather than claim Sat.
+        let mut ctx = Context::new();
+        let (list, _nil, _cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+        let y = uconst(&mut ctx, "y", list);
+        let atom = ctx.mk_eq(x, y).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), atom);
+
+        assert!(
+            matches!(dt.check(&mut cx, Effort::Full), TCheck::Unknown),
+            "constructor-undetermined class must fence to Unknown"
+        );
+    }
+
+    #[test]
+    fn determined_datatype_class_is_sat() {
+        let mut ctx = Context::new();
+        let (list, nil, _cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let atom = ctx.mk_eq(x, nil_t).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), atom);
+        let (xn, nn) = (cx.eq.intern(x), cx.eq.intern(nil_t));
+        let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
+
+        assert!(
+            matches!(dt.check(&mut cx, Effort::Full), TCheck::Sat),
+            "constructor-determined class must be Sat"
+        );
+    }
+
+    #[test]
+    fn model_assigns_ground_constructor_term() {
+        let mut ctx = Context::new();
+        let (list, nil, _cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let atom = ctx.mk_eq(x, nil_t).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), atom);
+        let (xn, nn) = (cx.eq.intern(x), cx.eq.intern(nil_t));
+        let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
+
+        let mut m = shinri_theory::ModelBuilder::default();
+        dt.model(&mut cx, &mut m);
+        match m.get(x) {
+            Some(shinri_theory::types::ModelVal::Datatype(s)) => assert_eq!(s, "nil"),
+            other => panic!("expected a datatype model value, got {other:?}"),
+        }
     }
 
     #[test]
