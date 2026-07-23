@@ -621,6 +621,11 @@ impl<'a> Parser<'a> {
                 // Both failure modes below (C undeclared, or C declared but
                 // not a constructor) share the same "not a constructor"
                 // wording so callers can match on one substring.
+                //
+                // `is` is claimed here for the datatype tester and is
+                // therefore unavailable as a future `parse_indexed_op` name
+                // (no current SMT-LIB indexed operator is named `is`, so
+                // this shadowing is deliberate, not accidental).
                 let (cname, csp) = self.expect_symbol()?;
                 self.expect_token(&Token::RParen)?; // close `(_ is C)`
                 let ctor = self.env.lookup_fun(&cname).ok_or_else(|| {
@@ -1984,41 +1989,76 @@ mod tests {
         assert!(e.contains("not a constructor"), "message was: {e}");
     }
 
+    /// The name resolves (via `env.lookup_fun`) but names a selector, not a
+    /// constructor — fails at the `ctx.dt_tester` lookup, not the `env`
+    /// lookup. This is the other branch behind the shared "not a
+    /// constructor" wording; `tester_rejects_unknown_constructor` above only
+    /// exercises the `env.lookup_fun` miss.
+    #[test]
+    fn tester_rejects_selector_name() {
+        let e = first_error(
+            "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
+             (declare-fun x () List)\
+             (assert ((_ is head) x))",
+        )
+        .expect("must error");
+        assert!(e.contains("not a constructor"), "message was: {e}");
+    }
+
+    /// The name resolves but names an ordinary `declare-fun`, unrelated to
+    /// any datatype — also fails at `ctx.dt_tester`.
+    #[test]
+    fn tester_rejects_plain_declared_function() {
+        let e = first_error(
+            "(declare-datatype List ((nil)))\
+             (declare-fun f () List)\
+             (declare-fun x () List)\
+             (assert ((_ is f) x))",
+        )
+        .expect("must error");
+        assert!(e.contains("not a constructor"), "message was: {e}");
+    }
+
     /// `((_ is C))` — zero arguments. The tester's arity is 1, so this must
-    /// fail as a clean sort-arity Diagnostic, never panic.
+    /// fail as a clean sort-arity Diagnostic, never panic. Message pinned so
+    /// this test can't pass green for an unrelated reason (e.g. the setup
+    /// commands failing first) — `first_error` returns the *first* error in
+    /// the script.
     #[test]
     fn tester_rejects_missing_argument() {
         let e = first_error(
             "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
              (assert ((_ is cons)))",
-        );
-        assert!(e.is_some(), "missing argument must produce a Diagnostic");
+        )
+        .expect("missing argument must produce a Diagnostic");
+        assert_eq!(e, "sort error: Arity { expected: 1, found: 0 }");
     }
 
     /// `((_ is) x)` — no constructor name after `is`. Must be a clean
-    /// Diagnostic, never a panic.
+    /// Diagnostic, never a panic. Message pinned for the same reason as
+    /// `tester_rejects_missing_argument`.
     #[test]
     fn tester_rejects_missing_constructor_name() {
         let e = first_error(
             "(declare-datatype List ((nil)))\
              (declare-fun x () List)\
              (assert ((_ is) x))",
-        );
-        assert!(
-            e.is_some(),
-            "missing constructor name must produce a Diagnostic"
-        );
+        )
+        .expect("missing constructor name must produce a Diagnostic");
+        assert_eq!(e, "expected symbol");
     }
 
     /// `((_ is C` truncated mid-tester (no closing parens at all). Must be a
-    /// clean Diagnostic, never a panic or hang.
+    /// clean Diagnostic, never a panic or hang. Message pinned for the same
+    /// reason as `tester_rejects_missing_argument`.
     #[test]
     fn tester_rejects_truncated_input() {
         let e = first_error(
             "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
              (assert ((_ is cons",
-        );
-        assert!(e.is_some(), "truncated input must produce a Diagnostic");
+        )
+        .expect("truncated input must produce a Diagnostic");
+        assert_eq!(e, "expected RParen, found EOF");
     }
 
     #[test]
