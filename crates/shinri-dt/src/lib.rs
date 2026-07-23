@@ -188,7 +188,16 @@ impl DtSolver {
         None
     }
 
-    /// `is-C(t)` where `t`'s class holds `C(a1..an)` is a valid UNIT tautology.
+    /// `is-C(t)` where `t`'s class holds `C(a1..an)` is a valid UNIT tautology
+    /// — but ONLY when written over the constructor application itself, the
+    /// same rewrite `collapse_lemma` performs. `t ≡ C(..)` may hold only on
+    /// the current decision branch, so `is-C(t)` is at most conditionally
+    /// true; `is-C(C(..))`, in contrast, is true by construction regardless
+    /// of assignment, so it can ride a guard-free unit `Split`. Congruence
+    /// then supplies `is-C(t) ≡ is-C(C(..))` on exactly the branches where
+    /// `t ≡ C(..)` holds. Emitting `is-C(t)` directly here would launder a
+    /// conditional fact into a permanent level-0 one (the SAT layer pins a
+    /// guard-free unit `Split` at level 0) — a wrong-UNSAT hazard.
     /// (The negative direction `¬is-D(t)` cannot ride `Split`, whose atoms are
     /// positive; it is handled at assert time instead — see `assert`.)
     fn tester_lemma(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
@@ -216,11 +225,15 @@ impl DtSolver {
                 if !cx.eq.are_equal(tn, cn) {
                     continue;
                 }
-                if !self.emitted.insert(tst) {
+                let is_c_on_ctor = cx
+                    .terms
+                    .mk_app(Op::Uninterpreted(tsym), &[capp])
+                    .expect("tester applies to its own datatype sort");
+                if !self.emitted.insert(is_c_on_ctor) {
                     continue;
                 }
                 return Some(TCheck::Split {
-                    atoms: vec![tst],
+                    atoms: vec![is_c_on_ctor],
                     guard: None,
                     phases: Vec::new(),
                 });
@@ -232,8 +245,7 @@ impl DtSolver {
     /// The constructor application in `t`'s class, if any: `(symbol, app)`.
     fn ctor_of_class(&self, cx: &mut TheoryCtx, t: TermId) -> Option<(SymbolId, TermId)> {
         let tn = cx.eq.intern(t);
-        let ctors: Vec<TermId> = self.ctor_apps.iter().copied().collect();
-        for capp in ctors {
+        for &capp in &self.ctor_apps {
             let Some((csym, _)) = Self::uapp(cx.terms, capp) else {
                 continue;
             };
@@ -280,32 +292,22 @@ impl TheorySolver for DtSolver {
     /// than in `check` because the consequence `¬is-D(t)` is a NEGATIVE
     /// literal and `TCheck::Split` carries only positive atoms.
     ///
-    /// House style bans `?` in this file (it would silently abandon the rest
-    /// of an in-progress loop elsewhere in this impl); `assert` is
-    /// straight-line, not a loop, so the hazard the ban guards against does
-    /// not apply here, but the file-wide `let..else { return None; }` idiom
-    /// is kept for consistency — hence the explicit lint override below.
-    #[allow(
-        clippy::question_mark,
-        reason = "house style: let..else, not ?, throughout this file"
-    )]
+    /// `assert` is straight-line, not a loop, so the loop-abandonment hazard
+    /// the file's `let..else { continue; }` house style guards against does
+    /// not apply here: `?` on each bailout below is exactly the intended
+    /// early-return behavior, so it is used directly (unlike the `continue`
+    /// idiom used inside the `for` loops elsewhere in this file).
     fn assert(&mut self, cx: &mut TheoryCtx, lit: Lit) -> Option<Vec<EqLeaf>> {
         if !lit.is_positive() {
             return None; // ¬is-D(t) constrains nothing in slice 39
         }
         let atom = cx.atoms.atom(lit.var());
-        let Some((tsym, targs)) = Self::uapp(cx.terms, atom) else {
+        let (tsym, targs) = Self::uapp(cx.terms, atom)?;
+        let DtRole::Tester { ctor } = cx.terms.dt_role(tsym)? else {
             return None;
         };
-        let Some(DtRole::Tester { ctor }) = cx.terms.dt_role(tsym) else {
-            return None;
-        };
-        let Some(&t) = targs.first() else {
-            return None;
-        };
-        let Some((csym, capp)) = self.ctor_of_class(cx, t) else {
-            return None;
-        };
+        let &t = targs.first()?;
+        let (csym, capp) = self.ctor_of_class(cx, t)?;
         if csym == ctor {
             return None; // agrees
         }
@@ -743,6 +745,61 @@ mod tests {
             TCheck::Split { atoms, guard, .. } => {
                 assert_eq!(guard, None);
                 assert_eq!(atoms, vec![is_cons_c]);
+            }
+            other => panic!("expected Split, got {}", tcheck_name(&other)),
+        }
+    }
+
+    /// `is-cons(x)` where `x ≡ cons(1,nil)` only *conditionally* (the merge is
+    /// asserted, not a syntactic identity) must NOT be emitted as the
+    /// unconditional unit lemma. The lemma must instead be rewritten onto the
+    /// constructor application itself — `is-cons(cons(1,nil))` — which IS an
+    /// unconditional tautology; congruence then supplies `is-cons(x) ≡
+    /// is-cons(cons(1,nil))` only on branches where `x ≡ cons(1,nil)` holds.
+    /// Emitting `is-cons(x)` directly as a guard-free level-0 unit fact would
+    /// launder a conditional fact into a permanent global one — a wrong-UNSAT
+    /// hazard (concrete repro: `(or (= x (cons 1 nil)) (= x nil))` together
+    /// with `(not (is-cons x))` is SAT via `x = nil`, but a decision that
+    /// merges `x` with `cons(1,nil)` first would pin `is-cons(x)` at level 0
+    /// and falsely report UNSAT).
+    #[test]
+    fn tester_lemma_over_class_member_rewrites_onto_constructor_app() {
+        let mut ctx = Context::new();
+        let (list, nil, cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let int_sort = ctx.int_sort();
+        let one = uconst(&mut ctx, "one", int_sort);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let cons_t = ctx.mk_app(Op::Uninterpreted(cons), &[one, nil_t]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), is_cons_x);
+        dt.new_var(&mut cx, Var::new(1), cons_t);
+        let (xn, cn) = (cx.eq.intern(x), cx.eq.intern(cons_t));
+        let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
+
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Split { atoms, guard, .. } => {
+                assert_eq!(guard, None, "the rewritten lemma is unconditional");
+                let expected = cx
+                    .terms
+                    .mk_app(Op::Uninterpreted(is_cons), &[cons_t])
+                    .unwrap();
+                assert_eq!(
+                    atoms,
+                    vec![expected],
+                    "lemma must be is-cons(cons(1,nil)), NOT is-cons(x) — \
+                     the latter is only conditionally true and cannot ride a \
+                     guard-free unit Split"
+                );
             }
             other => panic!("expected Split, got {}", tcheck_name(&other)),
         }
