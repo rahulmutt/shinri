@@ -486,14 +486,20 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse the body of an indexed identifier `(_ <id> <nums...>)` where the
-    /// `_` has already been consumed.  Returns the corresponding `BuiltinOp`.
+    /// `_` AND `<id>` have already been consumed (the caller reads `<id>`
+    /// itself first, to route the datatype-tester `is` identifier elsewhere,
+    /// since a tester resolves to `Op::Uninterpreted`, not a `BuiltinOp`).
+    /// Returns the corresponding `BuiltinOp`.
     ///
     /// Handles: `extract i j`, `zero_extend k`, `sign_extend k`,
     /// `rotate_left k`, `rotate_right k`, `repeat k`, `re.loop lo hi`, `re.^ n`.
-    fn parse_indexed_op(&mut self, usp: Span) -> Result<shinri_core::BuiltinOp, Diagnostic> {
+    fn parse_indexed_op(
+        &mut self,
+        id: &str,
+        isp: Span,
+    ) -> Result<shinri_core::BuiltinOp, Diagnostic> {
         use shinri_core::BuiltinOp::*;
-        let (id, isp) = self.expect_symbol()?;
-        let op = match id.as_str() {
+        let op = match id {
             "extract" => {
                 let hi = self.expect_numeral_u32()?;
                 let lo = self.expect_numeral_u32()?;
@@ -531,7 +537,6 @@ impl<'a> Parser<'a> {
                 ));
             }
         };
-        let _ = usp;
         Ok(op)
     }
 
@@ -609,7 +614,26 @@ impl<'a> Parser<'a> {
             if under != "_" {
                 return Err(Diagnostic::new(usp, "expected '_' in indexed identifier"));
             }
-            let op = self.parse_indexed_op(usp.clone())?;
+            let (id, isp) = self.expect_symbol()?;
+            if id == "is" {
+                // `((_ is C) x)` — datatype tester. Resolve C to its
+                // constructor symbol and apply that constructor's tester.
+                // Both failure modes below (C undeclared, or C declared but
+                // not a constructor) share the same "not a constructor"
+                // wording so callers can match on one substring.
+                let (cname, csp) = self.expect_symbol()?;
+                self.expect_token(&Token::RParen)?; // close `(_ is C)`
+                let ctor = self.env.lookup_fun(&cname).ok_or_else(|| {
+                    Diagnostic::new(csp.clone(), format!("{cname} is not a constructor"))
+                })?;
+                let tester = ctx
+                    .dt_tester(ctor)
+                    .ok_or_else(|| Diagnostic::new(csp, format!("{cname} is not a constructor")))?;
+                // parse_arg_list also consumes the outer application's ')'.
+                let args = self.parse_arg_list(ctx)?;
+                return Self::mk(ctx, shinri_core::Op::Uninterpreted(tester), &args, &open);
+            }
+            let op = self.parse_indexed_op(&id, isp)?;
             // consume closing ')' of the indexed identifier
             self.expect_token(&Token::RParen)?;
             // now parse the argument(s) and the outer closing ')'
@@ -1917,6 +1941,83 @@ mod tests {
     #[test]
     fn declare_datatypes_rejects_unbalanced_input() {
         let e = first_error("(declare-datatype List ((nil) (cons (head Int)");
+        assert!(e.is_some(), "truncated input must produce a Diagnostic");
+    }
+
+    #[test]
+    fn tester_term_resolves_to_tester_symbol() {
+        use shinri_core::{Op, TermNode};
+        let mut ctx = Context::new();
+        let src = "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
+                   (declare-fun x () List)\
+                   (assert ((_ is cons) x))";
+        let mut p = Parser::new(src);
+        let mut last = None;
+        while let Some(r) = p.next_command(&mut ctx) {
+            last = Some(r.expect("must parse"));
+        }
+        let t = match last {
+            Some(Command::Assert(t)) => t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        // The asserted term is `is-cons` applied to one argument, Bool-sorted.
+        assert_eq!(ctx.sort_of(t), ctx.bool_sort());
+        match ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Uninterpreted(sym),
+                args,
+                ..
+            } => {
+                assert_eq!(ctx.symbol_name(*sym), "is-cons");
+                assert_eq!(ctx.children(*args).len(), 1);
+            }
+            other => panic!("expected tester application, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tester_rejects_unknown_constructor() {
+        let e = first_error(
+            "(declare-datatype List ((nil)))(declare-fun x () List)(assert ((_ is bogus) x))",
+        )
+        .expect("must error");
+        assert!(e.contains("not a constructor"), "message was: {e}");
+    }
+
+    /// `((_ is C))` — zero arguments. The tester's arity is 1, so this must
+    /// fail as a clean sort-arity Diagnostic, never panic.
+    #[test]
+    fn tester_rejects_missing_argument() {
+        let e = first_error(
+            "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
+             (assert ((_ is cons)))",
+        );
+        assert!(e.is_some(), "missing argument must produce a Diagnostic");
+    }
+
+    /// `((_ is) x)` — no constructor name after `is`. Must be a clean
+    /// Diagnostic, never a panic.
+    #[test]
+    fn tester_rejects_missing_constructor_name() {
+        let e = first_error(
+            "(declare-datatype List ((nil)))\
+             (declare-fun x () List)\
+             (assert ((_ is) x))",
+        );
+        assert!(
+            e.is_some(),
+            "missing constructor name must produce a Diagnostic"
+        );
+    }
+
+    /// `((_ is C` truncated mid-tester (no closing parens at all). Must be a
+    /// clean Diagnostic, never a panic or hang.
+    #[test]
+    fn tester_rejects_truncated_input() {
+        let e = first_error(
+            "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
+             (assert ((_ is cons",
+        );
         assert!(e.is_some(), "truncated input must produce a Diagnostic");
     }
 
