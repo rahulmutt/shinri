@@ -1339,11 +1339,24 @@ impl<'a> Parser<'a> {
         // paren here keeps every failure mode under the rollback; the
         // dispatcher therefore skips its own close for this command.
         //
-        // It must be the LAST step. `next_command` calls
-        // `recover_to_command_end` on error with a paren depth of 1, i.e. it
-        // assumes the command's closing ')' is still unconsumed. Every error
-        // exit above leaves it unconsumed, and this one fails without
-        // consuming anything, so that assumption holds on every path.
+        // It must be the LAST step, because of a non-local coupling with error
+        // recovery. `next_command` calls `recover_to_command_end` on every
+        // `Err`, and that function hard-codes a starting paren depth of 1 — it
+        // assumes the command's closing ')' has NOT been consumed. So the
+        // invariant an error path must satisfy is precisely: *never consume the
+        // command's closing ')'*. (Not "consume nothing" — `expect_token` bumps
+        // the token it rejects, so this step does consume on failure. It is
+        // safe because the token it rejects can never be a ')': a ')' would
+        // have matched.)
+        //
+        // Known gap, pre-existing and not datatype-specific: an early
+        // `expect_*` that *rejects* the command's own ')' does consume it and
+        // desyncs the recovery. Step 3's `expect_token(&Token::LParen)` does
+        // exactly that on `(declare-datatype D )` — real depth is then 0 while
+        // recovery starts at 1, so it runs to EOF and swallows the rest of the
+        // script. `(declare-sort )` behaves identically, so it predates this
+        // slice; tracked as a follow-up (a `Parser`-level depth counter), out
+        // of scope here.
         self.expect_token(&Token::RParen)?;
 
         Ok(Command::DeclareDatatypes { sorts })
@@ -1853,10 +1866,11 @@ mod tests {
         );
     }
 
-    /// The same window for the constructor's own name: `is-is-c` would be the
-    /// tester of a constructor literally named `is-c`. Sanity check that the
-    /// self-collision `(c)` whose tester is `is-c` is only rejected when `is-c`
-    /// is actually taken — a plain constructor named `is` is fine.
+    /// The cross-constructor half of the same window: `is-a` is a constructor
+    /// of this command, and the *later* constructor `a` wants `is-a` as its
+    /// minted tester name. Paired with a negative control — `((is) (a))` mints
+    /// tester `is-a` against a constructor named `is`, which does not collide
+    /// and must still be accepted — so the check cannot pass by over-rejecting.
     #[test]
     fn declare_datatypes_rejects_tester_colliding_with_a_constructor_in_the_same_command() {
         // `is-a` is a constructor of the same command; `a`'s tester wants it.
