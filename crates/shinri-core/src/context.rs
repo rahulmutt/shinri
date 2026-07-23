@@ -1201,6 +1201,51 @@ impl Context {
     pub fn has_datatypes(&self) -> bool {
         !self.datatypes.ctors.is_empty()
     }
+
+    /// Iterative inhabitance fixpoint over all declared datatypes. Returns the
+    /// first sort in `group` that has no finite ground term (an empty sort),
+    /// or `None` when every member is inhabited.
+    ///
+    /// A non-datatype sort is always inhabited. A datatype is inhabited once
+    /// some constructor has all argument sorts inhabited. Marking is monotone,
+    /// so iterating to saturation terminates in at most `|datatypes|` rounds.
+    ///
+    /// Deliberately iterative (worklist, not recursion): the sort graph comes
+    /// from untrusted input and may be arbitrarily deep (threat model).
+    pub fn dt_first_ill_founded(&self, group: &[SortId]) -> Option<SortId> {
+        let mut inhabited: FxHashSet<SortId> = FxHashSet::default();
+        let all: Vec<SortId> = self.datatypes.ctors.keys().copied().collect();
+        loop {
+            let mut changed = false;
+            for &dt in &all {
+                if inhabited.contains(&dt) {
+                    continue;
+                }
+                let ctors = match self.dt_constructors(dt) {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let any_ctor_ok = ctors.iter().any(|&c| {
+                    self.fun_params(c).is_some_and(|params| {
+                        params
+                            .iter()
+                            .all(|&p| !self.is_datatype_sort(p) || inhabited.contains(&p))
+                    })
+                });
+                if any_ctor_ok {
+                    inhabited.insert(dt);
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        group
+            .iter()
+            .copied()
+            .find(|s| self.is_datatype_sort(*s) && !inhabited.contains(s))
+    }
 }
 
 #[cfg(test)]
@@ -2045,5 +2090,74 @@ mod tests {
         let cloned = ctx.clone();
         assert_eq!(cloned.dt_constructors(list), Some(&[nil][..]));
         assert!(cloned.is_datatype_sort(list));
+    }
+
+    #[test]
+    fn well_founded_list_is_inhabited() {
+        let mut ctx = Context::new();
+        let list = ctx.declare_datatype_sort("List");
+        let int = ctx.int_sort();
+        let b = ctx.bool_sort();
+        let nil = ctx.declare_fun("nil", &[], list);
+        let is_nil = ctx.declare_fun("is-nil", &[list], b);
+        ctx.dt_add_constructor(list, nil, &[], is_nil);
+        let cons = ctx.declare_fun("cons", &[int, list], list);
+        let head = ctx.declare_fun("head", &[list], int);
+        let tail = ctx.declare_fun("tail", &[list], list);
+        let is_cons = ctx.declare_fun("is-cons", &[list], b);
+        ctx.dt_add_constructor(list, cons, &[head, tail], is_cons);
+        assert_eq!(ctx.dt_first_ill_founded(&[list]), None);
+    }
+
+    #[test]
+    fn non_well_founded_datatype_is_rejected() {
+        // (declare-datatype T ((c (f T)))) — every value would be infinite.
+        let mut ctx = Context::new();
+        let t = ctx.declare_datatype_sort("T");
+        let b = ctx.bool_sort();
+        let c = ctx.declare_fun("c", &[t], t);
+        let f = ctx.declare_fun("f", &[t], t);
+        let is_c = ctx.declare_fun("is-c", &[t], b);
+        ctx.dt_add_constructor(t, c, &[f], is_c);
+        assert_eq!(ctx.dt_first_ill_founded(&[t]), Some(t));
+    }
+
+    #[test]
+    fn mutually_recursive_datatypes_inhabited_through_partner() {
+        // A ::= mkA(B) ; B ::= base | mkB(A)  — both inhabited via B's base case.
+        let mut ctx = Context::new();
+        let a = ctx.declare_datatype_sort("A");
+        let bs = ctx.declare_datatype_sort("B");
+        let b = ctx.bool_sort();
+        let base = ctx.declare_fun("base", &[], bs);
+        let is_base = ctx.declare_fun("is-base", &[bs], b);
+        ctx.dt_add_constructor(bs, base, &[], is_base);
+        let mk_a = ctx.declare_fun("mkA", &[bs], a);
+        let get_b = ctx.declare_fun("getB", &[a], bs);
+        let is_mk_a = ctx.declare_fun("is-mkA", &[a], b);
+        ctx.dt_add_constructor(a, mk_a, &[get_b], is_mk_a);
+        let mk_b = ctx.declare_fun("mkB", &[a], bs);
+        let get_a = ctx.declare_fun("getA", &[bs], a);
+        let is_mk_b = ctx.declare_fun("is-mkB", &[bs], b);
+        ctx.dt_add_constructor(bs, mk_b, &[get_a], is_mk_b);
+        assert_eq!(ctx.dt_first_ill_founded(&[a, bs]), None);
+    }
+
+    #[test]
+    fn mutually_recursive_without_base_case_is_rejected() {
+        // A ::= mkA(B) ; B ::= mkB(A) — neither has a base case.
+        let mut ctx = Context::new();
+        let a = ctx.declare_datatype_sort("A");
+        let bs = ctx.declare_datatype_sort("B");
+        let b = ctx.bool_sort();
+        let mk_a = ctx.declare_fun("mkA", &[bs], a);
+        let get_b = ctx.declare_fun("getB", &[a], bs);
+        let is_mk_a = ctx.declare_fun("is-mkA", &[a], b);
+        ctx.dt_add_constructor(a, mk_a, &[get_b], is_mk_a);
+        let mk_b = ctx.declare_fun("mkB", &[a], bs);
+        let get_a = ctx.declare_fun("getA", &[bs], a);
+        let is_mk_b = ctx.declare_fun("is-mkB", &[bs], b);
+        ctx.dt_add_constructor(bs, mk_b, &[get_a], is_mk_b);
+        assert!(ctx.dt_first_ill_founded(&[a, bs]).is_some());
     }
 }
