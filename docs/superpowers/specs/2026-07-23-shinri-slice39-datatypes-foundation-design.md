@@ -137,12 +137,20 @@ O(#DT-apps) per check — negligible beside congruence itself.
 ### 5.1 Slice-39 rules (no case splitting)
 
 - **Selector-collapse.** If the class of `t` contains `C(a₁…aₙ)` and also
-  contains `selᵢ(t)` where `selᵢ` is `C`'s *i*-th selector, derive
-  `selᵢ(t) = aᵢ`. If `selᵢ` belongs to a **different** constructor `D ≠ C`, the
-  SMT-LIB semantics leave the value **unspecified** and the rule must **not**
-  fire — collapsing there would be unsound. This is the workhorse rule.
-- **Injectivity (downward).** `C(a₁…aₙ) ≡ C(b₁…bₙ)` within one class ⇒ derive
-  `aᵢ = bᵢ` pairwise. EUF already supplies the upward direction.
+  contains `selᵢ(t)` where `selᵢ` is `C`'s *i*-th selector, emit the lemma
+  **`selᵢ(C(a₁…aₙ)) = aᵢ`**. Written over the constructor application itself
+  this is an *unconditional* T-tautology, so it needs no guard; congruence
+  supplies `selᵢ(t) ≡ selᵢ(C(a₁…aₙ))`. This is the workhorse rule, and it is
+  the ROW-1 pattern of `shinri-arrays` (`crates/shinri-arrays/src/lib.rs:94`).
+  If `selᵢ` belongs to a **different** constructor `D ≠ C`, the SMT-LIB
+  semantics leave the value **unspecified** and the rule must **not** fire —
+  collapsing there would be unsound.
+- **Injectivity (downward).** `C(a₁…aₙ) ≡ C(b₁…bₙ)` ⇒ `aᵢ = bᵢ` pairwise
+  requires **no dedicated code**: it is a consequence of selector-collapse plus
+  congruence. From `C(a…) ≡ C(b…)`, congruence gives
+  `selᵢ(C(a…)) ≡ selᵢ(C(b…))`; the two collapse lemmas give
+  `aᵢ ≡ selᵢ(C(a…))` and `bᵢ ≡ selᵢ(C(b…))`; hence `aᵢ ≡ bᵢ`. EUF already
+  supplies the upward direction. Tests pin this consequence (§7).
 - **Constructor clash.** A class containing both `C(…)` and `D(…)` with
   `C ≠ D` ⇒ conflict.
 - **Tester consistency (at-most-one only).** `t ≡ C(…)` ⇒ propagate `is-C(t)`
@@ -170,21 +178,41 @@ Slice 40 *lifts* the fence; it does not fix a bug.
 
 ## 6. Wiring — equality seam, Combiner, models
 
-**Derived equalities never bypass congruence.** This is the one place where the
-shared-substrate architecture could go subtly wrong: if `DtSolver` merged
-classes directly in the shared `EqualityEngine`, EUF's use-lists would not
-re-trigger and the congruence consequences of a DT-derived equality could be
-silently missed. So `DtSolver` *returns* its derived pairs and the Combiner
-installs each one into EUF through the existing `consume_interface_equality`
-seam, whose documented contract is exactly "merge the e-nodes and close
-congruence." `DtSolver` mints explanation tags via `mint_eq_tag`, so a conflict
-raised by another theory citing a DT-derived equality resolves back through
-`DtSolver::explain` to the input literals. No new lemma channel is invented —
-the N-O seam built for EUF⋈Arith carries this.
+**`DtSolver` owns no equality state and never merges.** The hazard this section
+originally guarded against — DT merging classes directly in the shared
+`EqualityEngine`, leaving EUF's use-lists un-triggered and congruence
+consequences silently missed — is designed out rather than mitigated.
+`DtSolver` is a **pure lemma-on-demand theory, structurally identical to
+`shinri-arrays`**: it derives nothing into the equality engine and instead
+emits axiom instances as positive-atom clauses via `TCheck::Split`, letting the
+SAT search and EUF congruence do all merging.
 
-Should that seam prove awkward in implementation, the fallback is the guarded
-`TCheck::Split` channel the string theory already uses; the plan picks one and
-pins it.
+> **Plan-time correction (2026-07-23).** This section originally routed DT's
+> derived equalities through the Combiner's `consume_interface_equality` seam,
+> with a guarded `TCheck::Split` as fallback. Both are unnecessary: writing
+> selector-collapse over the constructor application (§5.1) makes the lemma an
+> *unconditional* tautology, so no guard and no merge channel are needed, and
+> injectivity ceases to require code at all. The N-O extension is dropped from
+> this slice.
+
+The three channels DT actually uses, all pre-existing:
+
+| Rule | Channel |
+|---|---|
+| Selector-collapse `selᵢ(C(a…)) = aᵢ` (⇒ injectivity) | `TCheck::Split { guard: None }` — unconditional tautology |
+| Tester positive `is-C(C(a…))` | `TCheck::Split { guard: None }` — unit tautology |
+| Constructor clash `C(…) ≡ D(…)` | `TCheck::Conflict`, leaves from `cx.eq.explain(a, b, &mut out)` |
+| Tester disjointness: asserted `is-D(t)`, class holds `C(…)`, `C ≠ D` | `TheorySolver::assert` returns conflict leaves |
+
+Tester disjointness lives in `assert` rather than `check` because its
+consequence `¬is-D(t)` is a *negative* literal, and `TCheck::Split` carries
+only positive atoms. Catching it at assertion time is both sound and cheaper.
+
+Consequently `DtSolver::explain` handles only tags it mints for its own
+conflicts, and it implements none of the N-O exchange hooks
+(`consume_interface_equality`, `mint_eq_tag`, `entailed_equalities`) — their
+trait defaults stand. Slice 43 revisits this when arithmetic-sorted fields
+require genuine equality exchange.
 
 **Combiner.** `Combiner<E, A, R, S>` gains a fifth slot,
 `Combiner<E, A, R, S, D>`, with a `dt_mut()` accessor and a new
@@ -206,11 +234,13 @@ inhabitant exists and that the recursion terminates.
 ## 7. Testing
 
 - **Unit tests in `shinri-dt`**, against a hand-built
-  `EqualityEngine`/`TheoryCtx`: one per rule in §5.1 — selector-collapse fires
-  for the matching constructor and *provably does not* for a foreign selector;
-  pairwise injectivity; constructor clash conflict; tester propagation and
-  tester/constructor conflict. Plus fence tests asserting `Unknown` rather than
-  `Sat` on a constructor-undetermined class.
+  `EqualityEngine`/`TheoryCtx`: one per rule in §5.1 — selector-collapse emits
+  the tautology for the matching constructor and *provably does not* for a
+  foreign selector; constructor clash conflict; tester tautology and
+  tester/constructor conflict at assert time. Injectivity is tested as an
+  **emergent consequence** (collapse lemmas + congruence yield `aᵢ ≡ bᵢ`), not
+  as a dedicated rule. Plus fence tests asserting `Unknown` rather than `Sat` on
+  a constructor-undetermined class.
 - **Parser tests**: one per row of §3's rejection table, each asserting a
   `Diagnostic` rather than a panic — including the non-well-founded case and a
   deeply nested mutually recursive declaration. Datatype declarations seeded
