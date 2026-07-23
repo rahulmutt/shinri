@@ -146,6 +146,7 @@ pub(crate) fn format_modelval(v: &ModelVal) -> String {
             }
             .to_string()
         }
+        ModelVal::Datatype(s) => s.clone(),
     }
 }
 

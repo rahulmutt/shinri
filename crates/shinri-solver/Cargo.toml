@@ -16,6 +16,7 @@ shinri-bv = { path = "../shinri-bv" }
 shinri-abv = { path = "../shinri-abv" }
 shinri-fp = { path = "../shinri-fp" }
 shinri-str = { path = "../shinri-str" }
+shinri-dt = { path = "../shinri-dt" }
 shinri-num = { path = "../shinri-num" }
 shinri-frontend = { path = "../shinri-frontend" }
 rustc-hash = "2"

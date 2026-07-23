@@ -4,7 +4,7 @@
 
 use crate::types::Owner;
 use rustc_hash::{FxHashMap, FxHashSet};
-use shinri_core::{BuiltinOp, Context, Op, SortId, SortNode, TermId, TermNode, Var};
+use shinri_core::{BuiltinOp, Context, DtRole, Op, SortId, SortNode, TermId, TermNode, Var};
 
 /// An atom this solver cannot handle exactly (e.g. nonlinear). Refusing it at
 /// registration makes the whole query return `unknown` upstream.
@@ -92,6 +92,48 @@ pub fn classify(terms: &Context, atom: TermId) -> Result<Owner, Unsupported> {
     {
         return Ok(Owner::String);
     }
+    // Datatype routing: a tester application, or a (dis)equality over
+    // datatype-sorted operands, belongs to the DT theory. EUF still interns the
+    // terms for congruence (see the Owner::Datatypes routing in the Combiner).
+    if let TermNode::App {
+        op: Op::Uninterpreted(sym),
+        ..
+    } = terms.term_node(atom)
+    {
+        if matches!(terms.dt_role(*sym), Some(DtRole::Tester { .. })) {
+            return Ok(Owner::Datatypes);
+        }
+    }
+    if let TermNode::App {
+        op: Op::Builtin(BuiltinOp::Eq | BuiltinOp::Distinct),
+        args,
+        ..
+    } = terms.term_node(atom)
+    {
+        if terms
+            .children(*args)
+            .iter()
+            .any(|&c| terms.is_datatype_sort(terms.sort_of(c)))
+        {
+            return Ok(Owner::Datatypes);
+        }
+    }
+    // NOTE (slice-39 soundness fix): there is deliberately NO blanket
+    // `contains_dt_op → Owner::Datatypes` deep-walk here. A constructor/
+    // selector/tester is an ordinary uninterpreted function symbol, so an atom
+    // that merely MENTIONS one (e.g. `(< (head (cons 10 nil)) 5)`, or an Int
+    // `(distinct (head (cons 1 nil)) 1)`) must be classified EXACTLY as if that
+    // symbol were any other uninterpreted function of the same sort — Arith for
+    // a `< <= > >=` relation, EUF for an Int (dis)equality. An earlier version
+    // routed ALL such atoms to `Owner::Datatypes`, which dispatches to EUF+DT
+    // only and NEVER to Arith, so a relational atom whose operand was a buried
+    // selector was stolen from the simplex and the inequality went unevaluated
+    // (a wrong-SAT). DtSolver still learns about the buried applications: the
+    // Combiner notifies `dt.new_var` ownership-independently (guarded by
+    // `contains_dt_op`) in the EUF/Arith/Shared arms, mirroring the String
+    // theory's `atom_contains_str_len` notification. The two Datatypes clauses
+    // above (a tester application, or a datatype-SORTED (dis)equality) genuinely
+    // belong to DT+EUF and are kept.
     match terms.term_node(atom) {
         TermNode::App { op, args, .. } => {
             let children = terms.children(*args);
@@ -215,6 +257,54 @@ fn contains_array_op(terms: &Context, t: TermId) -> bool {
 
 fn is_array_sorted(terms: &Context, t: TermId) -> bool {
     matches!(terms.sort_node(terms.sort_of(t)), SortNode::Array(_, _))
+}
+
+/// True if any subterm of `t` is a constructor, selector, or tester
+/// application. Used by the Combiner to notify `DtSolver` ownership-
+/// independently: an atom owned by EUF/Arith/Shared that nonetheless mentions a
+/// datatype application must still be watched by DT so collapse/clash/tester/
+/// injectivity rules fire over the buried applications (mirrors the String
+/// theory's `atom_contains_str_len` notification for `str.len`).
+///
+/// The walk is memoized with a `seen` set: on a shared term DAG (nested
+/// lists/trees, `let`-shared subtrees) an unguarded recursion is exponential
+/// in sharing depth, the exact hazard `DtSolver::collect` (Task 5) and
+/// `string_under_uf` guard against. (`contains_array_op` / `array_touches_arith`
+/// in this file are NOT guarded — a pre-existing latent issue for QF_A inputs,
+/// left untouched here; this function is guarded regardless.)
+pub(crate) fn contains_dt_op(terms: &Context, t: TermId) -> bool {
+    fn walk(terms: &Context, t: TermId, seen: &mut FxHashSet<TermId>) -> bool {
+        if !seen.insert(t) {
+            return false;
+        }
+        // Synthetic split TermIds (from a sub-theory using its own Context) are
+        // not interned here; treat them as dt-free (they cannot mention a
+        // datatype application registered in this Context). Mirrors the guard in
+        // `atom_contains_str_len`.
+        if !terms.contains_term(t) {
+            return false;
+        }
+        match terms.term_node(t) {
+            TermNode::App { op, args, .. } => {
+                if let Op::Uninterpreted(sym) = op {
+                    if matches!(
+                        terms.dt_role(*sym),
+                        Some(
+                            DtRole::Constructor { .. }
+                                | DtRole::Selector { .. }
+                                | DtRole::Tester { .. }
+                        )
+                    ) {
+                        return true;
+                    }
+                }
+                terms.children(*args).iter().any(|&c| walk(terms, c, seen))
+            }
+            TermNode::Const { .. } => false,
+        }
+    }
+    let mut seen = FxHashSet::default();
+    walk(terms, t, &mut seen)
 }
 
 /// True if any select/store subterm touches an arith (Int/Real) index or element
@@ -469,6 +559,25 @@ mod tests {
             classify(&ctx, atom).is_err(),
             "string under a UF is out of scope in v1"
         );
+    }
+
+    #[test]
+    fn datatype_equality_and_tester_route_to_datatypes() {
+        let mut ctx = Context::new();
+        let list = ctx.declare_datatype_sort("List");
+        let b = ctx.bool_sort();
+        let nil = ctx.declare_fun("nil", &[], list);
+        let is_nil = ctx.declare_fun("is-nil", &[list], b);
+        ctx.dt_add_constructor(list, nil, &[], is_nil);
+        let xs = ctx.declare_fun("x", &[], list);
+        let x = ctx.mk_app(Op::Uninterpreted(xs), &[]).unwrap();
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+
+        let eq_atom = ctx.mk_eq(x, nil_t).unwrap();
+        assert_eq!(classify(&ctx, eq_atom), Ok(Owner::Datatypes));
+
+        let tester = ctx.mk_app(Op::Uninterpreted(is_nil), &[x]).unwrap();
+        assert_eq!(classify(&ctx, tester), Ok(Owner::Datatypes));
     }
 
     #[test]

@@ -26,6 +26,7 @@ pub enum Owner {
     Shared,
     Arrays,
     String,
+    Datatypes,
 }
 
 /// A range into `EqualityEngine`'s congruence-pair arena (keeps `EqJust` `Copy`).
@@ -129,6 +130,10 @@ pub enum ModelVal {
     },
     /// A rounding-mode value (slice 6: RM variables get model entries).
     Rm(shinri_core::RoundingMode),
+    /// A datatype value, pre-rendered as an SMT-LIB ground constructor term
+    /// (e.g. `nil`, `(cons 1 nil)`). Rendered by the DT theory, which has the
+    /// `Context`; `format_modelval` has none.
+    Datatype(std::string::String),
 }
 
 /// A class-union that occurred, surfaced to consumers via `drain_merges`.

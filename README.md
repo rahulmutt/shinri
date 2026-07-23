@@ -60,6 +60,7 @@ Dependency-ordered, foundations first:
 | `shinri-abv` | QF_ABV via lemmas-on-demand abstraction–refinement |
 | `shinri-fp` | eager bit-blasting of QF_FP, reusing the shinri-bv blaster |
 | `shinri-str` | string/regex theory solver |
+| `shinri-dt` | QF_DT algebraic datatypes: lemma-on-demand over the shared e-graph |
 | `shinri-solver` | embeddable solver entry point; owns the term DAG |
 | `shinri-parser` | SMT-LIB 2.6 frontend: lexer + recursive descent |
 | `shinri-frontend` | neutral SMT-LIB command IR (parser → solver bridge) |

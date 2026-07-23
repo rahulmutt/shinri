@@ -1,6 +1,6 @@
 //! End-to-end split-and-converge integration test (QF_LIA Plan A, Task 6).
 //!
-//! Drives a real `Solver<Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory>, NoProof, Vmtf>`
+//! Drives a real `Solver<Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory, NullTheory>, NoProof, Vmtf>`
 //! through the full splitting-on-demand loop:
 //!   sub-theory `TCheck::Split` → Combiner `TheoryResult::SplitAtoms`
 //!   → Solver mints+binds+learns+backtracks → search assigns split literals → Sat.
@@ -175,7 +175,7 @@ fn run_phase_seeded_split(phases: Vec<Option<bool>>) -> (Option<bool>, Option<bo
     BOUND.with(|b| b.borrow_mut().clear());
 
     let mut s: Solver<
-        Combiner<NullTheory, PhaseSeededSplitter, NullTheory, NullTheory>,
+        Combiner<NullTheory, PhaseSeededSplitter, NullTheory, NullTheory, NullTheory>,
         NoProof,
         Vmtf,
     > = Solver::new(SolverConfig::default());
@@ -242,11 +242,11 @@ fn split_once_then_sat_end_to_end() {
     // Reset the thread-local so a re-run in the same thread starts clean.
     BOUND.with(|b| b.borrow_mut().clear());
 
-    // Build a Solver whose theory is a real Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory>.
+    // Build a Solver whose theory is a real Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory, NullTheory>.
     // Combiner::default() uses Context::new() internally; no atoms are registered
     // here, so assert/propagate are no-ops for the single real var `a`.
     let mut s: Solver<
-        Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory>,
+        Combiner<NullTheory, OneShotSplitter, NullTheory, NullTheory, NullTheory>,
         NoProof,
         Vmtf,
     > = Solver::new(SolverConfig::default());

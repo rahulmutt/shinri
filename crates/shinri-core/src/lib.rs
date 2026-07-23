@@ -12,7 +12,7 @@ pub mod symbol;
 pub mod term;
 pub mod undo;
 
-pub use context::Context;
+pub use context::{Context, DatatypeRegistry, DtRole};
 pub use error::SortError;
 pub use ids::{BvId, ClauseId, Lit, RatId, SortId, StringId, SymbolId, TermId, Var};
 pub use proof::{NoProof, ProofSink, TheoryJust};

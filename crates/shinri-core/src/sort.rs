@@ -20,4 +20,9 @@ pub enum SortNode {
     RoundingMode,
     /// The RegLan sort (SMT-LIB regular expressions over String, slice 19).
     RegLan,
+    /// An algebraic datatype sort declared by `declare-datatypes` (slice 39).
+    /// Structurally identical to `Uninterpreted` for sort-checking; kept
+    /// distinct so atoms can be routed to the datatype theory and so
+    /// cardinality reasoning can identify it.
+    Datatype(SymbolId),
 }

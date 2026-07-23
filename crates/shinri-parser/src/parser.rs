@@ -1,6 +1,7 @@
 use crate::env::Env;
 use crate::lexer::{Lexer, Span, Token};
-use shinri_core::{Context, Rational, SortId, TermId};
+use rustc_hash::FxHashSet;
+use shinri_core::{Context, Rational, SortId, SymbolId, TermId};
 use shinri_frontend::Command;
 use shinri_num::Integer;
 
@@ -70,6 +71,36 @@ fn reject_reserved(ctx: &Context, name: &str, sp: &Span) -> Result<(), Diagnosti
         }
     }
     Ok(())
+}
+
+/// Reject `name` when it already resolves to a declared symbol (a signature or
+/// a datatype role). Declaring it again would hash-cons onto the same symbol
+/// and silently overwrite the existing declaration.
+///
+/// The wording is deliberately distinct from the `sort {n} already declared`
+/// check in `parse_declare_datatypes`, so a test can tell which gate fired.
+fn reject_collision(ctx: &Context, name: &str, sp: &Span) -> Result<(), Diagnostic> {
+    if ctx.name_is_declared(name) {
+        return Err(Diagnostic::new(
+            sp.clone(),
+            format!("cannot declare '{name}': collides with an existing declaration"),
+        ));
+    }
+    Ok(())
+}
+
+/// Ledger of everything a single `declare-datatype(s)` command installed, so an
+/// error exit can unwind it. Sort ids and symbol ids stay interned (the
+/// hash-cons tables are append-only); removing the name bindings and registry
+/// entries is what makes a rejected declaration unreachable.
+#[derive(Default)]
+struct DtStaging {
+    /// Datatype sorts added to `env` and `ctx.datatypes`.
+    sorts: Vec<(String, SortId)>,
+    /// Constructor and selector symbols, with the `env` name they were bound to.
+    funs: Vec<(String, SymbolId)>,
+    /// Minted testers — reserved in `ctx`, never bound in `env`.
+    minted: Vec<SymbolId>,
 }
 
 pub struct Parser<'a> {
@@ -455,14 +486,20 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse the body of an indexed identifier `(_ <id> <nums...>)` where the
-    /// `_` has already been consumed.  Returns the corresponding `BuiltinOp`.
+    /// `_` AND `<id>` have already been consumed (the caller reads `<id>`
+    /// itself first, to route the datatype-tester `is` identifier elsewhere,
+    /// since a tester resolves to `Op::Uninterpreted`, not a `BuiltinOp`).
+    /// Returns the corresponding `BuiltinOp`.
     ///
     /// Handles: `extract i j`, `zero_extend k`, `sign_extend k`,
     /// `rotate_left k`, `rotate_right k`, `repeat k`, `re.loop lo hi`, `re.^ n`.
-    fn parse_indexed_op(&mut self, usp: Span) -> Result<shinri_core::BuiltinOp, Diagnostic> {
+    fn parse_indexed_op(
+        &mut self,
+        id: &str,
+        isp: Span,
+    ) -> Result<shinri_core::BuiltinOp, Diagnostic> {
         use shinri_core::BuiltinOp::*;
-        let (id, isp) = self.expect_symbol()?;
-        let op = match id.as_str() {
+        let op = match id {
             "extract" => {
                 let hi = self.expect_numeral_u32()?;
                 let lo = self.expect_numeral_u32()?;
@@ -500,7 +537,6 @@ impl<'a> Parser<'a> {
                 ));
             }
         };
-        let _ = usp;
         Ok(op)
     }
 
@@ -578,7 +614,31 @@ impl<'a> Parser<'a> {
             if under != "_" {
                 return Err(Diagnostic::new(usp, "expected '_' in indexed identifier"));
             }
-            let op = self.parse_indexed_op(usp.clone())?;
+            let (id, isp) = self.expect_symbol()?;
+            if id == "is" {
+                // `((_ is C) x)` — datatype tester. Resolve C to its
+                // constructor symbol and apply that constructor's tester.
+                // Both failure modes below (C undeclared, or C declared but
+                // not a constructor) share the same "not a constructor"
+                // wording so callers can match on one substring.
+                //
+                // `is` is claimed here for the datatype tester and is
+                // therefore unavailable as a future `parse_indexed_op` name
+                // (no current SMT-LIB indexed operator is named `is`, so
+                // this shadowing is deliberate, not accidental).
+                let (cname, csp) = self.expect_symbol()?;
+                self.expect_token(&Token::RParen)?; // close `(_ is C)`
+                let ctor = self.env.lookup_fun(&cname).ok_or_else(|| {
+                    Diagnostic::new(csp.clone(), format!("{cname} is not a constructor"))
+                })?;
+                let tester = ctx
+                    .dt_tester(ctor)
+                    .ok_or_else(|| Diagnostic::new(csp, format!("{cname} is not a constructor")))?;
+                // parse_arg_list also consumes the outer application's ')'.
+                let args = self.parse_arg_list(ctx)?;
+                return Self::mk(ctx, shinri_core::Op::Uninterpreted(tester), &args, &open);
+            }
+            let op = self.parse_indexed_op(&id, isp)?;
             // consume closing ')' of the indexed identifier
             self.expect_token(&Token::RParen)?;
             // now parse the argument(s) and the outer closing ')'
@@ -1061,6 +1121,12 @@ impl<'a> Parser<'a> {
                 self.env.add_sort(&name, s);
                 Command::DeclareSort { name, arity }
             }
+            // These two consume their own closing ')' (it has to be validated
+            // inside their rollback ledger — see `parse_declare_datatypes`), so
+            // they return directly rather than falling through to the shared
+            // `expect_token(RParen)` below.
+            "declare-datatype" => return Ok(Some(self.parse_declare_datatypes(ctx, hsp, false)?)),
+            "declare-datatypes" => return Ok(Some(self.parse_declare_datatypes(ctx, hsp, true)?)),
             "declare-const" => {
                 let (name, nsp) = self.expect_symbol()?;
                 reject_reserved(ctx, &name, &nsp)?;
@@ -1159,6 +1225,255 @@ impl<'a> Parser<'a> {
         };
         self.expect_token(&Token::RParen)?; // close the command
         Ok(Some(cmd))
+    }
+
+    /// `(declare-datatype T (<ctor>...))` and
+    /// `(declare-datatypes ((T 0)...) ((<ctor>...)...))`.
+    ///
+    /// A `<ctor>` is `(<name> (<sel> <Sort>)...)`. All declared sorts are
+    /// interned BEFORE any constructor body is parsed so mutual recursion
+    /// resolves. Every malformed shape is rejected with a `Diagnostic`.
+    ///
+    /// Registration is *transactional*: everything the command installs into
+    /// `ctx` and `self.env` is recorded in a `DtStaging` ledger, and every error
+    /// exit unwinds it, so a rejected declaration leaves no reachable trace.
+    /// That includes the command's own closing `)`, which this function
+    /// consumes itself (the dispatcher's shared close would run after the
+    /// ledger was dropped, leaving a "rejected" command's declarations
+    /// installed).
+    fn parse_declare_datatypes(
+        &mut self,
+        ctx: &mut Context,
+        hsp: Span,
+        plural: bool,
+    ) -> Result<Command, Diagnostic> {
+        let mut staged = DtStaging::default();
+        match self.parse_declare_datatypes_inner(ctx, hsp, plural, &mut staged) {
+            Ok(cmd) => Ok(cmd),
+            Err(d) => {
+                // Unwind: name bindings first (they are what makes a rejected
+                // declaration reachable), then the context registries.
+                for (name, sort) in &staged.sorts {
+                    self.env.remove_sort(name);
+                    ctx.dt_clear_sort(*sort);
+                }
+                for (name, sym) in &staged.funs {
+                    self.env.remove_fun(name);
+                    ctx.undeclare_fun(*sym);
+                }
+                for sym in &staged.minted {
+                    ctx.undeclare_fun(*sym);
+                }
+                Err(d)
+            }
+        }
+    }
+
+    fn parse_declare_datatypes_inner(
+        &mut self,
+        ctx: &mut Context,
+        hsp: Span,
+        plural: bool,
+        staged: &mut DtStaging,
+    ) -> Result<Command, Diagnostic> {
+        // ---- 1. names -------------------------------------------------------
+        let mut names: Vec<(String, Span)> = Vec::new();
+        if plural {
+            self.expect_token(&Token::LParen)?;
+            while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+                self.expect_token(&Token::LParen)?;
+                let (n, nsp) = self.expect_symbol()?;
+                let arity = self.expect_numeral_u32()?;
+                if arity != 0 {
+                    return Err(Diagnostic::new(
+                        nsp,
+                        "declare-datatypes: parametric datatype arity > 0 unsupported",
+                    ));
+                }
+                self.expect_token(&Token::RParen)?;
+                names.push((n, nsp));
+            }
+            self.bump(); // ')'
+        } else {
+            let (n, nsp) = self.expect_symbol()?;
+            names.push((n, nsp));
+        }
+        if names.is_empty() {
+            return Err(Diagnostic::new(hsp, "declare-datatypes: no sorts declared"));
+        }
+
+        // ---- 2. intern every sort first (mutual recursion) ------------------
+        let mut sorts: Vec<(String, SortId)> = Vec::new();
+        for (n, nsp) in &names {
+            if self.env.lookup_sort(n).is_some() {
+                return Err(Diagnostic::new(
+                    nsp.clone(),
+                    format!("sort {n} already declared"),
+                ));
+            }
+            let s = ctx.declare_datatype_sort(n);
+            self.env.add_sort(n, s);
+            staged.sorts.push((n.clone(), s));
+            sorts.push((n.clone(), s));
+        }
+
+        // ---- 3. constructor bodies -----------------------------------------
+        // Both sets are COMMAND-scoped: a constructor or selector name may be
+        // introduced at most once per `declare-datatype(s)`, across all the
+        // group's members and all their constructors.
+        let mut seen_ctor: FxHashSet<String> = FxHashSet::default();
+        let mut seen_sel: FxHashSet<String> = FxHashSet::default();
+        if plural {
+            self.expect_token(&Token::LParen)?;
+        }
+        for (name, dt) in &sorts {
+            let dt = *dt;
+            self.expect_token(&Token::LParen)?;
+            let mut n_ctors = 0usize;
+            while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+                self.parse_one_constructor(ctx, dt, &mut seen_ctor, &mut seen_sel, staged)?;
+                n_ctors += 1;
+            }
+            self.bump(); // ')'
+            if n_ctors == 0 {
+                return Err(Diagnostic::new(
+                    hsp,
+                    format!("datatype {name} must have at least one constructor"),
+                ));
+            }
+        }
+        if plural {
+            self.expect_token(&Token::RParen)?;
+        }
+
+        // ---- 4. well-foundedness -------------------------------------------
+        let group: Vec<SortId> = sorts.iter().map(|(_, s)| *s).collect();
+        if let Some(bad) = ctx.dt_first_ill_founded(&group) {
+            let name = sorts
+                .iter()
+                .find(|(_, s)| *s == bad)
+                .map(|(n, _)| n.clone())
+                .unwrap_or_else(|| "<datatype>".to_string());
+            return Err(Diagnostic::new(
+                hsp,
+                format!("datatype {name} is not well-founded (no finite value exists)"),
+            ));
+        }
+
+        // ---- 5. close the command, INSIDE the staged region -----------------
+        // The shared `expect_token(RParen)` at the end of `parse_command_body`
+        // runs after this function has returned and the ledger has been
+        // dropped, so a truncated or trailing-garbage command would be reported
+        // as rejected while its declarations stayed installed. Consuming the
+        // paren here keeps every failure mode under the rollback; the
+        // dispatcher therefore skips its own close for this command.
+        //
+        // It must be the LAST step, because of a non-local coupling with error
+        // recovery. `next_command` calls `recover_to_command_end` on every
+        // `Err`, and that function hard-codes a starting paren depth of 1 — it
+        // assumes the command's closing ')' has NOT been consumed. So the
+        // invariant an error path must satisfy is precisely: *never consume the
+        // command's closing ')'*. (Not "consume nothing" — `expect_token` bumps
+        // the token it rejects, so this step does consume on failure. It is
+        // safe because the token it rejects can never be a ')': a ')' would
+        // have matched.)
+        //
+        // Known gap, pre-existing and not datatype-specific: an early
+        // `expect_*` that *rejects* the command's own ')' does consume it and
+        // desyncs the recovery. Step 3's `expect_token(&Token::LParen)` does
+        // exactly that on `(declare-datatype D )` — real depth is then 0 while
+        // recovery starts at 1, so it runs to EOF and swallows the rest of the
+        // script. `(declare-sort )` behaves identically, so it predates this
+        // slice; tracked as a follow-up (a `Parser`-level depth counter), out
+        // of scope here.
+        self.expect_token(&Token::RParen)?;
+
+        Ok(Command::DeclareDatatypes { sorts })
+    }
+
+    /// One `(<ctor> (<sel> <Sort>)...)` form, registered into `ctx`.
+    ///
+    /// `seen_ctor`/`seen_sel` are command-scoped; `reject_collision` additionally
+    /// fences every minted name against declarations already in `ctx` (from an
+    /// earlier command, an earlier constructor of this command, or an earlier
+    /// `declare-fun`). Without that fence a colliding name hash-conses onto the
+    /// existing symbol and silently overwrites its signature and datatype role.
+    fn parse_one_constructor(
+        &mut self,
+        ctx: &mut Context,
+        dt: SortId,
+        seen_ctor: &mut FxHashSet<String>,
+        seen_sel: &mut FxHashSet<String>,
+        staged: &mut DtStaging,
+    ) -> Result<(), Diagnostic> {
+        self.expect_token(&Token::LParen)?;
+        let (cname, csp) = self.expect_symbol()?;
+        reject_reserved(ctx, &cname, &csp)?;
+        if !seen_ctor.insert(cname.clone()) {
+            return Err(Diagnostic::new(
+                csp,
+                format!("duplicate constructor {cname}"),
+            ));
+        }
+        reject_collision(ctx, &cname, &csp)?;
+        let mut sel_names: Vec<(String, Span)> = Vec::new();
+        let mut sel_sorts: Vec<SortId> = Vec::new();
+        while !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+            self.expect_token(&Token::LParen)?;
+            let (sname, ssp) = self.expect_symbol()?;
+            reject_reserved(ctx, &sname, &ssp)?;
+            if !seen_sel.insert(sname.clone()) {
+                return Err(Diagnostic::new(ssp, format!("duplicate selector {sname}")));
+            }
+            reject_collision(ctx, &sname, &ssp)?;
+            if seen_ctor.contains(&sname) {
+                return Err(Diagnostic::new(
+                    ssp,
+                    format!("duplicate selector {sname}: name is already a constructor"),
+                ));
+            }
+            let s = self.parse_sort(ctx)?;
+            self.expect_token(&Token::RParen)?;
+            sel_names.push((sname, ssp));
+            sel_sorts.push(s);
+        }
+        self.bump(); // ')'
+
+        // The tester is minted, not user-written; it must not land on a name a
+        // user already took. `name_is_declared` covers earlier commands and
+        // earlier constructors of this one; the two command-scoped sets close
+        // the same-constructor window, where this constructor's own name and
+        // selectors have been *parsed* but not yet installed into `ctx`
+        // (e.g. `(declare-datatype D ((c (is-c Int))))`).
+        let tname = format!("is-{cname}");
+        if ctx.name_is_declared(&tname) || seen_ctor.contains(&tname) || seen_sel.contains(&tname) {
+            return Err(Diagnostic::new(
+                csp.clone(),
+                format!(
+                    "cannot declare constructor {cname}: \
+                     its tester {tname} collides with an existing declaration"
+                ),
+            ));
+        }
+
+        let ctor = ctx.declare_fun(&cname, &sel_sorts, dt);
+        self.env.add_fun(&cname, ctor);
+        staged.funs.push((cname.clone(), ctor));
+        let mut sels = Vec::with_capacity(sel_names.len());
+        for (i, (sname, _)) in sel_names.iter().enumerate() {
+            let sym = ctx.declare_fun(sname, &[dt], sel_sorts[i]);
+            self.env.add_fun(sname, sym);
+            staged.funs.push((sname.clone(), sym));
+            sels.push(sym);
+        }
+        // Reserve the tester so a later `declare-fun is-C` cannot hash-cons
+        // onto the same symbol.
+        let bool_s = ctx.bool_sort();
+        let tester = ctx.declare_fun(&tname, &[dt], bool_s);
+        ctx.reserve_symbol(tester);
+        staged.minted.push(tester);
+        ctx.dt_add_constructor(dt, ctor, &sels, tester);
+        Ok(())
     }
 
     /// `(define-fun f ((x S)…) R body)` — intern body against fresh formal
@@ -1305,6 +1620,446 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Parse a script and return the first error message, or None if all commands parsed.
+    fn first_error(src: &str) -> Option<String> {
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        while let Some(r) = p.next_command(&mut ctx) {
+            if let Err(d) = r {
+                return Some(d.message);
+            }
+        }
+        None
+    }
+
+    /// Parse a whole script, collecting every error. The driver continues past
+    /// a `Diagnostic` (see the solver's script_e2e), so state a rejected
+    /// command left behind is observable by the commands that follow.
+    fn all_errors(src: &str) -> Vec<String> {
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        let mut out = Vec::new();
+        while let Some(r) = p.next_command(&mut ctx) {
+            if let Err(d) = r {
+                out.push(d.message);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn declare_datatype_singular_registers_constructors() {
+        let mut ctx = Context::new();
+        let mut p = Parser::new("(declare-datatype List ((nil) (cons (head Int) (tail List))))");
+        let cmd = p.next_command(&mut ctx).unwrap().unwrap();
+        let sorts = match cmd {
+            Command::DeclareDatatypes { sorts } => sorts,
+            other => panic!("expected DeclareDatatypes, got {other:?}"),
+        };
+        assert_eq!(sorts.len(), 1);
+        assert_eq!(sorts[0].0, "List");
+        let list = sorts[0].1;
+        assert!(ctx.is_datatype_sort(list));
+        let ctors = ctx.dt_constructors(list).expect("constructors");
+        assert_eq!(ctors.len(), 2);
+        assert_eq!(ctx.symbol_name(ctors[0]), "nil");
+        assert_eq!(ctx.symbol_name(ctors[1]), "cons");
+        let sels = ctx.dt_selectors(ctors[1]).expect("selectors");
+        assert_eq!(sels.len(), 2);
+        assert_eq!(ctx.symbol_name(sels[0]), "head");
+        assert_eq!(
+            ctx.dt_tester(ctors[1]).map(|t| ctx.symbol_name(t)),
+            Some("is-cons")
+        );
+    }
+
+    #[test]
+    fn declare_datatypes_plural_mutually_recursive() {
+        let mut ctx = Context::new();
+        let src = "(declare-datatypes ((A 0) (B 0)) \
+                   (((mkA (getB B))) ((base) (mkB (getA A)))))";
+        let mut p = Parser::new(src);
+        let cmd = p.next_command(&mut ctx).unwrap().unwrap();
+        let sorts = match cmd {
+            Command::DeclareDatatypes { sorts } => sorts,
+            other => panic!("expected DeclareDatatypes, got {other:?}"),
+        };
+        assert_eq!(sorts.len(), 2);
+        assert!(ctx.dt_constructors(sorts[0].1).is_some());
+        assert_eq!(ctx.dt_constructors(sorts[1].1).map(|c| c.len()), Some(2));
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_nonzero_arity() {
+        let e = first_error("(declare-datatypes ((L 1)) (((nil))))").expect("must error");
+        assert!(e.contains("arity"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_zero_constructors() {
+        let e = first_error("(declare-datatype E ())").expect("must error");
+        assert!(e.contains("at least one constructor"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_duplicate_constructor() {
+        let e = first_error("(declare-datatype D ((c) (c)))").expect("must error");
+        assert!(e.contains("duplicate"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_duplicate_selector() {
+        let e = first_error("(declare-datatype D ((c (f Int) (f Int))))").expect("must error");
+        assert!(e.contains("duplicate"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_non_well_founded() {
+        let e = first_error("(declare-datatype T ((c (f T))))").expect("must error");
+        assert!(e.contains("well-founded"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_duplicate_sort_name() {
+        let e = first_error("(declare-datatype L ((nil)))(declare-datatype L ((nil2)))")
+            .expect("must error");
+        assert!(e.contains("already declared"), "message was: {e}");
+    }
+
+    // ---- rollback of a rejected declaration (review finding 1) -------------
+
+    /// The well-foundedness rejection must leave `T` unusable: before the fix
+    /// the sort binding survived and `x` was admitted with an empty sort.
+    #[test]
+    fn rejected_datatype_leaves_no_usable_sort() {
+        let errs = all_errors("(declare-datatype T ((c (f T))))(declare-fun x () T)(check-sat)");
+        assert_eq!(errs.len(), 2, "errors were: {errs:?}");
+        assert!(errs[0].contains("well-founded"), "message was: {}", errs[0]);
+        assert!(
+            errs[1].contains("unknown sort T"),
+            "message was: {}",
+            errs[1]
+        );
+    }
+
+    /// A rejected declaration must not burn its own name: a corrected retry
+    /// with the same sort name has to succeed.
+    #[test]
+    fn rejected_datatype_name_can_be_redeclared() {
+        let errs = all_errors("(declare-datatype T ((c (f T))))(declare-datatype T ((base)))");
+        assert_eq!(errs.len(), 1, "errors were: {errs:?}");
+        assert!(errs[0].contains("well-founded"), "message was: {}", errs[0]);
+    }
+
+    /// The same holds for the other rejection paths. Each case pins the
+    /// diagnostic the bad input must produce, so the test cannot pass by the
+    /// bad input being *accepted* and the retry being the sole error.
+    #[test]
+    fn other_rejection_paths_also_roll_back() {
+        for (bad, want) in [
+            ("(declare-datatype T ())", "at least one constructor"),
+            ("(declare-datatype T ((c) (c)))", "duplicate constructor"),
+            (
+                "(declare-datatype T ((c (f Int) (f Int))))",
+                "duplicate selector",
+            ),
+            ("(declare-datatype T ((c (f T))))", "well-founded"),
+        ] {
+            let src = format!("{bad}(declare-datatype T ((base)))");
+            let errs = all_errors(&src);
+            assert_eq!(errs.len(), 1, "for {bad}: errors were {errs:?}");
+            assert!(
+                errs[0].contains(want),
+                "for {bad}: wanted {want:?}, got {:?}",
+                errs[0]
+            );
+        }
+    }
+
+    // ---- the closing paren is inside the staged region (re-review 1) --------
+
+    /// The command's own `)` is validated by `parse_declare_datatypes`, not by
+    /// the dispatcher's shared close — otherwise the ledger would already be
+    /// dropped and a "rejected" command's declarations would stay installed.
+    #[test]
+    fn trailing_garbage_rolls_the_declaration_back() {
+        let errs = all_errors("(declare-datatype L ((nil)) junk)(declare-fun x () L)");
+        assert_eq!(errs.len(), 2, "errors were: {errs:?}");
+        assert!(
+            errs[1].contains("unknown sort L"),
+            "message was: {}",
+            errs[1]
+        );
+    }
+
+    /// Same for EOF before the closing `)`: a Diagnostic, never a panic, and
+    /// the truncated declaration must not survive.
+    #[test]
+    fn truncated_command_rolls_the_declaration_back() {
+        let errs = all_errors("(declare-datatype L ((nil))");
+        assert_eq!(errs.len(), 1, "errors were: {errs:?}");
+        // And the name is free again for a later, complete command.
+        let errs = all_errors("(declare-datatype L ((nil)) junk)(declare-datatype L ((nil)))");
+        assert_eq!(errs.len(), 1, "errors were: {errs:?}");
+    }
+
+    /// The plural form rolls back too: the body list here is one entry short,
+    /// so `B`'s constructor list is never reached and `A` must be released.
+    #[test]
+    fn plural_declaration_rolls_back_the_whole_group() {
+        let errs = all_errors(
+            "(declare-datatypes ((A 0) (B 0)) (((mkA (getB B)))))\
+             (declare-datatype A ((base)))(declare-fun x () B)",
+        );
+        assert_eq!(errs.len(), 2, "errors were: {errs:?}");
+        assert!(
+            errs[1].contains("unknown sort B"),
+            "message was: {}",
+            errs[1]
+        );
+    }
+
+    /// Constructor/selector/tester symbols minted by a rejected declaration
+    /// must be released too — the names are free for a later `declare-fun`.
+    #[test]
+    fn rejected_datatype_releases_its_function_names() {
+        let errs = all_errors(
+            "(declare-datatype T ((c (f T))))\
+             (declare-fun c () Int)(declare-fun f () Int)(declare-fun is-c () Int)",
+        );
+        assert_eq!(errs.len(), 1, "errors were: {errs:?}");
+    }
+
+    // ---- name collisions (review finding 2) --------------------------------
+
+    /// A selector reused across two constructors of the SAME datatype: the
+    /// duplicate check is command-scoped, not per-constructor.
+    #[test]
+    fn declare_datatypes_rejects_selector_reused_across_constructors() {
+        let e = first_error("(declare-datatype D ((a (f Int)) (b (f Bool))))").expect("must error");
+        assert!(e.contains("duplicate"), "message was: {e}");
+    }
+
+    /// A selector may not reuse a constructor name from the same command.
+    #[test]
+    fn declare_datatypes_rejects_selector_named_like_a_constructor() {
+        let e = first_error("(declare-datatype D ((c (c Int))))").expect("must error");
+        assert!(e.contains("duplicate selector c"), "message was: {e}");
+    }
+
+    /// A constructor reused across two commands would leave the first
+    /// datatype's constructor list pointing at a symbol owned by the second.
+    #[test]
+    fn declare_datatypes_rejects_constructor_reused_across_commands() {
+        let e = first_error("(declare-datatype A ((c)))(declare-datatype B ((c)))")
+            .expect("must error");
+        assert!(
+            e.contains("cannot declare 'c': collides with an existing declaration"),
+            "message was: {e}"
+        );
+    }
+
+    /// A constructor colliding with a plain `declare-fun` is equally fatal.
+    #[test]
+    fn declare_datatypes_rejects_constructor_colliding_with_declare_fun() {
+        let e =
+            first_error("(declare-fun c () Int)(declare-datatype D ((c)))").expect("must error");
+        assert!(
+            e.contains("cannot declare 'c': collides with an existing declaration"),
+            "message was: {e}"
+        );
+    }
+
+    /// A minted tester must not land on a user-written constructor name.
+    #[test]
+    fn declare_datatypes_rejects_tester_colliding_with_constructor() {
+        let e = first_error("(declare-datatype D ((is-c) (c)))").expect("must error");
+        assert!(
+            e.contains("its tester is-c collides with an existing declaration"),
+            "message was: {e}"
+        );
+    }
+
+    /// The same-constructor window: `is-c` is parsed as a selector of `c`, so
+    /// it is not yet in `fun_sigs` when the tester name is checked. Only the
+    /// command-scoped `seen_sel` set catches it. Without the check, the
+    /// selector's Int signature and Selector role are overwritten by the
+    /// tester's Bool signature and Tester role.
+    #[test]
+    fn declare_datatypes_rejects_tester_colliding_with_own_selector() {
+        let e = first_error("(declare-datatype D ((c (is-c Int))))").expect("must error");
+        assert!(
+            e.contains("its tester is-c collides with an existing declaration"),
+            "message was: {e}"
+        );
+    }
+
+    /// The cross-constructor half of the same window: `is-a` is a constructor
+    /// of this command, and the *later* constructor `a` wants `is-a` as its
+    /// minted tester name. Paired with a negative control — `((is) (a))` mints
+    /// tester `is-a` against a constructor named `is`, which does not collide
+    /// and must still be accepted — so the check cannot pass by over-rejecting.
+    #[test]
+    fn declare_datatypes_rejects_tester_colliding_with_a_constructor_in_the_same_command() {
+        // `is-a` is a constructor of the same command; `a`'s tester wants it.
+        let e = first_error("(declare-datatype D ((is-a) (a)))").expect("must error");
+        assert!(
+            e.contains("its tester is-a collides with an existing declaration"),
+            "message was: {e}"
+        );
+        // A non-colliding tester name must still be accepted.
+        assert!(first_error("(declare-datatype D ((is) (a)))").is_none());
+    }
+
+    /// The reverse order is caught by the reserved-symbol fence.
+    #[test]
+    fn declare_datatypes_rejects_constructor_named_like_an_earlier_tester() {
+        let e = first_error("(declare-datatype D ((c) (is-c)))").expect("must error");
+        assert!(e.contains("reserved"), "message was: {e}");
+    }
+
+    /// The minted tester is reserved, so a later user `declare-fun` naming it
+    /// is rejected rather than silently overwriting the tester's signature.
+    #[test]
+    fn minted_tester_name_is_reserved_against_later_declare_fun() {
+        let e = first_error("(declare-datatype L ((nil)))(declare-fun is-nil (L) Bool)")
+            .expect("must error");
+        assert!(e.contains("reserved"), "message was: {e}");
+    }
+
+    #[test]
+    fn declare_datatypes_deep_nesting_does_not_overflow() {
+        // 5000 nested datatypes, each referring to the next; the last is a base
+        // case. Must produce a decision (ok or Diagnostic), never a stack overflow.
+        let mut src = String::new();
+        src.push_str("(declare-datatype D5000 ((base5000)))");
+        for i in (0..5000).rev() {
+            src.push_str(&format!(
+                "(declare-datatype D{i} ((mk{i} (get{i} D{})))) ",
+                i + 1
+            ));
+        }
+        let _ = first_error(&src); // must return, not crash
+    }
+
+    #[test]
+    fn declare_datatypes_rejects_unbalanced_input() {
+        let e = first_error("(declare-datatype List ((nil) (cons (head Int)");
+        assert!(e.is_some(), "truncated input must produce a Diagnostic");
+    }
+
+    #[test]
+    fn tester_term_resolves_to_tester_symbol() {
+        use shinri_core::{Op, TermNode};
+        let mut ctx = Context::new();
+        let src = "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
+                   (declare-fun x () List)\
+                   (assert ((_ is cons) x))";
+        let mut p = Parser::new(src);
+        let mut last = None;
+        while let Some(r) = p.next_command(&mut ctx) {
+            last = Some(r.expect("must parse"));
+        }
+        let t = match last {
+            Some(Command::Assert(t)) => t,
+            other => panic!("expected Assert, got {other:?}"),
+        };
+        // The asserted term is `is-cons` applied to one argument, Bool-sorted.
+        assert_eq!(ctx.sort_of(t), ctx.bool_sort());
+        match ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Uninterpreted(sym),
+                args,
+                ..
+            } => {
+                assert_eq!(ctx.symbol_name(*sym), "is-cons");
+                assert_eq!(ctx.children(*args).len(), 1);
+            }
+            other => panic!("expected tester application, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tester_rejects_unknown_constructor() {
+        let e = first_error(
+            "(declare-datatype List ((nil)))(declare-fun x () List)(assert ((_ is bogus) x))",
+        )
+        .expect("must error");
+        assert!(e.contains("not a constructor"), "message was: {e}");
+    }
+
+    /// The name resolves (via `env.lookup_fun`) but names a selector, not a
+    /// constructor — fails at the `ctx.dt_tester` lookup, not the `env`
+    /// lookup. This is the other branch behind the shared "not a
+    /// constructor" wording; `tester_rejects_unknown_constructor` above only
+    /// exercises the `env.lookup_fun` miss.
+    #[test]
+    fn tester_rejects_selector_name() {
+        let e = first_error(
+            "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
+             (declare-fun x () List)\
+             (assert ((_ is head) x))",
+        )
+        .expect("must error");
+        assert!(e.contains("not a constructor"), "message was: {e}");
+    }
+
+    /// The name resolves but names an ordinary `declare-fun`, unrelated to
+    /// any datatype — also fails at `ctx.dt_tester`.
+    #[test]
+    fn tester_rejects_plain_declared_function() {
+        let e = first_error(
+            "(declare-datatype List ((nil)))\
+             (declare-fun f () List)\
+             (declare-fun x () List)\
+             (assert ((_ is f) x))",
+        )
+        .expect("must error");
+        assert!(e.contains("not a constructor"), "message was: {e}");
+    }
+
+    /// `((_ is C))` — zero arguments. The tester's arity is 1, so this must
+    /// fail as a clean sort-arity Diagnostic, never panic. Message pinned so
+    /// this test can't pass green for an unrelated reason (e.g. the setup
+    /// commands failing first) — `first_error` returns the *first* error in
+    /// the script.
+    #[test]
+    fn tester_rejects_missing_argument() {
+        let e = first_error(
+            "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
+             (assert ((_ is cons)))",
+        )
+        .expect("missing argument must produce a Diagnostic");
+        assert_eq!(e, "sort error: Arity { expected: 1, found: 0 }");
+    }
+
+    /// `((_ is) x)` — no constructor name after `is`. Must be a clean
+    /// Diagnostic, never a panic. Message pinned for the same reason as
+    /// `tester_rejects_missing_argument`.
+    #[test]
+    fn tester_rejects_missing_constructor_name() {
+        let e = first_error(
+            "(declare-datatype List ((nil)))\
+             (declare-fun x () List)\
+             (assert ((_ is) x))",
+        )
+        .expect("missing constructor name must produce a Diagnostic");
+        assert_eq!(e, "expected symbol");
+    }
+
+    /// `((_ is C` truncated mid-tester (no closing parens at all). Must be a
+    /// clean Diagnostic, never a panic or hang. Message pinned for the same
+    /// reason as `tester_rejects_missing_argument`.
+    #[test]
+    fn tester_rejects_truncated_input() {
+        let e = first_error(
+            "(declare-datatype List ((nil) (cons (head Int) (tail List))))\
+             (assert ((_ is cons",
+        )
+        .expect("truncated input must produce a Diagnostic");
+        assert_eq!(e, "expected RParen, found EOF");
+    }
 
     #[test]
     fn parses_real_decimal_to_rational() {

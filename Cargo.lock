@@ -397,6 +397,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "shinri-dt"
+version = "0.1.0"
+dependencies = [
+ "rustc-hash",
+ "shinri-core",
+ "shinri-sat",
+ "shinri-theory",
+]
+
+[[package]]
 name = "shinri-euf"
 version = "0.1.0"
 dependencies = [
@@ -468,6 +478,7 @@ dependencies = [
  "shinri-arrays",
  "shinri-bv",
  "shinri-core",
+ "shinri-dt",
  "shinri-euf",
  "shinri-fp",
  "shinri-frontend",

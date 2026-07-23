@@ -6,6 +6,40 @@ use crate::term::{BuiltinOp, ChildSlice, ConstVal, Op, TermNode};
 use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_num::{Integer, Rational};
 
+/// The datatype role of a symbol (slice 39). Constructors, selectors, and
+/// testers are ordinary uninterpreted functions; this table is what makes them
+/// datatype-aware without new `Op` variants.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DtRole {
+    /// `index` is the constructor's position in its datatype's constructor list.
+    Constructor {
+        dt: SortId,
+        index: u32,
+    },
+    /// `index` is the selector's argument position within `ctor`.
+    Selector {
+        ctor: SymbolId,
+        index: u32,
+    },
+    Tester {
+        ctor: SymbolId,
+    },
+}
+
+/// Side-table describing every declared datatype. Lives on `Context` so it is
+/// carried by `Context::clone` into the Combiner.
+#[derive(Clone, Default)]
+pub struct DatatypeRegistry {
+    /// datatype sort -> constructors, in declaration order
+    ctors: FxHashMap<SortId, Vec<SymbolId>>,
+    /// constructor -> its selectors, in argument order
+    sels: FxHashMap<SymbolId, Vec<SymbolId>>,
+    /// constructor -> its tester
+    testers: FxHashMap<SymbolId, SymbolId>,
+    /// any datatype-related symbol -> its role
+    roles: FxHashMap<SymbolId, DtRole>,
+}
+
 /// The single owning arena for all interned sorts (and, after Task 4, terms).
 #[derive(Clone)]
 pub struct Context {
@@ -35,6 +69,8 @@ pub struct Context {
     real_sort: SortId,
     string_sort: SortId,
     reglan_sort: SortId,
+    /// Datatype declarations (slice 39). Empty for non-datatype queries.
+    datatypes: DatatypeRegistry,
 }
 
 impl Default for Context {
@@ -64,6 +100,7 @@ impl Context {
             real_sort: SortId::from_index(0),
             string_sort: SortId::from_index(0),
             reglan_sort: SortId::from_index(0),
+            datatypes: DatatypeRegistry::default(),
         };
         ctx.bool_sort = ctx.intern_sort(SortNode::Bool);
         ctx.int_sort = ctx.intern_sort(SortNode::Int);
@@ -1098,6 +1135,218 @@ impl Context {
     }
 }
 
+impl Context {
+    /// Declare (and intern) a fresh datatype sort named `name`.
+    pub fn declare_datatype_sort(&mut self, name: &str) -> SortId {
+        let sym = self.symbols.intern(name);
+        self.intern_sort(SortNode::Datatype(sym))
+    }
+
+    /// True iff `name` already resolves to a symbol that carries a declared
+    /// signature or a datatype role. Never interns: an unseen name is `false`.
+    ///
+    /// The parser uses this to reject a constructor/selector/tester name that
+    /// would otherwise hash-cons onto an existing declaration and silently
+    /// overwrite its signature or role.
+    pub fn name_is_declared(&self, name: &str) -> bool {
+        match self.symbols.lookup(name) {
+            Some(sym) => {
+                self.fun_sigs.contains_key(&sym) || self.datatypes.roles.contains_key(&sym)
+            }
+            None => false,
+        }
+    }
+
+    /// Drop every registry entry keyed on `sym`: its signature, its reserved
+    /// mark, and any datatype role/selector-list/tester it owns. Used to unwind
+    /// a rejected `declare-datatype(s)` command. The interned symbol itself
+    /// stays in the hash-cons table — that is inert, since nothing can reach it
+    /// without a signature, a role, or a name binding.
+    ///
+    /// # Preconditions
+    ///
+    /// This is the one removal path into otherwise append-only declaration
+    /// state; two invariants must hold at every call site.
+    ///
+    /// 1. **No live references.** `sym` must not be the head of any already
+    ///    interned term. The term tables are append-only — a term cannot be
+    ///    withdrawn — so undeclaring a symbol still used as a head would leave
+    ///    a term whose operator has no `fun_sigs` entry, breaking sort lookup
+    ///    downstream. The parser satisfies this because it only undeclares
+    ///    symbols minted by the command currently being rejected, and that
+    ///    command builds no terms.
+    /// 2. **Reservation ownership.** `reserved_syms` is cleared
+    ///    unconditionally, which is only sound because every `reserve_symbol`
+    ///    call site pairs the reservation with a `declare_fun` of the same
+    ///    symbol. If a symbol were ever reserved *without* being declared, this
+    ///    would silently un-reserve it.
+    pub fn undeclare_fun(&mut self, sym: SymbolId) {
+        self.fun_sigs.remove(&sym);
+        self.reserved_syms.remove(&sym);
+        self.datatypes.roles.remove(&sym);
+        self.datatypes.sels.remove(&sym);
+        self.datatypes.testers.remove(&sym);
+    }
+
+    /// Drop the constructor list of datatype sort `dt`. Companion to
+    /// `undeclare_fun` when unwinding a rejected declaration; the `SortId`
+    /// itself remains interned but is no longer a declared datatype.
+    ///
+    /// # Precondition
+    ///
+    /// Same "no live references" rule as `undeclare_fun`: no interned term may
+    /// have sort `dt`, and no surviving constructor may take `dt` as an
+    /// argument or result — otherwise `dt_first_ill_founded` would classify a
+    /// datatype against a sort with no constructors. The parser satisfies this
+    /// because it clears the whole rejected group together, and only that
+    /// group's own constructors could mention its sorts.
+    pub fn dt_clear_sort(&mut self, dt: SortId) {
+        self.datatypes.ctors.remove(&dt);
+    }
+
+    /// Register `ctor` as a constructor of datatype sort `dt`, with `selectors`
+    /// in argument order and tester `tester`. Signatures must already have been
+    /// installed via `declare_fun`.
+    pub fn dt_add_constructor(
+        &mut self,
+        dt: SortId,
+        ctor: SymbolId,
+        selectors: &[SymbolId],
+        tester: SymbolId,
+    ) {
+        let list = self.datatypes.ctors.entry(dt).or_default();
+        let index = list.len() as u32;
+        list.push(ctor);
+        self.datatypes
+            .roles
+            .insert(ctor, DtRole::Constructor { dt, index });
+        for (i, &sel) in selectors.iter().enumerate() {
+            self.datatypes.roles.insert(
+                sel,
+                DtRole::Selector {
+                    ctor,
+                    index: i as u32,
+                },
+            );
+        }
+        self.datatypes.sels.insert(ctor, selectors.to_vec());
+        self.datatypes.roles.insert(tester, DtRole::Tester { ctor });
+        self.datatypes.testers.insert(ctor, tester);
+    }
+
+    pub fn dt_role(&self, sym: SymbolId) -> Option<DtRole> {
+        self.datatypes.roles.get(&sym).copied()
+    }
+
+    pub fn dt_constructors(&self, dt: SortId) -> Option<&[SymbolId]> {
+        self.datatypes.ctors.get(&dt).map(|v| v.as_slice())
+    }
+
+    pub fn dt_selectors(&self, ctor: SymbolId) -> Option<&[SymbolId]> {
+        self.datatypes.sels.get(&ctor).map(|v| v.as_slice())
+    }
+
+    pub fn dt_tester(&self, ctor: SymbolId) -> Option<SymbolId> {
+        self.datatypes.testers.get(&ctor).copied()
+    }
+
+    pub fn is_datatype_sort(&self, s: SortId) -> bool {
+        matches!(self.sort_node(s), SortNode::Datatype(_))
+    }
+
+    /// Declared parameter sorts of `sym`, if it has a signature.
+    pub fn fun_params(&self, sym: SymbolId) -> Option<&[SortId]> {
+        self.fun_sigs.get(&sym).map(|(p, _)| p.as_slice())
+    }
+
+    /// True iff any declared datatype exists (cheap gate for the DT theory).
+    pub fn has_datatypes(&self) -> bool {
+        !self.datatypes.ctors.is_empty()
+    }
+
+    /// Iterative inhabitance fixpoint over all declared datatypes. Returns the
+    /// first sort in `group` that has no finite ground term (an empty sort),
+    /// or `None` when every member is inhabited.
+    ///
+    /// A non-datatype sort is always inhabited. A datatype is inhabited once
+    /// some constructor has all argument sorts inhabited.
+    ///
+    /// Implemented as a genuine worklist over a reverse-dependency index
+    /// (datatype sort -> the constructors that take it as an argument), with a
+    /// per-constructor count of its still-un-inhabited datatype arguments. Each
+    /// constructor is enqueued at most once per distinct datatype argument, so
+    /// the whole fixpoint is O(V + E) and independent of hash-map scan order.
+    /// (The previous round-based rescan was O(V * E) when the map order ran
+    /// counter to the dependency chain.)
+    ///
+    /// Deliberately iterative (explicit worklist, no recursion): the sort graph
+    /// comes from untrusted input and may be arbitrarily deep (threat model).
+    pub fn dt_first_ill_founded(&self, group: &[SortId]) -> Option<SortId> {
+        // Constructor records: (owning datatype, count of distinct datatype
+        // argument sorts not yet known inhabited).
+        let mut owner: Vec<SortId> = Vec::new();
+        let mut remaining: Vec<usize> = Vec::new();
+        // Reverse dependency index: datatype sort -> indices of constructor
+        // records that are still waiting on it.
+        let mut waiters: FxHashMap<SortId, Vec<usize>> = FxHashMap::default();
+        // Scratch set to de-duplicate a constructor's datatype arguments.
+        let mut seen: FxHashSet<SortId> = FxHashSet::default();
+        let mut queue: Vec<SortId> = Vec::new();
+        let mut inhabited: FxHashSet<SortId> = FxHashSet::default();
+
+        for (&dt, ctors) in &self.datatypes.ctors {
+            for &c in ctors {
+                // A constructor with no declared signature can never be applied;
+                // it contributes nothing (matches the previous `is_some_and`).
+                let Some(params) = self.fun_params(c) else {
+                    continue;
+                };
+                let idx = owner.len();
+                seen.clear();
+                let mut pending = 0usize;
+                for &p in params {
+                    if self.is_datatype_sort(p) && seen.insert(p) {
+                        pending += 1;
+                        waiters.entry(p).or_default().push(idx);
+                    }
+                }
+                owner.push(dt);
+                remaining.push(pending);
+                if pending == 0 && inhabited.insert(dt) {
+                    queue.push(dt);
+                }
+            }
+        }
+
+        // Worklist propagation. Every datatype is pushed at most once (guarded
+        // by `inhabited.insert`), and each pop walks its waiter list once, so
+        // the loop performs at most |V| pops and |E| decrements.
+        while let Some(dt) = queue.pop() {
+            let Some(ws) = waiters.get(&dt) else {
+                continue;
+            };
+            for &idx in ws {
+                let r = &mut remaining[idx];
+                if *r == 0 {
+                    continue;
+                }
+                *r -= 1;
+                if *r == 0 {
+                    let target = owner[idx];
+                    if inhabited.insert(target) {
+                        queue.push(target);
+                    }
+                }
+            }
+        }
+
+        group
+            .iter()
+            .copied()
+            .find(|s| self.is_datatype_sort(*s) && !inhabited.contains(s))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1892,5 +2141,174 @@ mod tests {
         assert!(!ctx.any_fun_sig_mentions(re_s));
         ctx.declare_fun("r", &[], re_s);
         assert!(ctx.any_fun_sig_mentions(re_s));
+    }
+
+    #[test]
+    fn datatype_registry_records_roles() {
+        let mut ctx = Context::new();
+        let list = ctx.declare_datatype_sort("List");
+        let int = ctx.int_sort();
+        // nil : () List
+        let nil = ctx.declare_fun("nil", &[], list);
+        let is_nil = ctx.declare_fun("is-nil", &[list], ctx.bool_sort());
+        ctx.dt_add_constructor(list, nil, &[], is_nil);
+        // cons : (Int, List) List, selectors head/tail
+        let cons = ctx.declare_fun("cons", &[int, list], list);
+        let head = ctx.declare_fun("head", &[list], int);
+        let tail = ctx.declare_fun("tail", &[list], list);
+        let is_cons = ctx.declare_fun("is-cons", &[list], ctx.bool_sort());
+        ctx.dt_add_constructor(list, cons, &[head, tail], is_cons);
+
+        assert!(ctx.is_datatype_sort(list));
+        assert_eq!(ctx.dt_constructors(list), Some(&[nil, cons][..]));
+        assert_eq!(ctx.dt_selectors(cons), Some(&[head, tail][..]));
+        assert_eq!(ctx.dt_tester(cons), Some(is_cons));
+        assert!(matches!(
+            ctx.dt_role(cons),
+            Some(DtRole::Constructor { dt, index: 1 }) if dt == list
+        ));
+        assert!(matches!(
+            ctx.dt_role(tail),
+            Some(DtRole::Selector { ctor, index: 1 }) if ctor == cons
+        ));
+        assert!(matches!(
+            ctx.dt_role(is_cons),
+            Some(DtRole::Tester { ctor }) if ctor == cons
+        ));
+        assert!(ctx.dt_role(head).is_some());
+        assert_eq!(ctx.fun_params(cons), Some(&[int, list][..]));
+    }
+
+    #[test]
+    fn datatype_registry_survives_clone() {
+        let mut ctx = Context::new();
+        let list = ctx.declare_datatype_sort("List");
+        let nil = ctx.declare_fun("nil", &[], list);
+        let is_nil = ctx.declare_fun("is-nil", &[list], ctx.bool_sort());
+        ctx.dt_add_constructor(list, nil, &[], is_nil);
+        let cloned = ctx.clone();
+        assert_eq!(cloned.dt_constructors(list), Some(&[nil][..]));
+        assert!(cloned.is_datatype_sort(list));
+    }
+
+    #[test]
+    fn well_founded_list_is_inhabited() {
+        let mut ctx = Context::new();
+        let list = ctx.declare_datatype_sort("List");
+        let int = ctx.int_sort();
+        let b = ctx.bool_sort();
+        let nil = ctx.declare_fun("nil", &[], list);
+        let is_nil = ctx.declare_fun("is-nil", &[list], b);
+        ctx.dt_add_constructor(list, nil, &[], is_nil);
+        let cons = ctx.declare_fun("cons", &[int, list], list);
+        let head = ctx.declare_fun("head", &[list], int);
+        let tail = ctx.declare_fun("tail", &[list], list);
+        let is_cons = ctx.declare_fun("is-cons", &[list], b);
+        ctx.dt_add_constructor(list, cons, &[head, tail], is_cons);
+        assert_eq!(ctx.dt_first_ill_founded(&[list]), None);
+    }
+
+    #[test]
+    fn non_well_founded_datatype_is_rejected() {
+        // (declare-datatype T ((c (f T)))) — every value would be infinite.
+        let mut ctx = Context::new();
+        let t = ctx.declare_datatype_sort("T");
+        let b = ctx.bool_sort();
+        let c = ctx.declare_fun("c", &[t], t);
+        let f = ctx.declare_fun("f", &[t], t);
+        let is_c = ctx.declare_fun("is-c", &[t], b);
+        ctx.dt_add_constructor(t, c, &[f], is_c);
+        assert_eq!(ctx.dt_first_ill_founded(&[t]), Some(t));
+    }
+
+    #[test]
+    fn mutually_recursive_datatypes_inhabited_through_partner() {
+        // A ::= mkA(B) ; B ::= base | mkB(A)  — both inhabited via B's base case.
+        let mut ctx = Context::new();
+        let a = ctx.declare_datatype_sort("A");
+        let bs = ctx.declare_datatype_sort("B");
+        let b = ctx.bool_sort();
+        let base = ctx.declare_fun("base", &[], bs);
+        let is_base = ctx.declare_fun("is-base", &[bs], b);
+        ctx.dt_add_constructor(bs, base, &[], is_base);
+        let mk_a = ctx.declare_fun("mkA", &[bs], a);
+        let get_b = ctx.declare_fun("getB", &[a], bs);
+        let is_mk_a = ctx.declare_fun("is-mkA", &[a], b);
+        ctx.dt_add_constructor(a, mk_a, &[get_b], is_mk_a);
+        let mk_b = ctx.declare_fun("mkB", &[a], bs);
+        let get_a = ctx.declare_fun("getA", &[bs], a);
+        let is_mk_b = ctx.declare_fun("is-mkB", &[bs], b);
+        ctx.dt_add_constructor(bs, mk_b, &[get_a], is_mk_b);
+        assert_eq!(ctx.dt_first_ill_founded(&[a, bs]), None);
+    }
+
+    #[test]
+    fn mutually_recursive_without_base_case_is_rejected() {
+        // A ::= mkA(B) ; B ::= mkB(A) — neither has a base case.
+        let mut ctx = Context::new();
+        let a = ctx.declare_datatype_sort("A");
+        let bs = ctx.declare_datatype_sort("B");
+        let b = ctx.bool_sort();
+        let mk_a = ctx.declare_fun("mkA", &[bs], a);
+        let get_b = ctx.declare_fun("getB", &[a], bs);
+        let is_mk_a = ctx.declare_fun("is-mkA", &[a], b);
+        ctx.dt_add_constructor(a, mk_a, &[get_b], is_mk_a);
+        let mk_b = ctx.declare_fun("mkB", &[a], bs);
+        let get_a = ctx.declare_fun("getA", &[bs], a);
+        let is_mk_b = ctx.declare_fun("is-mkB", &[bs], b);
+        ctx.dt_add_constructor(bs, mk_b, &[get_a], is_mk_b);
+        assert!(ctx.dt_first_ill_founded(&[a, bs]).is_some());
+    }
+
+    /// Correctness guard for the inhabitance worklist at scale.
+    ///
+    /// A 2000-long dependency chain `D0 -> D1 -> ... -> D2000`. Declaration
+    /// order is deliberately the reverse of the dependency order, and the scan
+    /// order inside the fixpoint is hash-map order, so the worst-case
+    /// propagation direction is exercised: every classification below must hold
+    /// no matter how many rounds the fixpoint needs to reach it. (This test
+    /// asserts results only — it carries no timing bound.)
+    #[test]
+    fn long_datatype_chain_is_linear_and_correctly_classified() {
+        const N: usize = 2000;
+
+        // Well-founded: the tail of the chain has a nullary constructor.
+        let mut ctx = Context::new();
+        let b = ctx.bool_sort();
+        let base = ctx.declare_datatype_sort(&format!("D{N}"));
+        let nil = ctx.declare_fun(&format!("base{N}"), &[], base);
+        let is_nil = ctx.declare_fun(&format!("is-base{N}"), &[base], b);
+        ctx.dt_add_constructor(base, nil, &[], is_nil);
+        let mut prev = base;
+        let mut chain = vec![base];
+        for i in (0..N).rev() {
+            let s = ctx.declare_datatype_sort(&format!("D{i}"));
+            let c = ctx.declare_fun(&format!("mk{i}"), &[prev], s);
+            let g = ctx.declare_fun(&format!("get{i}"), &[s], prev);
+            let t = ctx.declare_fun(&format!("is-mk{i}"), &[s], b);
+            ctx.dt_add_constructor(s, c, &[g], t);
+            chain.push(s);
+            prev = s;
+        }
+        // Head of the chain, and the whole chain at once, are all inhabited.
+        assert_eq!(ctx.dt_first_ill_founded(&[prev]), None);
+        assert_eq!(ctx.dt_first_ill_founded(&chain), None);
+
+        // Same chain without the base case: nothing in it is inhabited, and the
+        // first member of `group` (in `group`'s order) is the one reported.
+        let mut ctx = Context::new();
+        let b = ctx.bool_sort();
+        let tail = ctx.declare_datatype_sort(&format!("E{N}"));
+        let mut prev = tail;
+        for i in (0..N).rev() {
+            let s = ctx.declare_datatype_sort(&format!("E{i}"));
+            let c = ctx.declare_fun(&format!("mkE{i}"), &[prev], s);
+            let g = ctx.declare_fun(&format!("getE{i}"), &[s], prev);
+            let t = ctx.declare_fun(&format!("is-mkE{i}"), &[s], b);
+            ctx.dt_add_constructor(s, c, &[g], t);
+            prev = s;
+        }
+        assert_eq!(ctx.dt_first_ill_founded(&[prev]), Some(prev));
+        assert_eq!(ctx.dt_first_ill_founded(&[tail, prev]), Some(tail));
     }
 }

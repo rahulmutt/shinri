@@ -312,6 +312,7 @@ impl Solver {
             }
             Command::SetLogic(_)
             | Command::DeclareSort { .. }
+            | Command::DeclareDatatypes { .. }
             | Command::DeclareFun { .. }
             | Command::SetOption { .. }
             | Command::SetInfo { .. }
@@ -366,7 +367,13 @@ impl Solver {
         use shinri_theory::Combiner;
 
         type Sat = shinri_sat::Solver<
-            Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays, shinri_str::StrSolver>,
+            Combiner<
+                Euf,
+                shinri_arith::Arith,
+                shinri_arrays::Arrays,
+                shinri_str::StrSolver,
+                shinri_dt::DtSolver,
+            >,
             NoProof,
             Vmtf,
         >;
@@ -1991,7 +1998,13 @@ impl Solver {
         use shinri_theory::Combiner;
 
         type Sat = shinri_sat::Solver<
-            Combiner<Euf, shinri_arith::Arith, shinri_arrays::Arrays, shinri_str::StrSolver>,
+            Combiner<
+                Euf,
+                shinri_arith::Arith,
+                shinri_arrays::Arrays,
+                shinri_str::StrSolver,
+                shinri_dt::DtSolver,
+            >,
             NoProof,
             Vmtf,
         >;
