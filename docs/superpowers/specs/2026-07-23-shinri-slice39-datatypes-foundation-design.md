@@ -145,12 +145,23 @@ O(#DT-apps) per check — negligible beside congruence itself.
   If `selᵢ` belongs to a **different** constructor `D ≠ C`, the SMT-LIB
   semantics leave the value **unspecified** and the rule must **not** fire —
   collapsing there would be unsound.
-- **Injectivity (downward).** `C(a₁…aₙ) ≡ C(b₁…bₙ)` ⇒ `aᵢ = bᵢ` pairwise
-  requires **no dedicated code**: it is a consequence of selector-collapse plus
-  congruence. From `C(a…) ≡ C(b…)`, congruence gives
-  `selᵢ(C(a…)) ≡ selᵢ(C(b…))`; the two collapse lemmas give
-  `aᵢ ≡ selᵢ(C(a…))` and `bᵢ ≡ selᵢ(C(b…))`; hence `aᵢ ≡ bᵢ`. EUF already
-  supplies the upward direction. Tests pin this consequence (§7).
+- **Injectivity (downward).** `C(a₁…aₙ) ≡ C(b₁…bₙ)` ⇒ `aᵢ = bᵢ` pairwise is
+  the *consequence* of selector-collapse plus congruence: from `C(a…) ≡
+  C(b…)`, congruence gives `selᵢ(C(a…)) ≡ selᵢ(C(b…))`; the two collapse
+  lemmas give `aᵢ ≡ selᵢ(C(a…))` and `bᵢ ≡ selᵢ(C(b…))`; hence `aᵢ ≡ bᵢ`. EUF
+  already supplies the upward direction.
+  > **Implementation correction (Task 10, human-approved deviation).** This
+  > consequence does **not** fall out for free: `selᵢ(C(a…))` and
+  > `selᵢ(C(b…))` only exist as watched applications, and hence only feed
+  > `collapse_lemma`, if something has *instantiated* those selector terms.
+  > When neither side of the equated constructor pair already has its
+  > selectors mentioned in the input, no lemma ever fires and the
+  > consequence is silently missed. Slice 39 therefore ships a **dedicated
+  > rule**, `DtSolver::instantiate_injectivity_selectors` (on-demand selector
+  > instantiation): for every pair of same-constructor applications found
+  > equal in the same class, it mints and watches every field selector
+  > applied to *both* applications, which then feeds selector-collapse as
+  > above. This is planted code, not an emergent property — see §10.
 - **Constructor clash.** A class containing both `C(…)` and `D(…)` with
   `C ≠ D` ⇒ conflict.
 - **Tester consistency (at-most-one only).** `t ≡ C(…)` ⇒ propagate `is-C(t)`
@@ -237,10 +248,12 @@ inhabitant exists and that the recursion terminates.
   `EqualityEngine`/`TheoryCtx`: one per rule in §5.1 — selector-collapse emits
   the tautology for the matching constructor and *provably does not* for a
   foreign selector; constructor clash conflict; tester tautology and
-  tester/constructor conflict at assert time. Injectivity is tested as an
-  **emergent consequence** (collapse lemmas + congruence yield `aᵢ ≡ bᵢ`), not
-  as a dedicated rule. Plus fence tests asserting `Unknown` rather than `Sat` on
-  a constructor-undetermined class.
+  tester/constructor conflict at assert time. Injectivity is tested as the
+  consequence of the dedicated `instantiate_injectivity_selectors` rule
+  feeding collapse lemmas + congruence to yield `aᵢ ≡ bᵢ` (see §5.1's
+  implementation correction) — not as a rule-free emergent property, which
+  was the original (incorrect) plan-time assumption. Plus fence tests
+  asserting `Unknown` rather than `Sat` on a constructor-undetermined class.
 - **Parser tests**: one per row of §3's rejection table, each asserting a
   `Diagnostic` rather than a panic — including the non-well-founded case and a
   deeply nested mutually recursive declaration. Datatype declarations seeded
@@ -281,3 +294,142 @@ gates on `fmt --check` and fails fast).
    run with `--features oracle` and with a non-zero test count confirmed.
 5. `mise run lint` and `cargo fmt --check` clean; blocking tier wall-clock
    unchanged.
+
+## 10. Measured outcomes
+
+Recorded 2026-07-23, Task 11, on the `slice39-datatypes-foundation` branch.
+Every number below is from a command actually run in this session; none are
+aspirational.
+
+**Rules exercised (via `crates/shinri-dt/src/lib.rs` unit tests, `cargo
+nextest run -p shinri-dt`, 14/14 pass):**
+
+| Rule | Test(s) |
+|---|---|
+| Selector-collapse (fires) | `selector_collapse_emits_tautology_for_matching_constructor`, `collapse_reaches_fixpoint_after_lemma_is_installed` |
+| Selector-collapse (does NOT fire on a foreign selector) | `selector_collapse_does_not_fire_for_foreign_selector` |
+| Injectivity, via the dedicated `instantiate_injectivity_selectors` rule (§5.1 correction) | `injectivity_is_a_consequence_of_collapse_and_congruence` |
+| Constructor clash | `constructor_clash_is_a_conflict` |
+| Tester consistency (unit tautology + assert-time conflict) | `tester_over_constructor_emits_unit_tautology`, `tester_lemma_over_class_member_rewrites_onto_constructor_app`, `asserted_tester_conflicting_with_constructor_is_rejected_at_assert`, `asserted_tester_agreeing_with_constructor_is_fine` |
+| §5.2 completeness fence | `undetermined_datatype_class_yields_unknown_not_sat`, `determined_datatype_class_is_sat` |
+| Model construction | `model_assigns_ground_constructor_term` |
+| Watch-set indexing / linearity | `new_var_indexes_constructor_selector_and_tester_apps`, `collect_seen_guard_keeps_shared_subterm_walk_linear` |
+
+**End-to-end** (`cargo nextest run -p shinri-solver --test qfdt_e2e`,
+confirmed 10/10 pass in the full run below): selector-over-constructor unsat,
+constructor disjointness unsat, injectivity unsat (direct and transitive),
+injectivity branch-local stays sat, tester/constructor agreement and
+contradiction, UF-over-datatype congruence unsat, mixed datatype+arith unsat,
+and the pinned fence case (`undetermined_constructor_fences_to_unknown`)
+returning `unknown` rather than a possibly-wrong `sat`.
+
+**Oracle differential** — command actually run:
+
+```
+cargo nextest run -p shinri-solver --features oracle -E 'binary(qfdt_oracle)'
+```
+
+z3 4.16.0 (via `mise`) was on `PATH` in this environment, so the suite was
+**executed, not merely compiled**. Result:
+
+```
+Starting 6 tests across 1 binary (24 binaries skipped)
+    PASS [   0.031s] (1/6) shinri-solver::qfdt_oracle qfdt_oracle_selector_collapse
+    PASS [   0.032s] (2/6) shinri-solver::qfdt_oracle qfdt_oracle_nested_constructors
+    PASS [   0.033s] (3/6) shinri-solver::qfdt_oracle qfdt_oracle_tester_agreement
+    PASS [   0.033s] (4/6) shinri-solver::qfdt_oracle qfdt_oracle_disjointness
+    PASS [   0.033s] (5/6) shinri-solver::qfdt_oracle qfdt_oracle_injectivity
+    PASS [   0.033s] (6/6) shinri-solver::qfdt_oracle qfdt_oracle_uf_over_datatype
+Summary [   0.034s] 6 tests run: 6 passed, 0 skipped
+```
+
+**Confirmed non-`unknown` on both sides for every case** (checked directly,
+outside the assertion, by instrumenting and by running each query's script
+through `z3 -smt2 -in -T:120 -memory:4096` standalone): shinri and z3 agree
+`unsat`/`unsat`/`unsat`/`sat`/`unsat`/`unsat` for
+selector-collapse/injectivity/disjointness/tester-agreement/nested-constructors/uf-over-datatype
+respectively. No case was a silent `unknown`-skip on either side, so all six
+comparisons genuinely exercised the differential, not a vacuous pass.
+
+Only z3 was run — **cvc5 was not wired into this suite** even though it is on
+`PATH` via `mise` (`cvc5 1.3.4`) and §7/§9-criterion-4 as originally written
+name both oracles. This is a real gap against the spec's own criterion 4 —
+see the criterion-4 verdict below.
+
+**Fuzz corpus seeds.** The 5 seed bodies from the task brief were added to
+`crates/shinri-parser/fuzz/corpus/parse_script/`, named by the sha1 hex of
+their content (matching the existing seed-naming convention in that
+directory). `ASAN_OPTIONS=detect_leaks=0 cargo +nightly fuzz run parse_script
+-- -runs=20000` was run locally and completed 20000 runs with no crash
+(`corp: 2245/226Kb` at completion). **The `corpus/` directory itself is
+git-ignored repository-wide** (`.gitignore`: `crates/*/fuzz/corpus/`,
+comment "Local cargo-fuzz state (nightly CI fuzzes from a fresh corpus)") —
+this is true for every fuzz target in the repo, none of which have a
+committed corpus. The 5 seed files exist on disk and were exercised by the
+local run; they are intentionally **not** part of the git commit, consistent
+with how every other fuzz crate in this repo is set up.
+
+**Blocking-tier wall-clock** — command actually run:
+
+```
+cargo nextest run --all
+```
+
+Result: `1218 tests run: 1218 passed (5 slow), 7 skipped` in **262.1s**
+nextest-reported (`4m22.7s` wall via `time`), comfortably inside the 10–15
+min blocking-PR budget. The slowest individual test in the run was
+`shinri-parser parser::tests::declare_datatypes_deep_nesting_does_not_overflow`
+at **22.0s** (the 5000-deep nested datatype declaration named in the task
+brief); the next-slowest DT-adjacent test was `qfbv_witnesses
+bvmul_commutativity_unsat` at 16.1s (pre-existing, unrelated to this slice).
+No DT test required an `#[ignore]` exhaustive tier. Wall-clock is effectively
+unchanged from pre-slice-39 baselines (the added DT suites total well under a
+second).
+
+**Lint.** `cargo fmt --all --check` and `cargo clippy --workspace
+--all-targets -- -D warnings` (i.e. `mise run lint`) are both clean.
+`cargo clippy -p shinri-solver --test qfdt_oracle --features oracle -- -D
+warnings` (the new file, isolated) is also clean. However,
+`cargo clippy -p shinri-solver --all-targets --features oracle -- -D
+warnings` (every oracle test compiled together) currently fails with 36
+pre-existing `clippy::wrong_self_convention` errors in
+`tests/qfs_differential.rs`, `tests/qfbv_oracle.rs`, `tests/fp_oracle.rs`, and
+`tests/nary_arith_oracle.rs` — none of them touched by this task, and none in
+`qfdt_oracle.rs`. This looks like latent drift (nobody previously ran clippy
+`--all-targets --features oracle` together) rather than anything introduced
+here; it is flagged, not fixed, since fixing it means editing unrelated
+oracle suites outside this task's scope ("tests, seeds, and docs only" for
+QF_DT).
+
+**§9 success criteria — verified one by one:**
+
+1. **MET.** Parser accepts `declare-datatype`/`declare-datatypes` including
+   mutual recursion, and rejects every malformed shape with a `Diagnostic`
+   (no panic) — 20+ dedicated tests in
+   `crates/shinri-parser/src/parser.rs` (e.g.
+   `declare_datatypes_rejects_non_well_founded`,
+   `declare_datatypes_rejects_duplicate_selector`,
+   `declare_datatypes_deep_nesting_does_not_overflow`), all green in the
+   1218-test run above.
+2. **MET.** Selector-collapse, injectivity (via the dedicated instantiation
+   rule — see §5.1 correction), constructor clash, and tester consistency
+   each have a passing unit test in `shinri-dt` (14/14, table above),
+   including the foreign-selector negative case
+   (`selector_collapse_does_not_fire_for_foreign_selector`).
+3. **MET.** `qfdt_e2e` (10/10) covers correct `sat`/`unsat`, and
+   `undetermined_constructor_fences_to_unknown` pins the §5.2 fence returning
+   `unknown`.
+4. **PARTIALLY MET.** Oracle differential agrees with z3 on all 6 non-`unknown`
+   cases, run with `--features oracle -E 'binary(qfdt_oracle)'`, confirmed
+   non-zero (6) test count, all passing. The criterion as originally written
+   also names cvc5; **cvc5 was not exercised by this suite** (Task 11's brief
+   scoped the oracle helper to z3 only, mirroring `qfs_differential.rs`).
+   This is a real, acknowledged shortfall against the letter of criterion 4,
+   not a silent claim of full compliance — a cvc5 leg is future work, not
+   landed here.
+5. **MET.** `mise run lint` (fmt --check + workspace clippy, no oracle
+   feature) is clean. Blocking-tier wall-clock is 262.1s / 4m22.7s,
+   unchanged in substance from pre-slice-39 (the added suites are
+   sub-second). The one caveat is the pre-existing, unrelated
+   `--features oracle --all-targets` clippy failure noted above, which this
+   task did not introduce and does not fix.
