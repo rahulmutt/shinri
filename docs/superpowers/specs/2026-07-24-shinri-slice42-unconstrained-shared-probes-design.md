@@ -43,9 +43,9 @@ Instrumentation confirms the location: 100 % of wall-clock is inside
 (`combiner.rs:605`) is not implicated; the per-round pairwise probing is.
 
 Slice 42 adds one guard, applied at two sites (§3.B, §3.C): **arith never probes
-or splits on a pair whose var it has received no constraint about.** The verdict
-on every query is unchanged — this slice is completeness-neutral by
-construction.
+or splits on a pair whose var it has received no constraint about.** No `sat` or
+`unsat` verdict changes — the slice removes no deduction. It is not, however,
+strictly verdict-neutral in one direction: see §4.A.
 
 ## 2. Why not fix the shared set instead
 
@@ -155,6 +155,28 @@ implementation plan
 must carry that audit as an explicit task with its findings recorded, not fold
 it into the coding task.
 
+### 4.A One permitted verdict change: `unknown` → decided
+
+The slice removes no deduction, so no `sat` can become `unsat` or vice versa,
+and nothing decided can become `unknown` on that account. There is one
+asymmetric exception, and it is an improvement rather than a regression.
+
+`Arith::STRING_PATH_PIVOT_BUDGET` and `STRING_PATH_BRANCH_BUDGET`
+(`lib.rs:171`, `lib.rs:180`) exist precisely because the String↔Arith length
+seam feeds `entailed_equalities` / `model_equal_shared_pairs` a degenerate
+system whose probing re-solves simplex unboundedly; on exhaustion `check_full`
+returns a **sound `Unknown`**. Those budgets are cumulative over a solve. Pruning
+hopeless probes consumes fewer pivots, so a query that previously exhausted its
+budget and bailed to `Unknown` may now finish and decide.
+
+That is `unknown` → `sat`/`unsat`: sound, an improvement, and an **adjudicated
+flip** in the sense slices 40 and 41 used the term. It must still be
+z3/cvc5-confirmed before any pin is updated. Every other flip direction remains
+a regression (§5).
+
+This also means the string path — not just QF_DT — is in this slice's blast
+radius, which is a further reason the oracle run must be unfiltered (§5).
+
 ## 5. Testing
 
 ### Unit — `shinri-arith`
@@ -200,10 +222,17 @@ coverage matters as much as QF_DT; the exchange is shared.
 
 ### `script_e2e`
 
-Run locally pre-push, with one distinction from slices 40 and 41: this change is
-**completeness-neutral**. It only skips probes that provably cannot succeed, so
-there is no adjudicated pin flip to expect. **Any** flip — decided→decided or
-decided→unknown — is a regression, not an adjudication.
+Run locally pre-push. The change removes no deduction, so the expected outcome
+is **no flips at all**. Adjudicate any that appear by direction:
+
+| Flip | Reading |
+|---|---|
+| `unknown` → `sat`/`unsat` | **Permitted** (§4.A): a budget-limited query now finishes. Confirm against z3/cvc5 before updating the pin. |
+| `sat` ↔ `unsat` | Regression. Stop. |
+| decided → `unknown` | Regression. Stop. |
+
+The permitted direction is expected on the **string** path, not QF_DT, since
+that is where the cumulative pivot/branch budgets actually bind.
 
 ### Standing gates
 
@@ -234,8 +263,10 @@ rule stays speculative until a query demands it.
   measured 24.1 s baseline; the n = 20 Int-field query matches the
   uninterpreted-field query's order of magnitude (6 ms), closing the
   sort-attributable gap.
-- **No verdict changes anywhere**: `qfdt_e2e`, `script_e2e`, and the full
-  unfiltered oracle run all agree with pre-slice results. A single flip is a
+- **No regressive verdict changes**: `qfdt_e2e`, `script_e2e`, and the full
+  unfiltered oracle run agree with pre-slice results, except that an
+  `unknown` → decided flip on the string path is permitted once
+  z3/cvc5-confirmed (§4.A). Any `sat` ↔ `unsat` or decided → `unknown` flip is a
   regression.
 - The §3.A entry-point audit is recorded, establishing that no path can
   constrain a problem var without marking it.
