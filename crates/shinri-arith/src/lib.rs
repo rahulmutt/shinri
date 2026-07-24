@@ -215,7 +215,6 @@ impl Arith {
     /// Whether arith has received any constraint about `v` (slice 42). An
     /// unmarked var is free: `u = v` is not entailed for any `v`, and any
     /// arrangement of it is arith-satisfiable.
-    #[allow(dead_code)] // used in Task 3/4 (slice42); only exercised by tests here
     fn is_constrained(&self, v: ArithVar) -> bool {
         self.constrained.get(v.index()).copied().unwrap_or(false)
     }
@@ -625,9 +624,25 @@ impl Arith {
         }
         // Pre-filter (R3 necessary condition): only same-β pairs can be entailed.
         // Group by current β (DeltaRational equality).
+        //
+        // Slice 42: additionally skip any pair containing a var arith has
+        // received no constraint about. Such a var is free, so `u = v` is not
+        // entailed for any `v` and the probe cannot succeed. The skip MUST
+        // happen here, before the `define_slack` loop below: the R1 snapshot is
+        // taken AFTER slack definition and the final `restore` restores to it,
+        // so a slack minted for a hopeless pair would persist for the rest of
+        // the solve. Without this, a datatype with an Int field makes every
+        // DT-minted selector app a free shared var at β = 0, admitting every
+        // pair — the ≈1600× regression this slice fixes.
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         for i in 0..items.len() {
+            if !self.is_constrained(items[i].1) {
+                continue;
+            }
             for j in (i + 1)..items.len() {
+                if !self.is_constrained(items[j].1) {
+                    continue;
+                }
                 if self.value[items[i].1.index()] == self.value[items[j].1.index()] {
                     candidates.push((i, j));
                 }
@@ -2299,6 +2314,68 @@ mod nelson_oppen_tests {
         let v = h.arith.vars.problem_var(five);
         assert_eq!(h.arith.value[v.index()], dr(5));
         assert!(matches!(h.arith.check_full(), TCheck::Sat));
+    }
+
+    #[test]
+    fn unconstrained_pair_is_not_probed_and_mints_no_slack() {
+        // Two shared vars arith knows nothing about. No equality can be
+        // entailed, AND no slack may be minted: `entailed_equalities` snapshots
+        // AFTER `define_slack`, so a slack created here would persist for the
+        // rest of the solve and re-admit the cost on every later call.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+
+        let vars_before = h.arith.vars.len();
+        let got = h.arith.entailed_equalities(&ctx, &[x, y]);
+
+        assert!(got.is_empty(), "no equality is entailed over free vars");
+        assert_eq!(
+            h.arith.vars.len(),
+            vars_before,
+            "no slack may be minted for a skipped pair"
+        );
+    }
+
+    #[test]
+    fn mixed_pair_with_one_free_var_is_skipped() {
+        // x is fixed to 0; y is free. `x = y` is not entailed, and the pair must
+        // be skipped rather than probed.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let three = num(&mut h.ctx, 0);
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[x, three])
+            .unwrap();
+        let ge = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[x, three])
+            .unwrap();
+        h.assert_atom(0, le);
+        h.assert_atom(1, ge);
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+
+        let vars_before = h.arith.vars.len();
+        let got = h.arith.entailed_equalities(&ctx, &[x, y]);
+
+        assert!(
+            got.is_empty(),
+            "a free var is not entailed equal to a fixed one"
+        );
+        assert_eq!(
+            h.arith.vars.len(),
+            vars_before,
+            "no slack for a skipped pair"
+        );
     }
 }
 
