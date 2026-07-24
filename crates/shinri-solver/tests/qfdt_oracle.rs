@@ -242,3 +242,26 @@ fn qfdt_oracle_color_three_ctor_partial_propagation_sat() {
          (assert (not ((_ is red) c)))(assert (not ((_ is green) c)))",
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// slice-41: datatype acyclicity. Cyclic equations over the (infinite,
+// well-founded) List datatype are UNSAT — no finite/infinite term satisfies
+// the occurs-check violation. Pre-slice-41 these fenced to unknown; now they
+// must decide unsat. Routed through `agree_decided`, so a regression back to
+// the fence fails loudly instead of silently passing as a non-mismatch.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn qfdt_oracle_cyclic_self_reference() {
+    // x = cons(h, x): z3/cvc5 return unsat by acyclicity; slice 41 must too.
+    agree_decided("(declare-fun x () List)(declare-fun h () Int)(assert (= x (cons h x)))");
+}
+
+#[test]
+fn qfdt_oracle_cyclic_mutual() {
+    // x = cons(1, y) ∧ y = cons(2, x): mutual datatype cycle → unsat.
+    agree_decided(
+        "(declare-fun x () List)(declare-fun y () List)\
+         (assert (= x (cons 1 y)))(assert (= y (cons 2 x)))",
+    );
+}
