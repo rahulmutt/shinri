@@ -26,6 +26,18 @@ pub struct DtSolver {
     /// Lemmas already emitted, so `check` reaches a fixpoint instead of
     /// re-emitting the same tautology forever.
     emitted: FxHashSet<TermId>,
+    /// Slice 40: watched terms whose exhaustiveness disjunction has already
+    /// been emitted, so `check` reaches a fixpoint instead of re-offering the
+    /// same split. Monotone — the `emitted`/watch-set discipline of slice 39.
+    split_done: FxHashSet<TermId>,
+    /// Slice 40: tester atoms asserted true — the trigger set for
+    /// `instantiate_constructor`. Monotone (never popped): a stale entry from a
+    /// backtracked branch only re-emits a GUARDED (hence inert) lemma, never an
+    /// unsound one, so retraction is unnecessary and `push`/`pop` stay no-ops.
+    /// Populated starting in Task 2 (`instantiate_constructor`); unread until
+    /// then, hence the lint allow.
+    #[allow(dead_code)]
+    asserted_testers: FxHashSet<TermId>,
     /// Test-only instrumentation: total `collect` invocations (including
     /// early returns on an already-seen term), so a test can pin that the
     /// `seen` guard keeps the walk linear in DAG size instead of exponential
@@ -318,6 +330,51 @@ impl DtSolver {
         None
     }
 
+    /// Exhaustiveness (slice 40): a watched datatype class with no constructor
+    /// application IS some constructor — offer the tester disjunction
+    /// `is-C1(t) ∨ … ∨ is-Cn(t)`. Guard-free: it is a T-tautology whose
+    /// at-most-one companion is the assert-time tester disjointness (slice 39).
+    /// Deduped per watched term. Nullary constructors get a `Some(true)` phase
+    /// preference so the SAT search tries finite models first, which bounds the
+    /// instantiation descent on recursive types.
+    fn exhaustiveness_split(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
+        for t in self.watched_dt_terms() {
+            if self.ctor_of_class(cx, t).is_some() {
+                continue; // already constructor-determined
+            }
+            if !self.split_done.insert(t) {
+                continue; // disjunction already offered for this term
+            }
+            let sort = cx.terms.sort_of(t);
+            let Some(ctors) = cx.terms.dt_constructors(sort).map(<[SymbolId]>::to_vec) else {
+                continue;
+            };
+            let mut atoms = Vec::with_capacity(ctors.len());
+            let mut phases = Vec::with_capacity(ctors.len());
+            for c in ctors {
+                let Some(tester) = cx.terms.dt_tester(c) else {
+                    continue;
+                };
+                let is_c_t = cx
+                    .terms
+                    .mk_app(Op::Uninterpreted(tester), &[t])
+                    .expect("tester applies to its own datatype sort");
+                let nullary = cx.terms.dt_selectors(c).is_none_or(<[SymbolId]>::is_empty);
+                atoms.push(is_c_t);
+                phases.push(if nullary { Some(true) } else { None });
+            }
+            if atoms.is_empty() {
+                continue;
+            }
+            return Some(TCheck::Split {
+                atoms,
+                guard: None,
+                phases,
+            });
+        }
+        None
+    }
+
     /// The constructor application in `t`'s class, if any: `(symbol, app)`.
     fn ctor_of_class(&self, cx: &mut TheoryCtx, t: TermId) -> Option<(SymbolId, TermId)> {
         let tn = cx.eq.intern(t);
@@ -502,6 +559,9 @@ impl TheorySolver for DtSolver {
             return split;
         }
         if let Some(split) = self.tester_lemma(cx) {
+            return split;
+        }
+        if let Some(split) = self.exhaustiveness_split(cx) {
             return split;
         }
         // Slice-39 completeness fence (spec §5.2): this MUST be the last
@@ -727,10 +787,18 @@ mod tests {
         dt.new_var(&mut cx, Var::new(1), cons_t);
 
         // Before x ≡ cons(1,nil), x's class is not constructor-determined, so
-        // the completeness fence (spec §5.2, Task 8) returns Unknown — NOT a
-        // possibly-wrong Sat. The collapse itself has still not fired:
-        // Unknown ≠ Split, which is what this pre-merge check pins. After
-        // the merge below it fires.
+        // the completeness fence (spec §5.2, Task 8) would return Unknown —
+        // NOT a possibly-wrong Sat — but slice 40's exhaustiveness split
+        // (Rule 1) fires first on x's undetermined class, offering the
+        // tester disjunction `is-nil(x) ∨ is-cons(x)`. Drain that split; the
+        // collapse itself has still not fired, which is what this pre-merge
+        // check pins: the SECOND check is Unknown (deduped exhaustiveness,
+        // class still undetermined), not a collapse Split. After the merge
+        // below, collapse fires.
+        assert!(matches!(
+            dt.check(&mut cx, Effort::Full),
+            TCheck::Split { .. }
+        ));
         assert!(matches!(dt.check(&mut cx, Effort::Full), TCheck::Unknown));
 
         // Merge x with the constructor application.
@@ -1048,12 +1116,17 @@ mod tests {
     fn undetermined_datatype_class_yields_unknown_not_sat() {
         // `x` is a List with no constructor in its class and no tester pinning
         // it. Exhaustiveness (slice 40) is what would decide this, so slice 39
-        // must fence to Unknown rather than claim Sat.
+        // must fence to Unknown rather than claim Sat — but slice 40's
+        // exhaustiveness split (Rule 1) now fires FIRST on `x`'s undetermined
+        // class, so the pre-fence signal is a guard-free `Split` (the tester
+        // disjunction), not `Unknown` directly. Only `x` is registered (not a
+        // second `x = y` var) so there is exactly one watched, undetermined
+        // datatype term and thus exactly one split to drain before the fence
+        // — see `undetermined_class_emits_exhaustiveness_disjunction` for why
+        // two undetermined terms would make this order-dependent.
         let mut ctx = Context::new();
         let (list, _nil, _cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
         let x = uconst(&mut ctx, "x", list);
-        let y = uconst(&mut ctx, "y", list);
-        let atom = ctx.mk_eq(x, y).unwrap();
 
         let mut dt = DtSolver::default();
         let mut eq = EqualityEngine::default();
@@ -1063,8 +1136,13 @@ mod tests {
             eq: &mut eq,
             atoms: &atoms,
         };
-        dt.new_var(&mut cx, Var::new(0), atom);
+        dt.new_var(&mut cx, Var::new(0), x);
 
+        // Drain the exhaustiveness split before the fence is reached.
+        assert!(
+            matches!(dt.check(&mut cx, Effort::Full), TCheck::Split { .. }),
+            "exhaustiveness offers the tester disjunction first"
+        );
         assert!(
             matches!(dt.check(&mut cx, Effort::Full), TCheck::Unknown),
             "constructor-undetermined class must fence to Unknown"
@@ -1123,6 +1201,60 @@ mod tests {
             Some(shinri_theory::types::ModelVal::Datatype(s)) => assert_eq!(s, "nil"),
             other => panic!("expected a datatype model value, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn undetermined_class_emits_exhaustiveness_disjunction() {
+        // A bare List var with no constructor and no tester: Rule 1 must offer the
+        // exhaustiveness split `is-nil(x) ∨ is-cons(x)`, guard-free (a tautology),
+        // biasing the nullary `nil` branch via phase preference.
+        //
+        // Only ONE List-sorted term (`x`) is registered — deliberately, not
+        // `x = y` over two fresh List vars. `exhaustiveness_split` scans
+        // `watched_dt_terms()`, which iterates an `FxHashSet`; with two
+        // undetermined terms watched, the split could target either one
+        // depending on hash order, AND draining it would leave the other
+        // still undetermined, so a second `check` would offer THAT term's
+        // split instead of falling through to the fence — the "second check
+        // is Unknown" assertion below would then depend on hash order too.
+        // Registering `x` itself as the atom keeps it the only datatype term
+        // the theory watches, so both the split's atoms and the dedup are
+        // deterministic.
+        let mut ctx = Context::new();
+        let (list, _nil, _cons, _head, _tail, is_nil, is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), x);
+
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Split {
+                atoms,
+                guard,
+                phases,
+            } => {
+                assert_eq!(guard, None, "exhaustiveness is a tautology");
+                let is_nil_x = cx.terms.mk_app(Op::Uninterpreted(is_nil), &[x]).unwrap();
+                let is_cons_x = cx.terms.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+                assert!(atoms.contains(&is_nil_x) && atoms.contains(&is_cons_x));
+                assert_eq!(atoms.len(), 2, "one atom per constructor");
+                // Nullary `nil` is preferred true; `cons` carries no preference.
+                let nil_pos = atoms.iter().position(|&a| a == is_nil_x).unwrap();
+                assert_eq!(phases[nil_pos], Some(true), "nullary-first phase bias");
+            }
+            other => panic!("expected Split, got {}", tcheck_name(&other)),
+        }
+
+        // Deduped: a second check does not re-emit; with no SAT to decide the
+        // disjunction the class stays undetermined, so the fence still says Unknown.
+        assert!(matches!(dt.check(&mut cx, Effort::Full), TCheck::Unknown));
     }
 
     #[test]
