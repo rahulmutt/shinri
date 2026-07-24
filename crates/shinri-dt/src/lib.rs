@@ -6,6 +6,7 @@ use rustc_hash::FxHashSet;
 use shinri_core::{Context, DtRole, Lit, Op, SymbolId, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
 use shinri_theory::types::EqLeaf;
+use shinri_theory::ENodeId;
 use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
 /// Datatype theory solver. Holds no union-find: all equality state lives in the
@@ -26,6 +27,16 @@ pub struct DtSolver {
     /// Lemmas already emitted, so `check` reaches a fixpoint instead of
     /// re-emitting the same tautology forever.
     emitted: FxHashSet<TermId>,
+    /// Slice 40: watched terms whose exhaustiveness disjunction has already
+    /// been emitted, so `check` reaches a fixpoint instead of re-offering the
+    /// same split. Monotone — the `emitted`/watch-set discipline of slice 39.
+    split_done: FxHashSet<TermId>,
+    /// Slice 40: tester atoms asserted true — the trigger set for
+    /// `instantiate_constructor`. Monotone (never popped): a stale entry from a
+    /// backtracked branch only re-emits a GUARDED (hence inert) lemma, never an
+    /// unsound one, so retraction is unnecessary and `push`/`pop` stay no-ops.
+    /// Populated by `assert`; consumed by `instantiate_constructor`.
+    asserted_testers: FxHashSet<TermId>,
     /// Test-only instrumentation: total `collect` invocations (including
     /// early returns on an already-seen term), so a test can pin that the
     /// `seen` guard keeps the walk linear in DAG size instead of exponential
@@ -318,6 +329,123 @@ impl DtSolver {
         None
     }
 
+    /// Exhaustiveness (slice 40): a watched datatype class with no constructor
+    /// application IS some constructor — offer the tester disjunction
+    /// `is-C1(t) ∨ … ∨ is-Cn(t)`. Guard-free: it is a T-tautology whose
+    /// at-most-one companion is the assert-time tester disjointness (slice 39).
+    /// Deduped per watched term. Nullary constructors get a `Some(true)` phase
+    /// preference so the SAT search tries finite models first, which bounds the
+    /// instantiation descent on recursive types.
+    fn exhaustiveness_split(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
+        for t in self.watched_dt_terms() {
+            if self.ctor_of_class(cx, t).is_some() {
+                continue; // already constructor-determined
+            }
+            if !self.split_done.insert(t) {
+                continue; // disjunction already offered for this term
+            }
+            let sort = cx.terms.sort_of(t);
+            let Some(ctors) = cx.terms.dt_constructors(sort).map(<[SymbolId]>::to_vec) else {
+                continue;
+            };
+            let mut atoms = Vec::with_capacity(ctors.len());
+            let mut phases = Vec::with_capacity(ctors.len());
+            for c in ctors {
+                let Some(tester) = cx.terms.dt_tester(c) else {
+                    continue;
+                };
+                let is_c_t = cx
+                    .terms
+                    .mk_app(Op::Uninterpreted(tester), &[t])
+                    .expect("tester applies to its own datatype sort");
+                let nullary = cx.terms.dt_selectors(c).is_none_or(<[SymbolId]>::is_empty);
+                atoms.push(is_c_t);
+                phases.push(if nullary { Some(true) } else { None });
+            }
+            if atoms.is_empty() {
+                continue;
+            }
+            return Some(TCheck::Split {
+                atoms,
+                guard: None,
+                phases,
+            });
+        }
+        None
+    }
+
+    /// Constructor instantiation (slice 40): for a tester `is-C(t)` asserted
+    /// true whose class holds no constructor application, offer the guarded
+    /// definitional lemma  `is-C(t) ⇒ t = C(sel1(t), …, seln(t))`. The guard
+    /// `¬is-C(t)` keeps the pinned clause a permanent tautology (sound at
+    /// level 0); EUF installs the equality on exactly the branches where
+    /// `is-C(t)` holds and retracts it on backtrack. The minted field selectors
+    /// are watched, so `collapse_lemma` fires on the new constructor app and any
+    /// datatype-sorted field recurses through its own exhaustiveness split —
+    /// the lazy descent that terminates recursive types. Gating on ASSERTED
+    /// testers (not all watched testers) is the laziness lever: only the
+    /// branch's chosen constructor is ever instantiated.
+    fn instantiate_constructor(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
+        let asserted: Vec<TermId> = self.asserted_testers.iter().copied().collect();
+        for tst in asserted {
+            let Some((tsym, targs)) = Self::uapp(cx.terms, tst) else {
+                continue;
+            };
+            let Some(DtRole::Tester { ctor }) = cx.terms.dt_role(tsym) else {
+                continue;
+            };
+            let Some(&t) = targs.first() else {
+                continue;
+            };
+            if self.ctor_of_class(cx, t).is_some() {
+                continue; // class already has a constructor app
+            }
+            let Some(sels) = cx.terms.dt_selectors(ctor).map(<[SymbolId]>::to_vec) else {
+                continue;
+            };
+            // Mint the field selectors on `t` and the constructor app.
+            let mut fields = Vec::with_capacity(sels.len());
+            for sel in &sels {
+                let app = cx
+                    .terms
+                    .mk_app(Op::Uninterpreted(*sel), &[t])
+                    .expect("selector applies to its own datatype sort");
+                self.sel_apps.insert(app);
+                if cx.terms.is_datatype_sort(cx.terms.sort_of(app)) {
+                    self.dt_terms.insert(app);
+                }
+                fields.push(app);
+            }
+            let capp = cx
+                .terms
+                .mk_app(Op::Uninterpreted(ctor), &fields)
+                .expect("constructor applies to its own field sorts");
+            self.ctor_apps.insert(capp);
+            if cx.terms.is_datatype_sort(cx.terms.sort_of(capp)) {
+                self.dt_terms.insert(capp);
+            }
+            let lemma = cx
+                .terms
+                .mk_eq(t, capp)
+                .expect("t and C(sel(t)…) share the datatype sort");
+            // Guard by ¬is-C(t). An asserted tester always has a SAT var; the
+            // `else { continue; }` is defensive and simply skips to the next
+            // asserted tester rather than abandoning the whole loop if not.
+            let Some(var) = cx.atoms.var_of_atom(tst) else {
+                continue;
+            };
+            if !self.emitted.insert(lemma) {
+                continue; // already offered on this branch
+            }
+            return Some(TCheck::Split {
+                atoms: vec![lemma],
+                guard: Some(Lit::new(var, true).negate()),
+                phases: Vec::new(),
+            });
+        }
+        None
+    }
+
     /// The constructor application in `t`'s class, if any: `(symbol, app)`.
     fn ctor_of_class(&self, cx: &mut TheoryCtx, t: TermId) -> Option<(SymbolId, TermId)> {
         let tn = cx.eq.intern(t);
@@ -331,6 +459,79 @@ impl DtSolver {
             }
         }
         None
+    }
+
+    /// The datatype-sorted argument class reps of the constructor application in
+    /// `rep`'s class, or `None` if the class holds no constructor app. Used by
+    /// the occurs-check to walk the constructor graph one level down.
+    fn ctor_child_class_reps(&self, cx: &mut TheoryCtx, rep: ENodeId) -> Option<Vec<ENodeId>> {
+        for &capp in &self.ctor_apps {
+            let capp_n = cx.eq.intern(capp);
+            if cx.eq.find(capp_n) != rep {
+                continue;
+            }
+            let (_, cargs) = Self::uapp(cx.terms, capp)?;
+            let kids = cargs
+                .iter()
+                .filter(|&&a| cx.terms.is_datatype_sort(cx.terms.sort_of(a)))
+                .map(|&a| {
+                    let an = cx.eq.intern(a);
+                    cx.eq.find(an)
+                })
+                .collect();
+            return Some(kids);
+        }
+        None
+    }
+
+    /// True iff the constructor graph over the currently determined classes has
+    /// a cycle — a class reachable from itself by following constructor
+    /// arguments. A cycle means the only ground model is an infinite term, so no
+    /// finite model exists on this branch: slice 40 answers `Unknown` here (the
+    /// residual fence), and slice 41 will turn the same detection into an
+    /// `unsat` conflict. Iterative (explicit DFS stack), never recursive: the
+    /// term graph comes from untrusted input and may be arbitrarily deep
+    /// (threat model), matching `dt_first_ill_founded`.
+    fn constructor_graph_has_cycle(&self, cx: &mut TheoryCtx) -> bool {
+        let mut on_path: FxHashSet<ENodeId> = FxHashSet::default(); // grey: DFS stack
+        let mut done: FxHashSet<ENodeId> = FxHashSet::default(); // black: fully explored
+        for t in self.watched_dt_terms() {
+            let tn = cx.eq.intern(t);
+            let root = cx.eq.find(tn);
+            if done.contains(&root) {
+                continue;
+            }
+            let Some(children) = self.ctor_child_class_reps(cx, root) else {
+                done.insert(root);
+                continue;
+            };
+            on_path.insert(root);
+            let mut stack: Vec<(ENodeId, Vec<ENodeId>)> = vec![(root, children)];
+            while let Some((node, mut kids)) = stack.pop() {
+                if let Some(child) = kids.pop() {
+                    stack.push((node, kids)); // more siblings to visit after
+                    if on_path.contains(&child) {
+                        return true; // back-edge → cycle
+                    }
+                    if done.contains(&child) {
+                        continue;
+                    }
+                    match self.ctor_child_class_reps(cx, child) {
+                        Some(gk) => {
+                            on_path.insert(child);
+                            stack.push((child, gk));
+                        }
+                        None => {
+                            done.insert(child);
+                        }
+                    }
+                } else {
+                    on_path.remove(&node);
+                    done.insert(node);
+                }
+            }
+        }
+        false
     }
 
     /// Every datatype-sorted term this theory watches. `dt_terms` (populated
@@ -348,8 +549,12 @@ impl DtSolver {
     /// True iff some watched datatype term's class has no constructor
     /// application in it — the class is not (yet) constructor-determined.
     /// Spec §5.2: the completeness fence in `check` uses this to keep a
-    /// possibly-wrong `Sat` from ever being reported before slice 40's
-    /// exhaustiveness case split exists.
+    /// possibly-wrong `Sat` from ever being reported. By the time `check`
+    /// reaches this call, `exhaustiveness_split` and `instantiate_constructor`
+    /// have already been offered to a fixpoint (slice 40's active case split),
+    /// so a `true` here means a class survived that splitting on this branch —
+    /// not that the split is unimplemented — and the fence defensively falls
+    /// back to `Unknown` rather than `Sat`.
     fn has_undetermined_class(&self, cx: &mut TheoryCtx) -> bool {
         for t in self.watched_dt_terms() {
             if self.ctor_of_class(cx, t).is_some() {
@@ -360,21 +565,51 @@ impl DtSolver {
         false
     }
 
-    /// Render the ground constructor term for `t`'s class as an SMT-LIB
-    /// string (e.g. `nil`, `(cons 1 nil)`), or `None` when the class is not
-    /// constructor-determined — unreachable when `check` has returned `Sat`,
-    /// since the fence guarantees every watched term is determined by then.
-    ///
-    /// `depth` bounds recursion defensively: real recursion is bounded by the
-    /// well-foundedness of the datatype (a finite ground term has finite
-    /// depth), so `depth > 64` should never trigger on a sound registry. It
-    /// exists only so a corrupt/cyclic registry produces a missing model
-    /// entry instead of a stack overflow — the same "fail safe, don't crash"
-    /// posture as the rest of this theory.
-    fn render_value(&self, cx: &mut TheoryCtx, t: TermId, depth: u32) -> Option<String> {
-        if depth > 64 {
-            return None;
+    /// Render the ground constructor term for `t`'s class as an SMT-LIB string
+    /// (e.g. `nil`, `(cons 1 nil)`), or `None` when the class is not
+    /// constructor-determined, a cycle is hit, or the overflow backstop trips.
+    /// `visited` holds the class reps on the current path: a repeat is a cycle
+    /// (no finite ground term), while a rep is removed on the way back up so a
+    /// DAG-shared subterm still renders under sibling branches. The visited-set
+    /// is the real cycle guard (the principled §5.C occurs-check) and is
+    /// unreachable with a cycle once `check` has returned `Sat` — the fence
+    /// rejects cyclic states first — but it is kept as fail-safe defense in
+    /// depth. `depth` is a SEPARATE, purely mechanical overflow backstop: a
+    /// determined, ACYCLIC chain of datatype constructors (e.g. `N` asserts
+    /// `x_i = cons(1, x_{i+1})`, ..., `x_{N-1} = nil`) is all distinct
+    /// e-classes, so the visited-set never trips, yet the recursion is still
+    /// `N` deep. On untrusted `declare-datatypes`/assert input (threat model)
+    /// `N` is attacker-controlled, so without a depth cap this recurses without
+    /// bound and can stack-overflow. `depth > 10_000` is comfortably above any
+    /// realistic model depth and exists ONLY to bound worst-case recursion —
+    /// it does not detect cycles and must not be read as doing so.
+    fn render_value(
+        &self,
+        cx: &mut TheoryCtx,
+        t: TermId,
+        visited: &mut FxHashSet<ENodeId>,
+        depth: u32,
+    ) -> Option<String> {
+        if depth > 10_000 {
+            return None; // overflow backstop, not a cycle detector
         }
+        let tn = cx.eq.intern(t);
+        let rep = cx.eq.find(tn);
+        if !visited.insert(rep) {
+            return None; // cycle
+        }
+        let rendered = self.render_value_inner(cx, t, visited, depth);
+        visited.remove(&rep);
+        rendered
+    }
+
+    fn render_value_inner(
+        &self,
+        cx: &mut TheoryCtx,
+        t: TermId,
+        visited: &mut FxHashSet<ENodeId>,
+        depth: u32,
+    ) -> Option<String> {
         let (csym, capp) = self.ctor_of_class(cx, t)?;
         let (_, cargs) = Self::uapp(cx.terms, capp)?;
         let name = cx.terms.symbol_name(csym).to_string();
@@ -394,7 +629,7 @@ impl DtSolver {
             .iter()
             .map(|&a| {
                 if cx.terms.is_datatype_sort(cx.terms.sort_of(a)) {
-                    self.render_value(cx, a, depth + 1)
+                    self.render_value(cx, a, visited, depth + 1)
                 } else {
                     // Non-datatype fields are owned by other theories, which
                     // this solver has no visibility into. Render a plain
@@ -463,6 +698,9 @@ impl TheorySolver for DtSolver {
         let DtRole::Tester { ctor } = cx.terms.dt_role(tsym)? else {
             return None;
         };
+        // Slice 40: record the positive tester so `instantiate_constructor`
+        // (in `check`) can introduce `t = C(sel(t)…)` on this branch.
+        self.asserted_testers.insert(atom);
         let &t = targs.first()?;
         let (csym, capp) = self.ctor_of_class(cx, t)?;
         if csym == ctor {
@@ -504,16 +742,23 @@ impl TheorySolver for DtSolver {
         if let Some(split) = self.tester_lemma(cx) {
             return split;
         }
-        // Slice-39 completeness fence (spec §5.2): this MUST be the last
-        // step — every rule above must be saturated first, or the fence
-        // could fire on a state that a pending lemma (a collapse, a tester
-        // tautology, or a clash) would otherwise have resolved on this same
-        // call. Exhaustiveness — that every datatype term IS some
-        // constructor — needs the case split that lands in slice 40. Until
-        // then, a class whose constructor is undetermined must NOT be
-        // reported Sat: slice 39 decides `unsat` fully but must never answer
-        // a possibly-wrong `sat`.
-        if self.has_undetermined_class(cx) {
+        if let Some(split) = self.instantiate_constructor(cx) {
+            return split;
+        }
+        if let Some(split) = self.exhaustiveness_split(cx) {
+            return split;
+        }
+        // Model-tied residual fence (spec §4). Slice 40 replaces slice 39's
+        // coarse "any undetermined class → Unknown" with a finer one: an
+        // undetermined class that survived splitting stays Unknown (defensive —
+        // SAT satisfies every emitted disjunction before a Full check), and a
+        // cyclic constructor graph is Unknown because its only model is
+        // infinite. Slice 41 turns the cycle into a proven `unsat`. This MUST
+        // be the last step — every rule above must be saturated first, or the
+        // fence could fire on a state that a pending lemma (a collapse, a
+        // tester tautology, or a clash) would otherwise have resolved on this
+        // same call.
+        if self.has_undetermined_class(cx) || self.constructor_graph_has_cycle(cx) {
             return TCheck::Unknown;
         }
         TCheck::Sat
@@ -528,7 +773,8 @@ impl TheorySolver for DtSolver {
             if m.get(t).is_some() {
                 continue;
             }
-            let Some(v) = self.render_value(cx, t, 0) else {
+            let mut visited = FxHashSet::default();
+            let Some(v) = self.render_value(cx, t, &mut visited, 0) else {
                 continue;
             };
             m.assign(t, shinri_theory::types::ModelVal::Datatype(v));
@@ -727,10 +973,18 @@ mod tests {
         dt.new_var(&mut cx, Var::new(1), cons_t);
 
         // Before x ≡ cons(1,nil), x's class is not constructor-determined, so
-        // the completeness fence (spec §5.2, Task 8) returns Unknown — NOT a
-        // possibly-wrong Sat. The collapse itself has still not fired:
-        // Unknown ≠ Split, which is what this pre-merge check pins. After
-        // the merge below it fires.
+        // the completeness fence (spec §5.2, Task 8) would return Unknown —
+        // NOT a possibly-wrong Sat — but slice 40's exhaustiveness split
+        // (Rule 1) fires first on x's undetermined class, offering the
+        // tester disjunction `is-nil(x) ∨ is-cons(x)`. Drain that split; the
+        // collapse itself has still not fired, which is what this pre-merge
+        // check pins: the SECOND check is Unknown (deduped exhaustiveness,
+        // class still undetermined), not a collapse Split. After the merge
+        // below, collapse fires.
+        assert!(matches!(
+            dt.check(&mut cx, Effort::Full),
+            TCheck::Split { .. }
+        ));
         assert!(matches!(dt.check(&mut cx, Effort::Full), TCheck::Unknown));
 
         // Merge x with the constructor application.
@@ -1048,12 +1302,17 @@ mod tests {
     fn undetermined_datatype_class_yields_unknown_not_sat() {
         // `x` is a List with no constructor in its class and no tester pinning
         // it. Exhaustiveness (slice 40) is what would decide this, so slice 39
-        // must fence to Unknown rather than claim Sat.
+        // must fence to Unknown rather than claim Sat — but slice 40's
+        // exhaustiveness split (Rule 1) now fires FIRST on `x`'s undetermined
+        // class, so the pre-fence signal is a guard-free `Split` (the tester
+        // disjunction), not `Unknown` directly. Only `x` is registered (not a
+        // second `x = y` var) so there is exactly one watched, undetermined
+        // datatype term and thus exactly one split to drain before the fence
+        // — see `undetermined_class_emits_exhaustiveness_disjunction` for why
+        // two undetermined terms would make this order-dependent.
         let mut ctx = Context::new();
         let (list, _nil, _cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
         let x = uconst(&mut ctx, "x", list);
-        let y = uconst(&mut ctx, "y", list);
-        let atom = ctx.mk_eq(x, y).unwrap();
 
         let mut dt = DtSolver::default();
         let mut eq = EqualityEngine::default();
@@ -1063,8 +1322,13 @@ mod tests {
             eq: &mut eq,
             atoms: &atoms,
         };
-        dt.new_var(&mut cx, Var::new(0), atom);
+        dt.new_var(&mut cx, Var::new(0), x);
 
+        // Drain the exhaustiveness split before the fence is reached.
+        assert!(
+            matches!(dt.check(&mut cx, Effort::Full), TCheck::Split { .. }),
+            "exhaustiveness offers the tester disjunction first"
+        );
         assert!(
             matches!(dt.check(&mut cx, Effort::Full), TCheck::Unknown),
             "constructor-undetermined class must fence to Unknown"
@@ -1126,6 +1390,65 @@ mod tests {
     }
 
     #[test]
+    fn undetermined_class_emits_exhaustiveness_disjunction() {
+        // A bare List var with no constructor and no tester: Rule 1 must offer the
+        // exhaustiveness split `is-nil(x) ∨ is-cons(x)`, guard-free (a tautology),
+        // biasing the nullary `nil` branch via phase preference.
+        //
+        // Only ONE List-sorted term (`x`) is registered — deliberately, not
+        // `x = y` over two fresh List vars. `exhaustiveness_split` scans
+        // `watched_dt_terms()`, which iterates an `FxHashSet`; with two
+        // undetermined terms watched, the split could target either one
+        // depending on hash order, AND draining it would leave the other
+        // still undetermined, so a second `check` would offer THAT term's
+        // split instead of falling through to the fence — the "second check
+        // is Unknown" assertion below would then depend on hash order too.
+        // Registering `x` itself as the atom keeps it the only datatype term
+        // the theory watches, so both the split's atoms and the dedup are
+        // deterministic.
+        let mut ctx = Context::new();
+        let (list, _nil, _cons, _head, _tail, is_nil, is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), x);
+
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Split {
+                atoms,
+                guard,
+                phases,
+            } => {
+                assert_eq!(guard, None, "exhaustiveness is a tautology");
+                let is_nil_x = cx.terms.mk_app(Op::Uninterpreted(is_nil), &[x]).unwrap();
+                let is_cons_x = cx.terms.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+                assert!(atoms.contains(&is_nil_x) && atoms.contains(&is_cons_x));
+                assert_eq!(atoms.len(), 2, "one atom per constructor");
+                // Nullary `nil` is preferred true; `cons` carries no preference.
+                let nil_pos = atoms.iter().position(|&a| a == is_nil_x).unwrap();
+                assert_eq!(phases[nil_pos], Some(true), "nullary-first phase bias");
+                let cons_pos = atoms.iter().position(|&a| a == is_cons_x).unwrap();
+                assert_eq!(
+                    phases[cons_pos], None,
+                    "non-nullary cons carries no preference"
+                );
+            }
+            other => panic!("expected Split, got {}", tcheck_name(&other)),
+        }
+
+        // Deduped: a second check does not re-emit; with no SAT to decide the
+        // disjunction the class stays undetermined, so the fence still says Unknown.
+        assert!(matches!(dt.check(&mut cx, Effort::Full), TCheck::Unknown));
+    }
+
+    #[test]
     fn asserted_tester_agreeing_with_constructor_is_fine() {
         let mut ctx = Context::new();
         let (list, nil, _cons, _head, _tail, is_nil, _is_cons) = list_dt(&mut ctx);
@@ -1149,5 +1472,157 @@ mod tests {
         let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
 
         assert!(dt.assert(&mut cx, Lit::new(v, true)).is_none());
+    }
+
+    #[test]
+    fn asserted_tester_instantiates_guarded_constructor() {
+        // is-cons(x) asserted, x's class holds no constructor: Rule 2 must offer the
+        // guarded lemma  ¬is-cons(x) ∨ x = cons(head(x), tail(x)),  and register the
+        // minted selector apps as watched (head(x) Int-sorted; tail(x) a dt_term).
+        let mut ctx = Context::new();
+        let (list, _nil, cons, head, tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_cons_x);
+
+        // Assert the tester true; it must be recorded, not conflict (empty class).
+        assert!(dt.assert(&mut cx, Lit::new(v, true)).is_none());
+
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Split {
+                atoms: lemma,
+                guard,
+                ..
+            } => {
+                assert_eq!(lemma.len(), 1, "instantiation emits a unit equality");
+                let head_x = cx.terms.mk_app(Op::Uninterpreted(head), &[x]).unwrap();
+                let tail_x = cx.terms.mk_app(Op::Uninterpreted(tail), &[x]).unwrap();
+                let capp = cx
+                    .terms
+                    .mk_app(Op::Uninterpreted(cons), &[head_x, tail_x])
+                    .unwrap();
+                let expected = cx.terms.mk_eq(x, capp).unwrap();
+                assert_eq!(lemma[0], expected, "x = cons(head(x), tail(x))");
+                assert_eq!(
+                    guard,
+                    Some(Lit::new(v, true).negate()),
+                    "guarded by ¬is-cons(x)"
+                );
+                assert!(
+                    dt.watches_sel(head_x) && dt.watches_sel(tail_x),
+                    "fields watched"
+                );
+                assert!(
+                    dt.watches_dt_term(tail_x),
+                    "datatype field is a watched dt_term"
+                );
+            }
+            other => panic!("expected Split, got {}", tcheck_name(&other)),
+        }
+    }
+
+    #[test]
+    fn cyclic_constructor_graph_fences_to_unknown() {
+        // x ≡ cons(h, x): x's class holds a constructor app whose `tail` field is x
+        // itself. Determined, so slice-39 rules are satisfied — but the only ground
+        // model is infinite. The occurs-check fence must return Unknown, NOT Sat.
+        let mut ctx = Context::new();
+        let (list, _nil, cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let int = ctx.int_sort();
+        let h = uconst(&mut ctx, "h", int);
+        let x = uconst(&mut ctx, "x", list);
+        let cons_hx = ctx.mk_app(Op::Uninterpreted(cons), &[h, x]).unwrap();
+        let atom = ctx.mk_eq(x, cons_hx).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), atom);
+        let (xn, cn) = (cx.eq.intern(x), cx.eq.intern(cons_hx));
+        let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
+
+        // Drain any collapse tautologies to a fixpoint, then the fence must fire.
+        let mut verdict = dt.check(&mut cx, Effort::Full);
+        for _ in 0..8 {
+            match verdict {
+                TCheck::Split { atoms: l, .. } => {
+                    if let TermNode::App { args, .. } = cx.terms.term_node(l[0]) {
+                        let kids = cx.terms.children(*args).to_vec();
+                        let (a, b) = (cx.eq.intern(kids[0]), cx.eq.intern(kids[1]));
+                        let _ = cx.eq.merge(a, b, EqJust::Definitional);
+                    }
+                    verdict = dt.check(&mut cx, Effort::Full);
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            matches!(verdict, TCheck::Unknown),
+            "cyclic (infinite-only) model must fence to Unknown, got {}",
+            tcheck_name(&verdict)
+        );
+    }
+
+    #[test]
+    fn determined_acyclic_datatype_child_renders_full_nested_term() {
+        // x ≡ cons(one, nil): a determined, ACYCLIC List whose datatype-sorted
+        // `tail` field is itself a determined constructor application (nil).
+        // This drives the DFS "descend into child, pop back, no back-edge →
+        // false" branch of `constructor_graph_has_cycle` AND the recursive
+        // descent into a datatype field inside `render_value_inner` — neither
+        // of which any other test reaches all the way to `Sat` + `model`.
+        let mut ctx = Context::new();
+        let (list, nil, cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let int_sort = ctx.int_sort();
+        let one = uconst(&mut ctx, "one", int_sort);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let cons_t = ctx.mk_app(Op::Uninterpreted(cons), &[one, nil_t]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let atom = ctx.mk_eq(x, cons_t).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), atom);
+        dt.new_var(&mut cx, Var::new(1), nil_t);
+        let (xn, cn) = (cx.eq.intern(x), cx.eq.intern(cons_t));
+        let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
+
+        assert!(
+            matches!(dt.check(&mut cx, Effort::Full), TCheck::Sat),
+            "determined, acyclic datatype term must be Sat — neither the \
+             undetermined-class branch nor the cycle branch of the fence \
+             should trip"
+        );
+
+        let mut m = shinri_theory::ModelBuilder::default();
+        dt.model(&mut cx, &mut m);
+        match m.get(x) {
+            Some(shinri_theory::types::ModelVal::Datatype(s)) => {
+                assert_eq!(s, "(cons one nil)")
+            }
+            other => panic!("expected a datatype model value, got {other:?}"),
+        }
     }
 }

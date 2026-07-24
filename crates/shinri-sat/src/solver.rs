@@ -714,6 +714,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // guard=None; the string F-split passes guard=Some(¬eqn) so the
                                     // disjunction is only enforced on branches where the triggering
                                     // word equation is asserted true (sound Nielsen lemma).
+                                    let guard_was_present = guard.is_some();
                                     if let Some(g) = guard {
                                         lits.push(g);
                                     }
@@ -789,10 +790,181 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                             return SolveResult::Unsat { core: vec![] };
                                         }
                                     } else {
-                                        self.add_learnt(&lits);
-                                        let dl = self.trail.decision_level();
-                                        if dl > 0 {
-                                            self.backtrack_to(dl - 1);
+                                        // The split clause `lits` may already be
+                                        // (partially) assigned on the trail when its
+                                        // atoms are PRE-EXISTING SAT vars (slice 40's
+                                        // datatype exhaustiveness split over parsed
+                                        // testers), not freshly-minted unassigned ones.
+                                        // Evaluate the clause status against the CURRENT
+                                        // trail (LBool values only — never a heuristic)
+                                        // and route to one of three cases:
+                                        //   * all literals false → conflict;
+                                        //   * exactly one unassigned, rest false → unit,
+                                        //     propagate the survivor;
+                                        //   * ≥2 non-false literals (or already satisfied
+                                        //     by a true literal) → branch, EXACTLY the
+                                        //     pre-existing behaviour.
+                                        // Every current fresh-atom emitter (arrays ROW-2,
+                                        // arith branch/cut, string F-split) splits over
+                                        // UNASSIGNED atoms, so its clause has ≥2 non-false
+                                        // literals and takes the unchanged branch arm
+                                        // byte-for-byte.
+                                        let mut false_count = 0usize;
+                                        let mut unassigned_idx: Option<usize> = None;
+                                        let mut unassigned_count = 0usize;
+                                        let mut has_true = false;
+                                        for (i, &l) in lits.iter().enumerate() {
+                                            match self.assign.lit_value(l) {
+                                                LBool::False => false_count += 1,
+                                                LBool::True => has_true = true,
+                                                LBool::Unset => {
+                                                    unassigned_count += 1;
+                                                    unassigned_idx = Some(i);
+                                                }
+                                            }
+                                        }
+                                        if guard_was_present {
+                                            // GUARDED split (a conditional lemma
+                                            // `¬guard → atoms`, e.g. the string
+                                            // Nielsen F-split `¬eqn ∨ a₁ ∨ …`): the
+                                            // emitting theory relies on the
+                                            // branch-and-backtrack structure and
+                                            // expects the clause to stay inert until
+                                            // its guard fires through normal BCP.
+                                            // Eager conflict/propagate resolution
+                                            // (arms 1 & 2 below) is only correct for
+                                            // UNCONDITIONAL (`guard: None`) split
+                                            // clauses — the datatype exhaustiveness
+                                            // split over parsed testers. Force a
+                                            // guarded clause down the pre-16efa9fb
+                                            // branch path regardless of its current
+                                            // trail status; it is logically sound to
+                                            // add_learnt it (it is a valid lemma) and
+                                            // let normal BCP unit-propagate the guard
+                                            // when the case-split reaches it. Eagerly
+                                            // propagating the survivor at the wrong
+                                            // level perturbs the theory's case-split
+                                            // and regresses satisfiable branches to
+                                            // Unknown (slice40 string regression).
+                                            self.add_learnt(&lits);
+                                            let dl = self.trail.decision_level();
+                                            if dl > 0 {
+                                                self.backtrack_to(dl - 1);
+                                            }
+                                        } else if false_count == lits.len() {
+                                            // ALL FALSE — a genuine conflict clause under
+                                            // the trail (every literal was read as
+                                            // LBool::False just above; never fabricated).
+                                            let max_level = lits
+                                                .iter()
+                                                .map(|l| self.assign.level(l.var()))
+                                                .max()
+                                                .unwrap_or(0);
+                                            if max_level == 0 {
+                                                // Every falsifying assignment is a level-0
+                                                // fact: a top-level conflict. Mirror the
+                                                // len==1 already-false path.
+                                                self.unsat = true;
+                                                return SolveResult::Unsat { core: vec![] };
+                                            }
+                                            // General (level > 0) all-false clause: route
+                                            // through the solver's normal theory-conflict
+                                            // path (identical to the TheoryResult::Conflict
+                                            // arm) so 1-UIP learns a real clause instead of
+                                            // the conflict being silently dropped.
+                                            let conflict = Conflict::Lits(lits.clone());
+                                            let conflict_lits = self.conflict_lits(&conflict);
+                                            if !self.theory_conflict_analyzable(&conflict_lits) {
+                                                self.theory_guard_bailouts += 1;
+                                                return SolveResult::Unknown;
+                                            }
+                                            if let Err(()) =
+                                                self.reduce_to_conflict_level(&conflict_lits)
+                                            {
+                                                self.unsat = true;
+                                                return SolveResult::Unsat { core: vec![] };
+                                            }
+                                            let (learnt, bt, chain) = self.analyze(conflict);
+                                            debug_assert!(
+                                                bt <= self.trail.decision_level(),
+                                                "analyze returned a backjump level above the current one"
+                                            );
+                                            self.backtrack_to(bt);
+                                            let asserting = learnt[0];
+                                            let r_opt = self.add_learnt(&learnt);
+                                            let pid = match r_opt {
+                                                Some(r) => self.db.clause_id(r),
+                                                None => ClauseId::new(u32::MAX),
+                                            };
+                                            self.proof.learn(pid, &learnt, &chain);
+                                            let reason = match r_opt {
+                                                Some(r) => Reason::Clause(r),
+                                                None if learnt.len() == 2 => {
+                                                    Reason::Binary(learnt[1])
+                                                }
+                                                None => Reason::Unit,
+                                            };
+                                            self.enqueue(asserting, reason);
+                                        } else if !has_true && unassigned_count == 1 {
+                                            // UNIT under the trail: exactly one unassigned
+                                            // literal, all others false. Propagate the
+                                            // survivor with the split clause as its reason
+                                            // (so `analyze` can resolve through it).
+                                            // Backtrack to the level at which the clause
+                                            // becomes unit = the max level of the FALSE
+                                            // literals (standard asserting-clause
+                                            // placement). For the datatype cases the false
+                                            // literals are level-0, so this pins the
+                                            // propagation at level 0 like the len==1 unit
+                                            // path — the fact cannot be un-assigned or
+                                            // re-emitted.
+                                            let idx = unassigned_idx
+                                                .expect("unassigned_count == 1 implies Some");
+                                            let mut ordered = lits.clone();
+                                            // Asserting (unassigned) literal → slot 0.
+                                            ordered.swap(0, idx);
+                                            // A max-level false literal → slot 1, so the
+                                            // watched pair is (asserting, highest-false):
+                                            // the invariant add_learnt/Reason::Binary
+                                            // assume (learnt[1] is the "other" literal).
+                                            let assert_level = ordered
+                                                .iter()
+                                                .skip(1)
+                                                .map(|l| self.assign.level(l.var()))
+                                                .max()
+                                                .unwrap_or(0);
+                                            if let Some(pos) = ordered
+                                                .iter()
+                                                .enumerate()
+                                                .skip(1)
+                                                .find(|(_, l)| {
+                                                    self.assign.level(l.var()) == assert_level
+                                                })
+                                                .map(|(j, _)| j)
+                                            {
+                                                ordered.swap(1, pos);
+                                            }
+                                            if self.trail.decision_level() > assert_level {
+                                                self.backtrack_to(assert_level);
+                                            }
+                                            let asserting = ordered[0];
+                                            let r_opt = self.add_learnt(&ordered);
+                                            let reason = match r_opt {
+                                                Some(r) => Reason::Clause(r),
+                                                None if ordered.len() == 2 => {
+                                                    Reason::Binary(ordered[1])
+                                                }
+                                                None => Reason::Unit,
+                                            };
+                                            self.enqueue(asserting, reason);
+                                        } else {
+                                            // ≥2 non-false literals (or already satisfied):
+                                            // the pre-existing branch path, UNCHANGED.
+                                            self.add_learnt(&lits);
+                                            let dl = self.trail.decision_level();
+                                            if dl > 0 {
+                                                self.backtrack_to(dl - 1);
+                                            }
                                         }
                                     }
                                 }
@@ -1547,6 +1719,709 @@ mod tests {
              wrong-UNSAT soundness bug — it means the split clause was learnt as a \
              bare disjunction, forbidding the model on every branch. got {:?}",
             res
+        );
+    }
+
+    // ── Task 4a: SplitAtoms over ALREADY-ASSIGNED trail vars ───────────────────
+    //
+    // Slice 40's datatype exhaustiveness split (`is-C₁(t) ∨ … ∨ is-Cₙ(t)`,
+    // guard: None) is the first SplitAtoms whose atoms are PRE-EXISTING SAT vars
+    // (parsed testers), possibly already assigned on the trail — not freshly
+    // minted unassigned ones. The split handler must evaluate the clause against
+    // the current trail (all-false → conflict; one-unassigned → propagate) rather
+    // than blindly branching. These two tests pin that behaviour at the SAT layer.
+
+    #[test]
+    fn already_false_split_over_assigned_atoms_is_unsat() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // A theory whose (guard-less) split ranges over atoms that map — via
+        // var_for_atom — to PRE-EXISTING SAT vars both asserted FALSE at level 0
+        // (mirrors `¬is-nil(x) ∧ ¬is-cons(x)` with split `is-nil ∨ is-cons`).
+        #[derive(Default)]
+        struct AssignedSplitter {
+            fired: bool,
+            // Every var the solver mints, in order. var_for_atom maps
+            // TermId(100) → vars[0] and TermId(101) → vars[1].
+            vars: Rc<RefCell<Vec<Var>>>,
+        }
+        impl Theory for AssignedSplitter {
+            fn new_var(&mut self, v: Var) {
+                self.vars.borrow_mut().push(v);
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                        guard: None,
+                        phases: Vec::new(),
+                    }
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+                let vars = self.vars.borrow();
+                match atom.index() {
+                    99 => vars.first().copied(), // TermId::new(100).index() == 99
+                    100 => vars.get(1).copied(), // TermId::new(101).index() == 100
+                    _ => None,
+                }
+            }
+        }
+
+        let mut s: Solver<AssignedSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let v0 = s.new_var();
+        let v1 = s.new_var();
+        // Both testers asserted FALSE at level 0.
+        s.add_clause(&[Lit::new(v0, false)]);
+        s.add_clause(&[Lit::new(v1, false)]);
+
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Unsat { .. }),
+            "a born-all-false split (both atoms false at level 0) is a level-0 \
+             conflict → UNSAT; pre-fix the len!=1 split handler ignores the trail \
+             and accepts the clause, so the theory re-checks and the solver \
+             returns Sat. got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn unit_under_trail_split_propagates_survivor() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // 3-constructor `Color`: testers is-red, is-green EXIST and are false at
+        // level 0; is-blue is NOT in the input (var_for_atom → None) so the split
+        // handler MINTS it fresh. Clause `is-red ∨ is-green ∨ is-blue` is UNIT
+        // under the trail (two false, one unassigned) → is-blue must PROPAGATE
+        // true, not be left for a branch decision.
+        #[derive(Default)]
+        struct UnitSplitter {
+            fired: bool,
+            vars: Rc<RefCell<Vec<Var>>>,
+            fresh: Rc<RefCell<Vec<Var>>>,
+        }
+        impl Theory for UnitSplitter {
+            fn new_var(&mut self, v: Var) {
+                self.vars.borrow_mut().push(v);
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![
+                            TermId::new(100).unwrap(), // is-red   → existing v0 (false)
+                            TermId::new(101).unwrap(), // is-green → existing v1 (false)
+                            TermId::new(102).unwrap(), // is-blue  → fresh, unassigned
+                        ],
+                        guard: None,
+                        // Seed the fresh survivor's saved phase FALSE: pre-fix the
+                        // solver DECIDES it false (no propagation); post-fix the
+                        // unit rule forces it true regardless of phase. This makes
+                        // the fix observable as value_of(fresh): false → true.
+                        phases: vec![None, None, Some(false)],
+                    }
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn bind_fresh(&mut self, v: Var, _atom: TermId) {
+                self.fresh.borrow_mut().push(v);
+            }
+            fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+                let vars = self.vars.borrow();
+                match atom.index() {
+                    99 => vars.first().copied(),
+                    100 => vars.get(1).copied(),
+                    _ => None, // is-blue (102) → fresh mint
+                }
+            }
+        }
+
+        let mut s: Solver<UnitSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let v0 = s.new_var();
+        let v1 = s.new_var();
+        let fresh_handle = s.theory().fresh.clone();
+        s.add_clause(&[Lit::new(v0, false)]); // ¬is-red
+        s.add_clause(&[Lit::new(v1, false)]); // ¬is-green
+
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Sat),
+            "instance is SAT (the color is blue). got {:?}",
+            res
+        );
+        let fresh = fresh_handle.borrow();
+        assert_eq!(
+            fresh.len(),
+            1,
+            "is-blue was minted as exactly one fresh var"
+        );
+        assert_eq!(
+            s.value_of(fresh[0]),
+            Some(true),
+            "the surviving tester is-blue must be PROPAGATED true by the unit \
+             split rule; pre-fix it is left unassigned then decided FALSE (phase \
+             seed) — this reads Some(false), the completeness gap this task closes",
+        );
+    }
+
+    // ── Task 4a hardening pass: coverage gaps flagged by the opus review ───────
+    //
+    // The two tests above only exercise the LEVEL-0 shortcuts of the all-false
+    // (arm 1) and unit-propagate (arm 2) branches. These tests close three
+    // remaining gaps: a general (level > 0) all-false conflict; guard-present
+    // splits in arms 1 and 2 (a guard-drop mutation check); and arm 2's
+    // len == 2 `Reason::Binary` path (the existing arm-2 test is len == 3,
+    // `Reason::Clause`).
+
+    /// General (level > 0) all-false split → conflict, resolved through normal
+    /// 1-UIP analysis and backtrack — NOT the level-0 `self.unsat = true`
+    /// shortcut. Pins the ~30-line general-conflict path (byte-identical to
+    /// the audited `TheoryResult::Conflict` arm) that the two existing tests
+    /// never reach.
+    ///
+    /// Uses THREE split atoms decided at three DISTINCT levels (1, 2, 3), not
+    /// two. This matters for RED-distinguishing a "silently accept" mutant
+    /// (arm 3's unconditional `add_learnt` + `backtrack_to(dl-1)` applied
+    /// here too): with only two literals, `add_learnt` registers a *binary*
+    /// watch on BOTH literals, and `backtrack_to(dl-1)` happens to unassign
+    /// exactly the one at the higher level, whose natural re-decision (same
+    /// phase-saved value) re-triggers that now-registered watch and
+    /// self-heals — a false negative that was caught empirically before this
+    /// test was finalized. With three literals, `add_learnt` (len ≥ 3) calls
+    /// `watch_clause(r, learnt[0], learnt[1])`, which watches only TWO of the
+    /// three slots; `backtrack_to(dl-1)` unassigns only the top (level-3)
+    /// literal, which is not guaranteed to be a watched slot, and the other
+    /// two false literals were assigned before the watch even existed — so
+    /// the clause can never be discovered violated, converging to a WRONG
+    /// Sat with all three atoms false (verified: this construction fails red
+    /// under the "always take arm 3" mutant; the two-literal version did
+    /// not). `check_model` would not catch this either way: it only walks
+    /// `input_clauses`, never learnt ones. This test pins the actual model
+    /// values, not just "some Sat".
+    #[test]
+    fn general_level_all_false_split_resolves_through_conflict_analysis() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // Split atoms map to three PRE-EXISTING vars with NO input clauses at
+        // all. With nothing else to do, `pick_branch` DECIDES them directly,
+        // one per level (default phase = false, `Assignment::new_var`), so
+        // all three land on the trail as `Reason::Decision` at levels 1, 2,
+        // 3 — never level 0.
+        #[derive(Default)]
+        struct DecidedSplitter {
+            fired: bool,
+            vars: Rc<RefCell<Vec<Var>>>,
+        }
+        impl Theory for DecidedSplitter {
+            fn new_var(&mut self, v: Var) {
+                self.vars.borrow_mut().push(v);
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![
+                            TermId::new(100).unwrap(),
+                            TermId::new(101).unwrap(),
+                            TermId::new(102).unwrap(),
+                        ],
+                        guard: None,
+                        phases: Vec::new(),
+                    }
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+                let vars = self.vars.borrow();
+                match atom.index() {
+                    99 => vars.first().copied(),
+                    100 => vars.get(1).copied(),
+                    101 => vars.get(2).copied(),
+                    _ => None,
+                }
+            }
+        }
+
+        let mut s: Solver<DecidedSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let v0 = s.new_var();
+        let v1 = s.new_var();
+        let v2 = s.new_var();
+        // No clauses on v0/v1/v2 at all: they are DECIDED, not propagated —
+        // all three land on the trail at decision level > 0, one per level.
+
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Sat),
+            "v0 ∨ v1 ∨ v2 is satisfiable (nothing else constrains them); a \
+             genuine conflict must be learnt and resolved, not dropped. \
+             got {:?}",
+            res
+        );
+        // v0, v1 (decided first, levels 1 and 2) are the non-asserting
+        // literals of the learnt clause: `analyze`'s 1-UIP loop keeps them
+        // and backjumps to just past the higher of the two, so they survive
+        // the conflict unchanged.
+        assert_eq!(
+            s.value_of(v0),
+            Some(false),
+            "v0's level-1 decision must survive the backjump unchanged"
+        );
+        assert_eq!(
+            s.value_of(v1),
+            Some(false),
+            "v1's level-2 decision must survive the backjump unchanged"
+        );
+        // v2 (decided LAST, level 3 — the 1-UIP) must be FLIPPED to true by
+        // the learnt clause's propagation.
+        assert_eq!(
+            s.value_of(v2),
+            Some(true),
+            "the general all-false conflict must be analyzed and the learnt \
+             clause propagated — v2 must flip to true, not be silently \
+             ignored (the wrong-SAT class this task's fix closes)"
+        );
+    }
+
+    /// Guard-drop regression check for arm 1 (all-false → conflict): guard
+    /// TRUE + both real atoms FALSE must NOT be treated as an all-false
+    /// clause, because the guard satisfies it.
+    ///
+    /// RED-distinguishing: imagine the status scan dropped the guard literal
+    /// (equivalent to treating `guard: Some(g)` as `guard: None`, exactly the
+    /// mutation `guarded_split_does_not_force_spurious_unsat` pins for arm 3).
+    /// It would then see `lits = [a1, a2]`, both false at level 0 →
+    /// `false_count == lits.len()` → wrong UNSAT. With the guard correctly
+    /// included, `lits.len() == 3`, `false_count == 2`, and `has_true` is set
+    /// by the guard — no conflict.
+    #[test]
+    fn guard_true_with_all_atoms_false_is_not_unsat() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct GuardTrueSplitter {
+            fired: bool,
+            eqn: Option<Var>,
+            vars: Rc<RefCell<Vec<Var>>>,
+        }
+        impl Theory for GuardTrueSplitter {
+            fn new_var(&mut self, v: Var) {
+                if self.eqn.is_none() {
+                    self.eqn = Some(v);
+                } else {
+                    self.vars.borrow_mut().push(v);
+                }
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    let eqn = self.eqn.expect("eqn var must exist before check");
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                        guard: Some(Lit::new(eqn, true)),
+                        phases: Vec::new(),
+                    }
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+                let vars = self.vars.borrow();
+                match atom.index() {
+                    99 => vars.first().copied(),
+                    100 => vars.get(1).copied(),
+                    _ => None,
+                }
+            }
+        }
+
+        let mut s: Solver<GuardTrueSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let eqn = s.new_var(); // first var minted -> captured as guard target
+        let a1 = s.new_var();
+        let a2 = s.new_var();
+        s.add_clause(&[Lit::new(eqn, true)]); // guard TRUE
+        s.add_clause(&[Lit::new(a1, false)]); // atom1 FALSE
+        s.add_clause(&[Lit::new(a2, false)]); // atom2 FALSE
+
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Sat),
+            "the guard is TRUE, so the split clause `guard ∨ a1 ∨ a2` is \
+             satisfied through the guard even though both real atoms are \
+             false. Reporting UNSAT here is exactly the guard-drop bug \
+             (imagine `guard: None`: the scan would then see lits=[a1,a2], \
+             both false at level 0 -> wrong UNSAT). got {:?}",
+            res
+        );
+    }
+
+    // ── slice40 regression: GUARDED all-false split DEFERS to the theory, it ───
+    //     does NOT eager-conflict at the SAT layer (guarded arm 1). ───────────────
+    //
+    // Companion to `guarded_unit_under_trail_branches_not_eager_propagates` for
+    // arm 1 (all-false → conflict). A guarded lemma `guard ∨ a₁ ∨ a₂` whose guard
+    // and both atoms read false is inert at the SAT layer under the gate: it takes
+    // the pre-16efa9fb branch path (`add_learnt`, no eager conflict). Enforcement
+    // is the EMITTING THEORY's job — on re-check it must re-derive the conflict
+    // (the string/datatype theories re-validate their guarded lemmas; a bare SAT
+    // mock would otherwise silently accept a model violating the learnt clause).
+    //
+    // The mock below re-checks and returns a genuine level-0 `Conflict`, so the
+    // solver correctly reaches UNSAT. Two observables prove the branch path was
+    // taken rather than the eager arm-1 short-circuit: (1) verdict is still UNSAT
+    // (soundness preserved), and (2) `check` is invoked TWICE — the split, then
+    // the theory-side conflict. The ungated code eager-conflicts inside the split
+    // handler and returns UNSAT before the second `check`, so `calls == 1` there:
+    // asserting `calls == 2` is RED against the ungated path.
+    #[test]
+    fn guarded_all_false_split_defers_to_theory_not_eager_conflict() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct GuardFalseSplitter {
+            calls: Rc<RefCell<u32>>,
+            eqn: Option<Var>,
+            vars: Rc<RefCell<Vec<Var>>>,
+        }
+        impl Theory for GuardFalseSplitter {
+            fn new_var(&mut self, v: Var) {
+                if self.eqn.is_none() {
+                    self.eqn = Some(v);
+                } else {
+                    self.vars.borrow_mut().push(v);
+                }
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                let eqn = self.eqn.expect("eqn var must exist before check");
+                let a1 = self.vars.borrow()[0];
+                let a2 = self.vars.borrow()[1];
+                let n = {
+                    let mut c = self.calls.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                if n == 1 {
+                    // Guard literal is "eqn is true"; eqn is asserted FALSE
+                    // below, so this guard literal reads FALSE too —
+                    // genuinely all-false including the guard.
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                        guard: Some(Lit::new(eqn, true)),
+                        phases: Vec::new(),
+                    }
+                } else {
+                    // Theory re-validation: the guarded lemma is violated
+                    // (guard, a1, a2 all false), so re-derive it as a genuine
+                    // conflict. All three literals read FALSE at level 0.
+                    TheoryResult::Conflict(vec![
+                        Lit::new(eqn, false),
+                        Lit::new(a1, false),
+                        Lit::new(a2, false),
+                    ])
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+                let vars = self.vars.borrow();
+                match atom.index() {
+                    99 => vars.first().copied(),
+                    100 => vars.get(1).copied(),
+                    _ => None,
+                }
+            }
+        }
+
+        let mut s: Solver<GuardFalseSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let calls = s.theory().calls.clone();
+        let eqn = s.new_var();
+        let a1 = s.new_var();
+        let a2 = s.new_var();
+        s.add_clause(&[Lit::new(eqn, false)]); // guard's target FALSE
+        s.add_clause(&[Lit::new(a1, false)]);
+        s.add_clause(&[Lit::new(a2, false)]);
+
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Unsat { .. }),
+            "the guarded all-false lemma, enforced by the theory's re-check, \
+             is a genuine level-0 conflict — must be UNSAT. got {:?}",
+            res
+        );
+        assert_eq!(
+            *calls.borrow(),
+            2,
+            "a GUARDED all-false split must NOT eager-conflict inside the split \
+             handler (arm 1 is gated to guard:None only). It takes the branch \
+             path and the theory re-check drives the conflict, so `check` runs \
+             TWICE. The ungated code short-circuits to UNSAT after ONE check.",
+        );
+    }
+
+    // ── slice40 regression: GUARDED unit-under-trail split must BRANCH, not ────
+    //     eagerly propagate its survivor (guarded arm 2). ────────────────────────
+    //
+    // Root cause of the slice40 string regression (a satisfiable `str.in_re`
+    // query flipped Sat → Unknown at HEAD, bisected to 16efa9fb): the string
+    // Nielsen F-split emits `SplitAtoms { guard: Some(¬eqn), … }` — a CONDITIONAL
+    // lemma `eqn → (a₁ ∨ …)`. On a branch where `eqn` is asserted true the guard
+    // `¬eqn` reads FALSE, and if all-but-one atom is already false the clause is
+    // unit under the trail. 16efa9fb's ungated arm 2 then EAGERLY propagated the
+    // lone survivor at the guard's (deep) level instead of learning the clause
+    // and letting the theory drive the case-split via normal BCP — perturbing the
+    // order-engine's search so a satisfiable branch was never reached (→ Unknown).
+    //
+    // The fix gates the eager arms (1 & 2) on `guard.is_none()`: an UNCONDITIONAL
+    // datatype exhaustiveness split (`is-C₁ ∨ … ∨ is-Cₙ`) still gets eager
+    // conflict/propagate, but every GUARDED lemma takes the pre-16efa9fb branch
+    // path (`add_learnt` + `backtrack_to(dl-1)`), staying inert until its guard
+    // fires through ordinary propagation.
+    //
+    // This test pins arm 2's guarded case: guard FALSE + one atom false + one
+    // atom unassigned (unit under the trail). Post-fix the survivor is left to a
+    // BRANCH DECISION (`Reason::Decision`), NOT force-propagated. RED against the
+    // ungated code, where the survivor carries `Reason::Binary` (eager arm 2).
+    #[test]
+    fn guarded_unit_under_trail_branches_not_eager_propagates() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct GuardUnitSplitter {
+            fired: bool,
+            eqn: Option<Var>,
+            vars: Rc<RefCell<Vec<Var>>>,
+            fresh: Rc<RefCell<Vec<Var>>>,
+        }
+        impl Theory for GuardUnitSplitter {
+            fn new_var(&mut self, v: Var) {
+                if self.eqn.is_none() {
+                    self.eqn = Some(v);
+                } else {
+                    self.vars.borrow_mut().push(v);
+                }
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    let eqn = self.eqn.expect("eqn var must exist before check");
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![
+                            TermId::new(100).unwrap(), // a1 -> existing, false
+                            TermId::new(101).unwrap(), // a2 -> fresh, unassigned
+                        ],
+                        guard: Some(Lit::new(eqn, true)), // eqn false -> guard false
+                        // Seed the survivor's saved phase TRUE so the branch path
+                        // DECIDES it true (satisfying the clause honestly → a real
+                        // SAT model, a2 = true). The eager arm would force it true
+                        // regardless of phase; the distinguishing observable is the
+                        // survivor's REASON (Decision vs Binary), not its value.
+                        phases: vec![None, Some(true)],
+                    }
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn bind_fresh(&mut self, v: Var, _atom: TermId) {
+                self.fresh.borrow_mut().push(v);
+            }
+            fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+                let vars = self.vars.borrow();
+                match atom.index() {
+                    99 => vars.first().copied(), // a1
+                    _ => None,                   // a2 (index 100) -> fresh mint
+                }
+            }
+        }
+
+        let mut s: Solver<GuardUnitSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let eqn = s.new_var();
+        let a1 = s.new_var();
+        let fresh_handle = s.theory().fresh.clone();
+        s.add_clause(&[Lit::new(eqn, false)]); // guard's target FALSE -> guard reads false
+        s.add_clause(&[Lit::new(a1, false)]); // a1 FALSE
+
+        let res = s.solve();
+        assert!(matches!(res, SolveResult::Sat), "got {:?}", res);
+        let a2 = fresh_handle.borrow()[0];
+        assert_eq!(
+            s.value_of(a2),
+            Some(true),
+            "the instance is SAT with a2 = true (the only way to satisfy the \
+             guarded clause `eqn ∨ a1 ∨ a2` when eqn and a1 are both false)"
+        );
+        assert_eq!(
+            s.assign.reason(a2),
+            Reason::Decision,
+            "a GUARDED unit-under-trail split must take the BRANCH path: the \
+             survivor is reached by a branch DECISION, not eagerly propagated. \
+             The ungated arm-2 code propagates it with a Reason::Clause/Binary \
+             (learnt-clause) reason — the slice40 string regression (Sat → \
+             Unknown) this gate closes.",
+        );
+    }
+
+    /// Arm 2 with `len == 2`: the survivor propagates via
+    /// `Reason::Binary(ordered[1])`, not `Reason::Clause` (the existing
+    /// arm-2 test, `unit_under_trail_split_propagates_survivor`, is
+    /// `len == 3`, `Reason::Clause`). Both literals are at level 0 (v0 via a
+    /// unit input clause), mirroring the existing arm-2 test's structure so
+    /// there is no decision to unassign/re-decide (no BCP self-healing to
+    /// worry about — see the note on the level>0 general-conflict test
+    /// above, which hit exactly that false-negative pitfall). A SECOND
+    /// theory fact then directly cites the propagated survivor as needing to
+    /// be false — "participates correctly if a later conflict analysis
+    /// touches it" — which is valid ONLY if arm 2 actually forced v1 true;
+    /// this proves the binary reason is not just set but load-bearing.
+    ///
+    /// RED-distinguishing, two independent ways:
+    /// 1. If arm 2 failed to propagate v1 (left it unassigned), the second
+    ///    conflict's literal `¬v1` reads `Unset`, not `False`, so
+    ///    `theory_conflict_analyzable` rejects it and the solver bails to
+    ///    `Unknown` instead of `Unsat`.
+    /// 2. This test also directly asserts `assign.reason(v1) ==
+    ///    Reason::Binary(v0_lit)` — a Binary/Unit/Clause mix-up (e.g. a
+    ///    `Reason::Unit` fabricated over a non-unit clause, the exact
+    ///    livelock-class bug the len==1 unit path's comment warns about)
+    ///    fails this directly regardless of the final verdict.
+    #[test]
+    fn unit_under_trail_len2_binary_reason_propagates_and_is_later_used() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct BinarySplitter {
+            calls: u32,
+            vars: Rc<RefCell<Vec<Var>>>, // vars[0] == v0 (pre-existing, level-0 false)
+            fresh: Rc<RefCell<Vec<Var>>>, // fresh[0] == v1 (minted by the split)
+        }
+        impl Theory for BinarySplitter {
+            fn new_var(&mut self, v: Var) {
+                self.vars.borrow_mut().push(v);
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                self.calls += 1;
+                match self.calls {
+                    1 => {
+                        // v0 is already FALSE at level 0 (unit input clause).
+                        // Split over [v0 (existing), v1 (fresh)]: len == 2,
+                        // one false, one unassigned -> arm 2, Reason::Binary.
+                        TheoryResult::SplitAtoms {
+                            atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                            guard: None,
+                            phases: Vec::new(),
+                        }
+                    }
+                    2 => {
+                        // A second, independent theory fact directly
+                        // contradicting the just-derived v1 = true: valid
+                        // (LBool::False under the trail) ONLY if arm 2
+                        // actually propagated v1.
+                        let v1 = self.fresh.borrow()[0];
+                        TheoryResult::Conflict(vec![Lit::new(v1, false)])
+                    }
+                    _ => TheoryResult::Sat,
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn bind_fresh(&mut self, v: Var, _atom: TermId) {
+                self.fresh.borrow_mut().push(v);
+            }
+            fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+                let vars = self.vars.borrow();
+                match atom.index() {
+                    99 => vars.first().copied(), // v0
+                    _ => None,                   // v1 (index 100) -> fresh mint
+                }
+            }
+        }
+
+        let mut s: Solver<BinarySplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let v0 = s.new_var();
+        let fresh_handle = s.theory().fresh.clone();
+        s.add_clause(&[Lit::new(v0, false)]); // v0 FALSE at level 0
+
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Unsat { .. }),
+            "arm 2 must propagate v1 = true (Reason::Binary(v0)) at level 0; \
+             the second theory fact then directly contradicts it, a genuine \
+             level-0 conflict -> Unsat. A broken arm 2 (v1 left unassigned) \
+             would make the second conflict's literal read Unset, not \
+             False, bailing to Unknown instead. got {:?}",
+            res
+        );
+        let v1 = fresh_handle.borrow()[0];
+        assert_eq!(
+            s.assign.reason(v1),
+            Reason::Binary(Lit::new(v0, true)),
+            "the survivor must be propagated with Reason::Binary(ordered[1]) \
+             (add_learnt's len==2 branch installs a watch_binary, not a \
+             stored clause) — a Unit or Clause reason here would be a \
+             mismatch with what add_learnt actually installed"
         );
     }
 
