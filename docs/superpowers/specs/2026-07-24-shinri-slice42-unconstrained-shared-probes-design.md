@@ -177,6 +177,67 @@ a regression (§5).
 This also means the string path — not just QF_DT — is in this slice's blast
 radius, which is a further reason the oracle run must be unfiltered (§5).
 
+### 4.B Entry-point audit (recorded during implementation)
+
+Method: every non-test writer of `bounds` in `shinri-arith` (`apply_bound` at
+`lib.rs:355` is the funnel; `Bounds::tighten` at `bounds.rs:73` the primitive),
+every non-test writer of the tableau (`Tableau::define_slack`,
+`Tableau::pivot`), and every emitter of a fresh atom. Line numbers are against
+`crates/shinri-arith/src/lib.rs` after Task 1 landed (`8d3a8f76`).
+
+| Site | Marks? | Why that is correct |
+|---|---|---|
+| `new_var` atom registration (`lib.rs:1163`) | yes | dominant site; marks every problem var of the normalized comb, so it covers multi-var atoms whose encoding is over a slack |
+| `assert` → `apply_bound` (`lib.rs:1210`, `1211`) | yes | the atom's bound goes on the trail. Unreachable without `new_var` (it indexes `self.enc`, sized there), so this is belt-and-braces over the row above |
+| `ensure_shared_var` numeral pin (`lib.rs:581` mark, `589`/`590` tighten) | yes | a numeral is fixed to its value |
+| `ensure_shared_var` non-numeral path (`lib.rs:570`–`596`) | **no** | installs no bound and no row — arith is told the var exists, nothing more. The population this slice prunes |
+| `assert_interface_equality` (`lib.rs:804`/`805` mark, `823`/`826` bound, `808` row) | yes | pins `av - bv = 0` |
+| `seed_apriori_if_needed` (`lib.rs:1116`, `1117`) | **no** | seeds a UNIFORM `[-M, M]` box on every non-slack Int var. `lo`/`hi` are computed once (`lib.rs:1104`–`1106`) outside the loop and nothing on this path narrows per var. `apriori_bound` (`lib.rs:1067`) gives `M = (n+1)·((n+m)a+1)^(n+m)` with `a = apriori_coeff_max ≥ 0` and `n ≥ 1` whenever the loop bounds anything, so `M ≥ 2`: the box always admits ≥ 5 integer values. Two vars in a box of width ≥ 2 are not entailed equal. Marking here would mark every Int var and defeat the slice |
+| `run_fbbt` (`lib.rs:1138`) | **no** | emits only *consequences* of the bounds and rows already present (Lemma L2) |
+| `probe` (`lib.rs:750`) | **no** | the probe's own synthetic strict bound. Undone by `restore` (`lib.rs:778`–`782`) after every probe and once more before `entailed_equalities` returns (`lib.rs:701`), so nothing survives the call. *(Site the plan's draft table omitted.)* |
+| `atom_var_and_rhs` slack row (`lib.rs:253`) | n/a | the comb is the registered atom's, whose vars `new_var` marked |
+| `entailed_equalities` probe slack rows (`lib.rs:645`) | **no** | the one row family that can span an unmarked var. Persists across calls (the snapshot at `lib.rs:651` is taken *after* the rows exist, and `pop` does not restore the tableau) — but carries no surviving bound, and by L1 acquires one only together with a mark |
+| `Tableau::pivot` (`lib.rs:467`) | n/a | basis change; the row space, hence the constraint set, is unchanged |
+| `integer_check` B&B split atoms (`lib.rs:958`–`979`) | n/a | emits `TCheck::Split`, writes no bound. Routed back through `solver.rs:734` → `Combiner::bind_fresh` (`combiner.rs:374`, `Owner::Arith`/`Shared` arms at `411`/`423`) → `Arith::new_var`, which marks. `branch.rs` itself holds only the pure helpers `floor_ceil`/`round_int_bound` — it emits nothing |
+| `try_gmi_cut` / `cuts::derive_gmi` (`lib.rs:985`, `cuts.rs:38`) | n/a | derived from existing rows and bounds; emits a `TCheck::Split` atom on the same `bind_fresh` → `new_var` route, and writes no bound directly |
+
+Two closure lemmas carry the argument.
+
+**L1 (slack-bound closure).** *If a slack carries a bound that survives the call
+that installed it, every problem var in its defining comb is marked.* The only
+sites that bound a slack are `assert` on an atom slack — and `new_var`
+(`lib.rs:1163`) marks exactly the comb that `atom_var_and_rhs` (`lib.rs:252`)
+interned that slack from — `assert_interface_equality`, which marks both sides,
+and `probe`, which does not survive. `VarStore::slack_var` interns by comb
+(`vars.rs:55`), so a probe slack that a later atom or interface equality reuses
+is the *same* `ArithVar`, and it is marked at the moment it acquires a bound.
+
+**L2 (derivation vacuity).** FBBT and GMI cuts emit only consequences of the
+constraints already present, so they cannot constrain a var the primitive sites
+left free. `tighten_to_fixpoint` (`propagate.rs:21`) is monotone interval
+propagation seeded from the live bounds, and `run_fbbt` runs only from
+`seed_apriori_if_needed` (`lib.rs:1120`), gated on `bounds.marks_len() == 0`
+(`lib.rs:1100`) — level 0, so its premises are permanent. (This is the same
+soundness property `sanitize_conflict` already relies on when it drops
+`apriori_lits` as level-0-entailed; a defect here would be a pre-existing
+wrong-UNSAT bug, not one this slice introduces.)
+
+**Conclusion.** Let `u` be a problem var unmarked at the moment a guard reads
+it. Marking is monotone, so `u` was unmarked at every earlier moment too: no
+marking site ever fired for it. By the table, the only primitive bound `u` can
+carry is the a-priori box, and only if it is Int and existed when the box was
+seeded — a Real var, or one minted later, carries none. By L1, `u` occurs only
+in slack rows whose slacks carry no bound, so those slacks are eliminable. By
+L2, FBBT and cuts add nothing. The projection of arith's feasible set onto `u`
+is therefore exactly its box, or all of ℤ/ℚ.
+
+Given any satisfying assignment, shift `u` by `±1` — choosing the direction that
+stays inside `[-M, M]`, always possible because `M ≥ 2` — or by any nonzero
+amount if `u` is Real or unbounded, and re-derive each slack from its row. Every
+bound and every row still holds. That is the §4 invariant, so `u = v` is not
+entailed for any `v` (§3.B) and every arrangement of `u` is arith-satisfiable
+(§3.C).
+
 ## 5. Testing
 
 ### Unit — `shinri-arith`
