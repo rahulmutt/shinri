@@ -134,19 +134,13 @@ fn uf_over_datatype_congruence_unsat() {
     assert_eq!(out, vec!["unsat"]);
 }
 
-#[test]
-fn undetermined_constructor_fences_to_unknown() {
-    // The slice-39 completeness fence (spec §5.2). Exhaustiveness — that x must
-    // be SOME constructor — needs the case split landing in slice 40, so this
-    // UNSAT query is reported `unknown` rather than wrongly `sat`.
-    // SLICE 40 WILL FLIP THIS PIN TO `unsat`.
-    let out = run_script(&format!(
-        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)\
-         (assert (not ((_ is nil) x)))(assert (not ((_ is cons) x)))\
-         (check-sat)"
-    ));
-    assert_eq!(out, vec!["unknown"], "slice-39 fence: see spec §5.2");
-}
+// NOTE: the slice-39 pin that used to live here (`undetermined_constructor_
+// fences_to_unknown`, asserting `unknown` on this exact query per spec §5.2)
+// was removed in slice 40 T4: it ran the byte-for-byte identical query as
+// `negated_all_testers_is_unsat` below, which now supersedes it with the
+// slice-40-correct `unsat` assertion. See task-4-report.md for the
+// reconciliation record (an adjudicated, z3-confirmed completeness gain, not
+// a regression).
 
 #[test]
 fn mixed_datatype_and_arith_unsat() {
@@ -228,4 +222,93 @@ fn arith_wrapped_selector_unsat() {
          (assert (< (+ (head (cons 10 nil)) 1) 5))(check-sat)"
     ));
     assert_eq!(out, vec!["unsat"]);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 40 — datatype tester case-splitting (the completeness-fence lift).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn negated_all_testers_is_unsat() {
+    // Exhaustiveness: x is a List, so it must be nil or cons, but both testers
+    // are negated. Slice 39 answered `unknown` (the coarse completeness
+    // fence); slice 40's exhaustiveness split decides `unsat`.
+    //
+    // This query originally surfaced a SAT-layer wiring gap while this test
+    // was being written (see task-4-report.md's original diagnosis): the
+    // exhaustiveness split's `TCheck::Split { guard: None, atoms: [is-nil(x),
+    // is-cons(x)] }` reuses the SAME atom terms as the already-asserted
+    // `¬is-nil(x)` / `¬is-cons(x)` unit facts, and `shinri-sat`'s
+    // `TheoryResult::SplitAtoms` handler (`lits.len() != 1` branch) installed
+    // the resulting binary clause via `add_learnt`/`watch_binary` without
+    // checking whether both literals were already false on the trail, so the
+    // conflict was silently accepted instead of discovered. That gap is now
+    // FIXED (`fix(sat): conflict/propagate SplitAtoms clauses already
+    // (un)assigned on the trail`, commit 16efa9fb, pinned in
+    // shinri-sat::solver tests, commit 8bce8a54) — this query now correctly
+    // decides `unsat`. This test supersedes the removed slice-39 pin
+    // `undetermined_constructor_fences_to_unknown`, which ran the identical
+    // query and asserted `unknown`.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)\
+         (assert (not ((_ is nil) x)))(assert (not ((_ is cons) x)))\
+         (check-sat)"
+    ));
+    assert_eq!(
+        out,
+        vec!["unsat"],
+        "slice-40 exhaustiveness split decides unsat (SAT-layer SplitAtoms fix, commit 16efa9fb)"
+    );
+}
+
+#[test]
+fn instantiation_yields_sat_model() {
+    // Sat requires instantiating cons to satisfy head(x) = 5. Exercises the
+    // guarded constructor-instantiation rule (Rule 2) plus the nullary-first
+    // phase bias steering the lazy descent to terminate.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)\
+         (assert ((_ is cons) x))(assert (= (head x) 5))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn mutually_recursive_group_is_sat() {
+    // Mutually recursive datatypes: a Tree is a leaf or a node holding a
+    // Forest, and a Forest is fnil or an fcons of a Tree and a Forest. Confirms
+    // the split/instantiation rules generalize across a mutually recursive
+    // sort group, not just single-sort List.
+    let out = run_script(
+        "(set-logic QF_UFDTLIA)\
+         (declare-datatypes ((Tree 0) (Forest 0))\
+           (((leaf (val Int)) (node (kids Forest)))\
+            ((fnil) (fcons (fhd Tree) (ftl Forest)))))\
+         (declare-fun t () Tree)\
+         (assert ((_ is node) t))\
+         (check-sat)",
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn cyclic_equation_is_unknown_until_slice41() {
+    // Cyclic constraint: x = cons(h, x) has no finite ground model (its only
+    // "model" is the infinite term cons(h, cons(h, ...))). Slice 40's
+    // model-tied residual fence (the occurs-check over the runtime
+    // constructor graph, spec §4) answers `unknown`; slice 41's acyclicity
+    // axiom is expected to flip this to `unsat` — a documented, adjudicated
+    // completeness gain, not a regression, per the project's
+    // completeness-shifting discipline.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)(declare-fun h () Int)\
+         (assert (= x (cons h x)))\
+         (check-sat)"
+    ));
+    assert_eq!(
+        out,
+        vec!["unknown"],
+        "slice-40 residual acyclicity fence: see spec §4; slice 41 flips this to unsat"
+    );
 }
