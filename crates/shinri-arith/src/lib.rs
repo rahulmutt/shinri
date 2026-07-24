@@ -730,10 +730,18 @@ impl Arith {
             }
         }
         // Slice 42: skip pairs containing a var arith has no constraint about.
-        // Arith constrains neither side, so every arrangement EUF chooses is
-        // arith-satisfiable and MBTC has nothing to decide. This is a DISTINCT
-        // soundness claim from the one in `entailed_equalities` — arrangement
-        // agreement, not equality entailment — over the same var set.
+        // This function only ever returns β-equal pairs, so for a surviving
+        // candidate `u = v` already holds in the current satisfying
+        // assignment; shifting the unconstrained side by ±1 (design doc §4.B)
+        // gives a satisfying assignment with `u != v`. Both cells of the
+        // trichotomy are arith-satisfiable FOR THIS PAIR, so arith has
+        // nothing to contribute and the split decides nothing — a claim
+        // about this pair, not about every arrangement of a free var in
+        // general (§4.B shows that stronger claim is false: a var boxed to
+        // `[-M, M]` cannot be forced equal to a var minted after seeding
+        // whose value exceeds `M`). This is a DISTINCT soundness claim from
+        // the one in `entailed_equalities` — arrangement agreement, not
+        // equality entailment — over the same var set.
         let mut out = Vec::new();
         for i in 0..items.len() {
             if !self.is_constrained(items[i].1) {
