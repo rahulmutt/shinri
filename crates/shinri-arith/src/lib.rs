@@ -729,9 +729,20 @@ impl Arith {
                 items.push((t, v));
             }
         }
+        // Slice 42: skip pairs containing a var arith has no constraint about.
+        // Arith constrains neither side, so every arrangement EUF chooses is
+        // arith-satisfiable and MBTC has nothing to decide. This is a DISTINCT
+        // soundness claim from the one in `entailed_equalities` — arrangement
+        // agreement, not equality entailment — over the same var set.
         let mut out = Vec::new();
         for i in 0..items.len() {
+            if !self.is_constrained(items[i].1) {
+                continue;
+            }
             for j in (i + 1)..items.len() {
+                if !self.is_constrained(items[j].1) {
+                    continue;
+                }
                 if self.value[items[i].1.index()] == self.value[items[j].1.index()] {
                     out.push((items[i].0, items[j].0));
                 }
@@ -2348,14 +2359,14 @@ mod nelson_oppen_tests {
         let mut h = Harness::new();
         let x = real_var(&mut h.ctx, "x");
         let y = real_var(&mut h.ctx, "y");
-        let three = num(&mut h.ctx, 0);
+        let zero = num(&mut h.ctx, 0);
         let le = h
             .ctx
-            .mk_app(Op::Builtin(BuiltinOp::Le), &[x, three])
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[x, zero])
             .unwrap();
         let ge = h
             .ctx
-            .mk_app(Op::Builtin(BuiltinOp::Ge), &[x, three])
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[x, zero])
             .unwrap();
         h.assert_atom(0, le);
         h.assert_atom(1, ge);
@@ -2376,6 +2387,54 @@ mod nelson_oppen_tests {
             vars_before,
             "no slack for a skipped pair"
         );
+    }
+
+    #[test]
+    fn mbtc_skips_pairs_with_a_free_var() {
+        // Two free Int shared vars both sit at β = 0, so the unguarded sweep
+        // reports them as a model-equal pair and the Combiner turns that into a
+        // 3-way trichotomy split. Arith constrains neither side, so any
+        // arrangement EUF picks is arith-satisfiable and the split is waste.
+        let mut h = Harness::new();
+        let x = int_var_no(&mut h.ctx, "xm");
+        let y = int_var_no(&mut h.ctx, "ym");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+
+        let pairs = h.arith.model_equal_shared_pairs(&[x, y]);
+        assert!(pairs.is_empty(), "free vars need no MBTC arrangement split");
+    }
+
+    #[test]
+    fn mbtc_still_reports_constrained_model_equal_pairs() {
+        // Both vars pinned to 3: still a model-equal pair, still reported.
+        let mut h = Harness::new();
+        let x = int_var_no(&mut h.ctx, "xc");
+        let y = int_var_no(&mut h.ctx, "yc");
+        let three = h
+            .ctx
+            .mk_numeral(Rational::from_int(3i128.into()), h.ctx.int_sort());
+        for (i, v) in [x, y].iter().enumerate() {
+            let le = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[*v, three])
+                .unwrap();
+            let ge = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[*v, three])
+                .unwrap();
+            h.assert_atom(2 * i as u32, le);
+            h.assert_atom(2 * i as u32 + 1, ge);
+        }
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+
+        let pairs = h.arith.model_equal_shared_pairs(&[x, y]);
+        assert_eq!(pairs.len(), 1, "constrained model-equal pair must survive");
     }
 }
 
