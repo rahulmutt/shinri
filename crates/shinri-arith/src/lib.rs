@@ -122,6 +122,21 @@ pub struct Arith {
     /// `model_equal_shared_pairs` probing re-solves simplex unboundedly. On exhaustion
     /// `check_full` returns a SOUND `Unknown`.
     pivot_budget: u64,
+    /// Problem vars arith has actually received a constraint about (slice 42).
+    /// Indexed by `ArithVar::index()`; `false`/absent means arith knows the var
+    /// exists but nothing about its value, so no equality over it can be
+    /// entailed and no arrangement of it needs deciding.
+    ///
+    /// MONOTONE: never un-marked, including on `pop`. After backtracking, a var
+    /// constrained only by a since-retracted assertion stays marked and is still
+    /// probed. That over-approximates constrainedness, which errs toward MORE
+    /// probing — the sound direction.
+    ///
+    /// Deliberately NOT inferred from `bounds`: `seed_apriori_if_needed` puts a
+    /// uniform box on every Int problem var (free ones included), and
+    /// `entailed_equalities`' probe slacks persist across calls, so both the
+    /// bounds table and the tableau report free vars as constrained.
+    constrained: Vec<bool>,
 }
 
 impl Default for Arith {
@@ -150,6 +165,7 @@ impl Default for Arith {
             total_branches: 0,
             branch_budget: Self::DEFAULT_BRANCH_BUDGET,
             pivot_budget: Self::DEFAULT_PIVOT_BUDGET,
+            constrained: Vec::default(),
         }
     }
 }
@@ -185,6 +201,23 @@ impl Arith {
                 .push(DeltaRational::from_rational(Rational::zero()));
         }
         self.bounds.ensure(self.vars.len());
+    }
+
+    /// Mark `v` as a var arith has received a constraint about (slice 42).
+    /// Resizes on demand rather than tracking `grow_value` ordering.
+    fn mark_constrained(&mut self, v: ArithVar) {
+        if v.index() >= self.constrained.len() {
+            self.constrained.resize(v.index() + 1, false);
+        }
+        self.constrained[v.index()] = true;
+    }
+
+    /// Whether arith has received any constraint about `v` (slice 42). An
+    /// unmarked var is free: `u = v` is not entailed for any `v`, and any
+    /// arrangement of it is arith-satisfiable.
+    #[allow(dead_code)] // used in Task 3/4 (slice42); only exercised by tests here
+    fn is_constrained(&self, v: ArithVar) -> bool {
+        self.constrained.get(v.index()).copied().unwrap_or(false)
     }
 
     /// Toggle the Plan B2 optimization gate (default ON). OFF = B1 baseline.
@@ -541,6 +574,11 @@ impl Arith {
         let v = self.vars.problem_var_sorted(t, is_int);
         self.grow_value();
         if let Some(r) = ctx.numeral_value(t) {
+            // Slice 42: pinning a numeral to its value IS a constraint. Marked
+            // outside the `already` guard so re-entry keeps the mark. The
+            // non-numeral path deliberately does NOT mark — that asymmetry is
+            // the whole point of the slice.
+            self.mark_constrained(v);
             let dr = DeltaRational::from_rational(r.clone());
             // Skip if already pinned to this value (idempotent).
             let already = matches!(self.bounds.lower(v), Some((lo, _)) if *lo == dr)
@@ -761,6 +799,10 @@ impl Arith {
         if av == bv {
             return None;
         }
+        // Slice 42: an EUF→arith interface equality pins `av - bv = 0`, which
+        // constrains both sides.
+        self.mark_constrained(av);
+        self.mark_constrained(bv);
         let comb = Self::diff_comb(av, bv);
         let s = self.vars.slack_var(&comb);
         self.tableau.define_slack(s, &comb);
@@ -1114,6 +1156,13 @@ impl TheorySolver for Arith {
                 }
             }
         }
+        // Slice 42: every problem var occurring in a registered arith atom is
+        // constrained. This is the dominant marking site — it subsumes `assert`
+        // for single-var atoms and covers multi-var atoms whose encoding is over
+        // a slack.
+        for (av, _) in &n.comb.0 {
+            self.mark_constrained(*av);
+        }
         // Track max |coeff| and |constant| across all atoms (for a-priori bound).
         self.apriori_atom_count += 1;
         for (_, coeff) in &n.comb.0 {
@@ -1153,6 +1202,12 @@ impl TheorySolver for Arith {
             }
             Some(AtomEncoding::Ineq { var, pos, neg }) => {
                 let (kind, val) = if lit.is_positive() { pos } else { neg };
+                // Slice 42: belt-and-braces. `new_var` already marked this atom's
+                // problem vars, and `var` here is a slack for multi-var atoms
+                // (slacks never appear in the shared set). Marking anyway costs
+                // nothing and keeps the invariant true even if an encoding path
+                // reaches `assert` without `new_var`.
+                self.mark_constrained(var);
                 self.apply_bound(var, kind, val, lit)
             }
         };
@@ -1690,6 +1745,120 @@ mod nelson_oppen_tests {
                 (lo, hi)
             })
             .collect()
+    }
+
+    // ----- Slice 42: constrainedness marking -----
+
+    fn int_var_no(ctx: &mut Context, name: &str) -> TermId {
+        let int = ctx.int_sort();
+        let s = ctx.declare_fun(name, &[], int);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    #[test]
+    fn ensure_shared_var_alone_does_not_constrain() {
+        // A shared term arith was merely TOLD about — no atom, not a numeral —
+        // must stay unconstrained. This is the `head(t)` population that slice
+        // 42 exists to prune.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        let xv = h.arith.vars.problem_var(x);
+        assert!(
+            !h.arith.is_constrained(xv),
+            "a merely-shared non-numeral term must not be marked constrained"
+        );
+    }
+
+    #[test]
+    fn registered_atom_constrains_its_problem_vars() {
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let xy = h.ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let five = num(&mut h.ctx, 5);
+        let a = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[xy, five])
+            .unwrap();
+        h.assert_atom(0, a);
+        let xv = h.arith.vars.problem_var(x);
+        let yv = h.arith.vars.problem_var(y);
+        assert!(h.arith.is_constrained(xv), "x occurs in a registered atom");
+        assert!(h.arith.is_constrained(yv), "y occurs in a registered atom");
+    }
+
+    #[test]
+    fn numeral_pin_constrains() {
+        let mut h = Harness::new();
+        let five = num(&mut h.ctx, 5);
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, five);
+        let fv = h.arith.vars.problem_var(five);
+        assert!(
+            h.arith.is_constrained(fv),
+            "a pinned numeral IS constrained"
+        );
+    }
+
+    #[test]
+    fn interface_equality_constrains_both_sides() {
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        let _ = h.arith.assert_interface_equality(&ctx, x, y, just);
+        let xv = h.arith.vars.problem_var(x);
+        let yv = h.arith.vars.problem_var(y);
+        assert!(h.arith.is_constrained(xv), "interface eq constrains lhs");
+        assert!(h.arith.is_constrained(yv), "interface eq constrains rhs");
+    }
+
+    #[test]
+    fn apriori_box_does_not_constrain() {
+        // The a-priori box (`seed_apriori_if_needed`) puts bounds on EVERY Int
+        // problem var, including free ones. Those bounds must NOT count as a
+        // constraint: a uniform [-M, M] box entails no equality, and treating it
+        // as constraining would defeat the whole slice.
+        let mut h = Harness::new();
+        let x = int_var_no(&mut h.ctx, "xi");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.seed_apriori_if_needed();
+        let xv = h.arith.vars.problem_var(x);
+        assert!(
+            h.arith.bounds.lower(xv).is_some() && h.arith.bounds.upper(xv).is_some(),
+            "precondition: the a-priori box must actually have been seeded"
+        );
+        assert!(
+            !h.arith.is_constrained(xv),
+            "a-priori box bounds must not mark a var constrained"
+        );
+    }
+
+    #[test]
+    fn constrained_marking_survives_pop() {
+        // The set is MONOTONE by design: never un-marked, including on pop.
+        // Over-approximating constrainedness errs toward more probing, which is
+        // the sound direction.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let five = num(&mut h.ctx, 5);
+        let a = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[x, five])
+            .unwrap();
+        h.arith.push();
+        h.assert_atom(0, a);
+        let xv = h.arith.vars.problem_var(x);
+        assert!(h.arith.is_constrained(xv));
+        h.arith.pop(0);
+        assert!(
+            h.arith.is_constrained(xv),
+            "constrainedness is monotone across pop"
+        );
     }
 
     // ----- Test 3: fixed_vars_entailed_equal -----
