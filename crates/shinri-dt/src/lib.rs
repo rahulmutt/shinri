@@ -429,8 +429,11 @@ impl DtSolver {
                 .mk_eq(t, capp)
                 .expect("t and C(sel(t)…) share the datatype sort");
             // Guard by ¬is-C(t). An asserted tester always has a SAT var; the
-            // `?` is defensive and simply defers to a later check if not.
-            let var = cx.atoms.var_of_atom(tst)?;
+            // `else { continue; }` is defensive and simply skips to the next
+            // asserted tester rather than abandoning the whole loop if not.
+            let Some(var) = cx.atoms.var_of_atom(tst) else {
+                continue;
+            };
             if !self.emitted.insert(lemma) {
                 continue; // already offered on this branch
             }
@@ -546,8 +549,12 @@ impl DtSolver {
     /// True iff some watched datatype term's class has no constructor
     /// application in it — the class is not (yet) constructor-determined.
     /// Spec §5.2: the completeness fence in `check` uses this to keep a
-    /// possibly-wrong `Sat` from ever being reported before slice 40's
-    /// exhaustiveness case split exists.
+    /// possibly-wrong `Sat` from ever being reported. By the time `check`
+    /// reaches this call, `exhaustiveness_split` and `instantiate_constructor`
+    /// have already been offered to a fixpoint (slice 40's active case split),
+    /// so a `true` here means a class survived that splitting on this branch —
+    /// not that the split is unimplemented — and the fence defensively falls
+    /// back to `Unknown` rather than `Sat`.
     fn has_undetermined_class(&self, cx: &mut TheoryCtx) -> bool {
         for t in self.watched_dt_terms() {
             if self.ctor_of_class(cx, t).is_some() {
@@ -1427,6 +1434,11 @@ mod tests {
                 // Nullary `nil` is preferred true; `cons` carries no preference.
                 let nil_pos = atoms.iter().position(|&a| a == is_nil_x).unwrap();
                 assert_eq!(phases[nil_pos], Some(true), "nullary-first phase bias");
+                let cons_pos = atoms.iter().position(|&a| a == is_cons_x).unwrap();
+                assert_eq!(
+                    phases[cons_pos], None,
+                    "non-nullary cons carries no preference"
+                );
             }
             other => panic!("expected Split, got {}", tcheck_name(&other)),
         }
