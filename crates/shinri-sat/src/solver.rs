@@ -789,10 +789,153 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                             return SolveResult::Unsat { core: vec![] };
                                         }
                                     } else {
-                                        self.add_learnt(&lits);
-                                        let dl = self.trail.decision_level();
-                                        if dl > 0 {
-                                            self.backtrack_to(dl - 1);
+                                        // The split clause `lits` may already be
+                                        // (partially) assigned on the trail when its
+                                        // atoms are PRE-EXISTING SAT vars (slice 40's
+                                        // datatype exhaustiveness split over parsed
+                                        // testers), not freshly-minted unassigned ones.
+                                        // Evaluate the clause status against the CURRENT
+                                        // trail (LBool values only — never a heuristic)
+                                        // and route to one of three cases:
+                                        //   * all literals false → conflict;
+                                        //   * exactly one unassigned, rest false → unit,
+                                        //     propagate the survivor;
+                                        //   * ≥2 non-false literals (or already satisfied
+                                        //     by a true literal) → branch, EXACTLY the
+                                        //     pre-existing behaviour.
+                                        // Every current fresh-atom emitter (arrays ROW-2,
+                                        // arith branch/cut, string F-split) splits over
+                                        // UNASSIGNED atoms, so its clause has ≥2 non-false
+                                        // literals and takes the unchanged branch arm
+                                        // byte-for-byte.
+                                        let mut false_count = 0usize;
+                                        let mut unassigned_idx: Option<usize> = None;
+                                        let mut unassigned_count = 0usize;
+                                        let mut has_true = false;
+                                        for (i, &l) in lits.iter().enumerate() {
+                                            match self.assign.lit_value(l) {
+                                                LBool::False => false_count += 1,
+                                                LBool::True => has_true = true,
+                                                LBool::Unset => {
+                                                    unassigned_count += 1;
+                                                    unassigned_idx = Some(i);
+                                                }
+                                            }
+                                        }
+                                        if false_count == lits.len() {
+                                            // ALL FALSE — a genuine conflict clause under
+                                            // the trail (every literal was read as
+                                            // LBool::False just above; never fabricated).
+                                            let max_level = lits
+                                                .iter()
+                                                .map(|l| self.assign.level(l.var()))
+                                                .max()
+                                                .unwrap_or(0);
+                                            if max_level == 0 {
+                                                // Every falsifying assignment is a level-0
+                                                // fact: a top-level conflict. Mirror the
+                                                // len==1 already-false path.
+                                                self.unsat = true;
+                                                return SolveResult::Unsat { core: vec![] };
+                                            }
+                                            // General (level > 0) all-false clause: route
+                                            // through the solver's normal theory-conflict
+                                            // path (identical to the TheoryResult::Conflict
+                                            // arm) so 1-UIP learns a real clause instead of
+                                            // the conflict being silently dropped.
+                                            let conflict = Conflict::Lits(lits.clone());
+                                            let conflict_lits = self.conflict_lits(&conflict);
+                                            if !self.theory_conflict_analyzable(&conflict_lits) {
+                                                self.theory_guard_bailouts += 1;
+                                                return SolveResult::Unknown;
+                                            }
+                                            if let Err(()) =
+                                                self.reduce_to_conflict_level(&conflict_lits)
+                                            {
+                                                self.unsat = true;
+                                                return SolveResult::Unsat { core: vec![] };
+                                            }
+                                            let (learnt, bt, chain) = self.analyze(conflict);
+                                            debug_assert!(
+                                                bt <= self.trail.decision_level(),
+                                                "analyze returned a backjump level above the current one"
+                                            );
+                                            self.backtrack_to(bt);
+                                            let asserting = learnt[0];
+                                            let r_opt = self.add_learnt(&learnt);
+                                            let pid = match r_opt {
+                                                Some(r) => self.db.clause_id(r),
+                                                None => ClauseId::new(u32::MAX),
+                                            };
+                                            self.proof.learn(pid, &learnt, &chain);
+                                            let reason = match r_opt {
+                                                Some(r) => Reason::Clause(r),
+                                                None if learnt.len() == 2 => {
+                                                    Reason::Binary(learnt[1])
+                                                }
+                                                None => Reason::Unit,
+                                            };
+                                            self.enqueue(asserting, reason);
+                                        } else if !has_true && unassigned_count == 1 {
+                                            // UNIT under the trail: exactly one unassigned
+                                            // literal, all others false. Propagate the
+                                            // survivor with the split clause as its reason
+                                            // (so `analyze` can resolve through it).
+                                            // Backtrack to the level at which the clause
+                                            // becomes unit = the max level of the FALSE
+                                            // literals (standard asserting-clause
+                                            // placement). For the datatype cases the false
+                                            // literals are level-0, so this pins the
+                                            // propagation at level 0 like the len==1 unit
+                                            // path — the fact cannot be un-assigned or
+                                            // re-emitted.
+                                            let idx = unassigned_idx
+                                                .expect("unassigned_count == 1 implies Some");
+                                            let mut ordered = lits.clone();
+                                            // Asserting (unassigned) literal → slot 0.
+                                            ordered.swap(0, idx);
+                                            // A max-level false literal → slot 1, so the
+                                            // watched pair is (asserting, highest-false):
+                                            // the invariant add_learnt/Reason::Binary
+                                            // assume (learnt[1] is the "other" literal).
+                                            let assert_level = ordered
+                                                .iter()
+                                                .skip(1)
+                                                .map(|l| self.assign.level(l.var()))
+                                                .max()
+                                                .unwrap_or(0);
+                                            if let Some(pos) = ordered
+                                                .iter()
+                                                .enumerate()
+                                                .skip(1)
+                                                .find(|(_, l)| {
+                                                    self.assign.level(l.var()) == assert_level
+                                                })
+                                                .map(|(j, _)| j)
+                                            {
+                                                ordered.swap(1, pos);
+                                            }
+                                            if self.trail.decision_level() > assert_level {
+                                                self.backtrack_to(assert_level);
+                                            }
+                                            let asserting = ordered[0];
+                                            let r_opt = self.add_learnt(&ordered);
+                                            let reason = match r_opt {
+                                                Some(r) => Reason::Clause(r),
+                                                None if ordered.len() == 2 => {
+                                                    Reason::Binary(ordered[1])
+                                                }
+                                                None => Reason::Unit,
+                                            };
+                                            self.enqueue(asserting, reason);
+                                        } else {
+                                            // ≥2 non-false literals (or already satisfied):
+                                            // the pre-existing branch path, UNCHANGED.
+                                            self.add_learnt(&lits);
+                                            let dl = self.trail.decision_level();
+                                            if dl > 0 {
+                                                self.backtrack_to(dl - 1);
+                                            }
                                         }
                                     }
                                 }
@@ -1547,6 +1690,171 @@ mod tests {
              wrong-UNSAT soundness bug — it means the split clause was learnt as a \
              bare disjunction, forbidding the model on every branch. got {:?}",
             res
+        );
+    }
+
+    // ── Task 4a: SplitAtoms over ALREADY-ASSIGNED trail vars ───────────────────
+    //
+    // Slice 40's datatype exhaustiveness split (`is-C₁(t) ∨ … ∨ is-Cₙ(t)`,
+    // guard: None) is the first SplitAtoms whose atoms are PRE-EXISTING SAT vars
+    // (parsed testers), possibly already assigned on the trail — not freshly
+    // minted unassigned ones. The split handler must evaluate the clause against
+    // the current trail (all-false → conflict; one-unassigned → propagate) rather
+    // than blindly branching. These two tests pin that behaviour at the SAT layer.
+
+    #[test]
+    fn already_false_split_over_assigned_atoms_is_unsat() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // A theory whose (guard-less) split ranges over atoms that map — via
+        // var_for_atom — to PRE-EXISTING SAT vars both asserted FALSE at level 0
+        // (mirrors `¬is-nil(x) ∧ ¬is-cons(x)` with split `is-nil ∨ is-cons`).
+        #[derive(Default)]
+        struct AssignedSplitter {
+            fired: bool,
+            // Every var the solver mints, in order. var_for_atom maps
+            // TermId(100) → vars[0] and TermId(101) → vars[1].
+            vars: Rc<RefCell<Vec<Var>>>,
+        }
+        impl Theory for AssignedSplitter {
+            fn new_var(&mut self, v: Var) {
+                self.vars.borrow_mut().push(v);
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
+                        guard: None,
+                        phases: Vec::new(),
+                    }
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+                let vars = self.vars.borrow();
+                match atom.index() {
+                    99 => vars.first().copied(), // TermId::new(100).index() == 99
+                    100 => vars.get(1).copied(), // TermId::new(101).index() == 100
+                    _ => None,
+                }
+            }
+        }
+
+        let mut s: Solver<AssignedSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let v0 = s.new_var();
+        let v1 = s.new_var();
+        // Both testers asserted FALSE at level 0.
+        s.add_clause(&[Lit::new(v0, false)]);
+        s.add_clause(&[Lit::new(v1, false)]);
+
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Unsat { .. }),
+            "a born-all-false split (both atoms false at level 0) is a level-0 \
+             conflict → UNSAT; pre-fix the len!=1 split handler ignores the trail \
+             and accepts the clause, so the theory re-checks and the solver \
+             returns Sat. got {:?}",
+            res
+        );
+    }
+
+    #[test]
+    fn unit_under_trail_split_propagates_survivor() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        // 3-constructor `Color`: testers is-red, is-green EXIST and are false at
+        // level 0; is-blue is NOT in the input (var_for_atom → None) so the split
+        // handler MINTS it fresh. Clause `is-red ∨ is-green ∨ is-blue` is UNIT
+        // under the trail (two false, one unassigned) → is-blue must PROPAGATE
+        // true, not be left for a branch decision.
+        #[derive(Default)]
+        struct UnitSplitter {
+            fired: bool,
+            vars: Rc<RefCell<Vec<Var>>>,
+            fresh: Rc<RefCell<Vec<Var>>>,
+        }
+        impl Theory for UnitSplitter {
+            fn new_var(&mut self, v: Var) {
+                self.vars.borrow_mut().push(v);
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![
+                            TermId::new(100).unwrap(), // is-red   → existing v0 (false)
+                            TermId::new(101).unwrap(), // is-green → existing v1 (false)
+                            TermId::new(102).unwrap(), // is-blue  → fresh, unassigned
+                        ],
+                        guard: None,
+                        // Seed the fresh survivor's saved phase FALSE: pre-fix the
+                        // solver DECIDES it false (no propagation); post-fix the
+                        // unit rule forces it true regardless of phase. This makes
+                        // the fix observable as value_of(fresh): false → true.
+                        phases: vec![None, None, Some(false)],
+                    }
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn bind_fresh(&mut self, v: Var, _atom: TermId) {
+                self.fresh.borrow_mut().push(v);
+            }
+            fn var_for_atom(&self, atom: TermId) -> Option<Var> {
+                let vars = self.vars.borrow();
+                match atom.index() {
+                    99 => vars.first().copied(),
+                    100 => vars.get(1).copied(),
+                    _ => None, // is-blue (102) → fresh mint
+                }
+            }
+        }
+
+        let mut s: Solver<UnitSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let v0 = s.new_var();
+        let v1 = s.new_var();
+        let fresh_handle = s.theory().fresh.clone();
+        s.add_clause(&[Lit::new(v0, false)]); // ¬is-red
+        s.add_clause(&[Lit::new(v1, false)]); // ¬is-green
+
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Sat),
+            "instance is SAT (the color is blue). got {:?}",
+            res
+        );
+        let fresh = fresh_handle.borrow();
+        assert_eq!(
+            fresh.len(),
+            1,
+            "is-blue was minted as exactly one fresh var"
+        );
+        assert_eq!(
+            s.value_of(fresh[0]),
+            Some(true),
+            "the surviving tester is-blue must be PROPAGATED true by the unit \
+             split rule; pre-fix it is left unassigned then decided FALSE (phase \
+             seed) — this reads Some(false), the completeness gap this task closes",
         );
     }
 
