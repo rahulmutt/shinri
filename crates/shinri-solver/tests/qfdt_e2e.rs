@@ -293,22 +293,26 @@ fn mutually_recursive_group_is_sat() {
 }
 
 #[test]
-fn cyclic_equation_is_unknown_until_slice41() {
-    // Cyclic constraint: x = cons(h, x) has no finite ground model (its only
-    // "model" is the infinite term cons(h, cons(h, ...))). Slice 40's
-    // model-tied residual fence (the occurs-check over the runtime
-    // constructor graph, spec §4) answers `unknown`; slice 41's acyclicity
-    // axiom is expected to flip this to `unsat` — a documented, adjudicated
-    // completeness gain, not a regression, per the project's
-    // completeness-shifting discipline.
+fn cyclic_self_reference_is_unsat() {
+    // x = cons(h, x) has no finite ground model and, by datatype acyclicity, no
+    // model at all. Slice 40 fenced this to `unknown`; slice 41 proves `unsat`
+    // via the cycle-explanation conflict. Adjudicated completeness flip
+    // (z3/cvc5 agree unsat), not a regression.
     let out = run_script(&format!(
         "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)(declare-fun h () Int)\
          (assert (= x (cons h x)))\
          (check-sat)"
     ));
-    assert_eq!(
-        out,
-        vec!["unknown"],
-        "slice-40 residual acyclicity fence: see spec §4; slice 41 flips this to unsat"
-    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn mutual_cycle_is_unsat() {
+    // x = cons(1, y) ∧ y = cons(2, x): a two-node datatype cycle → unsat.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)(declare-fun y () List)\
+         (assert (= x (cons 1 y)))(assert (= y (cons 2 x)))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
 }
