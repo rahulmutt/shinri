@@ -714,6 +714,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // guard=None; the string F-split passes guard=Some(¬eqn) so the
                                     // disjunction is only enforced on branches where the triggering
                                     // word equation is asserted true (sound Nielsen lemma).
+                                    let guard_was_present = guard.is_some();
                                     if let Some(g) = guard {
                                         lits.push(g);
                                     }
@@ -822,7 +823,35 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                                 }
                                             }
                                         }
-                                        if false_count == lits.len() {
+                                        if guard_was_present {
+                                            // GUARDED split (a conditional lemma
+                                            // `¬guard → atoms`, e.g. the string
+                                            // Nielsen F-split `¬eqn ∨ a₁ ∨ …`): the
+                                            // emitting theory relies on the
+                                            // branch-and-backtrack structure and
+                                            // expects the clause to stay inert until
+                                            // its guard fires through normal BCP.
+                                            // Eager conflict/propagate resolution
+                                            // (arms 1 & 2 below) is only correct for
+                                            // UNCONDITIONAL (`guard: None`) split
+                                            // clauses — the datatype exhaustiveness
+                                            // split over parsed testers. Force a
+                                            // guarded clause down the pre-16efa9fb
+                                            // branch path regardless of its current
+                                            // trail status; it is logically sound to
+                                            // add_learnt it (it is a valid lemma) and
+                                            // let normal BCP unit-propagate the guard
+                                            // when the case-split reaches it. Eagerly
+                                            // propagating the survivor at the wrong
+                                            // level perturbs the theory's case-split
+                                            // and regresses satisfiable branches to
+                                            // Unknown (slice40 string regression).
+                                            self.add_learnt(&lits);
+                                            let dl = self.trail.decision_level();
+                                            if dl > 0 {
+                                                self.backtrack_to(dl - 1);
+                                            }
+                                        } else if false_count == lits.len() {
                                             // ALL FALSE — a genuine conflict clause under
                                             // the trail (every literal was read as
                                             // LBool::False just above; never fabricated).
@@ -2067,19 +2096,33 @@ mod tests {
         );
     }
 
-    /// Guard-present arm 1, the complementary case: guard FALSE + both real
-    /// atoms FALSE is genuinely all-false (the guard included) → conflict.
-    /// Pins that a guard doesn't ALWAYS block the conflict path — only when
-    /// it is actually true.
+    // ── slice40 regression: GUARDED all-false split DEFERS to the theory, it ───
+    //     does NOT eager-conflict at the SAT layer (guarded arm 1). ───────────────
+    //
+    // Companion to `guarded_unit_under_trail_branches_not_eager_propagates` for
+    // arm 1 (all-false → conflict). A guarded lemma `guard ∨ a₁ ∨ a₂` whose guard
+    // and both atoms read false is inert at the SAT layer under the gate: it takes
+    // the pre-16efa9fb branch path (`add_learnt`, no eager conflict). Enforcement
+    // is the EMITTING THEORY's job — on re-check it must re-derive the conflict
+    // (the string/datatype theories re-validate their guarded lemmas; a bare SAT
+    // mock would otherwise silently accept a model violating the learnt clause).
+    //
+    // The mock below re-checks and returns a genuine level-0 `Conflict`, so the
+    // solver correctly reaches UNSAT. Two observables prove the branch path was
+    // taken rather than the eager arm-1 short-circuit: (1) verdict is still UNSAT
+    // (soundness preserved), and (2) `check` is invoked TWICE — the split, then
+    // the theory-side conflict. The ungated code eager-conflicts inside the split
+    // handler and returns UNSAT before the second `check`, so `calls == 1` there:
+    // asserting `calls == 2` is RED against the ungated path.
     #[test]
-    fn guard_false_with_all_atoms_false_is_unsat() {
+    fn guarded_all_false_split_defers_to_theory_not_eager_conflict() {
         use shinri_core::TermId;
         use std::cell::RefCell;
         use std::rc::Rc;
 
         #[derive(Default)]
         struct GuardFalseSplitter {
-            fired: bool,
+            calls: Rc<RefCell<u32>>,
             eqn: Option<Var>,
             vars: Rc<RefCell<Vec<Var>>>,
         }
@@ -2096,9 +2139,15 @@ mod tests {
                 None
             }
             fn check(&mut self, _e: Effort) -> TheoryResult {
-                if !self.fired {
-                    self.fired = true;
-                    let eqn = self.eqn.expect("eqn var must exist before check");
+                let eqn = self.eqn.expect("eqn var must exist before check");
+                let a1 = self.vars.borrow()[0];
+                let a2 = self.vars.borrow()[1];
+                let n = {
+                    let mut c = self.calls.borrow_mut();
+                    *c += 1;
+                    *c
+                };
+                if n == 1 {
                     // Guard literal is "eqn is true"; eqn is asserted FALSE
                     // below, so this guard literal reads FALSE too —
                     // genuinely all-false including the guard.
@@ -2108,7 +2157,14 @@ mod tests {
                         phases: Vec::new(),
                     }
                 } else {
-                    TheoryResult::Sat
+                    // Theory re-validation: the guarded lemma is violated
+                    // (guard, a1, a2 all false), so re-derive it as a genuine
+                    // conflict. All three literals read FALSE at level 0.
+                    TheoryResult::Conflict(vec![
+                        Lit::new(eqn, false),
+                        Lit::new(a1, false),
+                        Lit::new(a2, false),
+                    ])
                 }
             }
             fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
@@ -2125,6 +2181,7 @@ mod tests {
         }
 
         let mut s: Solver<GuardFalseSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let calls = s.theory().calls.clone();
         let eqn = s.new_var();
         let a1 = s.new_var();
         let a2 = s.new_var();
@@ -2135,17 +2192,45 @@ mod tests {
         let res = s.solve();
         assert!(
             matches!(res, SolveResult::Unsat { .. }),
-            "guard literal AND both atoms are false at level 0: a genuine \
-             all-false clause including the guard — must be UNSAT. got {:?}",
+            "the guarded all-false lemma, enforced by the theory's re-check, \
+             is a genuine level-0 conflict — must be UNSAT. got {:?}",
             res
+        );
+        assert_eq!(
+            *calls.borrow(),
+            2,
+            "a GUARDED all-false split must NOT eager-conflict inside the split \
+             handler (arm 1 is gated to guard:None only). It takes the branch \
+             path and the theory re-check drives the conflict, so `check` runs \
+             TWICE. The ungated code short-circuits to UNSAT after ONE check.",
         );
     }
 
-    /// Guard-present arm 2: guard FALSE + one atom false + one atom
-    /// unassigned is unit under the trail (the guard counts toward
-    /// `false_count`) → the survivor must propagate true.
+    // ── slice40 regression: GUARDED unit-under-trail split must BRANCH, not ────
+    //     eagerly propagate its survivor (guarded arm 2). ────────────────────────
+    //
+    // Root cause of the slice40 string regression (a satisfiable `str.in_re`
+    // query flipped Sat → Unknown at HEAD, bisected to 16efa9fb): the string
+    // Nielsen F-split emits `SplitAtoms { guard: Some(¬eqn), … }` — a CONDITIONAL
+    // lemma `eqn → (a₁ ∨ …)`. On a branch where `eqn` is asserted true the guard
+    // `¬eqn` reads FALSE, and if all-but-one atom is already false the clause is
+    // unit under the trail. 16efa9fb's ungated arm 2 then EAGERLY propagated the
+    // lone survivor at the guard's (deep) level instead of learning the clause
+    // and letting the theory drive the case-split via normal BCP — perturbing the
+    // order-engine's search so a satisfiable branch was never reached (→ Unknown).
+    //
+    // The fix gates the eager arms (1 & 2) on `guard.is_none()`: an UNCONDITIONAL
+    // datatype exhaustiveness split (`is-C₁ ∨ … ∨ is-Cₙ`) still gets eager
+    // conflict/propagate, but every GUARDED lemma takes the pre-16efa9fb branch
+    // path (`add_learnt` + `backtrack_to(dl-1)`), staying inert until its guard
+    // fires through ordinary propagation.
+    //
+    // This test pins arm 2's guarded case: guard FALSE + one atom false + one
+    // atom unassigned (unit under the trail). Post-fix the survivor is left to a
+    // BRANCH DECISION (`Reason::Decision`), NOT force-propagated. RED against the
+    // ungated code, where the survivor carries `Reason::Binary` (eager arm 2).
     #[test]
-    fn guard_false_one_unassigned_rest_false_propagates_survivor() {
+    fn guarded_unit_under_trail_branches_not_eager_propagates() {
         use shinri_core::TermId;
         use std::cell::RefCell;
         use std::rc::Rc;
@@ -2179,7 +2264,12 @@ mod tests {
                             TermId::new(101).unwrap(), // a2 -> fresh, unassigned
                         ],
                         guard: Some(Lit::new(eqn, true)), // eqn false -> guard false
-                        phases: Vec::new(),
+                        // Seed the survivor's saved phase TRUE so the branch path
+                        // DECIDES it true (satisfying the clause honestly → a real
+                        // SAT model, a2 = true). The eager arm would force it true
+                        // regardless of phase; the distinguishing observable is the
+                        // survivor's REASON (Decision vs Binary), not its value.
+                        phases: vec![None, Some(true)],
                     }
                 } else {
                     TheoryResult::Sat
@@ -2204,19 +2294,26 @@ mod tests {
         let eqn = s.new_var();
         let a1 = s.new_var();
         let fresh_handle = s.theory().fresh.clone();
-        s.add_clause(&[Lit::new(eqn, false)]); // guard's target FALSE
+        s.add_clause(&[Lit::new(eqn, false)]); // guard's target FALSE -> guard reads false
         s.add_clause(&[Lit::new(a1, false)]); // a1 FALSE
 
         let res = s.solve();
         assert!(matches!(res, SolveResult::Sat), "got {:?}", res);
-        let fresh = fresh_handle.borrow();
-        assert_eq!(fresh.len(), 1, "a2 was minted as exactly one fresh var");
+        let a2 = fresh_handle.borrow()[0];
         assert_eq!(
-            s.value_of(fresh[0]),
+            s.value_of(a2),
             Some(true),
-            "guard and a1 are both false, a2 is unassigned: unit under the \
-             trail (the guard counts toward false_count) -> a2 must be \
-             propagated true"
+            "the instance is SAT with a2 = true (the only way to satisfy the \
+             guarded clause `eqn ∨ a1 ∨ a2` when eqn and a1 are both false)"
+        );
+        assert_eq!(
+            s.assign.reason(a2),
+            Reason::Decision,
+            "a GUARDED unit-under-trail split must take the BRANCH path: the \
+             survivor is reached by a branch DECISION, not eagerly propagated. \
+             The ungated arm-2 code propagates it with a Reason::Clause/Binary \
+             (learnt-clause) reason — the slice40 string regression (Sat → \
+             Unknown) this gate closes.",
         );
     }
 
