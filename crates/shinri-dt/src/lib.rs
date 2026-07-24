@@ -34,9 +34,7 @@ pub struct DtSolver {
     /// `instantiate_constructor`. Monotone (never popped): a stale entry from a
     /// backtracked branch only re-emits a GUARDED (hence inert) lemma, never an
     /// unsound one, so retraction is unnecessary and `push`/`pop` stay no-ops.
-    /// Populated starting in Task 2 (`instantiate_constructor`); unread until
-    /// then, hence the lint allow.
-    #[allow(dead_code)]
+    /// Populated by `assert`; consumed by `instantiate_constructor`.
     asserted_testers: FxHashSet<TermId>,
     /// Test-only instrumentation: total `collect` invocations (including
     /// early returns on an already-seen term), so a test can pin that the
@@ -375,6 +373,75 @@ impl DtSolver {
         None
     }
 
+    /// Constructor instantiation (slice 40): for a tester `is-C(t)` asserted
+    /// true whose class holds no constructor application, offer the guarded
+    /// definitional lemma  `is-C(t) ⇒ t = C(sel1(t), …, seln(t))`. The guard
+    /// `¬is-C(t)` keeps the pinned clause a permanent tautology (sound at
+    /// level 0); EUF installs the equality on exactly the branches where
+    /// `is-C(t)` holds and retracts it on backtrack. The minted field selectors
+    /// are watched, so `collapse_lemma` fires on the new constructor app and any
+    /// datatype-sorted field recurses through its own exhaustiveness split —
+    /// the lazy descent that terminates recursive types. Gating on ASSERTED
+    /// testers (not all watched testers) is the laziness lever: only the
+    /// branch's chosen constructor is ever instantiated.
+    fn instantiate_constructor(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
+        let asserted: Vec<TermId> = self.asserted_testers.iter().copied().collect();
+        for tst in asserted {
+            let Some((tsym, targs)) = Self::uapp(cx.terms, tst) else {
+                continue;
+            };
+            let Some(DtRole::Tester { ctor }) = cx.terms.dt_role(tsym) else {
+                continue;
+            };
+            let Some(&t) = targs.first() else {
+                continue;
+            };
+            if self.ctor_of_class(cx, t).is_some() {
+                continue; // class already has a constructor app
+            }
+            let Some(sels) = cx.terms.dt_selectors(ctor).map(<[SymbolId]>::to_vec) else {
+                continue;
+            };
+            // Mint the field selectors on `t` and the constructor app.
+            let mut fields = Vec::with_capacity(sels.len());
+            for sel in &sels {
+                let app = cx
+                    .terms
+                    .mk_app(Op::Uninterpreted(*sel), &[t])
+                    .expect("selector applies to its own datatype sort");
+                self.sel_apps.insert(app);
+                if cx.terms.is_datatype_sort(cx.terms.sort_of(app)) {
+                    self.dt_terms.insert(app);
+                }
+                fields.push(app);
+            }
+            let capp = cx
+                .terms
+                .mk_app(Op::Uninterpreted(ctor), &fields)
+                .expect("constructor applies to its own field sorts");
+            self.ctor_apps.insert(capp);
+            if cx.terms.is_datatype_sort(cx.terms.sort_of(capp)) {
+                self.dt_terms.insert(capp);
+            }
+            let lemma = cx
+                .terms
+                .mk_eq(t, capp)
+                .expect("t and C(sel(t)…) share the datatype sort");
+            // Guard by ¬is-C(t). An asserted tester always has a SAT var; the
+            // `?` is defensive and simply defers to a later check if not.
+            let var = cx.atoms.var_of_atom(tst)?;
+            if !self.emitted.insert(lemma) {
+                continue; // already offered on this branch
+            }
+            return Some(TCheck::Split {
+                atoms: vec![lemma],
+                guard: Some(Lit::new(var, true).negate()),
+                phases: Vec::new(),
+            });
+        }
+        None
+    }
+
     /// The constructor application in `t`'s class, if any: `(symbol, app)`.
     fn ctor_of_class(&self, cx: &mut TheoryCtx, t: TermId) -> Option<(SymbolId, TermId)> {
         let tn = cx.eq.intern(t);
@@ -520,6 +587,9 @@ impl TheorySolver for DtSolver {
         let DtRole::Tester { ctor } = cx.terms.dt_role(tsym)? else {
             return None;
         };
+        // Slice 40: record the positive tester so `instantiate_constructor`
+        // (in `check`) can introduce `t = C(sel(t)…)` on this branch.
+        self.asserted_testers.insert(atom);
         let &t = targs.first()?;
         let (csym, capp) = self.ctor_of_class(cx, t)?;
         if csym == ctor {
@@ -559,6 +629,9 @@ impl TheorySolver for DtSolver {
             return split;
         }
         if let Some(split) = self.tester_lemma(cx) {
+            return split;
+        }
+        if let Some(split) = self.instantiate_constructor(cx) {
             return split;
         }
         if let Some(split) = self.exhaustiveness_split(cx) {
@@ -1281,5 +1354,63 @@ mod tests {
         let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
 
         assert!(dt.assert(&mut cx, Lit::new(v, true)).is_none());
+    }
+
+    #[test]
+    fn asserted_tester_instantiates_guarded_constructor() {
+        // is-cons(x) asserted, x's class holds no constructor: Rule 2 must offer the
+        // guarded lemma  ¬is-cons(x) ∨ x = cons(head(x), tail(x)),  and register the
+        // minted selector apps as watched (head(x) Int-sorted; tail(x) a dt_term).
+        let mut ctx = Context::new();
+        let (list, _nil, cons, head, tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_cons_x);
+
+        // Assert the tester true; it must be recorded, not conflict (empty class).
+        assert!(dt.assert(&mut cx, Lit::new(v, true)).is_none());
+
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Split {
+                atoms: lemma,
+                guard,
+                ..
+            } => {
+                assert_eq!(lemma.len(), 1, "instantiation emits a unit equality");
+                let head_x = cx.terms.mk_app(Op::Uninterpreted(head), &[x]).unwrap();
+                let tail_x = cx.terms.mk_app(Op::Uninterpreted(tail), &[x]).unwrap();
+                let capp = cx
+                    .terms
+                    .mk_app(Op::Uninterpreted(cons), &[head_x, tail_x])
+                    .unwrap();
+                let expected = cx.terms.mk_eq(x, capp).unwrap();
+                assert_eq!(lemma[0], expected, "x = cons(head(x), tail(x))");
+                assert_eq!(
+                    guard,
+                    Some(Lit::new(v, true).negate()),
+                    "guarded by ¬is-cons(x)"
+                );
+                assert!(
+                    dt.watches_sel(head_x) && dt.watches_sel(tail_x),
+                    "fields watched"
+                );
+                assert!(
+                    dt.watches_dt_term(tail_x),
+                    "datatype field is a watched dt_term"
+                );
+            }
+            other => panic!("expected Split, got {}", tcheck_name(&other)),
+        }
     }
 }
