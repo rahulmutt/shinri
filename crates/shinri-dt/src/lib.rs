@@ -564,6 +564,24 @@ impl DtSolver {
         None
     }
 
+    /// Build the acyclicity conflict from a cycle's edges. For each edge the one
+    /// fact that closes it is the merge equality `field = next_capp`; the
+    /// constructor applications sit in their classes definitionally and the
+    /// syntactic `C(…)` structure needs no citation. Leaves are cited directly
+    /// (no dedup) exactly as `constructor_clash` does — `Combiner::expand_conflict`
+    /// sorts and dedups the final learnt clause. In the real pipeline every edge
+    /// equality carries an asserted antecedent, so `leaves` is non-empty (an empty
+    /// conflict would be an unsound "unsat with no reason").
+    fn acyclicity_conflict(&self, cx: &mut TheoryCtx, edges: Vec<(TermId, TermId)>) -> TCheck {
+        let mut leaves = Vec::new();
+        for (field, next_capp) in edges {
+            let fnode = cx.eq.intern(field);
+            let cnode = cx.eq.intern(next_capp);
+            cx.eq.explain(fnode, cnode, &mut leaves);
+        }
+        TCheck::Conflict(leaves)
+    }
+
     /// Every datatype-sorted term this theory watches. `dt_terms` (populated
     /// by `collect`, Task 5) is already the full set — every term reachable
     /// while walking a registered atom's DAG whose sort is a datatype sort.
@@ -778,24 +796,27 @@ impl TheorySolver for DtSolver {
         if let Some(split) = self.exhaustiveness_split(cx) {
             return split;
         }
-        // Model-tied residual fence (spec §4). Slice 40 replaces slice 39's
-        // coarse "any undetermined class → Unknown" with a finer one: an
-        // undetermined class that survived splitting stays Unknown (defensive —
-        // SAT satisfies every emitted disjunction before a Full check), and a
-        // cyclic constructor graph is Unknown because its only model is
-        // infinite. Slice 41 turns the cycle into a proven `unsat`. This MUST
-        // be the last step — every rule above must be saturated first, or the
-        // fence could fire on a state that a pending lemma (a collapse, a
-        // tester tautology, or a clash) would otherwise have resolved on this
-        // same call.
-        if self.has_undetermined_class(cx) || self.constructor_graph_find_cycle(cx).is_some() {
+        // Model-tied residual fence (spec §5). An undetermined class that survived
+        // splitting stays Unknown (defensive; slice 42 leaves infinite-sort terms
+        // free). A cycle in the constructor graph over determined classes is a proven
+        // `unsat` by datatype acyclicity — build the minimal cycle-explanation
+        // conflict. MUST be the last step: every lemma rule above must be saturated
+        // first. The undetermined check precedes the cycle walk so the walk only ever
+        // runs over fully-determined classes (a cycle through an undetermined class is
+        // caught as Unknown, never mis-reported as a conflict).
+        if self.has_undetermined_class(cx) {
             return TCheck::Unknown;
+        }
+        if let Some(edges) = self.constructor_graph_find_cycle(cx) {
+            return self.acyclicity_conflict(cx, edges);
         }
         TCheck::Sat
     }
 
     fn explain(&mut self, _cx: &mut TheoryCtx, _tag: u32, _exp: &mut Explainer) {
-        // DT conflicts cite EqLeafs directly; no tags of its own yet.
+        // DT conflicts (constructor clash, acyclicity) cite EqLeafs directly via
+        // TCheck::Conflict; the mint_eq_tag/explain channel is for propagations,
+        // which this theory does not emit. No tags of its own.
     }
 
     fn model(&mut self, cx: &mut TheoryCtx, m: &mut ModelBuilder) {
@@ -1563,10 +1584,9 @@ mod tests {
     }
 
     #[test]
-    fn cyclic_constructor_graph_fences_to_unknown() {
-        // x ≡ cons(h, x): x's class holds a constructor app whose `tail` field is x
-        // itself. Determined, so slice-39 rules are satisfied — but the only ground
-        // model is infinite. The occurs-check fence must return Unknown, NOT Sat.
+    fn cyclic_constructor_graph_is_conflict_citing_the_asserted_equality() {
+        // x = cons(h, x): determined, cyclic → proven unsat by acyclicity. The
+        // conflict cites exactly the one asserted equality that formed the cycle.
         let mut ctx = Context::new();
         let (list, _nil, cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
         let int = ctx.int_sort();
@@ -1584,27 +1604,103 @@ mod tests {
             atoms: &atoms,
         };
         dt.new_var(&mut cx, Var::new(0), atom);
+        let eq_lit = Lit::new(Var::new(0), true);
         let (xn, cn) = (cx.eq.intern(x), cx.eq.intern(cons_hx));
-        let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
+        let _ = cx.eq.merge(xn, cn, EqJust::Asserted(eq_lit));
 
-        // Drain any collapse tautologies to a fixpoint, then the fence must fire.
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Conflict(leaves) => {
+                assert_eq!(
+                    leaves,
+                    vec![shinri_theory::types::EqLeaf::Asserted(eq_lit)],
+                    "minimal cycle path cites exactly the asserted x = cons(h, x)"
+                );
+            }
+            other => panic!(
+                "cyclic determined state must be Conflict, got {}",
+                tcheck_name(&other)
+            ),
+        }
+    }
+
+    #[test]
+    fn mutual_cycle_is_conflict_citing_both_equalities() {
+        // x = cons(1, y) ∧ y = cons(2, x): a two-node cycle → unsat, conflict cites
+        // both asserted equalities.
+        let mut ctx = Context::new();
+        let (list, _nil, cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let int = ctx.int_sort();
+        let one = uconst(&mut ctx, "one", int);
+        let two = uconst(&mut ctx, "two", int);
+        let x = uconst(&mut ctx, "x", list);
+        let y = uconst(&mut ctx, "y", list);
+        let cons_1y = ctx.mk_app(Op::Uninterpreted(cons), &[one, y]).unwrap();
+        let cons_2x = ctx.mk_app(Op::Uninterpreted(cons), &[two, x]).unwrap();
+        let e0 = ctx.mk_eq(x, cons_1y).unwrap();
+        let e1 = ctx.mk_eq(y, cons_2x).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), e0);
+        dt.new_var(&mut cx, Var::new(1), e1);
+        let (l0, l1) = (Lit::new(Var::new(0), true), Lit::new(Var::new(1), true));
+        let (xn, c1yn) = (cx.eq.intern(x), cx.eq.intern(cons_1y));
+        let _ = cx.eq.merge(xn, c1yn, EqJust::Asserted(l0));
+        let (yn, c2xn) = (cx.eq.intern(y), cx.eq.intern(cons_2x));
+        let _ = cx.eq.merge(yn, c2xn, EqJust::Asserted(l1));
+
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Conflict(leaves) => {
+                assert_eq!(leaves.len(), 2, "two cycle edges → two asserted leaves");
+                assert!(leaves.contains(&shinri_theory::types::EqLeaf::Asserted(l0)));
+                assert!(leaves.contains(&shinri_theory::types::EqLeaf::Asserted(l1)));
+            }
+            other => panic!("mutual cycle must be Conflict, got {}", tcheck_name(&other)),
+        }
+    }
+
+    #[test]
+    fn cycle_through_undetermined_class_stays_unknown_not_conflict() {
+        // x = cons(h, x) but x's tail is left undetermined by never determining the
+        // class the cycle would pass through: an undetermined watched class must
+        // fence to Unknown (slice-42 territory), never a false acyclicity conflict.
+        // Registering a bare undetermined datatype term alongside forces the
+        // has_undetermined_class branch first.
+        let mut ctx = Context::new();
+        let (list, _nil, _cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let z = uconst(&mut ctx, "z", list); // bare, undetermined
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), z);
+
+        // Drain the exhaustiveness split z is offered without ever determining its
+        // class (never merge z into a constructor). Once splitting is saturated the
+        // residual fence must catch the still-undetermined class as Unknown — the
+        // has_undetermined_class branch, which precedes the cycle walk, so an
+        // undetermined class can never be mis-reported as a false acyclicity conflict.
         let mut verdict = dt.check(&mut cx, Effort::Full);
-        for _ in 0..8 {
+        for _ in 0..4 {
             match verdict {
-                TCheck::Split { atoms: l, .. } => {
-                    if let TermNode::App { args, .. } = cx.terms.term_node(l[0]) {
-                        let kids = cx.terms.children(*args).to_vec();
-                        let (a, b) = (cx.eq.intern(kids[0]), cx.eq.intern(kids[1]));
-                        let _ = cx.eq.merge(a, b, EqJust::Definitional);
-                    }
-                    verdict = dt.check(&mut cx, Effort::Full);
-                }
+                TCheck::Split { .. } => verdict = dt.check(&mut cx, Effort::Full),
                 _ => break,
             }
         }
         assert!(
             matches!(verdict, TCheck::Unknown),
-            "cyclic (infinite-only) model must fence to Unknown, got {}",
+            "an undetermined class must fence to Unknown before the cycle walk, got {}",
             tcheck_name(&verdict)
         );
     }
