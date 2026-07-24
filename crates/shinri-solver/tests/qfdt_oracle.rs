@@ -181,3 +181,43 @@ fn qfdt_oracle_ge_over_selector() {
 fn qfdt_oracle_arith_wrapped_selector() {
     agree("(assert (< (+ (head (cons 10 nil)) 1) 5))");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// slice-40: exhaustiveness case-splitting + Sat-side PARTIAL propagation.
+// These queries exercise the tester-exhaustiveness fence lift (spec
+// docs/superpowers/specs/2026-07-24-shinri-slice40-tester-case-split-design.md
+// §5) and must land on a definite shinri verdict (sat/unsat), not the completeness-fence
+// `unknown` — `agree()` still accepts `unknown` as a non-mismatch so a
+// regression back to the fence wouldn't fail these tests outright, but the
+// point of these three cases is to exercise the newly-decided paths.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Two-constructor exhaustiveness: ¬is-nil(x) ∧ ¬is-cons(x) is UNSAT — every
+// List value is exactly one of nil/cons. Pre-slice-40 this fenced to unknown.
+#[test]
+fn qfdt_oracle_exhaustiveness_two_ctor_unsat() {
+    agree("(declare-fun x () List)(assert (not ((_ is nil) x)))(assert (not ((_ is cons) x)))");
+}
+
+// Instantiation over a fresh (non-List) datatype: constructor-argument
+// equalities must instantiate selectors on a Pair, not just List.
+#[test]
+fn qfdt_oracle_pair_instantiation_sat() {
+    agree(
+        "(declare-datatype Pair ((mk (fst Int) (snd Bool))))\
+         (declare-fun p () Pair)\
+         (assert (= (fst p) 7))(assert (snd p))",
+    );
+}
+
+// Three-constructor exhaustiveness: ¬is-red(c) ∧ ¬is-green(c) forces
+// is-blue(c) via PARTIAL propagation (the slice-40 SAT-side fix) — must
+// decide sat (c = blue), not fence to unknown.
+#[test]
+fn qfdt_oracle_color_three_ctor_partial_propagation_sat() {
+    agree(
+        "(declare-datatype Color ((red) (green) (blue)))\
+         (declare-fun c () Color)\
+         (assert (not ((_ is red) c)))(assert (not ((_ is green) c)))",
+    );
+}
