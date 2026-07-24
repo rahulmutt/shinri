@@ -560,24 +560,38 @@ impl DtSolver {
 
     /// Render the ground constructor term for `t`'s class as an SMT-LIB string
     /// (e.g. `nil`, `(cons 1 nil)`), or `None` when the class is not
-    /// constructor-determined or a cycle is hit. `visited` holds the class reps
-    /// on the current path: a repeat is a cycle (no finite ground term), while a
-    /// rep is removed on the way back up so a DAG-shared subterm still renders
-    /// under sibling branches. Unreachable with a cycle once `check` has
-    /// returned `Sat` — the fence rejects cyclic states first — but the guard is
-    /// kept as fail-safe defense in depth.
+    /// constructor-determined, a cycle is hit, or the overflow backstop trips.
+    /// `visited` holds the class reps on the current path: a repeat is a cycle
+    /// (no finite ground term), while a rep is removed on the way back up so a
+    /// DAG-shared subterm still renders under sibling branches. The visited-set
+    /// is the real cycle guard (the principled §5.C occurs-check) and is
+    /// unreachable with a cycle once `check` has returned `Sat` — the fence
+    /// rejects cyclic states first — but it is kept as fail-safe defense in
+    /// depth. `depth` is a SEPARATE, purely mechanical overflow backstop: a
+    /// determined, ACYCLIC chain of datatype constructors (e.g. `N` asserts
+    /// `x_i = cons(1, x_{i+1})`, ..., `x_{N-1} = nil`) is all distinct
+    /// e-classes, so the visited-set never trips, yet the recursion is still
+    /// `N` deep. On untrusted `declare-datatypes`/assert input (threat model)
+    /// `N` is attacker-controlled, so without a depth cap this recurses without
+    /// bound and can stack-overflow. `depth > 10_000` is comfortably above any
+    /// realistic model depth and exists ONLY to bound worst-case recursion —
+    /// it does not detect cycles and must not be read as doing so.
     fn render_value(
         &self,
         cx: &mut TheoryCtx,
         t: TermId,
         visited: &mut FxHashSet<ENodeId>,
+        depth: u32,
     ) -> Option<String> {
+        if depth > 10_000 {
+            return None; // overflow backstop, not a cycle detector
+        }
         let tn = cx.eq.intern(t);
         let rep = cx.eq.find(tn);
         if !visited.insert(rep) {
             return None; // cycle
         }
-        let rendered = self.render_value_inner(cx, t, visited);
+        let rendered = self.render_value_inner(cx, t, visited, depth);
         visited.remove(&rep);
         rendered
     }
@@ -587,6 +601,7 @@ impl DtSolver {
         cx: &mut TheoryCtx,
         t: TermId,
         visited: &mut FxHashSet<ENodeId>,
+        depth: u32,
     ) -> Option<String> {
         let (csym, capp) = self.ctor_of_class(cx, t)?;
         let (_, cargs) = Self::uapp(cx.terms, capp)?;
@@ -607,7 +622,7 @@ impl DtSolver {
             .iter()
             .map(|&a| {
                 if cx.terms.is_datatype_sort(cx.terms.sort_of(a)) {
-                    self.render_value(cx, a, visited)
+                    self.render_value(cx, a, visited, depth + 1)
                 } else {
                     // Non-datatype fields are owned by other theories, which
                     // this solver has no visibility into. Render a plain
@@ -752,7 +767,7 @@ impl TheorySolver for DtSolver {
                 continue;
             }
             let mut visited = FxHashSet::default();
-            let Some(v) = self.render_value(cx, t, &mut visited) else {
+            let Some(v) = self.render_value(cx, t, &mut visited, 0) else {
                 continue;
             };
             m.assign(t, shinri_theory::types::ModelVal::Datatype(v));
@@ -1550,5 +1565,52 @@ mod tests {
             "cyclic (infinite-only) model must fence to Unknown, got {}",
             tcheck_name(&verdict)
         );
+    }
+
+    #[test]
+    fn determined_acyclic_datatype_child_renders_full_nested_term() {
+        // x ≡ cons(one, nil): a determined, ACYCLIC List whose datatype-sorted
+        // `tail` field is itself a determined constructor application (nil).
+        // This drives the DFS "descend into child, pop back, no back-edge →
+        // false" branch of `constructor_graph_has_cycle` AND the recursive
+        // descent into a datatype field inside `render_value_inner` — neither
+        // of which any other test reaches all the way to `Sat` + `model`.
+        let mut ctx = Context::new();
+        let (list, nil, cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let int_sort = ctx.int_sort();
+        let one = uconst(&mut ctx, "one", int_sort);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let cons_t = ctx.mk_app(Op::Uninterpreted(cons), &[one, nil_t]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let atom = ctx.mk_eq(x, cons_t).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), atom);
+        dt.new_var(&mut cx, Var::new(1), nil_t);
+        let (xn, cn) = (cx.eq.intern(x), cx.eq.intern(cons_t));
+        let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
+
+        assert!(
+            matches!(dt.check(&mut cx, Effort::Full), TCheck::Sat),
+            "determined, acyclic datatype term must be Sat — neither the \
+             undetermined-class branch nor the cycle branch of the fence \
+             should trip"
+        );
+
+        let mut m = shinri_theory::ModelBuilder::default();
+        dt.model(&mut cx, &mut m);
+        match m.get(x) {
+            Some(shinri_theory::types::ModelVal::Datatype(s)) => {
+                assert_eq!(s, "(cons one nil)")
+            }
+            other => panic!("expected a datatype model value, got {other:?}"),
+        }
     }
 }
