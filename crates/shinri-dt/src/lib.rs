@@ -579,6 +579,10 @@ impl DtSolver {
             let cnode = cx.eq.intern(next_capp);
             cx.eq.explain(fnode, cnode, &mut leaves);
         }
+        debug_assert!(
+            !leaves.is_empty(),
+            "acyclicity conflict must cite a non-empty antecedent"
+        );
         TCheck::Conflict(leaves)
     }
 
