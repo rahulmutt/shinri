@@ -119,6 +119,25 @@ fn agree(body: &str) {
     assert_eq!(ours, theirs, "disagreement on:\n{src}");
 }
 
+/// Like `agree`, but for cases where the slice-40 fence lift means shinri
+/// MUST reach a decided verdict — asserts `ours != "unknown"` before
+/// cross-checking against z3, so a regression that reintroduces the
+/// completeness fence for these shapes fails loudly instead of silently
+/// passing as a non-mismatch.
+fn agree_decided(body: &str) {
+    let src = format!("(set-logic QF_UFDTLIA){LIST}{body}(check-sat)");
+    let ours = shinri_answer(&src);
+    assert_ne!(
+        ours, "unknown",
+        "slice-40 fence must be lifted for this query, got unknown:\n{src}"
+    );
+    let theirs = z3_answer(&src);
+    if theirs == "unknown" {
+        return; // no ground truth
+    }
+    assert_eq!(ours, theirs, "shinri {ours} vs z3 {theirs}:\n{src}");
+}
+
 #[test]
 fn qfdt_oracle_selector_collapse() {
     agree("(assert (distinct (head (cons 1 nil)) 1))");
@@ -186,24 +205,26 @@ fn qfdt_oracle_arith_wrapped_selector() {
 // slice-40: exhaustiveness case-splitting + Sat-side PARTIAL propagation.
 // These queries exercise the tester-exhaustiveness fence lift (spec
 // docs/superpowers/specs/2026-07-24-shinri-slice40-tester-case-split-design.md
-// §5) and must land on a definite shinri verdict (sat/unsat), not the completeness-fence
-// `unknown` — `agree()` still accepts `unknown` as a non-mismatch so a
-// regression back to the fence wouldn't fail these tests outright, but the
-// point of these three cases is to exercise the newly-decided paths.
+// §5) and must land on a definite shinri verdict (sat/unsat), not the
+// completeness-fence `unknown`. They route through `agree_decided`, which
+// asserts `ours != "unknown"` before cross-checking z3 — a regression back
+// to the fence WOULD fail these tests, unlike `agree()`.
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Two-constructor exhaustiveness: ¬is-nil(x) ∧ ¬is-cons(x) is UNSAT — every
 // List value is exactly one of nil/cons. Pre-slice-40 this fenced to unknown.
 #[test]
 fn qfdt_oracle_exhaustiveness_two_ctor_unsat() {
-    agree("(declare-fun x () List)(assert (not ((_ is nil) x)))(assert (not ((_ is cons) x)))");
+    agree_decided(
+        "(declare-fun x () List)(assert (not ((_ is nil) x)))(assert (not ((_ is cons) x)))",
+    );
 }
 
 // Instantiation over a fresh (non-List) datatype: constructor-argument
 // equalities must instantiate selectors on a Pair, not just List.
 #[test]
 fn qfdt_oracle_pair_instantiation_sat() {
-    agree(
+    agree_decided(
         "(declare-datatype Pair ((mk (fst Int) (snd Bool))))\
          (declare-fun p () Pair)\
          (assert (= (fst p) 7))(assert (snd p))",
@@ -215,7 +236,7 @@ fn qfdt_oracle_pair_instantiation_sat() {
 // decide sat (c = blue), not fence to unknown.
 #[test]
 fn qfdt_oracle_color_three_ctor_partial_propagation_sat() {
-    agree(
+    agree_decided(
         "(declare-datatype Color ((red) (green) (blue)))\
          (declare-fun c () Color)\
          (assert (not ((_ is red) c)))(assert (not ((_ is green) c)))",
