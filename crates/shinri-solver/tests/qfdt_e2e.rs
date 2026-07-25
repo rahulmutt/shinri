@@ -316,3 +316,79 @@ fn mutual_cycle_is_unsat() {
     ));
     assert_eq!(out, vec!["unsat"]);
 }
+
+/// Slice 42 performance gate. A datatype with an `Int` field makes every
+/// DT-minted `head(t)` selector application an Int-sorted UF app, so the
+/// sort-only filter in `Euf::shared_arith_terms` sweeps all of them into the
+/// Nelson-Oppen shared set. Pre-slice-42 every pair sat at β = 0 and was probed
+/// with two simplex solves: 24.7 s at n = 24 (release), against 10 ms for the
+/// same n = 24 query with an uninterpreted field sort — the control pinned by
+/// `uninterpreted_field_chain_is_fast` below. Post-fix the Int-field query
+/// matches that control exactly at 10 ms, a ≈2470× improvement. (The spec's
+/// ≈1600× headline is the n = 20 pair, 9.4 s vs 6 ms; do not mix the two.)
+///
+/// The bound is deliberately loose (5 s against a 24.7 s baseline). Wall-clock
+/// assertions are normally a flakiness smell; a fault of this size leaves enough
+/// margin to be worth one, and without it a regression silently consumes the
+/// blocking tier's 10-15 min budget. The tier that actually runs this is the
+/// DEBUG profile, where the query takes ≈90 ms against a ~5 ms process-startup
+/// floor — ~55× of margin under the 5 s bound, so the bound is not tight even
+/// unoptimized.
+#[test]
+fn int_field_chain_does_not_blow_up() {
+    let n = 24;
+    let mut src = String::from(
+        "(set-logic QF_DT)\
+         (declare-datatype List ((nil) (cons (head Int) (tail List))))\
+         (declare-const x List)",
+    );
+    let mut t = String::from("x");
+    for _ in 0..n {
+        src.push_str(&format!("(assert (not ((_ is nil) {t})))"));
+        t = format!("(tail {t})");
+    }
+    src.push_str("(check-sat)");
+
+    let start = std::time::Instant::now();
+    let out = run_script(&src);
+    let elapsed = start.elapsed();
+
+    // Exact, not `last()`: a script that errored on every `assert` and then
+    // trivially `sat`-ed on an empty problem would be fast AND green under the
+    // weaker form.
+    assert_eq!(out, vec!["sat"]);
+    assert!(
+        elapsed.as_secs() < 5,
+        "n={n} Int-field chain took {elapsed:?}; pre-slice-42 baseline was 24.7s \
+         and the post-fix target is milliseconds"
+    );
+}
+
+/// Companion control: the same query shape with an uninterpreted field sort
+/// never entered the shared set and was always fast. Pinning it here makes a
+/// future regression attributable — if BOTH tests slow down the cause is not
+/// the arith seam.
+#[test]
+fn uninterpreted_field_chain_is_fast() {
+    let n = 24;
+    let mut src = String::from(
+        "(set-logic ALL)\
+         (declare-sort U 0)\
+         (declare-datatype List ((nil) (cons (head U) (tail List))))\
+         (declare-const x List)",
+    );
+    let mut t = String::from("x");
+    for _ in 0..n {
+        src.push_str(&format!("(assert (not ((_ is nil) {t})))"));
+        t = format!("(tail {t})");
+    }
+    src.push_str("(check-sat)");
+
+    let start = std::time::Instant::now();
+    let out = run_script(&src);
+    let elapsed = start.elapsed();
+
+    // Exact, for the same reason as the gate above.
+    assert_eq!(out, vec!["sat"]);
+    assert!(elapsed.as_secs() < 5, "control query took {elapsed:?}");
+}

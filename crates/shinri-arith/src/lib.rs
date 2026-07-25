@@ -122,6 +122,37 @@ pub struct Arith {
     /// `model_equal_shared_pairs` probing re-solves simplex unboundedly. On exhaustion
     /// `check_full` returns a SOUND `Unknown`.
     pivot_budget: u64,
+    /// Union-find parent links over problem vars (slice 42). An EUF→arith
+    /// interface equality JOINS its two sides into one class instead of marking
+    /// them; constrainedness is then a property of the class, not the var.
+    /// Indexed by `ArithVar::index()`, kept the same length as `uf_size` and
+    /// `class_constrained` by `uf_ensure`.
+    uf_parent: Vec<u32>,
+    /// Class size at each root, for union-by-size (see `uf_find`).
+    uf_size: Vec<u32>,
+    /// Whether SOME member of the class carries a REAL constraint — a registered
+    /// atom, an asserted bound, or a numeral pin (slice 42). Read and written at
+    /// the class ROOT only; `is_constrained` resolves the root first.
+    ///
+    /// WHY A CLASS AND NOT A VAR: an interface equality pins `av - bv = 0`,
+    /// which is a real constraint on the DIFFERENCE but carries no information
+    /// about either value. Marking both sides made DT's collapse lemma
+    /// (`head(cons(h,t)) = h`) mark every selector application, which defeated
+    /// the guard entirely. A class of mutually-equal free vars is still free:
+    /// shifting every member by the same ±1 is another model (design doc §4.B,
+    /// lemma L3).
+    ///
+    /// MONOTONE in both components: unions are never undone, including on `pop`,
+    /// and the flag is never cleared. After backtracking, a class joined by a
+    /// since-retracted interface equality stays joined and a var constrained
+    /// only by a since-retracted assertion stays marked. Both over-approximate
+    /// constrainedness, which errs toward MORE probing — the sound direction.
+    ///
+    /// Deliberately NOT inferred from `bounds`: `seed_apriori_if_needed` puts a
+    /// uniform box on every Int problem var (free ones included), and
+    /// `entailed_equalities`' probe slacks persist across calls, so both the
+    /// bounds table and the tableau report free vars as constrained.
+    class_constrained: Vec<bool>,
 }
 
 impl Default for Arith {
@@ -150,6 +181,9 @@ impl Default for Arith {
             total_branches: 0,
             branch_budget: Self::DEFAULT_BRANCH_BUDGET,
             pivot_budget: Self::DEFAULT_PIVOT_BUDGET,
+            uf_parent: Vec::default(),
+            uf_size: Vec::default(),
+            class_constrained: Vec::default(),
         }
     }
 }
@@ -185,6 +219,83 @@ impl Arith {
                 .push(DeltaRational::from_rational(Rational::zero()));
         }
         self.bounds.ensure(self.vars.len());
+    }
+
+    /// Make `v` a valid index into the three union-find vectors, as its own
+    /// unconstrained singleton class. Resizes on demand rather than tracking
+    /// `grow_value` ordering.
+    fn uf_ensure(&mut self, v: ArithVar) {
+        while self.uf_parent.len() <= v.index() {
+            self.uf_parent.push(self.uf_parent.len() as u32);
+            self.uf_size.push(1);
+            self.class_constrained.push(false);
+        }
+    }
+
+    /// Root of `v`'s interface-equality class, as an index into
+    /// `class_constrained`. A var past the end of the vectors is its own root:
+    /// nothing has ever marked or joined it, so it is a free singleton.
+    ///
+    /// Deliberately no path compression, so `is_constrained` stays a pure
+    /// reader. Union-by-size (`union_interface_class`) already bounds the depth
+    /// by log2 of the class size, and interface classes are small — two members
+    /// on the shape this slice targets.
+    fn uf_find(&self, v: ArithVar) -> usize {
+        let mut i = v.index();
+        while i < self.uf_parent.len() && self.uf_parent[i] as usize != i {
+            i = self.uf_parent[i] as usize;
+        }
+        i
+    }
+
+    /// Record that `v` carries a REAL constraint — a registered atom, an
+    /// asserted bound, or a numeral pin (slice 42). The flag is stored at `v`'s
+    /// class root, so it covers every current member and, via the OR in
+    /// `union_interface_class`, every future one.
+    fn mark_constrained(&mut self, v: ArithVar) {
+        self.uf_ensure(v);
+        let r = self.uf_find(v);
+        self.class_constrained[r] = true;
+    }
+
+    /// Join `a` and `b` into one interface-equality class WITHOUT marking either
+    /// constrained (slice 42): `assert_interface_equality` pins `a - b = 0`,
+    /// which constrains the difference but says nothing about either value.
+    fn union_interface_class(&mut self, a: ArithVar, b: ArithVar) {
+        self.uf_ensure(a);
+        self.uf_ensure(b);
+        let (mut ra, mut rb) = (self.uf_find(a), self.uf_find(b));
+        if ra == rb {
+            return;
+        }
+        if self.uf_size[ra] < self.uf_size[rb] {
+            std::mem::swap(&mut ra, &mut rb);
+        }
+        self.uf_parent[rb] = ra as u32;
+        self.uf_size[ra] += self.uf_size[rb];
+        // OR, never assign: either side may carry the merged class's only real
+        // constraint, whichever order the mark and the join arrived in.
+        self.class_constrained[ra] |= self.class_constrained[rb];
+    }
+
+    /// Whether arith has received a real constraint about SOME member of `v`'s
+    /// interface-equality class (slice 42). A var in a class with no such member
+    /// is free AS A CLASS: `u = v` is not entailed for any `v` outside `u`'s
+    /// LIVE interface component, and no arrangement of the pair needs deciding
+    /// (§4.B, L3/L5).
+    ///
+    /// The class is the over-approximation; the live component is what the
+    /// soundness argument moves, and the two differ after a `pop` retracts an
+    /// interface equality without undoing the union. For a `v` inside `u`'s live
+    /// component the equality IS entailed — but an interface equality put it
+    /// there, so the shared engine already knows it (§4.B, C2). For a `v`
+    /// elsewhere in the same class, the shared engine may know nothing; what
+    /// covers that case is the shift, not C2 (§4.B, Conclusion case 1).
+    fn is_constrained(&self, v: ArithVar) -> bool {
+        self.class_constrained
+            .get(self.uf_find(v))
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Toggle the Plan B2 optimization gate (default ON). OFF = B1 baseline.
@@ -541,6 +652,11 @@ impl Arith {
         let v = self.vars.problem_var_sorted(t, is_int);
         self.grow_value();
         if let Some(r) = ctx.numeral_value(t) {
+            // Slice 42: pinning a numeral to its value IS a constraint. Marked
+            // outside the `already` guard so re-entry keeps the mark. The
+            // non-numeral path deliberately does NOT mark — that asymmetry is
+            // the whole point of the slice.
+            self.mark_constrained(v);
             let dr = DeltaRational::from_rational(r.clone());
             // Skip if already pinned to this value (idempotent).
             let already = matches!(self.bounds.lower(v), Some((lo, _)) if *lo == dr)
@@ -587,9 +703,31 @@ impl Arith {
         }
         // Pre-filter (R3 necessary condition): only same-β pairs can be entailed.
         // Group by current β (DeltaRational equality).
+        //
+        // Slice 42: additionally skip any pair containing a var whose
+        // interface-equality CLASS carries no real constraint. Shifting `u`'s
+        // whole LIVE interface component by ±1 is another model (§4.B, L3), so
+        // `u = v` is not entailed for any `v` outside that component — which
+        // includes a `v` elsewhere in the same class, i.e. one whose join has
+        // since been popped (§4.B, Conclusion case 1). For a `v` INSIDE the
+        // component the equality IS entailed, but the shared engine already has
+        // the two terms merged — that is where the interface equality came from
+        // — so the Combiner discards the report (`combiner.rs:718`) and nothing
+        // is lost (§4.B, C2). The skip MUST happen here, before the `define_slack` loop
+        // below: the R1 snapshot is taken AFTER slack definition and the final
+        // `restore` restores to it, so a slack minted for a hopeless pair would
+        // persist for the rest of the solve. Without this, a datatype with an
+        // Int field makes every DT-minted selector app a free shared var at
+        // β = 0, admitting every pair — the ≈1600× regression this slice fixes.
         let mut candidates: Vec<(usize, usize)> = Vec::new();
         for i in 0..items.len() {
+            if !self.is_constrained(items[i].1) {
+                continue;
+            }
             for j in (i + 1)..items.len() {
+                if !self.is_constrained(items[j].1) {
+                    continue;
+                }
                 if self.value[items[i].1.index()] == self.value[items[j].1.index()] {
                     candidates.push((i, j));
                 }
@@ -676,9 +814,45 @@ impl Arith {
                 items.push((t, v));
             }
         }
+        // Slice 42: skip pairs containing a var whose interface-equality class
+        // carries no real constraint. This function only ever returns β-equal
+        // pairs, so for a surviving candidate `u = v` already holds in the
+        // current satisfying assignment; shifting the free LIVE interface
+        // component of the unconstrained side (design doc §4.B, L3) gives a
+        // satisfying assignment with `u != v` whenever the other side is
+        // OUTSIDE that component — including when it is elsewhere in the same
+        // class, its join since popped (§4.B, Conclusion case 1). Both cells of
+        // the trichotomy are then arith-satisfiable FOR THIS PAIR, so arith has
+        // nothing to contribute and the split decides nothing. When the other
+        // side is INSIDE the component the pair is already merged in the shared
+        // engine, so the Combiner drops it at `combiner.rs:814` before
+        // splitting (§4.B, C2).
+        //
+        // Pair-local satisfiability is NOT the whole obligation: the Sat this
+        // feeds needs ONE model separating every skipped pair at once, and
+        // independent ±1 steps do not compose. §4.B, L5 supplies that joint
+        // model over exactly the candidate set built below — the `is_int`-
+        // stamped shared vars — which is MBTC's whole remit; free components
+        // carry no bound at all (L4), so each can be moved to a fresh value.
+        // It is also why the general claim "every arrangement of a free var is
+        // arith-satisfiable" stays refuted: a BOXED var cannot be forced equal
+        // to one minted after seeding whose value exceeds `M`; free vars are
+        // simply never boxed.
+        //
+        // This is a DISTINCT soundness claim from the one in
+        // `entailed_equalities` — arrangement agreement, not equality
+        // entailment — over MBTC's `is_int`-filtered subset of that var set.
+        // (`entailed_equalities` sweeps the shared set unfiltered; the filter
+        // above is why §4.B L5 is scoped to the stamp and not to the sort.)
         let mut out = Vec::new();
         for i in 0..items.len() {
+            if !self.is_constrained(items[i].1) {
+                continue;
+            }
             for j in (i + 1)..items.len() {
+                if !self.is_constrained(items[j].1) {
+                    continue;
+                }
                 if self.value[items[i].1.index()] == self.value[items[j].1.index()] {
                     out.push((items[i].0, items[j].0));
                 }
@@ -761,6 +935,15 @@ impl Arith {
         if av == bv {
             return None;
         }
+        // Slice 42: an EUF→arith interface equality pins `av - bv = 0`, so it
+        // JOINS the two vars into one constrainedness class — it does not mark
+        // either constrained. The pin is a real constraint on the difference and
+        // carries no numeric information about either side, so a class of
+        // mutually-equal free vars stays free (design doc §4.B, L3). Joining
+        // before the bound is installed is deliberate: the union is monotone and
+        // a class that is wider than the live interface-equality graph only ever
+        // over-approximates constrainedness (more probing, the sound direction).
+        self.union_interface_class(av, bv);
         let comb = Self::diff_comb(av, bv);
         let s = self.vars.slack_var(&comb);
         self.tableau.define_slack(s, &comb);
@@ -1067,6 +1250,20 @@ impl Arith {
             if self.vars.is_slack(v) || !self.vars.is_int(v) {
                 continue;
             }
+            // L4 (§4.B): "no free var carries an a-priori box" — load-bearing
+            // for L5 step 3. It holds by a coincidence across two loops in
+            // `new_var`: pre-seeding the ONLY `is_int` stamper is the
+            // `mark_int` loop (`lib.rs:1310`), which walks the same
+            // canonicalized comb as the marking loop right below it
+            // (`lib.rs:1319`) — so `is_int` ⟹ really marked. No union can exist
+            // yet (no shared var is interned before the first `propagate`), so
+            // class == var here and this reads the var's own mark. Widening
+            // Int-stamping breaks the soundness argument with every test still
+            // green; this fence fires instead, at zero release cost.
+            debug_assert!(
+                self.is_constrained(v),
+                "L4: every boxed var must be really marked"
+            );
             let lo_lit = self.fresh_sentinel();
             let hi_lit = self.fresh_sentinel();
             self.apriori_lits.insert(lo_lit.code());
@@ -1114,6 +1311,13 @@ impl TheorySolver for Arith {
                 }
             }
         }
+        // Slice 42: every problem var occurring in a registered arith atom is
+        // constrained. This is the dominant marking site — it subsumes `assert`
+        // for single-var atoms and covers multi-var atoms whose encoding is over
+        // a slack.
+        for (av, _) in &n.comb.0 {
+            self.mark_constrained(*av);
+        }
         // Track max |coeff| and |constant| across all atoms (for a-priori bound).
         self.apriori_atom_count += 1;
         for (_, coeff) in &n.comb.0 {
@@ -1153,6 +1357,12 @@ impl TheorySolver for Arith {
             }
             Some(AtomEncoding::Ineq { var, pos, neg }) => {
                 let (kind, val) = if lit.is_positive() { pos } else { neg };
+                // Slice 42: belt-and-braces. `new_var` already marked this atom's
+                // problem vars, and `var` here is a slack for multi-var atoms
+                // (slacks never appear in the shared set). Marking anyway costs
+                // nothing and keeps the invariant true even if an encoding path
+                // reaches `assert` without `new_var`.
+                self.mark_constrained(var);
                 self.apply_bound(var, kind, val, lit)
             }
         };
@@ -1692,6 +1902,313 @@ mod nelson_oppen_tests {
             .collect()
     }
 
+    // ----- Slice 42: constrainedness marking -----
+
+    fn int_var_no(ctx: &mut Context, name: &str) -> TermId {
+        let int = ctx.int_sort();
+        let s = ctx.declare_fun(name, &[], int);
+        ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+    }
+
+    #[test]
+    fn ensure_shared_var_alone_does_not_constrain() {
+        // A shared term arith was merely TOLD about — no atom, not a numeral —
+        // must stay unconstrained. This is the `head(t)` population that slice
+        // 42 exists to prune.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        let xv = h.arith.vars.problem_var(x);
+        assert!(
+            !h.arith.is_constrained(xv),
+            "a merely-shared non-numeral term must not be marked constrained"
+        );
+    }
+
+    #[test]
+    fn registered_atom_constrains_its_problem_vars() {
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let xy = h.ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[x, y]).unwrap();
+        let five = num(&mut h.ctx, 5);
+        let a = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[xy, five])
+            .unwrap();
+        h.assert_atom(0, a);
+        let xv = h.arith.vars.problem_var(x);
+        let yv = h.arith.vars.problem_var(y);
+        assert!(h.arith.is_constrained(xv), "x occurs in a registered atom");
+        assert!(h.arith.is_constrained(yv), "y occurs in a registered atom");
+    }
+
+    #[test]
+    fn numeral_pin_constrains() {
+        let mut h = Harness::new();
+        let five = num(&mut h.ctx, 5);
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, five);
+        let fv = h.arith.vars.problem_var(five);
+        assert!(
+            h.arith.is_constrained(fv),
+            "a pinned numeral IS constrained"
+        );
+    }
+
+    #[test]
+    fn interface_equality_alone_leaves_both_sides_unconstrained() {
+        // T4b: an EUF→arith interface equality pins `x - y = 0` — a real
+        // constraint on the DIFFERENCE that carries no information about either
+        // value. It joins the two vars into one class and marks NEITHER: a class
+        // of mutually-equal free vars is still free (§4.B, L3). Marking both
+        // sides (the pre-T4b rule) let DT's collapse lemma `head(cons(h,t)) = h`
+        // mark every selector application and defeat the guard entirely.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        let _ = h.arith.assert_interface_equality(&ctx, x, y, just);
+        let xv = h.arith.vars.problem_var(x);
+        let yv = h.arith.vars.problem_var(y);
+        assert!(
+            !h.arith.is_constrained(xv),
+            "an interface equality between two free vars must not constrain the lhs"
+        );
+        assert!(
+            !h.arith.is_constrained(yv),
+            "an interface equality between two free vars must not constrain the rhs"
+        );
+    }
+
+    #[test]
+    fn real_constraint_before_union_survives_from_either_side() {
+        // OR-on-union, direction 1: x carries a real constraint (a registered
+        // atom) BEFORE the interface equality joins it to the free y. The union
+        // must not drop x's mark, and y inherits it — arith really does know
+        // something about y's value now (y = x ≤ 5).
+        //
+        // Run with the marked var on BOTH sides of the interface equality. The
+        // flag lives at the SURVIVING root, so `marked | absorbed-free` and
+        // `free | absorbed-marked` are different paths through the union: an
+        // assignment where the OR belongs passes the first and fails the second.
+        for marked_first in [true, false] {
+            let mut h = Harness::new();
+            let x = real_var(&mut h.ctx, "x");
+            let y = real_var(&mut h.ctx, "y");
+            let five = num(&mut h.ctx, 5);
+            let le = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[x, five])
+                .unwrap();
+            h.assert_atom(0, le);
+            let ctx = std::mem::replace(&mut h.ctx, Context::new());
+            let just = TheoryJust { theory: 0, tag: 0 };
+            let (a, b) = if marked_first { (x, y) } else { (y, x) };
+            let _ = h.arith.assert_interface_equality(&ctx, a, b, just);
+            let xv = h.arith.vars.problem_var(x);
+            let yv = h.arith.vars.problem_var(y);
+            assert!(
+                h.arith.is_constrained(xv),
+                "the union must not clear an existing real constraint \
+                 (marked side first: {marked_first})"
+            );
+            assert!(
+                h.arith.is_constrained(yv),
+                "a var joined to a really-constrained one joins a constrained class \
+                 (marked side first: {marked_first})"
+            );
+        }
+    }
+
+    #[test]
+    fn real_constraint_after_union_constrains_the_whole_class() {
+        // OR-on-union, direction 2 (the ordering that is easiest to get wrong):
+        // the interface equality joins two FREE vars first, so the class is
+        // unconstrained; a later registered atom over ONE member must constrain
+        // the whole class, which only works if the flag lives at the class root.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let five = num(&mut h.ctx, 5);
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[y, five])
+            .unwrap();
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        let _ = h.arith.assert_interface_equality(&ctx, x, y, just);
+        let xv = h.arith.vars.problem_var(x);
+        let yv = h.arith.vars.problem_var(y);
+        assert!(
+            !h.arith.is_constrained(xv),
+            "precondition: the class is free before the atom is registered"
+        );
+        h.ctx = ctx; // give the harness its Context back for `assert_atom`
+        h.assert_atom(0, le);
+        assert!(
+            h.arith.is_constrained(yv),
+            "the atom's own var must be constrained"
+        );
+        assert!(
+            h.arith.is_constrained(xv),
+            "a real constraint on ANY member must constrain the whole class"
+        );
+    }
+
+    #[test]
+    fn interface_equality_class_is_transitive() {
+        // x = y and y = z as interface equalities put all three in one class,
+        // so constraining z reaches x through the intermediate root.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let z = real_var(&mut h.ctx, "z");
+        let five = num(&mut h.ctx, 5);
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[z, five])
+            .unwrap();
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        let _ = h.arith.assert_interface_equality(&ctx, x, y, just);
+        let _ = h.arith.assert_interface_equality(&ctx, y, z, just);
+        let xv = h.arith.vars.problem_var(x);
+        assert!(
+            !h.arith.is_constrained(xv),
+            "precondition: a chain of interface equalities alone constrains nothing"
+        );
+        h.ctx = ctx;
+        h.assert_atom(0, le);
+        assert!(
+            h.arith.is_constrained(xv),
+            "the constraint on z must reach x two interface equalities away"
+        );
+    }
+
+    #[test]
+    fn interface_equality_to_a_numeral_constrains_the_class() {
+        // The shape that keeps the DT⋈arith anchors green: DT's collapse lemma
+        // can produce `head(cons(5, t)) = 5`, and `ensure_shared_var` pins the
+        // numeral, which IS a real constraint. So this class is constrained and
+        // the selector application is still probed.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let five = num(&mut h.ctx, 5);
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        let _ = h.arith.assert_interface_equality(&ctx, x, five, just);
+        let xv = h.arith.vars.problem_var(x);
+        assert!(
+            h.arith.is_constrained(xv),
+            "a var pinned equal to a numeral is constrained"
+        );
+    }
+
+    #[test]
+    fn interface_equality_class_survives_pop() {
+        // MONOTONE in the union component too: the class join is never undone,
+        // including on `pop`. Join x and y at level 1, pop, THEN really
+        // constrain x — y must still read as constrained, which is only true if
+        // the class outlived the pop. Over-approximating constrainedness errs
+        // toward MORE probing, the sound direction.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let five = num(&mut h.ctx, 5);
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[x, five])
+            .unwrap();
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.push();
+        let just = TheoryJust { theory: 0, tag: 0 };
+        let _ = h.arith.assert_interface_equality(&ctx, x, y, just);
+        h.arith.pop(0);
+        h.ctx = ctx;
+        h.assert_atom(0, le);
+        let yv = h.arith.vars.problem_var(y);
+        assert!(
+            h.arith.is_constrained(yv),
+            "the interface-equality class is monotone across pop"
+        );
+    }
+
+    #[test]
+    fn apriori_box_does_not_constrain() {
+        // The a-priori box (`seed_apriori_if_needed`) must never leave a free
+        // var carrying box bounds — that is L4 (§4.B), and L5 step 3 rests on
+        // it. This test now builds the state in the SOLVER'S OWN ORDER, which
+        // is L4's premise: seeding runs at the first `propagate`
+        // (`lib.rs:1391`), strictly before any shared var is interned
+        // (`ensure_shared_var` is reachable only from `drive_final_check`).
+        //
+        // The earlier version of this test interned the free shared var FIRST
+        // and then seeded, asserting the resulting box did not mark it. That
+        // ordering is precisely what L4's premise excludes and cannot arise in
+        // the solver, and the box loop's `debug_assert!` correctly trips on it.
+        // Under the real order the property is stronger and simpler: a free var
+        // is never boxed at all.
+        let mut h = Harness::new();
+        let a = int_var_no(&mut h.ctx, "xa");
+        let five = h
+            .ctx
+            .mk_numeral(Rational::from_int(5i128.into()), h.ctx.int_sort());
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[a, five])
+            .unwrap();
+        h.assert_atom(0, le);
+        // First `propagate`: seeds the box over the vars present so far — all
+        // of them interned (and marked) by a registered atom.
+        h.arith.seed_apriori_if_needed();
+        let av = h.arith.vars.problem_var(a);
+        assert!(
+            h.arith.bounds.lower(av).is_some() && h.arith.bounds.upper(av).is_some(),
+            "precondition: the a-priori box must actually have been seeded"
+        );
+
+        // Now the shared var, interned the way `drive_final_check` does it:
+        // after seeding. It gets no box, and the box marks nothing.
+        let x = int_var_no(&mut h.ctx, "xi");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        let xv = h.arith.vars.problem_var(x);
+        assert!(
+            !h.arith.is_constrained(xv),
+            "a-priori box seeding must not mark a shared var constrained"
+        );
+        assert!(
+            h.arith.bounds.lower(xv).is_none() && h.arith.bounds.upper(xv).is_none(),
+            "L4: a free var carries no a-priori box"
+        );
+    }
+
+    #[test]
+    fn constrained_marking_survives_pop() {
+        // The set is MONOTONE by design: never un-marked, including on pop.
+        // Over-approximating constrainedness errs toward more probing, which is
+        // the sound direction.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let five = num(&mut h.ctx, 5);
+        let a = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[x, five])
+            .unwrap();
+        h.arith.push();
+        h.assert_atom(0, a);
+        let xv = h.arith.vars.problem_var(x);
+        assert!(h.arith.is_constrained(xv));
+        h.arith.pop(0);
+        assert!(
+            h.arith.is_constrained(xv),
+            "constrainedness is monotone across pop"
+        );
+    }
+
     // ----- Test 3: fixed_vars_entailed_equal -----
     #[test]
     fn fixed_vars_entailed_equal() {
@@ -2130,6 +2647,330 @@ mod nelson_oppen_tests {
         let v = h.arith.vars.problem_var(five);
         assert_eq!(h.arith.value[v.index()], dr(5));
         assert!(matches!(h.arith.check_full(), TCheck::Sat));
+    }
+
+    #[test]
+    fn unconstrained_pair_is_not_probed_and_mints_no_slack() {
+        // Two shared vars arith knows nothing about. No equality can be
+        // entailed, AND no slack may be minted: `entailed_equalities` snapshots
+        // AFTER `define_slack`, so a slack created here would persist for the
+        // rest of the solve and re-admit the cost on every later call.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+
+        let vars_before = h.arith.vars.len();
+        let got = h.arith.entailed_equalities(&ctx, &[x, y]);
+
+        assert!(got.is_empty(), "no equality is entailed over free vars");
+        assert_eq!(
+            h.arith.vars.len(),
+            vars_before,
+            "no slack may be minted for a skipped pair"
+        );
+    }
+
+    #[test]
+    fn mixed_pair_with_one_free_var_is_skipped() {
+        // x is fixed to 0; y is free. `x = y` is not entailed, and the pair must
+        // be skipped rather than probed.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let zero = num(&mut h.ctx, 0);
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[x, zero])
+            .unwrap();
+        let ge = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[x, zero])
+            .unwrap();
+        h.assert_atom(0, le);
+        h.assert_atom(1, ge);
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+
+        let vars_before = h.arith.vars.len();
+        let got = h.arith.entailed_equalities(&ctx, &[x, y]);
+
+        assert!(
+            got.is_empty(),
+            "a free var is not entailed equal to a fixed one"
+        );
+        assert_eq!(
+            h.arith.vars.len(),
+            vars_before,
+            "no slack for a skipped pair"
+        );
+    }
+
+    #[test]
+    fn mbtc_skips_pairs_with_a_free_var() {
+        // Two free Int shared vars both sit at β = 0, so the unguarded sweep
+        // reports them as a model-equal pair and the Combiner turns that into a
+        // 3-way trichotomy split. Arith constrains neither side, so any
+        // arrangement EUF picks is arith-satisfiable and the split is waste.
+        let mut h = Harness::new();
+        let x = int_var_no(&mut h.ctx, "xm");
+        let y = int_var_no(&mut h.ctx, "ym");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+
+        let pairs = h.arith.model_equal_shared_pairs(&[x, y]);
+        assert!(pairs.is_empty(), "free vars need no MBTC arrangement split");
+    }
+
+    #[test]
+    fn free_class_pair_joined_by_interface_equality_is_not_probed() {
+        // The target shape (T4b). The interface equality makes `x = y` genuinely
+        // arith-entailed, and before T4b the probe found it — 48 such pairs per
+        // round on the n = 24 chain. It is skipped now, and that drops no
+        // deduction: the equality ORIGINATED in the shared congruence engine, so
+        // `cx.eq.are_equal` already holds and the Combiner discards the report
+        // before it can make progress (`combiner.rs:718`). See §4.B, C2.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        assert!(
+            h.arith
+                .assert_interface_equality(&ctx, x, y, just)
+                .is_none(),
+            "x = y alone is feasible"
+        );
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+
+        let got = h.arith.entailed_equalities(&ctx, &[x, y]);
+        assert!(
+            got.is_empty(),
+            "a pair whose class carries no real constraint must not be probed"
+        );
+    }
+
+    #[test]
+    fn mbtc_skips_a_free_class_pair() {
+        // §3.C over the same shape: two free Int vars pinned equal by an
+        // interface equality sit at the same β, so the unguarded sweep offers
+        // them to MBTC. The pair is already merged in the shared engine (that is
+        // where the interface equality came from), so the Combiner would drop it
+        // at `combiner.rs:814`; skipping it here costs nothing.
+        let mut h = Harness::new();
+        let x = int_var_no(&mut h.ctx, "xf");
+        let y = int_var_no(&mut h.ctx, "yf");
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        assert!(
+            h.arith
+                .assert_interface_equality(&ctx, x, y, just)
+                .is_none(),
+            "x = y alone is feasible"
+        );
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+
+        let pairs = h.arith.model_equal_shared_pairs(&[x, y]);
+        assert!(
+            pairs.is_empty(),
+            "a free class needs no MBTC arrangement split"
+        );
+    }
+
+    #[test]
+    fn constrained_class_pair_is_still_probed_through_an_interface_equality() {
+        // The anti-regression companion: the class carries a real constraint (w
+        // is pinned to 3), so the pair is probed and the entailed equality
+        // `x = w` — which the shared engine does NOT already know — is still
+        // reported.
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let w = real_var(&mut h.ctx, "w");
+        let three = num(&mut h.ctx, 3);
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[w, three])
+            .unwrap();
+        let ge = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[w, three])
+            .unwrap();
+        let lex = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[x, three])
+            .unwrap();
+        let gex = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[x, three])
+            .unwrap();
+        h.assert_atom(0, le);
+        h.assert_atom(1, ge);
+        h.assert_atom(2, lex);
+        h.assert_atom(3, gex);
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        // y is free on its own; the interface equality puts it in x's class,
+        // which IS constrained, so y becomes probeable too.
+        assert!(
+            h.arith
+                .assert_interface_equality(&ctx, x, y, just)
+                .is_none(),
+            "x = y is consistent with x = 3"
+        );
+        let yv = h.arith.vars.problem_var(y);
+        assert!(
+            h.arith.is_constrained(yv),
+            "y joined a constrained class, so it is probed"
+        );
+
+        let got = pairset(&h.arith.entailed_equalities(&ctx, &[x, y, w]));
+        assert!(
+            got.contains(&(x.index().min(w.index()), x.index().max(w.index()))),
+            "x = w must still be reported, got {got:?}"
+        );
+        assert!(
+            got.contains(&(y.index().min(w.index()), y.index().max(w.index()))),
+            "y = w must still be reported, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn mbtc_still_reports_constrained_model_equal_pairs() {
+        // Both vars pinned to 3: still a model-equal pair, still reported.
+        let mut h = Harness::new();
+        let x = int_var_no(&mut h.ctx, "xc");
+        let y = int_var_no(&mut h.ctx, "yc");
+        let three = h
+            .ctx
+            .mk_numeral(Rational::from_int(3i128.into()), h.ctx.int_sort());
+        for (i, v) in [x, y].iter().enumerate() {
+            let le = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[*v, three])
+                .unwrap();
+            let ge = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[*v, three])
+                .unwrap();
+            h.assert_atom(2 * i as u32, le);
+            h.assert_atom(2 * i as u32 + 1, ge);
+        }
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, x);
+        h.arith.ensure_shared_var(&ctx, y);
+
+        let pairs = h.arith.model_equal_shared_pairs(&[x, y]);
+        assert_eq!(pairs.len(), 1, "constrained model-equal pair must survive");
+    }
+
+    #[test]
+    fn a_leading_free_var_does_not_abort_the_probe_sweep() {
+        // GUARD SHAPE, not guard predicate: the outer `if !is_constrained`
+        // must `continue` the outer loop, NOT `break` it. `free` sits at index
+        // 0 of the shared list, so a `break` would abandon the sweep before
+        // ever reaching the genuinely entailed `c1 = c2` behind it — dropping
+        // an entailed equality from the arith→EUF exchange, an incompleteness
+        // that can surface as a WRONG combined `sat`. Every other free-var
+        // test puts the free var last or makes both sides free, so none of
+        // them constrains this branch.
+        let mut h = Harness::new();
+        let free = real_var(&mut h.ctx, "free");
+        let c1 = real_var(&mut h.ctx, "c1");
+        let c2 = real_var(&mut h.ctx, "c2");
+        let three = num(&mut h.ctx, 3);
+        let mut i = 0u32;
+        for v in [c1, c2] {
+            let le = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[v, three])
+                .unwrap();
+            let ge = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[v, three])
+                .unwrap();
+            h.assert_atom(i, le);
+            h.assert_atom(i + 1, ge);
+            i += 2;
+        }
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        for v in [free, c1, c2] {
+            h.arith.ensure_shared_var(&ctx, v);
+        }
+        let freev = h.arith.vars.problem_var(free);
+        assert!(
+            !h.arith.is_constrained(freev),
+            "the index-0 var must really be free, or the test proves nothing"
+        );
+
+        let got = pairset(&h.arith.entailed_equalities(&ctx, &[free, c1, c2]));
+        assert!(
+            got.contains(&(c1.index().min(c2.index()), c1.index().max(c2.index()))),
+            "c1 = c2 is entailed and must survive a LEADING free var, got {got:?}"
+        );
+        assert_eq!(
+            got.len(),
+            1,
+            "only the constrained pair may be reported, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn mbtc_a_leading_free_var_does_not_abort_the_sweep() {
+        // The MBTC analogue of `a_leading_free_var_does_not_abort_the_probe_sweep`:
+        // `break` at the outer level would drop the model-equal pair behind
+        // the leading free var, so MBTC would never split an arrangement it is
+        // responsible for deciding.
+        let mut h = Harness::new();
+        let free = int_var_no(&mut h.ctx, "freem");
+        let c1 = int_var_no(&mut h.ctx, "c1m");
+        let c2 = int_var_no(&mut h.ctx, "c2m");
+        let three = h
+            .ctx
+            .mk_numeral(Rational::from_int(3i128.into()), h.ctx.int_sort());
+        for (i, v) in [c1, c2].iter().enumerate() {
+            let le = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[*v, three])
+                .unwrap();
+            let ge = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[*v, three])
+                .unwrap();
+            h.assert_atom(2 * i as u32, le);
+            h.assert_atom(2 * i as u32 + 1, ge);
+        }
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        for v in [free, c1, c2] {
+            h.arith.ensure_shared_var(&ctx, v);
+        }
+        let freev = h.arith.vars.problem_var(free);
+        assert!(
+            !h.arith.is_constrained(freev),
+            "the index-0 var must really be free, or the test proves nothing"
+        );
+        assert!(
+            h.arith.vars.is_int(freev),
+            "the leading var must survive the is_int filter to sit at index 0"
+        );
+
+        let pairs = h.arith.model_equal_shared_pairs(&[free, c1, c2]);
+        assert_eq!(
+            pairs.len(),
+            1,
+            "the (c1, c2) pair must survive a LEADING free var, got {pairs:?}"
+        );
     }
 }
 
