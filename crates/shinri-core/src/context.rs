@@ -187,6 +187,36 @@ impl Context {
         &self.sorts[id.index()]
     }
 
+    /// An interned sort as SMT-LIB text: `Int`, `(_ BitVec 8)`,
+    /// `(Array Int Bool)`. Used for the signature position of `define-fun` in
+    /// `get-model` output (slice 43 §4.B).
+    ///
+    /// Deliberately EXHAUSTIVE over `SortNode` with no catch-all arm: an
+    /// unprintable sort would emit malformed SMT-LIB, so a new sort variant must
+    /// break this match rather than silently render as a placeholder.
+    ///
+    /// The `Array` arm recurses. `Parser::parse_sort` is itself recursive over
+    /// nested `Array` sorts, so a sort deep enough to overflow here cannot be
+    /// parsed in the first place — the parser bounds this, not a depth cap.
+    pub fn sort_name(&self, s: SortId) -> String {
+        match self.sort_node(s) {
+            SortNode::Bool => "Bool".to_string(),
+            SortNode::Int => "Int".to_string(),
+            SortNode::Real => "Real".to_string(),
+            SortNode::String => "String".to_string(),
+            SortNode::RoundingMode => "RoundingMode".to_string(),
+            SortNode::RegLan => "RegLan".to_string(),
+            SortNode::Uninterpreted(sym) | SortNode::Datatype(sym) => {
+                self.symbol_name(*sym).to_string()
+            }
+            SortNode::BitVec(n) => format!("(_ BitVec {n})"),
+            SortNode::Float(eb, sb) => format!("(_ FloatingPoint {eb} {sb})"),
+            SortNode::Array(i, e) => {
+                format!("(Array {} {})", self.sort_name(*i), self.sort_name(*e))
+            }
+        }
+    }
+
     pub fn symbol_name(&self, sym: SymbolId) -> &str {
         self.symbols.resolve(sym)
     }
@@ -2310,5 +2340,46 @@ mod tests {
         }
         assert_eq!(ctx.dt_first_ill_founded(&[prev]), Some(prev));
         assert_eq!(ctx.dt_first_ill_founded(&[tail, prev]), Some(tail));
+    }
+
+    #[test]
+    fn sort_name_prints_every_sort_shape() {
+        let mut ctx = Context::new();
+        // Bind first: the *_sort constructors below need &mut self.
+        let b = ctx.bool_sort();
+        let i = ctx.int_sort();
+        let r = ctx.real_sort();
+        let st = ctx.string_sort();
+        let rl = ctx.reglan_sort();
+        let rm = ctx.rm_sort();
+        let bv8 = ctx.bv_sort(8);
+        let bv3 = ctx.bv_sort(3);
+        let f32s = ctx.fp_sort(8, 24);
+        let u = ctx.declare_sort("U");
+        let arr = ctx.array_sort(i, b);
+        let nested = ctx.array_sort(bv8, arr);
+        // A one-constructor datatype, to exercise the 11th SortNode variant.
+        let pair = ctx.declare_datatype_sort("Pair");
+        let mk_pair = ctx.declare_fun("mk-pair", &[i, i], pair);
+        let is_pair = ctx.declare_fun("is-pair", &[pair], b);
+        ctx.dt_add_constructor(pair, mk_pair, &[], is_pair);
+
+        assert_eq!(ctx.sort_name(b), "Bool");
+        assert_eq!(ctx.sort_name(i), "Int");
+        assert_eq!(ctx.sort_name(r), "Real");
+        assert_eq!(ctx.sort_name(st), "String");
+        assert_eq!(ctx.sort_name(rl), "RegLan");
+        assert_eq!(ctx.sort_name(rm), "RoundingMode");
+        assert_eq!(ctx.sort_name(bv8), "(_ BitVec 8)");
+        assert_eq!(ctx.sort_name(bv3), "(_ BitVec 3)");
+        assert_eq!(ctx.sort_name(f32s), "(_ FloatingPoint 8 24)");
+        assert_eq!(ctx.sort_name(u), "U");
+        assert_eq!(ctx.sort_name(arr), "(Array Int Bool)");
+        // Nested, to pin the recursion.
+        assert_eq!(
+            ctx.sort_name(nested),
+            "(Array (_ BitVec 8) (Array Int Bool))"
+        );
+        assert_eq!(ctx.sort_name(pair), "Pair");
     }
 }
