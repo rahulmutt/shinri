@@ -34,6 +34,11 @@ Measured on a chain of `n` nested `((_ is nil) (tail …))` constraints:
 | `(cons (head U) (tail List))`, `U` uninterpreted | — | — | 6 ms | — |
 | `(cons (tail List))`, no field | — | — | 5 ms | — |
 
+(This table is the original design-time measurement, kept as recorded. The
+n = 24 baseline was re-measured during implementation at **24.7 s** on the
+same machine; `qfdt_e2e.rs`'s `int_field_chain_does_not_blow_up` cites the
+re-measured figure, since that is what its bound is computed against.)
+
 **A ≈1600× slowdown at n = 20 attributable solely to the field's sort** (9.4 s
 vs 6 ms against the uninterpreted-field baseline — same term count, same
 structure, same number of DT lemmas).
@@ -140,8 +145,10 @@ guard actually needs.)*
 
 This is a **distinct soundness sub-claim** from §3.B (arrangement agreement
 rather than equality entailment) and gets its own test (§5). It is included
-because it is the same invariant over the same var set in the same file, and
-omitting it leaves a second, smaller source of the same waste in place.
+because it is the same invariant, applied in the same file over MBTC's
+`is_int`-filtered subset of §3.B's var set — not the same var set itself; see
+§4.B, "The stamp, not the sort" — and omitting it leaves a second, smaller
+source of the same waste in place.
 
 ## 4. Soundness
 
@@ -596,7 +603,8 @@ verdicts unchanged: `mixed_datatype_and_arith_unsat`,
 ### Performance gate
 
 Check the `deep` family in as a test: assert a **decided** verdict at n = 24
-under a generous wall-clock bound (5 s against a pre-fix 24.1 s). Wall-clock
+under a generous wall-clock bound (5 s against a pre-fix 24.1 s; re-measured
+at implementation time as 24.7 s — see `qfdt_e2e.rs`). Wall-clock
 assertions are normally a flakiness smell; a ≈1600× fault carries enough margin
 to justify one, and without it a silent regression quietly consumes the
 10–15 min blocking-tier budget.
@@ -650,7 +658,8 @@ rule stays speculative until a query demands it.
 ## 7. Success criteria
 
 - The n = 24 `deep` query decides `sat` in well under a second, against a
-  measured 24.1 s baseline; the n = 20 Int-field query matches the
+  measured 24.1 s baseline (re-measured at implementation time as 24.7 s); the
+  n = 20 Int-field query matches the
   uninterpreted-field query's order of magnitude (6 ms), closing the
   sort-attributable gap.
 - **No regressive verdict changes**: `qfdt_e2e`, `script_e2e`, and the full

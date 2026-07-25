@@ -4,7 +4,8 @@
 
 > **Superseded in part — read this before implementing anything below.** Tasks
 > 1–4 as written here shipped, passed review, and **pruned nothing**: 22 s at
-> n = 24 against a 24.1 s baseline. The per-var `constrained: Vec<bool>` this
+> n = 24 against a 24.1 s baseline (re-measured at implementation time as
+> 24.7 s — see `qfdt_e2e.rs`). The per-var `constrained: Vec<bool>` this
 > plan specifies is refuted. `DtSolver`'s collapse lemma feeds arith
 > congruence-only interface equalities, and marking both sides of those marked
 > every shared var, so the guards fired on nothing. Task 4b (commit `8362b1ec`)

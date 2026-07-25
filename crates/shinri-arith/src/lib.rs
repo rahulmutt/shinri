@@ -1253,9 +1253,9 @@ impl Arith {
             // L4 (§4.B): "no free var carries an a-priori box" — load-bearing
             // for L5 step 3. It holds by a coincidence across two loops in
             // `new_var`: pre-seeding the ONLY `is_int` stamper is the
-            // `mark_int` loop (`lib.rs:1294`), which walks the same
+            // `mark_int` loop (`lib.rs:1310`), which walks the same
             // canonicalized comb as the marking loop right below it
-            // (`lib.rs:1303`) — so `is_int` ⟹ really marked. No union can exist
+            // (`lib.rs:1319`) — so `is_int` ⟹ really marked. No union can exist
             // yet (no shared var is interned before the first `propagate`), so
             // class == var here and this reads the var's own mark. Widening
             // Int-stamping breaks the soundness argument with every test still
