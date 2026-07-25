@@ -326,10 +326,10 @@ impl Solver {
     fn format_value(&self, t: TermId) -> Option<String> {
         // Check BV/EUF model first.
         if let Some(val) = self.last_model.as_ref().and_then(|m| m.get(t)) {
-            return Some(crate::model::format_modelval(val));
+            return Some(shinri_theory::model::format_modelval(val));
         }
         if let Some(val) = self.eliminated_ite_vals.get(&t) {
-            return Some(crate::model::format_modelval(val));
+            return Some(shinri_theory::model::format_modelval(val));
         }
         // Fall through to ABV array model (for array-sorted terms).
         self.abv_array_models.get(&t).cloned()
@@ -346,7 +346,7 @@ impl Solver {
         if let Some(m) = &self.last_model {
             for (t, v) in m.values.iter() {
                 let name = crate::tseitin::display_term(&self.ctx, *t);
-                let val = crate::model::format_modelval(v);
+                let val = shinri_theory::model::format_modelval(v);
                 out.push_str(&format!("({name} {val})"));
             }
         }
