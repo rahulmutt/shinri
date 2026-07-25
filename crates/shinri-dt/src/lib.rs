@@ -3,7 +3,9 @@
 //! clauses via `TCheck::Split` and clashes via `TCheck::Conflict`.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use shinri_core::{Context, DtRole, Lit, Op, SymbolId, TermId, TermNode, TheoryJust, Var};
+use shinri_core::{
+    Context, DtRole, Lit, Op, SortNode, SymbolId, TermId, TermNode, TheoryJust, Var,
+};
 use shinri_sat::Effort;
 use shinri_theory::types::EqLeaf;
 use shinri_theory::ENodeId;
@@ -706,13 +708,36 @@ impl DtSolver {
     /// would otherwise render as `x`, and two distinct constants merged into one
     /// class would render as two different "values", which is a wrong model
     /// rather than an ugly one. `?` remains only for a field no theory assigned
-    /// and that is not a nullary application (Bool/BV fields today, §5).
+    /// a USABLE value to and that is not a nullary application (String/BV/FP
+    /// fields today, §5).
+    ///
+    /// Branch 3 is guarded on the value actually fitting the field's sort, for
+    /// the very same wrong-model reason the ordering exists. `ModelVal::Elem` is
+    /// EUF's opaque equivalence-CLASS TOKEN, not a value; it is a faithful
+    /// rendering only for a sort whose values genuinely are anonymous domain
+    /// elements (`SortNode::Uninterpreted`). On a sort that HAS an SMT-LIB value
+    /// grammar — String above all, since EUF treats String as uninterpreted and
+    /// an in-search-minted field never reaches `StrSolver`'s `str_terms` — an
+    /// `Elem` means "the owning theory assigned nothing", so printing `@elemN`
+    /// there would emit a sort-mismatched value where a placeholder belongs.
+    /// `shinri-str/src/model.rs:116-126` already encodes this same judgment,
+    /// overriding EUF's `Elem` on string-sorted terms as a mere placeholder.
+    /// Falling through to `?` is strictly conservative: it can only ever replace
+    /// a rendering with the placeholder, never with a different value.
     fn render_field(terms: &Context, m: &ModelBuilder, a: TermId) -> String {
         if let Some(r) = terms.numeral_value(a) {
             return shinri_theory::model::format_rational(r);
         }
         if let Some(v) = m.get(a) {
-            return shinri_theory::model::format_modelval(v);
+            let class_token_on_a_valued_sort =
+                matches!(v, shinri_theory::types::ModelVal::Elem(..))
+                    && !matches!(
+                        terms.sort_node(terms.sort_of(a)),
+                        SortNode::Uninterpreted(_)
+                    );
+            if !class_token_on_a_valued_sort {
+                return shinri_theory::model::format_modelval(v);
+            }
         }
         match Self::uapp(terms, a) {
             Some((s, kids)) if kids.is_empty() => terms.symbol_name(s).to_string(),

@@ -107,6 +107,50 @@ fn bool_field_resolves_from_the_euf_truth_node() {
     );
 }
 
+/// A String-sorted field is a SURVIVING `?` (spec §5's fenced-gap list — Task 7
+/// owns pinning that list). `(s w)` is minted in-search by DT, so it never
+/// enters `StrSolver`'s `str_terms` and the string model never assigns it
+/// (`shinri-str/src/model.rs:116-126`). EUF treats String as uninterpreted and
+/// leaves a `ModelVal::Elem` behind, which is an opaque CLASS TOKEN, not a
+/// String value. `render_field` must therefore refuse it and fall through to
+/// `?`: printing `@elem0` in a String position would be a sort-mismatched value
+/// — a wrong model, which is strictly worse than a visible placeholder.
+#[test]
+fn string_field_stays_a_placeholder_rather_than_an_elem_token() {
+    let out = run_script(
+        "(set-logic ALL)(declare-datatype S ((mk (s String))))(declare-fun w () S)\
+         (assert ((_ is mk) w))(check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert!(
+        !out[1].contains("@elem"),
+        "an EUF class token must never render in a String field, got: {}",
+        out[1]
+    );
+    assert!(
+        out[1].contains("(mk ?)"),
+        "an unassigned String field stays a visible placeholder, got: {}",
+        out[1]
+    );
+}
+
+/// The other side of that guard: for a genuinely UNINTERPRETED-sorted field an
+/// `@elemN` token IS the faithful SMT-LIB rendering of an anonymous domain
+/// element, so the guard must not over-fire and degrade it to `?`.
+#[test]
+fn uninterpreted_sorted_field_still_renders_its_elem_token() {
+    let out = run_script(
+        "(set-logic ALL)(declare-sort U 0)(declare-datatype P ((mk (u U))))\
+         (declare-fun p () P)(assert ((_ is mk) p))(check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert!(
+        out[1].contains("(mk @elem0)"),
+        "an uninterpreted-sorted field keeps its domain-element token, got: {}",
+        out[1]
+    );
+}
+
 /// Probe C4: two levels of tester-driven instantiation.
 #[test]
 fn nested_int_fields_both_render() {
