@@ -161,11 +161,21 @@ Thread `&ModelBuilder` through `render_value` (`:638`) into
 `render_value_inner` (`:658`). Per constructor argument, in order:
 
 1. **Datatype sort** → recurse (unchanged).
-2. **Integer or rational literal term** → print the literal. This case alone
-   fixes C2 and M3, where the field is a numeral and no model lookup is needed.
-3. **Otherwise** → look the field term up in the builder; on a hit, format the
-   `ModelVal`.
-4. **Miss** → `"?"`, now meaning only "no theory assigned this term".
+2. **Numeral term** → print the literal via `Context::numeral_value`. This case
+   alone fixes C2 and M3, where the field is a numeral and no lookup is needed.
+3. **Assigned in the builder** → format the `ModelVal`.
+4. **Nullary uninterpreted application** → its own symbol name.
+5. **Otherwise** → `"?"`, now meaning only "no theory assigned this term".
+
+**The order of 3 before 4 is load-bearing, not stylistic.** The nullary-app
+branch is what slice 39 already does, and it prints a *term name*, not a value.
+If it ran first, a field that is a declared Int constant `x` with arith value `7`
+would render `(cons x nil)` — and worse, two distinct constants in one
+equivalence class would render as two different "values", which is a wrong model,
+not merely an ugly one. A model maps symbols to values; the symbol's own name is
+only admissible when nothing assigned it one. So branch 4 survives strictly as a
+fallback below the builder lookup — better than `?` for an enum-like
+uninterpreted constant, never a substitute for an assigned value.
 
 Case 3 needs `format_modelval` callable from `shinri-dt`. **Move it — with
 `format_rational`, `format_hex_fixed`, `format_bin_fixed` — from
@@ -173,11 +183,6 @@ Case 3 needs `format_modelval` callable from `shinri-dt`. **Move it — with
 type it formats.** Rendering a value belongs with the value type; the BV
 extraction in that file stays where it is. `shinri-solver` then calls the
 relocated function, so its behaviour is unchanged for every existing caller.
-
-The existing nullary-uninterpreted-app branch is subsumed by case 3 once EUF's
-`Elem` assignment for that sort is in the builder, but is kept: it produces the
-symbol's own name (`mk`, an enum constant) which is strictly more informative
-than `@elem0`.
 
 Because `Arith::build_model` assigns every var it knows, Int/Real fields resolve
 **unconditionally** after 3.A — including the entirely unconstrained field in
@@ -289,6 +294,10 @@ determinism.
 
 - `render_value` against a builder holding a field value renders the value, not
   `?`; against a builder without one, still `?`.
+- **Branch order 3-before-4 (§3.C):** a field that is a declared constant *with*
+  an assigned value renders the value, not the constant's name. Two distinct
+  constants merged into one class render the *same* value. This is the
+  wrong-model fence, not a formatting preference.
 - A numeral field renders from the literal with an **empty** builder (case 2 of
   §3.C is independent of any theory).
 - Nested and DAG-shared datatype fields still render (the `visited`
