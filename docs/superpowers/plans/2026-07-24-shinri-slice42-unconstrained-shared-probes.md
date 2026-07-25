@@ -2,6 +2,21 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
+> **Superseded in part — read this before implementing anything below.** Tasks
+> 1–4 as written here shipped, passed review, and **pruned nothing**: 22 s at
+> n = 24 against a 24.1 s baseline. The per-var `constrained: Vec<bool>` this
+> plan specifies is refuted. `DtSolver`'s collapse lemma feeds arith
+> congruence-only interface equalities, and marking both sides of those marked
+> every shared var, so the guards fired on nothing. Task 4b (commit `8362b1ec`)
+> replaced the boolean with a union-find **class** over interface equalities —
+> a class is constrained iff some member carries a real atom / assertion /
+> numeral-pin constraint, and an interface equality *joins* rather than marks.
+> That is what shipped and what the soundness argument rests on: read
+> **§4.B of the design doc** (lemmas L1–L5, C2, C2b), which is the record of
+> authority. The task bodies below are left as written on purpose — they are
+> the historical record of what was attempted, and their being wrong is part of
+> that record.
+
 **Goal:** Stop `shinri-arith` from running Nelson–Oppen entailment probes and MBTC splits over shared problem vars it has received no constraint about, eliminating a ≈1600× slowdown on any QF_DT query whose datatype has an `Int` field.
 
 **Architecture:** `Arith` gains a monotone `constrained: Vec<bool>` marking problem vars it has actually been told something about, set at four semantic entry points. `entailed_equalities` and `model_equal_shared_pairs` skip any pair containing an unmarked var, at candidate-construction time — before any slack is minted. Nothing outside `shinri-arith` changes: the `Combiner`, the shared set `S`, and both exchange directions are untouched.
@@ -46,6 +61,8 @@ Adds the state and the four marking sites. **No behavior changes** — every exi
 - Produces: `Arith::mark_constrained(&mut self, v: ArithVar)` and `Arith::is_constrained(&self, v: ArithVar) -> bool`, both private to `shinri-arith`. Tasks 3 and 4 call `is_constrained`.
 
 - [ ] **Step 1: Write the failing test**
+
+> *Superseded (task 4b, `8362b1ec`; design doc §4.B).* `interface_equality_constrains_both_sides` below is **backwards** — an interface equality joins the two vars' classes without marking either, and the delivered test is its negation, `interface_equality_alone_leaves_both_sides_unconstrained`. `apriori_box_does_not_constrain` also survives only in a premise-respecting form: L4 says a free var is never boxed at all, so the sketch's ordering (intern the shared var, *then* seed) cannot arise in the solver.
 
 Add to `mod nelson_oppen_tests` in `crates/shinri-arith/src/lib.rs` (after the `pairset` helper, ~line 1692):
 
@@ -398,6 +415,8 @@ bounds and membership in bound-free probe-slack rows. Neither pins its value, so
 the §4 invariant holds: at least two values remain admissible for it in any
 satisfying assignment, and therefore `u = v` is not entailed for any `v`.
 ```
+
+> *Superseded (task 4b, `8362b1ec`; design doc §4.B).* This conclusion was overturned by the audit: an unmarked var can also carry a live **interface-equality** bound, which pins it to its class-mates, so it is *not* independently shiftable and `u = v` **can** be entailed for a same-component `v`. The repaired argument shifts the whole live component at once (L3) and discharges the same-component case via C2 — the equality originated in the shared congruence engine, so the Combiner already discards the report. §4.B's table is the corrected version of the table above; the entries here for `seed_apriori_if_needed` and `run_fbbt` also understate their reach (`run_fbbt` can bound a slack; L2 discharges it).
 
 Replace any row above whose finding differs from what Steps 1–3 actually show. **If a site is found that constrains without marking, do not proceed to Task 3** — add the marking site to Task 1 first and re-run its tests.
 

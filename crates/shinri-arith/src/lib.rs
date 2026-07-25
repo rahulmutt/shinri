@@ -841,7 +841,9 @@ impl Arith {
         //
         // This is a DISTINCT soundness claim from the one in
         // `entailed_equalities` — arrangement agreement, not equality
-        // entailment — over the same var set.
+        // entailment — over MBTC's `is_int`-filtered subset of that var set.
+        // (`entailed_equalities` sweeps the shared set unfiltered; the filter
+        // above is why §4.B L5 is scoped to the stamp and not to the sort.)
         let mut out = Vec::new();
         for i in 0..items.len() {
             if !self.is_constrained(items[i].1) {
@@ -1248,6 +1250,20 @@ impl Arith {
             if self.vars.is_slack(v) || !self.vars.is_int(v) {
                 continue;
             }
+            // L4 (§4.B): "no free var carries an a-priori box" — load-bearing
+            // for L5 step 3. It holds by a coincidence across two loops in
+            // `new_var`: pre-seeding the ONLY `is_int` stamper is the
+            // `mark_int` loop (`lib.rs:1294`), which walks the same
+            // canonicalized comb as the marking loop right below it
+            // (`lib.rs:1303`) — so `is_int` ⟹ really marked. No union can exist
+            // yet (no shared var is interned before the first `propagate`), so
+            // class == var here and this reads the var's own mark. Widening
+            // Int-stamping breaks the soundness argument with every test still
+            // green; this fence fires instead, at zero release cost.
+            debug_assert!(
+                self.is_constrained(v),
+                "L4: every boxed var must be really marked"
+            );
             let lo_lit = self.fresh_sentinel();
             let hi_lit = self.fresh_sentinel();
             self.apriori_lits.insert(lo_lit.code());
@@ -2122,23 +2138,51 @@ mod nelson_oppen_tests {
 
     #[test]
     fn apriori_box_does_not_constrain() {
-        // The a-priori box (`seed_apriori_if_needed`) puts bounds on EVERY Int
-        // problem var, including free ones. Those bounds must NOT count as a
-        // constraint: a uniform [-M, M] box entails no equality, and treating it
-        // as constraining would defeat the whole slice.
+        // The a-priori box (`seed_apriori_if_needed`) must never leave a free
+        // var carrying box bounds — that is L4 (§4.B), and L5 step 3 rests on
+        // it. This test now builds the state in the SOLVER'S OWN ORDER, which
+        // is L4's premise: seeding runs at the first `propagate`
+        // (`lib.rs:1391`), strictly before any shared var is interned
+        // (`ensure_shared_var` is reachable only from `drive_final_check`).
+        //
+        // The earlier version of this test interned the free shared var FIRST
+        // and then seeded, asserting the resulting box did not mark it. That
+        // ordering is precisely what L4's premise excludes and cannot arise in
+        // the solver, and the box loop's `debug_assert!` correctly trips on it.
+        // Under the real order the property is stronger and simpler: a free var
+        // is never boxed at all.
         let mut h = Harness::new();
+        let a = int_var_no(&mut h.ctx, "xa");
+        let five = h
+            .ctx
+            .mk_numeral(Rational::from_int(5i128.into()), h.ctx.int_sort());
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[a, five])
+            .unwrap();
+        h.assert_atom(0, le);
+        // First `propagate`: seeds the box over the vars present so far — all
+        // of them interned (and marked) by a registered atom.
+        h.arith.seed_apriori_if_needed();
+        let av = h.arith.vars.problem_var(a);
+        assert!(
+            h.arith.bounds.lower(av).is_some() && h.arith.bounds.upper(av).is_some(),
+            "precondition: the a-priori box must actually have been seeded"
+        );
+
+        // Now the shared var, interned the way `drive_final_check` does it:
+        // after seeding. It gets no box, and the box marks nothing.
         let x = int_var_no(&mut h.ctx, "xi");
         let ctx = std::mem::replace(&mut h.ctx, Context::new());
         h.arith.ensure_shared_var(&ctx, x);
-        h.arith.seed_apriori_if_needed();
         let xv = h.arith.vars.problem_var(x);
         assert!(
-            h.arith.bounds.lower(xv).is_some() && h.arith.bounds.upper(xv).is_some(),
-            "precondition: the a-priori box must actually have been seeded"
+            !h.arith.is_constrained(xv),
+            "a-priori box seeding must not mark a shared var constrained"
         );
         assert!(
-            !h.arith.is_constrained(xv),
-            "a-priori box bounds must not mark a var constrained"
+            h.arith.bounds.lower(xv).is_none() && h.arith.bounds.upper(xv).is_none(),
+            "L4: a free var carries no a-priori box"
         );
     }
 
@@ -2827,6 +2871,106 @@ mod nelson_oppen_tests {
 
         let pairs = h.arith.model_equal_shared_pairs(&[x, y]);
         assert_eq!(pairs.len(), 1, "constrained model-equal pair must survive");
+    }
+
+    #[test]
+    fn a_leading_free_var_does_not_abort_the_probe_sweep() {
+        // GUARD SHAPE, not guard predicate: the outer `if !is_constrained`
+        // must `continue` the outer loop, NOT `break` it. `free` sits at index
+        // 0 of the shared list, so a `break` would abandon the sweep before
+        // ever reaching the genuinely entailed `c1 = c2` behind it — dropping
+        // an entailed equality from the arith→EUF exchange, an incompleteness
+        // that can surface as a WRONG combined `sat`. Every other free-var
+        // test puts the free var last or makes both sides free, so none of
+        // them constrains this branch.
+        let mut h = Harness::new();
+        let free = real_var(&mut h.ctx, "free");
+        let c1 = real_var(&mut h.ctx, "c1");
+        let c2 = real_var(&mut h.ctx, "c2");
+        let three = num(&mut h.ctx, 3);
+        let mut i = 0u32;
+        for v in [c1, c2] {
+            let le = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[v, three])
+                .unwrap();
+            let ge = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[v, three])
+                .unwrap();
+            h.assert_atom(i, le);
+            h.assert_atom(i + 1, ge);
+            i += 2;
+        }
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        for v in [free, c1, c2] {
+            h.arith.ensure_shared_var(&ctx, v);
+        }
+        let freev = h.arith.vars.problem_var(free);
+        assert!(
+            !h.arith.is_constrained(freev),
+            "the index-0 var must really be free, or the test proves nothing"
+        );
+
+        let got = pairset(&h.arith.entailed_equalities(&ctx, &[free, c1, c2]));
+        assert!(
+            got.contains(&(c1.index().min(c2.index()), c1.index().max(c2.index()))),
+            "c1 = c2 is entailed and must survive a LEADING free var, got {got:?}"
+        );
+        assert_eq!(
+            got.len(),
+            1,
+            "only the constrained pair may be reported, got {got:?}"
+        );
+    }
+
+    #[test]
+    fn mbtc_a_leading_free_var_does_not_abort_the_sweep() {
+        // The MBTC analogue of `a_leading_free_var_does_not_abort_the_probe_sweep`:
+        // `break` at the outer level would drop the model-equal pair behind
+        // the leading free var, so MBTC would never split an arrangement it is
+        // responsible for deciding.
+        let mut h = Harness::new();
+        let free = int_var_no(&mut h.ctx, "freem");
+        let c1 = int_var_no(&mut h.ctx, "c1m");
+        let c2 = int_var_no(&mut h.ctx, "c2m");
+        let three = h
+            .ctx
+            .mk_numeral(Rational::from_int(3i128.into()), h.ctx.int_sort());
+        for (i, v) in [c1, c2].iter().enumerate() {
+            let le = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Le), &[*v, three])
+                .unwrap();
+            let ge = h
+                .ctx
+                .mk_app(Op::Builtin(BuiltinOp::Ge), &[*v, three])
+                .unwrap();
+            h.assert_atom(2 * i as u32, le);
+            h.assert_atom(2 * i as u32 + 1, ge);
+        }
+        assert!(matches!(h.check(), TCheck::Sat));
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        for v in [free, c1, c2] {
+            h.arith.ensure_shared_var(&ctx, v);
+        }
+        let freev = h.arith.vars.problem_var(free);
+        assert!(
+            !h.arith.is_constrained(freev),
+            "the index-0 var must really be free, or the test proves nothing"
+        );
+        assert!(
+            h.arith.vars.is_int(freev),
+            "the leading var must survive the is_int filter to sit at index 0"
+        );
+
+        let pairs = h.arith.model_equal_shared_pairs(&[free, c1, c2]);
+        assert_eq!(
+            pairs.len(),
+            1,
+            "the (c1, c2) pair must survive a LEADING free var, got {pairs:?}"
+        );
     }
 }
 

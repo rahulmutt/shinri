@@ -321,13 +321,19 @@ fn mutual_cycle_is_unsat() {
 /// DT-minted `head(t)` selector application an Int-sorted UF app, so the
 /// sort-only filter in `Euf::shared_arith_terms` sweeps all of them into the
 /// Nelson-Oppen shared set. Pre-slice-42 every pair sat at β = 0 and was probed
-/// with two simplex solves: 24.1 s at n = 24, against 6 ms for the same query
-/// with an uninterpreted field sort.
+/// with two simplex solves: 24.7 s at n = 24 (release), against 10 ms for the
+/// same n = 24 query with an uninterpreted field sort — the control pinned by
+/// `uninterpreted_field_chain_is_fast` below. Post-fix the Int-field query
+/// matches that control exactly at 10 ms, a ≈2470× improvement. (The spec's
+/// ≈1600× headline is the n = 20 pair, 9.4 s vs 6 ms; do not mix the two.)
 ///
-/// The bound is deliberately loose (5 s against a 24.1 s baseline). Wall-clock
-/// assertions are normally a flakiness smell; a ≈1600× fault leaves enough
+/// The bound is deliberately loose (5 s against a 24.7 s baseline). Wall-clock
+/// assertions are normally a flakiness smell; a fault of this size leaves enough
 /// margin to be worth one, and without it a regression silently consumes the
-/// blocking tier's 10-15 min budget.
+/// blocking tier's 10-15 min budget. The tier that actually runs this is the
+/// DEBUG profile, where the query takes ≈90 ms against a ~5 ms process-startup
+/// floor — ~55× of margin under the 5 s bound, so the bound is not tight even
+/// unoptimized.
 #[test]
 fn int_field_chain_does_not_blow_up() {
     let n = 24;
@@ -347,10 +353,13 @@ fn int_field_chain_does_not_blow_up() {
     let out = run_script(&src);
     let elapsed = start.elapsed();
 
-    assert_eq!(out.last().map(String::as_str), Some("sat"));
+    // Exact, not `last()`: a script that errored on every `assert` and then
+    // trivially `sat`-ed on an empty problem would be fast AND green under the
+    // weaker form.
+    assert_eq!(out, vec!["sat"]);
     assert!(
         elapsed.as_secs() < 5,
-        "n={n} Int-field chain took {elapsed:?}; pre-slice-42 baseline was 24.1s \
+        "n={n} Int-field chain took {elapsed:?}; pre-slice-42 baseline was 24.7s \
          and the post-fix target is milliseconds"
     );
 }
@@ -379,6 +388,7 @@ fn uninterpreted_field_chain_is_fast() {
     let out = run_script(&src);
     let elapsed = start.elapsed();
 
-    assert_eq!(out.last().map(String::as_str), Some("sat"));
+    // Exact, for the same reason as the gate above.
+    assert_eq!(out, vec!["sat"]);
     assert!(elapsed.as_secs() < 5, "control query took {elapsed:?}");
 }

@@ -199,6 +199,11 @@ radius, which is a further reason the oracle run must be unfiltered (§5).
 
 ### 4.B Entry-point audit (recorded during implementation)
 
+> **Reading order.** L1 + L2 (bound closure, primitive and derived) → L3 (the
+> class-level shift). L4 (no free var is boxed) → L5 (the joint arrangement).
+> C2 + C2b (merged ⟺ same live component) → Conclusion, which case-splits a
+> skipped pair on L3 and C2.
+
 Method: every non-test writer of `bounds` in `shinri-arith` (`apply_bound` at
 `lib.rs:433` is the funnel; `Bounds::tighten` at `bounds.rs:73` the primitive),
 every non-test writer of the tableau (`Tableau::define_slack`,
@@ -513,8 +518,11 @@ contains a stamped shared var; group the shared problem vars by live component.
 
 The construction moves a component whole, Real members included; that is sound
 for the same reason (an unmarked Real var carries no bound either), and it
-disturbs no out-of-scope pair either, since step 4's `D` is taken over every
-shared var and the targets clear all of them.
+disturbs no out-of-scope pair either — not in the *collision* direction, since
+step 4's `D` is taken over every shared var and the targets clear all of them;
+and not in the *separation* direction, because an out-of-scope var merged with a
+moved one lies in that same live component by C2b and therefore moves with it
+rigidly (L3 part 1), so no merged pair is pulled apart.
 
 **Conclusion.** Let `(u, v)` be a pair a guard skips, so (WLOG)
 `real(class(u)) = false`. Vars are deduped to distinct problem vars before
@@ -651,6 +659,8 @@ rule stays speculative until a query demands it.
   z3/cvc5-confirmed (§4.A). Any `sat` ↔ `unsat` or decided → `unknown` flip is a
   regression.
 - The §3.A entry-point audit is recorded, establishing that no path can
-  constrain a problem var without marking it.
+  constrain a problem var without marking it **or joining its class** — the
+  disjunct is task 4b's: an interface equality constrains only the *difference*,
+  so it joins rather than marks (§4.B, L1 case (b)).
 - Unit tests pin both the skip (no slack minted) and each marking path's
   restoration of probing.
