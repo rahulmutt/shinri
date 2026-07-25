@@ -73,6 +73,13 @@ pub struct Solver {
     /// Array models rendered after a QF_ABV SAT result: declared array constant
     /// TermId → pre-rendered SMT-LIB `store`-chain string. Cleared on non-ABV paths.
     abv_array_models: rustc_hash::FxHashMap<TermId, String>,
+    /// User-declared functions in declaration order — what `get-model`
+    /// enumerates (slice 43 §4.A). Datatype constructor/selector/tester symbols
+    /// are absent by construction: they arrive via `Command::DeclareDatatypes`,
+    /// not `Command::DeclareFun`, which is why `nil` cannot appear as a model
+    /// entry. Internal mints (`ite!`, `!`-prefixed bridge symbols) never pass
+    /// through a command at all.
+    declared: Vec<DeclaredFun>,
     /// Word-level normalization state (slice 5): ite→fresh-symbol memo and
     /// the internal-symbol set excluded from model output.
     word_norm: crate::word_norm::WordNorm,
@@ -97,6 +104,47 @@ pub struct Solver {
     /// Cumulative cluster-B guard bailouts across this solver's check-sats
     /// (slice 11); see `shinri_sat::Solver::theory_guard_bailouts`.
     theory_guard_bailouts: u64,
+}
+
+/// One user-declared function. `arity == 0` entries are the ones `get-model`
+/// emits; higher arities are recorded but not printed (slice 43 §5 — function
+/// graphs need EUF congruence-class enumeration and are a later slice).
+///
+/// Deliberately does NOT carry a precomputed `TermId` for the 0-arity nullary
+/// application, even though Task 5 needs exactly that to look up a symbol's
+/// assigned model value. Minting it here, in the `DeclareFun` arm, is NOT the
+/// pre-clone-mint-safe operation it looks like: `Context::mk_app` hash-conses,
+/// so for a symbol already referenced by an assertion the call is a free
+/// lookup, but for the (very common) case of "declare, then assert" — the
+/// normal SMT-LIB order — the term does not exist yet, so the call MINTS a
+/// brand-new term and extends the arena *before* the later `Assert` command
+/// would otherwise have created it in a different arena position. That shifts
+/// the numeric `TermId` of every term created afterward, which reorders the
+/// `FxHashMap<TermId, _>`-keyed atom/clause bookkeeping the string theory's
+/// (incomplete) decision procedure walks — and that reordering is
+/// verdict-observable. Measured: eagerly minting here flips
+/// `script_e2e::post_mint_declaration_of_pfx_name_is_rejected`'s second
+/// `check-sat` from `sat` to `unknown` (repro: declare-fun s, assert
+/// `str.prefixof`+`str.len`, check-sat, [rejected decl], check-sat again —
+/// same assertions re-solved, different verdict). That is exactly the
+/// verdict flip slice 43 must never produce. The safe timing for this lookup
+/// is post-solve, in Task 5's `format_model`/`GetModel` handling: by then
+/// every prior `Assert`'s terms already exist, so `mk_app` is either a
+/// no-op lookup (referenced symbols) or a term creation that happens after
+/// the current solve has already run (orphaned symbols) — neither can
+/// perturb the decision it would otherwise share ordering with. `sym` is
+/// kept (see below) precisely so Task 5 can do that lookup itself.
+struct DeclaredFun {
+    #[allow(dead_code)] // read by the #[cfg(test)] declared_names() proof
+    // helper today; Task 5 reads it to emit the define-fun name
+    name: String,
+    #[allow(dead_code)] // consumed by Task 5's post-solve TermId lookup via
+    // `ctx.mk_app(Op::Uninterpreted(sym), &[])` — see the struct doc above
+    sym: shinri_core::SymbolId,
+    #[allow(dead_code)] // Task 5 filters get-model entries on arity == 0
+    arity: usize,
+    #[allow(dead_code)] // Task 5 prints this as the define-fun result sort
+    result: shinri_core::SortId,
 }
 
 /// A pre-minted Real-bridge row (slice 9). All atom TermIds are minted before
@@ -170,6 +218,7 @@ impl Solver {
             fp_var_bits: rustc_hash::FxHashMap::default(),
             fp_rm_sels: rustc_hash::FxHashMap::default(),
             abv_array_models: rustc_hash::FxHashMap::default(),
+            declared: Vec::new(),
             word_norm: crate::word_norm::WordNorm::default(),
             eliminated_ite_vals: rustc_hash::FxHashMap::default(),
             pending_bridge: Vec::new(),
@@ -308,12 +357,26 @@ impl Solver {
                 self.last_model = None;
                 self.eliminated_ite_vals.clear();
                 self.abv_array_models.clear();
+                self.declared.clear();
+                CommandResponse::None
+            }
+            Command::DeclareFun {
+                name,
+                sym,
+                params,
+                result,
+            } => {
+                self.declared.push(DeclaredFun {
+                    name,
+                    sym,
+                    arity: params.len(),
+                    result,
+                });
                 CommandResponse::None
             }
             Command::SetLogic(_)
             | Command::DeclareSort { .. }
             | Command::DeclareDatatypes { .. }
-            | Command::DeclareFun { .. }
             | Command::SetOption { .. }
             | Command::SetInfo { .. }
             | Command::Exit => CommandResponse::None,
@@ -2017,6 +2080,10 @@ impl Solver {
         let lit = enc.encode(formula);
         (lit, enc.atom_vars.clone())
     }
+
+    pub(crate) fn declared_names(&self) -> Vec<&str> {
+        self.declared.iter().map(|d| d.name.as_str()).collect()
+    }
 }
 
 #[cfg(test)]
@@ -2061,6 +2128,25 @@ mod execute_tests {
         let mut s = Solver::new();
         assert!(matches!(s.execute(Command::Push(2)), CommandResponse::None));
         assert!(matches!(s.execute(Command::Pop(1)), CommandResponse::None));
+    }
+
+    #[test]
+    fn declare_fun_populates_the_declared_registry_in_order() {
+        // The registry is what get-model enumerates (slice 43 §4.A). It must
+        // hold user declarations in declaration order, and must NOT pick up
+        // constructor/selector/tester symbols, which arrive via
+        // Command::DeclareDatatypes rather than Command::DeclareFun.
+        let src = "(set-logic QF_UFDTLIA)\
+                   (declare-datatype List ((nil) (cons (head Int) (tail List))))\
+                   (declare-fun l () List)\
+                   (declare-fun x () Int)\
+                   (declare-fun f (Int) Int)";
+        let mut s = Solver::new();
+        let mut p = shinri_parser::Parser::new(src);
+        while let Some(Ok(cmd)) = p.next_command(s.ctx_mut()) {
+            s.execute(cmd);
+        }
+        assert_eq!(s.declared_names(), vec!["l", "x", "f"]);
     }
 }
 
