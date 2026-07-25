@@ -831,11 +831,13 @@ impl Arith {
         // Pair-local satisfiability is NOT the whole obligation: the Sat this
         // feeds needs ONE model separating every skipped pair at once, and
         // independent ±1 steps do not compose. §4.B, L5 supplies that joint
-        // model (free components carry no bound at all — L4 — so each can be
-        // moved to a fresh value). It is also why the general claim "every
-        // arrangement of a free var is arith-satisfiable" stays refuted: a
-        // BOXED var cannot be forced equal to one minted after seeding whose
-        // value exceeds `M`; free vars are simply never boxed.
+        // model over exactly the candidate set built below — the `is_int`-
+        // stamped shared vars — which is MBTC's whole remit; free components
+        // carry no bound at all (L4), so each can be moved to a fresh value.
+        // It is also why the general claim "every arrangement of a free var is
+        // arith-satisfiable" stays refuted: a BOXED var cannot be forced equal
+        // to one minted after seeding whose value exceeds `M`; free vars are
+        // simply never boxed.
         //
         // This is a DISTINCT soundness claim from the one in
         // `entailed_equalities` — arrangement agreement, not equality
