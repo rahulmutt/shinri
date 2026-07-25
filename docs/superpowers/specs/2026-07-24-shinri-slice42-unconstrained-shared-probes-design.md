@@ -23,7 +23,7 @@ registered terms by **sort alone** — sweeps every one of them into the
 Nelson–Oppen shared set `S`. Arith is then asked, once per exchange round, which
 equalities over `S` it entails. Every one of those terms is an unconstrained
 fresh problem var sitting at β = 0, so `entailed_equalities`' same-β pre-filter
-(`shinri-arith/src/lib.rs:631`) admits **every pair**, and each pair costs a
+(`shinri-arith/src/lib.rs:704`) admits **every pair**, and each pair costs a
 slack definition plus two simplex probes. None can ever succeed.
 
 Measured on a chain of `n` nested `((_ is nil) (tail …))` constraints:
@@ -83,10 +83,10 @@ without marking either:
 
 | Entry point | Site | Effect |
 |---|---|---|
-| Atom registration | `new_var`, `lib.rs:1284` | **marks** — the var occurs in a registered arith atom (including B&B branch/cut atoms routed via `Combiner::bind_fresh`) |
-| Assertion | `assert`, `lib.rs:1330` | **marks** — the atom's bound is on the trail |
-| Numeral pin | `ensure_shared_var`, `lib.rs:653` | **marks** — a numeral pinned to its value *is* a constraint |
-| Interface equality | `assert_interface_equality`, `lib.rs:925` (via `consume_interface_equality`, `lib.rs:1419`) | **joins only** — the EUF→arith equality pins `av - bv = 0`, a real constraint on the *difference* that carries no information about either value |
+| Atom registration | `new_var`, `lib.rs:1301` | **marks** — the var occurs in a registered arith atom (including B&B branch/cut atoms routed via `Combiner::bind_fresh`) |
+| Assertion | `assert`, `lib.rs:1347` | **marks** — the atom's bound is on the trail |
+| Numeral pin | `ensure_shared_var`, `lib.rs:659` | **marks** — a numeral pinned to its value *is* a constraint |
+| Interface equality | `assert_interface_equality`, `lib.rs:942` (via `consume_interface_equality`, `lib.rs:1436`) | **joins only** — the EUF→arith equality pins `av - bv = 0`, a real constraint on the *difference* that carries no information about either value |
 
 `is_constrained(v)` reads the flag at `v`'s class root, so a class counts as
 constrained iff **some** member carries a real constraint. The last row was a
@@ -111,14 +111,14 @@ pop-ordering hazard.
 
 ### 3.B The guard
 
-In `entailed_equalities`, at candidate construction (`lib.rs:714`–`727`), skip a
+In `entailed_equalities`, at candidate construction (`lib.rs:722`–`735`), skip a
 pair when **either** var is unconstrained — after task 4b, when either var's
 interface-equality class is (§3.A).
 
 The guard MUST sit at candidate construction, before the `define_slack` loop at
-`lib.rs:734`–`738`. Slacks minted for a candidate pair **persist across calls**:
-the snapshot at `lib.rs:743` is taken *after* `define_slack`, the final `restore`
-(`lib.rs:793`) restores to that post-definition snapshot, and
+`lib.rs:742`–`746`. Slacks minted for a candidate pair **persist across calls**:
+the snapshot at `lib.rs:751` is taken *after* `define_slack`, the final `restore`
+(`lib.rs:801`) restores to that post-definition snapshot, and
 `Vars::slack_var` memoizes the combination. A guard placed later would leave the
 `u − v` rows behind on the first call and pay for them forever.
 
@@ -129,7 +129,7 @@ previously-probed var into a row. Constrainedness must be tracked explicitly.
 
 ### 3.C MBTC
 
-The same guard applies in `model_equal_shared_pairs` (`lib.rs:801`), which feeds
+The same guard applies in `model_equal_shared_pairs` (`lib.rs:809`), which feeds
 the MBTC trichotomy split at `combiner.rs:813`. It runs the identical same-β
 pairwise sweep over `S` and hands the `Combiner` the first model-equal pair,
 which becomes a 3-way `(= u v) ∨ (< u v) ∨ (> u v)` split. With 40 unconstrained
@@ -164,7 +164,7 @@ Two consequences:
   nothing to contribute to deciding it and MBTC's split is not needed for
   agreement.
 
-Vars are deduped to distinct problem vars before pairing (`lib.rs:619`–`625`), so the
+Vars are deduped to distinct problem vars before pairing (`lib.rs:697`–`704`), so the
 degenerate `u = u` case does not arise.
 
 **The invariant is only as strong as the exhaustiveness of §3.A's four entry
@@ -182,7 +182,7 @@ and nothing decided can become `unknown` on that account. There is one
 asymmetric exception, and it is an improvement rather than a regression.
 
 `Arith::STRING_PATH_PIVOT_BUDGET` and `STRING_PATH_BRANCH_BUDGET`
-(`lib.rs:196`, `lib.rs:187`) exist precisely because the String↔Arith length
+(`lib.rs:214`, `lib.rs:205`) exist precisely because the String↔Arith length
 seam feeds `entailed_equalities` / `model_equal_shared_pairs` a degenerate
 system whose probing re-solves simplex unboundedly; on exhaustion `check_full`
 returns a **sound `Unknown`**. Those budgets are cumulative over a solve. Pruning
@@ -200,7 +200,7 @@ radius, which is a further reason the oracle run must be unfiltered (§5).
 ### 4.B Entry-point audit (recorded during implementation)
 
 Method: every non-test writer of `bounds` in `shinri-arith` (`apply_bound` at
-`lib.rs:427` is the funnel; `Bounds::tighten` at `bounds.rs:73` the primitive),
+`lib.rs:433` is the funnel; `Bounds::tighten` at `bounds.rs:73` the primitive),
 every non-test writer of the tableau (`Tableau::define_slack`,
 `Tableau::pivot`), and every emitter of a fresh atom. Line numbers are against
 `crates/shinri-arith/src/lib.rs` after task 4b landed.
@@ -234,19 +234,19 @@ often, i.e. probe more — the sound direction.
 
 | Site | Marks? | Why that is correct |
 |---|---|---|
-| `new_var` atom registration (`lib.rs:1284`) | yes | dominant site; marks every problem var of the normalized comb, so it covers multi-var atoms whose encoding is over a slack |
-| `assert` → `apply_bound` (`lib.rs:1330`, `1331`) | yes | the atom's bound goes on the trail. Unreachable without `new_var` (it indexes `self.enc`, sized there), so this is belt-and-braces over the row above |
-| `ensure_shared_var` numeral pin (`lib.rs:653` mark, `661`/`662` tighten) | yes | a numeral is fixed to its value. This is what keeps a DT collapse to a *constant* (`head(cons(5,t)) = 5`) probeable, and with it the QF_DT⋈arith anchors |
-| `ensure_shared_var` non-numeral path (`lib.rs:642`–`668`) | **no** | installs no bound and no row. It is not quite "nothing": `problem_var_sorted` (`lib.rs:646` → `vars.rs:46`) stamps Int-sortedness, which restricts the var to ℤ and makes it eligible for the a-priori box. Harmless — the shift step below is integral. The population this slice prunes |
-| `assert_interface_equality` (`lib.rs:925` **join**, `943`/`946` bound, `928` row) | **no — joins instead** | it pins `av - bv = 0`, which is a real constraint on the *difference* and carries no information about either value, so it is a class edge and not a mark (task 4b). L1 below still carries it as a primitive bound. Marking here was the pre-4b rule and it made the guard fire on nothing: DT's collapse lemma emits `head(cons(h,t)) = h` for every constructor instantiation, so every selector app got marked through a congruence-only equality |
-| `seed_apriori_if_needed` (`lib.rs:1236`, `1237`) | **no** | seeds a UNIFORM `[-M, M]` box on every non-slack Int var. `lo`/`hi` are computed once (`lib.rs:1225`–`1226`) outside the loop and nothing on this path narrows per var. `apriori_bound` (`lib.rs:1187`) gives `M = (n+1)·((n+m)a+1)^(n+m)` with `a = apriori_coeff_max ≥ 0` and `n ≥ 1` whenever the loop bounds anything, so `M ≥ 2`: the box always admits ≥ 5 integer values. Two vars in a box of width ≥ 2 are not entailed equal. Marking here would mark every Int var and defeat the slice |
-| `run_fbbt` (`lib.rs:1258`) | **no** | a *derived* site: it emits only consequences of the bounds and rows already present (Lemma L2). Note it CAN bound a slack — `propagate.rs:111`–`133` sweeps every var, slacks included, and `bounds.upper(v).is_none_or(…)` makes any finite derived interval on a bound-free slack count as strictly tighter, so it is emitted and installed permanently at level 0. L1 below is therefore stated over *primitive* bounds only, and this row is discharged by L2 instead |
-| `probe` (`lib.rs:863`) | **no** | the probe's own synthetic strict bound. Undone by `restore` (`lib.rs:758`–`772`) after every probe and once more before `entailed_equalities` returns (`lib.rs:793`), so nothing survives the call. *(Site the plan's draft table omitted.)* |
-| `atom_var_and_rhs` slack row (`lib.rs:325`) | n/a | the comb is the registered atom's, whose vars `new_var` marked |
-| `entailed_equalities` probe slack rows (`lib.rs:737`) | **no** | the one row family whose *defining comb* can span an unmarked var. Persists across calls (the snapshot at `lib.rs:743` is taken *after* the rows exist, and `pop` does not restore the tableau) — but carries no surviving primitive bound, and by L1 acquires one only together with a mark or a live class edge |
-| `Tableau::pivot` (`lib.rs:539`) | n/a | basis change; the row space, hence the constraint set, is unchanged |
-| `integer_check` B&B split atoms (`lib.rs:1020`+) | n/a | emits `TCheck::Split`, writes no bound. Routed back through `crates/shinri-sat/src/solver.rs:734` → `Combiner::bind_fresh` (`crates/shinri-theory/src/combiner.rs:374`, `Owner::Arith`/`Shared` arms at `combiner.rs:411`/`423`) → `Arith::new_var`, which marks. `branch.rs` itself holds only the pure helpers `floor_ceil`/`round_int_bound` — it emits nothing |
-| `try_gmi_cut` / `cuts::derive_gmi` (`lib.rs:1105`, `cuts.rs:38`) | n/a | derived from existing rows and bounds; emits a `TCheck::Split` atom on the same `bind_fresh` → `new_var` route, and writes no bound directly |
+| `new_var` atom registration (`lib.rs:1301`) | yes | dominant site; marks every problem var of the normalized comb, so it covers multi-var atoms whose encoding is over a slack |
+| `assert` → `apply_bound` (`lib.rs:1347`, `1348`) | yes | the atom's bound goes on the trail. Unreachable without `new_var` (it indexes `self.enc`, sized there), so this is belt-and-braces over the row above |
+| `ensure_shared_var` numeral pin (`lib.rs:659` mark, `667`/`668` tighten) | yes | a numeral is fixed to its value. This is what keeps a DT collapse to a *constant* (`head(cons(5,t)) = 5`) probeable, and with it the QF_DT⋈arith anchors |
+| `ensure_shared_var` non-numeral path (`lib.rs:648`–`674`) | **no** | installs no bound and no row. It is not quite "nothing": `problem_var_sorted` (`lib.rs:652` → `vars.rs:46`) stamps Int-sortedness, which restricts the var to ℤ and makes it eligible for the a-priori box. Harmless — the shift step below is integral. The population this slice prunes |
+| `assert_interface_equality` (`lib.rs:942` **join**, `960`/`963` bound, `945` row) | **no — joins instead** | it pins `av - bv = 0`, which is a real constraint on the *difference* and carries no information about either value, so it is a class edge and not a mark (task 4b). L1 below still carries it as a primitive bound. Marking here was the pre-4b rule and it made the guard fire on nothing: DT's collapse lemma emits `head(cons(h,t)) = h` for every constructor instantiation, so every selector app got marked through a congruence-only equality |
+| `seed_apriori_if_needed` (`lib.rs:1253`, `1254`) | **no** | seeds a UNIFORM `[-M, M]` box on every non-slack Int var. `lo`/`hi` are computed once (`lib.rs:1242`–`1243`) outside the loop and nothing on this path narrows per var. `apriori_bound` (`lib.rs:1204`) gives `M = (n+1)·((n+m)a+1)^(n+m)` with `a = apriori_coeff_max ≥ 0` and `n ≥ 1` whenever the loop bounds anything, so `M ≥ 2`: the box always admits ≥ 5 integer values. Two vars in a box of width ≥ 2 are not entailed equal. Marking here would mark every Int var and defeat the slice |
+| `run_fbbt` (`lib.rs:1275`) | **no** | a *derived* site: it emits only consequences of the bounds and rows already present (Lemma L2). Note it CAN bound a slack — `propagate.rs:111`–`133` sweeps every var, slacks included, and `bounds.upper(v).is_none_or(…)` makes any finite derived interval on a bound-free slack count as strictly tighter, so it is emitted and installed permanently at level 0. L1 below is therefore stated over *primitive* bounds only, and this row is discharged by L2 instead |
+| `probe` (`lib.rs:880`) | **no** | the probe's own synthetic strict bound. Undone by `restore` (`lib.rs:766`–`780`) after every probe and once more before `entailed_equalities` returns (`lib.rs:801`), so nothing survives the call. *(Site the plan's draft table omitted.)* |
+| `atom_var_and_rhs` slack row (`lib.rs:331`) | n/a | the comb is the registered atom's, whose vars `new_var` marked |
+| `entailed_equalities` probe slack rows (`lib.rs:745`) | **no** | the one row family whose *defining comb* can span an unmarked var. Persists across calls (the snapshot at `lib.rs:751` is taken *after* the rows exist, and `pop` does not restore the tableau) — but carries no surviving primitive bound, and by L1 acquires one only together with a mark or a live class edge |
+| `Tableau::pivot` (`lib.rs:545`) | n/a | basis change; the row space, hence the constraint set, is unchanged |
+| `integer_check` B&B split atoms (`lib.rs:1037`+) | n/a | emits `TCheck::Split`, writes no bound. Routed back through `crates/shinri-sat/src/solver.rs:734` → `Combiner::bind_fresh` (`crates/shinri-theory/src/combiner.rs:374`, `Owner::Arith`/`Shared` arms at `combiner.rs:411`/`423`) → `Arith::new_var`, which marks. `branch.rs` itself holds only the pure helpers `floor_ceil`/`round_int_bound` — it emits nothing |
+| `try_gmi_cut` / `cuts::derive_gmi` (`lib.rs:1122`, `cuts.rs:38`) | n/a | derived from existing rows and bounds; emits a `TCheck::Split` atom on the same `bind_fresh` → `new_var` route, and writes no bound directly |
 
 The sites split into **primitive** ones (they assert something arith was told)
 and **derived** ones (`run_fbbt`, GMI cuts — they restate what the primitive
@@ -259,8 +259,8 @@ var in its **defining comb** is really marked, or (b) the bound is an
 interface-equality pin, its defining comb is `av - bv`, and `av` and `bv` lie in
 the same live interface component.* Only three primitive sites bound a slack:
 
-- `assert` on an atom slack — case (a), because `new_var` (`lib.rs:1284`) marks
-  exactly the comb that `atom_var_and_rhs` (`lib.rs:324`) interned that slack
+- `assert` on an atom slack — case (a), because `new_var` (`lib.rs:1301`) marks
+  exactly the comb that `atom_var_and_rhs` (`lib.rs:330`) interned that slack
   from;
 - `assert_interface_equality` — case (b): a bound that is installed and not yet
   undone *is* a live interface edge, so its two endpoints are in one component
@@ -285,8 +285,8 @@ constraints already present, so they cannot constrain a var the primitive sites
 left free. `tighten_to_fixpoint` (`propagate.rs:21`) is monotone interval
 propagation seeded from the live bounds; it relaxes its inputs (δ dropped) and
 rounds only for Int vars, so everything it emits is implied. `run_fbbt` runs
-only from `seed_apriori_if_needed` (`lib.rs:1240`), gated on
-`bounds.marks_len() == 0` (`lib.rs:1220`) — level 0, so its premises are
+only from `seed_apriori_if_needed` (`lib.rs:1257`), gated on
+`bounds.marks_len() == 0` (`lib.rs:1237`) — level 0, so its premises are
 permanent and its output stays valid under every backtrack. (This is the same
 soundness property `sanitize_conflict` already relies on when it drops
 `apriori_lits` as level-0-entailed; a defect here would be a pre-existing
@@ -295,23 +295,37 @@ implied, it is preserved by any shift that preserves the primitive constraints �
 so L2 lets the argument below ignore derivation entirely.
 
 **L3 (free-class shift).** *Let `u` be a problem var with
-`real(class(u)) = false`. For any assignment satisfying arith's live
-constraints, adding the same `ε ∈ {+1, -1}` to every member of `K(u)` — and
-re-deriving each slack from its row — yields another satisfying assignment.*
+`real(class(u)) = false`. For any assignment satisfying arith's live constraints
+and any **integer** `δ` that keeps every boxed member of `K(u)` inside its box,
+adding `δ` to every member of `K(u)` — and re-deriving each slack from its row —
+yields another satisfying assignment.*
+
+By L4 below no member of a free component is boxed at all, so `δ` ranges over
+all of ℤ; the box proviso is kept because it makes the lemma independent of L4's
+call-order premise, and because §3.B needs no more than a single `δ = ±1` step,
+which a box can never take away (`M ≥ 2`, see part 2).
 
 1. *All of `K(u)` shares one value.* Each live interface edge pins its slack to
-   the fixed δ-rational `(0, 0)` (`lib.rs:943`/`946`) and that slack's defining
+   the fixed δ-rational `(0, 0)` (`lib.rs:960`/`963`) and that slack's defining
    comb is exactly `av - bv`, so `av` and `bv` agree in **both** the rational and
    the δ component. Transitively every member of `K(u)` holds the identical
-   value. The shift is therefore well defined and one choice of `ε` serves the
+   value. The shift is therefore well defined and one choice of `δ` serves the
    whole component.
+   *(One state does not satisfy that description: `apply_bound` can conflict on
+   the `Lower` pin and return before installing `Upper` (`lib.rs:960`–`965`),
+   leaving `s ≥ 0` rather than `s = 0`. It is vacuous here — the bound set is
+   infeasible, so "for any satisfying assignment" quantifies over nothing, and
+   the `Combiner` turns that conflict into `FinalCheck::Conflict`
+   (`combiner.rs:779`–`783`) without reaching either guard.)*
 2. *Bounds on problem vars.* For `x ∈ K(u)`, `x` is not really marked by (†), so
    by the table the only primitive bound it can carry is the a-priori box — and
    only if it is Int and already existed when the box was seeded; a Real var, or
-   one minted later (`lib.rs:1213` runs once), carries none. The box is uniform
-   and `M ≥ 2` (see its table row). Choose `ε` toward zero: the rational part of
-   the shifted common value then lands **strictly** inside `(-M, M)`, so the box
-   holds whatever the δ component is. Vars outside `K(u)` do not move.
+   one minted later (`lib.rs:1230` runs once), carries none. The box is uniform
+   and `M ≥ 2` (see its table row), so *some* `δ ≠ 0` always exists even for a
+   boxed component: with common rational part `r`, `|r| ≥ 1` admits the unit step
+   toward zero (`|r| - 1 < M`) and `|r| < 1` admits either unit step
+   (`|r ± 1| < 2 ≤ M`); both land **strictly** inside `(-M, M)`, so the bound
+   holds whatever the δ-rational component is. Vars outside `K(u)` do not move.
    *Mixed Int/Real components are harmless.* By (1) every member holds the same
    value and the shift moves them all by the same integer, so every member's
    integrality is whatever it was before, every Int member stays inside its box
@@ -322,28 +336,58 @@ re-deriving each slack from its row — yields another satisfying assignment.*
    L1 either (a) every var of its defining comb is really marked, so by (†) none
    is in `K(u)` and `s` does not move; or (b) `s` is an interface pin `av - bv`
    with both endpoints in one component — if that component is `K(u)` both move
-   by `ε` and the difference is unchanged, and if it is another component
-   neither moves. **Every primitively-bounded slack keeps its exact value**, so
-   every primitive slack bound still holds. Cross-component slacks *do* move by
-   `±1`, and they are exactly the ones L1 leaves bound-free: the probe slacks of
-   `entailed_equalities` (`lib.rs:737`), which persist across calls but never
-   carry a surviving primitive bound.
+   by `δ` and the difference is unchanged, and if it is another component
+   neither moves. **Every primitively-bounded slack keeps its exact value**,
+   whatever `δ` is, so every primitive slack bound still holds. Cross-component
+   slacks *do* move, and they are exactly the ones L1 leaves bound-free: the
+   probe slacks of `entailed_equalities` (`lib.rs:745`), which persist across
+   calls but never carry a surviving primitive bound.
+   This is also why shifting **several** free components at once, each by its own
+   `δ_i`, is no harder than shifting one: case (a) is immobile under all of them
+   and case (b) is intra-component, so neither case can see two different `δ`s.
+   L5 uses that.
 4. *Rows, derived bounds, integrality.* Rows hold by construction (slack values
    are re-derived from them). Every derived bound is a consequence of the
    primitive constraints (L2), which (2)–(3) preserve, so the derived bounds
-   hold too. Integrality survives because the shift is `±1`. ∎
+   hold too. Integrality survives because `δ` is an integer. ∎
+
+**L4 (no free var carries an a-priori box).** *Every var the box is seeded on is
+really marked, so no member of a free component is boxed.* The box is seeded
+exactly once, on the **first** `Arith::propagate` call:
+`Solver::solve_under` backtracks to level 0 and calls `propagate()` at the head
+of its loop (`shinri-sat/src/solver.rs:515`, `528`); `Solver::propagate` always
+calls `theory.propagate` after BCP (`solver.rs:1155`); `Combiner::propagate`
+runs `drive_propagation`, which calls `arith.propagate` unconditionally
+(`combiner.rs:865`); and `Arith::propagate` calls `seed_apriori_if_needed`
+(`lib.rs:1373`). At that first call `marks_len() == 0` — `bounds.mark()` happens
+only in `Arith::push`, driven by `trail.new_level()` at a decision
+(`solver.rs:617`, `625`) — so the seeding really does fire, and
+`apriori_seeded` (`lib.rs:1231`–`1233`) makes every later call a no-op.
+
+At that moment `self.vars` holds only `new_var`-derived problem vars — every one
+really marked (`lib.rs:1301`) — and slacks, which the box loop skips
+(`lib.rs:1246`). The only site that interns a *free* problem var is
+`ensure_shared_var`, whose sole non-test callers are `combiner.rs:582` and
+`Arith::assert_interface_equality` (`lib.rs:927`–`928`), both inside
+`drive_final_check`, which is reachable only from `theory.check(Effort::Full)`
+(`solver.rs:629`) — strictly after the first `propagate`. So every shared var is
+minted after seeding and carries no box. ∎
+
+*(This is a premise about call order, not about arith alone. If a future change
+interned a shared var before the first `propagate`, L4 fails and L5's free choice
+of target narrows to the box; L3 and §3.B are unaffected.)*
 
 **C2 (a same-component pair is already known to the shared engine).** *If
 `v ∈ K(u)` then arith does entail `u = v` — and skipping the pair still drops no
 deduction.* Every live interface bound was installed by
-`Arith::consume_interface_equality` (`lib.rs:1419`), whose only non-test caller
+`Arith::consume_interface_equality` (`lib.rs:1436`), whose only non-test caller
 is the Combiner's EUF→arith step (`combiner.rs:780`); that step asserts
 `rep = m` only for shared terms the congruence engine `cx.eq` holds in **one
 class** (`combiner.rs:745`–`757`). So each edge of the chain from `u` to `v` was
 `cx.eq`-equal when it was installed, at some level `ℓ' ≤ ℓ`, where `ℓ` is the
 level the arith bound went in at. `Combiner::pop` rewinds `cx.eq` and every
 theory to the same absolute target (`combiner.rs:500`–`505`) and `Arith::pop`
-undoes bounds by that target (`lib.rs:1442`), so a *live* arith bound means the
+undoes bounds by that target (`lib.rs:1459`), so a *live* arith bound means the
 current level is `≥ ℓ ≥ ℓ'` and the merge is live too. Hence
 `cx.eq.are_equal(u, v)` holds, and both guard sites would discard the pair
 anyway:
@@ -357,9 +401,63 @@ anyway:
 The merge target is the single shared engine `cx.eq` that every theory reads, so
 this is not an EUF-only argument: no third theory loses the equality either. ∎
 
+**C2b (the converse).** *A `cx.eq`-merged pair of shared terms lies in ONE live
+component.* The EUF→arith step asserts `rep = m` for every non-representative
+member of every `cx.eq` class of shared terms (`combiner.rs:735`–`787`), and
+MBTC is reached only after a whole round added nothing (`progressed == false`,
+`combiner.rs:797`), so by then every merged shared pair has been asserted at some
+point during this check — `iface_asserted` (`combiner.rs:763`) suppresses only
+*re*-assertion, and no `pop` runs inside `drive_final_check`, so every one of
+those bounds is still live. Chaining through the representative puts the whole
+class in one component. Together with C2: **merged ⟺ same live component**, for
+shared terms at the MBTC decision point. ∎
+
+**L5 (joint arrangement).** *When `drive_final_check` returns `Sat`
+(`combiner.rs:844`) there is a single arith model realizing the entire `cx.eq`
+arrangement over the shared terms.*
+
+L3 is not enough on its own, and it is worth being explicit about why. L3 moves
+**one** component **one** step, which is exactly what one skipped pair needs —
+that is all §3.B asks for. The `Sat` exit asserts something stronger: that every
+non-merged shared pair is *simultaneously* distinct in one model. `k` independent
+`±1` steps do not compose into that — two free components both sitting at β = 0
+and both shifted by `+1` are still equal to each other, and a shift can even
+collide a free component with a constrained var it was distinct from. The
+construction below is what bridges the gap.
+
+Let β be the model arith is sitting on (`check` returns `Sat` only after
+`integer_check` finds every Int problem var integral, `lib.rs:1037`+). Group the
+shared problem vars by live component.
+
+1. *What has to hold.* By C2/C2b, merged ⟺ same live component, and by L3 part 1
+   every member of a component holds one common value. So realizing the
+   arrangement means exactly: **distinct components get distinct values.**
+2. *Constrained components already agree.* Two constrained shared Int vars that
+   were β-equal and unmerged would be returned by `model_equal_shared_pairs`
+   (neither side is skipped) and picked as `undecided` (`combiner.rs:814`–`818`),
+   so the `Sat` exit would not have been taken. They are pairwise distinct at β
+   already; leave them there.
+3. *Free components move freely and independently.* By (†) no member of a free
+   component is really marked and by L4 none is boxed, so no member carries any
+   bound at all; by L3 parts 3–4 a rigid integer shift preserves every
+   primitively-bounded slack exactly, every row, every derived bound, and
+   integrality — and per-component shifts compose (L3 part 3). A pin can never
+   join a free component to a constrained one: that would make them one
+   component and hence one class.
+4. *Assign.* Let `D = 1 + max |β(w)|` over the shared problem vars `w`, and
+   enumerate the free components containing a shared var as `K_1, …, K_k`. Move
+   `K_i` rigidly to `D + i`. Every target is an integer, distinct from every
+   other target and strictly beyond every unmoved shared var's value, so each
+   moved component is distinct from everything else while no relation among the
+   unmoved vars changes. That is the arrangement of (1). ∎
+
+The construction moves a component whole, Real members included; that is sound
+for the same reason (an unmarked Real var carries no bound either) and disturbs
+no Real pair, since the targets avoid every other shared value.
+
 **Conclusion.** Let `(u, v)` be a pair a guard skips, so (WLOG)
 `real(class(u)) = false`. Vars are deduped to distinct problem vars before
-pairing (`lib.rs:690`–`697`), so `u ≠ v`.
+pairing (`lib.rs:697`–`704`), so `u ≠ v`.
 
 1. **`v ∉ K(u)`.** L3 shifts `K(u)` and leaves `v` where it is, so the shifted
    assignment satisfies arith with `u ≠ v`. Note this covers `v` in a *different*
@@ -375,16 +473,22 @@ Its two consequences, stated at the strength the argument actually proves:
   `combiner.rs:718` before it can make progress — so skipping still drops
   nothing. This is the one place the class rule could have cost a real
   deduction, and C2 is why it does not.
-- **§3.C.** *For the pair the split would be emitted over.* Not "every
-  arrangement of `u` is arith-satisfiable" — that is false in general, since a
-  boxed `u` cannot be made equal to a var minted after seeding whose value
-  exceeds `M`. What the guard needs is pair-local and does follow:
-  `model_equal_shared_pairs` returns only β-equal pairs (`lib.rs:801`), so at the
-  split point `u = v` already holds in the current satisfying assignment; in case
-  1 the L3 shift gives a satisfying assignment with `u ≠ v`, so both cells are
-  arith-satisfiable and arith has nothing to contribute to deciding that pair,
-  and in case 2 the pair is already merged and MBTC drops it at
-  `combiner.rs:814` regardless.
+- **§3.C.** Two things are owed here, and the pair-local one alone is *not*
+  enough.
+  *Pair-locally:* `model_equal_shared_pairs` returns only β-equal pairs
+  (`lib.rs:809`), so at the split point `u = v` already holds in the current
+  satisfying assignment; in case 1 the L3 shift gives a satisfying assignment
+  with `u ≠ v`, so both cells are arith-satisfiable and arith has nothing to
+  contribute to deciding that pair, and in case 2 the pair is already merged and
+  MBTC drops it at `combiner.rs:814` regardless.
+  *Jointly:* skipping pairs is only sound if the `Sat` the Combiner eventually
+  returns is backed by a model realizing the **whole** arrangement, over all `k`
+  skipped pairs at once. Pair-local satisfiability does not give that — `k`
+  independent `±1` steps do not compose — and L5 is what supplies it.
+  What is still NOT claimed: "every arrangement of `u` is arith-satisfiable" is
+  false in general, since a boxed `u` cannot be made equal to a var minted after
+  seeding whose value exceeds `M`. L4 is what keeps that from biting here — a
+  *free* var is never boxed, so L5's targets are unconstrained.
 
 ## 5. Testing
 

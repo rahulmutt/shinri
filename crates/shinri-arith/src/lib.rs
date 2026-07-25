@@ -280,11 +280,17 @@ impl Arith {
 
     /// Whether arith has received a real constraint about SOME member of `v`'s
     /// interface-equality class (slice 42). A var in a class with no such member
-    /// is free AS A CLASS: `u = v` is not entailed for any `v` outside the
-    /// class, and no arrangement of the pair needs deciding (§4.B). A pair
-    /// INSIDE one free class may be entailed-equal, but only because an
-    /// interface equality put it there — the shared engine already knows it
-    /// (§4.B, C2).
+    /// is free AS A CLASS: `u = v` is not entailed for any `v` outside `u`'s
+    /// LIVE interface component, and no arrangement of the pair needs deciding
+    /// (§4.B, L3/L5).
+    ///
+    /// The class is the over-approximation; the live component is what the
+    /// soundness argument moves, and the two differ after a `pop` retracts an
+    /// interface equality without undoing the union. For a `v` inside `u`'s live
+    /// component the equality IS entailed — but an interface equality put it
+    /// there, so the shared engine already knows it (§4.B, C2). For a `v`
+    /// elsewhere in the same class, the shared engine may know nothing; what
+    /// covers that case is the shift, not C2 (§4.B, Conclusion case 1).
     fn is_constrained(&self, v: ArithVar) -> bool {
         self.class_constrained
             .get(self.uf_find(v))
@@ -699,13 +705,15 @@ impl Arith {
         // Group by current β (DeltaRational equality).
         //
         // Slice 42: additionally skip any pair containing a var whose
-        // interface-equality CLASS carries no real constraint. Shifting that
-        // whole class by ±1 is another model (§4.B, L3), so `u = v` is not
-        // entailed for any `v` outside the class; for a `v` inside it the
-        // equality IS entailed but the shared engine already has the two terms
-        // merged — that is where the interface equality came from — so the
-        // Combiner discards the report (`combiner.rs:718`) and nothing is lost
-        // (§4.B, C2). The skip MUST happen here, before the `define_slack` loop
+        // interface-equality CLASS carries no real constraint. Shifting `u`'s
+        // whole LIVE interface component by ±1 is another model (§4.B, L3), so
+        // `u = v` is not entailed for any `v` outside that component — which
+        // includes a `v` elsewhere in the same class, i.e. one whose join has
+        // since been popped (§4.B, Conclusion case 1). For a `v` INSIDE the
+        // component the equality IS entailed, but the shared engine already has
+        // the two terms merged — that is where the interface equality came from
+        // — so the Combiner discards the report (`combiner.rs:718`) and nothing
+        // is lost (§4.B, C2). The skip MUST happen here, before the `define_slack` loop
         // below: the R1 snapshot is taken AFTER slack definition and the final
         // `restore` restores to it, so a slack minted for a hopeless pair would
         // persist for the rest of the solve. Without this, a datatype with an
@@ -809,17 +817,26 @@ impl Arith {
         // Slice 42: skip pairs containing a var whose interface-equality class
         // carries no real constraint. This function only ever returns β-equal
         // pairs, so for a surviving candidate `u = v` already holds in the
-        // current satisfying assignment; shifting the free class of the
-        // unconstrained side by ±1 (design doc §4.B, L3) gives a satisfying
-        // assignment with `u != v` whenever the other side is OUTSIDE that
-        // class. Both cells of the trichotomy are then arith-satisfiable FOR
-        // THIS PAIR, so arith has nothing to contribute and the split decides
-        // nothing — a claim about this pair, not about every arrangement of a
-        // free var in general (§4.B shows that stronger claim is false: a var
-        // boxed to `[-M, M]` cannot be forced equal to a var minted after
-        // seeding whose value exceeds `M`). When the other side is INSIDE the
-        // class the pair is already merged in the shared engine, so the
-        // Combiner drops it at `combiner.rs:814` before splitting (§4.B, C2).
+        // current satisfying assignment; shifting the free LIVE interface
+        // component of the unconstrained side (design doc §4.B, L3) gives a
+        // satisfying assignment with `u != v` whenever the other side is
+        // OUTSIDE that component — including when it is elsewhere in the same
+        // class, its join since popped (§4.B, Conclusion case 1). Both cells of
+        // the trichotomy are then arith-satisfiable FOR THIS PAIR, so arith has
+        // nothing to contribute and the split decides nothing. When the other
+        // side is INSIDE the component the pair is already merged in the shared
+        // engine, so the Combiner drops it at `combiner.rs:814` before
+        // splitting (§4.B, C2).
+        //
+        // Pair-local satisfiability is NOT the whole obligation: the Sat this
+        // feeds needs ONE model separating every skipped pair at once, and
+        // independent ±1 steps do not compose. §4.B, L5 supplies that joint
+        // model (free components carry no bound at all — L4 — so each can be
+        // moved to a fresh value). It is also why the general claim "every
+        // arrangement of a free var is arith-satisfiable" stays refuted: a
+        // BOXED var cannot be forced equal to one minted after seeding whose
+        // value exceeds `M`; free vars are simply never boxed.
+        //
         // This is a DISTINCT soundness claim from the one in
         // `entailed_equalities` — arrangement agreement, not equality
         // entailment — over the same var set.
