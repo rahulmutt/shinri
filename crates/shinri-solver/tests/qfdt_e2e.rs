@@ -316,3 +316,69 @@ fn mutual_cycle_is_unsat() {
     ));
     assert_eq!(out, vec!["unsat"]);
 }
+
+/// Slice 42 performance gate. A datatype with an `Int` field makes every
+/// DT-minted `head(t)` selector application an Int-sorted UF app, so the
+/// sort-only filter in `Euf::shared_arith_terms` sweeps all of them into the
+/// Nelson-Oppen shared set. Pre-slice-42 every pair sat at β = 0 and was probed
+/// with two simplex solves: 24.1 s at n = 24, against 6 ms for the same query
+/// with an uninterpreted field sort.
+///
+/// The bound is deliberately loose (5 s against a 24.1 s baseline). Wall-clock
+/// assertions are normally a flakiness smell; a ≈1600× fault leaves enough
+/// margin to be worth one, and without it a regression silently consumes the
+/// blocking tier's 10-15 min budget.
+#[test]
+fn int_field_chain_does_not_blow_up() {
+    let n = 24;
+    let mut src = String::from(
+        "(set-logic QF_DT)\
+         (declare-datatype List ((nil) (cons (head Int) (tail List))))\
+         (declare-const x List)",
+    );
+    let mut t = String::from("x");
+    for _ in 0..n {
+        src.push_str(&format!("(assert (not ((_ is nil) {t})))"));
+        t = format!("(tail {t})");
+    }
+    src.push_str("(check-sat)");
+
+    let start = std::time::Instant::now();
+    let out = run_script(&src);
+    let elapsed = start.elapsed();
+
+    assert_eq!(out.last().map(String::as_str), Some("sat"));
+    assert!(
+        elapsed.as_secs() < 5,
+        "n={n} Int-field chain took {elapsed:?}; pre-slice-42 baseline was 24.1s \
+         and the post-fix target is milliseconds"
+    );
+}
+
+/// Companion control: the same query shape with an uninterpreted field sort
+/// never entered the shared set and was always fast. Pinning it here makes a
+/// future regression attributable — if BOTH tests slow down the cause is not
+/// the arith seam.
+#[test]
+fn uninterpreted_field_chain_is_fast() {
+    let n = 24;
+    let mut src = String::from(
+        "(set-logic ALL)\
+         (declare-sort U 0)\
+         (declare-datatype List ((nil) (cons (head U) (tail List))))\
+         (declare-const x List)",
+    );
+    let mut t = String::from("x");
+    for _ in 0..n {
+        src.push_str(&format!("(assert (not ((_ is nil) {t})))"));
+        t = format!("(tail {t})");
+    }
+    src.push_str("(check-sat)");
+
+    let start = std::time::Instant::now();
+    let out = run_script(&src);
+    let elapsed = start.elapsed();
+
+    assert_eq!(out.last().map(String::as_str), Some("sat"));
+    assert!(elapsed.as_secs() < 5, "control query took {elapsed:?}");
+}
