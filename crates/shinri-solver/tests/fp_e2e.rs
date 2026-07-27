@@ -1248,19 +1248,28 @@ fn get_value_on_eliminated_rm_ite_returns_mode() {
 }
 
 #[test]
-fn pop_clears_eliminated_ite_value_no_stale_get_value() {
-    // I3 (slice 6): pop()/Reset cleared last_model but NOT eliminated_ite_vals
-    // (nor abv_array_models), so after (pop 1) a get-value on the eliminated ite
-    // served a STALE value while other vars correctly returned "?".
+fn get_value_after_pop_errors_no_stale_value() {
+    // Originally I3 (slice 6): pop()/Reset cleared last_model but NOT
+    // eliminated_ite_vals (nor abv_array_models), so after (pop 1) a
+    // get-value on the eliminated ite served a STALE value while other vars
+    // correctly returned "?". The fix was `Solver::pop` clearing those two
+    // maps directly (`lib.rs:362-363`).
     //
-    // Slice 43 T6 Part B tightened this further: `pop` already invalidates
-    // `last_outcome` (no fresh `check-sat` has run against the popped
-    // assertion set), and `get-value` is now gated on `last_outcome ==
-    // Some(Sat)` exactly like `get-model` (§4.B/§4.C). So a get-value after
-    // `pop` with no intervening `check-sat` is no longer a per-value `?`
-    // placeholder — it is `CommandResponse::Error("model is not
-    // available")`. Stronger than "not stale": there is no answer to leak in
-    // the first place.
+    // Slice 43 T6 Part B changed what this test verifies (T6 review finding
+    // 2): `pop` already invalidates `last_outcome` (no fresh `check-sat` has
+    // run against the popped assertion set), and `get-value` is now gated on
+    // `last_outcome == Some(Sat)` exactly like `get-model` (§4.B/§4.C). That
+    // gate closes the pop→get-value window entirely, so a get-value after
+    // `pop` with no intervening `check-sat` is now `CommandResponse::Error`
+    // regardless of whether `eliminated_ite_vals`/`abv_array_models` were
+    // ever cleared — this test NO LONGER exercises the I3 map-clearing fix;
+    // it exercises the `last_outcome` gate instead (confirmed by disabling
+    // `lib.rs:362-363` locally and re-running the full suite: all tests,
+    // including a "pop → fresh check-sat → get-value" probe, stayed green,
+    // because `check_sat()` unconditionally re-clears/re-sets both maps on
+    // every call — see `Solver::pop`'s comment for the write-up).
+    // `lib.rs:362-363` are kept as defense-in-depth for a future caller that
+    // bypasses the gate, not as something this test can pin.
     let mut s = Solver::new();
     let mut p = Parser::new(
         "(declare-const c Bool)(declare-const x (_ BitVec 8))\

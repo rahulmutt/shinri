@@ -404,6 +404,31 @@ impl<'a> Encoder<'a> {
     }
 }
 
+/// Node-visit budget for `display_term`'s recursion (slice 43 T6 review
+/// finding 1). The term DAG is hash-consed and the parser supports `let`
+/// (`shinri-parser/src/parser.rs:772`), which binds a name to a TermId
+/// without duplicating it — so a LINEAR-size, SMALL-depth script can build a
+/// term that shares the same subterm at every level, e.g. a chain of
+/// `x_i := (g x_{i-1} x_{i-1})`. This printer has no memoization, so it
+/// re-walks a shared child once per occurrence in its parent: rendering that
+/// chain costs `2^N` node-visits (and characters) for `N` levels, not `N`.
+/// Measured against this rendering (pre-budget) with a 22-level chain
+/// (612-byte script): a 29 MB response in ~4.3s; the review's own
+/// measurement on an equivalent script found 25 MB/4.1s at N=22 and 100
+/// MB/16.5s at N=24 — i.e. it roughly doubles per additional level. The
+/// `depth` cap below does NOT bound this: the blowup is already severe at
+/// depth 22-24, three orders of magnitude short of the depth-10_000 cap.
+/// `DISPLAY_TERM_BUDGET` counts down by one per node visited (checked BEFORE
+/// recursing into children, so the budget bounds work done, not just output
+/// size) and every remaining subterm renders as `t{index}` once it hits
+/// zero. 100_000 is comfortably more nodes than any human-written
+/// `get-value` target has (those are a handful of nested applications, not
+/// tens of thousands) while still cutting an exponential chain off at
+/// roughly its 17th sharing level — far short of the levels in the table
+/// above — so the worst case is sub-millisecond instead of double-digit
+/// seconds.
+const DISPLAY_TERM_BUDGET: usize = 100_000;
+
 /// An SMT-LIB rendering of a term, for `get-value` response labels: `x`,
 /// `(head l)`, `(+ x 1)`. The `t{index}` fallback remains for a term with no
 /// printable form; it should be unreachable for anything the user could have
@@ -411,18 +436,30 @@ impl<'a> Encoder<'a> {
 /// rendering — arithmetic and other builtin ops fall back to `t{index}`,
 /// which is out of scope for this slice.
 pub(crate) fn display_term(ctx: &shinri_core::Context, t: shinri_core::TermId) -> String {
-    display_term_at_depth(ctx, t, 0)
+    let mut budget = DISPLAY_TERM_BUDGET;
+    display_term_at_depth(ctx, t, 0, &mut budget)
 }
 
-/// Term depth is attacker-controlled per the threat model (deeply nested
-/// user input), so the recursion needs an explicit backstop — the same
-/// `depth > 10_000` cap `render_value` uses (`crates/shinri-dt/src/lib.rs`),
-/// for the same reason: comfortably above any realistic term depth, and
-/// existing only to bound worst-case recursion, not to detect cycles.
-fn display_term_at_depth(ctx: &shinri_core::Context, t: shinri_core::TermId, depth: u32) -> String {
-    if depth > 10_000 {
+/// `depth` mirrors `render_value`'s `depth > 10_000` cap
+/// (`crates/shinri-dt/src/lib.rs:645`) for the same reason render_value has
+/// it: term depth is attacker-controlled per the threat model, so the
+/// recursion needs an explicit, mechanical backstop rather than relying on
+/// the input being shallow. It is kept as a fence, not the operative bound
+/// here — a term deep enough to trip a 10_000 cap stack-overflows during
+/// parse/assert long before `display_term` is ever called. The operative
+/// bound against attacker-controlled *output size* is `budget` (see
+/// `DISPLAY_TERM_BUDGET` above), which is what actually stops the
+/// exponential-sharing blowup this function is otherwise exposed to.
+fn display_term_at_depth(
+    ctx: &shinri_core::Context,
+    t: shinri_core::TermId,
+    depth: u32,
+    budget: &mut usize,
+) -> String {
+    if depth > 10_000 || *budget == 0 {
         return format!("t{}", t.index());
     }
+    *budget -= 1;
     match ctx.term_node(t) {
         TermNode::App {
             op: Op::Uninterpreted(sym),
@@ -436,7 +473,7 @@ fn display_term_at_depth(ctx: &shinri_core::Context, t: shinri_core::TermId, dep
             }
             let parts: Vec<String> = kids
                 .iter()
-                .map(|&k| display_term_at_depth(ctx, k, depth + 1))
+                .map(|&k| display_term_at_depth(ctx, k, depth + 1, budget))
                 .collect();
             format!("({} {})", ctx.symbol_name(sym), parts.join(" "))
         }

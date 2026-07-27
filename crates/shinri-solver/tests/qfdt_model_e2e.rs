@@ -289,6 +289,45 @@ fn get_value_labels_responses_with_the_requested_term() {
     assert_eq!(out[1], "(((head l) 7) (l (cons 7 nil)))");
 }
 
+/// T6 review finding 1 (security-relevant, exponential output amplification):
+/// the term DAG is hash-consed and the parser supports `let`
+/// (`shinri-parser/src/parser.rs:772`), which binds a name to a TermId
+/// without duplicating it. `display_term` has no memoization, so before the
+/// node-visit budget it re-walked a shared child once per occurrence in its
+/// parent — a chain of `x_i := (g x_{i-1} x_{i-1})` cost `2^N` node-visits
+/// for `N` levels, not `N`. Measured pre-fix: a 22-level chain (612-byte
+/// script) rendered a 29 MB `get-value` response in ~4.3s; the review's own
+/// measurement found 25 MB/4.1s at N=22 and 100 MB/16.5s at N=24 — i.e. it
+/// roughly doubles per level. This pins a 40-level chain, which would be
+/// `2^40` node-visits unbounded, completing fast with a budget-capped,
+/// bounded-size response instead.
+#[test]
+fn get_value_on_exponentially_shared_term_stays_bounded() {
+    const N: usize = 40;
+    let mut src = String::from(
+        "(set-logic QF_UFLIA)(declare-fun g (Int Int) Int)(check-sat)(get-value ((let ((x0 0))",
+    );
+    for i in 1..=N {
+        let prev = i - 1;
+        src.push_str(&format!("(let ((x{i} (g x{prev} x{prev})))"));
+    }
+    src.push_str(&format!("x{N}"));
+    src.push_str(&")".repeat(N + 1));
+    src.push_str("))");
+
+    let out = run_script(&src);
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    // Unbounded this would be exponential in N (astronomically large at
+    // N=40). DISPLAY_TERM_BUDGET caps total node-visits regardless of N, so
+    // the response stays small — well under what an unbounded render would
+    // produce even at N=22 (29 MB).
+    assert!(
+        out[1].len() < 2_000_000,
+        "get-value response not bounded: {} bytes",
+        out[1].len()
+    );
+}
+
 /// Spec §1 defect 2: no internal name and no undeclared symbol may appear.
 #[test]
 fn model_names_only_declared_symbols() {
