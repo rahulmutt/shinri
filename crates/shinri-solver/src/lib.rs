@@ -104,6 +104,20 @@ pub struct Solver {
     /// Cumulative cluster-B guard bailouts across this solver's check-sats
     /// (slice 11); see `shinri_sat::Solver::theory_guard_bailouts`.
     theory_guard_bailouts: u64,
+    /// Outcome of the most recent `check_sat`, and `None` whenever the current
+    /// assertion set has not been solved (fresh solver, after `reset`, after a
+    /// `pop`, or after a new `assert` invalidated the previous answer).
+    ///
+    /// `get-model` is only meaningful immediately after a `Sat`, so this gates
+    /// `format_model`: since slice 43 the model is built by enumerating the
+    /// declared-symbol registry, which will happily emit a complete, well-formed
+    /// `define-fun` list of sort defaults even when nothing was solved. That
+    /// would be a well-formed LIE after `unsat`/`unknown` — strictly worse than
+    /// the old `()`, which no caller can mistake for a model. The old guard
+    /// ("is there any model data?") cannot be reused: a declared symbol
+    /// occurring in no assertion has no model data either, and defaulting it is
+    /// exactly what §1 defect 3 asks for.
+    last_outcome: Option<SolveOutcome>,
 }
 
 /// One user-declared function. `arity == 0` entries are the ones `get-model`
@@ -220,14 +234,32 @@ impl Solver {
             bridge_name_counter: 0,
             special_reals: rustc_hash::FxHashMap::default(),
             theory_guard_bailouts: 0,
+            last_outcome: None,
         }
     }
 
     pub fn declare_sort(&mut self, name: &str) -> SortId {
         self.ctx.declare_sort(name)
     }
+    /// Declare a function through the programmatic API. Like `declare_const`
+    /// (and like the `Command::DeclareFun` arm) a 0-arity declaration must
+    /// register in the declaration registry, since that registry is what
+    /// `get-model` enumerates — `declare_fun(name, &[], sort)` is just the other
+    /// spelling of declaring a constant, and a constant missing from the
+    /// registry is a constant missing from the model.
+    ///
+    /// Unlike `declare_const` this interns no term at all, so there is no arena
+    /// implication whatsoever. Arity > 0 is recorded too but not printed
+    /// (slice 43 §5).
     pub fn declare_fun(&mut self, name: &str, params: &[SortId], result: SortId) -> SymbolId {
-        self.ctx.declare_fun(name, params, result)
+        let sym = self.ctx.declare_fun(name, params, result);
+        self.declared.push(DeclaredFun {
+            name: name.to_string(),
+            sym,
+            arity: params.len(),
+            result,
+        });
+        sym
     }
     pub fn bool_sort(&self) -> SortId {
         self.ctx.bool_sort()
@@ -292,8 +324,12 @@ impl Solver {
     pub fn eq(&mut self, a: TermId, b: TermId) -> TermId {
         self.ctx.mk_eq(a, b).expect("well-sorted equality")
     }
+    /// Add a top-level assertion. This invalidates the recorded solve outcome:
+    /// the previous answer described a different assertion set, so `get-model`
+    /// must not report a model until the new set has been solved.
     pub fn assert(&mut self, formula: TermId) {
         self.assertions.push(formula);
+        self.last_outcome = None;
     }
 
     pub fn push(&mut self) {
@@ -309,6 +345,9 @@ impl Solver {
         self.last_model = None;
         self.eliminated_ite_vals.clear();
         self.abv_array_models.clear();
+        // Same reasoning as `assert`: the assertion set changed, so the recorded
+        // outcome no longer describes it.
+        self.last_outcome = None;
     }
 
     /// Mutable access to the shared term DAG, so the parser can intern terms
@@ -335,7 +374,14 @@ impl Solver {
                 SolveOutcome::Unsat => CommandResponse::Unsat,
                 SolveOutcome::Unknown => CommandResponse::Unknown,
             },
-            Command::CheckSatAssuming(_) => CommandResponse::Unknown,
+            Command::CheckSatAssuming(_) => {
+                // Unimplemented, so it answers `unknown` without solving. It
+                // must still invalidate the recorded outcome, or a `get-model`
+                // after it would report the previous `check-sat`'s model as the
+                // answer to a query that was never solved.
+                self.last_outcome = None;
+                CommandResponse::Unknown
+            }
             Command::Push(n) => {
                 for _ in 0..n {
                     self.push();
@@ -368,6 +414,7 @@ impl Solver {
                 self.eliminated_ite_vals.clear();
                 self.abv_array_models.clear();
                 self.declared.clear();
+                self.last_outcome = None;
                 CommandResponse::None
             }
             Command::DeclareFun {
@@ -419,7 +466,15 @@ impl Solver {
     /// stops a symbol occurring in no assertion from vanishing. Functions of
     /// arity > 0 are omitted: a function graph needs EUF congruence-class
     /// enumeration (§5), so this is NOT yet a complete model for UF queries.
+    ///
+    /// Guarded on the last solve being `Sat`. Registry enumeration would
+    /// otherwise emit a full, well-formed `define-fun` list of sort defaults
+    /// after an `unsat` or `unknown` — a model-shaped answer to a query that has
+    /// none. `()` is the honest reply there: visibly empty, unmistakable.
     fn format_model(&self) -> String {
+        if self.last_outcome != Some(SolveOutcome::Sat) {
+            return "()".to_string();
+        }
         let mut out = String::from("(");
         for d in self.declared.iter().filter(|d| d.arity == 0) {
             let val = self
@@ -542,7 +597,21 @@ impl Solver {
         rendered
     }
 
+    /// Solve the current assertion set, recording the outcome so `get-model`
+    /// can tell "solved sat" from "not solved" / "unsat" / "unknown".
+    ///
+    /// A thin wrapper rather than an assignment inside the solve: `check_sat_inner`
+    /// has several early `return`s on the fencing paths (`refused`/`mixed`/`lira`,
+    /// the string witness self-check), and each of those must record its outcome
+    /// too. Wrapping is the only way to catch them all without touching each
+    /// return site.
     pub fn check_sat(&mut self) -> SolveOutcome {
+        let outcome = self.check_sat_inner();
+        self.last_outcome = Some(outcome);
+        outcome
+    }
+
+    fn check_sat_inner(&mut self) -> SolveOutcome {
         use crate::tseitin::Encoder;
         use shinri_core::NoProof;
         use shinri_euf::Euf;
@@ -3075,6 +3144,13 @@ mod bv_model_tests {
         s2.assert(eq_euf);
         assert_eq!(s2.check_sat(), SolveOutcome::Sat);
         let m2 = s2.get_model_string();
+        // Positive assertion FIRST: the negative check below is vacuous on an
+        // empty model, so pin that the model actually names both constants
+        // before asserting what it must not contain.
+        assert!(
+            m2.contains("(define-fun a () U ") && m2.contains("(define-fun b () U "),
+            "non-BV model must still name a and b, got: {m2}"
+        );
         // Non-BV model must NOT contain any BV-formatted values.
         assert!(
             !m2.contains("#b") && !m2.contains("#x"),

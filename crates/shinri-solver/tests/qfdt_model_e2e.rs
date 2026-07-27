@@ -199,6 +199,60 @@ fn unasserted_datatype_without_nullary_ctor_recurses_into_field_defaults() {
     assert_eq!(out[1], "((define-fun b () Box (mk 0)))");
 }
 
+/// Slice 43 §2: `get-model` is only meaningful after `sat`. Registry
+/// enumeration would otherwise answer an UNSAT query with a complete,
+/// well-formed `define-fun` list of sort defaults — a model-shaped lie, and
+/// strictly worse than the old `()`, which no caller can misread. A harness
+/// that reads `out[1]` without checking `out[0]` must not be handed one.
+#[test]
+fn get_model_after_unsat_is_empty_not_a_fabricated_model() {
+    let out = run_script(
+        "(set-logic QF_LIA)(declare-fun x () Int)\
+         (assert (= x 5))(assert (= x 6))(check-sat)(get-model)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+    assert_eq!(out[1], "()");
+}
+
+/// The `unknown` half of the same guard: a fenced query has no model either.
+/// This is the case the old `if !has_bv_euf && !has_abv` guard would also have
+/// caught — but that guard cannot be restored, because it equally suppresses a
+/// declared symbol that occurs in no assertion (§1 defect 3). The gate must be
+/// "was the last solve sat", not "is there any model data".
+#[test]
+fn get_model_after_unknown_is_empty_not_a_fabricated_model() {
+    let out = run_script(
+        "(set-logic QF_ALIA)(declare-fun a () (Array Int Int))(declare-fun i () Int)\
+         (assert (= (select a i) 9))(check-sat)(get-model)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unknown"),
+        "got {out:?}"
+    );
+    assert_eq!(out[1], "()");
+}
+
+/// A new assertion invalidates the recorded outcome: the previous `sat`
+/// described a different assertion set, so a `get-model` before the next
+/// `check-sat` must not report the stale model as if it were current.
+#[test]
+fn get_model_after_a_new_assert_is_empty_until_resolved() {
+    let out = run_script(
+        "(set-logic QF_LIA)(declare-fun x () Int)(assert (= x 5))(check-sat)(get-model)\
+         (assert (= x 6))(get-model)(check-sat)(get-model)",
+    );
+    assert_eq!(out[0], "sat");
+    assert_eq!(out[1], "((define-fun x () Int 5))");
+    assert_eq!(out[2], "()", "stale model after a new assert: {out:?}");
+    assert_eq!(out[3], "unsat");
+    assert_eq!(out[4], "()");
+}
+
 /// Spec §1 defect 2: no internal name and no undeclared symbol may appear.
 #[test]
 fn model_names_only_declared_symbols() {
