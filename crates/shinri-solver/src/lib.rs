@@ -80,6 +80,12 @@ pub struct Solver {
     /// entry. Internal mints (`ite!`, `!`-prefixed bridge symbols) never pass
     /// through a command at all.
     declared: Vec<DeclaredFun>,
+    /// Membership mirror of `declared`'s `sym` field, kept in sync everywhere
+    /// `declared` is mutated (push sites and `Command::Reset`'s clear). Makes
+    /// the redeclare-dedup guard O(1) instead of the O(n) linear scan over
+    /// `declared` it replaces — `declared` itself must stay a `Vec` since its
+    /// order (not membership) is what `format_model` enumerates.
+    declared_syms: rustc_hash::FxHashSet<SymbolId>,
     /// Word-level normalization state (slice 5): ite→fresh-symbol memo and
     /// the internal-symbol set excluded from model output.
     word_norm: crate::word_norm::WordNorm,
@@ -228,6 +234,7 @@ impl Solver {
             fp_rm_sels: rustc_hash::FxHashMap::default(),
             abv_array_models: rustc_hash::FxHashMap::default(),
             declared: Vec::new(),
+            declared_syms: rustc_hash::FxHashSet::default(),
             word_norm: crate::word_norm::WordNorm::default(),
             eliminated_ite_vals: rustc_hash::FxHashMap::default(),
             pending_bridge: Vec::new(),
@@ -255,7 +262,9 @@ impl Solver {
         let sym = self.ctx.declare_fun(name, params, result);
         // Deduplicated for the same reason as the `Command::DeclareFun` arm: a
         // repeated declaration must not become a repeated model entry.
-        if !self.declared.iter().any(|e| e.sym == sym) {
+        // `declared_syms.insert` is O(1) and gates the `declared` push, so
+        // membership and order stay in lockstep.
+        if self.declared_syms.insert(sym) {
             self.declared.push(DeclaredFun {
                 name: name.to_string(),
                 sym,
@@ -314,8 +323,9 @@ impl Solver {
     /// new mint and no arena shift.
     pub fn declare_const(&mut self, name: &str, sort: SortId) -> TermId {
         let f = self.ctx.declare_fun(name, &[], sort);
-        // Deduplicated for the same reason as the `Command::DeclareFun` arm.
-        if !self.declared.iter().any(|e| e.sym == f) {
+        // Deduplicated for the same reason as the `Command::DeclareFun` arm;
+        // see `declared_syms` for why the guard is a set membership check.
+        if self.declared_syms.insert(f) {
             self.declared.push(DeclaredFun {
                 name: name.to_string(),
                 sym: f,
@@ -454,6 +464,7 @@ impl Solver {
                 self.eliminated_ite_vals.clear();
                 self.abv_array_models.clear();
                 self.declared.clear();
+                self.declared_syms.clear();
                 self.last_outcome = None;
                 CommandResponse::None
             }
@@ -469,7 +480,9 @@ impl Solver {
                 // un-deduplicated push would print the same `define-fun`
                 // twice. Pre-slice-43 the term-keyed value map collapsed the
                 // repeat implicitly; the registry has to do it explicitly.
-                if !self.declared.iter().any(|e| e.sym == sym) {
+                // See `declared_syms` for why this is a set membership check
+                // rather than a linear scan over `declared`.
+                if self.declared_syms.insert(sym) {
                     self.declared.push(DeclaredFun {
                         name,
                         sym,
