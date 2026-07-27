@@ -1,9 +1,10 @@
 //! Slice 43 — the model channel. Datatype field values must come from the
 //! theory that owns them, not render as `?`.
 //!
-//! Task 2 asserts with `contains` because model output is not yet deterministic
-//! (entries come from an FxHashMap). Task 5 makes it deterministic and converts
-//! these to exact-string assertions.
+//! Task 2 asserted with `contains` because model output was not yet
+//! deterministic (entries came from an FxHashMap). Task 5 made `get-model`
+//! enumerate the declared-symbol registry in declaration order, so every
+//! assertion here is now an exact whole-line pin.
 
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
@@ -42,15 +43,7 @@ fn int_field_renders_arith_assigned_value() {
          (check-sat)(get-model)"
     ));
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    let model = &out[1];
-    assert!(
-        model.contains("(cons 42 nil)"),
-        "Int field must render its arith value, got: {model}"
-    );
-    assert!(
-        !model.contains('?'),
-        "no `?` placeholder may survive for an Int field, got: {model}"
-    );
+    assert_eq!(out[1], "((define-fun l () List (cons 42 nil)))");
 }
 
 /// Probe C2: a LITERAL field. Independent of any theory — readable straight off
@@ -63,11 +56,7 @@ fn literal_int_field_renders_from_the_term() {
          (assert (= l (cons 1 nil)))(check-sat)(get-model)"
     ));
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    assert!(
-        out[1].contains("(cons 1 nil)"),
-        "literal field must render as 1, got: {}",
-        out[1]
-    );
+    assert_eq!(out[1], "((define-fun l () List (cons 1 nil)))");
 }
 
 /// Probe C1: the field is entirely UNCONSTRAINED and its selector application
@@ -81,11 +70,9 @@ fn unconstrained_minted_int_field_still_renders_a_value() {
          (assert ((_ is cons) l))(check-sat)(get-model)"
     ));
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    assert!(
-        !out[1].contains('?'),
-        "an unconstrained Int field must still get a value, got: {}",
-        out[1]
-    );
+    // MEASURED, not predicted: the tail is unconstrained, so the value is
+    // whichever beta arith is sitting on and whichever constructor DT picked.
+    assert_eq!(out[1], "((define-fun l () List (cons 0 nil)))");
 }
 
 /// Spec §5 left the Bool-field question open; this pins the MEASURED answer.
@@ -100,11 +87,7 @@ fn bool_field_resolves_from_the_euf_truth_node() {
          (assert (b z))(check-sat)(get-model)",
     );
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    assert!(
-        out[1].contains("(mk true)"),
-        "Bool field must render true, got: {}",
-        out[1]
-    );
+    assert_eq!(out[1], "((define-fun z () B (mk true)))");
 }
 
 /// A String-sorted field is a SURVIVING `?` (spec §5's fenced-gap list — Task 7
@@ -122,16 +105,7 @@ fn string_field_stays_a_placeholder_rather_than_an_elem_token() {
          (assert ((_ is mk) w))(check-sat)(get-model)",
     );
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    assert!(
-        !out[1].contains("@elem"),
-        "an EUF class token must never render in a String field, got: {}",
-        out[1]
-    );
-    assert!(
-        out[1].contains("(mk ?)"),
-        "an unassigned String field stays a visible placeholder, got: {}",
-        out[1]
-    );
+    assert_eq!(out[1], "((define-fun w () S (mk ?)))");
 }
 
 /// The other side of that guard: for a genuinely UNINTERPRETED-sorted field an
@@ -144,11 +118,7 @@ fn uninterpreted_sorted_field_still_renders_its_elem_token() {
          (declare-fun p () P)(assert ((_ is mk) p))(check-sat)(get-model)",
     );
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    assert!(
-        out[1].contains("(mk @elem0)"),
-        "an uninterpreted-sorted field keeps its domain-element token, got: {}",
-        out[1]
-    );
+    assert_eq!(out[1], "((define-fun p () P (mk @elem0)))");
 }
 
 /// Probe C4: two levels of tester-driven instantiation.
@@ -160,9 +130,91 @@ fn nested_int_fields_both_render() {
          (assert (= (head l) 7))(check-sat)(get-model)"
     ));
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    assert!(
-        out[1].contains("(cons 7 (cons "),
-        "outer field must render 7 with a nested cons, got: {}",
-        out[1]
+    // MEASURED, not predicted: only the outer field is pinned (7); the inner
+    // one is whatever arith's beta and DT's constructor choice landed on.
+    assert_eq!(out[1], "((define-fun l () List (cons 7 (cons 0 nil))))");
+}
+
+// ── Slice 43 Task 5: conformant, deterministic `define-fun` output ───────────
+
+/// Spec §4.B: conformant define-fun, single line, declaration order.
+#[test]
+fn model_emits_define_fun_in_declaration_order() {
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun l () List)(declare-fun x () Int)\
+         (assert ((_ is cons) l))(assert (= (head l) 42))(assert (= x 5))\
+         (check-sat)(get-model)"
+    ));
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert_eq!(
+        out[1],
+        "((define-fun l () List (cons 42 nil))(define-fun x () Int 5))"
     );
+}
+
+/// Determinism: the same query must produce byte-identical model output every
+/// run. Before slice 43 entries came out in FxHashMap order.
+#[test]
+fn model_output_is_deterministic() {
+    let q = format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun l () List)(declare-fun x () Int)\
+         (assert ((_ is cons) l))(assert (= x 5))(check-sat)(get-model)"
+    );
+    let first = run_script(&q);
+    for _ in 0..8 {
+        assert_eq!(run_script(&q), first, "model output must be deterministic");
+    }
+}
+
+/// Spec §1 probes M4/M4c: a declared symbol occurring in NO assertion. It is in
+/// no registered atom, so no theory assigns it and there is nothing in the value
+/// map to iterate — it used to vanish entirely, returning `()`. M4c is the
+/// non-datatype control: a fix that only handles the datatype path fails it.
+#[test]
+fn unasserted_int_symbol_gets_a_default() {
+    let out = run_script("(set-logic QF_LIA)(declare-fun x () Int)(check-sat)(get-model)");
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert_eq!(out[1], "((define-fun x () Int 0))");
+}
+
+#[test]
+fn unasserted_datatype_symbol_gets_a_structural_default() {
+    // `List` has a nullary constructor, so the default is `nil`.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun l () List)(check-sat)(get-model)"
+    ));
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert_eq!(out[1], "((define-fun l () List nil))");
+}
+
+#[test]
+fn unasserted_datatype_without_nullary_ctor_recurses_into_field_defaults() {
+    // `Box` has NO nullary constructor, so the default must be built by
+    // recursing into the field's own default (spec §4.B).
+    let out = run_script(
+        "(set-logic QF_UFDTLIA)(declare-datatype Box ((mk (unbox Int))))\
+         (declare-fun b () Box)(check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert_eq!(out[1], "((define-fun b () Box (mk 0)))");
+}
+
+/// Spec §1 defect 2: no internal name and no undeclared symbol may appear.
+#[test]
+fn model_names_only_declared_symbols() {
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun l () List)\
+         (assert (= l (cons 1 nil)))(check-sat)(get-model)"
+    ));
+    let model = &out[1];
+    assert!(
+        !model.contains("(define-fun nil"),
+        "a constructor constant is not a declared symbol: {model}"
+    );
+    for tn in ["t3", "t4", "t5", "t6", "t7"] {
+        assert!(
+            !model.contains(&format!("(define-fun {tn} ")),
+            "internal term id {tn} leaked into the model: {model}"
+        );
+    }
 }

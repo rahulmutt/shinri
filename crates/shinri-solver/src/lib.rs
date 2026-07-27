@@ -127,23 +127,18 @@ pub struct Solver {
 /// `check-sat` from `sat` to `unknown` (repro: declare-fun s, assert
 /// `str.prefixof`+`str.len`, check-sat, [rejected decl], check-sat again —
 /// same assertions re-solved, different verdict). That is exactly the
-/// verdict flip slice 43 must never produce. The safe timing for this lookup
-/// is post-solve, in Task 5's `format_model`/`GetModel` handling: by then
-/// every prior `Assert`'s terms already exist, so `mk_app` is either a
-/// no-op lookup (referenced symbols) or a term creation that happens after
-/// the current solve has already run (orphaned symbols) — neither can
-/// perturb the decision it would otherwise share ordering with. `sym` is
-/// kept (see below) precisely so Task 5 can do that lookup itself.
+/// verdict flip slice 43 must never produce. `format_model` therefore resolves
+/// the term with `Context::find_nullary_app`, a READ-ONLY probe of the
+/// hash-cons table that cannot extend the arena at all — neither at declare
+/// time nor at `get-model` time, which matters because a script may legally
+/// continue `(get-model)(assert …)(check-sat)`. When the probe finds nothing
+/// the symbol occurred in no assertion, so no theory assigned it a value
+/// either, and the sort default is the correct answer. `sym` is kept for
+/// exactly that lookup.
 struct DeclaredFun {
-    #[allow(dead_code)] // read by the #[cfg(test)] declared_names() proof
-    // helper today; Task 5 reads it to emit the define-fun name
     name: String,
-    #[allow(dead_code)] // consumed by Task 5's post-solve TermId lookup via
-    // `ctx.mk_app(Op::Uninterpreted(sym), &[])` — see the struct doc above
     sym: shinri_core::SymbolId,
-    #[allow(dead_code)] // Task 5 filters get-model entries on arity == 0
     arity: usize,
-    #[allow(dead_code)] // Task 5 prints this as the define-fun result sort
     result: shinri_core::SortId,
 }
 
@@ -272,8 +267,23 @@ impl Solver {
     pub fn bv_numeral(&mut self, value: shinri_num::Integer, width: u32) -> TermId {
         self.ctx.mk_bv_const(width, value)
     }
+    /// Declare a 0-arity constant through the programmatic API — the twin of
+    /// `Command::DeclareFun` on the script path, and it must register in the
+    /// same declaration registry: since slice 43 that registry is what
+    /// `get-model` enumerates, so a constant missing from it is a constant
+    /// missing from the model.
+    ///
+    /// Interning the application here is this API's long-standing contract (it
+    /// returns the `TermId`), so unlike the `DeclareFun` command arm there is no
+    /// new mint and no arena shift.
     pub fn declare_const(&mut self, name: &str, sort: SortId) -> TermId {
         let f = self.ctx.declare_fun(name, &[], sort);
+        self.declared.push(DeclaredFun {
+            name: name.to_string(),
+            sym: f,
+            arity: 0,
+            result: sort,
+        });
         self.ctx.mk_app(Op::Uninterpreted(f), &[]).expect("const")
     }
     pub fn app(&mut self, op: Op, args: &[TermId]) -> TermId {
@@ -398,28 +408,138 @@ impl Solver {
         self.abv_array_models.get(&t).cloned()
     }
 
+    /// `get-model` output: one `define-fun` per user-declared 0-arity symbol, in
+    /// declaration order, on a SINGLE line (slice 43 §4.B — `qfbv_witnesses`
+    /// reads the model as `out[1]`, so a multi-line model would break the
+    /// line-oriented response contract).
+    ///
+    /// Enumerating declarations rather than the theory value map is what keeps
+    /// internal `tN` names and datatype constructor constants out, makes the
+    /// output deterministic (declaration order, not `FxHashMap` order), and
+    /// stops a symbol occurring in no assertion from vanishing. Functions of
+    /// arity > 0 are omitted: a function graph needs EUF congruence-class
+    /// enumeration (§5), so this is NOT yet a complete model for UF queries.
     fn format_model(&self) -> String {
-        let has_bv_euf = self.last_model.is_some();
-        let has_abv = !self.abv_array_models.is_empty();
-        if !has_bv_euf && !has_abv {
-            return "()".into();
-        }
         let mut out = String::from("(");
-        // BV/EUF model entries (non-ABV path).
-        if let Some(m) = &self.last_model {
-            for (t, v) in m.values.iter() {
-                let name = crate::tseitin::display_term(&self.ctx, *t);
-                let val = shinri_theory::model::format_modelval(v);
-                out.push_str(&format!("({name} {val})"));
-            }
-        }
-        // QF_ABV array model entries: emit each as (name rendered-store-chain).
-        for (t, rendered) in &self.abv_array_models {
-            let name = crate::tseitin::display_term(&self.ctx, *t);
-            out.push_str(&format!("({name} {rendered})"));
+        for d in self.declared.iter().filter(|d| d.arity == 0) {
+            let val = self
+                .value_of_declared(d)
+                .or_else(|| self.sort_default(d.result, &mut Vec::new()))
+                // Only an ill-founded datatype reaches here; `?` is the
+                // established visible-placeholder convention (spec §5).
+                .unwrap_or_else(|| "?".to_string());
+            out.push_str(&format!(
+                "(define-fun {} () {} {})",
+                d.name,
+                self.ctx.sort_name(d.result),
+                val
+            ));
         }
         out.push(')');
         out
+    }
+
+    /// The assigned value of a declared 0-arity symbol, if some theory produced
+    /// one. Uses `format_value`'s channel order (theory model, then the
+    /// eliminated-ite remap, then the ABV array model) but keyed by the symbol's
+    /// own nullary application rather than an arbitrary term.
+    ///
+    /// The lookup is READ-ONLY (`Context::find_nullary_app` probes the hash-cons
+    /// table, it does not intern). Minting here would extend the term arena and
+    /// shift every later `TermId`, which is verdict-observable — and `get-model`
+    /// may be followed by further `assert`/`check-sat` commands, so "after a
+    /// solve" is not by itself safe. `None` means the symbol appeared in no
+    /// assertion, so no theory could have assigned it a value either; the caller
+    /// falls back to the sort default, which is the right answer for that case.
+    fn value_of_declared(&self, d: &DeclaredFun) -> Option<String> {
+        let t = self.ctx.find_nullary_app(d.sym)?;
+        self.format_value(t)
+    }
+
+    /// A canonical value for a sort, used for a declared symbol that occurs in no
+    /// assertion — it is in no registered atom, so no theory assigns it a value
+    /// (slice 43 §4.B). Without this the symbol vanishes from `get-model`.
+    ///
+    /// `on_path` carries the datatype sorts on the current recursion path: a
+    /// constructor whose field re-enters a sort already on the path cannot be
+    /// used as a base case, so we try the next constructor. `None` propagates
+    /// "no base case on this path" to the caller. `Context`'s inhabitance
+    /// fixpoint (`dt_first_ill_founded`) guarantees a usable constructor exists
+    /// for a well-founded datatype, which SMT-LIB requires.
+    fn sort_default(
+        &self,
+        s: shinri_core::SortId,
+        on_path: &mut Vec<shinri_core::SortId>,
+    ) -> Option<String> {
+        use shinri_core::SortNode;
+        match self.ctx.sort_node(s) {
+            SortNode::Bool => Some("false".to_string()),
+            SortNode::Int | SortNode::Real => Some("0".to_string()),
+            SortNode::String => Some("\"\"".to_string()),
+            SortNode::RoundingMode => Some("RNE".to_string()),
+            SortNode::BitVec(n) => Some(format!("#b{}", "0".repeat(*n as usize))),
+            SortNode::Float(eb, sb) => Some(format!(
+                "(fp #b0 #b{} #b{})",
+                "0".repeat(*eb as usize),
+                "0".repeat((*sb - 1) as usize)
+            )),
+            // No value vocabulary for these; `@elem0` matches what
+            // `format_modelval` already emits for an assigned `Elem`, so the
+            // defaulted and assigned cases read alike.
+            SortNode::Uninterpreted(_) | SortNode::RegLan => Some("@elem0".to_string()),
+            // A constant array of the element sort's own default, matching how
+            // the ABV model renders array values (`shinri-abv/src/model.rs`).
+            SortNode::Array(_, e) => {
+                let elem = self.sort_default(*e, on_path)?;
+                Some(format!("((as const {}) {})", self.ctx.sort_name(s), elem))
+            }
+            SortNode::Datatype(_) => self.datatype_default(s, on_path),
+        }
+    }
+
+    /// The structural default for a datatype sort: the first constructor whose
+    /// fields can all be defaulted without re-entering a sort already on the
+    /// recursion path. A nullary constructor trivially qualifies and is found
+    /// first when one exists.
+    fn datatype_default(
+        &self,
+        s: shinri_core::SortId,
+        on_path: &mut Vec<shinri_core::SortId>,
+    ) -> Option<String> {
+        if on_path.contains(&s) {
+            // Re-entering a sort already on the path: this constructor choice is
+            // not a base case. `None` tells the caller to try the next one.
+            return None;
+        }
+        on_path.push(s);
+        let ctors: Vec<shinri_core::SymbolId> = self
+            .ctx
+            .dt_constructors(s)
+            .map(|c| c.to_vec())
+            .unwrap_or_default();
+        let mut rendered = None;
+        for c in ctors {
+            let params: Vec<shinri_core::SortId> = self
+                .ctx
+                .fun_params(c)
+                .map(|p| p.to_vec())
+                .unwrap_or_default();
+            let name = self.ctx.symbol_name(c).to_string();
+            if params.is_empty() {
+                rendered = Some(name);
+                break;
+            }
+            let parts: Option<Vec<String>> = params
+                .iter()
+                .map(|p| self.sort_default(*p, on_path))
+                .collect();
+            if let Some(parts) = parts {
+                rendered = Some(format!("({} {})", name, parts.join(" ")));
+                break;
+            }
+        }
+        on_path.pop();
+        rendered
     }
 
     pub fn check_sat(&mut self) -> SolveOutcome {

@@ -1130,9 +1130,11 @@ fn model_never_leaks_ite_internals() {
         !model.contains("ite!"),
         "internal ite symbols leaked into get-model: {model}"
     );
-    // The user constants still get values.
+    // The user constants still get values. Slice 43 changed the entry shape to
+    // `define-fun`; `ite!` cannot appear at all now, because get-model
+    // enumerates the declared-symbol registry rather than the value map.
     assert!(
-        model.contains("(x "),
+        model.contains("(define-fun x () (_ FloatingPoint 8 24) "),
         "user constant x missing from model: {model}"
     );
 }
@@ -1144,8 +1146,9 @@ fn rm_variable_gets_model_value() {
     let (o, model) = run("(declare-const r RoundingMode)\
          (assert (= r RTZ))(check-sat)(get-model)");
     assert_eq!(o, SolveOutcome::Sat);
+    // Slice 43: entries are `define-fun`s over the declared-symbol registry.
     assert!(
-        model.contains("(r RTZ)"),
+        model.contains("(define-fun r () RoundingMode RTZ)"),
         "RM var missing/wrong in model: {model}"
     );
 }

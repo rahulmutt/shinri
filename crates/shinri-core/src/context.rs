@@ -252,6 +252,34 @@ impl Context {
         self.symbols.lookup(text)
     }
 
+    /// The `TermId` of the nullary application of a declared 0-arity symbol, if
+    /// that application has already been interned. Used by `get-model` to map a
+    /// declared symbol back to the term the theories keyed their model on
+    /// (slice 43 §4.B).
+    ///
+    /// READ-ONLY by construction: it probes the hash-cons table and never
+    /// interns, so it cannot extend the term arena. That matters — creating a
+    /// term shifts the numeric `TermId` of everything built afterwards, which
+    /// is verdict-observable (see `DeclaredFun` in `shinri-solver`), and
+    /// `get-model` may be followed by further `assert`/`check-sat` commands.
+    ///
+    /// `None` means the symbol occurs in no assertion, so no theory ever saw it
+    /// and no theory assigned it a value: the caller's sort default is the
+    /// correct answer for exactly that case.
+    pub fn find_nullary_app(&self, sym: SymbolId) -> Option<TermId> {
+        let (params, result) = self.fun_sigs.get(&sym)?;
+        if !params.is_empty() {
+            return None;
+        }
+        self.term_interner
+            .get(&TermKey::App {
+                op: Op::Uninterpreted(sym),
+                args: Vec::new(),
+                sort: *result,
+            })
+            .copied()
+    }
+
     /// Mark `sym` as solver-internal (reserved). Called by solver passes that
     /// mint fresh symbols so user declarations naming them can be rejected.
     pub fn reserve_symbol(&mut self, sym: SymbolId) {
@@ -2381,5 +2409,32 @@ mod tests {
             "(Array (_ BitVec 8) (Array Int Bool))"
         );
         assert_eq!(ctx.sort_name(pair), "Pair");
+    }
+
+    /// `find_nullary_app` must agree with `mk_app` where the term exists, and —
+    /// the property `get-model` depends on — must never extend the arena when
+    /// it does not (slice 43 §4.B: an arena shift is verdict-observable).
+    #[test]
+    fn find_nullary_app_is_a_read_only_hash_cons_probe() {
+        let mut ctx = Context::new();
+        let i = ctx.int_sort();
+        let applied = ctx.declare_fun("applied", &[], i);
+        let orphan = ctx.declare_fun("orphan", &[], i);
+        let unary = ctx.declare_fun("f", &[i], i);
+
+        // Interned as a name but never declared as a function.
+        let undeclared = ctx.symbols.intern("nope");
+        assert_eq!(ctx.find_nullary_app(undeclared), None);
+
+        let t = ctx.mk_app(Op::Uninterpreted(applied), &[]).unwrap();
+        assert_eq!(ctx.find_nullary_app(applied), Some(t));
+
+        // An orphaned declaration has no term, and probing for it must not make
+        // one: the arena length is unchanged across the probe.
+        let before = ctx.nodes.len();
+        assert_eq!(ctx.find_nullary_app(orphan), None);
+        // Arity > 0 is not a nullary application, whatever else exists.
+        assert_eq!(ctx.find_nullary_app(unary), None);
+        assert_eq!(ctx.nodes.len(), before, "the probe extended the term arena");
     }
 }
