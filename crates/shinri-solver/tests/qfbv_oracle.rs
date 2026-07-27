@@ -94,6 +94,8 @@ fn gen_instance(
     var_names: &[&str],
     vars_s: &[shinri_core::TermId],
     z_vars: &[easy_smt::SExpr],
+    uf1: shinri_core::SymbolId,
+    uf2: shinri_core::SymbolId,
     dump: &mut String,
 ) {
     // ── Build a term pool ────────────────────────────────────────────────────
@@ -111,7 +113,7 @@ fn gen_instance(
     // Add a small number of random BV terms to the pool.
     let n_extra = 2 + rng.below(4) as usize; // 2..=5 extra computed terms
     for _ in 0..n_extra {
-        let op_kind = rng.below(19); // pick from BV ops that keep the same width
+        let op_kind = rng.below(21); // 0..18 builtin BV ops, 19..20 uninterpreted apps
         let i = rng.below(pool.len() as u64) as usize;
         let j = rng.below(pool.len() as u64) as usize;
 
@@ -211,9 +213,21 @@ fn gen_instance(
                 let nz = ctx.list(vec![ctx.atom("bvlshr"), pool[i].z, pool[j].z]);
                 (ns, nz, width)
             }
-            _ => {
+            18 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvAshr), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvashr"), pool[i].z, pool[j].z]);
+                (ns, nz, width)
+            }
+            // slice 44: (f t_i) — a 1-ary uninterpreted application.
+            19 => {
+                let ns = s.app(Op::Uninterpreted(uf1), &[pool[i].s]);
+                let nz = ctx.list(vec![ctx.atom("f"), pool[i].z]);
+                (ns, nz, width)
+            }
+            // slice 44: (g t_i t_j) — a 2-ary uninterpreted application.
+            _ => {
+                let ns = s.app(Op::Uninterpreted(uf2), &[pool[i].s, pool[j].s]);
+                let nz = ctx.list(vec![ctx.atom("g"), pool[i].z, pool[j].z]);
                 (ns, nz, width)
             }
         };
@@ -446,7 +460,7 @@ fn differential_qf_bv_small() {
             .solver("z3", ["-smt2", "-in"])
             .build()
             .unwrap();
-        ctx.set_logic("QF_BV").unwrap();
+        ctx.set_logic("QF_UFBV").unwrap();
 
         let bv_type_atom = ctx.list(vec![
             ctx.atom("_"),
@@ -458,14 +472,33 @@ fn differential_qf_bv_small() {
             .map(|name| ctx.declare_const(name.to_string(), bv_type_atom).unwrap())
             .collect();
 
-        let mut dump = format!("iter={iter} width={width}\n(set-logic QF_BV)");
+        let mut dump = format!("iter={iter} width={width}\n(set-logic QF_UFBV)");
         for name in &var_names {
             dump.push_str(&format!("\n(declare-fun {name} () (_ BitVec {width}))"));
         }
 
+        // Uninterpreted symbols over BV, added in slice 44. The pool is small
+        // ON PURPOSE: two symbols over three variables means many applications
+        // share a symbol, which is exactly what makes a congruence violation
+        // reachable. A large pool would spread applications thin and the
+        // generator would stop finding the bug.
+        let uf1_s = s.declare_fun("f", &[bv_sort], bv_sort);
+        let uf2_s = s.declare_fun("g", &[bv_sort, bv_sort], bv_sort);
+        // easy-smt 0.2 takes Vec<SExpr> for the parameter list — same idiom as
+        // tests/oracle.rs:48.
+        ctx.declare_fun("f", vec![bv_type_atom], bv_type_atom)
+            .unwrap();
+        ctx.declare_fun("g", vec![bv_type_atom, bv_type_atom], bv_type_atom)
+            .unwrap();
+        dump.push_str(&format!(
+            "\n(declare-fun f ((_ BitVec {width})) (_ BitVec {width}))\
+             \n(declare-fun g ((_ BitVec {width}) (_ BitVec {width})) (_ BitVec {width}))"
+        ));
+
         // ── Generate random formula ─────────────────────────────────────────
         gen_instance(
-            &mut rng, &mut s, &mut ctx, width, &var_names, &vars_s, &z_vars, &mut dump,
+            &mut rng, &mut s, &mut ctx, width, &var_names, &vars_s, &z_vars, uf1_s, uf2_s,
+            &mut dump,
         );
 
         dump.push_str("\n(check-sat)");
