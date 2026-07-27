@@ -390,18 +390,43 @@ fn model_names_only_declared_symbols() {
 ///   in the workspace to combine a DT selector with a BV-sorted field, so
 ///   this crash was previously unexercised and undiscovered by any test.
 ///
-/// This test pins the DEV/TEST-profile reality (the panic), since that is
-/// what `cargo nextest run` — the invocation this suite actually runs
-/// under — hits. Lifting this gap is still the BV/DT channel-unification
-/// successor slice the spec pointed at, but that slice must ALSO decide
-/// what `debug_assert!` should do here, not just how to render the field.
+/// Both measured behaviours are pinned below, gated on `debug_assertions` so
+/// each build profile is provably tested against the SAME query (`BV_FIELD`)
+/// rather than trusting the two to stay in sync via prose. This matters
+/// because the two failure modes are a coupled pair, not independent: if a
+/// successor slice deletes the `debug_assert!` so dev matches release, the
+/// `should_panic` test below fails — and the natural repair is to replace it
+/// with an `assert_eq!` on the zero-fill, silently promoting "contradicts the
+/// assertion" to "expected". Splitting the pin in two, with the doc comment
+/// attached to both, is what stops that repair from reading as harmless.
+const BV_FIELD: &str = "(set-logic QF_UFDTBV)(declare-datatype W ((mk (w (_ BitVec 8)))))\
+                        (declare-fun v () W)(assert (= (w v) #x2a))(check-sat)(get-model)";
+
+/// DEV/TEST half: pins the panic. This is what `cargo nextest run` — the
+/// invocation the blocking tier and `mise run test` actually use (`mise.toml`
+/// has no `--release` test task anywhere) — hits for this query.
+#[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "non-nullary uninterpreted BV fn out of scope")]
-fn fenced_bv_field_panics_in_debug_and_zero_fills_in_release() {
-    let _ = run_script(
-        "(set-logic QF_UFDTBV)(declare-datatype W ((mk (w (_ BitVec 8)))))\
-         (declare-fun v () W)(assert (= (w v) #x2a))(check-sat)(get-model)",
-    );
+fn fenced_bv_field_panics_in_debug() {
+    let _ = run_script(BV_FIELD);
+}
+
+/// RELEASE half: pins the zero-fill. This is the more dangerous of the two
+/// manifestations — a `sat` answer whose model CONTRADICTS the assertion
+/// `(= (w v) #x2a)` rather than merely omitting information — and, unlike the
+/// panic, is unguarded today (no CI job runs the test suite with
+/// `--release`). Recording it here means a future release-mode test run
+/// cannot regress this silently: the assertion must hold exactly, or the
+/// test fails and forces a decision instead of drifting.
+#[cfg(not(debug_assertions))]
+#[test]
+fn fenced_bv_field_zero_fills_in_release() {
+    let out = run_script(BV_FIELD);
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    // MEASURED: CONTRADICTS the assertion `(= (w v) #x2a)`. Not an acceptable
+    // steady state — see the doc comment above.
+    assert_eq!(out[1], "((define-fun v () W (mk #b00000000)))");
 }
 
 /// `get-model` omits functions of arity > 0 (spec §5): a function graph needs
