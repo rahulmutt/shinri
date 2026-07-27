@@ -427,17 +427,35 @@ impl<'a> Encoder<'a> {
 /// roughly its 17th sharing level — far short of the levels in the table
 /// above — so the worst case is sub-millisecond instead of double-digit
 /// seconds.
-const DISPLAY_TERM_BUDGET: usize = 100_000;
+///
+/// The budget is built ONCE PER `get-value` RESPONSE (in the `Command::GetValue`
+/// arm) and threaded through every label in it. `(get-value (t1 … tK))` with a
+/// per-term budget would bound each label but not the response. Measured on a
+/// 24_635-byte script whose K=40 labels all name the same 25-level `let`-shared
+/// term: 14.0 MB in 0.55s with a per-term budget, 350 KB in 0.017s with this
+/// shared one — the multiplier is exactly K, and K is only bounded by script
+/// length. Sharing the countdown makes the bound this comment describes a
+/// property of the whole response.
+pub(crate) const DISPLAY_TERM_BUDGET: usize = 100_000;
 
 /// An SMT-LIB rendering of a term, for `get-value` response labels: `x`,
-/// `(head l)`, `(+ x 1)`. The `t{index}` fallback remains for a term with no
-/// printable form; it should be unreachable for anything the user could have
-/// written (slice 43 §4.C). Only `Op::Uninterpreted` gets a structural
-/// rendering — arithmetic and other builtin ops fall back to `t{index}`,
-/// which is out of scope for this slice.
-pub(crate) fn display_term(ctx: &shinri_core::Context, t: shinri_core::TermId) -> String {
-    let mut budget = DISPLAY_TERM_BUDGET;
-    display_term_at_depth(ctx, t, 0, &mut budget)
+/// `(head l)`. The `t{index}` fallback remains for a term with no printable
+/// form; it should be unreachable for anything the user could have written
+/// (slice 43 §4.C). Only `Op::Uninterpreted` gets a structural rendering —
+/// arithmetic and other builtin ops fall back to `t{index}`, which is out of
+/// scope for this slice.
+///
+/// `budget` is supplied BY THE CALLER and shared across the whole `get-value`
+/// response, not minted per term: `(get-value (a b c))` renders K labels, and
+/// `let` lets all K name the same deep shared term, so a per-term budget would
+/// multiply the bound by K and the size guarantee the constant documents would
+/// hold only of one label rather than of the response the user receives.
+pub(crate) fn display_term(
+    ctx: &shinri_core::Context,
+    t: shinri_core::TermId,
+    budget: &mut usize,
+) -> String {
+    display_term_at_depth(ctx, t, 0, budget)
 }
 
 /// `depth` mirrors `render_value`'s `depth > 10_000` cap

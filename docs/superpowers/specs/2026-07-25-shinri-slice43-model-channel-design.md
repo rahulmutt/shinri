@@ -118,8 +118,19 @@ valid**, so selector applications minted by `instantiate_constructor` resolve �
 this is what sidesteps the ctx-clone isolation hazard rather than fighting it
 (the solver-level filter at `shinri-solver/src/lib.rs:888` drops exactly those
 terms, which is why C1's field value is unreachable from the solver side).
-And **nothing reads DT's values**, so DT is free to go last; going after string
-additionally makes `String`-sorted fields resolve.
+And **nothing reads DT's values**, so DT is free to go last.
+
+> **Corrected against the shipped branch.** This section originally claimed
+> that going after string "additionally makes `String`-sorted fields resolve".
+> **Measured false.** The ordering is still right, but it does not buy that:
+> a field application like `(s w)` is minted *in-search* by DT, so it never
+> enters `StrSolver::str_terms` and the string model never assigns it
+> (`shinri-str/src/model.rs:116-126`) no matter when string runs. EUF, which
+> treats `String` as uninterpreted, leaves a `ModelVal::Elem` — an opaque class
+> token, not a String value — and `render_field`'s sort guard (§3.C) refuses it
+> rather than print a sort-mismatched `@elem0`. String-sorted fields therefore
+> render `?`; see the new row in §5 and the pin
+> `string_field_stays_a_placeholder_rather_than_an_elem_token`.
 
 That second property is a change in what the string solver sees, not just a
 reordering: today `string.model` reads a `combined` that already contains
@@ -260,7 +271,9 @@ Extend `display_term` (`shinri-solver/src/tseitin.rs:408`) to print full
 applications recursively — `(head l)` — keeping the `t{index}` fallback
 (`:415`) only for terms with no printable form. The `GetValue` arm (`:291`) then
 labels each response with the requested term, yielding
-`(((head l) 7) (l (cons 1 nil)))`.
+`(((head l) 7) (l (cons 7 nil)))`. (Originally written `(cons 1 nil)` here and
+in §7 criterion 2 — internally inconsistent with the same expression's
+`(head l) = 7`. The binary produces `(cons 7 nil)`, measured.)
 
 ## 5. Explicit gaps
 
@@ -269,13 +282,30 @@ Stated here so the spec is not read as promising more than it delivers.
 | Gap | Cause | Disposition |
 |---|---|---|
 | Bool-sorted fields | `Euf::model`'s Bool branch (`solver.rs:199`–`:208`) assigns `ModelVal::Bool` for terms merged with the truth node, so these **may** resolve opportunistically via §3.C — unverified | **Measure in task 1** and pin the observed behaviour either way. Do not assume either outcome. |
-| BV-sorted fields | BV values are extracted solver-side from SAT vars and never enter the Combiner's builder | `?`; fenced and test-pinned. Successor slice. |
+| BV-sorted fields | BV values are extracted solver-side from SAT vars and never enter the Combiner's builder. Worse than predicted: with only a *selector* application asserted, the symbol never enters `DtSolver::watched_dt_terms()` either, so DT contributes nothing for it at all — not even a partial `(mk ?)` | `?` — but for the WHOLE symbol, `((define-fun v () W ?))`, not `(mk ?)`: with no channel value there is no evidence of the constructor either. **Release only.** In a dev/debug build the same query panics before `check-sat` returns, on the pre-existing `debug_assert!(child_ids.is_empty(), "non-nullary uninterpreted BV fn out of scope")` in `shinri-bv/src/blast/mod.rs:282` — verified to reproduce on pre-slice `main`, so it is not this slice's doing and is deferred with it. Both halves pinned (`fenced_bv_field_panics_in_debug`, `fenced_bv_field_is_a_placeholder_in_release`). Successor slice. |
+| String-sorted fields | `(s w)` is minted in-search by DT, so it never reaches `StrSolver::str_terms` and the string model never assigns it (`shinri-str/src/model.rs:116-126`). EUF leaves a `ModelVal::Elem` class token behind, which is not a String value | `?`. `render_field`'s sort guard deliberately refuses the `Elem`: routing a String field through the shared builder unguarded would print `@elem0` in a String position — a sort-mismatched *wrong* value, strictly worse than a visible placeholder. Corrects §3.A's original claim; pinned by `string_field_stays_a_placeholder_rather_than_an_elem_token`. Successor slice. |
+| `get-value` on a builtin-op term | Only `Op::Uninterpreted` gets a structural rendering in `display_term` (`tseitin.rs:441-445`, which says so); and `format_value` has no entry for a compound arithmetic term | Both halves degrade: measured, `(get-value ((+ x 1) b))` → `((t7 ?) (b true))` — the label falls back to the internal `t{index}` and the value to `?`. §4.C's printer work covers applications of *declared* symbols only. Out of scope here, but it is a `tN` name reaching the user, which §7 criterion 1 forbids for `get-model`; a successor slice should close it. |
 | Uninterpreted-sort values | `format_modelval` renders `Elem` as `@elem{idx}` (`model.rs:95`), not z3's `(as @U!val!0 U)` | Pre-existing, out of scope, unchanged by the relocation in §3.C. |
 | Arity > 0 functions | Need EUF congruence-class enumeration plus a default point to build a function graph | Out of scope. **`get-model` therefore remains an incomplete model for UF queries** — it omits function symbols. Successor slice. |
 
-The two successor slices — unifying the Bool/BV value channels into the
-Combiner's builder, and function graphs for arity > 0 — are independent of each
-other and of this slice.
+**The general rule behind most of these rows**, not just their DT instances:
+`get-model` enumerates *declarations*, so it must produce an entry for a symbol
+whose value no channel supplies. It emits a sort default **only** when the
+symbol was never interned — occurs in no assertion, so its constraint set is
+empty and any value of its sort is a model value. When the symbol *is* interned
+but unvalued, it emits `?`. Defaulting there would fabricate a value for a
+symbol the query constrained: the QF_ABV stage populates only
+`abv_array_models`, so before this rule `(assert (= i #x3))` still printed
+`(define-fun i () (_ BitVec 4) #b0000)` (pinned by
+`abv_unvalued_symbol_is_a_placeholder_not_a_fabricated_default`). Pre-slice the
+value-map iteration made such symbols simply *absent*; moving the enumeration
+axis to declarations is what would otherwise have turned silent incompleteness
+into confident falsehood. **The output is incomplete in the rows above, never
+false.**
+
+The successor slices — unifying the Bool/BV/String value channels into the
+Combiner's builder, function graphs for arity > 0, and structural `get-value`
+labels for builtin ops — are independent of each other and of this slice.
 
 ## 6. Testing
 
@@ -364,9 +394,14 @@ unchanged — this slice adds no search work.
 ## 7. Success criteria
 
 1. Every probe in the §1 table produces conformant single-line `define-fun`
-   output with **no `?` for Int/Real/datatype/String fields**, no `tN` name, no
+   output with **no `?` for Int/Real/datatype fields**, no `tN` name, no
    entry for an undeclared symbol, and no declared symbol missing.
-2. `get-value ((head l) l)` returns `(((head l) 7) (l (cons 1 nil)))` — requested
+   **`String`-sorted fields are excluded**: they render `?` and are a §5 row,
+   not a criterion — see the correction to §3.A for why the ordering argument
+   that put String on this list does not hold. (The exclusion is narrow: a
+   String-sorted *declared symbol* still resolves normally; it is specifically
+   the in-search-minted *field* that has no channel.)
+2. `get-value ((head l) l)` returns `(((head l) 7) (l (cons 7 nil)))` — requested
    terms as labels.
 3. Model output is deterministic across runs, in declaration order.
 4. The §2 invariant holds: `qfdt_e2e`, `script_e2e`, and the full unfiltered
@@ -375,6 +410,7 @@ unchanged — this slice adds no search work.
    longer depends on `absorb` order.
 6. The Bool-field question in §5 is **measured**, and whichever way it lands is
    pinned by a test rather than left to inference.
-7. The two gaps that remain — BV fields, arity > 0 functions — are documented in
-   the spec and pinned by tests asserting the current fenced behaviour, so a
-   later slice can find them.
+7. The gaps that remain — BV fields, String fields, arity > 0 functions, and
+   `get-value` labels for builtin-op terms — are documented in §5 and (except
+   the last, which needs no new code path to find) pinned by tests asserting
+   the current fenced behaviour, so a later slice can find them.

@@ -303,7 +303,15 @@ fn get_value_labels_responses_with_the_requested_term() {
 /// bounded-size response instead.
 #[test]
 fn get_value_on_exponentially_shared_term_stays_bounded() {
-    const N: usize = 40;
+    // N is deliberately in the 22-25 band, NOT 40: if the budget is ever
+    // weakened this test must FAIL, and it can only fail by COMPLETING. At
+    // N=40 an unbudgeted render is 2^40 node-visits — the test would hang
+    // until CI's 20-minute cap killed the job, which reads as an
+    // infrastructure timeout rather than as a regression. At N=25 the
+    // unbudgeted render is only three doublings past the measured 25-29 MB /
+    // ~4s at N=22 (see the doc comment above), so it blows the size assertion
+    // below within seconds.
+    const N: usize = 25;
     let mut src = String::from(
         "(set-logic QF_UFLIA)(declare-fun g (Int Int) Int)(check-sat)(get-value ((let ((x0 0))",
     );
@@ -317,10 +325,9 @@ fn get_value_on_exponentially_shared_term_stays_bounded() {
 
     let out = run_script(&src);
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    // Unbounded this would be exponential in N (astronomically large at
-    // N=40). DISPLAY_TERM_BUDGET caps total node-visits regardless of N, so
-    // the response stays small — well under what an unbounded render would
-    // produce even at N=22 (29 MB).
+    // Unbounded this would be exponential in N (25-29 MB already at N=22,
+    // measured, roughly doubling per level). DISPLAY_TERM_BUDGET caps total
+    // node-visits regardless of N, so the response stays small.
     assert!(
         out[1].len() < 2_000_000,
         "get-value response not bounded: {} bytes",
@@ -335,7 +342,16 @@ fn model_names_only_declared_symbols() {
         "(set-logic QF_UFDTLIA){LIST}(declare-fun l () List)\
          (assert (= l (cons 1 nil)))(check-sat)(get-model)"
     ));
+    // Absence assertions alone are near-unfalsifiable — an empty model `()`,
+    // or an error response, satisfies every one of them. Gate on the verdict
+    // and pin a positive entry first, so the absences below are absences from
+    // a model that actually says something.
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
     let model = &out[1];
+    assert!(
+        model.contains("(define-fun l () List "),
+        "the declared symbol `l` must be present: {model}"
+    );
     assert!(
         !model.contains("(define-fun nil"),
         "a constructor constant is not a declared symbol: {model}"
@@ -360,22 +376,28 @@ fn model_names_only_declared_symbols() {
 /// that BV values are extracted solver-side from SAT vars and never enter the
 /// Combiner's ModelBuilder, so DT cannot see them.
 ///
-/// MEASURED, DIVERGES FROM THAT PREDICTION — and worse in TWO separate ways,
-/// one per build profile:
+/// MEASURED behaviour differs per build profile:
 ///
 /// * RELEASE (`cargo build --release --bin shinri`, no debug assertions):
-///   the field does not render `?` at all. `(w v)` is a bare selector
-///   application with no tester or constructor ever asserted about `v`
-///   itself, so `v` never lands in `DtSolver::watched_dt_terms()` and
-///   `DtSolver::model()` (`crates/shinri-dt/src/lib.rs:870-881`) skips it
-///   entirely — DT contributes NOTHING for `v` to the shared ModelBuilder,
-///   not even a partial `(mk ?)`. `format_model` then treats `v` exactly
-///   like a symbol that occurs in no assertion and falls all the way
-///   through to `sort_default`'s structural default
-///   (`crates/shinri-solver/src/lib.rs:552`), which zero-fills the BV
-///   field: `./target/release/shinri` on this exact script prints
-///   `((define-fun v () W (mk #b00000000)))` — silently CONTRADICTING the
-///   assertion `(= (w v) #x2a)` rather than visibly flagging "unknown".
+///   `(w v)` is a bare selector application with no tester or constructor ever
+///   asserted about `v` itself, so `v` never lands in
+///   `DtSolver::watched_dt_terms()` and `DtSolver::model()`
+///   (`crates/shinri-dt/src/lib.rs:870-881`) skips it entirely — DT
+///   contributes NOTHING for `v` to the shared ModelBuilder, not even a
+///   partial `(mk ?)`.
+///
+///   Task 7 measured this as `((define-fun v () W (mk #b00000000)))`:
+///   `format_model` treated `v` exactly like a symbol occurring in no
+///   assertion and fell through to `sort_default`'s structural default, which
+///   zero-filled the BV field — silently CONTRADICTING the assertion
+///   `(= (w v) #x2a)`. The final review's finding 1 removed that whole class
+///   of answer: `v` IS interned (it occurs in `(w v)`), so it is no longer
+///   eligible for a sort default, and the entry is now the visible placeholder
+///   `((define-fun v () W ?))`. The DT gap itself is unchanged and still open
+///   — nothing values `v` — but the model no longer states a falsehood about
+///   it. Note the placeholder covers the WHOLE symbol, not just the field:
+///   with no channel value there is no evidence of `v`'s constructor either,
+///   and `mk` is forced here only because `W` happens to have one constructor.
 ///
 /// * DEV/TEST (`cargo nextest run`, the tier this repo actually gates on —
 ///   AGENTS.md's blocking tier and `mise run test` both build the `dev`
@@ -392,13 +414,10 @@ fn model_names_only_declared_symbols() {
 ///
 /// Both measured behaviours are pinned below, gated on `debug_assertions` so
 /// each build profile is provably tested against the SAME query (`BV_FIELD`)
-/// rather than trusting the two to stay in sync via prose. This matters
-/// because the two failure modes are a coupled pair, not independent: if a
-/// successor slice deletes the `debug_assert!` so dev matches release, the
-/// `should_panic` test below fails — and the natural repair is to replace it
-/// with an `assert_eq!` on the zero-fill, silently promoting "contradicts the
-/// assertion" to "expected". Splitting the pin in two, with the doc comment
-/// attached to both, is what stops that repair from reading as harmless.
+/// rather than trusting the two to stay in sync via prose. If a successor
+/// slice deletes the `debug_assert!` so dev matches release, the
+/// `should_panic` test below fails and the release pin is what says what the
+/// answer should then be.
 const BV_FIELD: &str = "(set-logic QF_UFDTBV)(declare-datatype W ((mk (w (_ BitVec 8)))))\
                         (declare-fun v () W)(assert (= (w v) #x2a))(check-sat)(get-model)";
 
@@ -412,21 +431,20 @@ fn fenced_bv_field_panics_in_debug() {
     let _ = run_script(BV_FIELD);
 }
 
-/// RELEASE half: pins the zero-fill. This is the more dangerous of the two
-/// manifestations — a `sat` answer whose model CONTRADICTS the assertion
-/// `(= (w v) #x2a)` rather than merely omitting information — and, unlike the
-/// panic, is unguarded today (no CI job runs the test suite with
-/// `--release`). Recording it here means a future release-mode test run
-/// cannot regress this silently: the assertion must hold exactly, or the
-/// test fails and forces a decision instead of drifting.
+/// RELEASE half: pins the placeholder. Unlike the panic this path is
+/// unguarded today (no CI job runs the test suite with `--release`), so
+/// recording it here means a future release-mode run cannot regress it
+/// silently — in particular it cannot drift BACK to a fabricated value, which
+/// is what it printed before the final review's finding 1.
 #[cfg(not(debug_assertions))]
 #[test]
-fn fenced_bv_field_zero_fills_in_release() {
+fn fenced_bv_field_is_a_placeholder_in_release() {
     let out = run_script(BV_FIELD);
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    // MEASURED: CONTRADICTS the assertion `(= (w v) #x2a)`. Not an acceptable
-    // steady state — see the doc comment above.
-    assert_eq!(out[1], "((define-fun v () W (mk #b00000000)))");
+    // MEASURED (release binary, post-finding-1): incomplete, not false. Was
+    // `((define-fun v () W (mk #b00000000)))`, which contradicted
+    // `(= (w v) #x2a)`.
+    assert_eq!(out[1], "((define-fun v () W ?))");
 }
 
 /// `get-model` omits functions of arity > 0 (spec §5): a function graph needs
@@ -473,4 +491,101 @@ fn fenced_uninterpreted_field_agrees_across_a_merged_class() {
         out[1],
         "((define-fun p () P (mk @elem0))(define-fun q () P (mk @elem0)))"
     );
+}
+
+// ── Final review, finding 1: a sort default must not answer for a symbol the
+//    solve actually constrained ────────────────────────────────────────────
+
+/// `value_of_declared` returns `None` for two conditions that are not
+/// interchangeable: the symbol was never interned (occurs in no assertion — a
+/// sort default is then CORRECT, since its constraint set is empty), or it was
+/// interned and constrained but no value channel holds a value for it (a sort
+/// default is then a LIE).
+///
+/// The QF_ABV path (`crates/shinri-solver/src/lib.rs`, the
+/// `uses_arrays_over_bv` early return) is the general case of the second
+/// condition: it populates ONLY `abv_array_models`, so every non-array
+/// declared symbol on that path has no channel. Before the fix, `i` and `j`
+/// below — both pinned by an assertion to a nonzero value — printed
+/// `#b0000`, a model contradicting the very assertions that made the query
+/// `sat`. Pre-slice-43 `format_model` iterated the value map and they were
+/// merely ABSENT; changing the enumeration axis to declarations is what turned
+/// that silent incompleteness into a confident falsehood. The array entry,
+/// which DOES have a channel, must keep its real value — an over-broad fix
+/// that degraded everything to `?` fails this test too.
+#[test]
+fn abv_unvalued_symbol_is_a_placeholder_not_a_fabricated_default() {
+    let out = run_script(
+        "(set-logic QF_ABV)(declare-fun a () (Array (_ BitVec 4) (_ BitVec 8)))\
+         (declare-fun i () (_ BitVec 4))(declare-fun j () (_ BitVec 4))\
+         (assert (= i #x3))(assert (= j #x5))(assert (= (select a i) #x2a))\
+         (check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert_eq!(
+        out[1],
+        "((define-fun a () (Array (_ BitVec 4) (_ BitVec 8)) \
+          (store ((as const (Array (_ BitVec 4) (_ BitVec 8))) #x00) #x3 #x2a))\
+          (define-fun i () (_ BitVec 4) ?)(define-fun j () (_ BitVec 4) ?))"
+    );
+}
+
+/// The Bool half of the same condition, and the sharper demonstration: a
+/// defaulted `Bool` prints `false` for a symbol the query ASSERTED, so the
+/// falsehood is not a matter of an unlucky bit pattern.
+#[test]
+fn abv_unvalued_bool_is_a_placeholder_not_false() {
+    let out = run_script(
+        "(set-logic QF_ABV)(declare-fun a () (Array (_ BitVec 4) (_ BitVec 8)))\
+         (declare-fun b () Bool)(assert b)(assert (= (select a #x0) #x2a))\
+         (check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert!(
+        out[1].contains("(define-fun b () Bool ?)"),
+        "an asserted Bool must not be defaulted to `false`: {}",
+        out[1]
+    );
+}
+
+/// The control for the fix: a symbol in NO assertion is never interned, so the
+/// sort default still applies and `get-model` still answers for it. This is
+/// what keeps the finding-1 fix from being "degrade everything to `?`".
+/// (`unasserted_int_symbol_gets_a_default` above pins the same property on the
+/// arith path; this pins that the two `None` sources are distinguished within
+/// ONE model, side by side.)
+#[test]
+fn unasserted_and_unvalued_symbols_are_told_apart_in_one_model() {
+    let out = run_script(
+        "(set-logic QF_ABV)(declare-fun a () (Array (_ BitVec 4) (_ BitVec 8)))\
+         (declare-fun i () (_ BitVec 4))(declare-fun k () (_ BitVec 4))\
+         (assert (= (select a i) #x2a))(check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    // `i` occurs in the select (interned, unvalued → `?`); `k` occurs nowhere
+    // (never interned → default). Same model, same sort, different answers.
+    assert!(
+        out[1].contains("(define-fun i () (_ BitVec 4) ?)"),
+        "constrained-but-unvalued must be `?`: {}",
+        out[1]
+    );
+    assert!(
+        out[1].contains("(define-fun k () (_ BitVec 4) #x0)"),
+        "unasserted must keep its sort default: {}",
+        out[1]
+    );
+}
+
+/// Duplicate declarations must not produce duplicate model entries. The parser
+/// accepts redeclaration and hash-cons maps both to one symbol; pre-slice-43
+/// the term-keyed value map collapsed the repeat implicitly, the declaration
+/// registry has to do it explicitly.
+#[test]
+fn redeclared_symbol_appears_once_in_the_model() {
+    let out = run_script(
+        "(set-logic QF_LIA)(declare-fun x () Int)(declare-fun x () Int)\
+         (check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert_eq!(out[1], "((define-fun x () Int 0))");
 }

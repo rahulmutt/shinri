@@ -253,12 +253,16 @@ impl Solver {
     /// (slice 43 §5).
     pub fn declare_fun(&mut self, name: &str, params: &[SortId], result: SortId) -> SymbolId {
         let sym = self.ctx.declare_fun(name, params, result);
-        self.declared.push(DeclaredFun {
-            name: name.to_string(),
-            sym,
-            arity: params.len(),
-            result,
-        });
+        // Deduplicated for the same reason as the `Command::DeclareFun` arm: a
+        // repeated declaration must not become a repeated model entry.
+        if !self.declared.iter().any(|e| e.sym == sym) {
+            self.declared.push(DeclaredFun {
+                name: name.to_string(),
+                sym,
+                arity: params.len(),
+                result,
+            });
+        }
         sym
     }
     pub fn bool_sort(&self) -> SortId {
@@ -310,12 +314,15 @@ impl Solver {
     /// new mint and no arena shift.
     pub fn declare_const(&mut self, name: &str, sort: SortId) -> TermId {
         let f = self.ctx.declare_fun(name, &[], sort);
-        self.declared.push(DeclaredFun {
-            name: name.to_string(),
-            sym: f,
-            arity: 0,
-            result: sort,
-        });
+        // Deduplicated for the same reason as the `Command::DeclareFun` arm.
+        if !self.declared.iter().any(|e| e.sym == f) {
+            self.declared.push(DeclaredFun {
+                name: name.to_string(),
+                sym: f,
+                arity: 0,
+                result: sort,
+            });
+        }
         self.ctx.mk_app(Op::Uninterpreted(f), &[]).expect("const")
     }
     pub fn app(&mut self, op: Op, args: &[TermId]) -> TermId {
@@ -423,11 +430,16 @@ impl Solver {
             }
             Command::GetValue(ts) => {
                 let mut out = String::from("(");
+                // ONE budget for the whole response, not one per label: the
+                // labels can all name the same `let`-shared term, so a
+                // per-term budget bounds K labels at K× the documented size
+                // (measured, K=40: 14.0 MB per-term vs 350 KB shared).
+                let mut budget = crate::tseitin::DISPLAY_TERM_BUDGET;
                 for (i, t) in ts.iter().enumerate() {
                     if i > 0 {
                         out.push(' ');
                     }
-                    let name = crate::tseitin::display_term(&self.ctx, *t);
+                    let name = crate::tseitin::display_term(&self.ctx, *t, &mut budget);
                     let v = self.format_value(*t).unwrap_or_else(|| "?".to_string());
                     out.push_str(&format!("({name} {v})"));
                 }
@@ -451,12 +463,20 @@ impl Solver {
                 params,
                 result,
             } => {
-                self.declared.push(DeclaredFun {
-                    name,
-                    sym,
-                    arity: params.len(),
-                    result,
-                });
+                // SMT-LIB scripts in the wild redeclare a symbol, and the
+                // parser accepts it (the term is hash-consed to the same
+                // `sym`). The registry is what `get-model` enumerates, so an
+                // un-deduplicated push would print the same `define-fun`
+                // twice. Pre-slice-43 the term-keyed value map collapsed the
+                // repeat implicitly; the registry has to do it explicitly.
+                if !self.declared.iter().any(|e| e.sym == sym) {
+                    self.declared.push(DeclaredFun {
+                        name,
+                        sym,
+                        arity: params.len(),
+                        result,
+                    });
+                }
                 CommandResponse::None
             }
             Command::SetLogic(_)
@@ -505,12 +525,39 @@ impl Solver {
         }
         let mut out = String::from("(");
         for d in self.declared.iter().filter(|d| d.arity == 0) {
-            let val = self
-                .value_of_declared(d)
-                .or_else(|| self.sort_default(d.result, &mut Vec::new()))
-                // Only an ill-founded datatype reaches here; `?` is the
-                // established visible-placeholder convention (spec §5).
-                .unwrap_or_else(|| "?".to_string());
+            let val = match self.value_of_declared(d) {
+                Some(v) => v,
+                // `value_of_declared` returns `None` for two conditions that
+                // are NOT interchangeable, and only one of them licenses a
+                // fabricated value:
+                //
+                // (a) the symbol was never interned — it occurs in no
+                //     assertion. Its constraint set is empty, so ANY value of
+                //     its sort is a model value: the sort default is correct.
+                //
+                // (b) the symbol WAS interned, so it occurs in an assertion and
+                //     may be tightly constrained, but no value channel
+                //     (`last_model` / `eliminated_ite_vals` / `abv_array_models`)
+                //     holds a value for it — the solver stage that decided this
+                //     query does not feed one for that symbol. The QF_ABV path
+                //     (which populates only `abv_array_models`) puts every
+                //     non-array declared symbol here. A sort default would then
+                //     print a value CONTRADICTING the assertions that made the
+                //     query sat, under a `define-fun` that claims to be a model
+                //     entry. `?` is the established visible placeholder
+                //     (spec §5): incomplete, but never false.
+                //
+                // Pre-slice-43 `format_model` iterated the value map, so a
+                // case-(b) symbol was simply absent. Moving the enumeration
+                // axis to declarations is what turned that silent absence into
+                // a confident answer, so the two sources must be told apart
+                // here.
+                None if self.ctx.find_nullary_app(d.sym).is_none() => self
+                    .sort_default(d.result, &mut Vec::new())
+                    // Only an ill-founded datatype reaches here; `?` again.
+                    .unwrap_or_else(|| "?".to_string()),
+                None => "?".to_string(),
+            };
             out.push_str(&format!(
                 "(define-fun {} () {} {})",
                 d.name,
@@ -531,17 +578,28 @@ impl Solver {
     /// table, it does not intern). Minting here would extend the term arena and
     /// shift every later `TermId`, which is verdict-observable — and `get-model`
     /// may be followed by further `assert`/`check-sat` commands, so "after a
-    /// solve" is not by itself safe. `None` means the symbol appeared in no
-    /// assertion, so no theory could have assigned it a value either; the caller
-    /// falls back to the sort default, which is the right answer for that case.
+    /// solve" is not by itself safe.
+    ///
+    /// `None` is AMBIGUOUS and the caller must disambiguate it: either the
+    /// symbol was never interned (no assertion mentions it, so no theory could
+    /// have valued it) or it was interned and constrained but the solver stage
+    /// that ran fed no value channel for it. `format_model` re-probes
+    /// `find_nullary_app` to tell those apart — only the first may be
+    /// sort-defaulted.
     fn value_of_declared(&self, d: &DeclaredFun) -> Option<String> {
         let t = self.ctx.find_nullary_app(d.sym)?;
         self.format_value(t)
     }
 
-    /// A canonical value for a sort, used for a declared symbol that occurs in no
-    /// assertion — it is in no registered atom, so no theory assigns it a value
-    /// (slice 43 §4.B). Without this the symbol vanishes from `get-model`.
+    /// A canonical value for a sort, used ONLY for a declared symbol that occurs
+    /// in no assertion — it is in no term, hence in no registered atom, so no
+    /// theory assigns it a value (slice 43 §4.B) and every value of the sort is
+    /// equally a model value. Without this the symbol vanishes from `get-model`.
+    ///
+    /// It must NOT be used for a symbol that does occur in an assertion but that
+    /// no value channel valued: there the assertions constrain it, so a
+    /// canonical value is a guess that can contradict them. `format_model`
+    /// enforces that distinction; see its `find_nullary_app` guard.
     ///
     /// `on_path` carries the datatype sorts on the current recursion path: a
     /// constructor whose field re-enters a sort already on the path cannot be
@@ -560,16 +618,33 @@ impl Solver {
             SortNode::Int | SortNode::Real => Some("0".to_string()),
             SortNode::String => Some("\"\"".to_string()),
             SortNode::RoundingMode => Some("RNE".to_string()),
-            SortNode::BitVec(n) => Some(format!("#b{}", "0".repeat(*n as usize))),
+            // Via `format_modelval` rather than a hand-rolled `#b0…0`: that is
+            // the one place BV literal spelling is decided (it emits `#x…` at
+            // widths divisible by 4), and two spellings of zero inside a single
+            // model response is a needless inconsistency.
+            SortNode::BitVec(n) => Some(shinri_theory::model::format_modelval(
+                &shinri_theory::types::ModelVal::BitVec(*n, shinri_num::Integer::zero()),
+            )),
             SortNode::Float(eb, sb) => Some(format!(
                 "(fp #b0 #b{} #b{})",
                 "0".repeat(*eb as usize),
                 "0".repeat((*sb - 1) as usize)
             )),
-            // No value vocabulary for these; `@elem0` matches what
-            // `format_modelval` already emits for an assigned `Elem`, so the
-            // defaulted and assigned cases read alike.
-            SortNode::Uninterpreted(_) | SortNode::RegLan => Some("@elem0".to_string()),
+            // No value vocabulary for an uninterpreted sort; `@elem0` matches
+            // what `format_modelval` already emits for an assigned `Elem`, so
+            // the defaulted and assigned cases read alike.
+            SortNode::Uninterpreted(_) => Some("@elem0".to_string()),
+            // RegLan DOES have a value grammar, so an EUF class token would be
+            // sort-mismatched here — exactly the error class `render_field`'s
+            // String guard exists to prevent. `re.none` (the empty regular
+            // language) is a real RegLan value and the natural sibling of `0` /
+            // `""` / `false`. Unreachable today: declaring a RegLan symbol
+            // fences the query to `unknown` and `get-model` then returns `()`
+            // (see the declaration fence in `check_sat_inner`), so this is a
+            // latent-consistency fix with no observable behaviour change — the
+            // slice that lifts that fence would not think to look here.
+            // NOTE: deviates from the slice-43 plan, which sketched `@elem0`.
+            SortNode::RegLan => Some("re.none".to_string()),
             // A constant array of the element sort's own default, matching how
             // the ABV model renders array values (`shinri-abv/src/model.rs`).
             SortNode::Array(_, e) => {
