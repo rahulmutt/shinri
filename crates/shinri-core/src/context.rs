@@ -187,6 +187,36 @@ impl Context {
         &self.sorts[id.index()]
     }
 
+    /// An interned sort as SMT-LIB text: `Int`, `(_ BitVec 8)`,
+    /// `(Array Int Bool)`. Used for the signature position of `define-fun` in
+    /// `get-model` output (slice 43 §4.B).
+    ///
+    /// Deliberately EXHAUSTIVE over `SortNode` with no catch-all arm: an
+    /// unprintable sort would emit malformed SMT-LIB, so a new sort variant must
+    /// break this match rather than silently render as a placeholder.
+    ///
+    /// The `Array` arm recurses. `Parser::parse_sort` is itself recursive over
+    /// nested `Array` sorts, so a sort deep enough to overflow here cannot be
+    /// parsed in the first place — the parser bounds this, not a depth cap.
+    pub fn sort_name(&self, s: SortId) -> String {
+        match self.sort_node(s) {
+            SortNode::Bool => "Bool".to_string(),
+            SortNode::Int => "Int".to_string(),
+            SortNode::Real => "Real".to_string(),
+            SortNode::String => "String".to_string(),
+            SortNode::RoundingMode => "RoundingMode".to_string(),
+            SortNode::RegLan => "RegLan".to_string(),
+            SortNode::Uninterpreted(sym) | SortNode::Datatype(sym) => {
+                self.symbol_name(*sym).to_string()
+            }
+            SortNode::BitVec(n) => format!("(_ BitVec {n})"),
+            SortNode::Float(eb, sb) => format!("(_ FloatingPoint {eb} {sb})"),
+            SortNode::Array(i, e) => {
+                format!("(Array {} {})", self.sort_name(*i), self.sort_name(*e))
+            }
+        }
+    }
+
     pub fn symbol_name(&self, sym: SymbolId) -> &str {
         self.symbols.resolve(sym)
     }
@@ -220,6 +250,34 @@ impl Context {
     /// user-declared symbols.
     pub fn lookup_symbol(&self, text: &str) -> Option<SymbolId> {
         self.symbols.lookup(text)
+    }
+
+    /// The `TermId` of the nullary application of a declared 0-arity symbol, if
+    /// that application has already been interned. Used by `get-model` to map a
+    /// declared symbol back to the term the theories keyed their model on
+    /// (slice 43 §4.B).
+    ///
+    /// READ-ONLY by construction: it probes the hash-cons table and never
+    /// interns, so it cannot extend the term arena. That matters — creating a
+    /// term shifts the numeric `TermId` of everything built afterwards, which
+    /// is verdict-observable (see `DeclaredFun` in `shinri-solver`), and
+    /// `get-model` may be followed by further `assert`/`check-sat` commands.
+    ///
+    /// `None` means the symbol occurs in no assertion, so no theory ever saw it
+    /// and no theory assigned it a value: the caller's sort default is the
+    /// correct answer for exactly that case.
+    pub fn find_nullary_app(&self, sym: SymbolId) -> Option<TermId> {
+        let (params, result) = self.fun_sigs.get(&sym)?;
+        if !params.is_empty() {
+            return None;
+        }
+        self.term_interner
+            .get(&TermKey::App {
+                op: Op::Uninterpreted(sym),
+                args: Vec::new(),
+                sort: *result,
+            })
+            .copied()
     }
 
     /// Mark `sym` as solver-internal (reserved). Called by solver passes that
@@ -2310,5 +2368,73 @@ mod tests {
         }
         assert_eq!(ctx.dt_first_ill_founded(&[prev]), Some(prev));
         assert_eq!(ctx.dt_first_ill_founded(&[tail, prev]), Some(tail));
+    }
+
+    #[test]
+    fn sort_name_prints_every_sort_shape() {
+        let mut ctx = Context::new();
+        // Bind first: the *_sort constructors below need &mut self.
+        let b = ctx.bool_sort();
+        let i = ctx.int_sort();
+        let r = ctx.real_sort();
+        let st = ctx.string_sort();
+        let rl = ctx.reglan_sort();
+        let rm = ctx.rm_sort();
+        let bv8 = ctx.bv_sort(8);
+        let bv3 = ctx.bv_sort(3);
+        let f32s = ctx.fp_sort(8, 24);
+        let u = ctx.declare_sort("U");
+        let arr = ctx.array_sort(i, b);
+        let nested = ctx.array_sort(bv8, arr);
+        // A one-constructor datatype, to exercise the 11th SortNode variant.
+        let pair = ctx.declare_datatype_sort("Pair");
+        let mk_pair = ctx.declare_fun("mk-pair", &[i, i], pair);
+        let is_pair = ctx.declare_fun("is-pair", &[pair], b);
+        ctx.dt_add_constructor(pair, mk_pair, &[], is_pair);
+
+        assert_eq!(ctx.sort_name(b), "Bool");
+        assert_eq!(ctx.sort_name(i), "Int");
+        assert_eq!(ctx.sort_name(r), "Real");
+        assert_eq!(ctx.sort_name(st), "String");
+        assert_eq!(ctx.sort_name(rl), "RegLan");
+        assert_eq!(ctx.sort_name(rm), "RoundingMode");
+        assert_eq!(ctx.sort_name(bv8), "(_ BitVec 8)");
+        assert_eq!(ctx.sort_name(bv3), "(_ BitVec 3)");
+        assert_eq!(ctx.sort_name(f32s), "(_ FloatingPoint 8 24)");
+        assert_eq!(ctx.sort_name(u), "U");
+        assert_eq!(ctx.sort_name(arr), "(Array Int Bool)");
+        // Nested, to pin the recursion.
+        assert_eq!(
+            ctx.sort_name(nested),
+            "(Array (_ BitVec 8) (Array Int Bool))"
+        );
+        assert_eq!(ctx.sort_name(pair), "Pair");
+    }
+
+    /// `find_nullary_app` must agree with `mk_app` where the term exists, and —
+    /// the property `get-model` depends on — must never extend the arena when
+    /// it does not (slice 43 §4.B: an arena shift is verdict-observable).
+    #[test]
+    fn find_nullary_app_is_a_read_only_hash_cons_probe() {
+        let mut ctx = Context::new();
+        let i = ctx.int_sort();
+        let applied = ctx.declare_fun("applied", &[], i);
+        let orphan = ctx.declare_fun("orphan", &[], i);
+        let unary = ctx.declare_fun("f", &[i], i);
+
+        // Interned as a name but never declared as a function.
+        let undeclared = ctx.symbols.intern("nope");
+        assert_eq!(ctx.find_nullary_app(undeclared), None);
+
+        let t = ctx.mk_app(Op::Uninterpreted(applied), &[]).unwrap();
+        assert_eq!(ctx.find_nullary_app(applied), Some(t));
+
+        // An orphaned declaration has no term, and probing for it must not make
+        // one: the arena length is unchanged across the probe.
+        let before = ctx.nodes.len();
+        assert_eq!(ctx.find_nullary_app(orphan), None);
+        // Arity > 0 is not a nullary application, whatever else exists.
+        assert_eq!(ctx.find_nullary_app(unary), None);
+        assert_eq!(ctx.nodes.len(), before, "the probe extended the term arena");
     }
 }

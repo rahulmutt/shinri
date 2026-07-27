@@ -210,7 +210,16 @@ impl TheorySolver for Euf {
             // Skip Real/Int-sorted terms: the Arith theory assigns their numeric
             // values. EUF assigning Elem(...) for them would conflict with Arith's
             // Num(...) assignments and trigger the model seam debug_assert.
-            if sort == real_s || sort == int_s {
+            //
+            // Skip datatype-sorted terms for the same ownership reason: DtSolver
+            // renders them as ground constructor terms. This is REQUIRED, not
+            // cosmetic — since slice 43 DtSolver::model writes into the shared
+            // `combined` builder, so an Elem here would be visible to its
+            // `m.get(t).is_some()` guard and it would skip every datatype term.
+            // It also removes a latent fragility: before this skip, correct
+            // output depended on `absorb` being last-write-wins with dt_m
+            // absorbed after euf_m, which nothing documented or tested.
+            if sort == real_s || sort == int_s || cx.terms.is_datatype_sort(sort) {
                 continue;
             }
             let next = elem_of.len() as u32;
@@ -352,6 +361,50 @@ mod tests {
         assert!(
             shared.contains(&fx),
             "Int-sorted f-app must join the shared set"
+        );
+    }
+
+    #[test]
+    fn model_does_not_assign_datatype_sorted_terms() {
+        // DT owns datatype-sorted values (slice 43 §3.B). If EUF assigns an Elem
+        // here, DtSolver::model's already-assigned guard skips every datatype
+        // term against the shared builder and the model regresses.
+        use shinri_core::{Context, Op};
+        use shinri_theory::{AtomRegistry, EqualityEngine};
+
+        let mut ctx = Context::new();
+        // List ::= nil ; enough structure for `is_datatype_sort` to hold.
+        let list = ctx.declare_datatype_sort("List");
+        let nil = ctx.declare_fun("nil", &[], list);
+        let is_nil = ctx.declare_fun("is-nil", &[list], ctx.bool_sort());
+        ctx.dt_add_constructor(list, nil, &[], is_nil);
+        let dt_term = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        // A term of a plain uninterpreted sort, which EUF DOES own.
+        let u = ctx.declare_sort("U");
+        let us = ctx.declare_fun("u", &[], u);
+        let u_term = ctx.mk_app(Op::Uninterpreted(us), &[]).unwrap();
+
+        let mut euf = Euf::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        euf.inner.add_term(&mut cx, dt_term);
+        euf.inner.add_term(&mut cx, u_term);
+
+        let mut m = ModelBuilder::default();
+        euf.model(&mut cx, &mut m);
+
+        assert!(
+            m.get(dt_term).is_none(),
+            "EUF must leave datatype-sorted terms to DtSolver"
+        );
+        assert!(
+            m.get(u_term).is_some(),
+            "EUF must still assign uninterpreted-sorted terms"
         );
     }
 }

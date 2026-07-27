@@ -404,14 +404,97 @@ impl<'a> Encoder<'a> {
     }
 }
 
-/// Minimal term display for model/value output (name for nullary consts, else `t<id>`).
-pub(crate) fn display_term(ctx: &shinri_core::Context, t: shinri_core::TermId) -> String {
+/// Node-visit budget for `display_term`'s recursion (slice 43 T6 review
+/// finding 1). The term DAG is hash-consed and the parser supports `let`
+/// (`shinri-parser/src/parser.rs:772`), which binds a name to a TermId
+/// without duplicating it — so a LINEAR-size, SMALL-depth script can build a
+/// term that shares the same subterm at every level, e.g. a chain of
+/// `x_i := (g x_{i-1} x_{i-1})`. This printer has no memoization, so it
+/// re-walks a shared child once per occurrence in its parent: rendering that
+/// chain costs `2^N` node-visits (and characters) for `N` levels, not `N`.
+/// Measured against this rendering (pre-budget) with a 22-level chain
+/// (612-byte script): a 29 MB response in ~4.3s; the review's own
+/// measurement on an equivalent script found 25 MB/4.1s at N=22 and 100
+/// MB/16.5s at N=24 — i.e. it roughly doubles per additional level. The
+/// `depth` cap below does NOT bound this: the blowup is already severe at
+/// depth 22-24, three orders of magnitude short of the depth-10_000 cap.
+/// `DISPLAY_TERM_BUDGET` counts down by one per node visited (checked BEFORE
+/// recursing into children, so the budget bounds work done, not just output
+/// size) and every remaining subterm renders as `t{index}` once it hits
+/// zero. 100_000 is comfortably more nodes than any human-written
+/// `get-value` target has (those are a handful of nested applications, not
+/// tens of thousands) while still cutting an exponential chain off at
+/// roughly its 17th sharing level — far short of the levels in the table
+/// above — so the worst case is sub-millisecond instead of double-digit
+/// seconds.
+///
+/// The budget is built ONCE PER `get-value` RESPONSE (in the `Command::GetValue`
+/// arm) and threaded through every label in it. `(get-value (t1 … tK))` with a
+/// per-term budget would bound each label but not the response. Measured on a
+/// 24_635-byte script whose K=40 labels all name the same 25-level `let`-shared
+/// term: 14.0 MB in 0.55s with a per-term budget, 350 KB in 0.017s with this
+/// shared one — the multiplier is exactly K, and K is only bounded by script
+/// length. Sharing the countdown makes the bound this comment describes a
+/// property of the whole response.
+pub(crate) const DISPLAY_TERM_BUDGET: usize = 100_000;
+
+/// An SMT-LIB rendering of a term, for `get-value` response labels: `x`,
+/// `(head l)`. The `t{index}` fallback remains for a term with no printable
+/// form; it should be unreachable for anything the user could have written
+/// (slice 43 §4.C). Only `Op::Uninterpreted` gets a structural rendering —
+/// arithmetic and other builtin ops fall back to `t{index}`, which is out of
+/// scope for this slice.
+///
+/// `budget` is supplied BY THE CALLER and shared across the whole `get-value`
+/// response, not minted per term: `(get-value (a b c))` renders K labels, and
+/// `let` lets all K name the same deep shared term, so a per-term budget would
+/// multiply the bound by K and the size guarantee the constant documents would
+/// hold only of one label rather than of the response the user receives.
+pub(crate) fn display_term(
+    ctx: &shinri_core::Context,
+    t: shinri_core::TermId,
+    budget: &mut usize,
+) -> String {
+    display_term_at_depth(ctx, t, 0, budget)
+}
+
+/// `depth` mirrors `render_value`'s `depth > 10_000` cap
+/// (`crates/shinri-dt/src/lib.rs:645`) for the same reason render_value has
+/// it: term depth is attacker-controlled per the threat model, so the
+/// recursion needs an explicit, mechanical backstop rather than relying on
+/// the input being shallow. It is kept as a fence, not the operative bound
+/// here — a term deep enough to trip a 10_000 cap stack-overflows during
+/// parse/assert long before `display_term` is ever called. The operative
+/// bound against attacker-controlled *output size* is `budget` (see
+/// `DISPLAY_TERM_BUDGET` above), which is what actually stops the
+/// exponential-sharing blowup this function is otherwise exposed to.
+fn display_term_at_depth(
+    ctx: &shinri_core::Context,
+    t: shinri_core::TermId,
+    depth: u32,
+    budget: &mut usize,
+) -> String {
+    if depth > 10_000 || *budget == 0 {
+        return format!("t{}", t.index());
+    }
+    *budget -= 1;
     match ctx.term_node(t) {
         TermNode::App {
             op: Op::Uninterpreted(sym),
             args,
             ..
-        } if args.len == 0 => ctx.symbol_name(*sym).to_string(),
+        } => {
+            let sym = *sym;
+            let kids = ctx.children(*args).to_vec();
+            if kids.is_empty() {
+                return ctx.symbol_name(sym).to_string();
+            }
+            let parts: Vec<String> = kids
+                .iter()
+                .map(|&k| display_term_at_depth(ctx, k, depth + 1, budget))
+                .collect();
+            format!("({} {})", ctx.symbol_name(sym), parts.join(" "))
+        }
         _ => format!("t{}", t.index()),
     }
 }

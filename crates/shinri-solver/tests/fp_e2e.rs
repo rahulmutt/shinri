@@ -1130,9 +1130,11 @@ fn model_never_leaks_ite_internals() {
         !model.contains("ite!"),
         "internal ite symbols leaked into get-model: {model}"
     );
-    // The user constants still get values.
+    // The user constants still get values. Slice 43 changed the entry shape to
+    // `define-fun`; `ite!` cannot appear at all now, because get-model
+    // enumerates the declared-symbol registry rather than the value map.
     assert!(
-        model.contains("(x "),
+        model.contains("(define-fun x () (_ FloatingPoint 8 24) "),
         "user constant x missing from model: {model}"
     );
 }
@@ -1144,8 +1146,9 @@ fn rm_variable_gets_model_value() {
     let (o, model) = run("(declare-const r RoundingMode)\
          (assert (= r RTZ))(check-sat)(get-model)");
     assert_eq!(o, SolveOutcome::Sat);
+    // Slice 43: entries are `define-fun`s over the declared-symbol registry.
     assert!(
-        model.contains("(r RTZ)"),
+        model.contains("(define-fun r () RoundingMode RTZ)"),
         "RM var missing/wrong in model: {model}"
     );
 }
@@ -1245,12 +1248,30 @@ fn get_value_on_eliminated_rm_ite_returns_mode() {
 }
 
 #[test]
-fn pop_clears_eliminated_ite_value_no_stale_get_value() {
-    // I3 (slice 6): pop()/Reset cleared last_model but NOT eliminated_ite_vals
-    // (nor abv_array_models), so after (pop 1) a get-value on the eliminated ite
-    // served a STALE value while other vars correctly returned "?". Assert the
-    // stale value is gone.
-    let (o, values) = run_values(
+fn get_value_after_pop_errors_no_stale_value() {
+    // Originally I3 (slice 6): pop()/Reset cleared last_model but NOT
+    // eliminated_ite_vals (nor abv_array_models), so after (pop 1) a
+    // get-value on the eliminated ite served a STALE value while other vars
+    // correctly returned "?". The fix was `Solver::pop` clearing those two
+    // maps directly (`lib.rs:362-363`).
+    //
+    // Slice 43 T6 Part B changed what this test verifies (T6 review finding
+    // 2): `pop` already invalidates `last_outcome` (no fresh `check-sat` has
+    // run against the popped assertion set), and `get-value` is now gated on
+    // `last_outcome == Some(Sat)` exactly like `get-model` (§4.B/§4.C). That
+    // gate closes the pop→get-value window entirely, so a get-value after
+    // `pop` with no intervening `check-sat` is now `CommandResponse::Error`
+    // regardless of whether `eliminated_ite_vals`/`abv_array_models` were
+    // ever cleared — this test NO LONGER exercises the I3 map-clearing fix;
+    // it exercises the `last_outcome` gate instead (confirmed by disabling
+    // `lib.rs:362-363` locally and re-running the full suite: all tests,
+    // including a "pop → fresh check-sat → get-value" probe, stayed green,
+    // because `check_sat()` unconditionally re-clears/re-sets both maps on
+    // every call — see `Solver::pop`'s comment for the write-up).
+    // `lib.rs:362-363` are kept as defense-in-depth for a future caller that
+    // bypasses the gate, not as something this test can pin.
+    let mut s = Solver::new();
+    let mut p = Parser::new(
         "(declare-const c Bool)(declare-const x (_ BitVec 8))\
          (push 1)\
          (assert c)(assert (= x #x0f))\
@@ -1261,25 +1282,32 @@ fn pop_clears_eliminated_ite_value_no_stale_get_value() {
          (get-value ((ite c x #x00)))\
          (get-value (x))",
     );
-    assert_eq!(o, SolveOutcome::Sat);
-    assert_eq!(values.len(), 3);
+    let mut responses = Vec::new();
+    while let Some(result) = p.next_command(s.ctx_mut()) {
+        responses.push(s.execute(result.expect("parse")));
+    }
+    assert!(
+        responses.iter().any(|r| matches!(r, CommandResponse::Sat)),
+        "{responses:?}"
+    );
+    let post_check_sat: Vec<&CommandResponse> = responses
+        .iter()
+        .filter(|r| matches!(r, CommandResponse::Values(_) | CommandResponse::Error(_)))
+        .collect();
+    assert_eq!(post_check_sat.len(), 3, "{post_check_sat:?}");
     // Before pop: the eliminated ite resolves to #x0f (c true, x=#x0f).
-    assert!(
-        values[0].contains("#x0f"),
-        "pre-pop ite value: {}",
-        values[0]
-    );
-    // After pop: no stale value — the ite must read "?" like the now-unbound x.
-    assert!(
-        !values[1].contains("#x0f") && values[1].contains('?'),
-        "post-pop ite must be '?', not stale #x0f: {}",
-        values[1]
-    );
-    assert!(
-        values[2].contains('?'),
-        "post-pop x must be '?': {}",
-        values[2]
-    );
+    match post_check_sat[0] {
+        CommandResponse::Values(v) => assert!(v.contains("#x0f"), "pre-pop ite value: {v}"),
+        other => panic!("expected a value response pre-pop: {other:?}"),
+    }
+    // After pop: no fresh check-sat, so both post-pop get-values must error —
+    // not a stale value, and not even a "?" placeholder.
+    for r in &post_check_sat[1..] {
+        assert!(
+            matches!(r, CommandResponse::Error(_)),
+            "post-pop get-value must error, not answer: {r:?}"
+        );
+    }
 }
 
 #[test]

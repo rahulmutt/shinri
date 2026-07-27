@@ -935,6 +935,8 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
     /// (interface variables included); EUF fills uninterpreted classes. Arrays
     /// contributes nothing in the baseline but keeps the seam symmetric. The
     /// theories must agree on every shared term — a debug-asserted seam invariant.
+    /// Strings and then datatypes build into the SHARED builder last, because
+    /// both need to READ what the value-owning theories assigned (slice 43 §3.A).
     pub fn build_model(&mut self) -> ModelBuilder {
         let mut arith_m = ModelBuilder::default();
         {
@@ -967,24 +969,16 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
             };
             self.arrays.model(&mut cx, &mut arrays_m);
         }
-        let mut dt_m = ModelBuilder::default();
-        {
-            let mut cx = TheoryCtx {
-                terms: &mut self.terms,
-                eq: &mut self.eq,
-                atoms: &self.atoms,
-            };
-            self.dt.model(&mut cx, &mut dt_m);
-        }
         let mut combined = arith_m;
         combined.absorb(euf_m);
         combined.absorb(arrays_m);
-        combined.absorb(dt_m);
-        // Build the string model LAST, directly into `combined`, so it can read
-        // the arith-assigned `(str.len ·)` values (needed to fill free string
+        // Build the string model directly into `combined`, so it can read the
+        // arith-assigned `(str.len ·)` values (needed to fill free string
         // variables to their correct length) and any EUF-assigned string values.
         // A separate empty builder would hide those, yielding length-0 strings
-        // that violate their own `str.len` constraint.
+        // that violate their own `str.len` constraint. (Datatypes follow, for the
+        // same reason; string reads no datatype-sorted term, so the order between
+        // these two is free.)
         {
             let mut cx = TheoryCtx {
                 terms: &mut self.terms,
@@ -992,6 +986,26 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                 atoms: &self.atoms,
             };
             self.string.model(&mut cx, &mut combined);
+        }
+        // Build the datatype model LAST, directly into `combined`, so
+        // `render_value` can read the field values the owning theories assigned:
+        // arith's Num for Int/Real fields (Arith::build_model assigns EVERY var
+        // it knows, free ones included), EUF's Elem for uninterpreted-sorted
+        // ones, and the string model's values. A separate empty builder hides
+        // all of them and every field renders `?` (slice 43 §3.A).
+        //
+        // Going last is safe because nothing reads DT's values: DtSolver::model
+        // assigns only datatype-sorted terms (every `dt_terms` insertion is
+        // `is_datatype_sort`-guarded), and StrSolver::model — the only other
+        // theory that reads this builder — looks up only `(str.len ·)` (Int) and
+        // string-sorted terms, never a datatype-sorted one.
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut self.terms,
+                eq: &mut self.eq,
+                atoms: &self.atoms,
+            };
+            self.dt.model(&mut cx, &mut combined);
         }
         combined
     }
@@ -1398,6 +1412,64 @@ mod tests {
             Some(&crate::types::ModelVal::Num(
                 shinri_core::Rational::from_int(42i128.into())
             ))
+        );
+    }
+
+    /// Dt-slot stub: records whether the builder it was handed already held
+    /// term(1) (ValTheory's assignment) on entry, then assigns term(2) itself.
+    #[derive(Default)]
+    struct DtProbe {
+        saw_earlier_theorys_value: bool,
+    }
+    impl TheorySolver for DtProbe {
+        const THEORY_ID: u16 = 6;
+        fn new_var(&mut self, _cx: &mut TheoryCtx, _v: Var, _atom: TermId) {}
+        fn assert(&mut self, _cx: &mut TheoryCtx, _l: Lit) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn propagate(
+            &mut self,
+            _cx: &mut TheoryCtx,
+            _o: &mut Vec<(Lit, TheoryJust)>,
+        ) -> Option<Vec<EqLeaf>> {
+            None
+        }
+        fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+            TCheck::Sat
+        }
+        fn explain(&mut self, _cx: &mut TheoryCtx, _t: u32, _e: &mut Explainer) {}
+        fn model(&mut self, _cx: &mut TheoryCtx, m: &mut ModelBuilder) {
+            self.saw_earlier_theorys_value = m.get(TermId::new(1).unwrap()).is_some();
+            m.assign(
+                TermId::new(2).unwrap(),
+                crate::types::ModelVal::Datatype("nil".into()),
+            );
+        }
+        fn push(&mut self) {}
+        fn pop(&mut self, _l: usize) {}
+    }
+
+    #[test]
+    fn build_model_runs_dt_last_so_it_can_read_other_theories() {
+        // Slice 43 §3.A: DtSolver::model must receive a builder that ALREADY
+        // holds the other theories' assignments. With a fresh empty builder every
+        // datatype field renders `?`, which is the defect this ordering fixes.
+        // (a) the arith-slot value must be visible to the dt slot on entry, and
+        // (b) the dt slot's own assignment must survive into the returned
+        // builder. Asserting only (b) would still pass if dt ran FIRST, which is
+        // precisely the ordering this test exists to forbid.
+        let mut c: Combiner<OneShotProp, ValTheory, NullTheory, NullTheory, DtProbe> =
+            Combiner::default();
+        c.arith.k = 42;
+        let m = c.build_model();
+        assert!(
+            c.dt.saw_earlier_theorys_value,
+            "dt must run LAST: its builder must already hold the arith value"
+        );
+        assert_eq!(
+            m.get(TermId::new(2).unwrap()),
+            Some(&crate::types::ModelVal::Datatype("nil".into())),
+            "dt's own assignment must survive into the combined model"
         );
     }
 

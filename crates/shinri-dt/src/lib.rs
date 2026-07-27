@@ -3,7 +3,9 @@
 //! clauses via `TCheck::Split` and clashes via `TCheck::Conflict`.
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use shinri_core::{Context, DtRole, Lit, Op, SymbolId, TermId, TermNode, TheoryJust, Var};
+use shinri_core::{
+    Context, DtRole, Lit, Op, SortNode, SymbolId, TermId, TermNode, TheoryJust, Var,
+};
 use shinri_sat::Effort;
 use shinri_theory::types::EqLeaf;
 use shinri_theory::ENodeId;
@@ -635,12 +637,17 @@ impl DtSolver {
     /// bound and can stack-overflow. `depth > 10_000` is comfortably above any
     /// realistic model depth and exists ONLY to bound worst-case recursion —
     /// it does not detect cycles and must not be read as doing so.
+    ///
+    /// `m` is the COMBINED model builder (slice 43 §3.A): every other theory has
+    /// already written into it, so a non-datatype field resolves to the value its
+    /// owning theory assigned rather than the `?` placeholder.
     fn render_value(
         &self,
         cx: &mut TheoryCtx,
         t: TermId,
         visited: &mut FxHashSet<ENodeId>,
         depth: u32,
+        m: &ModelBuilder,
     ) -> Option<String> {
         if depth > 10_000 {
             return None; // overflow backstop, not a cycle detector
@@ -650,7 +657,7 @@ impl DtSolver {
         if !visited.insert(rep) {
             return None; // cycle
         }
-        let rendered = self.render_value_inner(cx, t, visited, depth);
+        let rendered = self.render_value_inner(cx, t, visited, depth, m);
         visited.remove(&rep);
         rendered
     }
@@ -661,6 +668,7 @@ impl DtSolver {
         t: TermId,
         visited: &mut FxHashSet<ENodeId>,
         depth: u32,
+        m: &ModelBuilder,
     ) -> Option<String> {
         let (csym, capp) = self.ctor_of_class(cx, t)?;
         let (_, cargs) = Self::uapp(cx.terms, capp)?;
@@ -681,24 +689,60 @@ impl DtSolver {
             .iter()
             .map(|&a| {
                 if cx.terms.is_datatype_sort(cx.terms.sort_of(a)) {
-                    self.render_value(cx, a, visited, depth + 1)
+                    self.render_value(cx, a, visited, depth + 1, m)
                 } else {
-                    // Non-datatype fields are owned by other theories, which
-                    // this solver has no visibility into. Render a plain
-                    // nullary constant by its symbol name; anything else is
-                    // unsupported here (fields of non-nullary, non-datatype
-                    // shape are not exercised by slice 39 and are left for
-                    // the combined model to fill in).
-                    match Self::uapp(cx.terms, a) {
-                        Some((s, kids)) if kids.is_empty() => {
-                            Some(cx.terms.symbol_name(s).to_string())
-                        }
-                        _ => Some("?".to_string()),
-                    }
+                    Some(Self::render_field(cx.terms, m, a))
                 }
             })
             .collect();
         Some(format!("({} {})", name, parts?.join(" ")))
+    }
+
+    /// A non-datatype constructor field as SMT-LIB text (slice 43 §3.C).
+    ///
+    /// The branch order is load-bearing. A numeral is readable straight off the
+    /// term, needing no theory. Otherwise the value the OWNING theory assigned
+    /// wins. Only when nothing assigned one do we fall back to a nullary
+    /// application's own symbol name — that is a *term*, not a value, so it must
+    /// never outrank the builder: a declared Int constant `x` with arith value 7
+    /// would otherwise render as `x`, and two distinct constants merged into one
+    /// class would render as two different "values", which is a wrong model
+    /// rather than an ugly one. `?` remains only for a field no theory assigned
+    /// a USABLE value to and that is not a nullary application (String/BV/FP
+    /// fields today, §5).
+    ///
+    /// Branch 3 is guarded on the value actually fitting the field's sort, for
+    /// the very same wrong-model reason the ordering exists. `ModelVal::Elem` is
+    /// EUF's opaque equivalence-CLASS TOKEN, not a value; it is a faithful
+    /// rendering only for a sort whose values genuinely are anonymous domain
+    /// elements (`SortNode::Uninterpreted`). On a sort that HAS an SMT-LIB value
+    /// grammar — String above all, since EUF treats String as uninterpreted and
+    /// an in-search-minted field never reaches `StrSolver`'s `str_terms` — an
+    /// `Elem` means "the owning theory assigned nothing", so printing `@elemN`
+    /// there would emit a sort-mismatched value where a placeholder belongs.
+    /// `shinri-str/src/model.rs:116-126` already encodes this same judgment,
+    /// overriding EUF's `Elem` on string-sorted terms as a mere placeholder.
+    /// Falling through to `?` is strictly conservative: it can only ever replace
+    /// a rendering with the placeholder, never with a different value.
+    fn render_field(terms: &Context, m: &ModelBuilder, a: TermId) -> String {
+        if let Some(r) = terms.numeral_value(a) {
+            return shinri_theory::model::format_rational(r);
+        }
+        if let Some(v) = m.get(a) {
+            let class_token_on_a_valued_sort =
+                matches!(v, shinri_theory::types::ModelVal::Elem(..))
+                    && !matches!(
+                        terms.sort_node(terms.sort_of(a)),
+                        SortNode::Uninterpreted(_)
+                    );
+            if !class_token_on_a_valued_sort {
+                return shinri_theory::model::format_modelval(v);
+            }
+        }
+        match Self::uapp(terms, a) {
+            Some((s, kids)) if kids.is_empty() => terms.symbol_name(s).to_string(),
+            _ => "?".to_string(),
+        }
     }
 
     #[cfg(test)]
@@ -829,7 +873,7 @@ impl TheorySolver for DtSolver {
                 continue;
             }
             let mut visited = FxHashSet::default();
-            let Some(v) = self.render_value(cx, t, &mut visited, 0) else {
+            let Some(v) = self.render_value(cx, t, &mut visited, 0, m) else {
                 continue;
             };
             m.assign(t, shinri_theory::types::ModelVal::Datatype(v));
@@ -1442,6 +1486,81 @@ mod tests {
             Some(shinri_theory::types::ModelVal::Datatype(s)) => assert_eq!(s, "nil"),
             other => panic!("expected a datatype model value, got {other:?}"),
         }
+    }
+
+    /// Slice 43 §3.C branch-order fence: the builder (branch 3) must outrank a
+    /// nullary application's own symbol name (branch 4). A symbol name is a
+    /// *term*, not a value — if branch 4 won, a declared Int constant with an
+    /// assigned value would print as its own name, and two distinct constants
+    /// merged into one class would print as two different "values". That is a
+    /// WRONG model, not merely an ugly one, so a future refactor must not
+    /// reorder these branches.
+    #[test]
+    fn assigned_field_value_outranks_the_constants_own_name() {
+        let mut ctx = Context::new();
+        let (list, nil, cons, _head, _tail, _is_nil, _is_cons) = list_dt(&mut ctx);
+        let int = ctx.int_sort();
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        // Two DISTINCT declared Int constants that the combined model puts in one
+        // class (arith assigns both the same value).
+        let k1 = uconst(&mut ctx, "k1", int);
+        let k2 = uconst(&mut ctx, "k2", int);
+        let c1 = ctx.mk_app(Op::Uninterpreted(cons), &[k1, nil_t]).unwrap();
+        let c2 = ctx.mk_app(Op::Uninterpreted(cons), &[k2, nil_t]).unwrap();
+        // A third field with NO assigned value, so branch 4 stays reachable —
+        // this test fences the ORDER, it does not delete the fallback.
+        let k3 = uconst(&mut ctx, "k3", int);
+        let c3 = ctx.mk_app(Op::Uninterpreted(cons), &[k3, nil_t]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let y = uconst(&mut ctx, "y", list);
+        let z = uconst(&mut ctx, "z", list);
+        let ax = ctx.mk_eq(x, c1).unwrap();
+        let ay = ctx.mk_eq(y, c2).unwrap();
+        let az = ctx.mk_eq(z, c3).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, Var::new(0), ax);
+        dt.new_var(&mut cx, Var::new(1), ay);
+        dt.new_var(&mut cx, Var::new(2), az);
+        for (a, b) in [(x, c1), (y, c2), (z, c3), (k1, k2)] {
+            let (an, bn) = (cx.eq.intern(a), cx.eq.intern(b));
+            let _ = cx.eq.merge(an, bn, EqJust::Definitional);
+        }
+
+        let mut m = shinri_theory::ModelBuilder::default();
+        let seven = shinri_core::Rational::from_int(7i128.into());
+        m.assign(k1, shinri_theory::types::ModelVal::Num(seven.clone()));
+        m.assign(k2, shinri_theory::types::ModelVal::Num(seven));
+
+        let mut visited = rustc_hash::FxHashSet::default();
+        let vx = dt.render_value(&mut cx, x, &mut visited, 0, &m);
+        let mut visited = rustc_hash::FxHashSet::default();
+        let vy = dt.render_value(&mut cx, y, &mut visited, 0, &m);
+        let mut visited = rustc_hash::FxHashSet::default();
+        let vz = dt.render_value(&mut cx, z, &mut visited, 0, &m);
+
+        assert_eq!(
+            vx.as_deref(),
+            Some("(cons 7 nil)"),
+            "assigned value must beat the constant's name `k1`"
+        );
+        assert_eq!(
+            vy.as_deref(),
+            Some("(cons 7 nil)"),
+            "one class must render as ONE value, not `k1` and `k2`"
+        );
+        assert_eq!(
+            vz.as_deref(),
+            Some("(cons k3 nil)"),
+            "the symbol-name fallback stays reachable for an unassigned field"
+        );
     }
 
     #[test]
