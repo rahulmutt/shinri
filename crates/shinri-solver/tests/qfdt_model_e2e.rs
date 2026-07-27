@@ -253,6 +253,42 @@ fn get_model_after_a_new_assert_is_empty_until_resolved() {
     assert_eq!(out[4], "()");
 }
 
+/// Task 5 found and fixed the identical defect in `format_model` (gated on
+/// `last_outcome`); `GetValue` had the same defect — the query changing
+/// underneath an unresolved `check-sat` must not answer with a value from
+/// the PREVIOUS, unrelated solve. SMT-LIB treats `get-value` after a
+/// non-`sat` check as an error, so this must produce `CommandResponse::Error`
+/// (the established pattern: `GetUnsatCore` does the same), not a
+/// model-shaped-but-stale response.
+#[test]
+fn get_value_after_unsat_is_an_error_not_a_stale_value() {
+    let out = run_script(
+        "(set-logic QF_LIA)(declare-fun x () Int)\
+         (assert (= x 5))(check-sat)(get-value (x))\
+         (assert (= x 6))(check-sat)(get-value (x))",
+    );
+    assert_eq!(out[0], "sat");
+    assert_eq!(out[1], "((x 5))");
+    assert_eq!(out[2], "unsat");
+    assert_eq!(
+        out[3], "(error \"model is not available\")",
+        "stale value after unsat: {out:?}"
+    );
+}
+
+/// Spec §4.C: get-value must label each response with the term the user asked
+/// for, not an internal id.
+#[test]
+fn get_value_labels_responses_with_the_requested_term() {
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun l () List)\
+         (assert ((_ is cons) l))(assert (= (head l) 7))\
+         (check-sat)(get-value ((head l) l))"
+    ));
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    assert_eq!(out[1], "(((head l) 7) (l (cons 7 nil)))");
+}
+
 /// Spec §1 defect 2: no internal name and no undeclared symbol may appear.
 #[test]
 fn model_names_only_declared_symbols() {

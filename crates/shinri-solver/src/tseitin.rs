@@ -404,14 +404,42 @@ impl<'a> Encoder<'a> {
     }
 }
 
-/// Minimal term display for model/value output (name for nullary consts, else `t<id>`).
+/// An SMT-LIB rendering of a term, for `get-value` response labels: `x`,
+/// `(head l)`, `(+ x 1)`. The `t{index}` fallback remains for a term with no
+/// printable form; it should be unreachable for anything the user could have
+/// written (slice 43 §4.C). Only `Op::Uninterpreted` gets a structural
+/// rendering — arithmetic and other builtin ops fall back to `t{index}`,
+/// which is out of scope for this slice.
 pub(crate) fn display_term(ctx: &shinri_core::Context, t: shinri_core::TermId) -> String {
+    display_term_at_depth(ctx, t, 0)
+}
+
+/// Term depth is attacker-controlled per the threat model (deeply nested
+/// user input), so the recursion needs an explicit backstop — the same
+/// `depth > 10_000` cap `render_value` uses (`crates/shinri-dt/src/lib.rs`),
+/// for the same reason: comfortably above any realistic term depth, and
+/// existing only to bound worst-case recursion, not to detect cycles.
+fn display_term_at_depth(ctx: &shinri_core::Context, t: shinri_core::TermId, depth: u32) -> String {
+    if depth > 10_000 {
+        return format!("t{}", t.index());
+    }
     match ctx.term_node(t) {
         TermNode::App {
             op: Op::Uninterpreted(sym),
             args,
             ..
-        } if args.len == 0 => ctx.symbol_name(*sym).to_string(),
+        } => {
+            let sym = *sym;
+            let kids = ctx.children(*args).to_vec();
+            if kids.is_empty() {
+                return ctx.symbol_name(sym).to_string();
+            }
+            let parts: Vec<String> = kids
+                .iter()
+                .map(|&k| display_term_at_depth(ctx, k, depth + 1))
+                .collect();
+            format!("({} {})", ctx.symbol_name(sym), parts.join(" "))
+        }
         _ => format!("t{}", t.index()),
     }
 }

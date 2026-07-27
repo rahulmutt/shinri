@@ -393,6 +393,18 @@ impl Solver {
                 CommandResponse::None
             }
             Command::GetModel => CommandResponse::Model(self.format_model()),
+            // `get-value` is only meaningful after `sat` (SMT-LIB) — guarded
+            // on the same `last_outcome` condition `format_model` uses
+            // (§4.B), for the identical reason: without the gate a stale
+            // value from the PREVIOUS `check-sat` would answer a query the
+            // current assertion set was never solved against. Unlike
+            // `format_model` (which has an honest empty answer, `()`),
+            // `get-value` has no such value-shaped placeholder, so this
+            // follows the established error-response pattern instead
+            // (`GetUnsatCore` below).
+            Command::GetValue(_) if self.last_outcome != Some(SolveOutcome::Sat) => {
+                CommandResponse::Error("model is not available".into())
+            }
             Command::GetValue(ts) => {
                 let mut out = String::from("(");
                 for (i, t) in ts.iter().enumerate() {
