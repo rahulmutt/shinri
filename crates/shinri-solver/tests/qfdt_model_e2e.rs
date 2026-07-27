@@ -347,3 +347,105 @@ fn model_names_only_declared_symbols() {
         );
     }
 }
+
+// ── Task 7: pin the three fenced gaps (spec §5) ───────────────────────────
+//
+// Each test below records CURRENT behaviour of a gap the spec leaves open on
+// purpose, so a successor slice can find it and a future change to it is a
+// deliberate decision rather than an accident. Every assertion here was
+// measured against the real release binary (`./target/release/shinri`)
+// before being written — none is a value predicted from the spec text.
+
+/// Spec §5 predicted a BV-sorted datatype field "still renders `?`", reasoning
+/// that BV values are extracted solver-side from SAT vars and never enter the
+/// Combiner's ModelBuilder, so DT cannot see them.
+///
+/// MEASURED, DIVERGES FROM THAT PREDICTION — and worse in TWO separate ways,
+/// one per build profile:
+///
+/// * RELEASE (`cargo build --release --bin shinri`, no debug assertions):
+///   the field does not render `?` at all. `(w v)` is a bare selector
+///   application with no tester or constructor ever asserted about `v`
+///   itself, so `v` never lands in `DtSolver::watched_dt_terms()` and
+///   `DtSolver::model()` (`crates/shinri-dt/src/lib.rs:870-881`) skips it
+///   entirely — DT contributes NOTHING for `v` to the shared ModelBuilder,
+///   not even a partial `(mk ?)`. `format_model` then treats `v` exactly
+///   like a symbol that occurs in no assertion and falls all the way
+///   through to `sort_default`'s structural default
+///   (`crates/shinri-solver/src/lib.rs:552`), which zero-fills the BV
+///   field: `./target/release/shinri` on this exact script prints
+///   `((define-fun v () W (mk #b00000000)))` — silently CONTRADICTING the
+///   assertion `(= (w v) #x2a)` rather than visibly flagging "unknown".
+///
+/// * DEV/TEST (`cargo nextest run`, the tier this repo actually gates on —
+///   AGENTS.md's blocking tier and `mise run test` both build the `dev`
+///   profile, debug assertions ON): bit-blasting `(w v)` to encode the `=`
+///   assertion hits `debug_assert!(child_ids.is_empty(), "non-nullary
+///   uninterpreted BV fn out of scope")` in
+///   `crates/shinri-bv/src/blast/mod.rs:282` and PANICS before `check-sat`
+///   ever returns. A selector application on a BV field is a non-nullary
+///   uninterpreted BV term that the bit-blaster's own comment marks as
+///   genuinely out of scope; the debug build crashes loudly on it instead
+///   of limping through with a bogus value. This exact query is the first
+///   in the workspace to combine a DT selector with a BV-sorted field, so
+///   this crash was previously unexercised and undiscovered by any test.
+///
+/// This test pins the DEV/TEST-profile reality (the panic), since that is
+/// what `cargo nextest run` — the invocation this suite actually runs
+/// under — hits. Lifting this gap is still the BV/DT channel-unification
+/// successor slice the spec pointed at, but that slice must ALSO decide
+/// what `debug_assert!` should do here, not just how to render the field.
+#[test]
+#[should_panic(expected = "non-nullary uninterpreted BV fn out of scope")]
+fn fenced_bv_field_panics_in_debug_and_zero_fills_in_release() {
+    let _ = run_script(
+        "(set-logic QF_UFDTBV)(declare-datatype W ((mk (w (_ BitVec 8)))))\
+         (declare-fun v () W)(assert (= (w v) #x2a))(check-sat)(get-model)",
+    );
+}
+
+/// `get-model` omits functions of arity > 0 (spec §5): a function graph needs
+/// EUF congruence-class enumeration plus a default point, which is a later
+/// slice, so `get-model` is knowingly NOT a complete model for UF queries.
+///
+/// MEASURED, matches the spec's prediction: `f` never appears in the output;
+/// `x` — the arity-0 symbol in the same query — is present, so an empty or
+/// errored model cannot make this test pass vacuously.
+#[test]
+fn fenced_arity_gt_zero_function_is_omitted() {
+    let out = run_script(
+        "(set-logic QF_UFLIA)(declare-fun x () Int)(declare-fun f (Int) Int)\
+         (assert (> (f x) 3))(check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    // MEASURED: `((define-fun x () Int 0))` — `f` is entirely absent; `x` is
+    // present (the beta arith settled on to satisfy `(f x) > 3` with `f`
+    // free).
+    assert_eq!(out[1], "((define-fun x () Int 0))");
+}
+
+/// Uninterpreted-sort field VALUES resolve (via EUF's `Elem`), but render as
+/// `@elem0` rather than SMT-LIB's `(as @U!val!0 U)` (spec §5) — pre-existing
+/// and out of scope to fix here.
+/// `uninterpreted_sorted_field_still_renders_its_elem_token` above already
+/// pins the single-symbol shape of that token; this test pins the OTHER half
+/// the brief calls for and that the single-symbol test cannot exercise: two
+/// symbols FORCED into the same EUF equivalence class must render the SAME
+/// field value, not two different opaque tokens for what is provably one
+/// value. Not a duplicate of the existing test — it exercises class-merge
+/// consistency, not just token shape.
+#[test]
+fn fenced_uninterpreted_field_agrees_across_a_merged_class() {
+    let out = run_script(
+        "(set-logic QF_UFDT)(declare-sort U 0)(declare-datatype P ((mk (f U))))\
+         (declare-fun p () P)(declare-fun q () P)(assert (= p q))\
+         (check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    // MEASURED: both fields resolve to the SAME @elemN token, not `?` and not
+    // two distinct tokens for a class the solver proved is one value.
+    assert_eq!(
+        out[1],
+        "((define-fun p () P (mk @elem0))(define-fun q () P (mk @elem0)))"
+    );
+}
