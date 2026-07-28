@@ -120,8 +120,16 @@ fn one_ary_congruence() {
     );
 }
 
-/// Two-ary with the arguments permuted — congruence must compare argument
-/// words POSITIONALLY, not as a set. A position-blind encoding leaves this sat.
+/// Two-ary: pins that congruence fires across two applications of a 2-ary
+/// symbol whose arguments are forced equal (`a = b`, so `g(a,b)` and `g(b,a)`
+/// are congruent applications of `g` to the same underlying values in both
+/// argument positions). NOTE: because `g(a,b)` and `g(b,a)` are the same two
+/// terms merely reordered, `{a,b} = {b,a}` as an unordered pair regardless of
+/// whether `a = b` holds — so this query does NOT by itself discriminate a
+/// positional argument comparison from a set/multiset one; a position-blind
+/// comparator also computes `cond = true` here and also returns `unsat`. See
+/// `positional_argument_comparison_is_not_set_based` below for the test that
+/// actually isolates positional vs. set-based comparison.
 #[test]
 fn two_ary_congruence_with_permuted_arguments() {
     let out = run_script(
@@ -134,6 +142,27 @@ fn two_ary_congruence_with_permuted_arguments() {
         Some("unsat"),
         "got {out:?}"
     );
+}
+
+/// DIRECTION TEST, positional vs. set-based argument comparison. `a` and `b`
+/// are DISTINCT here (unlike the sibling test above), so a correct positional
+/// encoder computes `cond = false` for the `g(a,b)`/`g(b,a)` pair — position 0
+/// compares `a` to `b` and they differ — leaving the results unconstrained,
+/// hence `sat`. A set/multiset-based comparator instead sees the *unordered*
+/// argument sets `{a,b}` and `{b,a}` as identical regardless of whether `a`
+/// equals `b`, wrongly computes `cond = true`, forces the results equal, and
+/// returns `unsat`. This is exactly the gap `two_ary_congruence_with_permuted_arguments`
+/// cannot cover (there `a = b` is asserted, so both a positional and a
+/// set-based comparator agree). MEASURED against z3 4.16.0 and cvc5 1.3.4:
+/// both `sat`.
+#[test]
+fn positional_argument_comparison_is_not_set_based() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun g ((_ BitVec 4)(_ BitVec 4)) (_ BitVec 4))\
+         (declare-fun a () (_ BitVec 4))(declare-fun b () (_ BitVec 4))\
+         (assert (distinct a b))(assert (distinct (g a b) (g b a)))(check-sat)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
 }
 
 /// The congruence must reach a BV PREDICATE over two applications, not just an
@@ -185,10 +214,14 @@ fn congruence_on_the_abv_path() {
     );
 }
 
-/// DIRECTION TEST. Congruence is an IMPLICATION, not a biconditional. An
-/// over-strong encoding (`args equal <-> results equal`) makes this `unsat`.
-/// It must be `sat`: nothing forbids a function from differing on differing
-/// arguments.
+/// DIRECTION TEST. `x` and `y` are DISTINCT, so the congruence guard `cond`
+/// (args equal) blasts to false and the arm must place NO constraint on
+/// `(f x)` vs `(f y)` — nothing forbids a function from differing on
+/// differing arguments, so this must be `sat`. This catches a mutant that
+/// drops the `cond` guard and forces the per-bit congruence clauses
+/// unconditionally (congruence applied regardless of whether the arguments
+/// are actually equal): that mutant would force `(f x) = (f y)`, contradicting
+/// the asserted `(distinct (f x) (f y))` and flipping this to `unsat`.
 #[test]
 fn distinct_arguments_may_give_distinct_results() {
     let out = run_script(
