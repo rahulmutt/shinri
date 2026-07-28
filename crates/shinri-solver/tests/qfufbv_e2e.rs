@@ -104,3 +104,128 @@ fn nan_arguments_trigger_congruence() {
         "got {out:?}"
     );
 }
+
+/// The canonical case. MEASURED pre-slice: shinri `sat`; z3 `unsat`; cvc5 `unsat`.
+#[test]
+fn one_ary_congruence() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (declare-fun x () (_ BitVec 8))(declare-fun y () (_ BitVec 8))\
+         (assert (= x y))(assert (distinct (f x) (f y)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// Two-ary with the arguments permuted — congruence must compare argument
+/// words POSITIONALLY, not as a set. A position-blind encoding leaves this sat.
+#[test]
+fn two_ary_congruence_with_permuted_arguments() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun g ((_ BitVec 4)(_ BitVec 4)) (_ BitVec 4))\
+         (declare-fun a () (_ BitVec 4))(declare-fun b () (_ BitVec 4))\
+         (assert (= a b))(assert (distinct (g a b) (g b a)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// The congruence must reach a BV PREDICATE over two applications, not just an
+/// equality between them.
+#[test]
+fn congruence_reaches_a_bv_predicate() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun f ((_ BitVec 4)) (_ BitVec 4))\
+         (declare-fun x () (_ BitVec 4))(declare-fun y () (_ BitVec 4))\
+         (assert (= x y))(assert (bvult (f x) (f y)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// ...and through a structural op applied to the results.
+#[test]
+fn congruence_survives_extract_over_the_results() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun f ((_ BitVec 4)) (_ BitVec 8))\
+         (declare-fun x () (_ BitVec 4))(declare-fun y () (_ BitVec 4))\
+         (assert (= x y))\
+         (assert (distinct ((_ extract 3 0) (f x)) ((_ extract 3 0) (f y))))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// The ABV stage builds its own Blaster, so it hits the same arm.
+/// MEASURED pre-slice: shinri `sat`; z3 `unsat`; cvc5 `unsat`.
+#[test]
+fn congruence_on_the_abv_path() {
+    let out = run_script(
+        "(set-logic QF_AUFBV)(declare-fun a () (Array (_ BitVec 4)(_ BitVec 8)))\
+         (declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (declare-fun i () (_ BitVec 4))(declare-fun j () (_ BitVec 4))\
+         (assert (= i j))(assert (distinct (f (select a i)) (f (select a j))))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// DIRECTION TEST. Congruence is an IMPLICATION, not a biconditional. An
+/// over-strong encoding (`args equal <-> results equal`) makes this `unsat`.
+/// It must be `sat`: nothing forbids a function from differing on differing
+/// arguments.
+#[test]
+fn distinct_arguments_may_give_distinct_results() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun f ((_ BitVec 4)) (_ BitVec 4))\
+         (declare-fun x () (_ BitVec 4))(declare-fun y () (_ BitVec 4))\
+         (assert (distinct x y))(assert (distinct (f x) (f y)))(check-sat)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}
+
+/// THE SHARPER DIRECTION TEST. A function may legitimately AGREE on distinct
+/// arguments. An inverted encoding (`args differ -> results differ`) fails
+/// exactly here and nowhere else — the test above would still pass under it.
+#[test]
+fn distinct_arguments_may_still_give_equal_results() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun f ((_ BitVec 4)) (_ BitVec 4))\
+         (declare-fun x () (_ BitVec 4))(declare-fun y () (_ BitVec 4))\
+         (assert (distinct x y))(assert (= (f x) (f y)))(check-sat)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}
+
+/// Pins Task 3's load-bearing step order: the inner application is registered
+/// while the outer one's argument is lowered, so `prior` must be read AFTER
+/// argument blasting. Reading it first drops the inner/outer pair and this
+/// returns `sat` — silent incompleteness, no crash, no other symptom.
+#[test]
+fn nested_application_congruence() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun f ((_ BitVec 4)) (_ BitVec 4))\
+         (declare-fun x () (_ BitVec 4))(declare-fun y () (_ BitVec 4))\
+         (assert (= x y))(assert (distinct (f (f x)) (f (f y))))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
