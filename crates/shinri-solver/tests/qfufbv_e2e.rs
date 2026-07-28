@@ -278,7 +278,7 @@ fn argument_variables_now_get_a_model_value() {
          (declare-fun x () (_ BitVec 8))(assert (= (f x) #x2a))(check-sat)(get-model)",
     );
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    // MEASURED 2026-07-28, release binary (`./target/release/shinri`) and via
+    // MEASURED 2026-07-27, release binary (`./target/release/shinri`) and via
     // the identical Solver::execute path used by run_script above.
     assert_eq!(out[1], "((define-fun x () (_ BitVec 8) #x00))");
     assert!(

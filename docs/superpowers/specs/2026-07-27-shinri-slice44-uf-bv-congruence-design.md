@@ -420,12 +420,18 @@ assumed:
    specific query.
 
 3. **Fence 2 (blowup cap), `qfufbv_e2e::encoding_past_the_budget_fences_to_unknown`.**
-   The `k=1500` chained-`g(vᵢ,vᵢ)` formula from §7.3's table, scaled past the
-   budget. MEASURED pre-slice (`main` @ `2e5e7c00`): decides `sat` in 0.165 s —
-   correctly, since each `g(vᵢ,vᵢ)` is independent and trivially self-
-   congruent; no cross-application constraint is asserted, so nothing in this
-   formula depends on congruence firing at all. Post-slice: `unknown`, because
-   the encoding cost (`pairs(1500) × 96 = 107,928,000`) exceeds
+   This test's `k=1500` formula is **not** the chained calibration formula of
+   §7.3's table — it is a *different* construction that happens to scale by
+   the same `pairs(k) × 96` cost: `k` **independent** assertions
+   `g(vᵢ,vᵢ) = #x00000000` for `i` in `0..k`, no application ever compared
+   against another (`crates/shinri-solver/tests/qfufbv_e2e.rs:51-72`). MEASURED
+   pre-slice (`main` @ `2e5e7c00`, release binary, this exact k=1500
+   construction reproduced byte-for-byte from the shipped test and run via
+   `time ./target/release/shinri`): decides `sat` in 0.168 s — correctly,
+   since each `g(vᵢ,vᵢ)` is independent and trivially self-congruent; no
+   cross-application constraint is asserted, so nothing in this formula
+   depends on congruence firing at all. Post-slice: `unknown`, because the
+   encoding cost (`pairs(1500) × 96 = 107,928,000`) exceeds
    `UF_CONGRUENCE_BUDGET`. This flip trades completeness for the PR-tier time
    budget on an intentionally adversarial size, not a correctness fix.
 
