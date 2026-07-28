@@ -555,7 +555,8 @@ fn differential_qf_bv_small() {
     println!(
         "differential_qf_bv_small: {N_ITERS} instances\n  \
          sat={n_sat} unsat={n_unsat} unknown={n_unknown}\n  \
-         width breakdown: w4={} w8={} w16={}",
+         width breakdown: w4={} w8={} w16={}\n  \
+         slice-45 Bool-result predicate family: decided={pred_decided}/{pred_total}",
         width_counts[0], width_counts[1], width_counts[2]
     );
 

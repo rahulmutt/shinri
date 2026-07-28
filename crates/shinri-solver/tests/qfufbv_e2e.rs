@@ -377,3 +377,131 @@ fn redeclared_at_an_equal_width_different_sort_is_a_different_function() {
     );
     assert_eq!(out.last().map(|s| s.as_str()), Some("sat"), "got {out:?}");
 }
+
+// ── Slice 45: Bool-result uninterpreted applications ─────────────────────────
+
+/// Spec §1 Q1: congruence fires through a Bool-result predicate.
+#[test]
+fn equal_arguments_force_equal_predicate_results() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun x () (_ BitVec 8))(declare-fun y () (_ BitVec 8))\
+         (assert (= x y))(assert (p x))(assert (not (p y)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// Spec §1 Q3: the converse must NOT hold — distinct arguments may disagree.
+#[test]
+fn distinct_arguments_leave_predicate_results_free() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun x () (_ BitVec 8))(declare-fun y () (_ BitVec 8))\
+         (assert (p x))(assert (not (p y)))(check-sat)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}
+
+/// Spec §1 Q5: the same hash-consed term at both polarities is refutable by
+/// the SAT skeleton alone. Pre-slice the fence fired before the skeleton ever
+/// ran, which is the sharpest illustration of the completeness gap.
+#[test]
+fn a_predicate_at_both_polarities_is_unsat() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun x () (_ BitVec 8))\
+         (assert (p x))(assert (not (p x)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// Spec §1 Q4: a predicate coexisting with a genuine BV atom decides.
+#[test]
+fn a_predicate_beside_a_bv_atom_decides() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun x () (_ BitVec 8))\
+         (assert (p x))(assert (bvult x #x05))(check-sat)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}
+
+/// Spec §1.1: a predicate buried inside a BV `ite`. Collection and the fence
+/// both treat a collected atom as a LEAF and do not descend, so this shape is
+/// invisible to their walks — it decides only because `word_norm.normalize`
+/// (crates/shinri-solver/src/lib.rs:759) eliminates BV ites into a fresh
+/// symbol plus a defining assertion BEFORE collection, lifting `(p x)` to the
+/// assertion level. This test is what proves that lifting, rather than
+/// assuming it.
+#[test]
+fn a_predicate_lifted_out_of_a_bv_ite_decides() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun x () (_ BitVec 8))(declare-fun y () (_ BitVec 8))\
+         (assert (= x y))\
+         (assert (= (ite (p x) #x01 #x00) #x01))\
+         (assert (= (ite (p y) #x01 #x00) #x00))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// Spec §1.1, the single-term variant: one hash-consed `(p x)` used at both
+/// ite branches must not mint two independent conditions.
+#[test]
+fn one_predicate_term_in_two_bv_ites_decides() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun x () (_ BitVec 8))\
+         (assert (= (ite (p x) #x01 #x00) #x01))\
+         (assert (= (ite (p x) #x01 #x00) #x00))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// Spec §2 out-of-scope: a Bool ARGUMENT has no blastable word — a Bool child
+/// can be an arbitrary formula and the blaster has no Tseitin encoder — so
+/// Fence 1 still fences. Sound, deliberately incomplete.
+#[test]
+fn bool_argument_to_a_predicate_still_fences() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun p (Bool) Bool)(declare-fun c () Bool)\
+         (declare-fun x () (_ BitVec 8))\
+         (assert (p c))(assert (bvult x #x05))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unknown"),
+        "got {out:?}"
+    );
+}
+
+/// Fence 1, the Bool-result sibling of `int_argument_to_a_bv_uf_fences_to_unknown`.
+#[test]
+fn int_argument_to_a_predicate_still_fences() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun p (Int) Bool)(declare-fun n () Int)\
+         (declare-fun x () (_ BitVec 8))\
+         (assert (p n))(assert (bvult x #x05))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unknown"),
+        "got {out:?}"
+    );
+}
