@@ -903,6 +903,13 @@ impl Solver {
             if crate::abv_stage::fenced(&self.ctx, &assertions) {
                 return SolveOutcome::Unknown;
             }
+            // Fence 1 (slice 44 §4). `abv_stage` builds its own
+            // `shinri_bv::Blaster` internally (no FP sink), and does its own
+            // atom collection, so pass `assertions` (a superset) rather than a
+            // collected atom set — the conservative bias this stage keeps.
+            if !crate::bv_stage::uf_args_supported(&self.ctx, &assertions, false) {
+                return SolveOutcome::Unknown;
+            }
             let assertions_owned = assertions.clone();
             // Harvest the internal eliminated-ite symbols so the ABV stage can
             // return their BV values (item 5, slice 7).
@@ -995,6 +1002,11 @@ impl Solver {
             if crate::bv_stage::has_non_bv_theory_atom(&self.ctx, &assertions, &bv_atoms) {
                 return SolveOutcome::Unknown;
             }
+            // Fence 1 (slice 44 §4): no FP sink on this path, so FP-sorted
+            // arguments are not admitted either.
+            if !crate::bv_stage::uf_args_supported(&self.ctx, &bv_atoms, false) {
+                return SolveOutcome::Unknown;
+            }
             Some(shinri_bv::lower(&mut self.ctx, &bv_atoms))
         } else {
             None
@@ -1051,6 +1063,12 @@ impl Solver {
             // fp.to_sbv). Any unsupported FP shape reachable through a BV
             // atom must fence BEFORE lowering, same argument as above.
             if !crate::fp_stage::bv_atoms_fp_supported(&self.ctx, &bv_atoms) {
+                return SolveOutcome::Unknown;
+            }
+            // Fence 1 (slice 44 §4). `allow_fp_args` is true here: the Lowerer's
+            // word_eq compares FP words with core_eq.
+            let uf_atoms: Vec<TermId> = fp_atoms.iter().chain(bv_atoms.iter()).copied().collect();
+            if !crate::bv_stage::uf_args_supported(&self.ctx, &uf_atoms, true) {
                 return SolveOutcome::Unknown;
             }
             Some(shinri_fp::lower_mixed(&mut self.ctx, &fp_atoms, &bv_atoms))

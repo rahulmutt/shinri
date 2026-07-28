@@ -255,6 +255,61 @@ pub fn has_non_bv_theory_atom(ctx: &Context, assertions: &[TermId], bv_atoms: &[
         .any(|&a| walk(ctx, a, &bv_set, &mut visited))
 }
 
+/// Fence 1 (slice 44 §4, SOUNDNESS-CRITICAL). Every non-nullary uninterpreted
+/// application with a **BitVec result sort** reachable from `atoms` must have
+/// arguments the blaster can turn into words, because `blast_bv_word`'s
+/// congruence arm compares argument words pairwise.
+///
+/// BV-sorted arguments always qualify. FP-sorted arguments qualify only when
+/// `allow_fp_args` — that is, on the FP/mixed path, where a `Lowerer` exists
+/// with a `core_eq`-based `word_eq`. A `Blaster` alone cannot compare an FP
+/// word (`core_eq` lives in `shinri-fp`, which depends on `shinri-bv` and not
+/// the reverse).
+///
+/// Everything else — Int, Bool, Array, String, uninterpreted sorts,
+/// RoundingMode — fences the caller to a sound `Unknown`. Without this,
+/// `Lowerer::word` reaches its `unreachable!("Lowerer::word on non-BV/non-FP
+/// sort")` (`crates/shinri-fp/src/lower.rs:69`) and `Blaster::word` reaches
+/// `blast_bv_word`'s builtin dispatch on a non-BV term.
+///
+/// Walks the ATOM set rather than the assertion list: that is exactly what
+/// reaches the blaster, and it stays a superset of what survives `rewrite`
+/// (rewriting can fold applications away but never create them), so the
+/// conservative bias every other fence in this stage has is preserved.
+pub fn uf_args_supported(ctx: &Context, atoms: &[TermId], allow_fp_args: bool) -> bool {
+    let mut seen = rustc_hash::FxHashSet::default();
+    atoms
+        .iter()
+        .all(|&a| walk_uf_args(ctx, a, allow_fp_args, &mut seen))
+}
+
+fn walk_uf_args(
+    ctx: &Context,
+    t: TermId,
+    allow_fp_args: bool,
+    seen: &mut rustc_hash::FxHashSet<TermId>,
+) -> bool {
+    if !seen.insert(t) {
+        return true; // already validated on another path
+    }
+    let TermNode::App { op, args, sort } = ctx.term_node(t) else {
+        return true; // a constant has no arguments
+    };
+    let kids = ctx.children(*args).to_vec();
+    if matches!(op, Op::Uninterpreted(_)) && !kids.is_empty() && ctx.bv_width(*sort).is_some() {
+        for &k in &kids {
+            let ks = ctx.sort_of(k);
+            let wordable =
+                ctx.bv_width(ks).is_some() || (allow_fp_args && ctx.fp_widths(ks).is_some());
+            if !wordable {
+                return false;
+            }
+        }
+    }
+    kids.iter()
+        .all(|&k| walk_uf_args(ctx, k, allow_fp_args, seen))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,5 +367,48 @@ mod tests {
             has_non_bv_theory_atom(&ctx, &assertions, &atoms),
             "Real Gt atom must trigger the mixed fence"
         );
+    }
+
+    #[test]
+    fn uf_args_supported_admits_bv_arguments() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fx, c]).unwrap();
+        assert!(uf_args_supported(&ctx, &[atom], false));
+    }
+
+    #[test]
+    fn uf_args_supported_rejects_an_int_argument() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let int_s = ctx.int_sort();
+        let h = ctx.declare_fun("h", &[int_s], s8);
+        let nf = ctx.declare_fun("n", &[], int_s);
+        let n = ctx.mk_app(Op::Uninterpreted(nf), &[]).unwrap();
+        let hn = ctx.mk_app(Op::Uninterpreted(h), &[n]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[hn, c]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "an Int-sorted argument has no blastable word — must fence"
+        );
+    }
+
+    #[test]
+    fn uf_args_supported_leaves_nullary_applications_alone() {
+        // A nullary uninterpreted BV symbol has no arguments to check and must
+        // never be fenced — it is the ordinary BV variable case.
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, c]).unwrap();
+        assert!(uf_args_supported(&ctx, &[atom], false));
     }
 }
