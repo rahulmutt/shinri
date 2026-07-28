@@ -364,8 +364,16 @@ impl WordSink for Blaster {
     }
 }
 
-/// Blast one uninterpreted, BV-result application of `sym` to `child_ids`, and
-/// wire Ackermann congruence to every prior application of the SAME function.
+/// Blast one uninterpreted application of `sym` to `child_ids`, whose declared
+/// result is `result_sort` occupying `width` bits, and wire Ackermann
+/// congruence to every prior application of the SAME function.
+///
+/// Two callers, two result kinds. `blast_bv_word` drives it for BV-result
+/// applications at the sort's own width (slice 44). `blast_bv_atom` drives it
+/// for BOOL-result applications — predicates — at width 1 (slice 45), where the
+/// per-pair clause degenerates to the single `cond -> (v_prior <-> v_new)`.
+/// `result_sort` is what keeps those two kinds apart when the widths coincide;
+/// see `shape_compatible`.
 ///
 /// Standalone (rather than inline in `blast_bv_word`'s match) for parity with
 /// its sibling `shinri_fp::blast_fp_to_bv`, which encodes the same clause shape
@@ -621,8 +629,14 @@ pub fn blast_bv_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
 }
 
 /// BV atom (Bool-sorted predicate) dispatch, generic over the sink. Handles
-/// `Eq`/`Distinct` over BV operands and all `BvUlt..BvSge` comparisons. No
-/// cache: callers recurse into words via `sink.word`, which IS memoized.
+/// `Eq`/`Distinct` over BV operands, all `BvUlt..BvSge` comparisons, and — since
+/// slice 45 — non-nullary uninterpreted applications with a Bool result.
+///
+/// NO CACHE, and callers must know it. Word subterms are memoized because they
+/// go through `sink.word`, but the atom node itself is re-blasted on every call.
+/// That is harmless for the arms that only combine already-memoized words, and
+/// for the uninterpreted arm it is load-bearing — see the note on that arm for
+/// which drivers memoize and which do not.
 pub fn blast_bv_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> BitLit {
     let node = ctx.term_node(t).clone();
     match node {
@@ -636,17 +650,37 @@ pub fn blast_bv_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Bit
         // pairing with a `(_ BitVec 1)` result of the same redeclared symbol,
         // which `result.len()` alone cannot distinguish.
         //
-        // NULLARY applications must never reach this arm. Collection
-        // (`bv_stage::collect_bv_atoms`) excludes them, which is what keeps
-        // `blast_uf_app`'s `child_ids.is_empty()` branch unreachable from here.
-        // The exclusion is NOT a soundness cliff — `encode_uncached`
-        // intercepts a collected atom by TermId and memoizes
-        // (`shinri-solver/src/tseitin.rs:112`), so a nullary symbol routed
-        // here would still get exactly one literal — it is that bare Bool
-        // constants already have a well-understood Tseitin path this slice has
-        // no reason to move, and that
-        // `nullary_applications_emit_no_congruence_clauses` pins its clause
-        // count.
+        // NULLARY applications must never reach this arm, and the exclusion in
+        // `bv_stage::collect_bv_atoms` is LOAD-BEARING FOR SOUNDNESS — not
+        // tidiness, and not merely a cost question.
+        //
+        // `blast_bv_atom` is uncached by contract (see this function's header),
+        // so every call on the same atom re-blasts it. For a NON-nullary
+        // application that is only wasteful: the repeat is `shape_compatible`
+        // with the prior one, so congruence pairs them and forces the two
+        // literals equal. For a NULLARY one there is no such rescue —
+        // `blast_uf_app`'s `child_ids.is_empty()` branch returns a fresh
+        // unconstrained literal and registers NOTHING in `uf_apps`, so two
+        // calls yield two INDEPENDENT literals for one Bool constant. It can
+        // then be true in one occurrence and false in another: a wrong `sat`.
+        //
+        // Whether a repeat call happens is the driver's business, and the
+        // drivers do NOT agree:
+        //   - the tseitin path is safe — `encode` memoizes by TermId BEFORE
+        //     `encode_uncached` intercepts a collected atom
+        //     (`shinri-solver/src/tseitin.rs:92-98`, `:112-116`);
+        //   - `lower` (this crate) is safe — it memoizes by rewritten TermId;
+        //   - the ARRAY path is NOT safe — `abv_stage::RealBridge::new` loops
+        //     `blast_atom` over the collected atoms with no such memo
+        //     (`shinri-solver/src/abv_stage.rs:318-324`), and `ensure_atom_lit`
+        //     (`:268-274`) calls it again on demand while documenting itself
+        //     "idempotent at the blaster's cache level" — true of the word
+        //     subterms it recurses into, false of the atom node itself.
+        //
+        // The `debug_assert!` below is a development tripwire, not the guard:
+        // it vanishes in the shipping profile, where `collect_bv_atoms`'
+        // exclusion is the only thing standing between a nullary Bool
+        // application and the wrong `sat` above.
         TermNode::App {
             op: Op::Uninterpreted(sym),
             args,

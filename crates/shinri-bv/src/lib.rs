@@ -527,6 +527,91 @@ mod lower_tests {
         );
     }
 
+    /// What the slice-45 arm ACTUALLY does with a BOOL-sorted NULLARY
+    /// application, pinned at the only layer where it is pinnable.
+    ///
+    /// `nullary_applications_emit_no_congruence_clauses` above does NOT cover
+    /// this. It lowers `(= x y)` over two BV-sorted nullary symbols, which
+    /// dispatch through `blast_bv_word`'s pre-existing `Op::Uninterpreted` arm;
+    /// they never reach `blast_bv_atom`, which only ever sees Bool-sorted
+    /// terms. Its clause count could not have moved whatever this arm does, and
+    /// it must not be read as evidence about it.
+    ///
+    /// The honest answer today: the arm's `debug_assert!` trips. That is a
+    /// development tripwire only — it vanishes under `--release`, where the
+    /// arm would instead mint a FRESH UNCONSTRAINED literal per call and
+    /// register nothing, so a driver without an atom memo (the array path,
+    /// `abv_stage::RealBridge::new`) would get two independent literals for one
+    /// Bool constant: a wrong `sat`. This test pins the tripwire and its
+    /// message; the real guard is the nullary exclusion in
+    /// `bv_stage::collect_bv_atoms`, which is Task 3's file and Task 3's to
+    /// pin end-to-end.
+    ///
+    /// `#[cfg(debug_assertions)]` because the assertion — and therefore the
+    /// panic this expects — is compiled out of a release-profile test run.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "nullary Bool application reached blast_bv_atom")]
+    fn nullary_bool_application_trips_the_arms_debug_guard() {
+        let mut ctx = Context::new();
+        let b = ctx.bool_sort();
+        let qf = ctx.declare_fun("q", &[], b);
+        let q = ctx.mk_app(Op::Uninterpreted(qf), &[]).unwrap();
+        let _ = lower(&mut ctx, &[q]);
+    }
+
+    /// The companion fact, and the reason the nullary guard above matters at
+    /// all: a NON-nullary Bool application blasted TWICE is rescued by
+    /// congruence — the exact rescue the nullary case does not get.
+    ///
+    /// Driven through a persistent `Blaster` with two direct `blast_atom` calls
+    /// rather than through `lower`, because that is the shape the array path
+    /// actually has (`abv_stage::RealBridge::new` loops `blast_atom`, and
+    /// `ensure_atom_lit` calls it again on demand, neither with an atom memo).
+    /// `lower`'s memo would collapse the repeat and hide the property.
+    #[test]
+    fn a_repeated_non_nullary_bool_application_is_rescued_by_congruence() {
+        use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
+
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let b = ctx.bool_sort();
+        let p = ctx.declare_fun("p", &[s8], b);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let p_x = ctx.mk_app(Op::Uninterpreted(p), &[x]).unwrap();
+
+        let mut blaster = Blaster::new();
+        let l1 = blaster.blast_atom(&ctx, p_x);
+        let l2 = blaster.blast_atom(&ctx, p_x);
+        assert_ne!(
+            l1, l2,
+            "`blast_bv_atom` is uncached — the atom really is blasted twice"
+        );
+
+        // Pin the two literals to OPPOSITE values. Congruence must make that
+        // contradictory; without it the two would be independent and this
+        // would come back SAT — which is precisely the nullary failure mode.
+        let mut cnf = blaster.finish();
+        cnf.clauses.push(vec![l1]);
+        cnf.clauses.push(vec![l2.negate()]);
+        let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..cnf.num_vars {
+            s.new_var();
+        }
+        for clause in &cnf.clauses {
+            let lits: Vec<Lit> = clause
+                .iter()
+                .map(|bit| Lit::new(Var::new(bit.var), bit.pos))
+                .collect();
+            s.add_clause(&lits);
+        }
+        assert!(
+            matches!(s.solve(), SolveResult::Unsat { .. }),
+            "congruence must force two blasts of ONE Bool application to agree"
+        );
+    }
+
     /// Two ORIGINAL atoms that converge under `rewrite` share one literal.
     /// `(p (bvadd x #x00))` rewrites to `(p x)` via the additive-identity
     /// rule, so both originals must map to the SAME BitLit while `atom_lit`
