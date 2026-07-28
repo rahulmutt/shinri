@@ -133,6 +133,7 @@ UF queries — `f` itself is still omitted.
 ```rust
 pub struct UfApp {
     pub sym: SymbolId,
+    pub arg_sorts: Vec<SortId>,   // one declared sort per argument, in order
     pub args: Vec<Vec<BitLit>>,   // one blasted word per argument, in order
     pub result: Vec<BitLit>,
 }
@@ -165,9 +166,25 @@ sort:
   the results unconstrained where the SMT semantics require them equal. This is
   the identical judgment `blast_fp_to_bv` already documents at `lib.rs:285`–`:287`.
 
-Applications are keyed on `SymbolId` alone: one `declare-fun` is one signature.
-A `debug_assert!` checks that paired applications agree on arity and on each
-argument's width, so a keying mistake is loud rather than silently unsound.
+Applications are keyed on **shape**, not on `SymbolId` alone. `declare-fun` is
+not one signature: `Context::declare_fun`
+(`crates/shinri-core/src/context.rs:233`) interns by NAME and overwrites
+`fun_sigs`, and `Command::DeclareFun`
+(`crates/shinri-solver/src/lib.rs:471`–`:493`) accepts a redeclaration
+silently. So `f : BV8→BV8` followed by `f : BV16→BV16` are two distinct
+`TermId`s carrying the SAME `Op::Uninterpreted(sym)`, both live in the same
+assertion list in the same `check_sat` — no `push`/`pop` needed to reach it.
+The pairing predicate, `shape_compatible`
+(`crates/shinri-bv/src/blast/mod.rs:101`–`:124`), is total over every way two
+applications recorded under one `SymbolId` can disagree: it conjoins same
+`SymbolId`, equal arity, per-argument equal `SortId`, per-argument equal
+blasted word length, and equal result word length. There is no `debug_assert!`
+guarding this. The three that once stood in for a shape check are **deleted**:
+`shape_compatible` makes them unreachable, and in any case a `debug_assert!`
+compiles out of the release profile and never protected the shipping
+binary — the wrong `unsat` and the index-out-of-bounds panic this slice fixes
+were both measured against the release binary, past where any `debug_assert!`
+could have caught them.
 
 ### 3.2 The arm
 
@@ -180,7 +197,9 @@ Non-nullary applications become:
 2. Mint the `width` result bits via `sink.blaster().fresh()` — still
    unconstrained in themselves; that is Ackermann's reduction, and the only
    property an uninterpreted function has is functional consistency.
-3. For each prior registered application of the same `SymbolId`, emit
+3. For each prior registered application of the same **shape**
+   (`shape_compatible`, §3.1: same `SymbolId`, arity, per-argument sort,
+   per-argument word length, and result word length), emit
    `(⋀ₖ word_eq(argₖ)) → (resᵢ ↔ resⱼ)` — the clause shape of
    `blast_fp_to_bv:314`–`:331`.
 4. Push this application onto `uf_apps()`.
@@ -193,13 +212,28 @@ incompleteness that produces a wrong `sat`, with no crash and no visible
 symptom — so §5 pins it with its own test rather than letting it ride on the
 others.
 
-**Why the reduction is sound and complete here.** Ackermann's reduction is
-equisatisfiable for an uninterpreted symbol provided every pair of its
-applications is constrained. `WordSink::word` memoizes per `TermId`, so each
-distinct application is blasted at most once and pushed at most once; each new
-application is paired against every earlier one; therefore every pair is
-covered. Applications not reachable from the blasted atom set never enter the
-CNF at all and need no constraint.
+**Why the reduction is sound, and loses no legitimate pairing.** Ackermann's
+reduction is equisatisfiable for an uninterpreted symbol provided every pair
+of its applications is constrained. `WordSink::word` memoizes per `TermId`, so
+each distinct application is blasted at most once and pushed at most once;
+each new application is paired against every earlier application in its
+**shape class** (`shape_compatible`, §3.1) — not against every earlier
+application of the same `SymbolId`, since one `SymbolId` can carry two
+different functions (§3.1).
+
+Skipping a shape-incompatible prior is sound in the completeness-losing
+direction only: congruence is an ADDED constraint over freshly minted,
+otherwise-unconstrained result bits, so omitting a clause can at most lose an
+`unsat` verdict — it can never manufacture one. And no legitimate pairing is
+lost by restricting to the shape class: `check_app`
+(`crates/shinri-core/src/context.rs:322`–`:341`) validates arity and every
+argument's sort against the signature in force at build time, so two
+applications of the SAME declaration necessarily agree on arity, argument
+sorts, and (since BV/FP sorts intern by width) argument and result word
+lengths — i.e. they are always shape-compatible with each other. The filter
+is therefore exactly as strict as "different signature," never stricter.
+Applications not reachable from the blasted atom set never enter the CNF at
+all and need no constraint.
 
 ## 4. Two fences, both before lowering
 
@@ -216,10 +250,17 @@ sound `unknown`. Without this fence, `Lowerer::word` reaches its
 `unreachable!("Lowerer::word on non-BV/non-FP sort")`
 (`crates/shinri-fp/src/lower.rs:69`).
 
-**Fence 2 — blowup cap.** For symbol *s* with *kₛ* applications, total argument
-width *Aₛ* and result width *wₛ*, the encoding costs
-`pairs(kₛ) × (Aₛ + wₛ)` gate-equivalents, where `pairs(k) = k(k−1)/2`. Fence to
-`unknown` when `Σₛ pairs(kₛ) × (Aₛ + wₛ)` exceeds a budget.
+**Fence 2 — blowup cap.** The cost model partitions by **shape**, not by
+symbol — for the same reason `shape_compatible` does not key on `SymbolId`
+alone (§3.1): one `SymbolId` can carry applications of two different
+functions, so grouping by symbol would over-count pairs that the blaster
+never actually relates. The grouping key,
+`UfShapeKey = (SymbolId, arg_sorts, result_sort)`
+(`crates/shinri-solver/src/bv_stage.rs:376`), mirrors `shape_compatible`
+exactly. For shape *s* with *kₛ* applications, total argument width *Aₛ* and
+result width *wₛ*, the encoding costs `pairs(kₛ) × (Aₛ + wₛ)` gate-equivalents,
+where `pairs(k) = k(k−1)/2`. Fence to `unknown` when
+`Σₛ pairs(kₛ) × (Aₛ + wₛ)` exceeds a budget.
 
 **The budget constant is deliberately not fixed in this spec.** It is
 calibrated in task 1 against the 10–15 min PR-tier budget and recorded as a
@@ -311,3 +352,169 @@ instance **proves** that rather than asserting it in prose.
    value, and the calibration measurement is recorded.
 6. Slice 43's spec §5 BV row is rewritten to match the shipped behaviour, so no
    committed spec contradicts the code.
+
+## 7. Measured outcomes
+
+### 7.1 Task 1 — the pre-fix oracle failure
+
+Extending `qfbv_oracle`'s term pool with a 1-ary `f` and a 2-ary `g` (small pool
+so applications collide) made `differential_qf_bv_small` reach the missing-
+congruence defect for the first time. The failure did **not** manifest as a
+`shinri=Sat z3=Unsat` verdict-disagreement pair — the process panicked before
+either solver reported a verdict for that iteration, so no pair exists to
+record:
+
+```
+cargo nextest run -p shinri-solver --features oracle -E 'test(differential_qf_bv_small)' --no-capture
+```
+
+discovers 1 test and **panics** at `crates/shinri-bv/src/blast/mod.rs:282`:
+`debug_assert!(child_ids.is_empty(), "non-nullary uninterpreted BV fn out of
+scope")`, since the dev/test profile builds with debug assertions on. Pinned
+to **iteration 3 (0-indexed), width 4** (a temporary `eprintln!` used to locate
+it, reverted before the commit — commit `e0d8af06`). The reviewer independently
+verified the causal chain: only the newly-added generator arms can construct a
+non-nullary `Op::Uninterpreted` node, so nothing else could have triggered this
+assertion.
+
+### 7.2 Task 3 — the post-fix oracle summary
+
+After the congruence gadget landed (commit `4acf7903`):
+
+```
+differential_qf_bv_small PASS, sat=116 unsat=84 unknown=0 disagreements=0
+```
+
+Full unfiltered oracle: **572 passed / 3 skipped**. Full workspace suite:
+**1307 passed / 7 skipped** (baseline 1303 + 4 new tests).
+
+### 7.3 Task 4 — the `k` → wall-clock calibration table and the chosen budget
+
+Measured on the release binary, single run each, foreground `bash time`, on a
+width-32 arity-2 symbol (`Aₛ + wₛ = 96`): `(set-logic QF_UFBV) (declare-fun g
+((_ BitVec 32) (_ BitVec 32)) (_ BitVec 32))`, `k` fresh `BitVec 32` variables,
+`k` applications `g(vᵢ,vᵢ)` chained pairwise.
+
+| k | wall-clock |
+|---|---|
+| 10 | 0.013 s |
+| 20 | 0.050 s |
+| 40 | 0.206 s |
+| 80 | 0.843 s |
+| 160 | 3.484 s |
+| 320 | 15.429 s |
+| 400 | 25.140 s |
+| 420 | 26.920 s |
+| 440 | 29.203 s — largest measured `k` still under 30 s |
+| 460 | 32.086 s — first measured `k` over 30 s; true crossing is between 440 and 460 |
+
+**Human ruling** (recorded because it overrode the implementer's first cut):
+the implementer initially set the budget at `k=160` (3.484 s), 7.6× below the
+plan's own "largest k under 30 s" criterion. The user's ruling: budget the
+measured 30 s crossing, since Fence 2 bounds *encoding blowup*, and encoding
+size (gate-equivalents) is the right unit for that bound, not a fixed `k`.
+
+**Chosen budget:**
+`UF_CONGRUENCE_BUDGET = pairs(440) × 96 = 96,580 × 96 = 9,271,680`
+(`crates/shinri-solver/src/bv_stage.rs:424`). The Fence-2 pin test
+(`encoding_past_the_budget_fences_to_unknown`) uses `k=1500`
+(`pairs(1500) × 96 = 1,124,250 × 96 = 107,928,000`, 11.6× the budget).
+
+The FP-argument cost is not separately calibrated against a real FP instance —
+no such instance was run at Task 4. Instead `FP_ARG_COST_MULTIPLIER = 3` is
+used as a conservative estimate, later confirmed against real source in Task 4's
+review: `bits_eq` is 3 gates/bit (`shinri-fp/src/blast/compare.rs:7-16`) and
+`unpack` costs `3·eb + 2·sb + 2` (`shinri-fp/src/unpack.rs:18-58`), giving true
+ratios of 2.60× (f32), 2.50× (f64), 2.75× (eb5/sb11) — so 3 is a genuine
+rounding-up, not false precision.
+
+### 7.4 Named fence-attributable decided → `unknown` flips
+
+Two named flips, one per fence, each measured directly against the pre-slice
+release binary (`main` @ `2e5e7c00`) so the "decided" half of the flip is not
+assumed:
+
+1. **Fence 1 (argument sort), `qfufbv_e2e::int_argument_to_a_bv_uf_fences_to_unknown`.**
+   `(set-logic ALL)(declare-fun h (Int) (_ BitVec 8))(declare-fun n () Int)
+   (assert (= (h n) #x2a))(check-sat)`. MEASURED pre-slice (worktree at
+   `e0d8af06`, immediately before Task 2's fence landed): decides `sat`. Post-
+   slice: `unknown`, because `n`'s Int sort has no blastable word. This is the
+   spec §2.1 named exception.
+
+2. **Fence 1 (argument sort), `qfdt_model_e2e::fenced_bv_field_is_unknown`
+   (the `BV_FIELD` query).** `(set-logic QF_UFDTBV)(declare-datatype W ((mk (w
+   (_ BitVec 8))))) (declare-fun v () W)(assert (= (w v) #x2a))(check-sat)
+   (get-model)`. `(w v)` is a non-nullary BV-result uninterpreted application
+   whose argument `v` is Datatype-sorted — also unwordable, also Fence 1, not
+   Fence 2 and not the congruence arm (the congruence arm never sees this
+   query — it is rejected before lowering starts). MEASURED (worktree at
+   `e0d8af06`, immediately before Task 2's fence landed, release binary):
+   pre-slice decides `sat`, `get-model` prints `((define-fun v () W ?))` — the
+   whole-symbol placeholder, not a partial `(mk ?)`, matching slice 43 spec
+   §5's BV row. Post-slice: `unknown`, `get-model` prints `()`. **Precision on
+   correctness:** for this specific
+   *single-application* query, the pre-slice `sat` was itself
+   correct-but-incomplete (an unconstrained placeholder), not unsound — the
+   wrong-`sat` defect this slice fixes requires **two or more** applications of
+   the same uninterpreted function, which this query never had. This flip is
+   therefore a named Fence-1 exception, not a soundness correction, for this
+   specific query.
+
+3. **Fence 2 (blowup cap), `qfufbv_e2e::encoding_past_the_budget_fences_to_unknown`.**
+   This test's `k=1500` formula is **not** the chained calibration formula of
+   §7.3's table — it is a *different* construction that happens to scale by
+   the same `pairs(k) × 96` cost: `k` **independent** assertions
+   `g(vᵢ,vᵢ) = #x00000000` for `i` in `0..k`, no application ever compared
+   against another (`crates/shinri-solver/tests/qfufbv_e2e.rs:51-72`). MEASURED
+   pre-slice (`main` @ `2e5e7c00`, release binary, this exact k=1500
+   construction reproduced byte-for-byte from the shipped test and run via
+   `time ./target/release/shinri`): decides `sat` in 0.168 s — correctly,
+   since each `g(vᵢ,vᵢ)` is independent and trivially self-congruent; no
+   cross-application constraint is asserted, so nothing in this formula
+   depends on congruence firing at all. Post-slice: `unknown`, because the
+   encoding cost (`pairs(1500) × 96 = 107,928,000`) exceeds
+   `UF_CONGRUENCE_BUDGET`. This flip trades completeness for the PR-tier time
+   budget on an intentionally adversarial size, not a correctness fix.
+
+No other decided → `unknown` flips were found across `qfbv_witnesses`,
+`script_e2e`, `qfdt_e2e`, or the full unfiltered oracle suite (§7.6).
+
+### 7.5 The Task 2 model side effect
+
+Measured on the release binary:
+
+```
+$ printf '%s\n' '(set-logic QF_UFBV)(declare-fun f ((_ BitVec 8)) (_ BitVec 8))(declare-fun x () (_ BitVec 8))(assert (= (f x) #x2a))(check-sat)(get-model)' > model.smt2
+$ ./target/release/shinri model.smt2
+sat
+((define-fun x () (_ BitVec 8) #x00))
+```
+
+(The `success` lines the CLI also prints are a `:print-success` presentation
+detail of `shinri-cli`'s driver, not part of `Solver::execute`'s
+`CommandResponse` stream that `run_script` in the test files consumes; the
+test-relevant string is the `((define-fun x () (_ BitVec 8) #x00))` line.)
+Pre-slice this printed `(define-fun x () (_ BitVec 8) ?)` — `x` was never
+blasted, so it never entered `Blaster.cache` and `exported_var_bits` could not
+see it. Congruence forces the arguments to be blasted, so the value now
+appears. Pinned by `argument_variables_now_get_a_model_value`
+(`crates/shinri-solver/tests/qfufbv_e2e.rs`). This does **not** make
+`get-model` complete for UF queries: `f` itself is still omitted, because a
+function graph needs EUF congruence-class enumeration (slice 43 §5, still
+open).
+
+### 7.6 PR-tier wall clock
+
+```
+$ time cargo nextest run --all
+...
+Summary [ 219.640s] 1324 tests run: 1324 passed (5 slow), 7 skipped
+real    3m40.100s
+```
+
+Well inside the 10–15 min (600–900 s) blocking PR-tier budget (CI hard cap
+20 min). `nullary_applications_emit_no_congruence_clauses`
+(`crates/shinri-bv/src/lib.rs`) still passes at its pre-slice constant,
+`NULLARY_EQ_CLAUSES = 57`, confirming the nullary arm's CNF **clause count** is
+unchanged by this slice. (The test asserts a count, not clause identity, so it
+does not establish that the CNF is byte-for-byte identical.)

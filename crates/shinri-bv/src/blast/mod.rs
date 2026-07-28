@@ -35,6 +35,8 @@ pub struct Blaster {
     drained: usize,
     /// Memoized blasted words: TermId -> LSB..MSB bit literals.
     pub(crate) cache: FxHashMap<TermId, Vec<BitLit>>,
+    /// Blasted uninterpreted applications, for Ackermann congruence (slice 44).
+    uf_apps: Vec<UfApp>,
 }
 
 impl Default for Blaster {
@@ -54,6 +56,73 @@ pub struct FpToBvApp {
     pub rm: [BitLit; 5],
     pub operand: Vec<BitLit>,
     pub result: Vec<BitLit>,
+}
+
+/// One blasted non-nullary uninterpreted application (slice 44). Recorded by
+/// the lowering driver so later applications of the SAME symbol can emit
+/// Ackermann congruence: an uninterpreted function's only property is
+/// functional consistency, so equal arguments must yield equal results.
+///
+/// `sym` ALONE does not identify a function. `Context::declare_fun` interns by
+/// NAME and overwrites `fun_sigs`, and `Command::DeclareFun` accepts a
+/// redeclaration silently, so one `SymbolId` can carry applications of two
+/// different functions — different arities, argument sorts, or result widths —
+/// inside a single assertion list. `arg_sorts` + the word lengths are what make
+/// the pairing predicate (`shape_compatible`) total; see it for the details.
+#[derive(Clone)]
+pub struct UfApp {
+    pub sym: shinri_core::SymbolId,
+    /// The declared sort of each argument, in argument order. Recorded because
+    /// bit width alone does not determine value equality: `Float32` and
+    /// `(_ BitVec 32)` are both 32 bits, but `word_eq` dispatches on the sort
+    /// and compares them by different semantics.
+    pub arg_sorts: Vec<shinri_core::SortId>,
+    /// One blasted word per argument, in argument order.
+    pub args: Vec<Vec<BitLit>>,
+    pub result: Vec<BitLit>,
+}
+
+/// True iff `prior` and a new application of the same symbol denote the SAME
+/// function, so Ackermann congruence between them is semantically justified
+/// and structurally well-formed (parallel-indexed comparisons cannot run off
+/// the end of a word).
+///
+/// This predicate is TOTAL over every way two `UfApp`s recorded under one
+/// `SymbolId` can be shape-incompatible: arity, per-argument sort, per-argument
+/// word length, and result word length. It is the sole guard — the arm below
+/// carries no shape assertion, because an assertion vanishes in the shipping
+/// profile and this must hold there.
+///
+/// SKIPPING an incompatible prior is sound in the COMPLETENESS-LOSING
+/// direction only: congruence is an ADDED constraint, so omitting it can only
+/// admit more models. It can never turn a `sat` into an `unsat`. That is why
+/// filtering here — rather than asserting, or rather than relating them anyway
+/// — is the safe response to a shape we cannot justify.
+fn shape_compatible(
+    prior: &UfApp,
+    sym: shinri_core::SymbolId,
+    arg_sorts: &[shinri_core::SortId],
+    arg_words: &[Vec<BitLit>],
+    result_len: usize,
+) -> bool {
+    prior.sym == sym
+        // Arity. `f` redeclared at a different arity walks only the NEW
+        // arity below, silently ignoring the surplus prior argument.
+        && prior.args.len() == arg_words.len()
+        // Value semantics per argument. Sorts intern structurally, so this
+        // also settles argument WIDTH -- but the length check below is what
+        // `compare::eq`'s `0..x.len()` loop actually indexes, so it is
+        // checked directly rather than inferred.
+        && prior.arg_sorts == arg_sorts
+        && prior
+            .args
+            .iter()
+            .zip(arg_words.iter())
+            .all(|(p, n)| p.len() == n.len())
+        // Result width: the congruence clauses `zip` the two result words.
+        // The arm only ever records BV results, and BV sorts intern by width,
+        // so equal length here is equal result sort.
+        && prior.result.len() == result_len
 }
 
 /// The one recursion + cache seam shared by BV and FP lowering. Implemented by
@@ -77,6 +146,35 @@ pub trait WordSink {
     fn fp2bv_apps(&mut self) -> &mut Vec<FpToBvApp> {
         unreachable!("pure BV lowering has no FP→BV conversions")
     }
+
+    /// Registry of blasted non-nullary uninterpreted applications, for
+    /// Ackermann congruence (slice 44).
+    ///
+    /// UNLIKE `fp2bv_apps`, this has NO `unreachable!` default: pure-BV
+    /// lowering is precisely where uninterpreted applications live, so every
+    /// sink must carry a real store. A defaulted `unreachable!` here would be
+    /// the slice-43 panic all over again.
+    fn uf_apps(&mut self) -> &mut Vec<UfApp>;
+
+    /// SMT-LIB **value** equality on two blasted words of `sort`.
+    ///
+    /// The default is bitwise, which is correct for every BV sort. A sink that
+    /// can see FP-sorted arguments must override it, because SMT-LIB
+    /// `FloatingPoint` has exactly ONE NaN value across many bit patterns, so
+    /// bitwise equality would UNDER-trigger congruence on NaN arguments and
+    /// leave results unconstrained where the semantics require them equal.
+    /// `core_eq` lives in `shinri-fp`, which depends on `shinri-bv` and not the
+    /// reverse — this hook is how the sort-aware comparison crosses the crate
+    /// boundary.
+    fn word_eq(
+        &mut self,
+        _ctx: &Context,
+        _sort: shinri_core::SortId,
+        x: &[BitLit],
+        y: &[BitLit],
+    ) -> BitLit {
+        crate::blast::compare::eq(self.blaster(), x, y)
+    }
 }
 
 impl Blaster {
@@ -87,6 +185,7 @@ impl Blaster {
             clauses: Vec::new(),
             drained: 0,
             cache: FxHashMap::default(),
+            uf_apps: Vec::new(),
         };
         let t = BitLit { var: 0, pos: true };
         b.add_clause(&[t]); // force var0 = true
@@ -245,6 +344,77 @@ impl WordSink for Blaster {
     fn blaster(&mut self) -> &mut Blaster {
         self
     }
+    fn uf_apps(&mut self) -> &mut Vec<UfApp> {
+        &mut self.uf_apps
+    }
+}
+
+/// Blast one uninterpreted, BV-result application of `sym` to `child_ids`, and
+/// wire Ackermann congruence to every prior application of the SAME function.
+///
+/// Standalone (rather than inline in `blast_bv_word`'s match) for parity with
+/// its sibling `shinri_fp::blast_fp_to_bv`, which encodes the same clause shape
+/// for FP→BV conversions.
+fn blast_uf_app<S: WordSink>(
+    sink: &mut S,
+    ctx: &Context,
+    sym: shinri_core::SymbolId,
+    child_ids: &[TermId],
+    width: u32,
+) -> Vec<BitLit> {
+    if child_ids.is_empty() {
+        // A nullary symbol is hash-consed to ONE TermId, so there is exactly
+        // one word for it and nothing to make consistent. Unchanged from the
+        // original dispatch.
+        return (0..width).map(|_| sink.blaster().fresh()).collect();
+    }
+    // Blast the arguments FIRST. Step order is LOAD-BEARING: `f(f(x))`
+    // registers the inner application while this call lowers its own
+    // argument, and reading `prior` before that would silently drop the
+    // inner/outer pair. The failure mode is missing congruence — a wrong
+    // `sat` with no crash and no visible symptom.
+    let arg_words: Vec<Vec<BitLit>> = child_ids.iter().map(|&k| sink.word(ctx, k)).collect();
+    let arg_sorts: Vec<shinri_core::SortId> = child_ids.iter().map(|&k| ctx.sort_of(k)).collect();
+    let result: Vec<BitLit> = (0..width).map(|_| sink.blaster().fresh()).collect();
+    // Ackermann congruence against every prior application of the same
+    // FUNCTION: (⋀ₖ argₖ equal) → (result equal). The IMPLICATION only —
+    // the converse would wrongly force distinct results for distinct
+    // arguments. O(k²) in the per-formula application count. Same clause
+    // shape as shinri_fp::blast_fp_to_bv.
+    //
+    // `shape_compatible` — not `a.sym == sym` — is the pairing predicate: one
+    // `SymbolId` can span two different functions under redeclaration, and
+    // relating those is both unsound (wrong `unsat`) and, at differing widths,
+    // an out-of-bounds index inside `compare::eq`.
+    let prior: Vec<UfApp> = sink
+        .uf_apps()
+        .iter()
+        .filter(|a| shape_compatible(a, sym, &arg_sorts, &arg_words, result.len()))
+        .cloned()
+        .collect();
+    for pa in prior {
+        let mut cond = sink.blaster().one();
+        for (k, aw) in arg_words.iter().enumerate() {
+            let e = sink.word_eq(ctx, arg_sorts[k], &pa.args[k], aw);
+            cond = sink.blaster().and2(cond, e);
+        }
+        let b = sink.blaster();
+        let ncond = b.not1(cond);
+        // Parallel-indexed result words, bit for bit.
+        for (&prior_bit, &new_bit) in pa.result.iter().zip(result.iter()) {
+            let d = b.xor2(prior_bit, new_bit);
+            let nd = b.not1(d);
+            let imp = b.or2(ncond, nd);
+            b.add_clause(&[imp]); // cond → (prior_bit ↔ new_bit)
+        }
+    }
+    sink.uf_apps().push(UfApp {
+        sym,
+        arg_sorts,
+        args: arg_words,
+        result: result.clone(),
+    });
+    result
 }
 
 /// BV word dispatch, generic over the sink. Assumes `t` is BV-sorted; callers
@@ -274,17 +444,13 @@ pub fn blast_bv_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
                 .collect()
         }
         TermNode::App {
-            op: Op::Uninterpreted(_),
+            op: Op::Uninterpreted(sym),
             args,
             sort,
         } => {
             let child_ids = ctx.children(args).to_vec();
-            debug_assert!(
-                child_ids.is_empty(),
-                "non-nullary uninterpreted BV fn out of scope"
-            );
             let width = ctx.bv_width(sort).expect("BV-sorted variable has BV sort");
-            (0..width).map(|_| sink.blaster().fresh()).collect()
+            blast_uf_app(sink, ctx, sym, &child_ids, width)
         }
         TermNode::App {
             op: Op::Builtin(bv_op),

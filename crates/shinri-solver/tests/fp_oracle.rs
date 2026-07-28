@@ -1239,9 +1239,14 @@ fn differential_qf_bvfp_int_to_fp() {
 
 /// FP→BV: a random source bit-pattern (naturally hitting NaN/±inf/subnormal/
 /// out-of-range) pinned via the 1-arg to_fp bitcast, converted under a random
-/// face/width/mode, then related to a random BV constant. One in four scripts
-/// is instead a two-application congruence probe (equal-forced operands,
-/// distinct results) — the encoding must agree with z3's UF-of-(rm,x) reading.
+/// face/width/mode, then related to a random BV constant. One in five scripts
+/// is instead a two-application FpToBvApp congruence probe (equal-forced
+/// operands, distinct results) — the encoding must agree with z3's
+/// UF-of-(rm,x) reading. One in five is a slice-44 UfApp congruence probe: a
+/// genuinely uninterpreted Float->BV symbol `k` (not fp.to_ubv/to_sbv),
+/// mirroring qfufbv_e2e.rs's fp_argument_congruence_on_the_mixed_path /
+/// nan_arguments_trigger_congruence — the FP-argument analogue of
+/// qfbv_oracle.rs's small f/g pool.
 fn gen_fp_to_bv_script(rng: &mut Lcg) -> String {
     const MS: &[u32] = &[4, 8, 16];
     let m = MS[rng.below(MS.len() as u64) as usize];
@@ -1259,15 +1264,58 @@ fn gen_fp_to_bv_script(rng: &mut Lcg) -> String {
     };
     const RMS: &[&str] = &["RNE", "RNA", "RTP", "RTN", "RTZ"];
     let rm = RMS[rng.below(RMS.len() as u64) as usize];
-    if rng.below(4) == 0 {
-        return format!(
-            "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
-             (declare-fun y () (_ FloatingPoint {eb} {sb}))\n\
-             (assert (= x ((_ to_fp {eb} {sb}) #b{bits:0w$b})))\n\
-             (assert (= y x))\n\
-             (assert (distinct ((_ {face} {m}) {rm} x) ((_ {face} {m}) {rm} y)))\n\
-             (check-sat)\n"
-        );
+    match rng.below(5) {
+        0 => {
+            return format!(
+                "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
+                 (declare-fun y () (_ FloatingPoint {eb} {sb}))\n\
+                 (assert (= x ((_ to_fp {eb} {sb}) #b{bits:0w$b})))\n\
+                 (assert (= y x))\n\
+                 (assert (distinct ((_ {face} {m}) {rm} x) ((_ {face} {m}) {rm} y)))\n\
+                 (check-sat)\n"
+            );
+        }
+        1 => {
+            // slice 44: uninterpreted k : Float(eb,sb) -> BitVec m. Three
+            // forms: forced value-equal free operands and the NaN-specific
+            // form (many bit patterns, ONE value) both test the UNDER-firing
+            // direction (a bitwise word_eq would miss both — expect unsat);
+            // the third tests the OVER-firing direction — x and y forced
+            // DISTINCT, so word_eq must NOT force k(x)=k(y) — expect sat.
+            // Without this arm every UF-over-FP probe in this file (and
+            // both qfufbv_e2e.rs additions) was unsat-by-construction, so a
+            // `word_eq` that over-fired (wrongly reported "equal" for
+            // genuinely different FP values, yielding a wrong `unsat`) had
+            // no test that could catch it.
+            return match rng.below(3) {
+                0 => format!(
+                    "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
+                     (declare-fun y () (_ FloatingPoint {eb} {sb}))\n\
+                     (declare-fun k ((_ FloatingPoint {eb} {sb})) (_ BitVec {m}))\n\
+                     (assert (= x y))\n\
+                     (assert (distinct (k x) (k y)))\n\
+                     (check-sat)\n"
+                ),
+                1 => format!(
+                    "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
+                     (declare-fun y () (_ FloatingPoint {eb} {sb}))\n\
+                     (declare-fun k ((_ FloatingPoint {eb} {sb})) (_ BitVec {m}))\n\
+                     (assert (fp.isNaN x))\n\
+                     (assert (fp.isNaN y))\n\
+                     (assert (distinct (k x) (k y)))\n\
+                     (check-sat)\n"
+                ),
+                _ => format!(
+                    "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
+                     (declare-fun y () (_ FloatingPoint {eb} {sb}))\n\
+                     (declare-fun k ((_ FloatingPoint {eb} {sb})) (_ BitVec {m}))\n\
+                     (assert (distinct x y))\n\
+                     (assert (distinct (k x) (k y)))\n\
+                     (check-sat)\n"
+                ),
+            };
+        }
+        _ => {}
     }
     let k = rng.next() & ((1u64 << m) - 1);
     const RELS: &[&str] = &["=", "bvult", "bvule", "bvugt"];

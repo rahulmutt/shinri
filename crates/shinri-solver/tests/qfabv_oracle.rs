@@ -1,4 +1,6 @@
-//! Differential oracle: shinri-solver vs z3 on random QF_ABV instances.
+//! Differential oracle: shinri-solver vs z3 on random QF_AUFBV instances
+//! (array + uninterpreted-function BV, per slice 44 — see the Atom 4 note
+//! below).
 //!
 //! Run with:
 //!   cargo test -p shinri-solver --features oracle --test qfabv_oracle -- --nocapture
@@ -38,12 +40,16 @@ impl Lcg {
 const N_ITERS: usize = 200;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QF_ABV instance generator
+// QF_AUFBV instance generator
 //
 // Per instance:
 //   - 3 BV-arrays a0, a1, a2 of type (Array (_ BitVec 8) (_ BitVec 8))
 //   - 3 index consts i0, i1, i2 of (_ BitVec 8)
 //   - 3 element consts e0, e1, e2 of (_ BitVec 8)
+//   - a small uninterpreted-function pool: 1-ary f, 2-ary g, both over
+//     (_ BitVec 8) (slice 44) — see Atom 4 below. Declared unconditionally,
+//     so the logic is QF_AUFBV (QF_ABV alone rejects nonzero-arity
+//     declare-fun) even though most atoms never touch f/g.
 //
 // Atoms generated (kept in sync between shinri and the z3 dump):
 //
@@ -66,9 +72,17 @@ const N_ITERS: usize = 200;
 //   Atom 3 (with prob 1/2): a `(distinct ax ay)` paired with a pinned per-cell
 //           agreement `(= (select ax i{p}) (select ay i{p}))` — drives the
 //           `distinct` extensionality WITNESS path.
+//
+//   Atom 4 (always, slice 44): an uninterpreted-application (Ackermann)
+//           congruence probe over the small f/g pool applied to i{p}, i{q}:
+//             (= (f i{p}) (f i{q})) | (distinct (f i{p}) (f i{q}))
+//           | (= (g i{p} i{q}) (g i{q} i{p})) | (distinct (g i{p} i{q}) (g i{q} i{p}))
+//           Exercises blast_bv_word's Uninterpreted-application congruence
+//           arm, which is otherwise unreachable by this suite (BV-sorted
+//           arguments; the FP-argument analogue lives in fp_oracle.rs).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Generate one QF_ABV instance.
+/// Generate one QF_AUFBV instance.
 ///
 /// Returns `(solver_with_assertions, dump_text)` where `dump_text` is the
 /// SMT-LIB2 script (without `(check-sat)`) that exactly represents the same
@@ -94,8 +108,20 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
         .map(|k| s.declare_const(&format!("e{k}"), bv8))
         .collect();
 
+    // slice 44: a small uninterpreted symbol pool (1-ary f, 2-ary g) over the
+    // BV8 sort, mirroring qfbv_oracle.rs's shape. Deliberately small — kept
+    // to two symbols applied over the 3-element idx pool — so applications
+    // collide on the same symbol across the corpus, which is what makes an
+    // Ackermann-congruence violation reachable (a large pool spreads
+    // applications thin and the generator stops finding the bug).
+    let uf1 = s.declare_fun("f", &[bv8], bv8);
+    let uf2 = s.declare_fun("g", &[bv8, bv8], bv8);
+
     // ── dump header ─────────────────────────────────────────────────────────
-    let mut dump = String::from("(set-logic QF_ABV)");
+    // set-logic QF_AUFBV (not QF_ABV): z3 rejects declare-fun with a nonzero
+    // arity under QF_ABV ("logic does not support uninterpreted functions"),
+    // confirmed by direct z3 -smt2 -in probe.
+    let mut dump = String::from("(set-logic QF_AUFBV)");
     for k in 0..N_ARR {
         dump.push_str(&format!(
             "\n(declare-const a{k} (Array (_ BitVec {width}) (_ BitVec {width})))"
@@ -107,6 +133,10 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
     for k in 0..N_ELT {
         dump.push_str(&format!("\n(declare-const e{k} (_ BitVec {width}))"));
     }
+    dump.push_str(&format!(
+        "\n(declare-fun f ((_ BitVec {width})) (_ BitVec {width}))\
+         \n(declare-fun g ((_ BitVec {width}) (_ BitVec {width})) (_ BitVec {width}))"
+    ));
 
     // ── Atom 0: store-select witness ─────────────────────────────────────────
     {
@@ -233,6 +263,50 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
         }
     }
 
+    // ── Atom 4: uninterpreted-application (Ackermann) congruence ─────────────
+    // slice 44: the fenced UF/BV congruence bug is only reachable if the
+    // generator ever emits uninterpreted applications at all — the missing
+    // congruence arm was silently unreachable by this suite before this
+    // change. `kind` selects among the 1-ary and 2-ary symbol, `=`/`distinct`
+    // — mirrors qfbv_oracle.rs's op-selector widening.
+    {
+        let p = rng.below(N_IDX as u64) as usize;
+        let q = rng.below(N_IDX as u64) as usize;
+        let kind = rng.below(4);
+        match kind {
+            0 => {
+                let fp = s.app(Op::Uninterpreted(uf1), &[idxs[p]]);
+                let fq = s.app(Op::Uninterpreted(uf1), &[idxs[q]]);
+                let atom = s.eq(fp, fq);
+                s.assert(atom);
+                dump.push_str(&format!("\n(assert (= (f i{p}) (f i{q})))"));
+            }
+            1 => {
+                let fp = s.app(Op::Uninterpreted(uf1), &[idxs[p]]);
+                let fq = s.app(Op::Uninterpreted(uf1), &[idxs[q]]);
+                let atom = s.app(Op::Builtin(BuiltinOp::Distinct), &[fp, fq]);
+                s.assert(atom);
+                dump.push_str(&format!("\n(assert (distinct (f i{p}) (f i{q})))"));
+            }
+            2 => {
+                let gpq = s.app(Op::Uninterpreted(uf2), &[idxs[p], idxs[q]]);
+                let gqp = s.app(Op::Uninterpreted(uf2), &[idxs[q], idxs[p]]);
+                let atom = s.eq(gpq, gqp);
+                s.assert(atom);
+                dump.push_str(&format!("\n(assert (= (g i{p} i{q}) (g i{q} i{p})))"));
+            }
+            _ => {
+                let gpq = s.app(Op::Uninterpreted(uf2), &[idxs[p], idxs[q]]);
+                let gqp = s.app(Op::Uninterpreted(uf2), &[idxs[q], idxs[p]]);
+                let atom = s.app(Op::Builtin(BuiltinOp::Distinct), &[gpq, gqp]);
+                s.assert(atom);
+                dump.push_str(&format!(
+                    "\n(assert (distinct (g i{p} i{q}) (g i{q} i{p})))"
+                ));
+            }
+        }
+    }
+
     (s, dump)
 }
 
@@ -266,6 +340,18 @@ fn z3_verdict(dump: &str) -> String {
 
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // z3 prints "(error ...)" and STILL answers check-sat afterwards (e.g.
+    // wrong logic string rejecting a declare-fun), so "last non-empty line"
+    // alone would silently accept a verdict computed over a malformed
+    // script. Panic instead — this generator now depends on z3 actually
+    // parsing every declaration (the f/g UF pool), so a silent parse error
+    // here would produce false confidence rather than a caught bug.
+    assert!(
+        !stdout.contains("(error") && !stderr.contains("(error"),
+        "z3 reported a parse/setup error — script was not solved as written:\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}\ndump:\n{dump}"
+    );
     // z3 may emit multiple lines; take the last non-empty one as the verdict.
     stdout
         .trim()

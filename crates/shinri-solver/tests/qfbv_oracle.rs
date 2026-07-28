@@ -78,10 +78,16 @@ fn z_bv_lit(ctx: &easy_smt::Context, width: u32, value: u64) -> easy_smt::SExpr 
 }
 
 /// A bitvector term that exists in both the shinri and z3 worlds.
+///
+/// Every entry in a single `gen_instance` pool shares the function's outer
+/// `width` (concat, the one op that would produce a different width, is
+/// deliberately excluded — see the comment near BvConcat below), so a
+/// per-entry width field would carry no information; there used to be one
+/// here and it was write-only (never read), which is what clippy's
+/// `dead_code` flagged.
 struct BvPair {
     s: shinri_core::TermId,
     z: easy_smt::SExpr,
-    width: u32,
 }
 
 /// Generate a pool of width-keyed BV terms and assertions for one iteration.
@@ -94,6 +100,8 @@ fn gen_instance(
     var_names: &[&str],
     vars_s: &[shinri_core::TermId],
     z_vars: &[easy_smt::SExpr],
+    uf1: shinri_core::SymbolId,
+    uf2: shinri_core::SymbolId,
     dump: &mut String,
 ) {
     // ── Build a term pool ────────────────────────────────────────────────────
@@ -101,127 +109,131 @@ fn gen_instance(
     let mut pool: Vec<BvPair> = vars_s
         .iter()
         .zip(z_vars.iter())
-        .map(|(&s_t, &z_t)| BvPair {
-            s: s_t,
-            z: z_t,
-            width,
-        })
+        .map(|(&s_t, &z_t)| BvPair { s: s_t, z: z_t })
         .collect();
 
     // Add a small number of random BV terms to the pool.
     let n_extra = 2 + rng.below(4) as usize; // 2..=5 extra computed terms
     for _ in 0..n_extra {
-        let op_kind = rng.below(19); // pick from BV ops that keep the same width
+        let op_kind = rng.below(21); // 0..18 builtin BV ops, 19..20 uninterpreted apps
         let i = rng.below(pool.len() as u64) as usize;
         let j = rng.below(pool.len() as u64) as usize;
 
-        let (new_s, new_z, new_w) = match op_kind {
+        let (new_s, new_z) = match op_kind {
             // Bitwise unary: bvnot, bvneg
             0 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvNot), &[pool[i].s]);
                 let nz = ctx.list(vec![ctx.atom("bvnot"), pool[i].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             1 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvNeg), &[pool[i].s]);
                 let nz = ctx.list(vec![ctx.atom("bvneg"), pool[i].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             // Bitwise binary: bvand, bvor, bvxor, bvnand, bvnor, bvxnor
             2 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvAnd), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvand"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             3 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvOr), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvor"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             4 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvXor), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvxor"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             5 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvNand), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvnand"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             6 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvNor), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvnor"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             7 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvXnor), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvxnor"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             // Arithmetic: bvadd, bvsub, bvmul
             8 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvAdd), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvadd"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             9 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvSub), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvsub"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             10 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvMul), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvmul"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             // Division / remainder: bvudiv, bvurem, bvsdiv, bvsrem, bvsmod
             11 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvUdiv), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvudiv"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             12 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvUrem), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvurem"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             13 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvSdiv), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvsdiv"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             14 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvSrem), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvsrem"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             15 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvSmod), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvsmod"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             // Shifts: bvshl, bvlshr, bvashr
             16 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvShl), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvshl"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
             17 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvLshr), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvlshr"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
             }
-            _ => {
+            18 => {
                 let ns = s.app(Op::Builtin(BuiltinOp::BvAshr), &[pool[i].s, pool[j].s]);
                 let nz = ctx.list(vec![ctx.atom("bvashr"), pool[i].z, pool[j].z]);
-                (ns, nz, width)
+                (ns, nz)
+            }
+            // slice 44: (f t_i) — a 1-ary uninterpreted application.
+            19 => {
+                let ns = s.app(Op::Uninterpreted(uf1), &[pool[i].s]);
+                let nz = ctx.list(vec![ctx.atom("f"), pool[i].z]);
+                (ns, nz)
+            }
+            // slice 44: (g t_i t_j) — a 2-ary uninterpreted application.
+            _ => {
+                let ns = s.app(Op::Uninterpreted(uf2), &[pool[i].s, pool[j].s]);
+                let nz = ctx.list(vec![ctx.atom("g"), pool[i].z, pool[j].z]);
+                (ns, nz)
             }
         };
-        pool.push(BvPair {
-            s: new_s,
-            z: new_z,
-            width: new_w,
-        });
+        pool.push(BvPair { s: new_s, z: new_z });
     }
 
     // Occasionally add a concat/extract/extend/rotate/repeat term.
@@ -236,11 +248,7 @@ fn gen_instance(
             let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("repeat"), ctx.atom("1")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair {
-            s: ns,
-            z: nz,
-            width,
-        });
+        pool.push(BvPair { s: ns, z: nz });
 
         // BvRotateLeft(1) — same width.
         let i = rng.below(pool.len() as u64) as usize;
@@ -249,11 +257,7 @@ fn gen_instance(
             let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("rotate_left"), ctx.atom("1")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair {
-            s: ns,
-            z: nz,
-            width,
-        });
+        pool.push(BvPair { s: ns, z: nz });
 
         // BvRotateRight(1) — same width.
         let i = rng.below(pool.len() as u64) as usize;
@@ -262,11 +266,7 @@ fn gen_instance(
             let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("rotate_right"), ctx.atom("1")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair {
-            s: ns,
-            z: nz,
-            width,
-        });
+        pool.push(BvPair { s: ns, z: nz });
 
         // BvExtract full-width (hi=width-1, lo=0) — same width as input, well-typed.
         if width >= 2 {
@@ -283,11 +283,7 @@ fn gen_instance(
                 ]);
                 ctx.list(vec![op_atom, pool[i].z])
             };
-            pool.push(BvPair {
-                s: ns,
-                z: nz,
-                width,
-            });
+            pool.push(BvPair { s: ns, z: nz });
         }
 
         // BvZeroExtend(0) — same width (extend by 0).
@@ -297,11 +293,7 @@ fn gen_instance(
             let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("zero_extend"), ctx.atom("0")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair {
-            s: ns,
-            z: nz,
-            width,
-        });
+        pool.push(BvPair { s: ns, z: nz });
 
         // BvSignExtend(0) — same width.
         let i = rng.below(pool.len() as u64) as usize;
@@ -310,11 +302,7 @@ fn gen_instance(
             let op_atom = ctx.list(vec![ctx.atom("_"), ctx.atom("sign_extend"), ctx.atom("0")]);
             ctx.list(vec![op_atom, pool[i].z])
         };
-        pool.push(BvPair {
-            s: ns,
-            z: nz,
-            width,
-        });
+        pool.push(BvPair { s: ns, z: nz });
 
         // BvConcat is NOT added to this random op pool because it produces a
         // different-width result, which would break sort-homogeneity.
@@ -419,7 +407,6 @@ fn differential_qf_bv_small() {
     let mut n_sat = 0usize;
     let mut n_unsat = 0usize;
     let mut n_unknown = 0usize;
-    let mut n_disagreements = 0usize;
 
     // We keep a separate counter for each width to ensure all widths are exercised.
     let mut width_counts = [0usize; 3]; // [w4, w8, w16]
@@ -446,7 +433,7 @@ fn differential_qf_bv_small() {
             .solver("z3", ["-smt2", "-in"])
             .build()
             .unwrap();
-        ctx.set_logic("QF_BV").unwrap();
+        ctx.set_logic("QF_UFBV").unwrap();
 
         let bv_type_atom = ctx.list(vec![
             ctx.atom("_"),
@@ -458,14 +445,33 @@ fn differential_qf_bv_small() {
             .map(|name| ctx.declare_const(name.to_string(), bv_type_atom).unwrap())
             .collect();
 
-        let mut dump = format!("iter={iter} width={width}\n(set-logic QF_BV)");
+        let mut dump = format!("iter={iter} width={width}\n(set-logic QF_UFBV)");
         for name in &var_names {
             dump.push_str(&format!("\n(declare-fun {name} () (_ BitVec {width}))"));
         }
 
+        // Uninterpreted symbols over BV, added in slice 44. The pool is small
+        // ON PURPOSE: two symbols over three variables means many applications
+        // share a symbol, which is exactly what makes a congruence violation
+        // reachable. A large pool would spread applications thin and the
+        // generator would stop finding the bug.
+        let uf1_s = s.declare_fun("f", &[bv_sort], bv_sort);
+        let uf2_s = s.declare_fun("g", &[bv_sort, bv_sort], bv_sort);
+        // easy-smt 0.2 takes Vec<SExpr> for the parameter list — same idiom as
+        // tests/oracle.rs:48.
+        ctx.declare_fun("f", vec![bv_type_atom], bv_type_atom)
+            .unwrap();
+        ctx.declare_fun("g", vec![bv_type_atom, bv_type_atom], bv_type_atom)
+            .unwrap();
+        dump.push_str(&format!(
+            "\n(declare-fun f ((_ BitVec {width})) (_ BitVec {width}))\
+             \n(declare-fun g ((_ BitVec {width}) (_ BitVec {width})) (_ BitVec {width}))"
+        ));
+
         // ── Generate random formula ─────────────────────────────────────────
         gen_instance(
-            &mut rng, &mut s, &mut ctx, width, &var_names, &vars_s, &z_vars, &mut dump,
+            &mut rng, &mut s, &mut ctx, width, &var_names, &vars_s, &z_vars, uf1_s, uf2_s,
+            &mut dump,
         );
 
         dump.push_str("\n(check-sat)");
@@ -485,7 +491,6 @@ fn differential_qf_bv_small() {
                 n_unsat += 1;
             }
             (o, t) => {
-                n_disagreements += 1;
                 panic!(
                     "QF_BV SOUNDNESS DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n\
                      Reproduce with this instance:\n{dump}"
@@ -496,7 +501,7 @@ fn differential_qf_bv_small() {
 
     println!(
         "differential_qf_bv_small: {N_ITERS} instances\n  \
-         sat={n_sat} unsat={n_unsat} unknown={n_unknown} disagreements={n_disagreements}\n  \
+         sat={n_sat} unsat={n_unsat} unknown={n_unknown}\n  \
          width breakdown: w4={} w8={} w16={}",
         width_counts[0], width_counts[1], width_counts[2]
     );
@@ -528,10 +533,15 @@ fn differential_qf_bv_small() {
          QF_BV fence is firing too aggressively or blaster is broken"
     );
 
-    // Zero disagreements is the hard guarantee — any panic above would have set
-    // n_disagreements but we also assert here as a belt-and-suspenders check.
-    assert_eq!(
-        n_disagreements, 0,
-        "SOUNDNESS BUG: {n_disagreements} disagreements detected"
-    );
+    // Zero disagreements is the hard guarantee, but there is no separate
+    // "belt and suspenders" check for it here: the (o, t) match arm above
+    // panics UNCONDITIONALLY and IMMEDIATELY on the first disagreement, so
+    // this function can only ever reach this point having seen zero of
+    // them — a trailing `assert_eq!(n_disagreements, 0, ...)` would always
+    // read a variable that provably never observed a nonzero write (the
+    // `+= 1` that used to precede the panic was live code that computed a
+    // value nothing could ever read, which is exactly what
+    // `unused_assignments` was flagging). If a future refactor changes the
+    // per-iteration arm to collect disagreements instead of panicking
+    // immediately, reintroduce a real counter alongside that change.
 }

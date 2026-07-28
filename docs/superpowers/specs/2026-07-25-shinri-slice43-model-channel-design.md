@@ -282,11 +282,41 @@ Stated here so the spec is not read as promising more than it delivers.
 | Gap | Cause | Disposition |
 |---|---|---|
 | Bool-sorted fields | `Euf::model`'s Bool branch (`solver.rs:199`–`:208`) assigns `ModelVal::Bool` for terms merged with the truth node, so these **may** resolve opportunistically via §3.C — unverified | **Measure in task 1** and pin the observed behaviour either way. Do not assume either outcome. |
-| BV-sorted fields | BV values are extracted solver-side from SAT vars and never enter the Combiner's builder. Worse than predicted: with only a *selector* application asserted, the symbol never enters `DtSolver::watched_dt_terms()` either, so DT contributes nothing for it at all — not even a partial `(mk ?)` | `?` — but for the WHOLE symbol, `((define-fun v () W ?))`, not `(mk ?)`: with no channel value there is no evidence of the constructor either. **Release only.** In a dev/debug build the same query panics before `check-sat` returns, on the pre-existing `debug_assert!(child_ids.is_empty(), "non-nullary uninterpreted BV fn out of scope")` in `shinri-bv/src/blast/mod.rs:282` — verified to reproduce on pre-slice `main`, so it is not this slice's doing and is deferred with it. Both halves pinned (`fenced_bv_field_panics_in_debug`, `fenced_bv_field_is_a_placeholder_in_release`). Successor slice. |
+| BV-sorted fields | BV values are extracted solver-side from SAT vars and never enter the Combiner's builder. Worse than predicted: with only a *selector* application asserted, the symbol never enters `DtSolver::watched_dt_terms()` either, so DT contributes nothing for it at all — not even a partial `(mk ?)` | `?` — but for the WHOLE symbol, `((define-fun v () W ?))`, not `(mk ?)`: with no channel value there is no evidence of the constructor either. **Release only.** In a dev/debug build the same query panics before `check-sat` returns, on the pre-existing `debug_assert!(child_ids.is_empty(), "non-nullary uninterpreted BV fn out of scope")` in `shinri-bv/src/blast/mod.rs:282` — verified to reproduce on pre-slice `main`, so it is not this slice's doing and is deferred with it. Both halves pinned (`fenced_bv_field_panics_in_debug`, `fenced_bv_field_is_a_placeholder_in_release`). Successor slice. **Superseded — see the correction after this table.** |
 | String-sorted fields | `(s w)` is minted in-search by DT, so it never reaches `StrSolver::str_terms` and the string model never assigns it (`shinri-str/src/model.rs:116-126`). EUF leaves a `ModelVal::Elem` class token behind, which is not a String value | `?`. `render_field`'s sort guard deliberately refuses the `Elem`: routing a String field through the shared builder unguarded would print `@elem0` in a String position — a sort-mismatched *wrong* value, strictly worse than a visible placeholder. Corrects §3.A's original claim; pinned by `string_field_stays_a_placeholder_rather_than_an_elem_token`. Successor slice. |
 | `get-value` on a builtin-op term | Only `Op::Uninterpreted` gets a structural rendering in `display_term` (`tseitin.rs:441-445`, which says so); and `format_value` has no entry for a compound arithmetic term | Both halves degrade: measured, `(get-value ((+ x 1) b))` → `((t7 ?) (b true))` — the label falls back to the internal `t{index}` and the value to `?`. §4.C's printer work covers applications of *declared* symbols only. Out of scope here, but it is a `tN` name reaching the user, which §7 criterion 1 forbids for `get-model`; a successor slice should close it. |
 | Uninterpreted-sort values | `format_modelval` renders `Elem` as `@elem{idx}` (`model.rs:95`), not z3's `(as @U!val!0 U)` | Pre-existing, out of scope, unchanged by the relocation in §3.C. |
 | Arity > 0 functions | Need EUF congruence-class enumeration plus a default point to build a function graph | Out of scope. **`get-model` therefore remains an incomplete model for UF queries** — it omits function symbols. Successor slice. |
+
+**Correction to the BV-sorted fields row (slice 44,
+`docs/superpowers/specs/2026-07-27-shinri-slice44-uf-bv-congruence-design.md`)**,
+added here rather than rewritten in place, matching how this spec's §4.C
+corrected slice 42's §3.A claim. The row's *diagnosis* is unchanged and still
+holds: DT contributes nothing for a BV-sorted field, because the value is
+extracted solver-side and never enters the Combiner's builder, and `v` itself
+is still unvalued for exactly that reason. What changed is the disposition.
+Slice 44 Task 2 added `uf_args_supported`, a sort-based fence that runs BEFORE
+lowering. `(w v)` is a non-nullary BV-result uninterpreted application whose
+argument `v` is Datatype-sorted and therefore has no blastable word, so this
+fence now catches the query first — **not** slice 44's congruence arm, which
+never sees it. Both build profiles now agree: the query decides `unknown`
+(measured, `./target/release/shinri`), and `get-model` prints the honest empty
+answer `()`. The `debug_assert!` this row cited and its
+`#[should_panic]`/release-placeholder sibling-test pair are gone — verified by
+grep, no match for `"non-nullary uninterpreted BV fn out of scope"` anywhere
+under `crates/`. Both halves are now pinned by one profile-independent test,
+`fenced_bv_field_is_unknown` (`crates/shinri-solver/tests/qfdt_model_e2e.rs`),
+replacing `fenced_bv_field_panics_in_debug` and
+`fenced_bv_field_is_a_placeholder_in_release`. Note that this specific
+single-application query's pre-slice release `sat` was itself
+**correct-but-incomplete** (an unconstrained placeholder for the whole
+symbol), not unsound — the wrong-`sat` defect slice 44 fixes is a *separate*
+case class requiring two-or-more applications of the same uninterpreted
+function, which this query never was. The `unknown` here is a named Fence-1
+verdict exception under slice 44 spec §2.1, not a soundness fix for this
+query. The surviving gap is unchanged from the row's original diagnosis: `v`
+remains unvalued because DT contributes nothing on the pure-BV path — still a
+successor-slice item.
 
 **The general rule behind most of these rows**, not just their DT instances:
 `get-model` enumerates *declarations*, so it must produce an entry for a symbol

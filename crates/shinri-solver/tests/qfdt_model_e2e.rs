@@ -376,75 +376,52 @@ fn model_names_only_declared_symbols() {
 /// that BV values are extracted solver-side from SAT vars and never enter the
 /// Combiner's ModelBuilder, so DT cannot see them.
 ///
-/// MEASURED behaviour differs per build profile:
+/// PRE-slice-44 history (superseded below, kept for the record — this is the
+/// same class of bug slice 44 fences): `(w v)` is a non-nullary uninterpreted
+/// application with a BV result sort whose one argument, `v`, is
+/// Datatype-sorted — not BV/FP-sorted, so it has no blastable word. Before
+/// slice 44 Task 2's fence existed, behaviour differed per build profile:
 ///
-/// * RELEASE (`cargo build --release --bin shinri`, no debug assertions):
-///   `(w v)` is a bare selector application with no tester or constructor ever
-///   asserted about `v` itself, so `v` never lands in
-///   `DtSolver::watched_dt_terms()` and `DtSolver::model()`
-///   (`crates/shinri-dt/src/lib.rs:870-881`) skips it entirely — DT
-///   contributes NOTHING for `v` to the shared ModelBuilder, not even a
-///   partial `(mk ?)`.
+/// * RELEASE (no debug assertions): `blast_bv_word`'s `Op::Uninterpreted` arm
+///   minted FRESH unconstrained bits for `(w v)` with no congruence and
+///   decided `sat` — the CORRECT verdict for this query, but with an
+///   INCOMPLETE model: the placeholder covered the WHOLE symbol,
+///   `((define-fun v () W ?))`, not just the field (the final review's
+///   finding 1 fix, itself now moot for this query). Missing congruence
+///   produces a wrong `sat` on queries with two-or-more applications of the
+///   same uninterpreted function; this single-application query was never
+///   one of those.
+/// * DEV/TEST (debug assertions ON): the same code path hit
+///   `debug_assert!(child_ids.is_empty(), "non-nullary uninterpreted BV fn
+///   out of scope")` in `crates/shinri-bv/src/blast/mod.rs:282` and PANICKED
+///   before `check-sat` ever returned.
 ///
-///   Task 7 measured this as `((define-fun v () W (mk #b00000000)))`:
-///   `format_model` treated `v` exactly like a symbol occurring in no
-///   assertion and fell through to `sort_default`'s structural default, which
-///   zero-filled the BV field — silently CONTRADICTING the assertion
-///   `(= (w v) #x2a)`. The final review's finding 1 removed that whole class
-///   of answer: `v` IS interned (it occurs in `(w v)`), so it is no longer
-///   eligible for a sort default, and the entry is now the visible placeholder
-///   `((define-fun v () W ?))`. The DT gap itself is unchanged and still open
-///   — nothing values `v` — but the model no longer states a falsehood about
-///   it. Note the placeholder covers the WHOLE symbol, not just the field:
-///   with no channel value there is no evidence of `v`'s constructor either,
-///   and `mk` is forced here only because `W` happens to have one constructor.
-///
-/// * DEV/TEST (`cargo nextest run`, the tier this repo actually gates on —
-///   AGENTS.md's blocking tier and `mise run test` both build the `dev`
-///   profile, debug assertions ON): bit-blasting `(w v)` to encode the `=`
-///   assertion hits `debug_assert!(child_ids.is_empty(), "non-nullary
-///   uninterpreted BV fn out of scope")` in
-///   `crates/shinri-bv/src/blast/mod.rs:282` and PANICS before `check-sat`
-///   ever returns. A selector application on a BV field is a non-nullary
-///   uninterpreted BV term that the bit-blaster's own comment marks as
-///   genuinely out of scope; the debug build crashes loudly on it instead
-///   of limping through with a bogus value. This exact query is the first
-///   in the workspace to combine a DT selector with a BV-sorted field, so
-///   this crash was previously unexercised and undiscovered by any test.
-///
-/// Both measured behaviours are pinned below, gated on `debug_assertions` so
-/// each build profile is provably tested against the SAME query (`BV_FIELD`)
-/// rather than trusting the two to stay in sync via prose. If a successor
-/// slice deletes the `debug_assert!` so dev matches release, the
-/// `should_panic` test below fails and the release pin is what says what the
-/// answer should then be.
+/// Slice 44 Task 2's `uf_args_supported` fence (`bv_stage.rs`) now catches
+/// this BEFORE lowering starts, in EVERY build profile: `v`'s Datatype sort
+/// has no blastable word, so the query fences to a SOUND `unknown`. This is
+/// the spec §2.1 named decided → unknown exception (an uninterpreted-sorted
+/// argument to a BV-result uninterpreted function), and it also means the
+/// debug-mode panic and the release-mode incomplete-model `sat` are BOTH
+/// gone — the debug_assert! is no longer reachable from this query at all.
 const BV_FIELD: &str = "(set-logic QF_UFDTBV)(declare-datatype W ((mk (w (_ BitVec 8)))))\
                         (declare-fun v () W)(assert (= (w v) #x2a))(check-sat)(get-model)";
 
-/// DEV/TEST half: pins the panic. This is what `cargo nextest run` — the
-/// invocation the blocking tier and `mise run test` actually use (`mise.toml`
-/// has no `--release` test task anywhere) — hits for this query.
-#[cfg(debug_assertions)]
+/// MEASURED (slice 44 Task 2): both build profiles now agree — the fence
+/// fires before the bit-blaster is ever invoked, so there is no longer a
+/// debug/release split to pin separately. `get-model` after `unknown` prints
+/// the honest empty answer `()` (`format_model`'s `last_outcome != Sat`
+/// guard, `lib.rs`) — pinned here so a regression cannot drift back to a
+/// fabricated value (e.g. a zero-filled `(mk #b00000000)`) that would
+/// CONTRADICT the asserted `(= (w v) #x2a)`.
 #[test]
-#[should_panic(expected = "non-nullary uninterpreted BV fn out of scope")]
-fn fenced_bv_field_panics_in_debug() {
-    let _ = run_script(BV_FIELD);
-}
-
-/// RELEASE half: pins the placeholder. Unlike the panic this path is
-/// unguarded today (no CI job runs the test suite with `--release`), so
-/// recording it here means a future release-mode run cannot regress it
-/// silently — in particular it cannot drift BACK to a fabricated value, which
-/// is what it printed before the final review's finding 1.
-#[cfg(not(debug_assertions))]
-#[test]
-fn fenced_bv_field_is_a_placeholder_in_release() {
+fn fenced_bv_field_is_unknown() {
     let out = run_script(BV_FIELD);
-    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
-    // MEASURED (release binary, post-finding-1): incomplete, not false. Was
-    // `((define-fun v () W (mk #b00000000)))`, which contradicted
-    // `(= (w v) #x2a)`.
-    assert_eq!(out[1], "((define-fun v () W ?))");
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unknown"),
+        "got {out:?}"
+    );
+    assert_eq!(out.get(1).map(|s| s.as_str()), Some("()"), "got {out:?}");
 }
 
 /// `get-model` omits functions of arity > 0 (spec §5): a function graph needs

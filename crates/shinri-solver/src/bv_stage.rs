@@ -11,7 +11,7 @@
 //! `collect_bv_atoms` deliberately includes Eq/Distinct over BV operands.
 
 use rustc_hash::FxHashMap;
-use shinri_core::{BuiltinOp, Context, Lit, Op, SortNode, TermId, TermNode, Var};
+use shinri_core::{BuiltinOp, Context, Lit, Op, SortId, SortNode, TermId, TermNode, Var};
 
 /// Surrogate maps produced by lowering BV atoms to CNF and replaying that CNF
 /// into the SAT solver. The Encoder consults `atom_to_lit` so a BV atom returns
@@ -255,6 +255,194 @@ pub fn has_non_bv_theory_atom(ctx: &Context, assertions: &[TermId], bv_atoms: &[
         .any(|&a| walk(ctx, a, &bv_set, &mut visited))
 }
 
+/// Fence 1 (slice 44 §4, SOUNDNESS-CRITICAL). Every non-nullary uninterpreted
+/// application with a **BitVec result sort** reachable from `atoms` must have
+/// arguments the blaster can turn into words, because `blast_bv_word`'s
+/// congruence arm compares argument words pairwise.
+///
+/// BV-sorted arguments always qualify. FP-sorted arguments qualify only when
+/// `allow_fp_args` — that is, on the FP/mixed path, where a `Lowerer` exists
+/// with a `core_eq`-based `word_eq`. A `Blaster` alone cannot compare an FP
+/// word (`core_eq` lives in `shinri-fp`, which depends on `shinri-bv` and not
+/// the reverse).
+///
+/// Everything else — Int, Bool, Array, String, uninterpreted sorts,
+/// RoundingMode — fences the caller to a sound `Unknown`. Without this,
+/// `Lowerer::word` reaches its `unreachable!("Lowerer::word on non-BV/non-FP
+/// sort")` (`crates/shinri-fp/src/lower.rs:69`) and `Blaster::word` reaches
+/// `blast_bv_word`'s builtin dispatch on a non-BV term.
+///
+/// Walks the ATOM set rather than the assertion list: that is exactly what
+/// reaches the blaster, and it stays a superset of what survives `rewrite`
+/// (rewriting can fold applications away but never create them), so the
+/// conservative bias every other fence in this stage has is preserved.
+pub fn uf_args_supported(ctx: &Context, atoms: &[TermId], allow_fp_args: bool) -> bool {
+    let mut seen = rustc_hash::FxHashSet::default();
+    atoms
+        .iter()
+        .all(|&a| walk_uf_args(ctx, a, allow_fp_args, &mut seen))
+}
+
+fn walk_uf_args(
+    ctx: &Context,
+    t: TermId,
+    allow_fp_args: bool,
+    seen: &mut rustc_hash::FxHashSet<TermId>,
+) -> bool {
+    if !seen.insert(t) {
+        return true; // already validated on another path
+    }
+    let TermNode::App { op, args, sort } = ctx.term_node(t) else {
+        return true; // a constant has no arguments
+    };
+    let kids = ctx.children(*args).to_vec();
+    if matches!(op, Op::Uninterpreted(_)) && !kids.is_empty() && ctx.bv_width(*sort).is_some() {
+        for &k in &kids {
+            let ks = ctx.sort_of(k);
+            let wordable =
+                ctx.bv_width(ks).is_some() || (allow_fp_args && ctx.fp_widths(ks).is_some());
+            if !wordable {
+                return false;
+            }
+        }
+    }
+    kids.iter()
+        .all(|&k| walk_uf_args(ctx, k, allow_fp_args, seen))
+}
+
+/// Fence 2 (slice 44 §4). Gate-equivalent cost of the Ackermann encoding for
+/// every non-nullary uninterpreted BV-result application reachable from
+/// `atoms`: for symbol `s` with `kₛ` applications, total argument width `Aₛ`
+/// and result width `wₛ`, the encoding emits `pairs(kₛ) × (Aₛ + wₛ)` gates,
+/// where `pairs(k) = k(k−1)/2`.
+///
+/// Nullary applications contribute zero: they emit no congruence at all.
+///
+/// FP-sorted arguments are counted at `FP_ARG_COST_MULTIPLIER × (eb + sb)`
+/// rather than the raw word width `eb + sb`, because a per-pair FP argument
+/// comparison goes through `core_eq` (`crates/shinri-fp/src/blast/compare.rs`),
+/// not the plain bitwise chain the BV proxy below implicitly models. `core_eq`
+/// unpacks BOTH operands (`unpack`, `crates/shinri-fp/src/unpack.rs`: ~`3*eb +
+/// 2*sb` gates each, for the all-ones/all-zero exponent and significand scans
+/// behind `is_nan`/`is_inf`/`is_zero`) and then still runs a full `bits_eq`
+/// bitwise-equality chain (~`3*(eb+sb)` gates) plus a handful of NaN-routing
+/// combinators — roughly `9*eb + 7*sb + 10` gates total, against the
+/// `3*(eb+sb)` gates a same-width bitwise BV comparison costs. The multiplier
+/// below is a ROUNDED-UP REASONED ESTIMATE from that gate count, NOT a
+/// measurement — no FP calibration instance has been run.
+///
+/// Cross-checked against the sources rather than measured: `bits_eq` is 3
+/// gates/bit (`crates/shinri-fp/src/blast/compare.rs:7-16`) and `unpack` is
+/// `3*eb + 2*sb + 2` (`crates/shinri-fp/src/unpack.rs:18-58`), which puts the
+/// true ratio at ~2.60x (Float32), ~2.50x (Float64) and ~2.75x (eb=5/sb=11).
+/// Rounding up gives 3, which is what spec §7.3 states. The rounding keeps
+/// this the safe (over-counting) direction for FP arguments regardless of when
+/// a real calibration eventually happens.
+pub fn uf_congruence_cost(ctx: &Context, atoms: &[TermId]) -> u64 {
+    let mut per_sym: FxHashMap<UfShapeKey, (u64, u64, u64)> = FxHashMap::default();
+    let mut seen = rustc_hash::FxHashSet::default();
+    for &a in atoms {
+        collect_uf_apps(ctx, a, &mut per_sym, &mut seen);
+    }
+    let mut total: u64 = 0;
+    for (_, (k, arg_bits, res_bits)) in per_sym {
+        let pairs = k.saturating_mul(k.saturating_sub(1)) / 2;
+        total = total.saturating_add(pairs.saturating_mul(arg_bits.saturating_add(res_bits)));
+    }
+    total
+}
+
+/// See `uf_congruence_cost`'s doc comment: a reasoned (not measured) upper
+/// bound on how much more `core_eq` costs per FP argument bit than a plain
+/// bitwise BV comparison costs per bit, rounded up from the ~2.5–2.75x gate-
+/// count ratio derived there. Keeps the FP-argument cost over-counting, the
+/// safe direction for a budget fence.
+const FP_ARG_COST_MULTIPLIER: u64 = 3;
+
+/// The grouping key for congruence counting: `(symbol, argument sorts, result
+/// sort)`.
+///
+/// MUST mirror the blaster's pairing predicate (`shape_compatible`,
+/// `crates/shinri-bv/src/blast/mod.rs`). A `SymbolId` alone is NOT a function:
+/// `Context::declare_fun` interns by name and overwrites the signature, and a
+/// redeclaration is accepted silently, so one symbol can carry applications of
+/// two different functions in one assertion list. The blaster only relates applications
+/// within a shape group; keying this map by symbol alone would merge those
+/// groups and OVER-count `pairs(k)` — but it also locked `arg_bits`/`res_bits`
+/// to the FIRST application seen (`or_insert`), which for a wider second shape
+/// UNDER-counts, and under-counting is the unsafe direction for a budget fence.
+/// Keying by shape removes both: within a group every application has the same
+/// argument and result widths by construction.
+type UfShapeKey = (shinri_core::SymbolId, Vec<shinri_core::SortId>, SortId);
+
+fn collect_uf_apps(
+    ctx: &Context,
+    t: TermId,
+    per_sym: &mut FxHashMap<UfShapeKey, (u64, u64, u64)>,
+    seen: &mut rustc_hash::FxHashSet<TermId>,
+) {
+    if !seen.insert(t) {
+        return;
+    }
+    let TermNode::App { op, args, sort } = ctx.term_node(t) else {
+        return;
+    };
+    let kids = ctx.children(*args).to_vec();
+    if let Op::Uninterpreted(sym) = op {
+        if !kids.is_empty() {
+            if let Some(res_bits) = ctx.bv_width(*sort) {
+                let arg_bits: u64 = kids
+                    .iter()
+                    .map(|&k| {
+                        let ks = ctx.sort_of(k);
+                        ctx.bv_width(ks)
+                            .map(u64::from)
+                            .or_else(|| {
+                                ctx.fp_widths(ks)
+                                    .map(|(eb, sb)| u64::from(eb + sb) * FP_ARG_COST_MULTIPLIER)
+                            })
+                            .unwrap_or(0)
+                    })
+                    .sum();
+                let key: UfShapeKey = (*sym, kids.iter().map(|&k| ctx.sort_of(k)).collect(), *sort);
+                let e = per_sym
+                    .entry(key)
+                    .or_insert((0, arg_bits, u64::from(res_bits)));
+                e.0 += 1;
+            }
+        }
+    }
+    for &k in &kids {
+        collect_uf_apps(ctx, k, per_sym, seen);
+    }
+}
+
+/// Calibrated 2026-07-28: the largest encoding that solves in under 30 s on
+/// the release binary, measured on a width-32 arity-2 symbol (Aₛ + wₛ = 96,
+/// `(set-logic QF_UFBV) (declare-fun g ((_ BitVec 32) (_ BitVec 32)) (_
+/// BitVec 32))`, k fresh BV32 vars, k applications `g(vᵢ,vᵢ)` chained
+/// `g(v0,v0)=g(v1,v1), g(v1,v1)=g(v2,v2), ...`) with k applications. Chosen so
+/// a single fenced query cannot consume the 10–15 min PR-tier budget on its
+/// own. Recorded here rather than in the spec because it is a measurement,
+/// not a design choice.
+///
+/// FULL measured k -> wall-clock table (single run each, release binary,
+/// foreground `bash time`):
+///   k=10  -> 0.013 s
+///   k=20  -> 0.050 s
+///   k=40  -> 0.206 s
+///   k=80  -> 0.843 s
+///   k=160 -> 3.484 s
+///   k=320 -> 15.429 s
+///   k=400 -> 25.140 s
+///   k=420 -> 26.920 s
+///   k=440 -> 29.203 s   <- largest measured k still under 30 s
+///   k=460 -> 32.086 s   <- first measured k over 30 s; true crossing is
+///                          between k=440 and k=460
+///
+/// UF_CONGRUENCE_BUDGET = pairs(440) * 96 = 96,580 * 96 = 9_271_680.
+pub const UF_CONGRUENCE_BUDGET: u64 = 9_271_680;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,6 +499,265 @@ mod tests {
         assert!(
             has_non_bv_theory_atom(&ctx, &assertions, &atoms),
             "Real Gt atom must trigger the mixed fence"
+        );
+    }
+
+    #[test]
+    fn uf_args_supported_admits_bv_arguments() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fx, c]).unwrap();
+        assert!(uf_args_supported(&ctx, &[atom], false));
+    }
+
+    #[test]
+    fn uf_args_supported_rejects_an_int_argument() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let int_s = ctx.int_sort();
+        let h = ctx.declare_fun("h", &[int_s], s8);
+        let nf = ctx.declare_fun("n", &[], int_s);
+        let n = ctx.mk_app(Op::Uninterpreted(nf), &[]).unwrap();
+        let hn = ctx.mk_app(Op::Uninterpreted(h), &[n]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[hn, c]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "an Int-sorted argument has no blastable word — must fence"
+        );
+    }
+
+    #[test]
+    fn uf_args_supported_leaves_nullary_applications_alone() {
+        // A nullary uninterpreted BV symbol has no arguments to check and must
+        // never be fenced — it is the ordinary BV variable case.
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, c]).unwrap();
+        assert!(uf_args_supported(&ctx, &[atom], false));
+    }
+
+    /// An FP-sorted argument to a BV-result uninterpreted application
+    /// qualifies ONLY when `allow_fp_args` — i.e. only on the FP/mixed path,
+    /// where a `Lowerer` exists with a `core_eq`-based `word_eq`. This is the
+    /// entire reason the parameter exists; without this pair, inverting the
+    /// guard (`!allow_fp_args && ...`) or dropping it (admitting FP args
+    /// unconditionally, which would crash the ABV path's bare `Blaster`)
+    /// would both pass silently.
+    #[test]
+    fn uf_args_supported_admits_fp_arguments_only_when_allowed() {
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let s8 = ctx.bv_sort(8);
+        let g = ctx.declare_fun("g", &[f32], s8);
+        let nf = ctx.declare_fun("n", &[], f32);
+        let n = ctx.mk_app(Op::Uninterpreted(nf), &[]).unwrap();
+        let gn = ctx.mk_app(Op::Uninterpreted(g), &[n]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[gn, c]).unwrap();
+        assert!(
+            uf_args_supported(&ctx, &[atom], true),
+            "an FP-sorted argument qualifies when allow_fp_args is true"
+        );
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "an FP-sorted argument must NOT qualify when allow_fp_args is false \
+             (no Lowerer sink exists to compare FP words, e.g. on the ABV path)"
+        );
+    }
+
+    /// A RoundingMode-sorted argument has no blastable word in EITHER sink —
+    /// neither a `Blaster` nor a `Lowerer` can turn it into a word — so it
+    /// must fence even when `allow_fp_args` is true.
+    #[test]
+    fn uf_args_supported_rejects_a_roundingmode_argument_even_when_fp_allowed() {
+        let mut ctx = Context::new();
+        let rm_s = ctx.rm_sort();
+        let s8 = ctx.bv_sort(8);
+        let k = ctx.declare_fun("k", &[rm_s], s8);
+        let r = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let kr = ctx.mk_app(Op::Uninterpreted(k), &[r]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[kr, c]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[atom], true),
+            "a RoundingMode-sorted argument has no blastable word in any sink — must fence"
+        );
+    }
+
+    #[test]
+    fn uf_congruence_cost_is_quadratic_in_application_count() {
+        // Three applications of one 1-ary 8-bit symbol: pairs(3) = 3, each
+        // costing 8 argument bits + 8 result bits = 16. Expect 3 * 16 = 48.
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let mut atoms = Vec::new();
+        let mut apps = Vec::new();
+        for name in ["x", "y", "z"] {
+            let vf = ctx.declare_fun(name, &[], s8);
+            let v = ctx.mk_app(Op::Uninterpreted(vf), &[]).unwrap();
+            apps.push(ctx.mk_app(Op::Uninterpreted(f), &[v]).unwrap());
+        }
+        atoms.push(
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[apps[0], apps[1]])
+                .unwrap(),
+        );
+        atoms.push(
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[apps[1], apps[2]])
+                .unwrap(),
+        );
+        assert_eq!(uf_congruence_cost(&ctx, &atoms), 48);
+    }
+
+    #[test]
+    fn uf_congruence_cost_ignores_nullary_applications() {
+        // Nullary symbols emit no congruence, so they must contribute zero.
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let yf = ctx.declare_fun("y", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, y]).unwrap();
+        assert_eq!(uf_congruence_cost(&ctx, &[atom]), 0);
+    }
+
+    /// Pins the FP-argument width branch: an FP argument costs
+    /// `FP_ARG_COST_MULTIPLIER * (eb + sb)`, not the raw `eb + sb`. Three
+    /// applications of one 1-ary `Float32 (eb=8, sb=24) -> BV8` symbol:
+    /// `pairs(3) = 3`, each pair costing `3 * (8 + 24) = 96` argument
+    /// "bits" + `8` result bits = `104`. Expect `3 * 104 = 312`. A test that
+    /// used the raw (unmultiplied) width would instead expect `3 * 40 = 120`
+    /// — this must NOT pass.
+    #[test]
+    fn uf_congruence_cost_applies_the_fp_argument_multiplier() {
+        let mut ctx = Context::new();
+        let f32s = ctx.fp_sort(8, 24);
+        let s8 = ctx.bv_sort(8);
+        let g = ctx.declare_fun("g", &[f32s], s8);
+        let mut atoms = Vec::new();
+        let mut apps = Vec::new();
+        for name in ["x", "y", "z"] {
+            let vf = ctx.declare_fun(name, &[], f32s);
+            let v = ctx.mk_app(Op::Uninterpreted(vf), &[]).unwrap();
+            apps.push(ctx.mk_app(Op::Uninterpreted(g), &[v]).unwrap());
+        }
+        atoms.push(
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[apps[0], apps[1]])
+                .unwrap(),
+        );
+        atoms.push(
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[apps[1], apps[2]])
+                .unwrap(),
+        );
+        assert_eq!(uf_congruence_cost(&ctx, &atoms), 312);
+    }
+
+    /// A keying bug that merged two DISTINCT symbols under one bucket would
+    /// pass a single-symbol fixture but not this: `f` (2 applications,
+    /// `pairs(2) = 1`) and `h` (3 applications, `pairs(3) = 3`), both 1-ary
+    /// `BV8 -> BV8`. Correct per-symbol total is `1*16 + 3*16 = 64`; a
+    /// symbol-blind merge would instead see 5 applications of one bucket,
+    /// `pairs(5) = 10`, cost `10*16 = 160`.
+    #[test]
+    fn uf_congruence_cost_does_not_merge_distinct_symbols() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let h = ctx.declare_fun("h", &[s8], s8);
+        let a = bv_var(&mut ctx, "a", 8);
+        let b = bv_var(&mut ctx, "b", 8);
+        let c = bv_var(&mut ctx, "c", 8);
+        let d = bv_var(&mut ctx, "d", 8);
+        let e = bv_var(&mut ctx, "e", 8);
+        let fa = ctx.mk_app(Op::Uninterpreted(f), &[a]).unwrap();
+        let fb = ctx.mk_app(Op::Uninterpreted(f), &[b]).unwrap();
+        let hc = ctx.mk_app(Op::Uninterpreted(h), &[c]).unwrap();
+        let hd = ctx.mk_app(Op::Uninterpreted(h), &[d]).unwrap();
+        let he = ctx.mk_app(Op::Uninterpreted(h), &[e]).unwrap();
+        let atoms = vec![
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fa, fb]).unwrap(),
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[hc, hd]).unwrap(),
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[hd, he]).unwrap(),
+        ];
+        assert_eq!(uf_congruence_cost(&ctx, &atoms), 64);
+    }
+
+    /// The counting key must MIRROR the blaster's pairing predicate: one
+    /// `SymbolId` can carry two different functions, because `declare_fun`
+    /// interns by name and overwrites the signature. Here `f` is applied once
+    /// at `BV8 -> BV8` and twice at `BV16 -> BV16`; the blaster pairs only
+    /// within a shape, so the true cost is `pairs(1)*16 + pairs(2)*32 = 0 + 32
+    /// = 32`.
+    ///
+    /// Keying by `SymbolId` alone gave `pairs(3) = 3` against whichever
+    /// `arg_bits`/`res_bits` the FIRST application happened to install
+    /// (`or_insert`): `3 * 16 = 48` for this ordering. That is over-counting
+    /// here, but reversing the declaration order installs the WIDE widths for
+    /// the narrow group and the same bug under-counts — and under-counting is
+    /// the unsafe direction for a budget fence.
+    #[test]
+    fn uf_congruence_cost_does_not_merge_two_shapes_of_one_symbol() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let s16 = ctx.bv_sort(16);
+        let f8 = ctx.declare_fun("f", &[s8], s8);
+        let a = bv_var(&mut ctx, "a", 8);
+        let fa = ctx.mk_app(Op::Uninterpreted(f8), &[a]).unwrap();
+        // Redeclaring `f` returns the SAME SymbolId — interned by name.
+        let f16 = ctx.declare_fun("f", &[s16], s16);
+        assert_eq!(f8, f16, "declare_fun interns by name");
+        let p = bv_var(&mut ctx, "p", 16);
+        let q = bv_var(&mut ctx, "q", 16);
+        let fp = ctx.mk_app(Op::Uninterpreted(f16), &[p]).unwrap();
+        let fq = ctx.mk_app(Op::Uninterpreted(f16), &[q]).unwrap();
+        let z8 = bv_var(&mut ctx, "z", 8);
+        let atoms = vec![
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fa, z8]).unwrap(),
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fp, fq]).unwrap(),
+        ];
+        assert_eq!(uf_congruence_cost(&ctx, &atoms), 32);
+    }
+
+    /// The walk must not stop at the first uninterpreted application whose
+    /// OWN arguments check out — it must continue past a passing node to
+    /// catch an unwordable argument further down. `f : BV8 -> BV8` applied to
+    /// `g(n)` (`g : Int -> BV8`) passes `f`'s own check (its argument `g(n)`
+    /// is BV-sorted) but must still be rejected because `g`'s argument `n` is
+    /// Int-sorted. A "return as soon as this node's own args check out"
+    /// regression would pass this atom.
+    ///
+    /// The shared `gn` operand is incidental, NOT extra coverage: the walk's
+    /// `kids.iter().all(..)` short-circuits on `fgn`'s `false` and never
+    /// reaches the sibling `gn`. The memo needs no case of its own — a `false`
+    /// propagates out of every enclosing `.all()` immediately, so a `true`
+    /// later returned by an already-`seen` node can never overwrite it.
+    #[test]
+    fn uf_args_supported_rejects_an_unwordable_argument_below_a_passing_application() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let int_s = ctx.int_sort();
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let g = ctx.declare_fun("g", &[int_s], s8);
+        let nf = ctx.declare_fun("n", &[], int_s);
+        let n = ctx.mk_app(Op::Uninterpreted(nf), &[]).unwrap();
+        let gn = ctx.mk_app(Op::Uninterpreted(g), &[n]).unwrap();
+        let fgn = ctx.mk_app(Op::Uninterpreted(f), &[gn]).unwrap();
+        // `gn` shared on both sides of the Eq exercises the `seen` memo.
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fgn, gn]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "f's own argument (g(n)) is BV-sorted and passes, but the walk must \
+             continue into g(n) and catch g's Int-sorted argument n underneath"
         );
     }
 }

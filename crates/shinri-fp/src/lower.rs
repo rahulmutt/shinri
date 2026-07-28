@@ -2,7 +2,7 @@
 //! sort. See docs/superpowers/specs/2026-07-01-shinri-qffp-slice4a-bvfp-unification-design.md.
 
 use rustc_hash::FxHashMap;
-use shinri_bv::{blast_bv_atom, blast_bv_word, BitLit, Blaster, FpToBvApp, WordSink};
+use shinri_bv::{blast_bv_atom, blast_bv_word, BitLit, Blaster, FpToBvApp, UfApp, WordSink};
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 
 pub struct Lowerer {
@@ -18,6 +18,10 @@ pub struct Lowerer {
     rm_cache: FxHashMap<TermId, [BitLit; 5]>,
     // FP→BV application registry for unspecified-value congruence (slice 4e).
     fp2bv_apps: Vec<FpToBvApp>,
+    // Uninterpreted-application registry for Ackermann congruence (slice 44).
+    // A real store, not a defaulted `unreachable!`: the unified path lowers
+    // BV-sorted uninterpreted applications through `blast_bv_word`.
+    uf_apps: Vec<UfApp>,
 }
 
 impl Lowerer {
@@ -27,6 +31,7 @@ impl Lowerer {
             cache: FxHashMap::default(),
             rm_cache: FxHashMap::default(),
             fp2bv_apps: Vec::new(),
+            uf_apps: Vec::new(),
         }
     }
     // atom() and var_bits_split() added in Step 3.
@@ -78,6 +83,28 @@ impl WordSink for Lowerer {
     }
     fn fp2bv_apps(&mut self) -> &mut Vec<FpToBvApp> {
         &mut self.fp2bv_apps
+    }
+    fn uf_apps(&mut self) -> &mut Vec<UfApp> {
+        &mut self.uf_apps
+    }
+
+    /// Sort-aware value equality. BV words compare bitwise; FP words compare
+    /// with `core_eq`, because SMT-LIB `FloatingPoint` has exactly ONE NaN
+    /// value across many bit patterns. A bitwise comparison would leave two
+    /// NaN-valued arguments looking unequal, so congruence would not fire and
+    /// the results would stay unconstrained — a wrong `sat`. This is the same
+    /// judgment `blast_fp_to_bv` documents for FP→BV applications.
+    fn word_eq(
+        &mut self,
+        ctx: &Context,
+        sort: shinri_core::SortId,
+        x: &[BitLit],
+        y: &[BitLit],
+    ) -> BitLit {
+        if let Some((eb, sb)) = ctx.fp_widths(sort) {
+            return crate::blast::compare::core_eq(&mut self.b, x, y, eb, sb);
+        }
+        shinri_bv::blast::compare::eq(&mut self.b, x, y)
     }
 }
 
