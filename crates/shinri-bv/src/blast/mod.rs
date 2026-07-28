@@ -35,6 +35,8 @@ pub struct Blaster {
     drained: usize,
     /// Memoized blasted words: TermId -> LSB..MSB bit literals.
     pub(crate) cache: FxHashMap<TermId, Vec<BitLit>>,
+    /// Blasted uninterpreted applications, for Ackermann congruence (slice 44).
+    uf_apps: Vec<UfApp>,
 }
 
 impl Default for Blaster {
@@ -53,6 +55,18 @@ pub struct FpToBvApp {
     pub key: (bool, u32, u32, u32),
     pub rm: [BitLit; 5],
     pub operand: Vec<BitLit>,
+    pub result: Vec<BitLit>,
+}
+
+/// One blasted non-nullary uninterpreted application (slice 44). Recorded by
+/// the lowering driver so later applications of the SAME symbol can emit
+/// Ackermann congruence: an uninterpreted function's only property is
+/// functional consistency, so equal arguments must yield equal results.
+#[derive(Clone)]
+pub struct UfApp {
+    pub sym: shinri_core::SymbolId,
+    /// One blasted word per argument, in argument order.
+    pub args: Vec<Vec<BitLit>>,
     pub result: Vec<BitLit>,
 }
 
@@ -77,6 +91,35 @@ pub trait WordSink {
     fn fp2bv_apps(&mut self) -> &mut Vec<FpToBvApp> {
         unreachable!("pure BV lowering has no FP→BV conversions")
     }
+
+    /// Registry of blasted non-nullary uninterpreted applications, for
+    /// Ackermann congruence (slice 44).
+    ///
+    /// UNLIKE `fp2bv_apps`, this has NO `unreachable!` default: pure-BV
+    /// lowering is precisely where uninterpreted applications live, so every
+    /// sink must carry a real store. A defaulted `unreachable!` here would be
+    /// the slice-43 panic all over again.
+    fn uf_apps(&mut self) -> &mut Vec<UfApp>;
+
+    /// SMT-LIB **value** equality on two blasted words of `sort`.
+    ///
+    /// The default is bitwise, which is correct for every BV sort. A sink that
+    /// can see FP-sorted arguments must override it, because SMT-LIB
+    /// `FloatingPoint` has exactly ONE NaN value across many bit patterns, so
+    /// bitwise equality would UNDER-trigger congruence on NaN arguments and
+    /// leave results unconstrained where the semantics require them equal.
+    /// `core_eq` lives in `shinri-fp`, which depends on `shinri-bv` and not the
+    /// reverse — this hook is how the sort-aware comparison crosses the crate
+    /// boundary.
+    fn word_eq(
+        &mut self,
+        _ctx: &Context,
+        _sort: shinri_core::SortId,
+        x: &[BitLit],
+        y: &[BitLit],
+    ) -> BitLit {
+        crate::blast::compare::eq(self.blaster(), x, y)
+    }
 }
 
 impl Blaster {
@@ -87,6 +130,7 @@ impl Blaster {
             clauses: Vec::new(),
             drained: 0,
             cache: FxHashMap::default(),
+            uf_apps: Vec::new(),
         };
         let t = BitLit { var: 0, pos: true };
         b.add_clause(&[t]); // force var0 = true
@@ -245,6 +289,9 @@ impl WordSink for Blaster {
     fn blaster(&mut self) -> &mut Blaster {
         self
     }
+    fn uf_apps(&mut self) -> &mut Vec<UfApp> {
+        &mut self.uf_apps
+    }
 }
 
 /// BV word dispatch, generic over the sink. Assumes `t` is BV-sorted; callers
@@ -274,17 +321,75 @@ pub fn blast_bv_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
                 .collect()
         }
         TermNode::App {
-            op: Op::Uninterpreted(_),
+            op: Op::Uninterpreted(sym),
             args,
             sort,
         } => {
             let child_ids = ctx.children(args).to_vec();
-            debug_assert!(
-                child_ids.is_empty(),
-                "non-nullary uninterpreted BV fn out of scope"
-            );
             let width = ctx.bv_width(sort).expect("BV-sorted variable has BV sort");
-            (0..width).map(|_| sink.blaster().fresh()).collect()
+            if child_ids.is_empty() {
+                // A nullary symbol is hash-consed to ONE TermId, so there is
+                // exactly one word for it and nothing to make consistent.
+                // Unchanged from the original dispatch.
+                return (0..width).map(|_| sink.blaster().fresh()).collect();
+            }
+            // Blast the arguments FIRST. Step order is LOAD-BEARING: `f(f(x))`
+            // registers the inner application while this call lowers its own
+            // argument, and reading `prior` before that would silently drop the
+            // inner/outer pair. The failure mode is missing congruence — a wrong
+            // `sat` with no crash and no visible symptom.
+            let arg_words: Vec<Vec<BitLit>> =
+                child_ids.iter().map(|&k| sink.word(ctx, k)).collect();
+            let result: Vec<BitLit> = (0..width).map(|_| sink.blaster().fresh()).collect();
+            // Ackermann congruence against every prior application of the same
+            // symbol: (⋀ₖ argₖ equal) → (result equal). The IMPLICATION only —
+            // the converse would wrongly force distinct results for distinct
+            // arguments. O(k²) in the per-formula application count. Same clause
+            // shape as shinri_fp::blast_fp_to_bv.
+            let prior: Vec<UfApp> = sink
+                .uf_apps()
+                .iter()
+                .filter(|a| a.sym == sym)
+                .cloned()
+                .collect();
+            for pa in prior {
+                debug_assert_eq!(
+                    pa.args.len(),
+                    arg_words.len(),
+                    "same SymbolId at two arities — keying is wrong"
+                );
+                let mut cond = sink.blaster().one();
+                for (k, aw) in arg_words.iter().enumerate() {
+                    debug_assert_eq!(
+                        pa.args[k].len(),
+                        aw.len(),
+                        "same SymbolId, differing argument width"
+                    );
+                    let sort_k = ctx.sort_of(child_ids[k]);
+                    let e = sink.word_eq(ctx, sort_k, &pa.args[k], aw);
+                    cond = sink.blaster().and2(cond, e);
+                }
+                debug_assert_eq!(
+                    pa.result.len(),
+                    result.len(),
+                    "same SymbolId, differing result width"
+                );
+                let b = sink.blaster();
+                let ncond = b.not1(cond);
+                // Parallel-indexed result words, bit for bit.
+                for (&prior_bit, &new_bit) in pa.result.iter().zip(result.iter()) {
+                    let d = b.xor2(prior_bit, new_bit);
+                    let nd = b.not1(d);
+                    let imp = b.or2(ncond, nd);
+                    b.add_clause(&[imp]); // cond → (prior_bit ↔ new_bit)
+                }
+            }
+            sink.uf_apps().push(UfApp {
+                sym,
+                args: arg_words,
+                result: result.clone(),
+            });
+            result
         }
         TermNode::App {
             op: Op::Builtin(bv_op),

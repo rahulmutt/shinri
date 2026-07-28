@@ -15,7 +15,7 @@ pub mod round;
 pub mod unpack;
 
 use rustc_hash::FxHashMap;
-use shinri_bv::{BitLit, Blaster, WordSink};
+use shinri_bv::{BitLit, Blaster, UfApp, WordSink};
 use shinri_core::{ConstVal, Context, Op, TermId, TermNode};
 
 /// FP-side blaster: wraps a `shinri_bv::Blaster` (used purely as a gate/clause
@@ -26,6 +26,10 @@ pub struct FpBlaster {
     cache: FxHashMap<TermId, Vec<BitLit>>,
     var_bits: FxHashMap<TermId, Vec<BitLit>>,
     rm_cache: FxHashMap<TermId, [BitLit; 5]>,
+    /// Uninterpreted-application registry for Ackermann congruence (slice 44).
+    /// A real store, not a defaulted `unreachable!` — `WordSink::uf_apps` has
+    /// no default by design (see the trait docs).
+    uf_apps: Vec<UfApp>,
 }
 
 impl FpBlaster {
@@ -35,6 +39,7 @@ impl FpBlaster {
             cache: FxHashMap::default(),
             var_bits: FxHashMap::default(),
             rm_cache: FxHashMap::default(),
+            uf_apps: Vec::new(),
         }
     }
 
@@ -88,6 +93,9 @@ impl WordSink for FpBlaster {
     }
     fn rm_cache(&mut self) -> &mut FxHashMap<TermId, [BitLit; 5]> {
         &mut self.rm_cache
+    }
+    fn uf_apps(&mut self) -> &mut Vec<UfApp> {
+        &mut self.uf_apps
     }
 }
 

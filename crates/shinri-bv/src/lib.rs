@@ -3,7 +3,7 @@
 pub mod blast;
 pub mod model;
 pub mod rewrite;
-pub use blast::{blast_bv_atom, blast_bv_word, BitLit, Blaster, Cnf, FpToBvApp, WordSink};
+pub use blast::{blast_bv_atom, blast_bv_word, BitLit, Blaster, Cnf, FpToBvApp, UfApp, WordSink};
 pub use rewrite::rewrite;
 
 use rustc_hash::FxHashMap;
@@ -189,5 +189,162 @@ mod lower_tests {
         assert_eq!(lo.var_bits[&x].len(), 8);
         // The two atoms must have different literals (they compare x against different constants).
         assert_ne!(lo.atom_lit[&atom1], lo.atom_lit[&atom2]);
+    }
+
+    // ── Slice 44: uninterpreted-application congruence ───────────────────────
+
+    /// Clause count of `lower` on `(= x y)` for two nullary BV8 variables.
+    /// Measured 2026-07-27 on the pre-slice-44 arm; pinned so any future change
+    /// to the nullary/pure-BV encoding is loud.
+    const NULLARY_EQ_CLAUSES: usize = 57;
+
+    /// Slice 44: two applications of one symbol to terms the CNF forces equal
+    /// must have equal results. Encoded as: assert `x = y` and `f(x) != f(y)`;
+    /// the CNF must be UNSAT. We check it structurally here — the clause count
+    /// for the congruence must be non-zero — and end-to-end in qfufbv_e2e.
+    #[test]
+    fn congruence_clauses_are_emitted_for_two_applications() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let yf = ctx.declare_fun("y", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+        let fy = ctx.mk_app(Op::Uninterpreted(f), &[y]).unwrap();
+        let a1 = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fx, fy]).unwrap();
+
+        let with_two = lower(&mut ctx, &[a1]).cnf.clauses.len();
+
+        // A single application emits no congruence clauses at all.
+        let mut ctx2 = Context::new();
+        let s8b = ctx2.bv_sort(8);
+        let f2 = ctx2.declare_fun("f", &[s8b], s8b);
+        let xf2 = ctx2.declare_fun("x", &[], s8b);
+        let x2 = ctx2.mk_app(Op::Uninterpreted(xf2), &[]).unwrap();
+        let fx2 = ctx2.mk_app(Op::Uninterpreted(f2), &[x2]).unwrap();
+        let c = ctx2.mk_bv_const(8, shinri_num::Integer::from(0u64));
+        let a2 = ctx2.mk_app(Op::Builtin(BuiltinOp::Eq), &[fx2, c]).unwrap();
+        let with_one = lower(&mut ctx2, &[a2]).cnf.clauses.len();
+
+        assert!(
+            with_two > with_one,
+            "two applications of one symbol must emit congruence clauses \
+             (two={with_two}, one={with_one})"
+        );
+    }
+
+    /// The nullary arm is UNCHANGED: a nullary uninterpreted symbol is
+    /// hash-consed to one TermId, so there is one word and nothing to make
+    /// consistent. Pins that slice 44 adds no clauses to the pure-variable case.
+    #[test]
+    fn nullary_applications_emit_no_congruence_clauses() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let yf = ctx.declare_fun("y", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, y]).unwrap();
+        let lo = lower(&mut ctx, &[atom]);
+        // 8 bits of xnor-and chain + the pinned var0 clause; the exact number is
+        // whatever pre-slice-44 produced. Recorded here as an equality so any
+        // future change to the nullary path is loud.
+        assert_eq!(
+            lo.cnf.clauses.len(),
+            NULLARY_EQ_CLAUSES,
+            "slice 44 must not change the nullary/pure-BV encoding"
+        );
+    }
+
+    /// Solve `lower`'s CNF with each `(atom, polarity)` asserted as a unit
+    /// clause. Returns true iff SAT.
+    fn solve_atoms(ctx: &mut Context, atoms: &[(TermId, bool)]) -> bool {
+        use shinri_sat::{Lit, NoProof, NoTheory, SolveResult, Solver, SolverConfig, Var, Vmtf};
+
+        let ids: Vec<TermId> = atoms.iter().map(|&(t, _)| t).collect();
+        let lo = lower(ctx, &ids);
+        let mut s: Solver<NoTheory, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        for _ in 0..lo.cnf.num_vars {
+            s.new_var();
+        }
+        for clause in &lo.cnf.clauses {
+            let lits: Vec<Lit> = clause
+                .iter()
+                .map(|bl| Lit::new(Var::new(bl.var), bl.pos))
+                .collect();
+            s.add_clause(&lits);
+        }
+        for &(t, want) in atoms {
+            let bl = lo.atom_lit[&t];
+            s.add_clause(&[Lit::new(Var::new(bl.var), bl.pos == want)]);
+        }
+        s.solve() == SolveResult::Sat
+    }
+
+    /// Congruence is an IMPLICATION — `(args equal) → (results equal)` — never a
+    /// biconditional. All three shapes are pinned in one test because getting
+    /// the direction wrong flips exactly one of them:
+    ///   - `x = y ∧ f(x) ≠ f(y)` must be UNSAT (this is the slice-44 bug);
+    ///   - `x ≠ y ∧ f(x) ≠ f(y)` must stay SAT (no converse);
+    ///   - `x ≠ y ∧ f(x) = f(y)` must stay SAT (a function may agree on
+    ///     distinct arguments — an inverted encoding breaks this one).
+    #[test]
+    fn congruence_is_an_implication_not_a_biconditional() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let yf = ctx.declare_fun("y", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+        let fy = ctx.mk_app(Op::Uninterpreted(f), &[y]).unwrap();
+        let args_eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, y]).unwrap();
+        let res_eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fx, fy]).unwrap();
+
+        assert!(
+            !solve_atoms(&mut ctx, &[(args_eq, true), (res_eq, false)]),
+            "x = y AND f(x) != f(y) must be UNSAT — this is the congruence"
+        );
+        assert!(
+            solve_atoms(&mut ctx, &[(args_eq, false), (res_eq, false)]),
+            "x != y AND f(x) != f(y) must stay SAT — no converse implication"
+        );
+        assert!(
+            solve_atoms(&mut ctx, &[(args_eq, false), (res_eq, true)]),
+            "x != y AND f(x) = f(y) must stay SAT — a function may agree on \
+             distinct arguments"
+        );
+    }
+
+    /// Step order: the arguments must be blasted BEFORE the registry is read,
+    /// or `f(f(x))` never pairs the inner application with the outer one. With
+    /// `x = f(x)` asserted, congruence forces `f(x) = f(f(x))`, so
+    /// `f(f(x)) != f(x)` is UNSAT. Reading `prior` first leaves the pair
+    /// unconstrained and this comes back SAT.
+    ///
+    /// The atom carrying `f(f(x))` is asserted FIRST and puts it in operand
+    /// position 0, so the outer application is blasted while the registry is
+    /// still empty — the inner one is registered only by the outer's own
+    /// argument recursion. That is precisely the ordering under test.
+    #[test]
+    fn nested_application_congruence() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+        let ffx = ctx.mk_app(Op::Uninterpreted(f), &[fx]).unwrap();
+        let res_eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[ffx, fx]).unwrap();
+        let args_eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, fx]).unwrap();
+
+        assert!(
+            !solve_atoms(&mut ctx, &[(res_eq, false), (args_eq, true)]),
+            "x = f(x) AND f(f(x)) != f(x) must be UNSAT — the inner application \
+             must be registered before the outer one reads the registry"
+        );
     }
 }
