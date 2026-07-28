@@ -171,6 +171,15 @@ pub fn collect_bv_atoms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
                 // tripwire that vanishes in the shipping profile; THIS
                 // exclusion is the guard.
                 //
+                // As of slice 45 that array-path hazard is DEFENCE IN DEPTH,
+                // not a live bug: `abv_stage::fenced`'s `walk_fence`
+                // (`abv_stage.rs:138-144`) exempts nullary Bool applications
+                // and fences every OTHER Bool-sorted application, and it runs
+                // at `lib.rs:903` before `RealBridge::new` collects anything —
+                // so no Bool-result application reaches that driver yet. It
+                // goes live when Task 5 lifts that fence, which is precisely
+                // when this exclusion must already be correct.
+                //
                 // Excluding it costs nothing: a bare Bool constant keeps its
                 // existing Tseitin path (`tseitin.rs`'s
                 // `Op::Uninterpreted(_) => self.atom(t)`), and

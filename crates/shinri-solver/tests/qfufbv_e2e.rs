@@ -505,3 +505,66 @@ fn int_argument_to_a_predicate_still_fences() {
         "got {out:?}"
     );
 }
+
+/// Spec §3.2(a): `Lowerer::atom` dispatches on the FIRST OPERAND's sort
+/// (crates/shinri-fp/src/lower.rs:117), so a predicate over an FP argument
+/// would route to `blast_fp_atom`, which has no uninterpreted-application arm.
+/// That is a PANIC, not an `unknown` — the slice-43 shape. This test is the
+/// one that catches it.
+///
+/// IGNORED BY TASK 3, DELIBERATELY. Task 3 widened `collect_bv_atoms`, which
+/// is what makes this shape reach the mis-dispatch: pre-slice it fenced to a
+/// sound `unknown`, and at Task 3's HEAD it panics at
+/// `crates/shinri-fp/src/lib.rs:432` ("blast_atom: FP atom Uninterpreted(..)
+/// out of slice-1 scope", exit 101). The blocker is `Lowerer::atom`'s
+/// first-operand-sort dispatch and the fix is Task 4's reorder — matching
+/// `Op::Uninterpreted` BEFORE the operand-sort test. This lives here as a
+/// tripwire so the gap is enforced by the suite rather than only by a report;
+/// Task 4's Step 1 is to delete the `#[ignore]` line below (and this
+/// paragraph), not to add a second copy of the test.
+#[ignore = "blocked on Task 4 dispatch reorder"]
+#[test]
+fn fp_argument_predicate_congruence() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun p ((_ FloatingPoint 8 24)) Bool)\
+         (declare-fun a () (_ FloatingPoint 8 24))\
+         (declare-fun b () (_ FloatingPoint 8 24))\
+         (assert (= a b))(assert (p a))(assert (not (p b)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// Slice 45 widened `collect_bv_atoms`, which changes the INPUT SET of
+/// `fp_stage::bridge_admissible` (`fp_stage.rs:437-455`): it requires every
+/// atom outside `fp_atoms ∪ bv_atoms` to be a pure-LRA-Real atom, so moving
+/// Bool-result applications INTO `bv_atoms` lets it return `true` where it
+/// returned `false`. That matters because `bridge` both suppresses the
+/// crossing-conversion `Unknown` (`lib.rs:999-1001`) and SKIPS
+/// `has_non_bvfp_theory_atom` entirely (`lib.rs:1058`, `if !bridge && …`) —
+/// a fence-skipping gate whose input set this slice changed.
+///
+/// This probe pins that the newly-admitted path is sound. It also proves the
+/// gate actually flipped rather than merely deciding: if `bridge` were false,
+/// `has_non_bvfp_theory_atom` would run and fence on the two Real atoms
+/// (neither is an FP atom nor a BV atom), returning `unknown` — which is
+/// exactly what this query returns on pre-slice `bv_stage.rs`. z3 4.16.0 and
+/// cvc5 1.3.4 both say `unsat`.
+#[test]
+fn a_predicate_alongside_the_real_bridge_decides() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun x () (_ BitVec 8))(declare-fun y () (_ BitVec 8))\
+         (declare-fun a () Float32)(declare-fun r () Real)\
+         (assert (= x y))(assert (p x))(assert (not (p y)))\
+         (assert (= r (fp.to_real a)))(assert (> r 0.0))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
