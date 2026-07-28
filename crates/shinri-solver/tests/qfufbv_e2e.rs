@@ -43,3 +43,30 @@ fn int_argument_to_a_bv_uf_fences_to_unknown() {
         "got {out:?}"
     );
 }
+
+/// Fence 2 (spec §4): an encoding past the calibrated budget fences to a SOUND
+/// `unknown` rather than hanging. Generated rather than written out, because
+/// the application count needed to exceed the budget is large by construction.
+#[test]
+fn encoding_past_the_budget_fences_to_unknown() {
+    let k = 1500; // pairs(1500) * 96 = 1_124_250 * 96 = 107_928_000, 11.6x
+                  // the calibrated UF_CONGRUENCE_BUDGET (9_271_680, k=440 --
+                  // see bv_stage.rs) -- still far past.
+    let mut src = String::from(
+        "(set-logic QF_UFBV)\
+         (declare-fun g ((_ BitVec 32) (_ BitVec 32)) (_ BitVec 32))",
+    );
+    for i in 0..k {
+        src.push_str(&format!("(declare-fun v{i} () (_ BitVec 32))"));
+    }
+    for i in 0..k {
+        src.push_str(&format!("(assert (= (g v{i} v{i}) #x00000000))"));
+    }
+    src.push_str("(check-sat)");
+    let out = run_script(&src);
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unknown"),
+        "got {out:?}"
+    );
+}

@@ -910,6 +910,13 @@ impl Solver {
             if !crate::bv_stage::uf_args_supported(&self.ctx, &assertions, false) {
                 return SolveOutcome::Unknown;
             }
+            // Fence 2 (slice 44 §4). `abv_stage` does its own atom collection
+            // (see the Fence-1 comment above), so pass `&assertions` here too.
+            if crate::bv_stage::uf_congruence_cost(&self.ctx, &assertions)
+                > crate::bv_stage::UF_CONGRUENCE_BUDGET
+            {
+                return SolveOutcome::Unknown;
+            }
             let assertions_owned = assertions.clone();
             // Harvest the internal eliminated-ite symbols so the ABV stage can
             // return their BV values (item 5, slice 7).
@@ -1007,6 +1014,14 @@ impl Solver {
             if !crate::bv_stage::uf_args_supported(&self.ctx, &bv_atoms, false) {
                 return SolveOutcome::Unknown;
             }
+            // Fence 2 (slice 44 §4). The Ackermann congruence encoding is
+            // quadratic in application count per symbol; past the calibrated
+            // budget, fence to a sound Unknown rather than hanging.
+            if crate::bv_stage::uf_congruence_cost(&self.ctx, &bv_atoms)
+                > crate::bv_stage::UF_CONGRUENCE_BUDGET
+            {
+                return SolveOutcome::Unknown;
+            }
             Some(shinri_bv::lower(&mut self.ctx, &bv_atoms))
         } else {
             None
@@ -1069,6 +1084,12 @@ impl Solver {
             // word_eq compares FP words with core_eq.
             let uf_atoms: Vec<TermId> = fp_atoms.iter().chain(bv_atoms.iter()).copied().collect();
             if !crate::bv_stage::uf_args_supported(&self.ctx, &uf_atoms, true) {
+                return SolveOutcome::Unknown;
+            }
+            // Fence 2 (slice 44 §4), same budget as the pure-BV path above.
+            if crate::bv_stage::uf_congruence_cost(&self.ctx, &uf_atoms)
+                > crate::bv_stage::UF_CONGRUENCE_BUDGET
+            {
                 return SolveOutcome::Unknown;
             }
             Some(shinri_fp::lower_mixed(&mut self.ctx, &fp_atoms, &bv_atoms))
