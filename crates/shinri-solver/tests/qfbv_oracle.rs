@@ -102,8 +102,10 @@ fn gen_instance(
     z_vars: &[easy_smt::SExpr],
     uf1: shinri_core::SymbolId,
     uf2: shinri_core::SymbolId,
+    pred1: shinri_core::SymbolId,
+    pred2: shinri_core::SymbolId,
     dump: &mut String,
-) {
+) -> bool {
     // ── Build a term pool ────────────────────────────────────────────────────
     // Start with variables, then add a few computed terms.
     let mut pool: Vec<BvPair> = vars_s
@@ -111,6 +113,12 @@ fn gen_instance(
         .zip(z_vars.iter())
         .map(|(&s_t, &z_t)| BvPair { s: s_t, z: z_t })
         .collect();
+
+    // slice 45: did this instance emit a Bool-result predicate application?
+    // The decidedness assertion in the driver is scoped to exactly these
+    // instances, so a healthy overall decided rate cannot mask a predicate
+    // family that never decides.
+    let mut used_pred = false;
 
     // Add a small number of random BV terms to the pool.
     let n_extra = 2 + rng.below(4) as usize; // 2..=5 extra computed terms
@@ -314,7 +322,8 @@ fn gen_instance(
     let n_atoms = 2 + rng.below(4) as usize; // 2..=5 atoms
 
     for _ in 0..n_atoms {
-        let kind = rng.below(11); // 0-1 eq/ne, 2-9 comparisons, 10 = literal comparison
+        let kind = rng.below(13); // 0-1 eq/ne, 2-9 comparisons, 10 literal,
+                                  // 11-12 slice-45 Bool-result predicates
         let i = rng.below(pool.len() as u64) as usize;
         let j = rng.below(pool.len() as u64) as usize;
 
@@ -381,13 +390,28 @@ fn gen_instance(
                 (sa, za, format!("(bvsge t{i} t{j})"))
             }
             // Compare a term against a literal value (exercises constant folding path)
-            _ => {
+            10 => {
                 let lit_val = rng.below(1u64 << width.min(16));
                 let s_lit = s.bv_numeral(Integer::from(lit_val as i128), width);
                 let z_lit = z_bv_lit(ctx, width, lit_val);
                 let sa = s.eq(pool[i].s, s_lit);
                 let za = ctx.eq(pool[i].z, z_lit);
                 (sa, za, format!("(= t{i} {})", bv_lit_smt2(width, lit_val)))
+            }
+            // slice 45: (p t_i) — a 1-ary Bool-result uninterpreted
+            // application. This is the atom the pre-slice fence rejects.
+            11 => {
+                used_pred = true;
+                let sa = s.app(Op::Uninterpreted(pred1), &[pool[i].s]);
+                let za = ctx.list(vec![ctx.atom("p"), pool[i].z]);
+                (sa, za, format!("(p t{i})"))
+            }
+            // slice 45: (q t_i t_j) — a 2-ary Bool-result application.
+            _ => {
+                used_pred = true;
+                let sa = s.app(Op::Uninterpreted(pred2), &[pool[i].s, pool[j].s]);
+                let za = ctx.list(vec![ctx.atom("q"), pool[i].z, pool[j].z]);
+                (sa, za, format!("(q t{i} t{j})"))
             }
         };
 
@@ -398,6 +422,8 @@ fn gen_instance(
             var_names.join(",")
         ));
     }
+
+    used_pred
 }
 
 #[test]
@@ -407,6 +433,10 @@ fn differential_qf_bv_small() {
     let mut n_sat = 0usize;
     let mut n_unsat = 0usize;
     let mut n_unknown = 0usize;
+
+    // slice 45: decidedness of the Bool-result predicate family.
+    let mut pred_total = 0usize;
+    let mut pred_decided = 0usize;
 
     // We keep a separate counter for each width to ensure all widths are exercised.
     let mut width_counts = [0usize; 3]; // [w4, w8, w16]
@@ -468,16 +498,39 @@ fn differential_qf_bv_small() {
              \n(declare-fun g ((_ BitVec {width}) (_ BitVec {width})) (_ BitVec {width}))"
         ));
 
+        // slice 45: Bool-result uninterpreted predicates. Same small-pool
+        // rationale as f/g above — two symbols over a shared term pool is what
+        // makes a congruence violation reachable. `bool_sort` is a Solver
+        // accessor (crates/shinri-solver/src/lib.rs:277), not a mint.
+        let bool_sort = s.bool_sort();
+        let pred1_s = s.declare_fun("p", &[bv_sort], bool_sort);
+        let pred2_s = s.declare_fun("q", &[bv_sort, bv_sort], bool_sort);
+        let z_bool = ctx.atom("Bool");
+        ctx.declare_fun("p", vec![bv_type_atom], z_bool).unwrap();
+        ctx.declare_fun("q", vec![bv_type_atom, bv_type_atom], z_bool)
+            .unwrap();
+        dump.push_str(&format!(
+            "\n(declare-fun p ((_ BitVec {width})) Bool)\
+             \n(declare-fun q ((_ BitVec {width}) (_ BitVec {width})) Bool)"
+        ));
+
         // ── Generate random formula ─────────────────────────────────────────
-        gen_instance(
-            &mut rng, &mut s, &mut ctx, width, &var_names, &vars_s, &z_vars, uf1_s, uf2_s,
-            &mut dump,
+        let used_pred = gen_instance(
+            &mut rng, &mut s, &mut ctx, width, &var_names, &vars_s, &z_vars, uf1_s, uf2_s, pred1_s,
+            pred2_s, &mut dump,
         );
 
         dump.push_str("\n(check-sat)");
 
         let ours = s.check_sat();
         let theirs = ctx.check().unwrap();
+
+        if used_pred {
+            pred_total += 1;
+            if ours != SolveOutcome::Unknown {
+                pred_decided += 1;
+            }
+        }
 
         match (ours, theirs) {
             (SolveOutcome::Unknown, _) => {
@@ -522,6 +575,30 @@ fn differential_qf_bv_small() {
     assert!(
         n_unsat > 0,
         "generator produced zero UNSAT instances — generator or blaster is broken"
+    );
+
+    // ── slice 45: the family-scoped decidedness gate ─────────────────────────
+    //
+    // THIS is the assertion that fails on pre-slice main. The zero-disagreement
+    // panic above cannot: pre-slice every predicate instance is Unknown, and
+    // Unknown is a skip, so a generator extension ALONE would be green on the
+    // unfixed tree and would prove nothing.
+    //
+    // `pred_total > 0` is not redundant with the ratio check: without it an
+    // empty family passes vacuously (0 > 0/2 is false, but a generator change
+    // that stopped emitting predicates entirely would be caught only by this
+    // line). Same class as a 0-test nextest run reading as green.
+    assert!(
+        pred_total > 0,
+        "generator emitted zero Bool-result predicate instances — the slice-45 \
+         family is not being exercised at all"
+    );
+    assert!(
+        pred_decided > pred_total / 2,
+        "Bool-result predicate family decided {pred_decided}/{pred_total} — \
+         more than half must decide. Pre-slice this is 0/N by construction \
+         (the bv_stage foreign-theory fence); post-slice a low rate means the \
+         collection widening or a fence is rejecting instances it should admit"
     );
 
     // The TEETH check: log whether we had enough non-unknown runs.

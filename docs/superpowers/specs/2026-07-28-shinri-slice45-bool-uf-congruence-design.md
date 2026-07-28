@@ -442,6 +442,34 @@ reproduce it.
 
 - 8.1 — T1: the pre-slice generator failures (three, one per oracle), with the
   measured decided fraction of 0%.
+
+  **`qfbv_oracle.rs` / `differential_qf_bv_small`** — measured at commit
+  `e1baa3bb` (pre-fix tree: `slice45-bool-uf-congruence` branch tip before
+  this task's commit), debug profile (nextest default), via:
+
+  ```
+  cargo nextest run -p shinri-solver --features oracle -E 'test(differential_qf_bv_small)' --no-capture
+  ```
+
+  Discovered test count: 1 (confirmed non-zero — not a 0-test skip). Result:
+  **FAIL**, on the family-scoped decidedness assertion, exactly as predicted
+  by the task brief (not on the `pred_total > 0` line). Verbatim panic:
+
+  ```
+  thread 'differential_qf_bv_small' (1686222) panicked at crates/shinri-solver/tests/qfbv_oracle.rs:596:5:
+  Bool-result predicate family decided 0/89 — more than half must decide. Pre-slice this is 0/N by construction (the bv_stage foreign-theory fence); post-slice a low rate means the collection widening or a fence is rejecting instances it should admit
+  ```
+
+  `pred_decided`/`pred_total` = **0/89** (out of 200 total generator
+  iterations; 89 of them happened to emit at least one Bool-result predicate
+  application). Run summary: `sat=78 unsat=33 unknown=89`, width breakdown
+  `w4=68 w8=60 w16=72`. The zero-disagreement soundness check never fires —
+  every predicate-bearing instance is `Unknown` pre-slice (the `bv_stage`
+  foreign-theory fence rejects the new `p`/`q` uninterpreted-Bool-result
+  applications), which is exactly why a plain differential extension alone
+  would have been green: `Unknown` is a harness skip, not a failure. The
+  `fp_oracle.rs` and `qfabv_oracle.rs` pre-slice measurements are recorded by
+  Tasks 4 and 5, which mirror this same shape.
 - 8.2 — T1: the post-slice decided fractions and the thresholds chosen.
 - 8.3 — T5: `get-value` and `get-model` behaviour on a Bool UF app.
 - 8.4 — §5: the Fence-1 blastability audit's conclusion and its evidence.
