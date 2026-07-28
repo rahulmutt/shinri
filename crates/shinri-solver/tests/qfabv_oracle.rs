@@ -94,8 +94,20 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
         .map(|k| s.declare_const(&format!("e{k}"), bv8))
         .collect();
 
+    // slice 44: a small uninterpreted symbol pool (1-ary f, 2-ary g) over the
+    // BV8 sort, mirroring qfbv_oracle.rs's shape. Deliberately small — kept
+    // to two symbols applied over the 3-element idx pool — so applications
+    // collide on the same symbol across the corpus, which is what makes an
+    // Ackermann-congruence violation reachable (a large pool spreads
+    // applications thin and the generator stops finding the bug).
+    let uf1 = s.declare_fun("f", &[bv8], bv8);
+    let uf2 = s.declare_fun("g", &[bv8, bv8], bv8);
+
     // ── dump header ─────────────────────────────────────────────────────────
-    let mut dump = String::from("(set-logic QF_ABV)");
+    // set-logic QF_AUFBV (not QF_ABV): z3 rejects declare-fun with a nonzero
+    // arity under QF_ABV ("logic does not support uninterpreted functions"),
+    // confirmed by direct z3 -smt2 -in probe.
+    let mut dump = String::from("(set-logic QF_AUFBV)");
     for k in 0..N_ARR {
         dump.push_str(&format!(
             "\n(declare-const a{k} (Array (_ BitVec {width}) (_ BitVec {width})))"
@@ -107,6 +119,10 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
     for k in 0..N_ELT {
         dump.push_str(&format!("\n(declare-const e{k} (_ BitVec {width}))"));
     }
+    dump.push_str(&format!(
+        "\n(declare-fun f ((_ BitVec {width})) (_ BitVec {width}))\
+         \n(declare-fun g ((_ BitVec {width}) (_ BitVec {width})) (_ BitVec {width}))"
+    ));
 
     // ── Atom 0: store-select witness ─────────────────────────────────────────
     {
@@ -230,6 +246,50 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
             let dist = s.app(Op::Builtin(BuiltinOp::Distinct), &[arrays[ax], arrays[ay]]);
             s.assert(dist);
             dump.push_str(&format!("\n(assert (distinct a{ax} a{ay}))"));
+        }
+    }
+
+    // ── Atom 4: uninterpreted-application (Ackermann) congruence ─────────────
+    // slice 44: the fenced UF/BV congruence bug is only reachable if the
+    // generator ever emits uninterpreted applications at all — the missing
+    // congruence arm was silently unreachable by this suite before this
+    // change. `kind` selects among the 1-ary and 2-ary symbol, `=`/`distinct`
+    // — mirrors qfbv_oracle.rs's op-selector widening.
+    {
+        let p = rng.below(N_IDX as u64) as usize;
+        let q = rng.below(N_IDX as u64) as usize;
+        let kind = rng.below(4);
+        match kind {
+            0 => {
+                let fp = s.app(Op::Uninterpreted(uf1), &[idxs[p]]);
+                let fq = s.app(Op::Uninterpreted(uf1), &[idxs[q]]);
+                let atom = s.eq(fp, fq);
+                s.assert(atom);
+                dump.push_str(&format!("\n(assert (= (f i{p}) (f i{q})))"));
+            }
+            1 => {
+                let fp = s.app(Op::Uninterpreted(uf1), &[idxs[p]]);
+                let fq = s.app(Op::Uninterpreted(uf1), &[idxs[q]]);
+                let atom = s.app(Op::Builtin(BuiltinOp::Distinct), &[fp, fq]);
+                s.assert(atom);
+                dump.push_str(&format!("\n(assert (distinct (f i{p}) (f i{q})))"));
+            }
+            2 => {
+                let gpq = s.app(Op::Uninterpreted(uf2), &[idxs[p], idxs[q]]);
+                let gqp = s.app(Op::Uninterpreted(uf2), &[idxs[q], idxs[p]]);
+                let atom = s.eq(gpq, gqp);
+                s.assert(atom);
+                dump.push_str(&format!("\n(assert (= (g i{p} i{q}) (g i{q} i{p})))"));
+            }
+            _ => {
+                let gpq = s.app(Op::Uninterpreted(uf2), &[idxs[p], idxs[q]]);
+                let gqp = s.app(Op::Uninterpreted(uf2), &[idxs[q], idxs[p]]);
+                let atom = s.app(Op::Builtin(BuiltinOp::Distinct), &[gpq, gqp]);
+                s.assert(atom);
+                dump.push_str(&format!(
+                    "\n(assert (distinct (g i{p} i{q}) (g i{q} i{p})))"
+                ));
+            }
         }
     }
 

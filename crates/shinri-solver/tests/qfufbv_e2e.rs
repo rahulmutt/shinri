@@ -70,3 +70,37 @@ fn encoding_past_the_budget_fences_to_unknown() {
         "got {out:?}"
     );
 }
+
+/// The FP/mixed path shares blast_bv_word, so it had the identical defect.
+/// MEASURED pre-slice: shinri `sat`, z3 `unsat`.
+#[test]
+fn fp_argument_congruence_on_the_mixed_path() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun k (Float32) (_ BitVec 8))\
+         (declare-fun f () Float32)(declare-fun g () Float32)\
+         (assert (= f g))(assert (distinct (k f) (k g)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// core_eq, not bitwise: SMT-LIB Float has ONE NaN value across many bit
+/// patterns, so two NaN arguments must trigger congruence. A bitwise word_eq
+/// leaves this `sat`.
+#[test]
+fn nan_arguments_trigger_congruence() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun k (Float32) (_ BitVec 8))\
+         (declare-fun f () Float32)(declare-fun g () Float32)\
+         (assert (fp.isNaN f))(assert (fp.isNaN g))\
+         (assert (distinct (k f) (k g)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}

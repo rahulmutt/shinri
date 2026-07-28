@@ -87,6 +87,25 @@ impl WordSink for Lowerer {
     fn uf_apps(&mut self) -> &mut Vec<UfApp> {
         &mut self.uf_apps
     }
+
+    /// Sort-aware value equality. BV words compare bitwise; FP words compare
+    /// with `core_eq`, because SMT-LIB `FloatingPoint` has exactly ONE NaN
+    /// value across many bit patterns. A bitwise comparison would leave two
+    /// NaN-valued arguments looking unequal, so congruence would not fire and
+    /// the results would stay unconstrained — a wrong `sat`. This is the same
+    /// judgment `blast_fp_to_bv` documents for FP→BV applications.
+    fn word_eq(
+        &mut self,
+        ctx: &Context,
+        sort: shinri_core::SortId,
+        x: &[BitLit],
+        y: &[BitLit],
+    ) -> BitLit {
+        if let Some((eb, sb)) = ctx.fp_widths(sort) {
+            return crate::blast::compare::core_eq(&mut self.b, x, y, eb, sb);
+        }
+        shinri_bv::blast::compare::eq(&mut self.b, x, y)
+    }
 }
 
 impl Lowerer {
