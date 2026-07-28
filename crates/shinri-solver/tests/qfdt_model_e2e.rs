@@ -383,9 +383,14 @@ fn model_names_only_declared_symbols() {
 /// slice 44 Task 2's fence existed, behaviour differed per build profile:
 ///
 /// * RELEASE (no debug assertions): `blast_bv_word`'s `Op::Uninterpreted` arm
-///   minted FRESH unconstrained bits for `(w v)` with no congruence, decided
-///   `sat`, and the model rendered `v`'s field as the placeholder `?` (the
-///   final review's finding 1 fix, itself now moot for this query).
+///   minted FRESH unconstrained bits for `(w v)` with no congruence and
+///   decided `sat` — the CORRECT verdict for this query, but with an
+///   INCOMPLETE model: the placeholder covered the WHOLE symbol,
+///   `((define-fun v () W ?))`, not just the field (the final review's
+///   finding 1 fix, itself now moot for this query). Missing congruence
+///   produces a wrong `sat` on queries with two-or-more applications of the
+///   same uninterpreted function; this single-application query was never
+///   one of those.
 /// * DEV/TEST (debug assertions ON): the same code path hit
 ///   `debug_assert!(child_ids.is_empty(), "non-nullary uninterpreted BV fn
 ///   out of scope")` in `crates/shinri-bv/src/blast/mod.rs:282` and PANICKED
@@ -396,14 +401,18 @@ fn model_names_only_declared_symbols() {
 /// has no blastable word, so the query fences to a SOUND `unknown`. This is
 /// the spec §2.1 named decided → unknown exception (an uninterpreted-sorted
 /// argument to a BV-result uninterpreted function), and it also means the
-/// debug-mode panic and the release-mode unsound `sat` are BOTH gone — the
-/// debug_assert! is no longer reachable from this query at all.
+/// debug-mode panic and the release-mode incomplete-model `sat` are BOTH
+/// gone — the debug_assert! is no longer reachable from this query at all.
 const BV_FIELD: &str = "(set-logic QF_UFDTBV)(declare-datatype W ((mk (w (_ BitVec 8)))))\
                         (declare-fun v () W)(assert (= (w v) #x2a))(check-sat)(get-model)";
 
 /// MEASURED (slice 44 Task 2): both build profiles now agree — the fence
 /// fires before the bit-blaster is ever invoked, so there is no longer a
-/// debug/release split to pin separately.
+/// debug/release split to pin separately. `get-model` after `unknown` prints
+/// the honest empty answer `()` (`format_model`'s `last_outcome != Sat`
+/// guard, `lib.rs`) — pinned here so a regression cannot drift back to a
+/// fabricated value (e.g. a zero-filled `(mk #b00000000)`) that would
+/// CONTRADICT the asserted `(= (w v) #x2a)`.
 #[test]
 fn fenced_bv_field_is_unknown() {
     let out = run_script(BV_FIELD);
@@ -412,6 +421,7 @@ fn fenced_bv_field_is_unknown() {
         Some("unknown"),
         "got {out:?}"
     );
+    assert_eq!(out.get(1).map(|s| s.as_str()), Some("()"), "got {out:?}");
 }
 
 /// `get-model` omits functions of arity > 0 (spec §5): a function graph needs

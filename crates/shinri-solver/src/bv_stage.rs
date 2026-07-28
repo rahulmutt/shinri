@@ -411,4 +411,84 @@ mod tests {
         let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, c]).unwrap();
         assert!(uf_args_supported(&ctx, &[atom], false));
     }
+
+    /// An FP-sorted argument to a BV-result uninterpreted application
+    /// qualifies ONLY when `allow_fp_args` — i.e. only on the FP/mixed path,
+    /// where a `Lowerer` exists with a `core_eq`-based `word_eq`. This is the
+    /// entire reason the parameter exists; without this pair, inverting the
+    /// guard (`!allow_fp_args && ...`) or dropping it (admitting FP args
+    /// unconditionally, which would crash the ABV path's bare `Blaster`)
+    /// would both pass silently.
+    #[test]
+    fn uf_args_supported_admits_fp_arguments_only_when_allowed() {
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let s8 = ctx.bv_sort(8);
+        let g = ctx.declare_fun("g", &[f32], s8);
+        let nf = ctx.declare_fun("n", &[], f32);
+        let n = ctx.mk_app(Op::Uninterpreted(nf), &[]).unwrap();
+        let gn = ctx.mk_app(Op::Uninterpreted(g), &[n]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[gn, c]).unwrap();
+        assert!(
+            uf_args_supported(&ctx, &[atom], true),
+            "an FP-sorted argument qualifies when allow_fp_args is true"
+        );
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "an FP-sorted argument must NOT qualify when allow_fp_args is false \
+             (no Lowerer sink exists to compare FP words, e.g. on the ABV path)"
+        );
+    }
+
+    /// A RoundingMode-sorted argument has no blastable word in EITHER sink —
+    /// neither a `Blaster` nor a `Lowerer` can turn it into a word — so it
+    /// must fence even when `allow_fp_args` is true.
+    #[test]
+    fn uf_args_supported_rejects_a_roundingmode_argument_even_when_fp_allowed() {
+        let mut ctx = Context::new();
+        let rm_s = ctx.rm_sort();
+        let s8 = ctx.bv_sort(8);
+        let k = ctx.declare_fun("k", &[rm_s], s8);
+        let r = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let kr = ctx.mk_app(Op::Uninterpreted(k), &[r]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[kr, c]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[atom], true),
+            "a RoundingMode-sorted argument has no blastable word in any sink — must fence"
+        );
+    }
+
+    /// The walk must not stop at the first uninterpreted application whose
+    /// OWN arguments check out — it must continue past a passing node to
+    /// catch an unwordable argument further down. `f : BV8 -> BV8` applied to
+    /// `g(n)` (`g : Int -> BV8`) passes `f`'s own check (its argument `g(n)`
+    /// is BV-sorted) but must still be rejected because `g`'s argument `n` is
+    /// Int-sorted. A "return as soon as this node's own args check out"
+    /// regression would pass this atom.
+    ///
+    /// Also folds in the `seen`-memo case: `gn` (`g(n)`) is shared as BOTH
+    /// operands of the outer equality, so the walk visits it twice — the memo
+    /// must not let the second, already-`seen` visit mask the `false` the
+    /// first visit already found.
+    #[test]
+    fn uf_args_supported_rejects_an_unwordable_argument_below_a_passing_application() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let int_s = ctx.int_sort();
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let g = ctx.declare_fun("g", &[int_s], s8);
+        let nf = ctx.declare_fun("n", &[], int_s);
+        let n = ctx.mk_app(Op::Uninterpreted(nf), &[]).unwrap();
+        let gn = ctx.mk_app(Op::Uninterpreted(g), &[n]).unwrap();
+        let fgn = ctx.mk_app(Op::Uninterpreted(f), &[gn]).unwrap();
+        // `gn` shared on both sides of the Eq exercises the `seen` memo.
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fgn, gn]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "f's own argument (g(n)) is BV-sorted and passes, but the walk must \
+             continue into g(n) and catch g's Int-sorted argument n underneath"
+        );
+    }
 }
