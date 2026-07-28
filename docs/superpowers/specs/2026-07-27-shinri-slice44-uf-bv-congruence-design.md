@@ -474,5 +474,6 @@ real    3m40.100s
 Well inside the 10–15 min (600–900 s) blocking PR-tier budget (CI hard cap
 20 min). `nullary_applications_emit_no_congruence_clauses`
 (`crates/shinri-bv/src/lib.rs`) still passes at its pre-slice constant,
-`NULLARY_EQ_CLAUSES = 57`, confirming the nullary arm's CNF output is
-byte-for-byte unchanged by this slice.
+`NULLARY_EQ_CLAUSES = 57`, confirming the nullary arm's CNF **clause count** is
+unchanged by this slice. (The test asserts a count, not clause identity, so it
+does not establish that the CNF is byte-for-byte identical.)

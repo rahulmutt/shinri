@@ -1082,6 +1082,15 @@ impl Solver {
             }
             // Fence 1 (slice 44 §4). `allow_fp_args` is true here: the Lowerer's
             // word_eq compares FP words with core_eq.
+            //
+            // The two atom lists are joined into ONE call DELIBERATELY: one
+            // walk, one `seen` memo, so a subterm reachable from both an FP
+            // atom and a BV atom is validated once instead of once per call.
+            // Splitting this into two calls would give the SAME verdict (a
+            // `false` is the return value of every enclosing `.all()`, so an
+            // already-`seen` node returning `true` can never mask one) but
+            // re-walks the shared subgraph — and invites passing a different
+            // `allow_fp_args` to each, which would fence valid queries.
             let uf_atoms: Vec<TermId> = fp_atoms.iter().chain(bv_atoms.iter()).copied().collect();
             if !crate::bv_stage::uf_args_supported(&self.ctx, &uf_atoms, true) {
                 return SolveOutcome::Unknown;

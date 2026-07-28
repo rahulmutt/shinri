@@ -287,3 +287,93 @@ fn argument_variables_now_get_a_model_value() {
         out[1]
     );
 }
+
+// ---------------------------------------------------------------------------
+// Redeclaration: one `SymbolId`, two different functions.
+//
+// `Context::declare_fun` interns by NAME and OVERWRITES `fun_sigs`, and
+// `Command::DeclareFun` accepts a redeclaration silently, so applications built
+// before and after a redeclaration are distinct `TermId`s carrying the SAME
+// `Op::Uninterpreted(sym)` at different arities / argument sorts / widths. No
+// `push`/`pop` is involved — both live in one assertion list in one
+// `check_sat`.
+//
+// Congruence must NOT relate them: they are different functions. The blaster's
+// pairing predicate (`shape_compatible`) is what keeps them apart; skipping an
+// incompatible prior is sound because congruence is an ADDED constraint, so
+// omitting it can only admit more models.
+//
+// Every verdict below was CONFIRMED against z3 4.16.0. Each of these four
+// returned a wrong `unsat` (or panicked) before the shape-total filter landed.
+// ---------------------------------------------------------------------------
+
+/// Same arity, different widths, NARROW-FIRST. The 8-bit application is
+/// recorded first; the 16-bit one then pairs with it. `compare::eq` loops
+/// `0..x.len()` over the 8-bit prior word, so it compares it against the LOW 8
+/// bits of the 16-bit argument, `cond` blasts true, and the result `zip`
+/// forces `#x00 == #x01`. Wrong `unsat`; z3 4.16.0 says `sat`.
+#[test]
+fn redeclared_at_a_wider_signature_is_a_different_function() {
+    let out = run_script(
+        "(set-logic ALL)\
+         (declare-fun x () (_ BitVec 8))(declare-fun y () (_ BitVec 16))\
+         (declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (assert (= (f x) #x00))\
+         (declare-fun f ((_ BitVec 16)) (_ BitVec 16))\
+         (assert (= ((_ extract 7 0) y) x))\
+         (assert (= ((_ extract 7 0) (f y)) #x01))(check-sat)",
+    );
+    assert_eq!(out.last().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}
+
+/// The SAME shape in the REVERSE order — 16-bit recorded first, 8-bit second.
+/// Here `compare::eq`'s `0..x.len()` runs off the end of the 8-bit word: at
+/// HEAD this PANICKED in the release profile ("index out of bounds: the len is
+/// 8 but the index is 8", `crates/shinri-bv/src/blast/compare.rs:6`), exit 101.
+/// Both orders are pinned because they fail differently. z3 4.16.0 says `sat`.
+#[test]
+fn redeclared_at_a_narrower_signature_is_a_different_function() {
+    let out = run_script(
+        "(set-logic ALL)\
+         (declare-fun x () (_ BitVec 8))(declare-fun y () (_ BitVec 16))\
+         (declare-fun f ((_ BitVec 16)) (_ BitVec 16))\
+         (assert (= ((_ extract 7 0) (f y)) #x01))\
+         (declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (assert (= (f x) #x00))(check-sat)",
+    );
+    assert_eq!(out.last().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}
+
+/// Different ARITY: 2-ary then redeclared 1-ary. The congruence loop walks
+/// `arg_words` — the NEW arity — so the surplus prior argument was silently
+/// dropped and `cond` blasted true, forcing `#x2a == #x2b`. Wrong `unsat`;
+/// z3 4.16.0 says `sat`.
+#[test]
+fn redeclared_at_a_different_arity_is_a_different_function() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun x () (_ BitVec 8))\
+         (declare-fun f ((_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))\
+         (assert (= (f x x) #x2a))\
+         (declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (assert (= (f x) #x2b))(check-sat)",
+    );
+    assert_eq!(out.last().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}
+
+/// WHY WIDTH EQUALITY IS NOT ENOUGH, and the reason `UfApp` carries
+/// `arg_sorts`. `Float32` and `(_ BitVec 32)` are both 32-bit words, so arity,
+/// argument width and result width all match and NO shape assertion would
+/// fire — yet these are different functions, and `word_eq` compares the two
+/// sorts by different semantics (`core_eq` vs. bitwise). At HEAD this returned
+/// a wrong `unsat` completely silently. z3 4.16.0 says `sat`.
+#[test]
+fn redeclared_at_an_equal_width_different_sort_is_a_different_function() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun b () (_ BitVec 32))\
+         (declare-fun f (Float32) (_ BitVec 32))\
+         (assert (= (f ((_ to_fp 8 24) b)) #x00000000))\
+         (declare-fun f ((_ BitVec 32)) (_ BitVec 32))\
+         (assert (= (f b) #x00000001))(check-sat)",
+    );
+    assert_eq!(out.last().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}

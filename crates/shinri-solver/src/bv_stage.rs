@@ -11,7 +11,7 @@
 //! `collect_bv_atoms` deliberately includes Eq/Distinct over BV operands.
 
 use rustc_hash::FxHashMap;
-use shinri_core::{BuiltinOp, Context, Lit, Op, SortNode, TermId, TermNode, Var};
+use shinri_core::{BuiltinOp, Context, Lit, Op, SortId, SortNode, TermId, TermNode, Var};
 
 /// Surrogate maps produced by lowering BV atoms to CNF and replaying that CNF
 /// into the SAT solver. The Encoder consults `atom_to_lit` so a BV atom returns
@@ -327,16 +327,19 @@ fn walk_uf_args(
 /// behind `is_nan`/`is_inf`/`is_zero`) and then still runs a full `bits_eq`
 /// bitwise-equality chain (~`3*(eb+sb)` gates) plus a handful of NaN-routing
 /// combinators — roughly `9*eb + 7*sb + 10` gates total, against the
-/// `3*(eb+sb)` gates a same-width bitwise BV comparison costs. That ratio is
-/// ~2.5–2.8x across eb=8/sb=24 (float32) and eb=11/sb=53 (float64); the
-/// multiplier below is a ROUNDED-UP REASONED ESTIMATE from that gate count,
-/// not a measurement — no FP calibration instance has been run (`Lowerer::
-/// word_eq`'s `core_eq` wiring doesn't exist yet; a later task owns it, so a
-/// measurement taken today would not reflect the shipped FP cost anyway). The
-/// multiplier keeps this the safe (over-counting) direction for FP arguments
-/// regardless of when that measurement eventually happens.
+/// `3*(eb+sb)` gates a same-width bitwise BV comparison costs. The multiplier
+/// below is a ROUNDED-UP REASONED ESTIMATE from that gate count, NOT a
+/// measurement — no FP calibration instance has been run.
+///
+/// Cross-checked against the sources rather than measured: `bits_eq` is 3
+/// gates/bit (`crates/shinri-fp/src/blast/compare.rs:7-16`) and `unpack` is
+/// `3*eb + 2*sb + 2` (`crates/shinri-fp/src/unpack.rs:18-58`), which puts the
+/// true ratio at ~2.60x (Float32), ~2.50x (Float64) and ~2.75x (eb=5/sb=11).
+/// Rounding up gives 3, which is what spec §7.3 states. The rounding keeps
+/// this the safe (over-counting) direction for FP arguments regardless of when
+/// a real calibration eventually happens.
 pub fn uf_congruence_cost(ctx: &Context, atoms: &[TermId]) -> u64 {
-    let mut per_sym: FxHashMap<shinri_core::SymbolId, (u64, u64, u64)> = FxHashMap::default();
+    let mut per_sym: FxHashMap<UfShapeKey, (u64, u64, u64)> = FxHashMap::default();
     let mut seen = rustc_hash::FxHashSet::default();
     for &a in atoms {
         collect_uf_apps(ctx, a, &mut per_sym, &mut seen);
@@ -351,15 +354,31 @@ pub fn uf_congruence_cost(ctx: &Context, atoms: &[TermId]) -> u64 {
 
 /// See `uf_congruence_cost`'s doc comment: a reasoned (not measured) upper
 /// bound on how much more `core_eq` costs per FP argument bit than a plain
-/// bitwise BV comparison costs per bit, rounded up from the ~2.5–2.8x gate-
+/// bitwise BV comparison costs per bit, rounded up from the ~2.5–2.75x gate-
 /// count ratio derived there. Keeps the FP-argument cost over-counting, the
 /// safe direction for a budget fence.
 const FP_ARG_COST_MULTIPLIER: u64 = 3;
 
+/// The grouping key for congruence counting: `(symbol, argument sorts, result
+/// sort)`.
+///
+/// MUST mirror the blaster's pairing predicate (`shape_compatible`,
+/// `crates/shinri-bv/src/blast/mod.rs`). A `SymbolId` alone is NOT a function:
+/// `Context::declare_fun` interns by name and overwrites the signature, and a
+/// redeclaration is accepted silently, so one symbol can carry applications of
+/// two different functions in one assertion list. The blaster only relates applications
+/// within a shape group; keying this map by symbol alone would merge those
+/// groups and OVER-count `pairs(k)` — but it also locked `arg_bits`/`res_bits`
+/// to the FIRST application seen (`or_insert`), which for a wider second shape
+/// UNDER-counts, and under-counting is the unsafe direction for a budget fence.
+/// Keying by shape removes both: within a group every application has the same
+/// argument and result widths by construction.
+type UfShapeKey = (shinri_core::SymbolId, Vec<shinri_core::SortId>, SortId);
+
 fn collect_uf_apps(
     ctx: &Context,
     t: TermId,
-    per_sym: &mut FxHashMap<shinri_core::SymbolId, (u64, u64, u64)>,
+    per_sym: &mut FxHashMap<UfShapeKey, (u64, u64, u64)>,
     seen: &mut rustc_hash::FxHashSet<TermId>,
 ) {
     if !seen.insert(t) {
@@ -385,8 +404,9 @@ fn collect_uf_apps(
                             .unwrap_or(0)
                     })
                     .sum();
+                let key: UfShapeKey = (*sym, kids.iter().map(|&k| ctx.sort_of(k)).collect(), *sort);
                 let e = per_sym
-                    .entry(*sym)
+                    .entry(key)
                     .or_insert((0, arg_bits, u64::from(res_bits)));
                 e.0 += 1;
             }
@@ -649,7 +669,7 @@ mod tests {
     /// symbol-blind merge would instead see 5 applications of one bucket,
     /// `pairs(5) = 10`, cost `10*16 = 160`.
     #[test]
-    fn uf_congruence_cost_keys_by_symbol_not_shape() {
+    fn uf_congruence_cost_does_not_merge_distinct_symbols() {
         let mut ctx = Context::new();
         let s8 = ctx.bv_sort(8);
         let f = ctx.declare_fun("f", &[s8], s8);
@@ -672,6 +692,42 @@ mod tests {
         assert_eq!(uf_congruence_cost(&ctx, &atoms), 64);
     }
 
+    /// The counting key must MIRROR the blaster's pairing predicate: one
+    /// `SymbolId` can carry two different functions, because `declare_fun`
+    /// interns by name and overwrites the signature. Here `f` is applied once
+    /// at `BV8 -> BV8` and twice at `BV16 -> BV16`; the blaster pairs only
+    /// within a shape, so the true cost is `pairs(1)*16 + pairs(2)*32 = 0 + 32
+    /// = 32`.
+    ///
+    /// Keying by `SymbolId` alone gave `pairs(3) = 3` against whichever
+    /// `arg_bits`/`res_bits` the FIRST application happened to install
+    /// (`or_insert`): `3 * 16 = 48` for this ordering. That is over-counting
+    /// here, but reversing the declaration order installs the WIDE widths for
+    /// the narrow group and the same bug under-counts — and under-counting is
+    /// the unsafe direction for a budget fence.
+    #[test]
+    fn uf_congruence_cost_does_not_merge_two_shapes_of_one_symbol() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let s16 = ctx.bv_sort(16);
+        let f8 = ctx.declare_fun("f", &[s8], s8);
+        let a = bv_var(&mut ctx, "a", 8);
+        let fa = ctx.mk_app(Op::Uninterpreted(f8), &[a]).unwrap();
+        // Redeclaring `f` returns the SAME SymbolId — interned by name.
+        let f16 = ctx.declare_fun("f", &[s16], s16);
+        assert_eq!(f8, f16, "declare_fun interns by name");
+        let p = bv_var(&mut ctx, "p", 16);
+        let q = bv_var(&mut ctx, "q", 16);
+        let fp = ctx.mk_app(Op::Uninterpreted(f16), &[p]).unwrap();
+        let fq = ctx.mk_app(Op::Uninterpreted(f16), &[q]).unwrap();
+        let z8 = bv_var(&mut ctx, "z", 8);
+        let atoms = vec![
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fa, z8]).unwrap(),
+            ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fp, fq]).unwrap(),
+        ];
+        assert_eq!(uf_congruence_cost(&ctx, &atoms), 32);
+    }
+
     /// The walk must not stop at the first uninterpreted application whose
     /// OWN arguments check out — it must continue past a passing node to
     /// catch an unwordable argument further down. `f : BV8 -> BV8` applied to
@@ -680,10 +736,11 @@ mod tests {
     /// Int-sorted. A "return as soon as this node's own args check out"
     /// regression would pass this atom.
     ///
-    /// Also folds in the `seen`-memo case: `gn` (`g(n)`) is shared as BOTH
-    /// operands of the outer equality, so the walk visits it twice — the memo
-    /// must not let the second, already-`seen` visit mask the `false` the
-    /// first visit already found.
+    /// The shared `gn` operand is incidental, NOT extra coverage: the walk's
+    /// `kids.iter().all(..)` short-circuits on `fgn`'s `false` and never
+    /// reaches the sibling `gn`. The memo needs no case of its own — a `false`
+    /// propagates out of every enclosing `.all()` immediately, so a `true`
+    /// later returned by an already-`seen` node can never overwrite it.
     #[test]
     fn uf_args_supported_rejects_an_unwordable_argument_below_a_passing_application() {
         let mut ctx = Context::new();
