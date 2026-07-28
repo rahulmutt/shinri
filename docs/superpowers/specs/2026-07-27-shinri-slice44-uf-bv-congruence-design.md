@@ -311,3 +311,162 @@ instance **proves** that rather than asserting it in prose.
    value, and the calibration measurement is recorded.
 6. Slice 43's spec §5 BV row is rewritten to match the shipped behaviour, so no
    committed spec contradicts the code.
+
+## 7. Measured outcomes
+
+### 7.1 Task 1 — the pre-fix oracle failure
+
+Extending `qfbv_oracle`'s term pool with a 1-ary `f` and a 2-ary `g` (small pool
+so applications collide) made `differential_qf_bv_small` reach the missing-
+congruence defect for the first time. The failure did **not** manifest as a
+`shinri=Sat z3=Unsat` verdict-disagreement pair — the process panicked before
+either solver reported a verdict for that iteration, so no pair exists to
+record:
+
+```
+cargo nextest run -p shinri-solver --features oracle -E 'test(differential_qf_bv_small)' --no-capture
+```
+
+discovers 1 test and **panics** at `crates/shinri-bv/src/blast/mod.rs:282`:
+`debug_assert!(child_ids.is_empty(), "non-nullary uninterpreted BV fn out of
+scope")`, since the dev/test profile builds with debug assertions on. Pinned
+to **iteration 3 (0-indexed), width 4** (a temporary `eprintln!` used to locate
+it, reverted before the commit — commit `e0d8af06`). The reviewer independently
+verified the causal chain: only the newly-added generator arms can construct a
+non-nullary `Op::Uninterpreted` node, so nothing else could have triggered this
+assertion.
+
+### 7.2 Task 3 — the post-fix oracle summary
+
+After the congruence gadget landed (commit `4acf7903`):
+
+```
+differential_qf_bv_small PASS, sat=116 unsat=84 unknown=0 disagreements=0
+```
+
+Full unfiltered oracle: **572 passed / 3 skipped**. Full workspace suite:
+**1307 passed / 7 skipped** (baseline 1303 + 4 new tests).
+
+### 7.3 Task 4 — the `k` → wall-clock calibration table and the chosen budget
+
+Measured on the release binary, single run each, foreground `bash time`, on a
+width-32 arity-2 symbol (`Aₛ + wₛ = 96`): `(set-logic QF_UFBV) (declare-fun g
+((_ BitVec 32) (_ BitVec 32)) (_ BitVec 32))`, `k` fresh `BitVec 32` variables,
+`k` applications `g(vᵢ,vᵢ)` chained pairwise.
+
+| k | wall-clock |
+|---|---|
+| 10 | 0.013 s |
+| 20 | 0.050 s |
+| 40 | 0.206 s |
+| 80 | 0.843 s |
+| 160 | 3.484 s |
+| 320 | 15.429 s |
+| 400 | 25.140 s |
+| 420 | 26.920 s |
+| 440 | 29.203 s — largest measured `k` still under 30 s |
+| 460 | 32.086 s — first measured `k` over 30 s; true crossing is between 440 and 460 |
+
+**Human ruling** (recorded because it overrode the implementer's first cut):
+the implementer initially set the budget at `k=160` (3.484 s), 7.6× below the
+plan's own "largest k under 30 s" criterion. The user's ruling: budget the
+measured 30 s crossing, since Fence 2 bounds *encoding blowup*, and encoding
+size (gate-equivalents) is the right unit for that bound, not a fixed `k`.
+
+**Chosen budget:**
+`UF_CONGRUENCE_BUDGET = pairs(440) × 96 = 96,580 × 96 = 9,271,680`
+(`crates/shinri-solver/src/bv_stage.rs:424`). The Fence-2 pin test
+(`encoding_past_the_budget_fences_to_unknown`) uses `k=1500`
+(`pairs(1500) × 96 = 1,124,250 × 96 = 107,928,000`, 11.6× the budget).
+
+The FP-argument cost is not separately calibrated against a real FP instance —
+no such instance was run at Task 4. Instead `FP_ARG_COST_MULTIPLIER = 3` is
+used as a conservative estimate, later confirmed against real source in Task 4's
+review: `bits_eq` is 3 gates/bit (`shinri-fp/src/blast/compare.rs:7-16`) and
+`unpack` costs `3·eb + 2·sb + 2` (`shinri-fp/src/unpack.rs:18-58`), giving true
+ratios of 2.60× (f32), 2.50× (f64), 2.75× (eb5/sb11) — so 3 is a genuine
+rounding-up, not false precision.
+
+### 7.4 Named fence-attributable decided → `unknown` flips
+
+Two named flips, one per fence, each measured directly against the pre-slice
+release binary (`main` @ `2e5e7c00`) so the "decided" half of the flip is not
+assumed:
+
+1. **Fence 1 (argument sort), `qfufbv_e2e::int_argument_to_a_bv_uf_fences_to_unknown`.**
+   `(set-logic ALL)(declare-fun h (Int) (_ BitVec 8))(declare-fun n () Int)
+   (assert (= (h n) #x2a))(check-sat)`. MEASURED pre-slice (worktree at
+   `e0d8af06`, immediately before Task 2's fence landed): decides `sat`. Post-
+   slice: `unknown`, because `n`'s Int sort has no blastable word. This is the
+   spec §2.1 named exception.
+
+2. **Fence 1 (argument sort), `qfdt_model_e2e::fenced_bv_field_is_unknown`
+   (the `BV_FIELD` query).** `(set-logic QF_UFDTBV)(declare-datatype W ((mk (w
+   (_ BitVec 8))))) (declare-fun v () W)(assert (= (w v) #x2a))(check-sat)
+   (get-model)`. `(w v)` is a non-nullary BV-result uninterpreted application
+   whose argument `v` is Datatype-sorted — also unwordable, also Fence 1, not
+   Fence 2 and not the congruence arm (the congruence arm never sees this
+   query — it is rejected before lowering starts). MEASURED (worktree at
+   `e0d8af06`, immediately before Task 2's fence landed, release binary):
+   pre-slice decides `sat`, `get-model` prints `((define-fun v () W ?))` — the
+   whole-symbol placeholder, not a partial `(mk ?)`, matching slice 43 spec
+   §5's BV row. Post-slice: `unknown`, `get-model` prints `()`. **Precision on
+   correctness:** for this specific
+   *single-application* query, the pre-slice `sat` was itself
+   correct-but-incomplete (an unconstrained placeholder), not unsound — the
+   wrong-`sat` defect this slice fixes requires **two or more** applications of
+   the same uninterpreted function, which this query never had. This flip is
+   therefore a named Fence-1 exception, not a soundness correction, for this
+   specific query.
+
+3. **Fence 2 (blowup cap), `qfufbv_e2e::encoding_past_the_budget_fences_to_unknown`.**
+   The `k=1500` chained-`g(vᵢ,vᵢ)` formula from §7.3's table, scaled past the
+   budget. MEASURED pre-slice (`main` @ `2e5e7c00`): decides `sat` in 0.165 s —
+   correctly, since each `g(vᵢ,vᵢ)` is independent and trivially self-
+   congruent; no cross-application constraint is asserted, so nothing in this
+   formula depends on congruence firing at all. Post-slice: `unknown`, because
+   the encoding cost (`pairs(1500) × 96 = 107,928,000`) exceeds
+   `UF_CONGRUENCE_BUDGET`. This flip trades completeness for the PR-tier time
+   budget on an intentionally adversarial size, not a correctness fix.
+
+No other decided → `unknown` flips were found across `qfbv_witnesses`,
+`script_e2e`, `qfdt_e2e`, or the full unfiltered oracle suite (§7.6).
+
+### 7.5 The Task 2 model side effect
+
+Measured on the release binary:
+
+```
+$ printf '%s\n' '(set-logic QF_UFBV)(declare-fun f ((_ BitVec 8)) (_ BitVec 8))(declare-fun x () (_ BitVec 8))(assert (= (f x) #x2a))(check-sat)(get-model)' > model.smt2
+$ ./target/release/shinri model.smt2
+sat
+((define-fun x () (_ BitVec 8) #x00))
+```
+
+(The `success` lines the CLI also prints are a `:print-success` presentation
+detail of `shinri-cli`'s driver, not part of `Solver::execute`'s
+`CommandResponse` stream that `run_script` in the test files consumes; the
+test-relevant string is the `((define-fun x () (_ BitVec 8) #x00))` line.)
+Pre-slice this printed `(define-fun x () (_ BitVec 8) ?)` — `x` was never
+blasted, so it never entered `Blaster.cache` and `exported_var_bits` could not
+see it. Congruence forces the arguments to be blasted, so the value now
+appears. Pinned by `argument_variables_now_get_a_model_value`
+(`crates/shinri-solver/tests/qfufbv_e2e.rs`). This does **not** make
+`get-model` complete for UF queries: `f` itself is still omitted, because a
+function graph needs EUF congruence-class enumeration (slice 43 §5, still
+open).
+
+### 7.6 PR-tier wall clock
+
+```
+$ time cargo nextest run --all
+...
+Summary [ 219.640s] 1324 tests run: 1324 passed (5 slow), 7 skipped
+real    3m40.100s
+```
+
+Well inside the 10–15 min (600–900 s) blocking PR-tier budget (CI hard cap
+20 min). `nullary_applications_emit_no_congruence_clauses`
+(`crates/shinri-bv/src/lib.rs`) still passes at its pre-slice constant,
+`NULLARY_EQ_CLAUSES = 57`, confirming the nullary arm's CNF output is
+byte-for-byte unchanged by this slice.

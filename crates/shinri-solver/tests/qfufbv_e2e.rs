@@ -262,3 +262,28 @@ fn nested_application_congruence() {
         "got {out:?}"
     );
 }
+
+/// Spec §2.2: a MEASURED SIDE EFFECT, not a goal. Pre-slice this printed
+/// `(define-fun x () (_ BitVec 8) ?)` — the argument was never blasted, so it
+/// never entered Blaster.cache and exported_var_bits could not see it.
+/// Congruence forces the arguments to be blasted, so the value appears.
+///
+/// This does NOT make get-model complete for UF queries: `f` itself is still
+/// omitted, because a function graph needs EUF congruence-class enumeration
+/// (slice 43 §5, still open).
+#[test]
+fn argument_variables_now_get_a_model_value() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (declare-fun x () (_ BitVec 8))(assert (= (f x) #x2a))(check-sat)(get-model)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+    // MEASURED 2026-07-28, release binary (`./target/release/shinri`) and via
+    // the identical Solver::execute path used by run_script above.
+    assert_eq!(out[1], "((define-fun x () (_ BitVec 8) #x00))");
+    assert!(
+        !out[1].contains('?'),
+        "the argument variable must have a real value, not a placeholder: {}",
+        out[1]
+    );
+}
