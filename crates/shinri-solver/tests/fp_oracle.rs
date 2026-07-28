@@ -1276,21 +1276,27 @@ fn gen_fp_to_bv_script(rng: &mut Lcg) -> String {
             );
         }
         1 => {
-            // slice 44: uninterpreted k : Float(eb,sb) -> BitVec m. Two forms,
-            // half and half: forced value-equal free operands, and the
-            // NaN-specific form (many bit patterns, ONE value) that a
-            // bitwise word_eq would miss entirely.
-            return if rng.below(2) == 0 {
-                format!(
+            // slice 44: uninterpreted k : Float(eb,sb) -> BitVec m. Three
+            // forms: forced value-equal free operands and the NaN-specific
+            // form (many bit patterns, ONE value) both test the UNDER-firing
+            // direction (a bitwise word_eq would miss both — expect unsat);
+            // the third tests the OVER-firing direction — x and y forced
+            // DISTINCT, so word_eq must NOT force k(x)=k(y) — expect sat.
+            // Without this arm every UF-over-FP probe in this file (and
+            // both qfufbv_e2e.rs additions) was unsat-by-construction, so a
+            // `word_eq` that over-fired (wrongly reported "equal" for
+            // genuinely different FP values, yielding a wrong `unsat`) had
+            // no test that could catch it.
+            return match rng.below(3) {
+                0 => format!(
                     "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
                      (declare-fun y () (_ FloatingPoint {eb} {sb}))\n\
                      (declare-fun k ((_ FloatingPoint {eb} {sb})) (_ BitVec {m}))\n\
                      (assert (= x y))\n\
                      (assert (distinct (k x) (k y)))\n\
                      (check-sat)\n"
-                )
-            } else {
-                format!(
+                ),
+                1 => format!(
                     "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
                      (declare-fun y () (_ FloatingPoint {eb} {sb}))\n\
                      (declare-fun k ((_ FloatingPoint {eb} {sb})) (_ BitVec {m}))\n\
@@ -1298,7 +1304,15 @@ fn gen_fp_to_bv_script(rng: &mut Lcg) -> String {
                      (assert (fp.isNaN y))\n\
                      (assert (distinct (k x) (k y)))\n\
                      (check-sat)\n"
-                )
+                ),
+                _ => format!(
+                    "(declare-fun x () (_ FloatingPoint {eb} {sb}))\n\
+                     (declare-fun y () (_ FloatingPoint {eb} {sb}))\n\
+                     (declare-fun k ((_ FloatingPoint {eb} {sb})) (_ BitVec {m}))\n\
+                     (assert (distinct x y))\n\
+                     (assert (distinct (k x) (k y)))\n\
+                     (check-sat)\n"
+                ),
             };
         }
         _ => {}

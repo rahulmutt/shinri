@@ -1,4 +1,6 @@
-//! Differential oracle: shinri-solver vs z3 on random QF_ABV instances.
+//! Differential oracle: shinri-solver vs z3 on random QF_AUFBV instances
+//! (array + uninterpreted-function BV, per slice 44 — see the Atom 4 note
+//! below).
 //!
 //! Run with:
 //!   cargo test -p shinri-solver --features oracle --test qfabv_oracle -- --nocapture
@@ -38,12 +40,16 @@ impl Lcg {
 const N_ITERS: usize = 200;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// QF_ABV instance generator
+// QF_AUFBV instance generator
 //
 // Per instance:
 //   - 3 BV-arrays a0, a1, a2 of type (Array (_ BitVec 8) (_ BitVec 8))
 //   - 3 index consts i0, i1, i2 of (_ BitVec 8)
 //   - 3 element consts e0, e1, e2 of (_ BitVec 8)
+//   - a small uninterpreted-function pool: 1-ary f, 2-ary g, both over
+//     (_ BitVec 8) (slice 44) — see Atom 4 below. Declared unconditionally,
+//     so the logic is QF_AUFBV (QF_ABV alone rejects nonzero-arity
+//     declare-fun) even though most atoms never touch f/g.
 //
 // Atoms generated (kept in sync between shinri and the z3 dump):
 //
@@ -66,9 +72,17 @@ const N_ITERS: usize = 200;
 //   Atom 3 (with prob 1/2): a `(distinct ax ay)` paired with a pinned per-cell
 //           agreement `(= (select ax i{p}) (select ay i{p}))` — drives the
 //           `distinct` extensionality WITNESS path.
+//
+//   Atom 4 (always, slice 44): an uninterpreted-application (Ackermann)
+//           congruence probe over the small f/g pool applied to i{p}, i{q}:
+//             (= (f i{p}) (f i{q})) | (distinct (f i{p}) (f i{q}))
+//           | (= (g i{p} i{q}) (g i{q} i{p})) | (distinct (g i{p} i{q}) (g i{q} i{p}))
+//           Exercises blast_bv_word's Uninterpreted-application congruence
+//           arm, which is otherwise unreachable by this suite (BV-sorted
+//           arguments; the FP-argument analogue lives in fp_oracle.rs).
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Generate one QF_ABV instance.
+/// Generate one QF_AUFBV instance.
 ///
 /// Returns `(solver_with_assertions, dump_text)` where `dump_text` is the
 /// SMT-LIB2 script (without `(check-sat)`) that exactly represents the same
@@ -326,6 +340,18 @@ fn z3_verdict(dump: &str) -> String {
 
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // z3 prints "(error ...)" and STILL answers check-sat afterwards (e.g.
+    // wrong logic string rejecting a declare-fun), so "last non-empty line"
+    // alone would silently accept a verdict computed over a malformed
+    // script. Panic instead — this generator now depends on z3 actually
+    // parsing every declaration (the f/g UF pool), so a silent parse error
+    // here would produce false confidence rather than a caught bug.
+    assert!(
+        !stdout.contains("(error") && !stderr.contains("(error"),
+        "z3 reported a parse/setup error — script was not solved as written:\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}\ndump:\n{dump}"
+    );
     // z3 may emit multiple lines; take the last non-empty one as the verdict.
     stdout
         .trim()

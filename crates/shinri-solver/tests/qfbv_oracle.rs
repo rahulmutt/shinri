@@ -407,7 +407,6 @@ fn differential_qf_bv_small() {
     let mut n_sat = 0usize;
     let mut n_unsat = 0usize;
     let mut n_unknown = 0usize;
-    let mut n_disagreements = 0usize;
 
     // We keep a separate counter for each width to ensure all widths are exercised.
     let mut width_counts = [0usize; 3]; // [w4, w8, w16]
@@ -492,7 +491,6 @@ fn differential_qf_bv_small() {
                 n_unsat += 1;
             }
             (o, t) => {
-                n_disagreements += 1;
                 panic!(
                     "QF_BV SOUNDNESS DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n\
                      Reproduce with this instance:\n{dump}"
@@ -503,7 +501,7 @@ fn differential_qf_bv_small() {
 
     println!(
         "differential_qf_bv_small: {N_ITERS} instances\n  \
-         sat={n_sat} unsat={n_unsat} unknown={n_unknown} disagreements={n_disagreements}\n  \
+         sat={n_sat} unsat={n_unsat} unknown={n_unknown}\n  \
          width breakdown: w4={} w8={} w16={}",
         width_counts[0], width_counts[1], width_counts[2]
     );
@@ -535,10 +533,15 @@ fn differential_qf_bv_small() {
          QF_BV fence is firing too aggressively or blaster is broken"
     );
 
-    // Zero disagreements is the hard guarantee — any panic above would have set
-    // n_disagreements but we also assert here as a belt-and-suspenders check.
-    assert_eq!(
-        n_disagreements, 0,
-        "SOUNDNESS BUG: {n_disagreements} disagreements detected"
-    );
+    // Zero disagreements is the hard guarantee, but there is no separate
+    // "belt and suspenders" check for it here: the (o, t) match arm above
+    // panics UNCONDITIONALLY and IMMEDIATELY on the first disagreement, so
+    // this function can only ever reach this point having seen zero of
+    // them — a trailing `assert_eq!(n_disagreements, 0, ...)` would always
+    // read a variable that provably never observed a nonzero write (the
+    // `+= 1` that used to precede the panic was live code that computed a
+    // value nothing could ever read, which is exactly what
+    // `unused_assignments` was flagging). If a future refactor changes the
+    // per-iteration arm to collect disagreements instead of panicking
+    // immediately, reintroduce a real counter alongside that change.
 }
