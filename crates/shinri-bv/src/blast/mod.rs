@@ -66,9 +66,10 @@ pub struct FpToBvApp {
 /// `sym` ALONE does not identify a function. `Context::declare_fun` interns by
 /// NAME and overwrites `fun_sigs`, and `Command::DeclareFun` accepts a
 /// redeclaration silently, so one `SymbolId` can carry applications of two
-/// different functions — different arities, argument sorts, or result widths —
-/// inside a single assertion list. `arg_sorts` + the word lengths are what make
-/// the pairing predicate (`shape_compatible`) total; see it for the details.
+/// different functions — different arities, argument sorts, or result sorts —
+/// inside a single assertion list. `arg_sorts` + `result_sort` + the word
+/// lengths are what make the pairing predicate (`shape_compatible`) total; see
+/// it for the details.
 #[derive(Clone)]
 pub struct UfApp {
     pub sym: shinri_core::SymbolId,
@@ -77,6 +78,13 @@ pub struct UfApp {
     /// `(_ BitVec 32)` are both 32 bits, but `word_eq` dispatches on the sort
     /// and compares them by different semantics.
     pub arg_sorts: Vec<shinri_core::SortId>,
+    /// The declared RESULT sort. Slice 44 could infer it from `result.len()`
+    /// because the only arm recording a `UfApp` recorded BV results and BV
+    /// sorts intern by width. Slice 45 breaks that inference: it records
+    /// Bool results as ONE-BIT words, and `Bool` and `(_ BitVec 1)` are
+    /// different sorts at the same length. Pairing those two relates two
+    /// different functions — a wrong `unsat`, silently.
+    pub result_sort: shinri_core::SortId,
     /// One blasted word per argument, in argument order.
     pub args: Vec<Vec<BitLit>>,
     pub result: Vec<BitLit>,
@@ -89,9 +97,9 @@ pub struct UfApp {
 ///
 /// This predicate is TOTAL over every way two `UfApp`s recorded under one
 /// `SymbolId` can be shape-incompatible: arity, per-argument sort, per-argument
-/// word length, and result word length. It is the sole guard — the arm below
-/// carries no shape assertion, because an assertion vanishes in the shipping
-/// profile and this must hold there.
+/// word length, result sort, and result word length. It is the sole guard — the
+/// arm below carries no shape assertion, because an assertion vanishes in the
+/// shipping profile and this must hold there.
 ///
 /// SKIPPING an incompatible prior is sound in the COMPLETENESS-LOSING
 /// direction only: congruence is an ADDED constraint, so omitting it can only
@@ -103,6 +111,7 @@ fn shape_compatible(
     sym: shinri_core::SymbolId,
     arg_sorts: &[shinri_core::SortId],
     arg_words: &[Vec<BitLit>],
+    result_sort: shinri_core::SortId,
     result_len: usize,
 ) -> bool {
     prior.sym == sym
@@ -119,9 +128,15 @@ fn shape_compatible(
             .iter()
             .zip(arg_words.iter())
             .all(|(p, n)| p.len() == n.len())
+        // Result SORT. Slice 44 inferred this from the length below, on the
+        // premise that only BV results are ever recorded. Slice 45 records
+        // Bool results at length 1, so `Bool` and `(_ BitVec 1)` now collide
+        // on length — the same redeclaration hazard `arg_sorts` guards on the
+        // argument side, on the result side. Checked directly.
+        && prior.result_sort == result_sort
         // Result width: the congruence clauses `zip` the two result words.
-        // The arm only ever records BV results, and BV sorts intern by width,
-        // so equal length here is equal result sort.
+        // Equal sorts already imply equal length, but this is what the `zip`
+        // actually walks, so it is checked directly rather than inferred.
         && prior.result.len() == result_len
 }
 
@@ -360,6 +375,7 @@ fn blast_uf_app<S: WordSink>(
     ctx: &Context,
     sym: shinri_core::SymbolId,
     child_ids: &[TermId],
+    result_sort: shinri_core::SortId,
     width: u32,
 ) -> Vec<BitLit> {
     if child_ids.is_empty() {
@@ -389,7 +405,7 @@ fn blast_uf_app<S: WordSink>(
     let prior: Vec<UfApp> = sink
         .uf_apps()
         .iter()
-        .filter(|a| shape_compatible(a, sym, &arg_sorts, &arg_words, result.len()))
+        .filter(|a| shape_compatible(a, sym, &arg_sorts, &arg_words, result_sort, result.len()))
         .cloned()
         .collect();
     for pa in prior {
@@ -411,6 +427,7 @@ fn blast_uf_app<S: WordSink>(
     sink.uf_apps().push(UfApp {
         sym,
         arg_sorts,
+        result_sort,
         args: arg_words,
         result: result.clone(),
     });
@@ -450,7 +467,7 @@ pub fn blast_bv_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
         } => {
             let child_ids = ctx.children(args).to_vec();
             let width = ctx.bv_width(sort).expect("BV-sorted variable has BV sort");
-            blast_uf_app(sink, ctx, sym, &child_ids, width)
+            blast_uf_app(sink, ctx, sym, &child_ids, sort, width)
         }
         TermNode::App {
             op: Op::Builtin(bv_op),
@@ -609,6 +626,40 @@ pub fn blast_bv_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
 pub fn blast_bv_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> BitLit {
     let node = ctx.term_node(t).clone();
     match node {
+        // Slice 45: a Bool-result uninterpreted application. Delegates to the
+        // slice-44 gadget at result width 1, so the Ackermann clause per prior
+        // pair degenerates to the single `cond -> (v_prior <-> v_new)`.
+        //
+        // `blast_bv_atom` is only ever called on a Bool-sorted term, so no
+        // result-sort test is needed here. The node's own `sort` is handed to
+        // `blast_uf_app` and recorded: it is what keeps this Bool result from
+        // pairing with a `(_ BitVec 1)` result of the same redeclared symbol,
+        // which `result.len()` alone cannot distinguish.
+        //
+        // NULLARY applications must never reach this arm. Collection
+        // (`bv_stage::collect_bv_atoms`) excludes them, which is what keeps
+        // `blast_uf_app`'s `child_ids.is_empty()` branch unreachable from here.
+        // The exclusion is NOT a soundness cliff — `encode_uncached`
+        // intercepts a collected atom by TermId and memoizes
+        // (`shinri-solver/src/tseitin.rs:112`), so a nullary symbol routed
+        // here would still get exactly one literal — it is that bare Bool
+        // constants already have a well-understood Tseitin path this slice has
+        // no reason to move, and that
+        // `nullary_applications_emit_no_congruence_clauses` pins its clause
+        // count.
+        TermNode::App {
+            op: Op::Uninterpreted(sym),
+            args,
+            sort,
+        } => {
+            let child_ids = ctx.children(args).to_vec();
+            debug_assert!(
+                !child_ids.is_empty(),
+                "nullary Bool application reached blast_bv_atom — collection \
+                 must exclude it"
+            );
+            blast_uf_app(sink, ctx, sym, &child_ids, sort, 1)[0]
+        }
         TermNode::App {
             op: Op::Builtin(BuiltinOp::Eq),
             args,

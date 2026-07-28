@@ -31,9 +31,21 @@ pub struct Lowered {
 pub fn lower(ctx: &mut Context, bv_atoms: &[TermId]) -> Lowered {
     let mut b = Blaster::new();
     let mut atom_lit: FxHashMap<TermId, BitLit> = FxHashMap::default();
+    // Memo keyed by the REWRITTEN id: two distinct originals can converge
+    // under `rewrite` (it rewrites children bottom-up and rebuilds), and
+    // blasting each separately mints two literals for one term. Congruence
+    // forces them equal, so this is deduplication, NOT a soundness fix.
+    let mut by_rewritten: FxHashMap<TermId, BitLit> = FxHashMap::default();
     for &original in bv_atoms {
         let rewritten = rewrite(ctx, original);
-        let lit = b.blast_atom(ctx, rewritten);
+        let lit = match by_rewritten.get(&rewritten) {
+            Some(&l) => l,
+            None => {
+                let l = b.blast_atom(ctx, rewritten);
+                by_rewritten.insert(rewritten, l);
+                l
+            }
+        };
         // KEY: store under the ORIGINAL atom id so Task 17's hook can look it up.
         atom_lit.insert(original, lit);
     }
@@ -345,6 +357,200 @@ mod lower_tests {
             !solve_atoms(&mut ctx, &[(res_eq, false), (args_eq, true)]),
             "x = f(x) AND f(f(x)) != f(x) must be UNSAT — the inner application \
              must be registered before the outer one reads the registry"
+        );
+    }
+
+    // ── Slice 45: Bool-result uninterpreted applications ─────────────────────
+
+    /// The Bool-result mirror of slice 44's implication test. All three shapes
+    /// are pinned together because getting the direction wrong flips exactly
+    /// one of them, and at result width 1 a biconditional is an easy slip:
+    /// the single-bit case looks like plain equality until distinct arguments
+    /// are involved.
+    #[test]
+    fn bool_result_congruence_is_an_implication_not_a_biconditional() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let b = ctx.bool_sort();
+        let p = ctx.declare_fun("p", &[s8], b);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let yf = ctx.declare_fun("y", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let y = ctx.mk_app(Op::Uninterpreted(yf), &[]).unwrap();
+        let px = ctx.mk_app(Op::Uninterpreted(p), &[x]).unwrap();
+        let py = ctx.mk_app(Op::Uninterpreted(p), &[y]).unwrap();
+        let args_eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, y]).unwrap();
+
+        assert!(
+            !solve_atoms(&mut ctx, &[(args_eq, true), (px, true), (py, false)]),
+            "x = y AND p(x) AND !p(y) must be UNSAT — this is the congruence"
+        );
+        assert!(
+            solve_atoms(&mut ctx, &[(args_eq, false), (px, true), (py, false)]),
+            "x != y AND p(x) AND !p(y) must stay SAT — no converse implication"
+        );
+        assert!(
+            solve_atoms(&mut ctx, &[(args_eq, false), (px, true), (py, true)]),
+            "x != y AND p(x) AND p(y) must stay SAT — a predicate may agree on \
+             distinct arguments"
+        );
+    }
+
+    /// A Bool-result and a BitVec-result application of ONE redeclared symbol
+    /// name must never be paired. `Context::declare_fun` interns by name and
+    /// OVERWRITES `fun_sigs` (crates/shinri-core/src/context.rs:233-237), so
+    /// both live under one `SymbolId`; `shape_compatible` discriminates them on
+    /// `result.len()` — 1 vs. 8.
+    ///
+    /// Pairing them would relate a one-bit result word to an eight-bit one.
+    /// The test asserts SAT: nothing may constrain the two together, so
+    /// asserting the predicate true while pinning the BV result to a constant
+    /// must remain satisfiable.
+    ///
+    /// THE ORDER BELOW IS LOAD-BEARING. `check_app` reads `fun_sigs` at
+    /// `mk_app` time, so the Bool-result application must be built BEFORE the
+    /// redeclaration — declaring both signatures first would make both
+    /// `mk_app` calls see the BV signature and produce two BV-sorted apps.
+    /// They would then hash-cons to one TermId (`TermKey::App` includes the
+    /// result sort, context.rs:298-302) and the test would be vacuous.
+    #[test]
+    fn bool_and_bv_results_of_one_symbol_are_never_paired() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let b = ctx.bool_sort();
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+
+        // Same NAME, two signatures — the redeclaration hazard slice 44's
+        // shape_compatible was built for. Build each application immediately
+        // after the declaration that gives it its result sort.
+        let f_bool = ctx.declare_fun("f", &[s8], b);
+        let f_bool_x = ctx.mk_app(Op::Uninterpreted(f_bool), &[x]).unwrap();
+        let f_bv = ctx.declare_fun("f", &[s8], s8);
+        let f_bv_x = ctx.mk_app(Op::Uninterpreted(f_bv), &[x]).unwrap();
+
+        assert_eq!(f_bool, f_bv, "one name interns to one SymbolId");
+        assert_ne!(
+            f_bool_x, f_bv_x,
+            "differing result sorts must give differing TermIds"
+        );
+        assert_eq!(
+            ctx.sort_of(f_bool_x),
+            b,
+            "the Bool-result app kept its sort"
+        );
+
+        let c = ctx.mk_bv_const(8, shinri_num::Integer::from(0u64));
+        let bv_eq = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Eq), &[f_bv_x, c])
+            .unwrap();
+
+        assert!(
+            solve_atoms(&mut ctx, &[(f_bool_x, true), (bv_eq, true)]),
+            "a Bool-result and a BV-result application of one symbol name must \
+             be unrelated — pairing them relates a 1-bit word to an 8-bit one"
+        );
+    }
+
+    /// The SAME hazard at the width where `result.len()` cannot see it.
+    /// Slice 44's `shape_compatible` inferred the result SORT from the result
+    /// word LENGTH, on the premise that only BV results are ever recorded.
+    /// Slice 45 records Bool results as one-bit words, so `Bool` and
+    /// `(_ BitVec 1)` now collide on length — the sibling test above passes on
+    /// the length check alone (1 vs. 8) and would NOT have caught this.
+    ///
+    /// Before `UfApp::result_sort` landed this returned a wrong `unsat`:
+    /// congruence paired the two applications, forcing the Bool literal equal
+    /// to the one-bit BV result. Ground truth is `sat` — they are different
+    /// functions.
+    #[test]
+    fn bool_and_bv1_results_of_one_symbol_are_never_paired() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let s1 = ctx.bv_sort(1);
+        let b = ctx.bool_sort();
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+
+        // Order is load-bearing for the same reason as the test above.
+        let f_bool = ctx.declare_fun("f", &[s8], b);
+        let f_bool_x = ctx.mk_app(Op::Uninterpreted(f_bool), &[x]).unwrap();
+        let f_bv1 = ctx.declare_fun("f", &[s8], s1);
+        let f_bv1_x = ctx.mk_app(Op::Uninterpreted(f_bv1), &[x]).unwrap();
+
+        assert_eq!(f_bool, f_bv1, "one name interns to one SymbolId");
+        assert_ne!(
+            f_bool_x, f_bv1_x,
+            "differing result sorts must give differing TermIds"
+        );
+        assert_eq!(
+            ctx.sort_of(f_bool_x),
+            b,
+            "the Bool-result app kept its sort"
+        );
+
+        let zero1 = ctx.mk_bv_const(1, shinri_num::Integer::from(0u64));
+        let bv_eq = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Eq), &[f_bv1_x, zero1])
+            .unwrap();
+
+        assert!(
+            solve_atoms(&mut ctx, &[(f_bool_x, true), (bv_eq, true)]),
+            "p(x) AND f(x) = #b0 for a Bool f and a (_ BitVec 1) f of one \
+             symbol name must be SAT — equal result WIDTH is not equal result \
+             SORT"
+        );
+    }
+
+    /// Step order, the Bool-result case: `p(f(x))` blasts its argument — the
+    /// BV-result application `f(x)` — before reading the registry. With
+    /// `x = f(x)` asserted, congruence forces `f(x) = f(f(x))`, and the
+    /// predicate applications over them must agree.
+    #[test]
+    fn bool_result_over_a_bv_result_application() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let b = ctx.bool_sort();
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let p = ctx.declare_fun("p", &[s8], b);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+        let p_x = ctx.mk_app(Op::Uninterpreted(p), &[x]).unwrap();
+        let p_fx = ctx.mk_app(Op::Uninterpreted(p), &[fx]).unwrap();
+        let args_eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, fx]).unwrap();
+
+        assert!(
+            !solve_atoms(&mut ctx, &[(args_eq, true), (p_x, true), (p_fx, false)]),
+            "x = f(x) AND p(x) AND !p(f(x)) must be UNSAT — the predicate's \
+             argument is a BV-result application and congruence must see it"
+        );
+    }
+
+    /// Two ORIGINAL atoms that converge under `rewrite` share one literal.
+    /// `(p (bvadd x #x00))` rewrites to `(p x)` via the additive-identity
+    /// rule, so both originals must map to the SAME BitLit while `atom_lit`
+    /// stays keyed by each original — the contract `lower` documents.
+    #[test]
+    fn converging_originals_share_one_atom_literal() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let b = ctx.bool_sort();
+        let p = ctx.declare_fun("p", &[s8], b);
+        let xf = ctx.declare_fun("x", &[], s8);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let zero = ctx.mk_bv_const(8, shinri_num::Integer::from(0u64));
+        let x_plus_0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, zero])
+            .unwrap();
+        let p_x = ctx.mk_app(Op::Uninterpreted(p), &[x]).unwrap();
+        let p_x_plus_0 = ctx.mk_app(Op::Uninterpreted(p), &[x_plus_0]).unwrap();
+        assert_ne!(p_x, p_x_plus_0, "the two ORIGINAL atoms must differ");
+
+        let lo = lower(&mut ctx, &[p_x, p_x_plus_0]);
+        assert_eq!(
+            lo.atom_lit[&p_x], lo.atom_lit[&p_x_plus_0],
+            "converging originals must share one literal"
         );
     }
 }
