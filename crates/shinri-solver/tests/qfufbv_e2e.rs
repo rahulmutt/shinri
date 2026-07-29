@@ -734,3 +734,66 @@ fn a_foreign_array_read_argument_to_a_predicate_fences_to_unknown() {
         "got {out:?}"
     );
 }
+
+// ── Slice 45 Task 6, review round 1: the FP→BV conversion half of Fence 1 ────
+//
+// `Select` is not the only BV-SORTED head the bare blaster lacks an arm for.
+// Enumerating `BuiltinOp` against `blast_bv_word`'s dispatch, the BV-sorted
+// heads with no arm are `Select`, `Ite`, `FpToUbv` and `FpToSbv`. `Ite` is
+// eliminated unconditionally by `word_norm.normalize` (`lib.rs:759`) before any
+// routing decision; `Select` is covered by the four pins above; the FP→BV
+// conversions are these two.
+//
+// The discriminator is `allow_fp_args`, i.e. "does this path's sink have an
+// arm". `Lowerer::word` intercepts `FpToUbv`/`FpToSbv` and routes them to
+// `blast_fp_to_bv` (`crates/shinri-fp/src/lower.rs:52-73`); a bare
+// `shinri_bv::Blaster` does not. The ABV path uses a bare `Blaster` and passes
+// `allow_fp_args = false` (`lib.rs:910`), so it must fence — and, crucially,
+// its gate at `lib.rs:902` runs BEFORE any FP routing and `return`s in every
+// arm, so `solver_uses_fp` never gets to divert such a query to the FP path.
+
+/// The ABV path with an FP→BV conversion inside a UF argument. The argument is
+/// BitVec-8-SORTED and contains no `select`, so neither the sort check nor the
+/// array half of the blastability check catches it; `abv_stage::fenced` cannot
+/// either, because `(fp.to_ubv rm x)` is not Bool-sorted and `walk_fence` only
+/// descends through it into constants.
+///
+/// Measured at commit 4a3701e8 (the pre-fix tip of this task): PANIC on BOTH
+/// the release and the debug binary —
+/// `unreachable!("non-BV builtin reached blast_word")`,
+/// `crates/shinri-bv/src/blast/mod.rs:624`. Now a sound `unknown`.
+/// z3 4.16.0 and cvc5 1.3.4 both answer `sat`, so this is a completeness cost
+/// on a shape that previously crashed, not a lost verdict.
+#[test]
+fn an_fp_to_bv_argument_fences_on_the_array_path() {
+    let out = run_script(
+        "(set-logic ALL)\
+         (declare-fun a () (Array (_ BitVec 4) (_ BitVec 8)))\
+         (declare-fun i () (_ BitVec 4))(declare-fun x () Float32)\
+         (declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (assert (= (select a i) (f ((_ fp.to_ubv 8) RNE x))))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unknown"),
+        "got {out:?}"
+    );
+}
+
+/// The other direction, and the reason the fence above had to be GATED rather
+/// than unconditional. The same conversion in the same argument position on the
+/// FP/mixed path decides `sat` — `Lowerer::word` has the arm. Rejecting
+/// `FpToUbv`/`FpToSbv` outright would flip this to `unknown`: a decided →
+/// unknown regression, forbidden with no named-exception list.
+///
+/// Measured `sat` on both binaries before and after the round-1 fix; z3 4.16.0
+/// and cvc5 1.3.4 both answer `sat`.
+#[test]
+fn an_fp_to_bv_argument_still_decides_on_the_fp_path() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun x () Float32)\
+         (declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (assert (= (f ((_ fp.to_ubv 8) RNE x)) #x2a))(check-sat)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}

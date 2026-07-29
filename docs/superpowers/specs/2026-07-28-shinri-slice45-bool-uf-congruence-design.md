@@ -630,10 +630,61 @@ reproduce it.
   on the ABV path, where the abstraction removes it before blasting; on the
   pure-BV (`:1007`) and FP/mixed (`:1095`) paths `uses_arrays_over_bv` was
   false, so no BV-array `select` can be present and the predicate rejects every
-  array access there. `Select`/`Store` is the only reachable unblastable shape:
-  a BV-sorted `Ite` is eliminated by `word_norm` before lowering, and
-  `fp.to_ubv`/`fp.to_sbv` force `solver_uses_fp`, routing to the FP path where
-  `Lowerer::word` has arms for them.
+  array access there.
+
+  **Completeness of the check (CORRECTED in review round 1).** Enumerating
+  `BuiltinOp` (`crates/shinri-core/src/term.rs`) against `blast_bv_word`'s
+  dispatch (`crates/shinri-bv/src/blast/mod.rs:448-628`), the BV-**sorted**
+  heads with no arm are exactly four: `Select`, `Ite`, `FpToUbv`, `FpToSbv`.
+
+  - `Ite` is excluded upstream and unconditionally — `word_norm.normalize`
+    (`lib.rs:759`) eliminates every BV-sorted `ite` BEFORE any fence or routing
+    decision runs.
+  - `Select`/`Store` is gated by array sort, as above.
+  - **`FpToUbv`/`FpToSbv` is gated by `allow_fp_args`.** The first version of
+    this section claimed they "force `solver_uses_fp`, routing to the FP path
+    where `Lowerer::word` has arms for them", and concluded `Select` was the
+    only reachable shape. **That claim is FALSE and the conclusion with it.**
+    It holds for the pure-BV path (`lib.rs:1007` is guarded by
+    `uses_bv && !uses_fp`) but NOT for the ABV path: the ABV gate at
+    `lib.rs:902` runs BEFORE any FP routing and `return`s in every arm, and
+    `abv_stage` blasts with a bare `shinri_bv::Blaster` that has no FP sink —
+    as the Fence-1 comment at `lib.rs:905-908` already stated. Measured at
+    commit `4a3701e8` (this task's first commit), release AND debug:
+
+    ```
+    (set-logic ALL)(declare-fun a () (Array (_ BitVec 4) (_ BitVec 8)))
+    (declare-fun i () (_ BitVec 4))(declare-fun x () Float32)
+    (declare-fun f ((_ BitVec 8)) (_ BitVec 8))
+    (assert (= (select a i) (f ((_ fp.to_ubv 8) RNE x))))(check-sat)
+
+    thread 'main' panicked at crates/shinri-bv/src/blast/mod.rs:624:22:
+    internal error: entered unreachable code: non-BV builtin reached blast_word
+    ```
+
+    The argument is BitVec-8-sorted (passes the sort check) and contains no
+    `select` (passes the array half). `abv_stage::fenced` cannot help either:
+    `(fp.to_ubv rm x)` is not Bool-sorted, so `walk_fence` reaches only its
+    descend-into-a-non-Bool-term arm (`abv_stage.rs:198-200`) and the kids
+    bottom out at constants → `false`.
+
+    The gate must be conditional in both directions. `Lowerer::word`
+    (`crates/shinri-fp/src/lower.rs:52-73`) intercepts exactly these two ops and
+    routes them to `blast_fp_to_bv`, so on the FP/mixed path the shape decides:
+    `(= (f ((_ fp.to_ubv 8) RNE x)) #x2a)` is `sat` on both profiles, z3 4.16.0
+    and cvc5 1.3.4 agreeing. Rejecting unconditionally would flip that to
+    `unknown` — the same decided → unknown trap the `select` exemption avoids.
+    `allow_fp_args` is already precisely "an FP sink exists", so it is the
+    correct discriminator rather than a proxy for one. Post-fix, both profiles:
+    the ABV variant is `unknown` (a completeness cost on a shape that
+    previously crashed — z3 and cvc5 say `sat`, so no verdict was lost), the FP
+    variant stays `sat`.
+
+    Provenance: **pre-existing, not slice-45-introduced** — the no-UF variant
+    panics identically, so it belongs to the same class as the out-of-scope
+    hole below. Unlike that hole, however, it sits squarely inside Fence 1's
+    jurisdiction and inside what the fence's own doc-comment asserts it covers,
+    so it is fixed here rather than deferred.
 
   **Verdict-flip audit.** The only flips are `escape-bv` panic → `unknown` and
   `escape-bool` panic → `unknown`. No `sat`/`unsat` flip, and no decided →

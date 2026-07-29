@@ -365,13 +365,20 @@ fn is_bv_array(ctx: &Context, t: TermId) -> bool {
 /// `(Array Int (_ BitVec 8))` is BitVec-8-**sorted** and passes the sort check,
 /// then panics there — measured on both profiles, slice 45 Task 6.
 ///
-/// `Select`/`Store` is the only such shape reachable in practice. The other
-/// BV-sorted non-BV-op heads are all excluded upstream: a BV-sorted `Ite` is
-/// eliminated by `word_norm` before any lowering (slice 5), and the FP→BV
-/// conversions (`fp.to_ubv`/`fp.to_sbv`) force `solver_uses_fp`, which routes
-/// to the FP/mixed path where `Lowerer::word` has arms for them.
+/// Enumerating `BuiltinOp` (`crates/shinri-core/src/term.rs`) against
+/// `blast_bv_word`'s dispatch (`blast/mod.rs:448-628`), the BV-sorted heads
+/// with no arm are exactly four: `Select`, `Ite`, `FpToUbv`, `FpToSbv`.
 ///
-/// A `select`/`store` over a **BV-indexed, BV-valued** array is ADMITTED, and
+/// - `Ite` is excluded upstream and unconditionally: `word_norm.normalize`
+///   (`lib.rs:759`) eliminates every BV-sorted `ite` BEFORE any fence or
+///   routing decision runs, so it cannot reach any path.
+/// - `Select`/`Store` is handled below, by array sort.
+/// - `FpToUbv`/`FpToSbv` is handled below, by `allow_fp_args`.
+///
+/// # The two conditional exemptions
+///
+/// **`select`/`store` over a BV-indexed, BV-valued array is ADMITTED**, and
+/// that exemption is load-bearing, not laxity:
 /// that exemption is load-bearing, not laxity:
 /// `abv_stage::uses_arrays_over_bv` (`lib.rs:902`) routes any query containing
 /// one to the ABV path, where `shinri_abv::abstract_arrays` substitutes a
@@ -387,9 +394,45 @@ fn is_bv_array(ctx: &Context, t: TermId) -> bool {
 /// `select` can occur there at all — on those paths this predicate rejects
 /// every array access, which is exactly right.
 ///
+/// **`fp.to_ubv`/`fp.to_sbv` is admitted only when `allow_fp_args`** — that
+/// is, only where a `shinri_fp::Lowerer` is the sink. `Lowerer::word`
+/// intercepts exactly these two ops and routes them to `blast_fp_to_bv`
+/// (`crates/shinri-fp/src/lower.rs:52-73`); a bare `shinri_bv::Blaster` has no
+/// such interception and sends them straight to `blast_bv_word`'s
+/// `unreachable!`. `allow_fp_args` is already precisely "an FP sink exists",
+/// so it is the correct discriminator and not a proxy for one.
+///
+/// The gating is REQUIRED IN BOTH DIRECTIONS, and the review round that found
+/// this measured both:
+///
+/// - Rejecting unconditionally would fence `(= (f ((_ fp.to_ubv 8) RNE x))
+///   #x2a)` to `unknown`, where the FP/mixed path decides it `sat` today — a
+///   forbidden decided → unknown flip, the same trap the `select` exemption
+///   avoids.
+/// - Admitting unconditionally leaves the **ABV path** panicking. An earlier
+///   revision of this comment claimed these ops "force `solver_uses_fp`, which
+///   routes to the FP/mixed path"; that is TRUE of the pure-BV path
+///   (`lib.rs:1007` is guarded by `uses_bv && !uses_fp`) and FALSE of the ABV
+///   path, whose gate at `lib.rs:902` runs BEFORE any FP routing and `return`s
+///   in every arm. `abv_stage` blasts with a bare `Blaster` and passes
+///   `allow_fp_args = false` (`lib.rs:910`, and see the Fence-1 comment at
+///   `lib.rs:905-908` which states the no-FP-sink property), so this predicate
+///   correctly rejects there.
+///
+/// `abv_stage::fenced` cannot substitute: `(fp.to_ubv rm x)` is not Bool-sorted,
+/// so `walk_fence` reaches only its "descend into a non-Bool term" arm
+/// (`abv_stage.rs:198-200`) and the kids bottom out at constants → `false`.
+///
 /// Only positive results are memoized in `clean`: a negative short-circuits
-/// the whole `uf_args_supported` call, so it is never revisited.
-fn arg_term_blastable(ctx: &Context, t: TermId, clean: &mut rustc_hash::FxHashSet<TermId>) -> bool {
+/// the whole `uf_args_supported` call, so it is never revisited. `clean` is
+/// minted per `uf_args_supported` call, where `allow_fp_args` is fixed, so the
+/// memo cannot leak across a differing flag value.
+fn arg_term_blastable(
+    ctx: &Context,
+    t: TermId,
+    allow_fp_args: bool,
+    clean: &mut rustc_hash::FxHashSet<TermId>,
+) -> bool {
     if clean.contains(&t) {
         return true;
     }
@@ -398,7 +441,15 @@ fn arg_term_blastable(ctx: &Context, t: TermId, clean: &mut rustc_hash::FxHashSe
             let kids: Vec<TermId> = ctx.children(*args).to_vec();
             let foreign_array_op = matches!(op, Op::Builtin(BuiltinOp::Select | BuiltinOp::Store))
                 && !kids.first().is_some_and(|&k| is_bv_array(ctx, k));
-            !foreign_array_op && kids.iter().all(|&k| arg_term_blastable(ctx, k, clean))
+            let sinkless_fp_conversion = matches!(
+                op,
+                Op::Builtin(BuiltinOp::FpToUbv(_) | BuiltinOp::FpToSbv(_))
+            ) && !allow_fp_args;
+            !foreign_array_op
+                && !sinkless_fp_conversion
+                && kids
+                    .iter()
+                    .all(|&k| arg_term_blastable(ctx, k, allow_fp_args, clean))
         }
         TermNode::Const { .. } => true,
     };
@@ -436,9 +487,9 @@ fn walk_uf_args(
                 return false;
             }
             // Slice 45 Task 6: the sort check above is necessary but NOT
-            // sufficient — the argument TERM must also be one the blaster has
-            // an arm for. See `arg_term_blastable`.
-            if !arg_term_blastable(ctx, k, arg_clean) {
+            // sufficient — the argument TERM must also be one THIS PATH's sink
+            // has an arm for. See `arg_term_blastable`.
+            if !arg_term_blastable(ctx, k, allow_fp_args, arg_clean) {
                 return false;
             }
         }
@@ -1153,6 +1204,112 @@ mod tests {
         let fa = ctx.mk_app(Op::Uninterpreted(f), &[add]).unwrap();
         let c = ctx.mk_bv_const(8, Integer::from(42u64));
         let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fa, c]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "the walk must descend the whole argument subtree"
+        );
+    }
+
+    /// Review round 1's Critical. `((_ fp.to_ubv 8) RNE x)` is BitVec-8-SORTED,
+    /// so the sort check admits it, and it contains no `select`, so the array
+    /// half of `arg_term_blastable` admits it too — yet only a
+    /// `shinri_fp::Lowerer` has an arm for it (`Lowerer::word` intercepts
+    /// `FpToUbv`/`FpToSbv` and routes to `blast_fp_to_bv`,
+    /// `crates/shinri-fp/src/lower.rs:52-73`). A bare `shinri_bv::Blaster` —
+    /// which is what the ABV path uses — sends it to `blast_bv_word`'s
+    /// `unreachable!`.
+    ///
+    /// This must be gated on `allow_fp_args` in BOTH directions and this test
+    /// is the discriminating case for the `allow_fp_args = true` call site:
+    ///
+    /// - drop the gate (admit unconditionally) → the `false` assertion fails,
+    ///   and the ABV path panics again (measured: `(= (select a i)
+    ///   (f ((_ fp.to_ubv 8) RNE x)))` panicked at `blast/mod.rs:624` on both
+    ///   profiles at commit 4a3701e8);
+    /// - invert it, or reject unconditionally → the `true` assertion fails, and
+    ///   `(= (f ((_ fp.to_ubv 8) RNE x)) #x2a)` flips from `sat` to `unknown`,
+    ///   a forbidden decided → unknown regression.
+    ///
+    /// Note this is a strictly stronger claim than
+    /// `uf_args_supported_admits_fp_arguments_only_when_allowed`: there the
+    /// argument's SORT is FP, so the sort check alone discriminates. Here the
+    /// argument's sort is BitVec and only `arg_term_blastable` can catch it.
+    #[test]
+    fn uf_args_supported_admits_an_fp_to_bv_argument_only_when_allowed() {
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let s8 = ctx.bv_sort(8);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let rm = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let conv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rm, x])
+            .unwrap();
+        assert_eq!(
+            ctx.sort_of(conv),
+            s8,
+            "the conversion IS BitVec-sorted — the sort check cannot catch it"
+        );
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let fc = ctx.mk_app(Op::Uninterpreted(f), &[conv]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fc, c]).unwrap();
+        assert!(
+            uf_args_supported(&ctx, &[atom], true),
+            "with an FP sink (the FP/mixed path) `Lowerer::word` has the arm — \
+             rejecting here would be a decided (sat) -> unknown regression"
+        );
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "without an FP sink (the ABV path, `lib.rs:910`) a bare Blaster \
+             reaches blast_bv_word's unreachable! — must fence"
+        );
+    }
+
+    /// The signed twin, so a fix that special-cases only `FpToUbv` is caught.
+    #[test]
+    fn uf_args_supported_gates_fp_to_sbv_the_same_way() {
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let s8 = ctx.bv_sort(8);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let rm = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let conv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToSbv(8)), &[rm, x])
+            .unwrap();
+        let p = ctx.declare_fun("p", &[s8], ctx.bool_sort());
+        let pc = ctx.mk_app(Op::Uninterpreted(p), &[conv]).unwrap();
+        assert!(uf_args_supported(&ctx, &[pc], true));
+        assert!(
+            !uf_args_supported(&ctx, &[pc], false),
+            "fp.to_sbv needs the same gate as fp.to_ubv"
+        );
+    }
+
+    /// Buried under BV operators, so the check must descend rather than only
+    /// inspect the argument's head — the FP-conversion twin of
+    /// `uf_args_supported_rejects_a_foreign_array_read_nested_under_bv_ops`.
+    #[test]
+    fn uf_args_supported_rejects_a_nested_fp_to_bv_without_an_fp_sink() {
+        let mut ctx = Context::new();
+        let f32 = ctx.fp_sort(8, 24);
+        let s8 = ctx.bv_sort(8);
+        let xf = ctx.declare_fun("x", &[], f32);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let rm = ctx.mk_rm_const(shinri_core::RoundingMode::Rne);
+        let conv = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpToUbv(8)), &[rm, x])
+            .unwrap();
+        let one = ctx.mk_bv_const(8, Integer::from(1u64));
+        let add = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[conv, one])
+            .unwrap();
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let fa = ctx.mk_app(Op::Uninterpreted(f), &[add]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fa, c]).unwrap();
+        assert!(uf_args_supported(&ctx, &[atom], true));
         assert!(
             !uf_args_supported(&ctx, &[atom], false),
             "the walk must descend the whole argument subtree"
