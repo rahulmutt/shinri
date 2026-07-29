@@ -66,11 +66,13 @@ fn walk_uses(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>)
 /// use BV-arrays, returns true iff it ALSO contains a Bool-sorted atom that is
 /// not in scope. In-scope atoms are: a BV predicate / BV (dis)equality (handled
 /// by the bit-blaster); an array operation (select/store/array-eq — handled by
-/// refinement); and pure Boolean structure (And/Or/Not/Implies/Xor/Ite, plus
-/// Bool iff/xor). Anything else — EUF over an uninterpreted sort, an arithmetic
-/// relation, an array over an uninterpreted index/element, an uninterpreted
-/// predicate — would route to a theory we cannot combine with the eager
-/// abstraction here, so it fences and the caller returns Unknown.
+/// refinement); a Bool-sorted uninterpreted application, nullary (Tseitin
+/// skeleton) or, since slice 45, non-nullary over blastable arguments (handled
+/// by the bit-blaster's Ackermann congruence — see `walk_fence`); and pure
+/// Boolean structure (And/Or/Not/Implies/Xor/Ite, plus Bool iff/xor). Anything
+/// else — EUF over an uninterpreted sort, an arithmetic relation, an array over
+/// an uninterpreted index/element — would route to a theory we cannot combine
+/// with the eager abstraction here, so it fences and the caller returns Unknown.
 pub fn fenced(ctx: &Context, assertions: &[TermId]) -> bool {
     let mut visited = rustc_hash::FxHashSet::default();
     assertions.iter().any(|&a| walk_fence(ctx, a, &mut visited))
@@ -128,16 +130,53 @@ fn walk_fence(ctx: &Context, t: TermId, visited: &mut rustc_hash::FxHashSet<Term
                 // select/store over a non-BV array → out of scope.
                 return true;
             }
-            // A bare declared Bool constant (0-ary uninterpreted symbol,
-            // Bool-sorted) needs NO theory reasoning: it is Tseitin-encoded
-            // as a plain SAT variable regardless of which theories are in
-            // play — skeleton, not a foreign theory atom. Same exemption as
-            // fp_stage::has_non_fp_theory_atom / bv_stage's
-            // has_non_bv_theory_atom (ported in slice 6; closes the pinned
-            // sound-Unknown asymmetry from slice 5).
-            if matches!(op, Op::Uninterpreted(_)) && kids.is_empty() && ctx.sort_of(t) == bool_sort
-            {
-                return false;
+            // A Bool-sorted uninterpreted application. Two cases, both in scope,
+            // for different reasons.
+            //
+            // NULLARY (slices 5/6): a bare declared Bool constant needs NO theory
+            // reasoning — it is Tseitin-encoded as a plain SAT variable regardless
+            // of which theories are in play, so it is skeleton, not a foreign
+            // theory atom. Same exemption as fp_stage::has_non_fp_theory_atom /
+            // bv_stage's has_non_bv_theory_atom (ported in slice 6; closes the
+            // pinned sound-Unknown asymmetry from slice 5). On this path it
+            // reaches `encode_skeleton`'s catch-all → `bool_leaf` (`:505`), which
+            // memoizes one SAT var per TermId in `proxy_var`.
+            //
+            // NON-NULLARY (slice 45): a predicate over blastable arguments. The
+            // bit-blaster owns it — `blast_bv_atom`'s `Op::Uninterpreted` arm
+            // lowers it through `blast_uf_app` at result width 1, with Ackermann
+            // congruence — and `collect_bv_atoms` collects it
+            // (`bv_stage.rs:202`), so `RealBridge::new` blasts it at `:361` with
+            // the persistent blaster.
+            //
+            // WHY THIS FENCE NEEDED ITS OWN WIDENING. Slice 45's other two paths
+            // inherited theirs from `collect_bv_atoms`: `bv_stage`'s and
+            // `fp_stage`'s foreign-theory fences each consume a COLLECTED ATOM
+            // SET, so widening the collector widened them for free. This fence
+            // consumes no atom set at all — it walks the RAW assertions, and it
+            // runs at `lib.rs:903`, BEFORE `shinri_abv::abstract_arrays` builds
+            // the abstraction that `collect_bv_atoms` is later called on
+            // (`:357`). A query fenced here never constructs a `RealBridge`, so
+            // the collector never runs and slice 45's widening of it could not
+            // reach this path. Hence the explicit widening, authorized after
+            // measurement (slice 45 Task 5).
+            //
+            // Argument SORTS are deliberately not checked here: that is Fence 1's
+            // job (`bv_stage::uf_args_supported`, `lib.rs:910`), which runs
+            // unconditionally on the same raw assertions immediately after and
+            // rejects any Bool-result application whose argument the blaster
+            // cannot turn into a word (Int, Array, String, uninterpreted sort, …).
+            //
+            // Recursing into the arguments rather than returning `false` keeps a
+            // nested out-of-scope atom discoverable (e.g. a `select` over a non-BV
+            // array buried in an argument), matching the in-scope arms above. It
+            // is also what keeps the NULLARY case bit-identical to the pre-slice
+            // `return false`: for `kids.is_empty()` the iterator is empty and
+            // `Iterator::any` on an empty iterator is `false` by definition, so
+            // this branch returns exactly what it returned before for every
+            // nullary Bool application.
+            if matches!(op, Op::Uninterpreted(_)) && ctx.sort_of(t) == bool_sort {
+                return kids.iter().any(|&k| walk_fence(ctx, k, visited));
             }
             // Any other Bool-sorted application is an out-of-scope theory atom.
             if ctx.sort_of(t) == bool_sort {

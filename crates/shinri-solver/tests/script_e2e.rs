@@ -607,18 +607,35 @@ fn abv_ite_true_bool_const_not_wrong_sat() {
 }
 
 #[test]
-fn abv_bare_bool_plus_uninterpreted_predicate_fences_unknown() {
-    // M1 / Task-5 over-admission pin (a): a bare Bool and an uninterpreted
-    // predicate alongside an array-over-BV constraint fall outside ABV's admitted
-    // fragment. Both today fence to `unknown` (z3: sat — a sound fence, never
-    // wrong-SAT). Pins the fence so a future admission is a deliberate change.
+fn abv_bare_bool_plus_uninterpreted_predicate_decides() {
+    // Was `..._fences_unknown` (M1 / Task-5 over-admission pin (a)). Its doc said
+    // it existed "so a future admission is a deliberate change" — slice 45 Task 5
+    // IS that change, and this is the record of it.
+    //
+    // A bare Bool and a non-nullary uninterpreted PREDICATE alongside an
+    // array-over-BV constraint. Both are now in ABV's admitted fragment:
+    // `abv_stage::fenced` admits a Bool-sorted uninterpreted application at any
+    // arity (nullary as Tseitin skeleton since slice 5/6, non-nullary via the
+    // bit-blaster's Ackermann congruence since slice 45), and the blaster decides
+    // the query instead of the whole thing fencing to `unknown`.
+    //
+    // Verdict flip: `unknown` → `sat`. That is the slice-45 permitted
+    // `unknown` → decided direction, and the decided verdict is CORRECT —
+    // z3 4.16.0 and cvc5 1.3.4 both answer `sat` on this exact script. The
+    // widening was authorized only after that three-way agreement was measured,
+    // together with a full unfiltered oracle run in which this was the sole
+    // verdict change across the suite.
+    //
+    // The pin is KEPT, not deleted: it still guards everything beyond this one
+    // admission, and its sibling `abv_bare_bool_plus_arith_fences_unknown` below
+    // still fences — proving the fence bites on arithmetic exactly as before.
     let out = run_script(
         "(declare-const a (Array (_ BitVec 8) (_ BitVec 8)))\
          (declare-const p Bool)(declare-fun P ((_ BitVec 8)) Bool)\
          (declare-const x (_ BitVec 8))\
          (assert p)(assert (P x))(assert (= (select a x) #x2a))(check-sat)",
     );
-    assert_eq!(out, vec!["unknown"]);
+    assert_eq!(out, vec!["sat"]);
 }
 
 #[test]

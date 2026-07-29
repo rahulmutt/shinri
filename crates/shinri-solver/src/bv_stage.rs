@@ -162,8 +162,8 @@ pub fn collect_bv_atoms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
                 // (`tseitin.rs`'s `encode`) and `shinri_bv::lower` memoizes by
                 // rewritten TermId, but the ARRAY path does not —
                 // `abv_stage::RealBridge::new` loops `blast_atom` over the
-                // collected atoms unmemoized (`abv_stage.rs:318-324`) and
-                // `ensure_atom_lit` (`:268-274`) calls it again on demand.
+                // collected atoms unmemoized (`abv_stage.rs:357-363`) and
+                // `ensure_atom_lit` (`:307-313`) calls it again on demand.
                 // There, collecting a nullary Bool application would give one
                 // Bool constant two INDEPENDENT literals, true in one
                 // occurrence and false in another: a wrong `sat`. The
@@ -171,14 +171,29 @@ pub fn collect_bv_atoms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
                 // tripwire that vanishes in the shipping profile; THIS
                 // exclusion is the guard.
                 //
-                // As of slice 45 that array-path hazard is DEFENCE IN DEPTH,
-                // not a live bug: `abv_stage::fenced`'s `walk_fence`
-                // (`abv_stage.rs:138-144`) exempts nullary Bool applications
-                // and fences every OTHER Bool-sorted application, and it runs
-                // at `lib.rs:903` before `RealBridge::new` collects anything —
-                // so no Bool-result application reaches that driver yet. It
-                // goes live when Task 5 lifts that fence, which is precisely
-                // when this exclusion must already be correct.
+                // That array-path hazard IS LIVE as of slice 45 Task 5. It was
+                // previously masked: `abv_stage::fenced` fenced every
+                // non-nullary Bool-sorted application at `lib.rs:903`, before
+                // `RealBridge::new` collected anything, so no Bool-result
+                // application reached that driver and this exclusion was
+                // defence in depth. Task 5 widened that fence (authorized after
+                // measurement), so the ABV path now calls this collector for
+                // real and THIS CONJUNCT IS LOAD-BEARING FOR SOUNDNESS THERE:
+                // collecting a nullary Bool application would hand one Bool
+                // constant two independent literals and permit a wrong `sat`.
+                //
+                // What keeps the nullary case out on that path is this line and
+                // nothing else. `abv_stage::fenced` cannot help: its widened
+                // branch returns `kids.iter().any(walk_fence)`, which for a
+                // nullary application is `Iterator::any` over an EMPTY iterator
+                // — `false` by definition, i.e. bit-identical to the `return
+                // false` it replaced. So the fence admits nullary Bool
+                // applications exactly as it always did, and it is this
+                // collector that must decline to hand them to the blaster. A
+                // nullary Bool application instead reaches
+                // `abv_stage::encode_skeleton`'s catch-all → `bool_leaf`
+                // (`abv_stage.rs:505`), which memoizes one SAT var per TermId in
+                // `proxy_var` — one constant, one literal, sound.
                 //
                 // Excluding it costs nothing: a bare Bool constant keeps its
                 // existing Tseitin path (`tseitin.rs`'s

@@ -80,14 +80,26 @@ const N_ITERS: usize = 200;
 //           Exercises blast_bv_word's Uninterpreted-application congruence
 //           arm, which is otherwise unreachable by this suite (BV-sorted
 //           arguments; the FP-argument analogue lives in fp_oracle.rs).
+//
+//   Atom 5 (with prob 1/2, slice 45): 1..=2 Bool-result uninterpreted
+//           applications over the p/q pool, at either polarity:
+//             (p i{k}) | (q i{p} i{q}) | (p (select a{k} i{p}))
+//             | (q (select a{k} i{p}) (select a{k} i{q}))
+//           Exercises blast_bv_ATOM's Uninterpreted arm on the ABV path. The
+//           select-argument kinds are the ABV-specific shape: the argument is
+//           only a plain word after `abstract_arrays` replaces the read.
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Generate one QF_AUFBV instance.
 ///
-/// Returns `(solver_with_assertions, dump_text)` where `dump_text` is the
-/// SMT-LIB2 script (without `(check-sat)`) that exactly represents the same
+/// Returns `(solver_with_assertions, dump_text, used_pred)` where `dump_text` is
+/// the SMT-LIB2 script (without `(check-sat)`) that exactly represents the same
 /// formula sent to z3.  The two are built in lockstep so they are always in sync.
-fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
+/// `used_pred` reports whether this instance emitted a slice-45 Bool-result
+/// predicate application; the driver's decidedness gate is scoped to exactly
+/// those instances, so a healthy overall decided rate cannot mask a predicate
+/// family that never decides.
+fn gen_instance(rng: &mut Lcg) -> (Solver, String, bool) {
     const N_ARR: usize = 3;
     const N_IDX: usize = 3;
     const N_ELT: usize = 3;
@@ -117,6 +129,15 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
     let uf1 = s.declare_fun("f", &[bv8], bv8);
     let uf2 = s.declare_fun("g", &[bv8, bv8], bv8);
 
+    // slice 45: the Bool-result analogue of the f/g pool — 1-ary p, 2-ary q.
+    // Same deliberately-small pool for the same reason: applications must
+    // collide on one symbol across the corpus for a congruence violation to be
+    // reachable. Declared unconditionally (Atom 5 is emitted with prob 1/2), so
+    // every dump parses identically whether or not the family is exercised.
+    let bool_sort = s.bool_sort();
+    let pred1 = s.declare_fun("p", &[bv8], bool_sort);
+    let pred2 = s.declare_fun("q", &[bv8, bv8], bool_sort);
+
     // ── dump header ─────────────────────────────────────────────────────────
     // set-logic QF_AUFBV (not QF_ABV): z3 rejects declare-fun with a nonzero
     // arity under QF_ABV ("logic does not support uninterpreted functions"),
@@ -136,6 +157,10 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
     dump.push_str(&format!(
         "\n(declare-fun f ((_ BitVec {width})) (_ BitVec {width}))\
          \n(declare-fun g ((_ BitVec {width}) (_ BitVec {width})) (_ BitVec {width}))"
+    ));
+    dump.push_str(&format!(
+        "\n(declare-fun p ((_ BitVec {width})) Bool)\
+         \n(declare-fun q ((_ BitVec {width}) (_ BitVec {width})) Bool)"
     ));
 
     // ── Atom 0: store-select witness ─────────────────────────────────────────
@@ -307,7 +332,67 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String) {
         }
     }
 
-    (s, dump)
+    // ── Atom 5 (prob 1/2): slice-45 Bool-result predicate applications ────────
+    // The Task-5 family: a NON-NULLARY uninterpreted application with a Bool
+    // result sort, which `blast_bv_atom`'s `Op::Uninterpreted` arm owns. On the
+    // ABV path this is what `abv_stage::fenced` used to reject outright, so the
+    // driver's `pred_decided` gate is what proves the path now DECIDES these
+    // rather than merely staying sound.
+    //
+    // Emitted at probability 1/2 so `pred_total` is a strict subset of the
+    // corpus and the family's decided rate cannot be read off the overall rate.
+    // 1..=2 atoms per instance so two applications of ONE symbol can collide and
+    // make an Ackermann-congruence contradiction reachable: paired with Atom 1's
+    // functional-consistency `(= (select a i{p}) (select a i{q}))`, a
+    // `(p (select a i{p}))` / `(not (p (select a i{q})))` pair is UNSAT only if
+    // congruence fires.
+    let mut used_pred = false;
+    if rng.below(2) == 1 {
+        used_pred = true;
+        let n_pred = 1 + rng.below(2) as usize; // 1..=2
+        for _ in 0..n_pred {
+            let p = rng.below(N_IDX as u64) as usize;
+            let q = rng.below(N_IDX as u64) as usize;
+            let ai = rng.below(N_ARR as u64) as usize;
+            let neg = rng.below(2) == 1;
+            let (atom, text) = match rng.below(4) {
+                0 => {
+                    let a = s.app(Op::Uninterpreted(pred1), &[idxs[p]]);
+                    (a, format!("(p i{p})"))
+                }
+                1 => {
+                    let a = s.app(Op::Uninterpreted(pred2), &[idxs[p], idxs[q]]);
+                    (a, format!("(q i{p} i{q})"))
+                }
+                // The ABV-specific shapes: the predicate's argument is a
+                // `select`, so it only becomes a plain BV word after
+                // `shinri_abv::abstract_arrays` substitutes a read var
+                // (crates/shinri-abv/src/abstraction.rs:72 `subst`, which
+                // rebuilds through ANY `Op` including `Uninterpreted`).
+                2 => {
+                    let sel = s.app(Op::Builtin(BuiltinOp::Select), &[arrays[ai], idxs[p]]);
+                    let a = s.app(Op::Uninterpreted(pred1), &[sel]);
+                    (a, format!("(p (select a{ai} i{p}))"))
+                }
+                _ => {
+                    let sp = s.app(Op::Builtin(BuiltinOp::Select), &[arrays[ai], idxs[p]]);
+                    let sq = s.app(Op::Builtin(BuiltinOp::Select), &[arrays[ai], idxs[q]]);
+                    let a = s.app(Op::Uninterpreted(pred2), &[sp, sq]);
+                    (a, format!("(q (select a{ai} i{p}) (select a{ai} i{q}))"))
+                }
+            };
+            if neg {
+                let n = s.app(Op::Builtin(BuiltinOp::Not), &[atom]);
+                s.assert(n);
+                dump.push_str(&format!("\n(assert (not {text}))"));
+            } else {
+                s.assert(atom);
+                dump.push_str(&format!("\n(assert {text})"));
+            }
+        }
+    }
+
+    (s, dump, used_pred)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -376,12 +461,28 @@ fn qfabv_matches_z3() {
     let mut n_sat = 0usize;
     let mut n_unsat = 0usize;
     let mut n_unknown_or_skipped = 0usize;
+    // slice 45: decidedness of the Bool-result predicate family.
+    let mut pred_total = 0usize;
+    let mut pred_decided = 0usize;
 
     for it in 0..N_ITERS {
-        let (mut solver, dump) = gen_instance(&mut rng);
+        let (mut solver, dump, used_pred) = gen_instance(&mut rng);
 
         let ours = solver.check_sat();
         let theirs = z3_verdict(&dump);
+
+        // Counted BEFORE the match, and keyed on `ours` ALONE. `n_unknown_or_
+        // skipped` below conflates two distinct outcomes — OUR incompleteness
+        // (`SolveOutcome::Unknown`) and z3 having no ground truth (the `(_,
+        // "unknown")` arm, where shinri may well have decided). Deriving
+        // `pred_decided` from that counter would charge z3's timeouts to our
+        // fence and depress the ratio for a reason this gate is not about.
+        if used_pred {
+            pred_total += 1;
+            if ours != SolveOutcome::Unknown {
+                pred_decided += 1;
+            }
+        }
 
         match (ours, theirs.as_str()) {
             (SolveOutcome::Sat, "sat") => {
@@ -409,7 +510,8 @@ fn qfabv_matches_z3() {
 
     println!(
         "qfabv_matches_z3: {N_ITERS} iters, {n_sat} sat / {n_unsat} unsat / \
-         {n_unknown_or_skipped} unknown-or-skipped, 0 mismatches"
+         {n_unknown_or_skipped} unknown-or-skipped, 0 mismatches\n  \
+         slice-45 Bool-result predicate family: decided={pred_decided}/{pred_total}"
     );
 
     // Both SAT and UNSAT must be exercised — otherwise the oracle proves nothing.
@@ -420,5 +522,30 @@ fn qfabv_matches_z3() {
     assert!(
         n_unsat > 0,
         "generator produced zero UNSAT instances — generator or solver is broken"
+    );
+
+    // ── slice 45: the family-scoped decidedness gate ─────────────────────────
+    //
+    // THIS is the assertion that fails on pre-slice main. The zero-disagreement
+    // panic above cannot: pre-slice every predicate instance is Unknown (the
+    // whole query fences at `abv_stage::fenced`), and Unknown is a skip — so a
+    // generator extension ALONE would be green on the unfixed tree and would
+    // prove nothing.
+    //
+    // `pred_total > 0` is not redundant with the ratio check: a generator change
+    // that stopped emitting predicates entirely would leave the ratio vacuously
+    // unmet in a way only this line names. Same class as a 0-test nextest run
+    // reading as green.
+    assert!(
+        pred_total > 0,
+        "generator emitted zero Bool-result predicate instances — the slice-45 \
+         family is not being exercised at all"
+    );
+    assert!(
+        pred_decided > pred_total / 2,
+        "Bool-result predicate family decided {pred_decided}/{pred_total} — \
+         more than half must decide. Pre-slice this is 0/N by construction \
+         (the abv_stage foreign-theory fence); post-slice a low rate means the \
+         collection widening or a fence is rejecting instances it should admit"
     );
 }

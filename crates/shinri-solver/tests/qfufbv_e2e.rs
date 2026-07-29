@@ -594,3 +594,36 @@ fn a_predicate_alongside_the_real_bridge_decides() {
         "got {out:?}"
     );
 }
+
+/// The ABV path shares `blast_bv_atom` through a PERSISTENT blaster that
+/// survives refinement rounds (crates/shinri-solver/src/abv_stage.rs:351),
+/// unlike `lower`'s one-shot. The `UfApp` registry must survive with it, or a
+/// predicate application registered in round 1 will not be paired with one
+/// blasted in round 2.
+///
+/// The array abstraction replaces `select`/`store` with fresh BV symbols
+/// BEFORE `collect_bv_atoms` runs, so the predicate's argument is already a
+/// plain word by the time the arm sees it.
+///
+/// Reaching this at all required widening `abv_stage::fenced` (slice 45 Task 5,
+/// authorized after measurement): that fence walks the RAW assertions at
+/// `lib.rs:903`, before the abstraction exists, so it never sees
+/// `collect_bv_atoms`' output and Task 3's widening of the collector could not
+/// reach this path. Pre-widening this query returned `unknown`. z3 4.16.0 and
+/// cvc5 1.3.4 both answer `unsat`.
+#[test]
+fn predicate_over_an_array_read_decides() {
+    let out = run_script(
+        "(set-logic QF_AUFBV)\
+         (declare-fun a () (Array (_ BitVec 4) (_ BitVec 8)))\
+         (declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun i () (_ BitVec 4))(declare-fun j () (_ BitVec 4))\
+         (assert (= i j))\
+         (assert (p (select a i)))(assert (not (p (select a j))))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
