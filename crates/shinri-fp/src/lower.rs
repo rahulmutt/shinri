@@ -111,6 +111,29 @@ impl WordSink for Lowerer {
 impl Lowerer {
     /// Blast a Bool-sorted atom (BV or FP predicate / (dis)equality) to a literal.
     pub fn atom(&mut self, ctx: &Context, t: TermId) -> BitLit {
+        // Slice 45: an uninterpreted application is matched BEFORE the
+        // first-operand-sort test below. Dispatching it by operand sort would
+        // send a predicate over an FP argument — `(p a)` with `a : Float32` —
+        // to `blast_fp_atom`, which has no uninterpreted-application arm: a
+        // PANIC, not an `unknown`. `blast_bv_atom`'s slice-45 arm handles both
+        // argument sorts, because `blast_uf_app` compares arguments through
+        // `sink.word_eq`, which this Lowerer overrides with `core_eq`.
+        //
+        // No arity test here, DELIBERATELY: `blast_bv_atom`'s arm owns the
+        // nullary invariant (its `debug_assert!` — a nullary Bool application
+        // must never be collected, because `blast_uf_app` would mint a fresh
+        // unconstrained literal per call). `collect_bv_atoms` enforces it with
+        // a load-bearing `!kids.is_empty()` conjunct, so this path relies on
+        // exactly the same guarantee the pure-BV path does. Re-testing arity
+        // here would fall through to the `kids[0]` index below and turn a
+        // documented invariant into a second, divergent failure mode.
+        if let TermNode::App {
+            op: Op::Uninterpreted(_),
+            ..
+        } = ctx.term_node(t)
+        {
+            return blast_bv_atom(self, ctx, t);
+        }
         // Dispatch by the sort of the atom's first operand.
         let first_operand_sort = match ctx.term_node(t) {
             TermNode::App { args, .. } => {

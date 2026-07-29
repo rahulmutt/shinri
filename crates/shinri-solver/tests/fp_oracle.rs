@@ -164,13 +164,49 @@ const RMS: &[&str] = &["RNE", "RNA", "RTP", "RTN", "RTZ"];
 /// Declares three fp32 variables (x, y, z) and optionally a symbolic rounding mode.
 /// Builds 1–3 assertions mixing fp.add/fp.sub with fp.eq/=/fp.isNaN atoms,
 /// some negated, so that both SAT and UNSAT witnesses arise across iterations.
-fn gen_arith_script(rng: &mut Lcg) -> String {
+///
+/// Slice 45 additionally declares `p`, a Bool-result uninterpreted predicate
+/// over Float32, and can emit `(p <fp-term>)` atoms. The `PredFamily` in the
+/// return value reports which slice-45 family this instance exercises, so the
+/// driver's gates can be scoped to exactly that family — a healthy overall
+/// decided rate must not mask a predicate family that never decides.
+///
+/// One instance in five is instead a whole-script `PredFamily::UnblastableArg`
+/// congruence probe (see `gen_pred_unblastable_arg_probe`) rather than the
+/// random assertion mix. That branch draws one extra `rng.below(5)` per
+/// iteration, which SHIFTS THE RNG STREAM relative to the pre-fix generator —
+/// the per-family decided counts printed by the driver are therefore not
+/// comparable across that change by absolute value.
+///
+/// `p` is declared under `(set-logic QF_FP)`: z3 4.16.0 accepts an
+/// uninterpreted function declaration under QF_FP (verified — it returns a
+/// concrete `sat`, unlike `(set-logic QF_UFFP)`, which z3 rejects outright
+/// with `unknown sort 'FloatingPoint'`). So `z3_outcome_arith`'s logic is
+/// unchanged; this is NOT the `z3_outcome_mixed` situation. The same holds for
+/// the probe's `g : Float32 -> Float32` and `h : Float32 -> RoundingMode`
+/// declarations — measured on z3 4.16.0, both are accepted under QF_FP and z3
+/// answers `unsat` on the probe scripts. (cvc5 1.3.4 REJECTS them under QF_FP
+/// with "Functions (of non-zero arity) cannot be declared in logic QF_FP"; this
+/// oracle only ever consults z3, and the same shapes are cross-checked against
+/// cvc5 under `(set-logic ALL)` in qfufbv_e2e.rs.)
+fn gen_arith_script(rng: &mut Lcg) -> (String, PredFamily) {
+    // slice 45 (C1 fix): one in five instances is the unblastable-argument
+    // congruence probe instead of the random mix.
+    if rng.below(5) == 0 {
+        return (
+            gen_pred_unblastable_arg_probe(rng),
+            PredFamily::UnblastableArg,
+        );
+    }
     let mut s = String::from(
         "(set-logic QF_FP)\n\
          (declare-fun x () (_ FloatingPoint 8 24))\n\
          (declare-fun y () (_ FloatingPoint 8 24))\n\
-         (declare-fun z () (_ FloatingPoint 8 24))\n",
+         (declare-fun z () (_ FloatingPoint 8 24))\n\
+         (declare-fun p ((_ FloatingPoint 8 24)) Bool)\n",
     );
+    // slice 45: did this instance emit a Bool-result predicate application?
+    let mut used_pred = false;
     let use_sym_rm = rng.below(4) == 0;
     if use_sym_rm {
         s.push_str("(declare-fun rm () RoundingMode)\n");
@@ -190,10 +226,23 @@ fn gen_arith_script(rng: &mut Lcg) -> String {
             "fp.sub"
         };
         let term = format!("({op} {} x y)", rm(rng));
-        let atom = match rng.below(3) {
+        let atom = match rng.below(4) {
             0 => format!("(fp.eq z {term})"),
             1 => format!("(= z {term})"),
-            _ => format!("(fp.isNaN {term})"),
+            2 => format!("(fp.isNaN {term})"),
+            // slice 45: a Bool-result uninterpreted application over an FP
+            // argument — the atom `Lowerer::atom` used to mis-dispatch into
+            // `blast_fp_atom` (a panic) and that the pre-slice fence rejected.
+            // Mirrors the `fp.isNaN` arm's shape: the predicate wraps the same
+            // arithmetic term, so two asserts picking this arm with different
+            // rounding modes give congruence something real to do. This arm is
+            // what makes a z3 disagreement reachable — see the TRIAGE NOTE at
+            // the `DISAGREEMENT` panic in `differential_qf_fp_add_sub` before
+            // concluding shinri is at fault.
+            _ => {
+                used_pred = true;
+                format!("(p {term})")
+            }
         };
         if rng.below(2) == 0 {
             s.push_str(&format!("(assert (not {atom}))\n"));
@@ -202,7 +251,68 @@ fn gen_arith_script(rng: &mut Lcg) -> String {
         }
     }
     s.push_str("(check-sat)\n");
-    s
+    (
+        s,
+        if used_pred {
+            PredFamily::Blastable
+        } else {
+            PredFamily::None
+        },
+    )
+}
+
+/// Which slice-45 Bool-result-predicate family an instance exercises.
+///
+/// The two non-`None` families have OPPOSITE expectations, so one counter
+/// cannot serve both — that conflation is precisely what let C1 hide.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PredFamily {
+    /// No Bool-result uninterpreted application at all.
+    None,
+    /// `(p <blastable-fp-term>)`. Slice 45's deliverable: must DECIDE.
+    Blastable,
+    /// `(p …)` whose argument subtree contains a NON-NULLARY uninterpreted
+    /// application of FP result sort (`g`) or RoundingMode result sort (`h`).
+    /// `blast_fp_word`/`blast_rm` have no arm for either: they mint a fresh
+    /// unconstrained word / a fresh symbolic rounding mode and register
+    /// NOTHING in `uf_apps`, so two applications of `g` to provably equal
+    /// arguments get INDEPENDENT words and congruence on `p` never fires.
+    /// Every form below is unsat-by-construction; at `cd4a91b8` all four
+    /// returned a wrong `sat` (release) or panicked at
+    /// `crates/shinri-fp/src/lib.rs:151` (debug). Must NOT come back `Sat`.
+    UnblastableArg,
+}
+
+/// Slice-45 C1 probe: a Bool-result predicate whose argument subtree hides a
+/// non-nullary uninterpreted application the FP blaster cannot turn into a
+/// word. `(= x y)` forces the two `g`/`h` arguments equal, so congruence on
+/// `p` makes every form UNSAT (confirmed on z3 4.16.0 and cvc5 1.3.4).
+///
+/// This is the shape `fp_oracle`'s generator could NOT emit before the C1 fix:
+/// it declared only `p` (Bool result) and always applied it to an argument the
+/// blaster HAS an arm for, so 627 green oracle tests could not see the bug.
+fn gen_pred_unblastable_arg_probe(rng: &mut Lcg) -> String {
+    let head = "(set-logic QF_FP)\n\
+                (declare-fun x () (_ FloatingPoint 8 24))\n\
+                (declare-fun y () (_ FloatingPoint 8 24))\n\
+                (declare-fun z () (_ FloatingPoint 8 24))\n\
+                (declare-fun p ((_ FloatingPoint 8 24)) Bool)\n";
+    let g = "(declare-fun g ((_ FloatingPoint 8 24)) (_ FloatingPoint 8 24))\n";
+    let h = "(declare-fun h ((_ FloatingPoint 8 24)) RoundingMode)\n";
+    // Four forms, matching the four measured C1 instances.
+    let (decls, a1, a2) = match rng.below(4) {
+        // Bare FP-result UF directly as the predicate argument.
+        0 => (g, "(p (g x))", "(p (g y))"),
+        // Nested under a SUPPORTED FP op — the generic child recursion in the
+        // support walk has to descend to find it.
+        1 => (g, "(p (fp.abs (g x)))", "(p (fp.abs (g y)))"),
+        // Nested as an operand of a rounding op, one level deeper still.
+        2 => (g, "(p (fp.add RNE (g x) z))", "(p (fp.add RNE (g y) z))"),
+        // The RoundingMode twin: a non-nullary RM-result symbol in the RM slot,
+        // which `blast_rm` silently treats as a fresh symbolic rounding mode.
+        _ => (h, "(p (fp.add (h x) x x))", "(p (fp.add (h y) x x))"),
+    };
+    format!("{head}{decls}(assert (= x y))\n(assert {a1})\n(assert (not {a2}))\n(check-sat)\n")
 }
 
 #[test]
@@ -211,9 +321,40 @@ fn differential_qf_fp_add_sub() {
     // Fixed to 0x0ADD_5AB_0001 (replaced U→A, prepended 0 for valid u64 literal).
     let mut rng = Lcg(0x00AD_D5AB_0001);
     let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    // slice 45: decidedness of the Bool-result predicate family.
+    let (mut pred_total, mut pred_decided) = (0usize, 0usize);
+    // slice 45 C1: instances whose predicate argument hides a non-nullary
+    // FP-result / RoundingMode-result uninterpreted application.
+    let mut probe_total = 0usize;
     for iter in 0..N_ITERS {
-        let src = gen_arith_script(&mut rng);
+        let (src, family) = gen_arith_script(&mut rng);
         let ours = shinri_outcome(&src);
+        match family {
+            PredFamily::None => {}
+            PredFamily::Blastable => {
+                pred_total += 1;
+                if ours != SolveOutcome::Unknown {
+                    pred_decided += 1;
+                }
+            }
+            // Every probe form is unsat-by-construction. `Unknown` is the
+            // correct post-C1-fence answer and `Unsat` would be correct too;
+            // `Sat` is the wrong-`sat` this whole arm exists to catch, and it
+            // is what `cd4a91b8` returned. Assert BEFORE the z3 comparison so
+            // the failure names the defect rather than surfacing as a generic
+            // disagreement.
+            PredFamily::UnblastableArg => {
+                probe_total += 1;
+                assert_ne!(
+                    ours,
+                    SolveOutcome::Sat,
+                    "slice-45 C1 WRONG SAT (iter {iter}): a predicate argument \
+                     containing a non-nullary FP-result / RoundingMode-result \
+                     uninterpreted application blasted without congruence; \
+                     this script is unsat-by-construction\n{src}"
+                );
+            }
+        }
         if ours == SolveOutcome::Unknown {
             n_unknown += 1;
             continue;
@@ -228,13 +369,45 @@ fn differential_qf_fp_add_sub() {
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
             (SolveOutcome::Sat, easy_smt::Response::Unknown)
             | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            // TRIAGE NOTE, slice 45. If this fires as shinri=Unsat z3=Sat on a
+            // script containing `(p …)`, SUSPECT z3 FIRST — do not "fix"
+            // congruence to under-trigger, which is the wrong-`sat` direction.
+            // z3 (measured on 4.16.0) has an FP+UF congruence defect: two
+            // NaN-valued arguments are one VALUE in SMT-LIB but many bit
+            // patterns, and z3 misses the ENTAILED equality. It is self-
+            // refuting — asked for its model it returns `p := λx. true` and
+            // then evaluates `(p b)` to `true` against an asserted
+            // `(not (p b))` — and it answers `unsat` for the same query once
+            // `(= a b)` is stated syntactically. cvc5 and shinri say `unsat`.
+            // Full diagnosis and the corroborating probes live at
+            // `nan_arguments_are_congruent_for_a_predicate` in
+            // tests/qfufbv_e2e.rs. This generator emits `(p <fp-term>)`, so
+            // the split is reachable here even though it has never fired.
             (o, t) => {
                 panic!("QF_FP add/sub DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}")
             }
         }
     }
-    println!("differential_qf_fp_add_sub: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+    println!(
+        "differential_qf_fp_add_sub: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
+         pred_total={pred_total} pred_decided={pred_decided} probe_total={probe_total}"
+    );
     assert!(n_sat > 0 && n_unsat > 0, "oracle produced no coverage");
+    assert!(
+        pred_total > 0,
+        "generator emitted zero Bool-result predicate instances — the slice-45 \
+         family is not being exercised at all"
+    );
+    assert!(
+        probe_total > 0,
+        "generator emitted zero unblastable-argument probes — the slice-45 C1 \
+         shape is not being exercised at all (a green run would prove nothing)"
+    );
+    assert!(
+        pred_decided > pred_total / 2,
+        "Bool-result predicate family decided {pred_decided}/{pred_total} — \
+         more than half must decide"
+    );
 }
 
 /// Feed a QF_FP script to z3 via easy_smt and return its check-sat response.

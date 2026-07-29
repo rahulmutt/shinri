@@ -66,9 +66,10 @@ pub struct FpToBvApp {
 /// `sym` ALONE does not identify a function. `Context::declare_fun` interns by
 /// NAME and overwrites `fun_sigs`, and `Command::DeclareFun` accepts a
 /// redeclaration silently, so one `SymbolId` can carry applications of two
-/// different functions — different arities, argument sorts, or result widths —
-/// inside a single assertion list. `arg_sorts` + the word lengths are what make
-/// the pairing predicate (`shape_compatible`) total; see it for the details.
+/// different functions — different arities, argument sorts, or result sorts —
+/// inside a single assertion list. `arg_sorts` + `result_sort` + the word
+/// lengths are what make the pairing predicate (`shape_compatible`) total; see
+/// it for the details.
 #[derive(Clone)]
 pub struct UfApp {
     pub sym: shinri_core::SymbolId,
@@ -77,6 +78,13 @@ pub struct UfApp {
     /// `(_ BitVec 32)` are both 32 bits, but `word_eq` dispatches on the sort
     /// and compares them by different semantics.
     pub arg_sorts: Vec<shinri_core::SortId>,
+    /// The declared RESULT sort. Slice 44 could infer it from `result.len()`
+    /// because the only arm recording a `UfApp` recorded BV results and BV
+    /// sorts intern by width. Slice 45 breaks that inference: it records
+    /// Bool results as ONE-BIT words, and `Bool` and `(_ BitVec 1)` are
+    /// different sorts at the same length. Pairing those two relates two
+    /// different functions — a wrong `unsat`, silently.
+    pub result_sort: shinri_core::SortId,
     /// One blasted word per argument, in argument order.
     pub args: Vec<Vec<BitLit>>,
     pub result: Vec<BitLit>,
@@ -89,9 +97,9 @@ pub struct UfApp {
 ///
 /// This predicate is TOTAL over every way two `UfApp`s recorded under one
 /// `SymbolId` can be shape-incompatible: arity, per-argument sort, per-argument
-/// word length, and result word length. It is the sole guard — the arm below
-/// carries no shape assertion, because an assertion vanishes in the shipping
-/// profile and this must hold there.
+/// word length, result sort, and result word length. It is the sole guard — the
+/// arm below carries no shape assertion, because an assertion vanishes in the
+/// shipping profile and this must hold there.
 ///
 /// SKIPPING an incompatible prior is sound in the COMPLETENESS-LOSING
 /// direction only: congruence is an ADDED constraint, so omitting it can only
@@ -103,6 +111,7 @@ fn shape_compatible(
     sym: shinri_core::SymbolId,
     arg_sorts: &[shinri_core::SortId],
     arg_words: &[Vec<BitLit>],
+    result_sort: shinri_core::SortId,
     result_len: usize,
 ) -> bool {
     prior.sym == sym
@@ -119,9 +128,15 @@ fn shape_compatible(
             .iter()
             .zip(arg_words.iter())
             .all(|(p, n)| p.len() == n.len())
+        // Result SORT. Slice 44 inferred this from the length below, on the
+        // premise that only BV results are ever recorded. Slice 45 records
+        // Bool results at length 1, so `Bool` and `(_ BitVec 1)` now collide
+        // on length — the same redeclaration hazard `arg_sorts` guards on the
+        // argument side, on the result side. Checked directly.
+        && prior.result_sort == result_sort
         // Result width: the congruence clauses `zip` the two result words.
-        // The arm only ever records BV results, and BV sorts intern by width,
-        // so equal length here is equal result sort.
+        // Equal sorts already imply equal length, but this is what the `zip`
+        // actually walks, so it is checked directly rather than inferred.
         && prior.result.len() == result_len
 }
 
@@ -349,8 +364,16 @@ impl WordSink for Blaster {
     }
 }
 
-/// Blast one uninterpreted, BV-result application of `sym` to `child_ids`, and
-/// wire Ackermann congruence to every prior application of the SAME function.
+/// Blast one uninterpreted application of `sym` to `child_ids`, whose declared
+/// result is `result_sort` occupying `width` bits, and wire Ackermann
+/// congruence to every prior application of the SAME function.
+///
+/// Two callers, two result kinds. `blast_bv_word` drives it for BV-result
+/// applications at the sort's own width (slice 44). `blast_bv_atom` drives it
+/// for BOOL-result applications — predicates — at width 1 (slice 45), where the
+/// per-pair clause degenerates to the single `cond -> (v_prior <-> v_new)`.
+/// `result_sort` is what keeps those two kinds apart when the widths coincide;
+/// see `shape_compatible`.
 ///
 /// Standalone (rather than inline in `blast_bv_word`'s match) for parity with
 /// its sibling `shinri_fp::blast_fp_to_bv`, which encodes the same clause shape
@@ -360,6 +383,7 @@ fn blast_uf_app<S: WordSink>(
     ctx: &Context,
     sym: shinri_core::SymbolId,
     child_ids: &[TermId],
+    result_sort: shinri_core::SortId,
     width: u32,
 ) -> Vec<BitLit> {
     if child_ids.is_empty() {
@@ -389,7 +413,7 @@ fn blast_uf_app<S: WordSink>(
     let prior: Vec<UfApp> = sink
         .uf_apps()
         .iter()
-        .filter(|a| shape_compatible(a, sym, &arg_sorts, &arg_words, result.len()))
+        .filter(|a| shape_compatible(a, sym, &arg_sorts, &arg_words, result_sort, result.len()))
         .cloned()
         .collect();
     for pa in prior {
@@ -411,6 +435,7 @@ fn blast_uf_app<S: WordSink>(
     sink.uf_apps().push(UfApp {
         sym,
         arg_sorts,
+        result_sort,
         args: arg_words,
         result: result.clone(),
     });
@@ -450,7 +475,7 @@ pub fn blast_bv_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
         } => {
             let child_ids = ctx.children(args).to_vec();
             let width = ctx.bv_width(sort).expect("BV-sorted variable has BV sort");
-            blast_uf_app(sink, ctx, sym, &child_ids, width)
+            blast_uf_app(sink, ctx, sym, &child_ids, sort, width)
         }
         TermNode::App {
             op: Op::Builtin(bv_op),
@@ -604,11 +629,71 @@ pub fn blast_bv_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
 }
 
 /// BV atom (Bool-sorted predicate) dispatch, generic over the sink. Handles
-/// `Eq`/`Distinct` over BV operands and all `BvUlt..BvSge` comparisons. No
-/// cache: callers recurse into words via `sink.word`, which IS memoized.
+/// `Eq`/`Distinct` over BV operands, all `BvUlt..BvSge` comparisons, and — since
+/// slice 45 — non-nullary uninterpreted applications with a Bool result.
+///
+/// NO CACHE, and callers must know it. Word subterms are memoized because they
+/// go through `sink.word`, but the atom node itself is re-blasted on every call.
+/// That is harmless for the arms that only combine already-memoized words, and
+/// for the uninterpreted arm it is load-bearing — see the note on that arm for
+/// which drivers memoize and which do not.
 pub fn blast_bv_atom<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> BitLit {
     let node = ctx.term_node(t).clone();
     match node {
+        // Slice 45: a Bool-result uninterpreted application. Delegates to the
+        // slice-44 gadget at result width 1, so the Ackermann clause per prior
+        // pair degenerates to the single `cond -> (v_prior <-> v_new)`.
+        //
+        // `blast_bv_atom` is only ever called on a Bool-sorted term, so no
+        // result-sort test is needed here. The node's own `sort` is handed to
+        // `blast_uf_app` and recorded: it is what keeps this Bool result from
+        // pairing with a `(_ BitVec 1)` result of the same redeclared symbol,
+        // which `result.len()` alone cannot distinguish.
+        //
+        // NULLARY applications must never reach this arm, and the exclusion in
+        // `bv_stage::collect_bv_atoms` is LOAD-BEARING FOR SOUNDNESS — not
+        // tidiness, and not merely a cost question.
+        //
+        // `blast_bv_atom` is uncached by contract (see this function's header),
+        // so every call on the same atom re-blasts it. For a NON-nullary
+        // application that is only wasteful: the repeat is `shape_compatible`
+        // with the prior one, so congruence pairs them and forces the two
+        // literals equal. For a NULLARY one there is no such rescue —
+        // `blast_uf_app`'s `child_ids.is_empty()` branch returns a fresh
+        // unconstrained literal and registers NOTHING in `uf_apps`, so two
+        // calls yield two INDEPENDENT literals for one Bool constant. It can
+        // then be true in one occurrence and false in another: a wrong `sat`.
+        //
+        // Whether a repeat call happens is the driver's business, and the
+        // drivers do NOT agree:
+        //   - the tseitin path is safe — `encode` memoizes by TermId BEFORE
+        //     `encode_uncached` intercepts a collected atom
+        //     (`shinri-solver/src/tseitin.rs:92-98`, `:112-116`);
+        //   - `lower` (this crate) is safe — it memoizes by rewritten TermId;
+        //   - the ARRAY path is NOT safe — `abv_stage::RealBridge::new` loops
+        //     `blast_atom` over the collected atoms with no such memo
+        //     (`shinri-solver/src/abv_stage.rs:318-324`), and `ensure_atom_lit`
+        //     (`:268-274`) calls it again on demand while documenting itself
+        //     "idempotent at the blaster's cache level" — true of the word
+        //     subterms it recurses into, false of the atom node itself.
+        //
+        // The `debug_assert!` below is a development tripwire, not the guard:
+        // it vanishes in the shipping profile, where `collect_bv_atoms`'
+        // exclusion is the only thing standing between a nullary Bool
+        // application and the wrong `sat` above.
+        TermNode::App {
+            op: Op::Uninterpreted(sym),
+            args,
+            sort,
+        } => {
+            let child_ids = ctx.children(args).to_vec();
+            debug_assert!(
+                !child_ids.is_empty(),
+                "nullary Bool application reached blast_bv_atom — collection \
+                 must exclude it"
+            );
+            blast_uf_app(sink, ctx, sym, &child_ids, sort, 1)[0]
+        }
         TermNode::App {
             op: Op::Builtin(BuiltinOp::Eq),
             args,

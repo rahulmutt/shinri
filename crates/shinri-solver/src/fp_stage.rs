@@ -708,17 +708,62 @@ fn is_supported_fp_to_bv(ctx: &Context, t: TermId) -> bool {
     kids.len() == 2 && is_rounding_mode_term(ctx, kids[0]) && is_supported_fp_word(ctx, kids[1])
 }
 
-/// Walk a BV-sorted subtree hunting embedded FP→BV applications; each must be
-/// fully supported. Mutually recursive with `is_supported_fp_word`: since 4e a
-/// BV subtree can contain FP subtrees (via fp.to_ubv/to_sbv) and vice versa
-/// (via int→FP / bitcast / fp-constructor BV children), so the old 4c/4d
-/// argument — that a bare sort check on a BV-sorted subtree is enough to
-/// guarantee it blasts cleanly — holds only modulo this walk.
+/// Walk a subtree reachable from a collected BV atom's operand; every FP-,
+/// RoundingMode- and FP→BV-shaped node in it must be one the blaster has an arm
+/// for. Mutually recursive with `is_supported_fp_word`: since 4e a BV subtree
+/// can contain FP subtrees (via fp.to_ubv/to_sbv) and vice versa (via int→FP /
+/// bitcast / fp-constructor BV children), so the old 4c/4d argument — that a
+/// bare sort check on a BV-sorted subtree is enough to guarantee it blasts
+/// cleanly — holds only modulo this walk.
+///
+/// SORT DISPATCH (slice 45, C1 fix). Through 4e this walk validated ONLY
+/// `FpToUbv`/`FpToSbv` heads and descended generically through everything else,
+/// which was safe exactly as long as every generically-reached node was
+/// BV-sorted. Tasks 3+4 broke that: a collected BV atom is now allowed to be a
+/// Bool-result uninterpreted application whose operand is DIRECTLY FP-sorted
+/// (`(p (g a))`), so the generic recursion reaches FP- and RoundingMode-sorted
+/// nodes for the first time. `Lowerer::word` dispatches those to
+/// `blast_fp_word`, whose `Op::Uninterpreted` arm mints a FRESH UNCONSTRAINED
+/// word and registers nothing in `uf_apps` (`crates/shinri-fp/src/lib.rs`,
+/// `blast_fp_word`) — no congruence, hence a wrong `sat` in release and a
+/// `debug_assert!` panic in debug. The two arms below re-impose the invariant
+/// the walk always assumed:
+///
+/// - an FP-sorted node must satisfy `is_supported_fp_word`;
+/// - a RoundingMode-sorted node must satisfy `is_rounding_mode_term`.
+///
+/// Both arms return WITHOUT further generic descent — the callee already
+/// validates the node's own children recursively (and re-enters this walk for
+/// any BV children), so descending again would only re-walk the subtree.
+///
+/// The RoundingMode arm is DEFENCE IN DEPTH, not the load-bearing check for any
+/// shape measured today: every RoundingMode operand reachable from a collected
+/// atom sits in the RM slot of an FP op or of `fp.to_ubv`/`fp.to_sbv`, and
+/// `is_supported_fp_word` / `is_supported_fp_to_bv` already run
+/// `is_rounding_mode_term` on it first — while a RoundingMode-sorted term as a
+/// direct uninterpreted-application ARGUMENT is rejected on sort by Fence 1
+/// (`bv_stage::walk_uf_args`; see
+/// `uf_args_supported_rejects_a_roundingmode_argument_even_when_fp_allowed`).
+/// It is kept so the walk is total over sorts rather than total-by-coincidence,
+/// which is the assumption that failed here; the unit fence
+/// `bv_atom_rejects_a_non_nullary_rounding_mode_operand` is its proof.
+///
+/// Bool- and Int/Real-sorted nodes deliberately keep the generic descent: a
+/// Bool node is an `ite` condition or Boolean structure (skeleton, not a word),
+/// and foreign-theory sorts are fenced upstream by `has_non_bvfp_theory_atom`
+/// and `bv_stage::arg_term_blastable`.
 fn bv_subtree_fp_supported(ctx: &Context, root: TermId) -> bool {
     let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
     fn walk(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>) -> bool {
         if !seen.insert(t) {
             return true;
+        }
+        // Sort dispatch FIRST: an FP- or RoundingMode-sorted node is a word the
+        // blaster must have an arm for, whatever its head op is.
+        match ctx.sort_node(ctx.sort_of(t)) {
+            SortNode::Float(_, _) => return is_supported_fp_word(ctx, t),
+            SortNode::RoundingMode => return is_rounding_mode_term(ctx, t),
+            _ => {}
         }
         if let TermNode::App { op, args, .. } = ctx.term_node(t) {
             if matches!(
@@ -741,8 +786,20 @@ fn bv_subtree_fp_supported(ctx: &Context, root: TermId) -> bool {
 }
 
 /// Solver-facing: every collected BV atom's operands must pass the embedded-FP
-/// support walk. Until 4e BV atoms could not contain FP subterms, so this is
-/// the first slice that support-checks the BV side at all.
+/// support walk.
+///
+/// STALE PREMISE, CORRECTED (slice 45, C1). This doc previously read: "Until 4e
+/// BV atoms could not contain FP subterms, so this is the first slice that
+/// support-checks the BV side at all." The first clause is now FALSE in a
+/// second, stronger way, and its falseness is what hid C1: after Tasks 3+4 a
+/// collected atom's operand can *be* an FP term, not merely contain one. Task 3
+/// admits a Bool-result uninterpreted application into `bv_atoms`
+/// (`bv_stage::collect_bv_atoms`) with NO constraint on argument sort, and Task
+/// 4 lets an FP-sorted argument reach that path — so `(p (g a))` arrives here
+/// with `(g a)` as a direct, FP-sorted operand. The walk below therefore
+/// dispatches on sort (see `bv_subtree_fp_supported`); reading it as an
+/// FP→BV-conversion hunt over an otherwise all-BV subtree is exactly the
+/// mistake to avoid.
 pub fn bv_atoms_fp_supported(ctx: &Context, bv_atoms: &[TermId]) -> bool {
     bv_atoms.iter().all(|&a| {
         let TermNode::App { args, .. } = ctx.term_node(a) else {
@@ -1459,6 +1516,128 @@ mod tests {
         assert!(
             !bv_atoms_fp_supported(&ctx, &[atom_bad]),
             "unsupported FP shape under BV atom fences"
+        );
+    }
+
+    /// Slice 45 C1. A collected BV atom's operand can now BE an FP term — a
+    /// Bool-result uninterpreted application admits FP-sorted arguments — so
+    /// the support walk has to dispatch on sort, not assume BV-sortedness.
+    ///
+    /// Measured at `cd4a91b8` on the end-to-end query
+    /// `(= a b) ∧ (p (g a)) ∧ ¬(p (g b))`: shinri release `sat` (WRONG; z3
+    /// 4.16.0 and cvc5 1.3.4 both `unsat`), shinri debug a panic at
+    /// `crates/shinri-fp/src/lib.rs`'s `non-nullary FP fn out of scope`
+    /// `debug_assert!`. `main` (`e1baa3bb`) answered `unknown`.
+    ///
+    /// Three shapes, matching the three measured instances: bare, nested under
+    /// a supported FP op, and reached through a BV-result uninterpreted
+    /// application's argument.
+    #[test]
+    fn bv_atom_rejects_a_non_nullary_fp_operand() {
+        let mut ctx = Context::new();
+        let f32s = ctx.fp_sort(8, 24);
+        let bs = ctx.bool_sort();
+        let bv8 = ctx.bv_sort(8);
+        let af = ctx.declare_fun("a", &[], f32s);
+        let a = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
+        let pf = ctx.declare_fun("p", &[f32s], bs);
+        let gf = ctx.declare_fun("g", &[f32s], f32s);
+        let ga = ctx.mk_app(Op::Uninterpreted(gf), &[a]).unwrap();
+
+        // Baseline: the shape slice 45 exists to decide must still pass.
+        let pa = ctx.mk_app(Op::Uninterpreted(pf), &[a]).unwrap();
+        assert!(
+            bv_atoms_fp_supported(&ctx, &[pa]),
+            "a predicate over a nullary FP variable must keep deciding"
+        );
+
+        // (1) bare: `(p (g a))`.
+        let bare = ctx.mk_app(Op::Uninterpreted(pf), &[ga]).unwrap();
+        assert!(
+            !bv_atoms_fp_supported(&ctx, &[bare]),
+            "FP-result UF directly as a predicate argument must fence"
+        );
+
+        // (2) nested under a supported FP op: `(p (fp.abs (g a)))`.
+        let abs = ctx.mk_app(Op::Builtin(BuiltinOp::FpAbs), &[ga]).unwrap();
+        let nested = ctx.mk_app(Op::Uninterpreted(pf), &[abs]).unwrap();
+        assert!(
+            !bv_atoms_fp_supported(&ctx, &[nested]),
+            "FP-result UF under a supported FP op must fence"
+        );
+        // …and the same op over the plain variable still passes, so (2) fences
+        // on the `g` application and not on `fp.abs`.
+        let abs_ok = ctx.mk_app(Op::Builtin(BuiltinOp::FpAbs), &[a]).unwrap();
+        let nested_ok = ctx.mk_app(Op::Uninterpreted(pf), &[abs_ok]).unwrap();
+        assert!(
+            bv_atoms_fp_supported(&ctx, &[nested_ok]),
+            "fp.abs over a nullary FP variable must keep deciding"
+        );
+
+        // (3) through a BV-result UF argument: `p : BV8→Bool`, `f : F32→BV8`,
+        // atom `(p (f (g a)))`. The walk reaches `(g a)` only by generic
+        // descent through a node that is neither FP-sorted nor an FP→BV
+        // conversion.
+        let pbf = ctx.declare_fun("pb", &[bv8], bs);
+        let ff = ctx.declare_fun("f", &[f32s], bv8);
+        let fga = ctx.mk_app(Op::Uninterpreted(ff), &[ga]).unwrap();
+        let via_bv = ctx.mk_app(Op::Uninterpreted(pbf), &[fga]).unwrap();
+        assert!(
+            !bv_atoms_fp_supported(&ctx, &[via_bv]),
+            "FP-result UF reached through a BV-result UF argument must fence"
+        );
+        let fa = ctx.mk_app(Op::Uninterpreted(ff), &[a]).unwrap();
+        let via_bv_ok = ctx.mk_app(Op::Uninterpreted(pbf), &[fa]).unwrap();
+        assert!(
+            bv_atoms_fp_supported(&ctx, &[via_bv_ok]),
+            "BV-result UF over a nullary FP variable must keep deciding"
+        );
+    }
+
+    /// Slice 45 C1, RoundingMode half. `blast_rm` classifies a RoundingMode
+    /// operand as "literal or fresh symbolic" with no arity check, so a
+    /// non-nullary RM-result application blasts as an unconstrained fresh
+    /// rounding mode and two applications to equal arguments get INDEPENDENT
+    /// modes. Measured at `cd4a91b8`:
+    /// `(= a b) ∧ (p (fp.add (h a) a a)) ∧ ¬(p (fp.add (h b) a a))` → shinri
+    /// `sat` on BOTH profiles (no debug tripwire fires on this one), z3 4.16.0
+    /// and cvc5 1.3.4 `unsat`, `main` `unknown`.
+    ///
+    /// The fence that actually catches this is the FP-sorted arm of
+    /// `bv_subtree_fp_supported` reaching `is_supported_fp_word`, which runs
+    /// `is_rounding_mode_term` on the `fp.add`'s RM operand — VERIFIED by
+    /// deleting the walk's RoundingMode arm and re-measuring: the probe still
+    /// answers `unknown`. That arm is therefore defence in depth; this test
+    /// pins the end-to-end property either way.
+    #[test]
+    fn bv_atom_rejects_a_non_nullary_rounding_mode_operand() {
+        let mut ctx = Context::new();
+        let f32s = ctx.fp_sort(8, 24);
+        let rms = ctx.rm_sort();
+        let bs = ctx.bool_sort();
+        let af = ctx.declare_fun("a", &[], f32s);
+        let a = ctx.mk_app(Op::Uninterpreted(af), &[]).unwrap();
+        let pf = ctx.declare_fun("p", &[f32s], bs);
+        let hf = ctx.declare_fun("h", &[f32s], rms);
+        let ha = ctx.mk_app(Op::Uninterpreted(hf), &[a]).unwrap();
+        let add_bad = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpAdd), &[ha, a, a])
+            .unwrap();
+        let bad = ctx.mk_app(Op::Uninterpreted(pf), &[add_bad]).unwrap();
+        assert!(
+            !bv_atoms_fp_supported(&ctx, &[bad]),
+            "non-nullary RoundingMode application in the RM slot must fence"
+        );
+        // A nullary RM symbol in the same slot is blastable and must not fence.
+        let rmf = ctx.declare_fun("rm", &[], rms);
+        let rm = ctx.mk_app(Op::Uninterpreted(rmf), &[]).unwrap();
+        let add_ok = ctx
+            .mk_app(Op::Builtin(BuiltinOp::FpAdd), &[rm, a, a])
+            .unwrap();
+        let ok = ctx.mk_app(Op::Uninterpreted(pf), &[add_ok]).unwrap();
+        assert!(
+            bv_atoms_fp_supported(&ctx, &[ok]),
+            "a symbolic (nullary) rounding mode must keep deciding"
         );
     }
 
