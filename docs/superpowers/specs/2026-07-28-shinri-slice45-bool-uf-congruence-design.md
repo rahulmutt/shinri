@@ -1,19 +1,38 @@
 # Slice 45 — Bool-result uninterpreted applications in the bit-blaster
 
-**Status:** design
-**Date:** 2026-07-28
-**Area:** `shinri-bv` (`blast::blast_bv_atom`'s new `Op::Uninterpreted` arm),
-`shinri-fp` (`Lowerer::atom`'s dispatch), `shinri-solver` (`bv_stage`'s
-`collect_bv_atoms`, `uf_args_supported`, `uf_congruence_cost`; three oracle
-generators). No new crate, no new theory slot, no parser surface change, no
-`Combiner` change, no new gadget.
+**Status:** implemented
+**Date:** 2026-07-28 (design); implemented 2026-07-29 on branch
+`slice45-bool-uf-congruence`, seven tasks over base `main` @ `e1baa3bb`
+**Area:** `shinri-bv` (`blast::blast_bv_atom`'s new `Op::Uninterpreted` arm;
+`UfApp::result_sort` and its `shape_compatible` conjunct), `shinri-fp`
+(`Lowerer::atom`'s dispatch), `shinri-solver` (`bv_stage`'s `collect_bv_atoms`,
+`uf_args_supported` + the new `arg_term_blastable`, `uf_congruence_cost`;
+`abv_stage::fenced`; three oracle generators). No new crate, no new theory slot,
+no parser surface change, no `Combiner` change, no new gadget, and no new
+dependency.
 **Predecessors:** slice 44 gave BitVec-result uninterpreted applications
 Ackermann congruence in the blaster and named Bool-result applications as
 deliberately out of scope (slice 44 §2, "Out of scope, deliberately
 unchanged"). This slice is that follow-on. It reuses slice 44's `blast_uf_app`,
-`UfApp` registry, `shape_compatible` pairing predicate, `word_eq` hook, and
-`UF_CONGRUENCE_BUDGET` **verbatim** — the only new code is one match arm, one
-dispatch reorder, and three fence-guard widenings.
+`UfApp` registry, `word_eq` hook, and `UF_CONGRUENCE_BUDGET` **verbatim** (the
+budget confirmed byte-identical to `main` at `9_271_680`).
+
+> **As-built delta from the design, three items — each measured, each written up
+> where the original prose lived.** The design said "the only new code is one
+> match arm, one dispatch reorder, and three fence-guard widenings", and reused
+> `shape_compatible` verbatim. All four of those claims moved:
+>
+> 1. **`shape_compatible` DID change** — the design's argument that it needed no
+>    change is false at result width 1 (§3.1).
+> 2. **A FOURTH fence needed its own widening** — `abv_stage::fenced`, which
+>    takes raw assertions and so inherited nothing from the collector (§4).
+> 3. **A new fence predicate was added** — `bv_stage::arg_term_blastable`,
+>    because Fence 1 checked argument *sorts*, not argument *blastability*
+>    (§5, §8.4).
+>
+> None of the three widened scope beyond §2; items 1 and 3 are guards, i.e.
+> they narrow. §2.1's invariant held, and needed no exception list: every
+> measured flip across the slice was `unknown` → decided or panic → `unknown`.
 
 ## 1. Summary
 
@@ -177,7 +196,25 @@ At `width = 1` the result word is a single fresh literal and the pairwise
 clause degenerates to one clause — `cond → (v_prior ↔ v_new)` — rather than one
 per result bit.
 
-### 3.1 Why `shape_compatible` needs no change
+### 3.1 `shape_compatible` DID need a change — this section's original claim was false
+
+> **CORRECTED during implementation (Task 2), with the human partner's
+> authorization.** As designed, this section was titled "Why `shape_compatible`
+> needs no change" and argued the following, which is **FALSE**:
+>
+> > `shape_compatible` already discriminates them on `prior.result.len() ==
+> > result_len` — 1 for a Bool result, `width` for a BitVec result.
+>
+> The premise "1 for a Bool result, `width` for a BitVec result" silently
+> assumes `width ≠ 1`. At **result width 1** it collapses: this slice records a
+> Bool result as a ONE-BIT word, so a Bool-result application and a
+> `(_ BitVec 1)`-result application of one redeclared symbol have
+> `result.len() == 1` alike. The length check does not tell them apart, the
+> pairing predicate would relate two different functions, and congruence would
+> emit a clause that is not entailed — a **wrong `unsat`, silently**.
+>
+> Task 2 did not reason this out on paper; it built the probe, measured the
+> wrong `unsat`, and fixed it. The claim below is the corrected one.
 
 `Context::declare_fun` interns by name and overwrites `fun_sigs`, and
 `Command::DeclareFun` accepts a redeclaration silently, so one `SymbolId` can
@@ -185,11 +222,29 @@ carry applications of two different functions in a single assertion list. This
 slice makes that sharper: the same name can now be Bool-result in one
 declaration and BitVec-result in another, and pairing those would be unsound.
 
-`shape_compatible` already discriminates them on `prior.result.len() ==
-result_len` — 1 for a Bool result, `width` for a BitVec result. It is total
-over arity, per-argument sort, per-argument word length, and result length, and
-the arm carries no shape assertion precisely so that the guard is what holds in
-the shipping profile. No change; a test pins the discrimination.
+Slice 44 could infer the result sort from `result.len()`, because the only arm
+recording a `UfApp` recorded BitVec results and BitVec sorts intern by width —
+equal length therefore meant equal sort. Slice 45 breaks that inference, so the
+sort is recorded and compared **directly**:
+
+- `UfApp` gains a `result_sort: SortId` field
+  (`crates/shinri-bv/src/blast/mod.rs:87`), the result-side twin of the
+  `arg_sorts` field slice 44 added for exactly the same redeclaration hazard on
+  the argument side;
+- `shape_compatible` gains `&& prior.result_sort == result_sort`
+  (`blast/mod.rs:136`), alongside — not instead of — the existing
+  `result.len()` check, which stays because it is what the congruence clauses'
+  `zip` actually walks.
+
+With that added conjunct the predicate is total over arity, per-argument sort,
+per-argument word length, **result sort**, and result word length. The arm
+carries no shape assertion precisely so that the guard is what holds in the
+shipping profile. `bool_and_bv_results_of_one_symbol_are_never_paired` pins the
+discrimination at the unit level, at width 1 where the length check alone fails.
+
+The general lesson, and the reason this correction is written out rather than
+quietly patched: a discriminator that works "because the values differ" is not
+a discriminator until you check the boundary where they coincide.
 
 ### 3.2 Two implementation details that are easy to get wrong
 
@@ -235,13 +290,60 @@ The load-bearing edit is to collection, because all three paths call it:
 **`collect_bv_atoms`** (`bv_stage.rs:124`) additionally collects Bool-sorted
 non-nullary `Op::Uninterpreted` applications.
 
-That single change satisfies every path's foreign-theory fence at once, since a
-collected atom is in `bv_set` and each fence's walk returns at it.
+> **CORRECTED during implementation (Task 5), after measurement, with the human
+> partner's authorization.** As designed, this section continued:
+>
+> > That single change satisfies every path's foreign-theory fence at once,
+> > since a collected atom is in `bv_set` and each fence's walk returns at it.
+>
+> **That premise is measured-false for the third of §2's three paths.** It holds
+> for two of them and for exactly the reason given: `bv_stage`'s
+> `has_non_bv_theory_atom` and `fp_stage`'s `has_non_bvfp_theory_atom` each
+> consume a **collected atom set**, so widening the collector widened them for
+> free. The ABV path has a fourth fence, `abv_stage::fenced`, which the table
+> below never listed — and it consumes **no atom set at all**. It walks the RAW
+> assertions, and it runs at `lib.rs:903`, *before* `shinri_abv::abstract_arrays`
+> builds the abstraction that `collect_bv_atoms` is later called on
+> (`abv_stage.rs:373`). A query fenced at `:903` never constructs a
+> `RealBridge`, so the collector never runs on that path at all and Task 3's
+> widening was **invisible to it**.
+>
+> Task 5 measured this rather than inferring it: after Tasks 1–4, an ABV probe
+> containing a Bool-result predicate still answered `unknown`, and the
+> `qfabv_oracle` family-scoped decidedness gate still failed at **0/94** — a
+> `0/94` that would otherwise have read as "the widening does not work",
+> when in fact the widening was correct and simply never reached.
+>
+> **What replaced it.** A separate, minimal widening of `abv_stage::fenced`'s
+> Bool-sorted-uninterpreted-application arm (`abv_stage.rs:194-196`), from
+> `return false` for the nullary case only to
+> `return kids.iter().any(walk_fence)`. Two properties make it minimal rather
+> than a second design:
+>
+> - it is **bit-identical to the code it replaced for nullary applications** —
+>   `Iterator::any` over an empty child list is `false` by definition — so it
+>   withdraws nothing and admits nothing new in the nullary case;
+> - it does **not** duplicate Fence 1's argument-admissibility check.
+>   `uf_args_supported` runs unconditionally on the same raw assertions
+>   immediately after, at `lib.rs:910`. `fenced` is explicitly **not sufficient
+>   on its own**, and its doc-comment now states that caller obligation.
+>
+> After it, the same probe decides (`unknown` → `sat`, z3 and cvc5 agreeing —
+> the one authorized verdict flip in this slice) and the gate reads 94/94.
+>
+> The general lesson: "one change satisfies all N consumers" is a claim about
+> the consumer list being complete. Here it was not — a fence that takes raw
+> assertions instead of an atom set does not appear in a table organized by
+> atom sets.
+
+For the two paths where it does hold, a collected atom is in `bv_set` and each
+fence's walk returns at it.
 
 | Guard | Today | Change |
 |---|---|---|
 | `has_non_bv_theory_atom` (`bv_stage.rs:177`) | non-nullary Bool UF app → fence | **none** — the app is now in `bv_set`, so the walk returns at it |
 | `has_non_bvfp_theory_atom` (`fp_stage.rs:303`) | delegates over `fp_atoms ∪ bv_atoms` | **none** — inherits the widened `bv_atoms` |
+| `abv_stage::fenced` (`abv_stage.rs:194`), called at `lib.rs:903` | non-nullary Bool UF app → fence | **its own widening** — *added by the correction above*; this fence walks RAW assertions and runs before the abstraction, so it inherits nothing from the collector |
 | `uf_args_supported` — Fence 1 (`bv_stage.rs:279`) | guards on `ctx.bv_width(*sort).is_some()` | widen to BitVec-**or-Bool** result sort; the argument-admissibility rule is unchanged |
 | `uf_congruence_cost` → `collect_uf_apps` — Fence 2 (`bv_stage.rs:341`) | same `bv_width` guard | same widening, with `res_bits = 1`; `UfShapeKey` already keys on the result `SortId`, so Bool and BitVec results group separately, mirroring `shape_compatible` |
 
@@ -265,6 +367,52 @@ imprecision — kept and re-documented with both subtleties stated. The
 implementer picks one and records which; what is **not** acceptable is leaving
 the doc comment describing the pre-slice meaning.
 
+**Decision (Task 7): the name is KEPT and the docs rewritten.** Rationale, in
+order of weight:
+
+1. **Diff hygiene at the one moment it matters most.** The rename is 9 call
+   sites (6 of them outside `bv_stage`) but **28** total occurrences
+   (`grep -rn collect_bv_atoms --include=*.rs`, counted at this commit:
+   `bv_stage.rs`, `fp_stage.rs`, `abv_stage.rs`, `lib.rs`, `qfufbv_e2e.rs`,
+   plus cross-crate prose in `shinri-bv/src/lib.rs` and
+   `shinri-bv/src/blast/mod.rs`). Slice 45's final commit lands immediately
+   before a fresh-eyes whole-branch review whose job is to spot a pairing or
+   fence defect in a soundness path — the failure mode that slice 43 and slice
+   44 each shipped past every per-task review. A ~28-site mechanical rename in
+   that same diff buys nothing and costs the reviewer signal-to-noise.
+2. **The name is defensible; the doc was the actual defect.** "BV atoms" reads
+   correctly as "the BV stage's atoms" — the set the bit-blaster owns — and
+   that is exactly what the function returns. What was genuinely wrong was the
+   module doc, which named BV (dis)equality inclusion as *the* subtlety.
+3. **It would strand the committed record.** The slice-44 spec on `main` and
+   several cross-crate comments cite the function by name as the soundness
+   anchor; renaming either invalidates those citations or drags them into this
+   diff.
+
+**What was written instead**, since three subtleties now exist and the brief's
+"both" undercounts. The module doc (`bv_stage.rs:1`) states each with its
+direction of load-bearing-ness:
+
+1. BV (dis)equalities are **included**, for soundness — the pre-existing
+   `classify_equality`/EUF argument;
+2. non-nullary Bool-result uninterpreted applications are **included**, for
+   completeness — this slice;
+3. nullary Bool applications are **excluded**, for soundness *on the ABV path*
+   — live as of Task 5, and easy to misread as tidiness (full argument at the
+   arm).
+
+Plus the consequence that motivates `arg_term_blastable`: a collected atom is a
+**leaf** to `has_non_bv_theory_atom`, so collecting a Bool UF application also
+hides its argument subtrees from the foreign-theory fence. The function's own
+doc-comment leads with "collect the Bool-sorted atoms the BIT-BLASTER OWNS —
+despite the name, this is no longer 'atoms with a BV operator on top'", so a
+reader who arrives at the call site rather than the module header still gets
+the correction. Success criterion 7 is met by re-documentation, the second of
+the two permitted branches.
+
+*A future slice that touches this area for other reasons should do the rename
+then, when it can land alone.*
+
 ## 5. The one new risk
 
 A collected atom is a **leaf** in `has_non_bv_theory_atom`'s walk — it returns
@@ -277,21 +425,60 @@ DT-sorted can hide there. But **Fence 1 checks argument sorts, not
 blastability**. A BitVec-sorted `(select a i)` passes by sort while the pure-BV
 blaster has no arm for it.
 
-The expected resolution is that `uses_arrays` routes any such query to
-`abv_stage` before the pure-BV path is reached, and that `abv_stage`'s
-abstraction replaces `select`/`store` with fresh BitVec symbols *before*
-`collect_bv_atoms` runs on `abs.assertions` — making the shape unreachable.
-That is a plausible argument, not a measurement, and slice 38 is this project's
-standing lesson that "provably unreachable" claims must be measured. It gets
-its own task.
+> **CORRECTED during implementation (Task 6), after measurement.** As designed,
+> this section predicted:
+>
+> > The expected resolution is that `uses_arrays` routes any such query to
+> > `abv_stage` before the pure-BV path is reached, and that `abv_stage`'s
+> > abstraction replaces `select`/`store` with fresh BitVec symbols *before*
+> > `collect_bv_atoms` runs on `abs.assertions` — making the shape unreachable.
+>
+> **That prediction is false, and the audit took the code-change branch.** The
+> error is the routing predicate's name. There is no general `uses_arrays`. The
+> real predicate is `abv_stage::uses_arrays_over_bv` (`lib.rs:902`), and via
+> `is_bv_array` (`abv_stage.rs:30-35`) it claims a query only when the array is
+> BV-indexed **and** BV-valued. For that shape the prediction is exactly right,
+> and the mechanism is as described. But `(Array Int (_ BitVec 8))` makes
+> `uses_arrays_over_bv` **false**, so the query escapes to the pure-BV path
+> (`lib.rs:1007`), where nothing abstracts anything — while `(select a i)` is
+> still BitVec-8-**sorted** and so passed Fence 1's sort check.
+>
+> Measurement (four probes, both profiles, cross-checked against z3 4.16.0 and
+> cvc5 1.3.4) found two things, of different provenance:
+>
+> - `(f (select a i))` over an Int-indexed array **panicked on `main`** —
+>   pre-existing, and exactly what this section predicted for slice 44's
+>   already-shipped BitVec-result arm;
+> - `(p (select a i))` over the same array answered a sound `unknown` on `main`
+>   and **panicked at the slice-45 branch tip** — a regression this slice
+>   introduced, and precisely this section's "one new risk" realised: Task 3's
+>   widening made the application a collected atom, hence a leaf the
+>   foreign-theory fence no longer descends into.
+>
+> So the second branch below — "the fix is a fence" — is what shipped:
+> `bv_stage::arg_term_blastable`, called from `walk_uf_args`. It rejects a UF
+> argument whose subtree contains a `select`/`store` over a **non-BV** array,
+> and (round 1) an `fp.to_ubv`/`fp.to_sbv` where the path's sink has no arm for
+> it. Both exemptions are **conditional in both directions**: an unconditional
+> rejection would have flipped shapes that decide today to `unknown`, the one
+> thing §2.1 forbids with no exception list. Full evidence in §8.4.
+>
+> The general lesson, and why slice 38's rule earned its keep again: a
+> reachability argument that names the wrong predicate reads exactly like one
+> that names the right predicate. Only the measurement told them apart.
 
 Two things to note about its blast radius. First, it applies **equally to slice
 44's already-shipped BitVec-result arm** — `(f (select a i))` has the same
-shape — so whatever the audit finds is a pre-existing condition this slice
-surfaces, not one it introduces. Second, if the routing argument does not hold,
-the fix is a fence (reject an application whose argument is not a blastable
-word, not merely a well-sorted one), which costs completeness on a shape
-nobody has yet demonstrated.
+shape — so part of what the audit finds is a pre-existing condition this slice
+surfaces rather than introduces. *(Measured: only part. `(f (select a i))` is
+pre-existing; the Bool-result twin `(p (select a i))` is a regression slice 45
+introduced, because only slice 45 makes it a collected atom. The audit had to
+tell the two apart — see the correction above and §8.4.)* Second, if the
+routing argument does not hold, the fix is a fence (reject an application whose
+argument is not a blastable word, not merely a well-sorted one), which costs
+completeness on a shape ~~nobody has yet demonstrated~~ *(demonstrated by Task
+6: four probes, both profiles; the cost is bounded to shapes that previously
+**panicked**, so no verdict was lost — §8.4's verdict-flip audit)*.
 
 ## 6. Testing
 
@@ -498,9 +685,78 @@ reproduce it.
   same line, same message (with `SymbolId(0)`) is what the two `qfufbv_e2e`
   probes below produce pre-fix. **This is the one slice-45 path that panics
   rather than degrading to `unknown`, and the measurement confirms it.**
+
+  **`qfabv_oracle.rs` / `qfabv_matches_z3`** — measured by Task 5 at commit
+  `b5b7ffa3` (Task 4's tip) with Task 5's Step-3 tests in place but the
+  `abv_stage::fenced` widening REVERTED, debug profile (nextest default), via:
+
+  ```
+  cargo nextest run -p shinri-solver --features oracle -E 'test(qfabv_matches_z3)' --no-capture
+  ```
+
+  Discovered test count: 1 (confirmed non-zero). Result: **FAIL** on the
+  family-scoped decidedness assertion. Verbatim panic:
+
+  ```
+  thread 'qfabv_matches_z3' panicked at crates/shinri-solver/tests/qfabv_oracle.rs:544:5:
+  Bool-result predicate family decided 0/94 — more than half must decide. Pre-slice this is 0/N by construction (the abv_stage foreign-theory fence); post-slice a low rate means the collection widening or a fence is rejecting instances it should admit
+       Summary [   3.223s] 1 test run: 0 passed, 1 failed, 0 skipped
+  ```
+
+  `pred_decided`/`pred_total` = **0/94** — not "a low rate" but *every*
+  predicate-bearing instance fencing, because `abv_stage::fenced` rejected the
+  whole query at `lib.rs:903`. Note what this row measures that the other two
+  do not: it was taken with Tasks 1–4 **already applied**, so its `0/94` is not
+  a pre-slice baseline but the evidence that Task 3's collector widening never
+  reached this path at all — the §4 premise correction above.
 - 8.2 — T1: the post-slice decided fractions and the thresholds chosen.
 
-  **`fp_oracle.rs` / `differential_qf_fp_add_sub`** — measured at this task's
+  **All three, re-measured together at the slice tip (Task 7).** Debug profile
+  (nextest default), on the finished branch — `7b69df2f` plus Task 7's
+  doc-and-test-only edits, which cannot move a solver verdict. One command, so
+  the three numbers come from one tree:
+
+  ```
+  $ cargo nextest run -p shinri-solver --features oracle --no-capture \
+      -E 'test(differential_qf_bv_small) + test(qfabv_matches_z3) + test(differential_qf_fp_add_sub)'
+
+      Starting 3 tests across 27 binaries (627 tests skipped)
+  differential_qf_fp_add_sub: sat=193 unsat=7 unknown=0 pred_total=83 pred_decided=83
+          PASS [  27.022s] (1/3) shinri-solver::fp_oracle differential_qf_fp_add_sub
+    slice-45 Bool-result predicate family: decided=94/94
+          PASS [   3.497s] (2/3) shinri-solver::qfabv_oracle qfabv_matches_z3
+    slice-45 Bool-result predicate family: decided=89/89
+          PASS [   5.529s] (3/3) shinri-solver::qfbv_oracle differential_qf_bv_small
+       Summary [  36.050s] 3 tests run: 3 passed, 627 skipped
+  ```
+
+  Discovered count **3** — confirmed non-zero, and `--no-capture` is what makes
+  the counter lines visible at all (nextest swallows stdout on a passing test,
+  so without it the run is green and says nothing).
+
+  | oracle | gate test | pre-slice | post-slice | threshold |
+  | --- | --- | --- | --- | --- |
+  | `qfbv_oracle` | `differential_qf_bv_small` | **0/89** (§8.1) | **89/89 = 100%** | `pred_decided > pred_total / 2` |
+  | `qfabv_oracle` | `qfabv_matches_z3` | **0/94** (§8.1) | **94/94 = 100%** | `pred_decided > pred_total / 2` |
+  | `fp_oracle` | `differential_qf_fp_add_sub` | **PANIC**, no fraction exists (§8.1) | **83/83 = 100%** | `pred_decided > pred_total / 2` |
+
+  **No threshold moved off `> total / 2`,** and that is deliberate rather than
+  incidental. §6.1 authorized moving it only to keep the assertion off a flaky
+  boundary; all three families measured at 100%, which is nowhere near the
+  boundary, so the mirror-the-global-guard default stands unmodified in every
+  case. §6.1's other instruction — "never tune it upward to whatever the run
+  happened to produce" — is why these stay at half rather than being ratcheted
+  to 100%: the gate exists to catch a family that *silently stops deciding*,
+  and a 100% gate would additionally fail on any unrelated instance that fences
+  for a legitimate reason (a budget trip, a generator-emitted Int argument),
+  making it a flakiness source rather than a signal. The distance between the
+  threshold (>50%) and the measurement (100%) is headroom, not slack.
+
+  Each of the three was independently shown to FAIL on the tree that lacked its
+  fix (§8.1) — so none is green-by-omission, the
+  `oracle-generator-blind-spots` failure mode this gate design exists to close.
+
+  **`fp_oracle.rs` / `differential_qf_fp_add_sub`** — measured at Task 4's
   commit, debug profile, same command as above. Result: **PASS** in 29.13s
   (31.40s in the full-binary parallel run). Summary line:
 
@@ -549,6 +805,66 @@ reproduce it.
   the exposure is real and should be revisited if that oracle ever reports a
   shinri-`unsat`/z3-`sat` split on a predicate-bearing instance.
 - 8.3 — T5: `get-value` and `get-model` behaviour on a Bool UF app.
+
+  **Measured, not predicted.** RELEASE profile (`cargo build --release`), at
+  commit `7b69df2f` (the branch tip before this task; the doc-only edits in
+  this task's commit cannot change it, and the pinning test passes identically
+  in the DEBUG profile). Query and verbatim output:
+
+  ```
+  (set-logic QF_UFBV)(declare-fun p ((_ BitVec 8)) Bool)
+  (declare-fun x () (_ BitVec 8))(assert (p x))(check-sat)
+  (get-value ((p x)))(get-model)
+
+  success
+  success
+  success
+  success
+  sat
+  (((p x) ?))
+  ((define-fun x () (_ BitVec 8) #x00))
+  ```
+
+  Three separate facts, and the second is the one §6.5 existed to catch:
+
+  1. **The query now decides `sat`.** Pre-slice it was `unknown` (§1, Q2), so
+     `get-value` returned the `model is not available` error (`lib.rs:438`) and
+     neither channel was observable at all. That is why this had to be measured
+     after the slice, not predicted before it.
+
+  2. **The label renders; the value channel does NOTHING, and says so.**
+     `display_term` (`tseitin.rs:483`) renders the application structurally, so
+     the label is `(p x)` as §6.5 predicted. `format_value` (`lib.rs:585`) then
+     returns `None` — it resolves a **0-arity** symbol through `last_model`,
+     and `(p x)` is not one — and `get-value` prints `?` (`lib.rs:453`).
+
+     `?` is the established visible placeholder for "no value", the same one
+     slice 43 §5 introduced for a symbol whose value no channel holds. This is
+     the **correct** outcome by slice 43's rule, and it is pinned as such: the
+     failure mode that rule guards against is rendering absence as a confident
+     default, which would here mean printing `true` because `(p x)` is
+     asserted. `(p x)` being asserted is exactly why a default would look
+     plausible and exactly why it must not be synthesized here — the blaster
+     knows the literal's polarity, but nothing plumbs a blaster literal back to
+     `format_value`, and inventing the answer from the assertion text would be
+     answering from the question. Slice 45 leaves the value channel alone; the
+     test pins that it does nothing, plainly.
+
+  3. **`get-model` still omits `p`.** `format_model` filters `d.arity == 0`
+     (`lib.rs:540`), so an arity-1 symbol is structurally absent no matter what
+     the blaster learned — unchanged by this slice, and §2 records it as
+     deliberately out of scope. A function graph needs congruence-class
+     enumeration (slice 43 §5, still open). The **argument** `x` does get a
+     value, by the mechanism slice 44 §7.5 measured: congruence forces the
+     argument word to be blasted, so it enters `Blaster.cache` and reaches
+     `exported_var_bits`.
+
+  Pinned by `qfufbv_e2e::get_value_on_a_predicate_application` (debug profile,
+  1 discovered, PASS). The test pins the `get-value` string exactly and the
+  `get-model` **shape** — that `p` is absent and that `x` has some 8-bit value
+  — but not the witness `#x00`: `(p x)` constrains nothing about `x`, so every
+  8-bit value is a legitimate model and pinning the solver's current pick would
+  pin an implementation detail rather than a contract.
 - 8.4 — §5: the Fence-1 blastability audit's conclusion and its evidence.
 
   **Conclusion: §5's expected resolution is FALSE. Step 4's second branch was
@@ -665,8 +981,22 @@ reproduce it.
     The argument is BitVec-8-sorted (passes the sort check) and contains no
     `select` (passes the array half). `abv_stage::fenced` cannot help either:
     `(fp.to_ubv rm x)` is not Bool-sorted, so `walk_fence` reaches only its
-    descend-into-a-non-Bool-term arm (`abv_stage.rs:198-200`) and the kids
-    bottom out at constants → `false`.
+    descend-into-a-non-Bool-term arm (`abv_stage.rs:201-203`) and its kids —
+    `rm` and `x` — are themselves non-Bool-sorted, so each takes that same arm
+    over an EMPTY child list, and `Iterator::any` on an empty iterator is
+    `false`.
+
+    *(Citation corrected in Task 7. This sentence originally cited
+    `abv_stage.rs:198-200`, which is the WRONG ARM — `:198-200` is the "any
+    other Bool-sorted application → `true`" arm, which `(fp.to_ubv rm x)` never
+    reaches because it is not Bool-sorted; the descend arm is `:201-203`. The
+    same wording originally said "the kids bottom out at constants", which is
+    loose: a nullary uninterpreted symbol such as `rm` or `x` is an `App` node
+    with an empty child list, NOT a `TermNode::Const`, so it returns `false`
+    via the empty-`kids` `any` rather than via the `Const` arm. The substantive
+    conclusion — that `fenced` cannot substitute for the blastability check —
+    was independently traced and confirmed and is unaffected; this is a
+    citation fix, not an argument change.)*
 
     The gate must be conditional in both directions. `Lowerer::word`
     (`crates/shinri-fp/src/lower.rs:52-73`) intercepts exactly these two ops and
@@ -720,3 +1050,96 @@ reproduce it.
   `has_non_bv_theory_atom`, or a new pre-lowering check) is an architectural
   decision this slice did not take.
 - 8.5 — T6: the full unfiltered oracle summary and the PR-tier wall clock.
+
+  Both measured at the slice tip (`7b69df2f` + Task 7's doc-and-test-only
+  edits), debug profile (nextest default), foreground, output captured.
+
+  **Full UNFILTERED oracle suite.** No `-E` filter at all — slice 40's lesson
+  is that a filtered run silently skips `qfs_differential` and nearly shipped a
+  string `Sat`→`Unknown` regression.
+
+  ```
+  $ time cargo nextest run -p shinri-solver --features oracle
+
+       Summary [1084.012s] 627 tests run: 627 passed (6 slow), 3 skipped
+
+  real  18m6.828s
+  user  38m48.059s
+  sys   3m14.224s
+  ```
+
+  **627 passed, 0 failed, 0 disagreements.** The 3 skipped are the `#[ignore]`d
+  nightly-tier tests. Every oracle binary is represented — `qfs_differential`
+  90, `fp_oracle` 43, `qfdt_oracle` 16, `oracle` 13, `ite_oracle` 3,
+  `qfax_oracle` 2, `nary_oracle` 2, `qfbv_oracle` 1, `qfabv_oracle` 1,
+  `nary_arith_oracle` 1.
+
+  **The feature flag was verified to have taken effect, not assumed.** Without
+  `--features oracle` these binaries are `#![cfg]`-compiled away and the run is
+  green while testing none of them:
+
+  ```
+  $ cargo nextest list -p shinri-solver                     → 483 tests
+  $ cargo nextest list -p shinri-solver --features oracle   → 630 tests
+  ```
+
+  **147 tests** exist only under the flag; 627 ran + 3 `#[ignore]`d = 630. A
+  483-test run would have read as green and been no coverage at all.
+
+  **PR tier (blocking) wall clock.**
+
+  ```
+  $ time cargo nextest run --all
+
+       Summary [ 238.555s] 1369 tests run: 1369 passed (5 slow), 7 skipped
+
+  real  4m0.694s
+  user  18m21.243s
+  sys   0m47.526s
+  ```
+
+  **4m00.7s against a 10–15 min budget and a 20 min CI hard cap** — comfortably
+  inside, with the slice's new tests included. `mise run test` is exactly this
+  command, so this is the blocking tier and not a proxy for it. The §2.1 gates
+  all discovered non-zero counts inside it: `qfbv_witnesses` 33, `script_e2e`
+  73, `qfdt_e2e` 21, `qfuf_e2e` 2, and `qfufbv_e2e` 37 (the slice's own file).
+
+  Slowest blocking-tier test: `shinri-fp blast::rem::tests::
+  rem_float32_specials_and_random` at **238.2s = 3.97 min**, inside the
+  5-minute `#[ignore]` rule. Nothing on this tier exceeds it.
+
+  **`UF_CONGRUENCE_BUDGET` unchanged, and the shared-budget claim is now
+  measured rather than assumed** — §4's open question. Confirmed by grep:
+
+  ```
+  $ grep -rn "UF_CONGRUENCE_BUDGET" --include=*.rs .
+  crates/shinri-solver/src/bv_stage.rs:690:/// UF_CONGRUENCE_BUDGET = pairs(440) * 96 = 96,580 * 96 = 9_271_680.
+  crates/shinri-solver/src/bv_stage.rs:691:pub const UF_CONGRUENCE_BUDGET: u64 = 9_271_680;
+  crates/shinri-solver/tests/qfufbv_e2e.rs:53:                  // the calibrated UF_CONGRUENCE_BUDGET (9_271_680, k=440 --
+  crates/shinri-solver/src/lib.rs:916:                > crate::bv_stage::UF_CONGRUENCE_BUDGET
+  crates/shinri-solver/src/lib.rs:1021:                > crate::bv_stage::UF_CONGRUENCE_BUDGET
+  crates/shinri-solver/src/lib.rs:1100:                > crate::bv_stage::UF_CONGRUENCE_BUDGET
+
+  $ git show main:crates/shinri-solver/src/bv_stage.rs | grep -n "pub const UF_CONGRUENCE_BUDGET"
+  444:pub const UF_CONGRUENCE_BUDGET: u64 = 9_271_680;
+  ```
+
+  Exactly one definition, three consumers (the three routing paths' Fence 2),
+  and one test-comment citation. The three `lib.rs` sites are the pure-BV, ABV
+  and FP/mixed gates — the same three §2 names as the slice's scope, which is
+  what makes "global, shared" a checked statement rather than a description.
+
+  Byte-identical to `main`'s slice-44 calibrated value: still ONE global
+  budget, still `9_271_680`, no second budget and no per-family budget. With
+  Bool-result applications now joining the same `pairs(k) × (arg_bits +
+  res_bits)` sum at `res_bits = 1`, the three predicate families measured
+  **89/89, 94/94 and 83/83 decided** (§8.2) — i.e. the added population does
+  not trip Fence 2 — and the tier came in at 4m00.7s. This is slice 42's
+  lesson answered: the claim that the existing budget still holds with
+  predicates in the mix rested on a plausible premise until a measured gate
+  ran, and the gate has now run.
+
+  **Verdict-flip audit across both tiers: no forbidden flip.** 627/627 and
+  1369/1369 passed with no test expectation altered by this task, so no
+  `sat`→`unsat`, no `unsat`→`sat`, and no decided→`unknown` anywhere in either
+  suite. §2.1's "no named-exception list" survives the sweep intact.

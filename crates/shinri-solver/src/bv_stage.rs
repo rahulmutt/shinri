@@ -1,14 +1,47 @@
-//! BV lowering stage: detect QF_BV queries, collect BV atoms, enforce the
-//! mixed-theory fence, and carry the CNF→SAT surrogate maps.
+//! BV lowering stage: detect QF_BV queries, collect the atoms the blaster owns,
+//! enforce the mixed-theory fence, and carry the CNF→SAT surrogate maps.
 //!
-//! ## Soundness contract
-//! The theory's `classify_equality` routes any `(= a b)` whose operand sort is
-//! neither Int nor Real to `Owner::Euf`, where BV operators are treated as
-//! UNINTERPRETED functions. So `(= (bvadd x #x01) x)` would be answered SAT by
-//! EUF when the true BV answer is UNSAT. Therefore EVERY BV atom — including BV
+//! ## What `collect_bv_atoms` collects (slice 45: no longer just "BV atoms")
+//!
+//! The name is historical. Since slice 45 the set is **"the Bool-sorted atoms
+//! the bit-blaster owns"**, which is strictly larger than "atoms with a BV
+//! operator on top". The name was kept rather than changed to
+//! `collect_blastable_atoms` (spec §4.1 permits either): the alternative is a
+//! 28-occurrence mechanical rename spanning three crates and the committed
+//! slice-44 spec, landing in the same diff as this slice's soundness-relevant
+//! fence edits, where it would swamp them for a reviewer. The precision goes
+//! here instead. Three subtleties, each load-bearing in a different direction:
+//!
+//! **1. BV (dis)equalities are INCLUDED — for soundness.** The theory's
+//! `classify_equality` routes any `(= a b)` whose operand sort is neither Int
+//! nor Real to `Owner::Euf`, where BV operators are treated as UNINTERPRETED
+//! functions. So `(= (bvadd x #x01) x)` would be answered SAT by EUF when the
+//! true BV answer is UNSAT. Therefore EVERY BV atom — including BV
 //! (dis)equalities — MUST be surrogated (intercepted by the Encoder and mapped
 //! to a pre-blasted SAT literal) so it never reaches `register_atom`/`classify`.
-//! `collect_bv_atoms` deliberately includes Eq/Distinct over BV operands.
+//!
+//! **2. NON-NULLARY Bool-result uninterpreted applications are INCLUDED — for
+//! completeness (slice 45).** `(p x)` with `p : (_ BitVec 8) → Bool` used to
+//! fall through to `has_non_bv_theory_atom`'s conservative "any other
+//! Bool-sorted App is a foreign atom" arm and fence the whole query to
+//! `unknown`. It is now a collected atom, so the blaster owns it
+//! (`blast_bv_atom`'s `Op::Uninterpreted` arm, at result width 1) and every
+//! fence's walk returns at it.
+//!
+//! **3. NULLARY Bool applications are EXCLUDED — for soundness, on the ABV
+//! path.** This is the one that is easy to read as tidiness and is not: a bare
+//! Bool constant handed to the blaster would get a FRESH unconstrained literal
+//! per call, with nothing registered in `uf_apps` to pair the occurrences. The
+//! ABV driver calls `blast_atom` unmemoized, so one constant would get two
+//! independent literals — a wrong `sat`. Full argument at the arm itself.
+//!
+//! Consequence of (2) worth stating once here, because it is the mechanism
+//! behind the `arg_term_blastable` check further down: a collected atom is a
+//! **leaf** to `has_non_bv_theory_atom`, which does not descend into it. So
+//! collecting a Bool UF application also HIDES its argument subtrees from the
+//! foreign-theory fence. Fence 1 (`uf_args_supported`) is what must catch a
+//! foreign term hiding there, and — as slice 45 measured — an argument *sort*
+//! check alone was not enough.
 
 use rustc_hash::FxHashMap;
 use shinri_core::{BuiltinOp, Context, Lit, Op, SortId, SortNode, TermId, TermNode, Var};
@@ -117,12 +150,15 @@ pub fn solver_uses_bv(ctx: &Context, assertions: &[TermId]) -> bool {
     assertions.iter().any(|&a| walk(ctx, a, &mut seen))
 }
 
-/// Collect all Bool-sorted BV atoms: subterms whose top op is a BV predicate,
-/// an Eq/Distinct whose operands are BV-sorted, OR — since slice 45 — a
-/// NON-NULLARY uninterpreted application with a Bool result sort.
+/// Collect the Bool-sorted atoms the BIT-BLASTER OWNS. Despite the name this is
+/// no longer "atoms with a BV operator on top": subterms whose top op is a BV
+/// predicate, an Eq/Distinct whose operands are BV-sorted, OR — since slice 45
+/// — a NON-NULLARY uninterpreted application with a Bool result sort.
 ///
-/// SOUNDNESS-CRITICAL: BV (dis)equalities ARE included (see module doc), and
-/// nullary Bool applications are EXCLUDED (see the arm's comment below).
+/// SOUNDNESS-CRITICAL in both directions: BV (dis)equalities ARE included and
+/// nullary Bool applications are EXCLUDED. Both reasons, plus the leaf-rule
+/// consequence of the slice-45 widening, are in the module doc; the nullary
+/// argument is restated in full at its arm below.
 pub fn collect_bv_atoms(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
     let mut out: Vec<TermId> = Vec::new();
     let mut in_set: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
@@ -379,7 +415,6 @@ fn is_bv_array(ctx: &Context, t: TermId) -> bool {
 ///
 /// **`select`/`store` over a BV-indexed, BV-valued array is ADMITTED**, and
 /// that exemption is load-bearing, not laxity:
-/// that exemption is load-bearing, not laxity:
 /// `abv_stage::uses_arrays_over_bv` (`lib.rs:902`) routes any query containing
 /// one to the ABV path, where `shinri_abv::abstract_arrays` substitutes a
 /// fresh BV read symbol for every `select` — including those buried in a UF
@@ -421,7 +456,14 @@ fn is_bv_array(ctx: &Context, t: TermId) -> bool {
 ///
 /// `abv_stage::fenced` cannot substitute: `(fp.to_ubv rm x)` is not Bool-sorted,
 /// so `walk_fence` reaches only its "descend into a non-Bool term" arm
-/// (`abv_stage.rs:198-200`) and the kids bottom out at constants → `false`.
+/// (`abv_stage.rs:201-203`) and its kids — `rm` and `x` — are themselves
+/// non-Bool-sorted, so each takes that same arm over an EMPTY child list, and
+/// `Iterator::any` on an empty iterator is `false`. (Careful: they bottom out
+/// via that empty-`kids` `any`, not via the `TermNode::Const` arm — a nullary
+/// uninterpreted symbol is an `App` with no children, not a `Const` node.
+/// A citation of `:198-200` here would be the wrong arm: that is the "any
+/// other Bool-sorted application → `true`" arm, which `(fp.to_ubv rm x)`
+/// never reaches. The conclusion is unchanged; it was traced independently.)
 ///
 /// Only positive results are memoized in `clean`: a negative short-circuits
 /// the whole `uf_args_supported` call, so it is never revisited. `clean` is

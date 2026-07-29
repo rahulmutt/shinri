@@ -797,3 +797,77 @@ fn an_fp_to_bv_argument_still_decides_on_the_fp_path() {
     );
     assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
 }
+
+// ---------------------------------------------------------------------------
+// Spec §6.5 / §8.3 — the model channel, MEASURED not predicted.
+// ---------------------------------------------------------------------------
+
+/// Spec §6.5: measured, not predicted. Pre-slice this query never got past the
+/// `bv_stage` foreign-theory fence, so neither channel had ever been observed
+/// on a non-nullary Bool-result application. Measured on the RELEASE binary at
+/// commit 7b69df2f (the branch tip before this task), verbatim:
+///
+/// ```text
+/// sat
+/// (((p x) ?))
+/// ((define-fun x () (_ BitVec 8) #x00))
+/// ```
+///
+/// Three separate facts, pinned separately:
+///
+/// 0. **The query decides `sat` at all.** Pre-slice it was `unknown` (spec §1,
+///    Q2), so `get-value` returned the `model is not available` error
+///    (`lib.rs:438`) and neither channel below was observable. That is why
+///    this had to be measured after the slice rather than predicted before it.
+///
+/// 1. **The label renders, the value does not.** `display_term`
+///    (`crates/shinri-solver/src/tseitin.rs:483`) renders the application
+///    structurally, so the label is `(p x)`. `format_value` (`lib.rs:585`)
+///    then returns `None` — it resolves a *0-arity* symbol through
+///    `last_model`, and `(p x)` is not one — and `get-value` prints the
+///    established `?` placeholder (`lib.rs:453`). That is the correct
+///    rendering of "no value": slice 43's lesson is that absence must never be
+///    dressed up as a confident default, and `?` is exactly the visible
+///    placeholder that refusal uses. This test pins that the value channel
+///    does NOTHING here, plainly — it is not an aspiration that it should.
+///
+/// 2. **`get-model` still omits `p`.** `format_model` filters
+///    `d.arity == 0` (`lib.rs:540`), so an arity-1 symbol is structurally
+///    absent regardless of what the blaster learned. A function graph needs
+///    congruence-class enumeration (slice 43 §5, still open); slice 45 does
+///    not change this and the spec's §2 records it as deliberately out of
+///    scope. The argument `x` DOES get a value, by the slice 44 §7.5
+///    mechanism: congruence forces the argument word to be blasted, so it
+///    enters `Blaster.cache` and reaches `exported_var_bits`.
+///
+/// The concrete witness `#x00` is not pinned — `(p x)` constrains nothing
+/// about `x`, so any 8-bit value is a legitimate model and pinning the
+/// solver's current choice would be pinning an implementation detail.
+#[test]
+fn get_value_on_a_predicate_application() {
+    let out = run_script(
+        "(set-logic QF_UFBV)(declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun x () (_ BitVec 8))\
+         (assert (p x))(check-sat)(get-value ((p x)))(get-model)",
+    );
+    assert_eq!(
+        out.len(),
+        3,
+        "expected sat + get-value + get-model: {out:?}"
+    );
+    assert_eq!(out[0].as_str(), "sat", "got {out:?}");
+
+    // Fact 1: the label is structural, the value is the `?` placeholder.
+    assert_eq!(out[1].as_str(), "(((p x) ?))", "got {out:?}");
+
+    // Fact 2: `get-model` omits the arity-1 symbol `p` entirely, and gives the
+    // argument a value.
+    assert!(
+        !out[2].contains("define-fun p"),
+        "get-model must still omit the arity-1 symbol p: {out:?}"
+    );
+    assert!(
+        out[2].starts_with("((define-fun x () (_ BitVec 8) #x"),
+        "the argument x must still get a concrete 8-bit value: {out:?}"
+    );
+}
