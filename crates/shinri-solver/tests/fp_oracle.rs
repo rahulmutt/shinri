@@ -214,7 +214,10 @@ fn gen_arith_script(rng: &mut Lcg) -> (String, bool) {
             // `blast_fp_atom` (a panic) and that the pre-slice fence rejected.
             // Mirrors the `fp.isNaN` arm's shape: the predicate wraps the same
             // arithmetic term, so two asserts picking this arm with different
-            // rounding modes give congruence something real to do.
+            // rounding modes give congruence something real to do. This arm is
+            // what makes a z3 disagreement reachable — see the TRIAGE NOTE at
+            // the `DISAGREEMENT` panic in `differential_qf_fp_add_sub` before
+            // concluding shinri is at fault.
             _ => {
                 used_pred = true;
                 format!("(p {term})")
@@ -261,6 +264,20 @@ fn differential_qf_fp_add_sub() {
             (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
             (SolveOutcome::Sat, easy_smt::Response::Unknown)
             | (SolveOutcome::Unsat, easy_smt::Response::Unknown) => continue,
+            // TRIAGE NOTE, slice 45. If this fires as shinri=Unsat z3=Sat on a
+            // script containing `(p …)`, SUSPECT z3 FIRST — do not "fix"
+            // congruence to under-trigger, which is the wrong-`sat` direction.
+            // z3 (measured on 4.16.0) has an FP+UF congruence defect: two
+            // NaN-valued arguments are one VALUE in SMT-LIB but many bit
+            // patterns, and z3 misses the ENTAILED equality. It is self-
+            // refuting — asked for its model it returns `p := λx. true` and
+            // then evaluates `(p b)` to `true` against an asserted
+            // `(not (p b))` — and it answers `unsat` for the same query once
+            // `(= a b)` is stated syntactically. cvc5 and shinri say `unsat`.
+            // Full diagnosis and the corroborating probes live at
+            // `nan_arguments_are_congruent_for_a_predicate` in
+            // tests/qfufbv_e2e.rs. This generator emits `(p <fp-term>)`, so
+            // the split is reachable here even though it has never fired.
             (o, t) => {
                 panic!("QF_FP add/sub DISAGREEMENT (iter {iter}): shinri={o:?} z3={t:?}\n{src}")
             }
