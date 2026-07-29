@@ -119,7 +119,7 @@ arguments**, on all three paths that share `blast_bv_atom`
 
 - **FP-result** applications. An uninterpreted FP-sorted word is still rejected
   by `is_supported_fp_word`, and `fp_atoms_fully_supported`
-  (`fp_stage.rs:767`) still fences the query.
+  (`fp_stage.rs:824`) still fences the query.
 - Applications whose **arguments** are Int-, Bool-, Array-, String-,
   Datatype-, uninterpreted-, or RoundingMode-sorted. Fence 1 keeps fencing
   them. A Bool argument is worth calling out because it looks superficially
@@ -965,10 +965,43 @@ reproduce it.
   false, so no BV-array `select` can be present and the predicate rejects every
   array access there.
 
-  **Completeness of the check (CORRECTED in review round 1).** Enumerating
-  `BuiltinOp` (`crates/shinri-core/src/term.rs`) against `blast_bv_word`'s
-  dispatch (`crates/shinri-bv/src/blast/mod.rs:448-628`), the BV-**sorted**
-  heads with no arm are exactly four: `Select`, `Ite`, `FpToUbv`, `FpToSbv`.
+  **Completeness of the check (CORRECTED in review round 1; NARROWED again in
+  the whole-branch review — see §8.6).** Enumerating `BuiltinOp`
+  (`crates/shinri-core/src/term.rs`) against `blast_bv_word`'s dispatch
+  (`crates/shinri-bv/src/blast/mod.rs:448-628`), the heads with no arm that are
+  **BV-sorted and therefore reachable by `blast_bv_word`** are exactly four:
+  `Select`, `Ite`, `FpToUbv`, `FpToSbv`.
+
+  > **SCOPE, stated explicitly because its absence caused C1.** This
+  > enumeration is a claim about **one sink**, `blast_bv_word`. It is NOT a
+  > claim about the admissible-argument space. As originally written — "the
+  > BV-**sorted** heads with no arm are exactly four" — it reads as the latter,
+  > and read that way it is FALSE.
+  >
+  > The real sink for an admitted UF argument is `Lowerer::word`
+  > (`crates/shinri-fp/src/lower.rs`), which dispatches **on the argument's
+  > sort**: BV-sorted → `blast_bv_word`, FP-sorted → `blast_fp_word`,
+  > RoundingMode → `blast_rm`. Task 4 made FP-sorted arguments admissible, so
+  > from that commit onward the enumeration covers only the BV half of the
+  > sink and says nothing about an FP-sorted argument. Nobody enumerated the
+  > other half, and the other half has holes:
+  >
+  > | sink | arm with no congruence / no validation | reached by |
+  > | --- | --- | --- |
+  > | `blast_fp_word` | `Op::Uninterpreted` with a NON-EMPTY child list: mints a fresh unconstrained word, registers **nothing** in `uf_apps`, guarded only by a `debug_assert!` | any FP-sorted argument subtree containing `(g …)`, `g` non-nullary with FP result |
+  > | `blast_rm` | the "not a literal → fresh symbolic rounding mode" fallback, with no arity check at all | a RoundingMode operand `(h …)`, `h` non-nullary with RM result |
+  >
+  > Both mint an unconstrained value per OCCURRENCE, so two applications to
+  > provably equal arguments get independent values, congruence on the
+  > enclosing predicate never fires, and the encoding is satisfiable where the
+  > theory is not — a wrong `sat`. C1 is exactly this; §8.6 has the
+  > measurements and the fence that closes it.
+  >
+  > The durable form of the rule: **an enumeration of "heads with no arm" is
+  > only as complete as the set of sinks it enumerates against, and the set of
+  > sinks is determined by the set of admissible argument SORTS.** Widening the
+  > admissible sorts (Task 4) silently invalidates any such enumeration written
+  > before the widening.
 
   - `Ite` is excluded upstream and unconditionally — `word_norm.normalize`
     (`lib.rs:759`) eliminates every BV-sorted `ite` BEFORE any fence or routing
@@ -1160,3 +1193,200 @@ reproduce it.
   1369/1369 passed with no test expectation altered by this task, so no
   `sat`→`unsat`, no `unsat`→`sat`, and no decided→`unknown` anywhere in either
   suite. §2.1's "no named-exception list" survives the sweep intact.
+- 8.6 — C1 (whole-branch review): a wrong `sat` on well-formed QF_UFFP,
+  introduced by this branch, and the fence that closes it.
+
+  **What it is.** §5's "one new risk" — a collected atom is an opaque leaf the
+  foreign-theory fence no longer descends into — in a **third** manifestation
+  that §8.4's Task-6 audit did not enumerate. §8.4 found the `select` and
+  `fp.to_ubv` instances, both BV-sorted. This one is FP-sorted, and it is
+  invisible to that audit for the reason §8.4's new scope box states: the
+  audit enumerated `blast_bv_word`'s missing arms, and an FP-sorted argument
+  never reaches `blast_bv_word`.
+
+  **Mechanism, verified against the code rather than inferred.**
+
+  1. Task 3 makes a Bool-result uninterpreted application a collected atom
+     (`bv_stage::collect_bv_atoms`, the
+     `Op::Uninterpreted(_) => !kids.is_empty() && ctx.sort_of(t) == ctx.bool_sort()`
+     arm) with **no constraint on argument sort**. Task 4 makes an FP-sorted
+     argument reach that path. So for the first time a member of `bv_atoms` can
+     have a directly FP-sorted operand.
+  2. `has_non_bvfp_theory_atom` treats a collected atom as a leaf, so the
+     foreign-theory fence no longer sees the subtree.
+  3. `fp_atoms_fully_supported` (`lib.rs`) walks only `fp_atoms`, and `(p …)`
+     is not one — it is a `bv_atom`.
+  4. `bv_atoms_fp_supported` → `bv_subtree_fp_supported` walked the operand
+     subtree but validated **only** `FpToUbv`/`FpToSbv` heads, descending
+     generically through everything else. Its premise — recorded in its own doc
+     comment as "Until 4e BV atoms could not contain FP subterms" — silently
+     assumed every generically-reached node was BV-sorted. It never called
+     `is_supported_fp_word` on an FP-sorted node.
+  5. Fence 1 (`bv_stage::walk_uf_args`) accepts the argument on **sort**
+     (`allow_fp_args && ctx.fp_widths(ks).is_some()`), and `arg_term_blastable`
+     enumerates only BV-sorted unblastable heads. Neither validates FP-word
+     blastability.
+  6. `blast_fp_word`'s `Op::Uninterpreted` arm (`crates/shinri-fp/src/lib.rs`)
+     carries only a `debug_assert!` for arity and then **mints a fresh
+     unconstrained word, registering nothing in `uf_apps`**. No congruence.
+     `word(g a)` and `word(g b)` are independent, so `core_eq` never forces the
+     `cond` literal true, congruence on `p` never fires, and the query is
+     satisfiable in the encoding while unsatisfiable in the theory. The
+     RoundingMode twin is the same defect one sink over: `blast_rm` has no
+     arity check either, so `(h a)` and `(h b)` become independent fresh
+     symbolic rounding modes.
+
+  **Measurement.** Six probes plus one control, run on BOTH profiles.
+  `main` column measured at `e1baa3bb` in a separate `git worktree` (never
+  `git stash` — there is a pre-existing `stash@{0}` on this repo and a
+  no-op `stash push` would make a paired `pop` pop the wrong entry). HEAD
+  column at `cd4a91b8` (the whole-branch-review tip). Post-fix at this
+  commit. Commands:
+
+  ```
+  cargo build --release -p shinri-cli && cargo build -p shinri-cli
+  ./target/{release,debug}/shinri <probe>.smt2
+  mise exec -- z3 <probe>.smt2 ; mise exec -- cvc5 <probe>.smt2
+  ```
+
+  All six probes share the frame `(assert (= a b))` plus a predicate asserted
+  both ways, so **every one is unsat-by-construction**; `g : Float32 →
+  Float32` and `h : Float32 → RoundingMode` are the non-nullary symbols the
+  blaster has no arm for.
+
+  | probe | shape | `main` e1baa3bb | HEAD `cd4a91b8` rel | HEAD `cd4a91b8` dbg | post-fix rel | post-fix dbg | z3 4.16.0 | cvc5 1.3.4 |
+  | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `c1a` | `(p (g a))` / `¬(p (g b))` | `unknown` | **`sat`** | **PANIC** | `unknown` | `unknown` | `unsat` | `unsat` |
+  | `c1b` | `(p (fp.abs (g a)))` / `¬(p (fp.abs (g b)))` | `unknown` | **`sat`** | **PANIC** | `unknown` | `unknown` | `unsat` | `unsat` |
+  | `c1c` | `p : BV8→Bool`, `f : F32→BV8`; `(p (f (g a)))` / `¬(p (f (g b)))` | `unknown` | **`sat`** | **PANIC** | `unknown` | `unknown` | `unsat` | `unsat` |
+  | `c1d` | `(p (fp.add RNE (g a) z))` / `¬(p (fp.add RNE (g b) z))` | `unknown` | **`sat`** | **PANIC** | `unknown` | `unknown` | `unsat` | `unsat` |
+  | `c1rm` | `(p (fp.add (h a) a b))`, single occurrence | `unknown` | `sat` | `sat` | `unknown` | `unknown` | `sat` | `sat` |
+  | `c1rm2` | `(p (fp.add (h a) a a))` / `¬(p (fp.add (h b) a a))` | `unknown` | **`sat`** | **`sat`** | `unknown` | `unknown` | `unsat` | `unsat` |
+  | control | `(= a b) ∧ ¬(= (g a) (g b))` — no predicate | `unknown` | `unknown` | `unknown` | `unknown` | `unknown` | `unsat` | `unsat` |
+
+  Verbatim, on the debug profile at `cd4a91b8`, for `c1a`/`c1b`/`c1c`/`c1d`:
+
+  ```
+  thread 'main' (3765984) panicked at crates/shinri-fp/src/lib.rs:151:13:
+  non-nullary FP fn out of scope
+  ```
+
+  Three things the table settles:
+
+  1. **`c1a`–`c1d` and `c1rm2` are regressions this branch introduced.** `main`
+     answered a sound `unknown` on every one; HEAD answers a wrong `sat` in the
+     shipping profile. This is not a pre-existing hole surfaced, it is new.
+  2. **The debug tripwire is not a safety net.** It is a `debug_assert!`, so it
+     vanishes in release — and `c1rm2` shows it does not even fire in debug for
+     the RoundingMode half, because `blast_rm` has no assertion at all. The
+     release column is the one that matters and it says `sat`.
+  3. **The control isolates the new door.** `(= a b) ∧ ¬(= (g a) (g b))` is the
+     same `g` and the same entailment with no predicate, and it stays `unknown`
+     at HEAD — it routes through `collect_fp_atoms` →
+     `fp_atoms_fully_supported` → `is_supported_fp_word`, which rejects a
+     non-nullary UF. So the pre-existing FP fence still holds; what leaked is
+     specifically the Task-3 + Task-4 door.
+
+  `c1rm`'s HEAD `sat` happens to match z3 and cvc5 — with one occurrence of
+  `(h a)` there is nothing for congruence to relate, so an unconstrained fresh
+  rounding mode is a sound over-approximation *for that query*. It is recorded
+  because it is the same unvalidated blast, and `c1rm2` is what turns the same
+  blast into a wrong verdict.
+
+  **The fix, and why it is placed there.** Sort dispatch at the head of
+  `fp_stage::bv_subtree_fp_supported`'s `walk`: an FP-sorted node must satisfy
+  `is_supported_fp_word`, a RoundingMode-sorted node must satisfy
+  `is_rounding_mode_term`, everything else keeps the generic descent.
+
+  This is the fence whose *premise* was false, not merely a fence that happens
+  to sit upstream of the bug. `bv_subtree_fp_supported` already owns "everything
+  reachable from a collected BV atom's operand must be blastable"; it was
+  written when "reachable" implied "BV-sorted", and the repair is to make it
+  total over sorts rather than total-by-coincidence. Placing it here also covers
+  the case where the offending FP node is reached through a node that is neither
+  an FP→BV conversion nor a UF argument — `c1c`, where the walk descends
+  generically through `(f (g a))` — with the same three lines.
+
+  The considered alternative was `bv_stage::walk_uf_args`'s FP-argument branch
+  (Fence 1), which would need `is_supported_fp_word` raised to `pub(crate)`.
+  Measured reachability makes the two near-equivalent for every shape that
+  exists today: on the pure-BV (`lib.rs:1007`) and ABV (`lib.rs:902`) paths
+  `allow_fp_args` is `false`, so an FP-sorted argument is rejected on sort and
+  neither fence is reached; the FP/mixed path is the only one that admits FP
+  arguments, and it runs `bv_atoms_fp_supported` (`lib.rs:1080`) and Fence 1
+  (`lib.rs:1095`) one after the other over the same atom set. The tiebreak is
+  that Fence 1 inspects UF *arguments* only, so it would leave `c1c`'s generic
+  descent to a second mechanism, while the walk covers all four shapes at once.
+
+  **The RoundingMode arm is defence in depth, and that is measured, not
+  assumed.** Deleting it and re-measuring, `c1rm` and `c1rm2` still answer
+  `unknown` on both profiles: the FP-sorted arm reaches `is_supported_fp_word`,
+  which runs `is_rounding_mode_term` on the `fp.add`'s RM operand first. It is
+  kept so the walk is total over sorts — the assumption whose failure caused
+  C1 — with `fp_stage::tests::bv_atom_rejects_a_non_nullary_rounding_mode_operand`
+  as its unit proof.
+
+  **The gate, red before the fence and green after.** `fp_oracle`'s generator
+  could not emit an FP-result uninterpreted application: it declared only `p`
+  (Bool result) and always applied it to a term the blaster HAS an arm for. So
+  the 627-test green oracle run in §8.5 could not see C1 — the slice-44
+  `oracle-generator-blind-spots` failure mode, repeated.
+
+  `gen_arith_script` now emits, one instance in five,
+  `gen_pred_unblastable_arg_probe`: a whole script in four forms matching the
+  four measured probes above (`(p (g x))`, `(p (fp.abs (g x)))`,
+  `(p (fp.add RNE (g x) z))`, and the `h`-in-the-RM-slot twin), each with
+  `(assert (= x y))` and the predicate asserted both ways. The driver counts
+  that family separately from the `Blastable` family, because the two have
+  OPPOSITE expectations — `Blastable` must decide, `UnblastableArg` must not
+  come back `Sat` — and conflating them into one counter is exactly what let
+  C1 hide. Measured **at `cd4a91b8`, source unmodified, test file only**:
+
+  ```
+  $ cargo nextest run -p shinri-solver --features oracle \
+      -E 'test(differential_qf_fp_add_sub)' --no-capture
+      Starting 1 test across 27 binaries (629 tests skipped)
+
+  thread 'differential_qf_fp_add_sub' (3861182) panicked at crates/shinri-solver/tests/fp_oracle.rs:348:17:
+  assertion `left != right` failed: slice-45 C1 WRONG SAT (iter 3): a predicate
+  argument containing a non-nullary FP-result / RoundingMode-result
+  uninterpreted application blasted without congruence; this script is
+  unsat-by-construction
+  (set-logic QF_FP)
+  (declare-fun x () (_ FloatingPoint 8 24))
+  (declare-fun y () (_ FloatingPoint 8 24))
+  (declare-fun z () (_ FloatingPoint 8 24))
+  (declare-fun p ((_ FloatingPoint 8 24)) Bool)
+  (declare-fun h ((_ FloatingPoint 8 24)) RoundingMode)
+  (assert (= x y))
+  (assert (p (fp.add (h x) x x)))
+  (assert (not (p (fp.add (h y) x x))))
+  (check-sat)
+    left: Sat
+   right: Sat
+       Summary [   1.352s] 1 test run: 0 passed, 1 failed, 629 skipped
+  ```
+
+  Discovered count **1**, confirmed non-zero. The assertion fires on the FIRST
+  probe instance (iteration 3, the RoundingMode form) and aborts, so this one
+  run does not exercise the other three forms; each of the four was
+  independently measured at `cd4a91b8` through the CLI — rows `c1a`, `c1b`,
+  `c1d`, `c1rm2` of the table above, all `sat` in release.
+
+  The probe branch draws one extra `rng.below(5)` per iteration, which
+  **SHIFTS THE RNG STREAM** for this generator. §8.2's `fp_oracle` denominator
+  therefore moves; §8.5's re-measurement records both numbers. The other two
+  families' generators are untouched, so `89/89` and `94/94` must not move.
+
+  **Verdict-flip audit.** Six flips, all `sat` → `unknown`, all of them
+  restoring `main`'s answer on a query where the `sat` was WRONG (z3 and cvc5
+  both `unsat` on five of six; `c1rm` had no verdict worth keeping — its `sat`
+  was unsound reasoning that happened to land on the right answer). No
+  `sat`→`unsat`, no `unsat`→`sat`, and **no decided → `unknown` on any shape
+  that was decided correctly**: the shapes §2.1 protects are predicates over
+  arguments `is_supported_fp_word` admits — nullary FP variables, FP constants,
+  and rounding ops with a literal or nullary-symbol RM — which is exactly what
+  `fp_oracle`'s `Blastable` family and `qfufbv_e2e`'s
+  `fp_argument_predicate_congruence` /
+  `nan_arguments_are_congruent_for_a_predicate` cover, and all of them still
+  decide (§8.5's re-measurement).

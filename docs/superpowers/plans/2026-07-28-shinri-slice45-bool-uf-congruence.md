@@ -1388,7 +1388,7 @@ two.
 
 Pick one and record which:
 - **Rename** to `collect_blastable_atoms`, updating all call sites
-  (`bv_stage.rs:473`, `:497`, `fp_stage.rs:448`, `:1343`, `:1358`,
+  (`bv_stage.rs:473`, `:497`, `fp_stage.rs:448`, `:1400`, `:1415`,
   `abv_stage.rs:318`, `lib.rs:1008`, `:1038`), or
 - **Keep the name** and rewrite the doc comment to state both subtleties.
 

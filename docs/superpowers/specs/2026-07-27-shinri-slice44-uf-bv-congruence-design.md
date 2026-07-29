@@ -84,7 +84,7 @@ disturbed: a Bool-result application `p(x)` is not collected by
 (`crates/shinri-solver/src/bv_stage.rs:177`) sees a non-Boolean-structure atom
 outside the BV set and fences; an FP-result application routes to the FP path
 instead, where `is_supported_fp_word` rejects an uninterpreted FP-sorted word
-and `fp_atoms_fully_supported` (`fp_stage.rs:767`) fences. BV ⋈ Int/String/DT
+and `fp_atoms_fully_supported` (`fp_stage.rs:824`) fences. BV ⋈ Int/String/DT
 stays fenced; BV is still
 not a combinable theory. `get-model` still omits arity > 0 symbols, so it
 remains an incomplete model for UF queries (slice 43 §5).
@@ -238,7 +238,7 @@ all and need no constraint.
 ## 4. Two fences, both before lowering
 
 Both follow the discipline already established by `fp_atoms_fully_supported` and
-`bv_atoms_fp_supported` (`crates/shinri-solver/src/fp_stage.rs:767`, `:746`):
+`bv_atoms_fp_supported` (`crates/shinri-solver/src/fp_stage.rs:824`, `:803`):
 fence *ahead of* lowering, so the blast arms' `unreachable!`s stay internal
 invariants rather than reachable states.
 
