@@ -817,15 +817,20 @@ fn an_fp_to_bv_argument_still_decides_on_the_fp_path() {
 ///
 /// 0. **The query decides `sat` at all.** Pre-slice it was `unknown` (spec §1,
 ///    Q2), so `get-value` returned the `model is not available` error
-///    (`lib.rs:438`) and neither channel below was observable. That is why
-///    this had to be measured after the slice rather than predicted before it.
+///    (`lib.rs:438-440`, the guarded `Command::GetValue` arm) and neither
+///    channel below was observable. That is why this had to be measured after
+///    the slice rather than predicted before it.
 ///
 /// 1. **The label renders, the value does not.** `display_term`
 ///    (`crates/shinri-solver/src/tseitin.rs:483`) renders the application
-///    structurally, so the label is `(p x)`. `format_value` (`lib.rs:585`)
-///    then returns `None` — it resolves a *0-arity* symbol through
-///    `last_model`, and `(p x)` is not one — and `get-value` prints the
-///    established `?` placeholder (`lib.rs:453`). That is the correct
+///    structurally, so the label is `(p x)`. `format_value` (`lib.rs:507`)
+///    then returns `None`: it is keyed by **TermId** and consults exactly
+///    three value channels — `last_model`, `eliminated_ite_vals`, and
+///    `abv_array_models` — and `(p x)`'s TermId is in none of them. The
+///    model builder produces values for blasted *variables*, not for atom
+///    literals, which is why the argument `x` resolves (fact 2) and the
+///    application does not. `get-value` then prints the established `?`
+///    placeholder (`lib.rs:453`). That is the correct
 ///    rendering of "no value": slice 43's lesson is that absence must never be
 ///    dressed up as a confident default, and `?` is exactly the visible
 ///    placeholder that refusal uses. This test pins that the value channel

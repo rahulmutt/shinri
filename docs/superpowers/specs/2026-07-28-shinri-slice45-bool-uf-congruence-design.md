@@ -371,14 +371,15 @@ the doc comment describing the pre-slice meaning.
 order of weight:
 
 1. **Diff hygiene at the one moment it matters most.** The rename is 9 call
-   sites (6 of them outside `bv_stage`) but **28** total occurrences
-   (`grep -rn collect_bv_atoms --include=*.rs`, counted at this commit:
-   `bv_stage.rs`, `fp_stage.rs`, `abv_stage.rs`, `lib.rs`, `qfufbv_e2e.rs`,
-   plus cross-crate prose in `shinri-bv/src/lib.rs` and
-   `shinri-bv/src/blast/mod.rs`). Slice 45's final commit lands immediately
+   sites (6 of them outside `bv_stage`) but **29** total occurrences across
+   **8 files** in 3 crates (`grep -rn "collect_bv_atoms" --include=*.rs .`,
+   counted at this commit): `bv_stage.rs` 10, `abv_stage.rs` 5,
+   `qfufbv_e2e.rs` 5, `fp_stage.rs` 3, `lib.rs` 2, plus cross-crate prose in
+   `shinri-bv/src/blast/mod.rs` 2, `shinri-bv/src/lib.rs` 1, and
+   `shinri-fp/src/lower.rs` 1. Slice 45's final commit lands immediately
    before a fresh-eyes whole-branch review whose job is to spot a pairing or
    fence defect in a soundness path — the failure mode that slice 43 and slice
-   44 each shipped past every per-task review. A ~28-site mechanical rename in
+   44 each shipped past every per-task review. A 29-site mechanical rename in
    that same diff buys nothing and costs the reviewer signal-to-noise.
 2. **The name is defensible; the doc was the actual defect.** "BV atoms" reads
    correctly as "the BV stage's atoms" — the set the bit-blaster owns — and
@@ -828,15 +829,31 @@ reproduce it.
   Three separate facts, and the second is the one §6.5 existed to catch:
 
   1. **The query now decides `sat`.** Pre-slice it was `unknown` (§1, Q2), so
-     `get-value` returned the `model is not available` error (`lib.rs:438`) and
-     neither channel was observable at all. That is why this had to be measured
-     after the slice, not predicted before it.
+     `get-value` returned the `model is not available` error
+     (`lib.rs:438-440`, the guarded `Command::GetValue` arm) and neither
+     channel was observable at all. That is why this had to be measured after
+     the slice, not predicted before it.
 
   2. **The label renders; the value channel does NOTHING, and says so.**
      `display_term` (`tseitin.rs:483`) renders the application structurally, so
-     the label is `(p x)` as §6.5 predicted. `format_value` (`lib.rs:585`) then
-     returns `None` — it resolves a **0-arity** symbol through `last_model`,
-     and `(p x)` is not one — and `get-value` prints `?` (`lib.rs:453`).
+     the label is `(p x)` as §6.5 predicted. `format_value` (`lib.rs:507`) then
+     returns `None`: it is keyed by **TermId** and consults exactly three value
+     channels — `last_model`, `eliminated_ite_vals`, `abv_array_models` — and
+     `(p x)`'s TermId is in none of them. The model builder produces values for
+     blasted *variables*, not for atom literals; that is why the argument `x`
+     resolves (fact 3) while the application does not. `get-value` then prints
+     `?` (`lib.rs:453`).
+
+     *(Corrected in Task 7 fix round 1. This paragraph originally cited
+     `format_value` at `lib.rs:585` and said it "resolves a 0-arity symbol
+     through `last_model`". Both were wrong, and from one root cause: that is
+     `value_of_declared` (`lib.rs:602`, doc comment at `:585`), which does key
+     on arity via `find_nullary_app` — `format_value` at `:507` is
+     arity-agnostic and simply looks the TermId up in three maps. The
+     conclusion — `None`, hence `?` — is unchanged and was independently
+     re-derived from the function body. Same defect class as the
+     `abv_stage.rs:198-200` citation this task fixed elsewhere, which is why
+     it is recorded rather than quietly patched.)*
 
      `?` is the established visible placeholder for "no value", the same one
      slice 43 §5 introduced for a symbol whose value no channel holds. This is

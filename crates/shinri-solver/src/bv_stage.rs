@@ -7,10 +7,11 @@
 //! the bit-blaster owns"**, which is strictly larger than "atoms with a BV
 //! operator on top". The name was kept rather than changed to
 //! `collect_blastable_atoms` (spec §4.1 permits either): the alternative is a
-//! 28-occurrence mechanical rename spanning three crates and the committed
-//! slice-44 spec, landing in the same diff as this slice's soundness-relevant
-//! fence edits, where it would swamp them for a reviewer. The precision goes
-//! here instead. Three subtleties, each load-bearing in a different direction:
+//! 29-occurrence mechanical rename across 8 files in three crates, plus the
+//! committed slice-44 spec, landing in the same diff as this slice's
+//! soundness-relevant fence edits, where it would swamp them for a reviewer.
+//! The precision goes here instead. Three subtleties, each load-bearing in a
+//! different direction:
 //!
 //! **1. BV (dis)equalities are INCLUDED — for soundness.** The theory's
 //! `classify_equality` routes any `(= a b)` whose operand sort is neither Int

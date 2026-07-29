@@ -157,8 +157,8 @@ fn walk_fence(ctx: &Context, t: TermId, visited: &mut rustc_hash::FxHashSet<Term
             // bit-blaster owns it — `blast_bv_atom`'s `Op::Uninterpreted` arm
             // lowers it through `blast_uf_app` at result width 1, with Ackermann
             // congruence — and `collect_bv_atoms` collects it
-            // (`bv_stage.rs:202`), so `RealBridge::new` blasts it at `:361` with
-            // the persistent blaster.
+            // (`bv_stage.rs:239`), so `RealBridge::new` blasts it at `:377`
+            // with the persistent blaster.
             //
             // WHY THIS FENCE NEEDED ITS OWN WIDENING. Slice 45's other two paths
             // inherited theirs from `collect_bv_atoms`: `bv_stage`'s and
