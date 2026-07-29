@@ -1273,9 +1273,52 @@ reproduce it.
 
   Three things the table settles:
 
-  1. **`c1a`–`c1d` and `c1rm2` are regressions this branch introduced.** `main`
-     answered a sound `unknown` on every one; HEAD answers a wrong `sat` in the
-     shipping profile. This is not a pre-existing hole surfaced, it is new.
+  1. **The six Bool-predicate SHAPES are regressions this branch introduced.**
+     `main` answered a sound `unknown` on every one; HEAD answers a wrong `sat`
+     in the shipping profile.
+
+     > **CORRECTED in the scoped re-review of the fix wave.** This item
+     > originally continued: "This is not a pre-existing hole surfaced, it is
+     > new." **That is FALSE of the underlying defect**, and the distinction
+     > matters — a false premise left in a doc is the exact mechanism that
+     > produced C1 in the first place.
+     >
+     > What is new is the *reachability via a Bool-result predicate*. The
+     > `blast_fp_word` / `blast_rm` congruence hole itself is **pre-existing and
+     > reachable on `main`**, through slice 44's already-shipped **BV-result**
+     > UF application with an FP-sorted argument on the FP/mixed path
+     > (`lib.rs:1095`, `allow_fp_args = true`) — no predicate involved:
+     >
+     > ```
+     > (set-logic ALL)
+     > (declare-fun a () (_ FloatingPoint 8 24))
+     > (declare-fun b () (_ FloatingPoint 8 24))
+     > (declare-fun g ((_ FloatingPoint 8 24)) (_ FloatingPoint 8 24))
+     > (declare-fun f ((_ FloatingPoint 8 24)) (_ BitVec 8))
+     > (assert (= a b))
+     > (assert (not (= (f (g a)) (f (g b)))))
+     > (check-sat)
+     > ```
+     >
+     > | | verdict |
+     > | --- | --- |
+     > | `main` `e1baa3bb` release | **`sat`** ← wrong, shipped today |
+     > | `main` `e1baa3bb` debug | **PANIC**, `crates/shinri-fp/src/lib.rs:151` |
+     > | HEAD `cd4a91b8` release | **`sat`** / debug **PANIC**, same line |
+     > | post-fix release **and** debug | `unknown` |
+     > | z3 4.16.0 | `unsat` |
+     > | cvc5 1.3.4 | `unsat` |
+     >
+     > (Re-measured independently in throwaway worktrees before being recorded
+     > here, not carried over from the review message.)
+     >
+     > So the correct statement of provenance is: **the Bool-predicate shapes
+     > are new; the hole they reach is not.** `main` ships this wrong `sat`
+     > today, and the sort dispatch in `bv_subtree_fp_supported` closes it too —
+     > it fences on the FP-sorted argument regardless of whether the enclosing
+     > application's result is Bool or BitVec. On this shape the branch is
+     > therefore **strictly better than `main`**, which the original wording
+     > obscured.
   2. **The debug tripwire is not a safety net.** It is a `debug_assert!`, so it
      vanishes in release — and `c1rm2` shows it does not even fire in debug for
      the RoundingMode half, because `blast_rm` has no assertion at all. The
@@ -1373,10 +1416,115 @@ reproduce it.
   independently measured at `cd4a91b8` through the CLI — rows `c1a`, `c1b`,
   `c1d`, `c1rm2` of the table above, all `sat` in release.
 
-  The probe branch draws one extra `rng.below(5)` per iteration, which
-  **SHIFTS THE RNG STREAM** for this generator. §8.2's `fp_oracle` denominator
-  therefore moves; §8.5's re-measurement records both numbers. The other two
-  families' generators are untouched, so `89/89` and `94/94` must not move.
+  **Why §8.2's `fp_oracle` denominator moves, 83 → 70.** Two causes, and the
+  smaller one is not the dominant one.
+
+  > **ATTRIBUTION CORRECTED in the scoped re-review.** This paragraph first
+  > blamed the shifted RNG stream alone: "The probe branch draws one extra
+  > `rng.below(5)` per iteration, which SHIFTS THE RNG STREAM for this
+  > generator. §8.2's `fp_oracle` denominator therefore moves." True but
+  > misleading — the shift is the *minor* term.
+  >
+  > The probe branch takes its iteration **instead of** the random assertion
+  > mix (it `return`s a whole script), so with `N_ITERS = 200` and a 1-in-5
+  > draw, ~44 iterations can no longer produce a `Blastable` instance at all.
+  > That is the 13-instance drop. Normalising by the iterations still
+  > *available* to the family:
+  >
+  > | | `Blastable` instances | iterations available | rate |
+  > | --- | --- | --- | --- |
+  > | before | 83 | 200 | 41.5% |
+  > | after | 70 | 156 | 44.9% |
+  >
+  > The ~3-point residual is the RNG shift. The family's *density* did not
+  > fall — it rose slightly — so the coverage claim is unaffected; only the
+  > attribution was wrong. Both denominators are recorded in §8.5, and the
+  > other two families' generators are untouched, so `89/89` and `94/94` must
+  > not move (they did not).
+
+  **Verdict-flip audit.** Six flips, all `sat` → `unknown`, all of them
+  restoring `main`'s answer on a query where the `sat` was WRONG (z3 and cvc5
+  both `unsat` on five of six; `c1rm` had no verdict worth keeping — its `sat`
+  was unsound reasoning that happened to land on the right answer). No
+  `sat`→`unsat`, no `unsat`→`sat`, and **no decided → `unknown` on any shape
+  that was decided correctly**: the shapes §2.1 protects are predicates over
+  arguments `is_supported_fp_word` admits — nullary FP variables, FP constants,
+  and rounding ops with a literal or nullary-symbol RM — which is exactly what
+  `fp_oracle`'s `Blastable` family and `qfufbv_e2e`'s
+  `fp_argument_predicate_congruence` /
+  `nan_arguments_are_congruent_for_a_predicate` cover, and all of them still
+  decide (§8.5's re-measurement).
+
+  Add to that the `(f (g a))` row above: `main` `sat` → post-fix `unknown`, a
+  seventh flip in the same direction, on a shape `main` got WRONG. It is listed
+  separately because it is not a Bool-predicate shape and is not slice-45
+  provenance.
+
+  **RESOURCE flip, recorded here because the fix report is not the durable
+  record.** One further consequence of the fence has no verdict in it and would
+  otherwise go unrecorded.
+
+  `is_supported_fp_word` is **unmemoized**: on a `let`-shared term DAG it
+  recurses once per PATH, not once per node, so `tₙ₊₁ = (fp.add RNE tₙ tₙ)`
+  costs 2ⁿ. Routing `(p …)` through the fence therefore routes it through that
+  cost. Measured, release, `(assert (p tₙ))` with `p : Float32 → Bool`:
+
+  | depth `n` | `main` `e1baa3bb` | HEAD `cd4a91b8` | post-fix |
+  | --- | --- | --- | --- |
+  | 30 | `unknown`, 0.002 s | `sat`, 0.133 s | 33.5 s |
+  | 32 | `unknown`, 0.002 s | `sat`, 0.163 s | 113.2 s |
+  | 34 | `unknown` | `sat` | >120 s (timeout) |
+  | 40 | `unknown`, 0.002 s | `sat`, 0.188 s | >60 s (timeout) |
+
+  ≈1.84× per level — exponential, as the double recursion predicts.
+
+  **This is NOT a forbidden flip under §2.1, and the framing is what settles
+  it.** §2.1's invariant is stated **branch versus `main`**, and `main` answers
+  `unknown` on every row of that table (a Bool-result UF application is a
+  foreign theory atom there, fenced before any FP walk). So the flip is
+  `unknown` → *no answer*, not decided → `unknown`. `cd4a91b8` is an unmerged
+  intermediate commit on this branch; its verdicts are not a baseline, and its
+  fast `sat` came from **skipping the fence** — the same code path that
+  produces the wrong `sat` in `c1a`–`c1d`. The speed was the bug's symptom, not
+  a capability.
+
+  Two supporting facts:
+
+  - **The cost is pre-existing and reachable without this branch.** The
+    non-predicate form `(assert (fp.isNaN t₄₀))` times out identically on
+    `main` (`e1baa3bb`), at `cd4a91b8`, and post-fix — every FP atom over the
+    same term already pays it. The fix makes `(p t)` *consistent* with the rest
+    of the FP front-end rather than adding a new class of hazard.
+  - **No cheaper placement exists.** Fencing FP words at `walk_uf_args` instead
+    would call the same unmemoized predicate. Nor can `is_supported_fp_word` be
+    decomposed into a cheap "head check ∧ children supported" — its 2-arg
+    `ToFp` arm is a **disjunction** over child kinds (supported FP word OR
+    constant Real OR BV-sorted-and-walked), so the recursion is load-bearing.
+    The only alternatives are to memoize it or to duplicate its logic, and
+    duplicating a soundness predicate is not acceptable.
+
+  **OWED FOLLOW-UP, named so it is not lost.** Memoize the FP support fences —
+  thread an `FxHashMap<TermId, bool>` through `is_supported_fp_word` /
+  `is_supported_fp_to_bv` / `bv_subtree_fp_supported` / `fp_atom_is_supported`.
+  The predicate is pure in `(ctx, t)`, so a memo is semantics-preserving, and
+  it would remove the blowup for **all** entry points including the
+  pre-existing `fp.isNaN` one — making the tree strictly better than `main` on
+  cost as well as on verdict. It is deliberately NOT done here: it is a
+  signature refactor of four soundness-critical fences plus ~20 test call sites
+  landing in the last wave before merge with no review pass left, and it sits
+  in `docs/threat-model.md`'s territory (unbounded work on adversarial input),
+  which deserves its own spec. Shipping as-is was adjudicated by the human
+  partner and independently by the scoped re-review.
+
+  **Tripwire parity gap, reported not fixed.** `blast_fp_word`'s
+  `Op::Uninterpreted` arm at least carries a `debug_assert!` (which is how
+  `c1a`–`c1d` announced themselves in debug). `blast_rm`'s "not a literal →
+  fresh symbolic rounding mode" fallback (`crates/shinri-fp/src/lib.rs:105-116`)
+  has **no arity check and no assertion at all**, which is why `c1rm2` returned
+  a wrong `sat` on BOTH profiles with nothing to warn a developer. It is
+  unreachable through the fenced paths as of this slice, but the asymmetry is
+  worth naming: whoever adds congruence for FP-result applications should add
+  the missing tripwire to `blast_rm` in the same change.
 
   **Verdict-flip audit.** Six flips, all `sat` → `unknown`, all of them
   restoring `main`'s answer on a query where the `sat` was WRONG (z3 and cvc5
