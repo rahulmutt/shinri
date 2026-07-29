@@ -627,3 +627,110 @@ fn predicate_over_an_array_read_decides() {
         "got {out:?}"
     );
 }
+
+// ── Slice 45 Task 6: the Fence-1 blastability audit ──────────────────────────
+//
+// Fence 1 (`bv_stage::uf_args_supported`) originally checked argument SORTS
+// only. A BitVec-sorted `(select a i)` passed by sort while `blast_bv_word`
+// has no `Select` arm. The audit measured this on the release AND debug
+// binaries, for both result sorts, at commit 99b282af.
+//
+// The routing predicate that decides which way a query goes is
+// `abv_stage::uses_arrays_over_bv` (`lib.rs:902`): it is true only for a
+// `select`/`store`/array-(dis)equality whose array operand is BV-INDEXED and
+// BV-VALUED. True → the ABV path, where `shinri_abv::abstract_arrays`
+// substitutes a fresh BV read symbol for every `select` (its `collect`/`subst`
+// walk children generically, so one buried in a UF application's arguments is
+// substituted too) before `collect_bv_atoms` ever sees the abstraction.
+// False → the pure-BV / FP paths, which have no array machinery at all.
+//
+// So the exposure is exactly the array shapes that predicate does NOT claim.
+// The four pins below cover both sides of it for both result sorts.
+
+/// ABV side, BV result (slice 44's shipped arm). `uses_arrays_over_bv` is TRUE
+/// (the array is `(Array (_ BitVec 4) (_ BitVec 8))`), so the read is
+/// abstracted to a fresh BV symbol before blasting. Measured `sat` on both
+/// binaries; z3 4.16.0 and cvc5 1.3.4 both say `sat`.
+///
+/// This pin is what makes a future narrowing of `uses_arrays_over_bv` loud:
+/// if such a query ever stopped routing to the ABV path, Fence 1's
+/// blastability check would fence it and this would flip to `unknown`.
+#[test]
+fn a_bv_array_read_argument_is_abstracted_and_decides() {
+    let out = run_script(
+        "(set-logic QF_AUFBV)\
+         (declare-fun a () (Array (_ BitVec 4) (_ BitVec 8)))\
+         (declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (declare-fun i () (_ BitVec 4))\
+         (assert (= (f (select a i)) #x2a))(check-sat)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}
+
+/// ABV side, Bool result (slice 45's new arm). Same routing, same abstraction.
+/// Measured `sat` on both binaries; z3 4.16.0 and cvc5 1.3.4 both say `sat`.
+/// On pre-slice `main` (e1baa3bb) this was `unknown` — the slice-45 gain.
+#[test]
+fn a_bv_array_read_argument_to_a_predicate_is_abstracted_and_decides() {
+    let out = run_script(
+        "(set-logic QF_AUFBV)\
+         (declare-fun a () (Array (_ BitVec 4) (_ BitVec 8)))\
+         (declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun i () (_ BitVec 4))\
+         (assert (p (select a i)))(check-sat)",
+    );
+    assert_eq!(out.first().map(|s| s.as_str()), Some("sat"), "got {out:?}");
+}
+
+/// Non-ABV side, BV result. The array is `(Array Int (_ BitVec 8))`, so
+/// `uses_arrays_over_bv` is FALSE and the query takes the pure-BV path — where
+/// nothing abstracts the read away. The read is BitVec-8-SORTED, so Fence 1's
+/// sort check admitted it and the blaster then hit
+/// `unreachable!("non-BV builtin reached blast_word")`
+/// (`crates/shinri-bv/src/blast/mod.rs:624`) on BOTH profiles.
+///
+/// This shape PREDATES slice 45: pre-slice `main` (e1baa3bb) panicked on it
+/// too, through slice 44's BitVec-result arm. Task 6's blastability check
+/// turns that panic into a sound `unknown`.
+#[test]
+fn a_foreign_array_read_argument_fences_to_unknown() {
+    let out = run_script(
+        "(set-logic ALL)\
+         (declare-fun a () (Array Int (_ BitVec 8)))\
+         (declare-fun f ((_ BitVec 8)) (_ BitVec 8))\
+         (declare-fun i () Int)\
+         (assert (= (f (select a i)) #x2a))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unknown"),
+        "got {out:?}"
+    );
+}
+
+/// Non-ABV side, Bool result — the one case slice 45 itself regressed, and the
+/// reason this audit ended in a code change rather than an unreachability
+/// argument.
+///
+/// Pre-slice `main` (e1baa3bb) answered a sound `unknown` here: the Bool-result
+/// application was NOT a collected BV atom, so `has_non_bv_theory_atom` treated
+/// it as a foreign Bool-sorted atom and fenced. Task 3 widened
+/// `collect_bv_atoms` to collect it — which makes it a collected atom, i.e. a
+/// LEAF that `has_non_bv_theory_atom` no longer descends into — so the foreign
+/// `select` in its arguments stopped being seen and the query PANICKED on both
+/// profiles. Fence 1's blastability check restores the `unknown`.
+#[test]
+fn a_foreign_array_read_argument_to_a_predicate_fences_to_unknown() {
+    let out = run_script(
+        "(set-logic ALL)\
+         (declare-fun a () (Array Int (_ BitVec 8)))\
+         (declare-fun p ((_ BitVec 8)) Bool)\
+         (declare-fun i () Int)\
+         (assert (p (select a i)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unknown"),
+        "got {out:?}"
+    );
+}

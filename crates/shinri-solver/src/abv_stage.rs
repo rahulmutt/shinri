@@ -172,11 +172,14 @@ fn walk_fence(ctx: &Context, t: TermId, visited: &mut rustc_hash::FxHashSet<Term
             // reach this path. Hence the explicit widening, authorized after
             // measurement (slice 45 Task 5).
             //
-            // Argument SORTS are deliberately not checked here: that is Fence 1's
-            // job (`bv_stage::uf_args_supported`, `lib.rs:910`), which runs
-            // unconditionally on the same raw assertions immediately after and
-            // rejects any Bool-result application whose argument the blaster
-            // cannot turn into a word (Int, Array, String, uninterpreted sort, …).
+            // Argument admissibility is deliberately not checked here: that is
+            // Fence 1's job (`bv_stage::uf_args_supported`, `lib.rs:910`), which
+            // runs unconditionally on the same raw assertions immediately after
+            // and rejects any Bool-result application whose argument the blaster
+            // cannot turn into a word — either because its SORT is unwordable
+            // (Int, Array, String, uninterpreted sort, …) or, since slice 45
+            // Task 6, because the argument TERM has no blaster arm (a `select`
+            // over a non-BV array is BitVec-sorted yet unblastable).
             // This makes `fenced` insufficient on its own — see its doc-comment,
             // which states that obligation for callers.
             //
@@ -1211,12 +1214,20 @@ mod tests {
     /// Pins the RECURSION half of the widened branch, which is soundness-relevant
     /// and which no other test in the tree exercises.
     ///
-    /// `(P (select b i))` where `b : (Array Int (_ BitVec 8))`. `P`'s argument is
-    /// BV8-sorted, so Fence 1 (`bv_stage::uf_args_supported`) is satisfied and
-    /// would NOT stop this query. The out-of-scope operation is the `select` over
-    /// an Int-indexed array, buried inside the predicate's argument — and it is
-    /// caught ONLY because the widened branch returns
-    /// `kids.iter().any(walk_fence)` and so descends into the arguments.
+    /// `(P (select b i))` where `b : (Array Int (_ BitVec 8))`. The out-of-scope
+    /// operation is the `select` over an Int-indexed array, buried inside the
+    /// predicate's argument — and `walk_fence` catches it ONLY because the
+    /// widened branch returns `kids.iter().any(walk_fence)` and so descends into
+    /// the arguments.
+    ///
+    /// SLICE 45 TASK 6 UPDATE. When Task 5 wrote this test, Fence 1
+    /// (`bv_stage::uf_args_supported`) checked argument SORTS only, so it
+    /// admitted this shape and the assertion below was stated as a precondition
+    /// ("Fence 1 must ADMIT this"). Task 6's audit measured that a `select` over
+    /// a non-BV array PANICS in `blast_bv_word` and added a blastability half to
+    /// Fence 1, which now rejects it as well. The two fences are now independent
+    /// lines of defence over this one shape — the intended arrangement, since
+    /// `fenced`'s own doc-comment declares it insufficient on its own.
     ///
     /// Non-vacuous by construction: had the branch been written `return false`
     /// (the shape it replaced), this query would be ADMITTED and the assertion
@@ -1248,11 +1259,14 @@ mod tests {
         let pred = ctx.mk_app(Op::Uninterpreted(pf), &[foreign_sel]).unwrap();
 
         assert!(uses_arrays_over_bv(&ctx, &[bv_atom, pred]));
-        // Fence 1 does NOT save us here: the predicate's argument is BV8-sorted.
+        // Fence 1 also rejects this shape since slice 45 Task 6 (see the
+        // doc-comment). That does NOT make the assertion below vacuous: `fenced`
+        // is called directly, independently of Fence 1, so it is `walk_fence`'s
+        // recursion and nothing else that must return true there.
         assert!(
-            crate::bv_stage::uf_args_supported(&ctx, &[bv_atom, pred], false),
-            "precondition: Fence 1 must ADMIT this, so the assertion below is \
-             actually testing walk_fence's recursion and not Fence 1"
+            !crate::bv_stage::uf_args_supported(&ctx, &[bv_atom, pred], false),
+            "Fence 1's blastability half (slice 45 Task 6) rejects a select over \
+             a non-BV array as a UF argument — the second line of defence"
         );
         assert!(
             fenced(&ctx, &[bv_atom, pred]),

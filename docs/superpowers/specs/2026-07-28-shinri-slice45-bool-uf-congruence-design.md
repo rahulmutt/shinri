@@ -550,4 +550,122 @@ reproduce it.
   shinri-`unsat`/z3-`sat` split on a predicate-bearing instance.
 - 8.3 — T5: `get-value` and `get-model` behaviour on a Bool UF app.
 - 8.4 — §5: the Fence-1 blastability audit's conclusion and its evidence.
+
+  **Conclusion: §5's expected resolution is FALSE. Step 4's second branch was
+  taken — a blastability check was added to `walk_uf_args`.** The routing
+  argument holds only for the array shape the router actually claims, and the
+  audit additionally found that slice 45 had itself turned a sound `unknown`
+  into a panic. Both are measured below.
+
+  **The routing predicate, verified at HEAD.** It is
+  `abv_stage::uses_arrays_over_bv` (`crates/shinri-solver/src/lib.rs:902`), not
+  a general `uses_arrays`. Its `walk_uses` helper (`abv_stage.rs:44-63`) fires
+  only when a `select`/`store`/array-(dis)equality has an array operand that
+  `is_bv_array` accepts — **BV-indexed AND BV-valued** (`abv_stage.rs:30-35`).
+  When it fires, `shinri_abv::abstract_arrays`
+  (`crates/shinri-abv/src/abstraction.rs:38`) mints one fresh BV symbol per
+  distinct `select` and `subst` (`:72-107`) rewrites it throughout — and both
+  `shinri-abv`'s `collect` (`collect.rs:65-67`) and `subst` (`abstraction.rs:95-98`)
+  recurse into children **generically**, so a `select` buried in a UF
+  application's arguments is substituted like any other. `collect_bv_atoms`
+  then runs on `abs.assertions` (`abv_stage.rs:370`), by which point the
+  argument is a plain word. So for BV arrays §5's argument is CORRECT.
+
+  It fails for every other array shape. `(Array Int (_ BitVec 8))` makes
+  `uses_arrays_over_bv` false, so the query takes the pure-BV path
+  (`lib.rs:1007`) where nothing abstracts anything — and `(select a i)` is
+  still BitVec-8-**sorted**, so Fence 1's sort check admitted it.
+
+  **Measurement.** Four probes, run on BOTH profiles. Pre-slice column measured
+  at commit `e1baa3bb` (`main`) in a separate worktree; HEAD column at commit
+  `99b282af` (branch tip before this task); post-fix at this task's commit.
+  Commands:
+
+  ```
+  cargo build --release && cargo build
+  ./target/{release,debug}/shinri /tmp/claude-1000/-workspace/<probe>.smt2
+  mise exec -- z3 <probe>.smt2 ; mise exec -- cvc5 <probe>.smt2
+  ```
+
+  | probe | array sort | result sort | `main` e1baa3bb | HEAD 99b282af | post-fix | z3 4.16.0 | cvc5 1.3.4 |
+  | --- | --- | --- | --- | --- | --- | --- | --- |
+  | `audit-bv`   | `(Array (_ BitVec 4) (_ BitVec 8))` | BitVec | `sat` | `sat` | `sat` | `sat` | `sat` |
+  | `audit-bool` | `(Array (_ BitVec 4) (_ BitVec 8))` | Bool | `unknown` | `sat` | `sat` | `sat` | `sat` |
+  | `escape-bv`  | `(Array Int (_ BitVec 8))` | BitVec | **PANIC** | **PANIC** | `unknown` | `sat` | `sat` |
+  | `escape-bool`| `(Array Int (_ BitVec 8))` | Bool | `unknown` | **PANIC** | `unknown` | `sat` | `sat` |
+
+  Release and debug agreed on every cell — the panic is an `unreachable!`, not
+  a `debug_assert!`, so it fires in the shipping profile too. Verbatim, on both
+  profiles at HEAD:
+
+  ```
+  thread 'main' panicked at crates/shinri-bv/src/blast/mod.rs:624:22:
+  internal error: entered unreachable code: non-BV builtin reached blast_word
+  ```
+
+  (At `e1baa3bb` the identical message is reported at `mod.rs:599:22` — the same
+  arm, before slice 45 Task 2 added lines to that file.)
+
+  Two findings, of different provenance:
+
+  1. **`escape-bv` is pre-existing**, exactly as §5 predicted for slice 44's
+     shipped BitVec-result arm: it panicked identically on `main`. The fix
+     upgrades it from a panic to a sound `unknown`.
+  2. **`escape-bool` is a regression slice 45 introduced.** `main` answered a
+     sound `unknown`; HEAD panics. The mechanism is precisely §5's "one new
+     risk", realised: pre-slice, the Bool-result application was not a
+     collected BV atom, so `has_non_bv_theory_atom` saw a foreign Bool-sorted
+     atom and fenced. Task 3's widening of `collect_bv_atoms` makes it a
+     collected atom — hence a **leaf** the fence no longer descends into — so
+     the foreign `select` in its arguments stopped being seen, and Fence 1's
+     sort check was, as §5 warned, not a sufficient backstop.
+
+  **The fix.** `bv_stage::arg_term_blastable` (called from `walk_uf_args`)
+  rejects a UF argument whose subtree contains a `select`/`store` over a
+  non-BV array. The exemption for BV arrays is load-bearing in the opposite
+  direction: an unconditional rejection would fence `audit-bv` and `audit-bool`
+  to `unknown`, a **decided → unknown** regression forbidden by §2.1 and a
+  regression against slice 44's shipped behaviour. It is safe because Fence 1
+  runs on RAW assertions at `lib.rs:910` (still containing the `select`) only
+  on the ABV path, where the abstraction removes it before blasting; on the
+  pure-BV (`:1007`) and FP/mixed (`:1095`) paths `uses_arrays_over_bv` was
+  false, so no BV-array `select` can be present and the predicate rejects every
+  array access there. `Select`/`Store` is the only reachable unblastable shape:
+  a BV-sorted `Ite` is eliminated by `word_norm` before lowering, and
+  `fp.to_ubv`/`fp.to_sbv` force `solver_uses_fp`, routing to the FP path where
+  `Lowerer::word` has arms for them.
+
+  **Verdict-flip audit.** The only flips are `escape-bv` panic → `unknown` and
+  `escape-bool` panic → `unknown`. No `sat`/`unsat` flip, and no decided →
+  `unknown`: `escape-bool`'s `unknown` restores `main`'s answer, and
+  `escape-bv` had no verdict to lose. Pinned as four `qfufbv_e2e` tests plus
+  four `bv_stage` unit tests.
+
+  **One Task-5 unit test needed updating.**
+  `abv_stage::tests::fence_descends_into_predicate_arguments_to_find_a_foreign_select`
+  asserted as a *precondition* that Fence 1 ADMITS its shape, to show the test
+  exercised `walk_fence`'s recursion rather than Fence 1. Fence 1 now rejects
+  that shape too, so the assertion was inverted with a comment: the test is
+  still non-vacuous because it calls `fenced` directly, independently of Fence
+  1. The two fences are now independent lines of defence over one shape, which
+  is what `fenced`'s doc-comment ("NOT sufficient on its own") already declared.
+
+  **OUT OF SCOPE, REPORTED NOT FIXED — a broader pre-existing hole.** The same
+  panic reproduces with **no uninterpreted application anywhere**:
+
+  ```
+  (set-logic ALL)(declare-fun a () (Array Int (_ BitVec 8)))(declare-fun i () Int)
+  (assert (= (select a i) #x2a))(check-sat)     → PANIC (mod.rs:624)
+  (assert (bvult (select a i) #x2a))(check-sat) → PANIC (mod.rs:624)
+  ```
+
+  Measured at `main` (`e1baa3bb`) and at this task's commit, both profiles:
+  panics in all four cells. Fence 1 has no jurisdiction — `walk_uf_args` only
+  inspects UF *arguments*. The cause is one level up: `has_non_bv_theory_atom`
+  treats a collected BV-sorted `Eq`/predicate atom as an opaque leaf, so a
+  foreign `select` inside it is never fenced. This predates slice 44 and is a
+  general "the pure-BV path admits an unblastable BV-sorted term" hole; where
+  the general blastability fence belongs (`collect_bv_atoms`,
+  `has_non_bv_theory_atom`, or a new pre-lowering check) is an architectural
+  decision this slice did not take.
 - 8.5 — T6: the full unfiltered oracle summary and the PR-tier wall clock.

@@ -337,9 +337,75 @@ pub fn has_non_bv_theory_atom(ctx: &Context, assertions: &[TermId], bv_atoms: &[
 /// conservative bias every other fence in this stage has is preserved.
 pub fn uf_args_supported(ctx: &Context, atoms: &[TermId], allow_fp_args: bool) -> bool {
     let mut seen = rustc_hash::FxHashSet::default();
+    let mut arg_clean = rustc_hash::FxHashSet::default();
     atoms
         .iter()
-        .all(|&a| walk_uf_args(ctx, a, allow_fp_args, &mut seen))
+        .all(|&a| walk_uf_args(ctx, a, allow_fp_args, &mut seen, &mut arg_clean))
+}
+
+/// True if `t`'s sort is an array whose index AND element sorts are both
+/// BitVec — the only array shape `shinri-abv` abstracts. Mirrors
+/// `abv_stage::is_bv_array`; duplicated rather than shared because
+/// `bv_stage` must not depend on the ABV stage's module for a fence that runs
+/// on all three paths.
+fn is_bv_array(ctx: &Context, t: TermId) -> bool {
+    match ctx.sort_node(ctx.sort_of(t)) {
+        SortNode::Array(i, e) => ctx.bv_width(*i).is_some() && ctx.bv_width(*e).is_some(),
+        _ => false,
+    }
+}
+
+/// Fence 1's BLASTABILITY half (slice 45 Task 6, SOUNDNESS-CRITICAL).
+///
+/// A BitVec-sorted argument is necessary but NOT sufficient. `blast_uf_app`'s
+/// congruence arm calls `word` on each argument, and `blast_bv_word`'s builtin
+/// dispatch has arms only for BV operators: everything else falls into
+/// `unreachable!("non-BV builtin reached blast_word")`
+/// (`crates/shinri-bv/src/blast/mod.rs:624`). `(select a i)` over
+/// `(Array Int (_ BitVec 8))` is BitVec-8-**sorted** and passes the sort check,
+/// then panics there — measured on both profiles, slice 45 Task 6.
+///
+/// `Select`/`Store` is the only such shape reachable in practice. The other
+/// BV-sorted non-BV-op heads are all excluded upstream: a BV-sorted `Ite` is
+/// eliminated by `word_norm` before any lowering (slice 5), and the FP→BV
+/// conversions (`fp.to_ubv`/`fp.to_sbv`) force `solver_uses_fp`, which routes
+/// to the FP/mixed path where `Lowerer::word` has arms for them.
+///
+/// A `select`/`store` over a **BV-indexed, BV-valued** array is ADMITTED, and
+/// that exemption is load-bearing, not laxity:
+/// `abv_stage::uses_arrays_over_bv` (`lib.rs:902`) routes any query containing
+/// one to the ABV path, where `shinri_abv::abstract_arrays` substitutes a
+/// fresh BV read symbol for every `select` — including those buried in a UF
+/// application's arguments, since `shinri-abv`'s `collect`/`subst` walk
+/// children generically — BEFORE `collect_bv_atoms` sees the abstraction. So
+/// nothing unblastable survives to the blaster there. Rejecting it instead
+/// would fence `(f (select a i))` over a BV array to `unknown`, a decided →
+/// unknown regression against slice 44's shipped behaviour.
+///
+/// Conversely, reaching the pure-BV path (`lib.rs:1007`) or the FP/mixed path
+/// (`lib.rs:1095`) means `uses_arrays_over_bv` was FALSE, so no BV-array
+/// `select` can occur there at all — on those paths this predicate rejects
+/// every array access, which is exactly right.
+///
+/// Only positive results are memoized in `clean`: a negative short-circuits
+/// the whole `uf_args_supported` call, so it is never revisited.
+fn arg_term_blastable(ctx: &Context, t: TermId, clean: &mut rustc_hash::FxHashSet<TermId>) -> bool {
+    if clean.contains(&t) {
+        return true;
+    }
+    let ok = match ctx.term_node(t) {
+        TermNode::App { op, args, .. } => {
+            let kids: Vec<TermId> = ctx.children(*args).to_vec();
+            let foreign_array_op = matches!(op, Op::Builtin(BuiltinOp::Select | BuiltinOp::Store))
+                && !kids.first().is_some_and(|&k| is_bv_array(ctx, k));
+            !foreign_array_op && kids.iter().all(|&k| arg_term_blastable(ctx, k, clean))
+        }
+        TermNode::Const { .. } => true,
+    };
+    if ok {
+        clean.insert(t);
+    }
+    ok
 }
 
 fn walk_uf_args(
@@ -347,6 +413,7 @@ fn walk_uf_args(
     t: TermId,
     allow_fp_args: bool,
     seen: &mut rustc_hash::FxHashSet<TermId>,
+    arg_clean: &mut rustc_hash::FxHashSet<TermId>,
 ) -> bool {
     if !seen.insert(t) {
         return true; // already validated on another path
@@ -368,10 +435,16 @@ fn walk_uf_args(
             if !wordable {
                 return false;
             }
+            // Slice 45 Task 6: the sort check above is necessary but NOT
+            // sufficient — the argument TERM must also be one the blaster has
+            // an arm for. See `arg_term_blastable`.
+            if !arg_term_blastable(ctx, k, arg_clean) {
+                return false;
+            }
         }
     }
     kids.iter()
-        .all(|&k| walk_uf_args(ctx, k, allow_fp_args, seen))
+        .all(|&k| walk_uf_args(ctx, k, allow_fp_args, seen, arg_clean))
 }
 
 /// Fence 2 (slice 44 §4). Gate-equivalent cost of the Ackermann encoding for
@@ -973,5 +1046,116 @@ mod tests {
         let gb = ctx.mk_app(Op::Uninterpreted(f_bv1), &[b]).unwrap();
         let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[ga, gb]).unwrap();
         assert_eq!(uf_congruence_cost(&ctx, &[fa, fb, eq]), 18);
+    }
+
+    // ── Slice 45 Task 6: Fence 1's blastability half ─────────────────────────
+
+    fn arr(ctx: &mut Context, index: SortId, elem: SortId) -> TermId {
+        let s = ctx.array_sort(index, elem);
+        let f = ctx.declare_fun("arr", &[], s);
+        ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+    }
+
+    /// The audit's finding (slice 45 Task 6). `(select a i)` over
+    /// `(Array Int (_ BitVec 8))` is BitVec-8-SORTED, so the sort check alone
+    /// admits it — and the blaster then reaches
+    /// `unreachable!("non-BV builtin reached blast_word")`. Measured: before
+    /// this check, `(= (f (select a i)) #x2a)` PANICKED on both the release and
+    /// the debug binary.
+    #[test]
+    fn uf_args_supported_rejects_a_foreign_array_read_argument() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let int = ctx.int_sort();
+        let a = arr(&mut ctx, int, s8);
+        let idxf = ctx.declare_fun("i", &[], int);
+        let i = ctx.mk_app(Op::Uninterpreted(idxf), &[]).unwrap();
+        let sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, i]).unwrap();
+        assert_eq!(ctx.sort_of(sel), s8, "the read IS BitVec-sorted");
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let fs = ctx.mk_app(Op::Uninterpreted(f), &[sel]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fs, c]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "a BV-sorted read over a NON-BV array has no blaster arm"
+        );
+    }
+
+    /// Same shape with a Bool result — slice 45's new arm. Before Task 6 this
+    /// query panicked where PRE-slice-45 it returned a sound `unknown`
+    /// (Task 3's widening of `collect_bv_atoms` made the application a
+    /// collected atom, so `has_non_bv_theory_atom` stopped descending into it
+    /// and no longer saw the foreign `select`). This is the check that
+    /// restores that `unknown`.
+    #[test]
+    fn uf_args_supported_rejects_a_foreign_array_read_under_a_bool_result() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let int = ctx.int_sort();
+        let bool_s = ctx.bool_sort();
+        let a = arr(&mut ctx, int, s8);
+        let idxf = ctx.declare_fun("i", &[], int);
+        let i = ctx.mk_app(Op::Uninterpreted(idxf), &[]).unwrap();
+        let sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, i]).unwrap();
+        let p = ctx.declare_fun("p", &[s8], bool_s);
+        let ps = ctx.mk_app(Op::Uninterpreted(p), &[sel]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[ps], false),
+            "the Bool-result arm needs the same blastability check"
+        );
+    }
+
+    /// The exemption is load-bearing, not laxity: a read over a BV-indexed,
+    /// BV-valued array MUST still pass. `uses_arrays_over_bv` (`lib.rs:902`)
+    /// routes such a query to the ABV path, where `abstract_arrays` replaces
+    /// every `select` — including one buried in a UF argument — with a fresh
+    /// BV symbol before `collect_bv_atoms` runs. Rejecting it would fence
+    /// `(f (select a i))` to `unknown`, a decided → unknown regression against
+    /// slice 44's shipped behaviour (measured `sat`, z3 and cvc5 agreeing).
+    #[test]
+    fn uf_args_supported_still_admits_a_bv_array_read_argument() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let s4 = ctx.bv_sort(4);
+        let bool_s = ctx.bool_sort();
+        let a = arr(&mut ctx, s4, s8);
+        let i = bv_var(&mut ctx, "i", 4);
+        let sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, i]).unwrap();
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let fs = ctx.mk_app(Op::Uninterpreted(f), &[sel]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fs, c]).unwrap();
+        let p = ctx.declare_fun("p", &[s8], bool_s);
+        let ps = ctx.mk_app(Op::Uninterpreted(p), &[sel]).unwrap();
+        assert!(
+            uf_args_supported(&ctx, &[atom, ps], false),
+            "a BV-array read is abstracted away before blasting — must pass"
+        );
+    }
+
+    /// The check looks at the whole argument SUBTREE, not just its head: a
+    /// foreign read buried under BV operators is still unblastable.
+    #[test]
+    fn uf_args_supported_rejects_a_foreign_array_read_nested_under_bv_ops() {
+        let mut ctx = Context::new();
+        let s8 = ctx.bv_sort(8);
+        let int = ctx.int_sort();
+        let a = arr(&mut ctx, int, s8);
+        let idxf = ctx.declare_fun("i", &[], int);
+        let i = ctx.mk_app(Op::Uninterpreted(idxf), &[]).unwrap();
+        let sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, i]).unwrap();
+        let one = ctx.mk_bv_const(8, Integer::from(1u64));
+        let add = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[sel, one])
+            .unwrap();
+        let f = ctx.declare_fun("f", &[s8], s8);
+        let fa = ctx.mk_app(Op::Uninterpreted(f), &[add]).unwrap();
+        let c = ctx.mk_bv_const(8, Integer::from(42u64));
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[fa, c]).unwrap();
+        assert!(
+            !uf_args_supported(&ctx, &[atom], false),
+            "the walk must descend the whole argument subtree"
+        );
     }
 }
