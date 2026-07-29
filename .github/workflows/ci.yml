@@ -139,7 +139,7 @@ jobs:
           esac
       - name: Upload mutants.out
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: mutants-${{ steps.pick.outputs.crate }}
           path: target/mutants/mutants.out
