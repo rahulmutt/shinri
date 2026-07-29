@@ -400,7 +400,20 @@ mod lower_tests {
     /// name must never be paired. `Context::declare_fun` interns by name and
     /// OVERWRITES `fun_sigs` (crates/shinri-core/src/context.rs:233-237), so
     /// both live under one `SymbolId`; `shape_compatible` discriminates them on
-    /// `result.len()` — 1 vs. 8.
+    /// `result_sort` — `Bool` vs. `(_ BitVec 8)` — and separately checks
+    /// `result.len()` (1 vs. 8) to keep the parallel `zip` in `compare::eq`
+    /// from running off the end of the shorter word.
+    ///
+    /// STALE PREMISE, CORRECTED (slice 45). This doc previously read
+    /// "`shape_compatible` discriminates them on `result.len()` — 1 vs. 8",
+    /// which is the exact premise spec §3.1 records as FALSE: slice 44's
+    /// length-based inference of the result sort does not survive slice 45,
+    /// because a Bool result is recorded as a ONE-BIT word and `Bool` collides
+    /// with `(_ BitVec 1)` on length. The length check happens to separate THIS
+    /// fixture (8 bits vs. 1), so the old claim was incidentally true here and
+    /// misleading everywhere else — see the sibling test
+    /// `bool_and_bv1_results_of_one_symbol_are_never_paired`, which is the same
+    /// hazard at the width where `result.len()` cannot see it.
     ///
     /// Pairing them would relate a one-bit result word to an eight-bit one.
     /// The test asserts SAT: nothing may constrain the two together, so
