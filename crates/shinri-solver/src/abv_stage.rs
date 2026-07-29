@@ -67,12 +67,23 @@ fn walk_uses(ctx: &Context, t: TermId, seen: &mut rustc_hash::FxHashSet<TermId>)
 /// not in scope. In-scope atoms are: a BV predicate / BV (dis)equality (handled
 /// by the bit-blaster); an array operation (select/store/array-eq — handled by
 /// refinement); a Bool-sorted uninterpreted application, nullary (Tseitin
-/// skeleton) or, since slice 45, non-nullary over blastable arguments (handled
-/// by the bit-blaster's Ackermann congruence — see `walk_fence`); and pure
-/// Boolean structure (And/Or/Not/Implies/Xor/Ite, plus Bool iff/xor). Anything
-/// else — EUF over an uninterpreted sort, an arithmetic relation, an array over
-/// an uninterpreted index/element — would route to a theory we cannot combine
-/// with the eager abstraction here, so it fences and the caller returns Unknown.
+/// skeleton) or, since slice 45, non-nullary (handled by the bit-blaster's
+/// Ackermann congruence — see `walk_fence`); and pure Boolean structure
+/// (And/Or/Not/Implies/Xor/Ite, plus Bool iff/xor). Anything else — EUF over an
+/// uninterpreted sort, an arithmetic relation, an array over an uninterpreted
+/// index/element — would route to a theory we cannot combine with the eager
+/// abstraction here, so it fences and the caller returns Unknown.
+///
+/// # This fence is NOT sufficient on its own
+///
+/// It admits a non-nullary Bool-sorted uninterpreted application **whatever its
+/// arguments' sorts** — it performs no blastability check. `(P n)` with
+/// `n : Int` returns `false` here. Argument admissibility is deliberately left
+/// to Fence 1, so **a caller MUST also run `bv_stage::uf_args_supported` before
+/// entering the ABV path** (the production caller does, at `lib.rs:910`,
+/// immediately after this one). Without it the blaster is handed an argument it
+/// cannot turn into a word. Fence 2 (`bv_stage::uf_congruence_cost`) likewise
+/// remains the caller's responsibility.
 pub fn fenced(ctx: &Context, assertions: &[TermId]) -> bool {
     let mut visited = rustc_hash::FxHashSet::default();
     assertions.iter().any(|&a| walk_fence(ctx, a, &mut visited))
@@ -166,6 +177,8 @@ fn walk_fence(ctx: &Context, t: TermId, visited: &mut rustc_hash::FxHashSet<Term
             // unconditionally on the same raw assertions immediately after and
             // rejects any Bool-result application whose argument the blaster
             // cannot turn into a word (Int, Array, String, uninterpreted sort, …).
+            // This makes `fenced` insufficient on its own — see its doc-comment,
+            // which states that obligation for callers.
             //
             // Recursing into the arguments rather than returning `false` keeps a
             // nested out-of-scope atom discoverable (e.g. a `select` over a non-BV
@@ -1160,5 +1173,91 @@ mod tests {
         let ult = ctx.mk_app(Op::Builtin(BuiltinOp::BvUlt), &[i, e]).unwrap();
         assert!(uses_arrays_over_bv(&ctx, &[atom, ult]));
         assert!(!fenced(&ctx, &[atom, ult]));
+    }
+
+    // ── slice 45: the widened Bool-sorted-uninterpreted-application branch ────
+
+    /// Pins the NULLARY half of the widened branch. Slice 45 replaced
+    /// `kids.is_empty() && … => return false` with
+    /// `… => return kids.iter().any(walk_fence)`; for a nullary application that
+    /// iterator is empty and `Iterator::any` is `false`, so the branch must still
+    /// return exactly what it returned before.
+    ///
+    /// This bit-identity is not a nicety: the soundness argument at
+    /// `bv_stage.rs`'s `collect_bv_atoms` (the `!kids.is_empty()` conjunct, which
+    /// is load-bearing on the ABV path) leans on this fence continuing to admit
+    /// nullary Bool applications as plain Tseitin skeleton, so that the collector
+    /// alone decides they never reach the blaster.
+    #[test]
+    fn fence_admits_nullary_bool_constant_alongside_bv_array() {
+        let mut ctx = Context::new();
+        let i8 = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i8, i8);
+        let a = uconst(&mut ctx, "a", arr);
+        let i = uconst(&mut ctx, "i", i8);
+        let e = uconst(&mut ctx, "e", i8);
+        let bool_sort = ctx.bool_sort();
+        // A bare `(declare-const c Bool)` used directly as an assertion.
+        let c = uconst(&mut ctx, "c", bool_sort);
+        let sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, i]).unwrap();
+        let atom = ctx.mk_eq(sel, e).unwrap();
+        assert!(uses_arrays_over_bv(&ctx, &[atom, c]));
+        assert!(
+            !fenced(&ctx, &[atom, c]),
+            "a nullary Bool constant must stay admitted — it is Tseitin skeleton"
+        );
+    }
+
+    /// Pins the RECURSION half of the widened branch, which is soundness-relevant
+    /// and which no other test in the tree exercises.
+    ///
+    /// `(P (select b i))` where `b : (Array Int (_ BitVec 8))`. `P`'s argument is
+    /// BV8-sorted, so Fence 1 (`bv_stage::uf_args_supported`) is satisfied and
+    /// would NOT stop this query. The out-of-scope operation is the `select` over
+    /// an Int-indexed array, buried inside the predicate's argument — and it is
+    /// caught ONLY because the widened branch returns
+    /// `kids.iter().any(walk_fence)` and so descends into the arguments.
+    ///
+    /// Non-vacuous by construction: had the branch been written `return false`
+    /// (the shape it replaced), this query would be ADMITTED and the assertion
+    /// below would fail. Verified by reverting the branch and observing this test
+    /// fail while `fence_admits_nullary_bool_constant_alongside_bv_array` and the
+    /// rest of the module stayed green.
+    #[test]
+    fn fence_descends_into_predicate_arguments_to_find_a_foreign_select() {
+        let mut ctx = Context::new();
+        let i8 = ctx.bv_sort(8);
+        let bool_sort = ctx.bool_sort();
+        let int_sort = ctx.int_sort();
+
+        // A genuine QF_ABV constraint, so `uses_arrays_over_bv` routes here at all.
+        let bv_arr = ctx.array_sort(i8, i8);
+        let a = uconst(&mut ctx, "a", bv_arr);
+        let i = uconst(&mut ctx, "i", i8);
+        let e = uconst(&mut ctx, "e", i8);
+        let bv_sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, i]).unwrap();
+        let bv_atom = ctx.mk_eq(bv_sel, e).unwrap();
+
+        // The out-of-scope part: a select over an INT-indexed array, reachable
+        // only through the predicate's argument.
+        let int_arr = ctx.array_sort(int_sort, i8);
+        let b = uconst(&mut ctx, "b", int_arr);
+        let n = uconst(&mut ctx, "n", int_sort);
+        let foreign_sel = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[b, n]).unwrap();
+        let pf = ctx.declare_fun("P", &[i8], bool_sort);
+        let pred = ctx.mk_app(Op::Uninterpreted(pf), &[foreign_sel]).unwrap();
+
+        assert!(uses_arrays_over_bv(&ctx, &[bv_atom, pred]));
+        // Fence 1 does NOT save us here: the predicate's argument is BV8-sorted.
+        assert!(
+            crate::bv_stage::uf_args_supported(&ctx, &[bv_atom, pred], false),
+            "precondition: Fence 1 must ADMIT this, so the assertion below is \
+             actually testing walk_fence's recursion and not Fence 1"
+        );
+        assert!(
+            fenced(&ctx, &[bv_atom, pred]),
+            "the Int-indexed select inside the predicate's argument must fence — \
+             it is found only by descending into the arguments"
+        );
     }
 }
