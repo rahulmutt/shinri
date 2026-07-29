@@ -470,7 +470,84 @@ reproduce it.
   would have been green: `Unknown` is a harness skip, not a failure. The
   `fp_oracle.rs` and `qfabv_oracle.rs` pre-slice measurements are recorded by
   Tasks 4 and 5, which mirror this same shape.
+
+  **`fp_oracle.rs` / `differential_qf_fp_add_sub`** — measured at commit
+  `f4079ec5` (Task 3's tip) with this task's Step-1 and Step-6 TEST changes
+  applied but the Step-3 `Lowerer::atom` dispatch fix REVERTED (`git
+  checkout -- crates/shinri-fp/src/lower.rs`), debug profile (nextest
+  default), via:
+
+  ```
+  cargo nextest run -p shinri-solver --features oracle -E 'test(differential_qf_fp_add_sub)' --no-capture
+  ```
+
+  Discovered test count: 1 (confirmed non-zero). Result: **FAIL** — and,
+  unlike the `qfbv_oracle` row above, NOT on the decidedness assertion. It is
+  a **PANIC**, which is exactly the §3.2(a) claim this task exists to test:
+
+  ```
+  thread 'differential_qf_fp_add_sub' (4051127) panicked at crates/shinri-fp/src/lib.rs:432:18:
+  internal error: entered unreachable code: blast_atom: FP atom Uninterpreted(SymbolId(3)) out of slice-1 scope
+  ```
+
+  The run dies at 1.47s, before any counter is printed, so no pre-fix
+  `pred_decided`/`pred_total` fraction exists for this family — the process
+  never reaches the assertion. `Lowerer::atom` (`crates/shinri-fp/src/lower.rs`)
+  dispatched on the FIRST OPERAND's sort, so `(p <fp-term>)` routed to
+  `blast_fp_atom`, which has no uninterpreted-application arm. The same panic,
+  same line, same message (with `SymbolId(0)`) is what the two `qfufbv_e2e`
+  probes below produce pre-fix. **This is the one slice-45 path that panics
+  rather than degrading to `unknown`, and the measurement confirms it.**
 - 8.2 — T1: the post-slice decided fractions and the thresholds chosen.
+
+  **`fp_oracle.rs` / `differential_qf_fp_add_sub`** — measured at this task's
+  commit, debug profile, same command as above. Result: **PASS** in 29.13s
+  (31.40s in the full-binary parallel run). Summary line:
+
+  ```
+  differential_qf_fp_add_sub: sat=193 unsat=7 unknown=0 pred_total=83 pred_decided=83
+  ```
+
+  Decided fraction for the Bool-result predicate family: **83/83 = 100%**
+  (up from an unmeasurable pre-fix panic). Threshold chosen: `pred_decided >
+  pred_total / 2`, identical to the `qfbv_oracle` gate — the point is to catch
+  a family that silently stops deciding, not to pin 100%. `unknown=0` across
+  all 200 iterations also shows the unconditional `(declare-fun p ...)` added
+  to the preamble fences nothing when no application of `p` appears.
+
+  **Two `qfufbv_e2e` probes** (debug profile, this task's commit):
+  `fp_argument_predicate_congruence` and
+  `nan_arguments_are_congruent_for_a_predicate`, 2 discovered, both **PASS**
+  (`unsat`); both **panicked** at `crates/shinri-fp/src/lib.rs:432:18` before
+  the fix.
+
+  **Oracle caveat — z3 4.16.0 is WRONG on the NaN probe; cvc5 is right.**
+  Three-way cross-check of the second probe
+  (`fp.isNaN a ∧ fp.isNaN b ∧ p(a) ∧ ¬p(b)`):
+
+  | solver | verdict |
+  | --- | --- |
+  | shinri (post-fix) | `unsat` |
+  | cvc5 1.3.4 | `unsat` |
+  | z3 4.16.0 | `sat` ← **defective** |
+
+  z3's `sat` is refuted by z3 itself: asked for its own model it returns
+  `p := λx. true` and then evaluates `(p b) = true` — while the query asserts
+  `(not (p b))`. The model does not satisfy the input. z3 also agrees the two
+  arguments are equal (`fp.isNaN a ∧ fp.isNaN b ∧ a ≠ b` is `unsat` for z3)
+  and returns `unsat` once `(= a b)` is asserted SYNTACTICALLY — so the defect
+  is z3's FP+UF congruence closure failing on an ENTAILED rather than stated
+  equality. Ground truth is `unsat` (SMT-LIB `FloatingPoint` has exactly one
+  NaN value), so the pinned expectation is correct and shinri matches cvc5.
+  The first probe is unanimous: shinri / z3 / cvc5 all `unsat`.
+
+  This matters beyond the probe, because `fp_oracle` uses **z3** as its
+  differential oracle: a generated instance that makes two FP arguments
+  NaN-equal but bitwise-distinct under one predicate could produce a spurious
+  "DISAGREEMENT" panic that is z3's fault, not ours. It did NOT occur at the
+  `differential_qf_fp_add_sub` seed (200 iterations, zero disagreements), but
+  the exposure is real and should be revisited if that oracle ever reports a
+  shinri-`unsat`/z3-`sat` split on a predicate-bearing instance.
 - 8.3 — T5: `get-value` and `get-model` behaviour on a Bool UF app.
 - 8.4 — §5: the Fence-1 blastability audit's conclusion and its evidence.
 - 8.5 — T6: the full unfiltered oracle summary and the PR-tier wall clock.

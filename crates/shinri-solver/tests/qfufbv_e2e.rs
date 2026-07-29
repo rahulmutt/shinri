@@ -506,23 +506,16 @@ fn int_argument_to_a_predicate_still_fences() {
     );
 }
 
-/// Spec §3.2(a): `Lowerer::atom` dispatches on the FIRST OPERAND's sort
-/// (crates/shinri-fp/src/lower.rs:117), so a predicate over an FP argument
-/// would route to `blast_fp_atom`, which has no uninterpreted-application arm.
-/// That is a PANIC, not an `unknown` — the slice-43 shape. This test is the
-/// one that catches it.
-///
-/// IGNORED BY TASK 3, DELIBERATELY. Task 3 widened `collect_bv_atoms`, which
-/// is what makes this shape reach the mis-dispatch: pre-slice it fenced to a
-/// sound `unknown`, and at Task 3's HEAD it panics at
-/// `crates/shinri-fp/src/lib.rs:432` ("blast_atom: FP atom Uninterpreted(..)
-/// out of slice-1 scope", exit 101). The blocker is `Lowerer::atom`'s
-/// first-operand-sort dispatch and the fix is Task 4's reorder — matching
-/// `Op::Uninterpreted` BEFORE the operand-sort test. This lives here as a
-/// tripwire so the gap is enforced by the suite rather than only by a report;
-/// Task 4's Step 1 is to delete the `#[ignore]` line below (and this
-/// paragraph), not to add a second copy of the test.
-#[ignore = "blocked on Task 4 dispatch reorder"]
+/// Spec §3.2(a): `Lowerer::atom` dispatched on the FIRST OPERAND's sort
+/// (crates/shinri-fp/src/lower.rs:137-138, now reached only AFTER the
+/// `Op::Uninterpreted` match Task 4 put in front of it), so a predicate over
+/// an FP argument routed to `blast_fp_atom`, which has no
+/// uninterpreted-application arm. That is a PANIC, not an `unknown` — the
+/// slice-43 shape. This test is the one that catches it. MEASURED pre-fix:
+/// `internal error: entered unreachable code: blast_atom: FP atom
+/// Uninterpreted(SymbolId(0)) out of slice-1 scope` at
+/// `crates/shinri-fp/src/lib.rs:432:18`. z3 4.16.0 and cvc5 1.3.4 both
+/// `unsat`.
 #[test]
 fn fp_argument_predicate_congruence() {
     let out = run_script(
@@ -530,6 +523,39 @@ fn fp_argument_predicate_congruence() {
          (declare-fun a () (_ FloatingPoint 8 24))\
          (declare-fun b () (_ FloatingPoint 8 24))\
          (assert (= a b))(assert (p a))(assert (not (p b)))(check-sat)",
+    );
+    assert_eq!(
+        out.first().map(|s| s.as_str()),
+        Some("unsat"),
+        "got {out:?}"
+    );
+}
+
+/// FP value equality is NOT bitwise: SMT-LIB `FloatingPoint` has exactly one
+/// NaN VALUE across many bit patterns. `blast_uf_app` calls `sink.word_eq`,
+/// which the `Lowerer` overrides with `core_eq` for exactly this reason
+/// (`crates/shinri-bv/src/blast/mod.rs:184` declares `word_eq`;
+/// `crates/shinri-fp/src/lower.rs:97` is the `core_eq` override). A bitwise
+/// comparison would UNDER-trigger congruence here and leave the results free,
+/// so this comes back `sat` on a wrong implementation.
+///
+/// DO NOT "correct" this expectation to `sat` against z3. MEASURED: cvc5 1.3.4
+/// `unsat`, z3 4.16.0 `sat` — and **z3 is wrong here**. Asked for its model z3
+/// returns `p := λx. true` and then evaluates `(p b)` to `true`, contradicting
+/// the asserted `(not (p b))`: the model does not satisfy the input. z3 also
+/// agrees the arguments are equal (`fp.isNaN a ∧ fp.isNaN b ∧ a ≠ b` is `unsat`
+/// for z3) and returns `unsat` once `(= a b)` is stated syntactically, so the
+/// defect is its FP+UF congruence closure missing an ENTAILED equality.
+/// SMT-LIB `FloatingPoint` has exactly one NaN value, so `unsat` is the ground
+/// truth.
+#[test]
+fn nan_arguments_are_congruent_for_a_predicate() {
+    let out = run_script(
+        "(set-logic ALL)(declare-fun p ((_ FloatingPoint 8 24)) Bool)\
+         (declare-fun a () (_ FloatingPoint 8 24))\
+         (declare-fun b () (_ FloatingPoint 8 24))\
+         (assert (fp.isNaN a))(assert (fp.isNaN b))\
+         (assert (p a))(assert (not (p b)))(check-sat)",
     );
     assert_eq!(
         out.first().map(|s| s.as_str()),

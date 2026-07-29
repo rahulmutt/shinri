@@ -164,13 +164,28 @@ const RMS: &[&str] = &["RNE", "RNA", "RTP", "RTN", "RTZ"];
 /// Declares three fp32 variables (x, y, z) and optionally a symbolic rounding mode.
 /// Builds 1–3 assertions mixing fp.add/fp.sub with fp.eq/=/fp.isNaN atoms,
 /// some negated, so that both SAT and UNSAT witnesses arise across iterations.
-fn gen_arith_script(rng: &mut Lcg) -> String {
+///
+/// Slice 45 additionally declares `p`, a Bool-result uninterpreted predicate
+/// over Float32, and can emit `(p <fp-term>)` atoms. The bool in the return
+/// value reports whether this instance emitted one, so the driver's
+/// decidedness gate can be scoped to exactly that family — a healthy overall
+/// decided rate must not mask a predicate family that never decides.
+///
+/// `p` is declared under `(set-logic QF_FP)`: z3 4.16.0 accepts an
+/// uninterpreted function declaration under QF_FP (verified — it returns a
+/// concrete `sat`, unlike `(set-logic QF_UFFP)`, which z3 rejects outright
+/// with `unknown sort 'FloatingPoint'`). So `z3_outcome_arith`'s logic is
+/// unchanged; this is NOT the `z3_outcome_mixed` situation.
+fn gen_arith_script(rng: &mut Lcg) -> (String, bool) {
     let mut s = String::from(
         "(set-logic QF_FP)\n\
          (declare-fun x () (_ FloatingPoint 8 24))\n\
          (declare-fun y () (_ FloatingPoint 8 24))\n\
-         (declare-fun z () (_ FloatingPoint 8 24))\n",
+         (declare-fun z () (_ FloatingPoint 8 24))\n\
+         (declare-fun p ((_ FloatingPoint 8 24)) Bool)\n",
     );
+    // slice 45: did this instance emit a Bool-result predicate application?
+    let mut used_pred = false;
     let use_sym_rm = rng.below(4) == 0;
     if use_sym_rm {
         s.push_str("(declare-fun rm () RoundingMode)\n");
@@ -190,10 +205,20 @@ fn gen_arith_script(rng: &mut Lcg) -> String {
             "fp.sub"
         };
         let term = format!("({op} {} x y)", rm(rng));
-        let atom = match rng.below(3) {
+        let atom = match rng.below(4) {
             0 => format!("(fp.eq z {term})"),
             1 => format!("(= z {term})"),
-            _ => format!("(fp.isNaN {term})"),
+            2 => format!("(fp.isNaN {term})"),
+            // slice 45: a Bool-result uninterpreted application over an FP
+            // argument — the atom `Lowerer::atom` used to mis-dispatch into
+            // `blast_fp_atom` (a panic) and that the pre-slice fence rejected.
+            // Mirrors the `fp.isNaN` arm's shape: the predicate wraps the same
+            // arithmetic term, so two asserts picking this arm with different
+            // rounding modes give congruence something real to do.
+            _ => {
+                used_pred = true;
+                format!("(p {term})")
+            }
         };
         if rng.below(2) == 0 {
             s.push_str(&format!("(assert (not {atom}))\n"));
@@ -202,7 +227,7 @@ fn gen_arith_script(rng: &mut Lcg) -> String {
         }
     }
     s.push_str("(check-sat)\n");
-    s
+    (s, used_pred)
 }
 
 #[test]
@@ -211,9 +236,17 @@ fn differential_qf_fp_add_sub() {
     // Fixed to 0x0ADD_5AB_0001 (replaced U→A, prepended 0 for valid u64 literal).
     let mut rng = Lcg(0x00AD_D5AB_0001);
     let (mut n_sat, mut n_unsat, mut n_unknown) = (0usize, 0usize, 0usize);
+    // slice 45: decidedness of the Bool-result predicate family.
+    let (mut pred_total, mut pred_decided) = (0usize, 0usize);
     for iter in 0..N_ITERS {
-        let src = gen_arith_script(&mut rng);
+        let (src, used_pred) = gen_arith_script(&mut rng);
         let ours = shinri_outcome(&src);
+        if used_pred {
+            pred_total += 1;
+            if ours != SolveOutcome::Unknown {
+                pred_decided += 1;
+            }
+        }
         if ours == SolveOutcome::Unknown {
             n_unknown += 1;
             continue;
@@ -233,8 +266,21 @@ fn differential_qf_fp_add_sub() {
             }
         }
     }
-    println!("differential_qf_fp_add_sub: sat={n_sat} unsat={n_unsat} unknown={n_unknown}");
+    println!(
+        "differential_qf_fp_add_sub: sat={n_sat} unsat={n_unsat} unknown={n_unknown} \
+         pred_total={pred_total} pred_decided={pred_decided}"
+    );
     assert!(n_sat > 0 && n_unsat > 0, "oracle produced no coverage");
+    assert!(
+        pred_total > 0,
+        "generator emitted zero Bool-result predicate instances — the slice-45 \
+         family is not being exercised at all"
+    );
+    assert!(
+        pred_decided > pred_total / 2,
+        "Bool-result predicate family decided {pred_decided}/{pred_total} — \
+         more than half must decide"
+    );
 }
 
 /// Feed a QF_FP script to z3 via easy_smt and return its check-sat response.
