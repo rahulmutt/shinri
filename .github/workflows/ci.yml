@@ -15,7 +15,7 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2 # single source of toolchain+tools: mise.toml
+      - uses: jdx/mise-action@v4.2.3 # single source of toolchain+tools: mise.toml
         env:
           GITHUB_TOKEN: ${{ github.token }} # mise github backend → avoid API rate limits resolving z3/cvc5 releases
       - uses: Swatinem/rust-cache@v2
@@ -45,7 +45,7 @@ jobs:
           - rem_tiny_exhaustive
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4.2.3
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
@@ -61,7 +61,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4.2.3
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
@@ -81,7 +81,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4.2.3
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
@@ -98,7 +98,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4.2.3
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
@@ -117,7 +117,7 @@ jobs:
     timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
-      - uses: jdx/mise-action@v2
+      - uses: jdx/mise-action@v4.2.3
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
