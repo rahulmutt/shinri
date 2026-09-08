@@ -30,6 +30,9 @@ impl<R: BufRead> ZstdStream<R> {
 
 impl<R: BufRead> Read for ZstdStream<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
         loop {
             if !self.started || (self.decoder.is_finished() && self.decoder.can_collect() == 0) {
                 let buf = self.src.fill_buf()?;
@@ -143,6 +146,98 @@ fn field_str(field: &[u8]) -> io::Result<&str> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 tar name field"))
 }
 
+/// Sanity cap on GNU long-name / pax extended-header bodies. These hold a
+/// path string, not file data — a `size` field beyond this is almost
+/// certainly corrupt or hostile, so reject it rather than allocating
+/// whatever it claims.
+const MAX_METADATA_BODY: u64 = 1 << 20;
+
+/// Read a bounded (`size`-byte) metadata body — a GNU long-name or pax
+/// extended-header entry — plus its padding to the next 512-byte boundary.
+/// `what` names the entry kind for error messages.
+fn read_bounded_body(mut tar: impl Read, size: u64, what: &str) -> io::Result<Vec<u8>> {
+    if size > MAX_METADATA_BODY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{what} body too large ({size} bytes, cap {MAX_METADATA_BODY})"),
+        ));
+    }
+    let mut body = vec![0u8; size as usize];
+    if !read_exact_or_eof(&mut tar, &mut body)? {
+        return Err(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("truncated archive: {what} body cut short"),
+        ));
+    }
+    let pad = (512 - (size % 512) % 512) % 512;
+    if pad > 0 {
+        let mut pad_buf = [0u8; 512];
+        if !read_exact_or_eof(&mut tar, &mut pad_buf[..pad as usize])? {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                format!("truncated archive: missing {what} padding"),
+            ));
+        }
+    }
+    Ok(body)
+}
+
+/// Parse a pax extended-header body (a sequence of
+/// `"<decimal-len> key=value\n"` records, where the length counts the
+/// whole record including its own digits and the trailing newline) and
+/// return the value of the last `path` record, if any.
+fn parse_pax_path(body: &[u8]) -> io::Result<Option<String>> {
+    let mut pos = 0usize;
+    let mut result = None;
+    while pos < body.len() {
+        let digit_start = pos;
+        while pos < body.len() && body[pos].is_ascii_digit() {
+            pos += 1;
+        }
+        if pos == digit_start || pos >= body.len() || body[pos] != b' ' {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed pax record: bad length field",
+            ));
+        }
+        let len_str = std::str::from_utf8(&body[digit_start..pos]).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed pax record length")
+        })?;
+        let rec_len: usize = len_str.parse().map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "malformed pax record length")
+        })?;
+        if rec_len == 0 || digit_start + rec_len > body.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed pax record: length out of range",
+            ));
+        }
+        let record_end = digit_start + rec_len;
+        // Record shape is "<len> key=value\n"; `pos` is right after the
+        // digits, so `pos + 1` skips the single space separator.
+        let kv_start = pos + 1;
+        if kv_start > record_end || body[record_end - 1] != b'\n' {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "malformed pax record: missing trailing newline",
+            ));
+        }
+        let kv = &body[kv_start..record_end - 1];
+        if let Some(eq) = kv.iter().position(|&b| b == b'=') {
+            let key = &kv[..eq];
+            if key == b"path" {
+                let value = &kv[eq + 1..];
+                let s = std::str::from_utf8(value)
+                    .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 pax path"))?
+                    .to_string();
+                result = Some(s);
+            }
+        }
+        pos = record_end;
+    }
+    Ok(result)
+}
+
 /// Skip `size` bytes of entry body plus padding to the next 512-byte
 /// boundary, without buffering the body.
 fn skip_body(mut tar: impl Read, size: u64) -> io::Result<()> {
@@ -240,28 +335,27 @@ pub fn extract_tar(mut tar: impl Read, dest: &Path) -> io::Result<usize> {
         if typeflag == b'L' {
             // GNU long name: body is the long path (NUL-terminated) for the
             // *next* header.
-            let mut body = vec![0u8; size as usize];
-            if !read_exact_or_eof(&mut tar, &mut body)? {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "truncated archive: GNU long-name body cut short",
-                ));
-            }
-            let pad = (512 - (size % 512) % 512) % 512;
-            if pad > 0 {
-                let mut pad_buf = [0u8; 512];
-                if !read_exact_or_eof(&mut tar, &mut pad_buf[..pad as usize])? {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "truncated archive: missing GNU long-name padding",
-                    ));
-                }
-            }
+            let body = read_bounded_body(&mut tar, size, "GNU long-name")?;
             let end = body.iter().position(|&b| b == 0).unwrap_or(body.len());
             let name = std::str::from_utf8(&body[..end])
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "non-UTF8 GNU long name"))?
                 .to_string();
             pending_long_name = Some(name);
+            continue;
+        }
+
+        if typeflag == b'x' {
+            // Pax extended header: if it carries a `path=` record, that
+            // overrides the (possibly truncated) name of the *next*
+            // header — same override mechanism as GNU 'L'. Ruling R9:
+            // libarchive/bsdtar-produced pax archives store an overlength
+            // path only here, with a truncated fallback in the ustar name
+            // field, so skipping this body blind risks silent path
+            // truncation and collisions.
+            let body = read_bounded_body(&mut tar, size, "pax extended header")?;
+            if let Some(path) = parse_pax_path(&body)? {
+                pending_long_name = Some(path);
+            }
             continue;
         }
 
@@ -291,9 +385,10 @@ pub fn extract_tar(mut tar: impl Read, dest: &Path) -> io::Result<usize> {
                 fs::create_dir_all(dest.join(&rel))?;
             }
             _ => {
-                // Symlinks, hard links, pax extended headers ('x'/'g'),
-                // and anything else we don't materialise: consume and
-                // discard the body.
+                // Symlinks, hard links, pax global headers ('g'), and
+                // anything else we don't materialise: consume and discard
+                // the body. ('x' pax extended headers are handled above,
+                // before the name is resolved, so they never reach here.)
                 skip_body(&mut tar, size)?;
             }
         }
@@ -408,6 +503,68 @@ mod tests {
         out
     }
 
+    /// Build one pax extended-header record: `"<len> key=value\n"`, where
+    /// `len` counts the whole record including its own decimal digits and
+    /// the trailing newline. `len` is only known once its own width is
+    /// fixed, so iterate to a fixed point (the standard pax construction).
+    fn pax_record(key: &str, value: &str) -> Vec<u8> {
+        let fixed_len = key.len() + value.len() + 3; // ' ' + '=' + '\n'
+        let mut len = fixed_len;
+        loop {
+            let total = len.to_string().len() + fixed_len;
+            if total == len {
+                break;
+            }
+            len = total;
+        }
+        format!("{len} {key}={value}\n").into_bytes()
+    }
+
+    /// Build a ustar archive containing a single pax extended-header ('x')
+    /// entry carrying a `path=` record, followed by its data entry (whose
+    /// classic `name` field holds a truncated stand-in, as bsdtar/libarchive
+    /// would emit for an overlength path).
+    fn tar_bytes_pax_path(long_path: &str, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let body = pax_record("path", long_path);
+
+        // 'x' header: name field is conventionally "PaxHeaders/<base>".
+        let mut xh = [0u8; 512];
+        let xn = b"PaxHeaders/x.smt2";
+        xh[..xn.len()].copy_from_slice(xn);
+        xh[100..108].copy_from_slice(b"0000644\0");
+        xh[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
+        xh[156] = b'x';
+        xh[257..263].copy_from_slice(b"ustar\0");
+        xh[263..265].copy_from_slice(b"00");
+        xh[148..156].copy_from_slice(b"        ");
+        let sum: u32 = xh.iter().map(|&b| b as u32).sum();
+        xh[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        out.extend_from_slice(&xh);
+        out.extend_from_slice(&body);
+        out.resize(out.len() + (512 - body.len() % 512) % 512, 0);
+
+        // Data header: classic name field holds a truncated stand-in;
+        // the extractor must prefer the pax `path=` record instead.
+        let mut dh = [0u8; 512];
+        let truncated = &long_path.as_bytes()[..long_path.len().min(100)];
+        dh[..truncated.len()].copy_from_slice(truncated);
+        dh[100..108].copy_from_slice(b"0000644\0");
+        dh[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+        dh[156] = b'0';
+        dh[257..263].copy_from_slice(b"ustar\0");
+        dh[263..265].copy_from_slice(b"00");
+        dh[148..156].copy_from_slice(b"        ");
+        let sum: u32 = dh.iter().map(|&b| b as u32).sum();
+        dh[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        out.extend_from_slice(&dh);
+        out.extend_from_slice(data);
+        out.resize(out.len() + (512 - data.len() % 512) % 512, 0);
+
+        out.extend_from_slice(&[0u8; 1024]);
+        out
+    }
+
     #[test]
     fn zstd_stream_decodes_two_concatenated_frames() {
         let a = compress_to_vec(&b"hello "[..], CompressionLevel::Fastest);
@@ -472,5 +629,60 @@ mod tests {
             b"(set-info :status unsat)"
         );
         std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn extract_pax_extended_header_path_record() {
+        // Ruling R9: bsdtar/libarchive pax archives store an overlength
+        // path only in the 'x' header's `path=` record, with a truncated
+        // fallback in the ustar name field — the extractor must prefer the
+        // pax record, not the truncated name.
+        let long = format!("{}/{}/x.smt2", "p".repeat(60), "q".repeat(60));
+        let tar = tar_bytes_pax_path(&long, b"(set-info :status sat)");
+        let dest = std::env::temp_dir().join(format!("shinri-bench-pax-{}", std::process::id()));
+        let n = extract_tar(std::io::Cursor::new(tar), &dest).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            std::fs::read(dest.join(&long)).unwrap(),
+            b"(set-info :status sat)"
+        );
+        // The truncated ustar-name fallback must NOT have been written to
+        // — only the full pax `path=` value.
+        let truncated: String = long.chars().take(100).collect();
+        assert_ne!(truncated, long);
+        assert!(!dest.join(&truncated).exists());
+        std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn zstd_stream_decodes_a_large_multi_block_frame() {
+        // Exercise the mid-frame branch (`can_collect() == 0 &&
+        // !is_finished()` -> `decode_blocks(UptoBytes(1 << 20))`) that a
+        // real ~1.7 GB Zenodo archive lives in, which the small (tens of
+        // bytes) fixtures above never reach.
+        let pattern: Vec<u8> = (0..4093u32).map(|i| (i % 251) as u8).collect();
+        let mut input = Vec::with_capacity(4 * 1024 * 1024 + pattern.len());
+        while input.len() < 4 * 1024 * 1024 {
+            input.extend_from_slice(&pattern);
+        }
+        let compressed = compress_to_vec(&input[..], CompressionLevel::Fastest);
+
+        let mut stream = ZstdStream::new(std::io::Cursor::new(compressed));
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 65536];
+        let mut iterations = 0usize;
+        loop {
+            let n = stream.read(&mut chunk).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+            iterations += 1;
+        }
+        assert!(
+            iterations > 1,
+            "expected multiple read() calls to drain a >1MiB frame, got {iterations}"
+        );
+        assert_eq!(out, input);
     }
 }
