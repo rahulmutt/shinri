@@ -19,14 +19,7 @@ pub struct Instance {
 /// Scan the first 64 KiB for `(set-info :status <sat|unsat|unknown>)`
 /// outside comments. Only the first match counts.
 pub fn scan_status(head: &str) -> Option<Answer> {
-    // Strip `;` comments line by line so a status mentioned in a comment
-    // never counts.
-    let mut stripped = String::with_capacity(head.len());
-    for line in head.lines() {
-        let content = line.split(';').next().unwrap_or("");
-        stripped.push_str(content);
-        stripped.push('\n');
-    }
+    let stripped = strip_comments(head);
 
     let mut rest = stripped.as_str();
     while let Some(pos) = rest.find("(set-info") {
@@ -44,6 +37,78 @@ pub fn scan_status(head: &str) -> Option<Answer> {
         }
     }
     None
+}
+
+/// Strip `;`-to-end-of-line comments from SMT-LIB source, respecting
+/// string literals (`"..."`, where `""` inside a string is an escaped
+/// quote per SMT-LIB 2.6 §3.1, not a terminator) and quoted symbols
+/// (`|...|`) so a `;` inside either is not mistaken for a comment start.
+/// Only comment text is dropped; everything else — including the quote
+/// characters themselves — is kept verbatim, so callers can still find
+/// literal command text such as `(set-info`.
+///
+/// If a string or quoted symbol is left unterminated by the end of `head`,
+/// no special handling kicks in: nothing after the opening quote was ever
+/// comment text (there being no confirmed close), so nothing is dropped,
+/// and a `(set-info :status ...)` occurring later in the text is still
+/// found. `head` is only the first 64 KiB of a file, so a literal
+/// straddling that boundary is an expected shape, not necessarily
+/// malformed input — see `unterminated_string_still_finds_trailing_status`.
+fn strip_comments(head: &str) -> String {
+    #[derive(Clone, Copy, PartialEq)]
+    enum State {
+        Normal,
+        Str,
+        Sym,
+    }
+
+    let mut out = String::with_capacity(head.len());
+    let mut state = State::Normal;
+    let mut chars = head.chars().peekable();
+    while let Some(c) = chars.next() {
+        match state {
+            State::Normal => match c {
+                ';' => {
+                    while let Some(&next) = chars.peek() {
+                        if next == '\n' {
+                            break;
+                        }
+                        chars.next();
+                    }
+                }
+                '"' => {
+                    state = State::Str;
+                    out.push(c);
+                }
+                '|' => {
+                    state = State::Sym;
+                    out.push(c);
+                }
+                _ => out.push(c),
+            },
+            State::Str => match c {
+                '"' => {
+                    if chars.peek() == Some(&'"') {
+                        out.push('"');
+                        out.push('"');
+                        chars.next();
+                    } else {
+                        out.push('"');
+                        state = State::Normal;
+                    }
+                }
+                _ => out.push(c),
+            },
+            State::Sym => match c {
+                '|' => {
+                    out.push(c);
+                    state = State::Normal;
+                }
+                _ => out.push(c),
+            },
+        }
+    }
+    out
 }
 
 /// Walk `<corpus>/<LOGIC>/**/*.smt2` for each logic in `logics`, returning
@@ -135,6 +200,53 @@ mod tests {
     fn status_after_check_sat_still_counts_and_crlf() {
         assert_eq!(
             scan_status("(check-sat)\r\n(set-info :status sat)\r\n"),
+            Some(Answer::Sat)
+        );
+    }
+
+    #[test]
+    fn semicolon_inside_string_literal_is_not_a_comment() {
+        assert_eq!(
+            scan_status("(assert (= s \";\"))(set-info :status sat)"),
+            Some(Answer::Sat)
+        );
+    }
+
+    #[test]
+    fn escaped_quote_inside_string_literal_keeps_scanning() {
+        assert_eq!(
+            scan_status("(assert (= s \"a\"\"b;c\"))\n(set-info :status unsat)"),
+            Some(Answer::Unsat)
+        );
+    }
+
+    #[test]
+    fn semicolon_inside_quoted_symbol_is_not_a_comment() {
+        assert_eq!(
+            scan_status("(declare-fun |x;y| () Int)(set-info :status sat)"),
+            Some(Answer::Sat)
+        );
+    }
+
+    #[test]
+    fn real_comment_before_real_status_on_next_line_still_found() {
+        assert_eq!(
+            scan_status("; (set-info :status sat)\n(set-info :status unsat)"),
+            Some(Answer::Unsat)
+        );
+    }
+
+    #[test]
+    fn unterminated_string_still_finds_trailing_status() {
+        // `head` is only the first 64 KiB of a file, so a string literal
+        // left open at the point we stop reading is an expected shape, not
+        // necessarily malformed input. Nothing after the opening quote was
+        // ever comment text, so `strip_comments` drops nothing and the
+        // later `:status` is still found. A `None` "fail closed" would also
+        // be a defensible choice; this pins the one actually implemented so
+        // a future change to it is a conscious decision.
+        assert_eq!(
+            scan_status("(assert (= s \"abc\n(set-info :status sat)"),
             Some(Answer::Sat)
         );
     }
