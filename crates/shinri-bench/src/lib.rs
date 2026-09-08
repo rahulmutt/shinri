@@ -5,6 +5,7 @@ pub mod instance;
 pub mod json;
 pub mod oracle;
 pub mod process;
+pub mod report;
 pub mod results;
 pub mod runner;
 pub mod verdict;

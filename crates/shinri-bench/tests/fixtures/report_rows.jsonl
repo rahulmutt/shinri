@@ -1,0 +1,31 @@
+{"fixture":{"sha":"0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c","version":"shinri 0.1.0","timeout_s":20,"mem_mb":3072,"jobs":6,"cpu_max":"800000 100000","memory_max":"34359738368","corpus":"zenodo.11061097","started":"2026-09-08T00:00:00Z"}}
+{"path":"QF_BV/core/bv-c01.smt2","logic":"QF_BV","bytes":100,"status":"sat","rc":0,"wall_ms":5,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_BV/core/bv-c02.smt2","logic":"QF_BV","bytes":200,"status":"unsat","rc":0,"wall_ms":11,"answers":["unsat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_BV/core/bv-c03.smt2","logic":"QF_BV","bytes":300,"status":"sat","rc":0,"wall_ms":23,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_BV/core/bv-c04.smt2","logic":"QF_BV","bytes":400,"status":"unsat","rc":0,"wall_ms":47,"answers":["unsat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_BV/core/bv-c05.smt2","logic":"QF_BV","bytes":500,"status":"sat","rc":0,"wall_ms":96,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_BV/core/bv-c06.smt2","logic":"QF_BV","bytes":600,"status":"unsat","rc":0,"wall_ms":210,"answers":["unsat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_BV/core/bv-wrong01.smt2","logic":"QF_BV","bytes":150,"status":"unsat","rc":0,"wall_ms":30,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"wrong","oracle":{"z3":"unsat","cvc5":"unsat"}}
+{"path":"QF_BV/core/bv-panic01.smt2","logic":"QF_BV","bytes":250,"status":"sat","rc":101,"wall_ms":15,"answers":[],"fence":null,"stderr_head":"thread 'main' panicked at crates/shinri-bv/src/blast.rs:412:9:\nindex out of bounds: the len is 64 but the index is 64","verdict":"panic","oracle":null}
+{"path":"QF_BV/core/bv-oom01.smt2","logic":"QF_BV","bytes":9000,"status":null,"rc":134,"wall_ms":8123,"answers":[],"fence":null,"stderr_head":"memory allocation of 4294967296 bytes failed","verdict":"oom","oracle":null}
+{"path":"QF_BV/core/bv-to01.smt2","logic":"QF_BV","bytes":8000,"status":"sat","rc":124,"wall_ms":20001,"answers":[],"fence":null,"stderr_head":"","verdict":"timeout","oracle":null}
+{"path":"QF_BV/core/bv-to02.smt2","logic":"QF_BV","bytes":7000,"status":null,"rc":124,"wall_ms":20002,"answers":[],"fence":null,"stderr_head":"","verdict":"timeout","oracle":null}
+{"path":"QF_BV/core/bv-unk01.smt2","logic":"QF_BV","bytes":700,"status":"unsat","rc":0,"wall_ms":300,"answers":["unknown"],"fence":"bv-uf-budget","stderr_head":"","verdict":"unknown:bv-uf-budget","oracle":null}
+{"path":"QF_S/kaluza/s-c01.smt2","logic":"QF_S","bytes":110,"status":"sat","rc":0,"wall_ms":7,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_S/kaluza/s-c02.smt2","logic":"QF_S","bytes":210,"status":"unsat","rc":0,"wall_ms":13,"answers":["unsat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_S/kaluza/s-c03.smt2","logic":"QF_S","bytes":310,"status":"sat","rc":0,"wall_ms":29,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_S/kaluza/s-c04.smt2","logic":"QF_S","bytes":410,"status":"unsat","rc":0,"wall_ms":61,"answers":["unsat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_S/kaluza/s-c05.smt2","logic":"QF_S","bytes":510,"status":"sat","rc":0,"wall_ms":130,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_S/kaluza/s-c06.smt2","logic":"QF_S","bytes":610,"status":"unsat","rc":0,"wall_ms":275,"answers":["unsat"],"fence":null,"stderr_head":"","verdict":"correct","oracle":null}
+{"path":"QF_S/kaluza/s-susp01.smt2","logic":"QF_S","bytes":160,"status":"unsat","rc":0,"wall_ms":40,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"status-suspect","oracle":{"z3":"sat","cvc5":"sat"}}
+{"path":"QF_S/kaluza/s-unk01.smt2","logic":"QF_S","bytes":120,"status":"sat","rc":0,"wall_ms":90,"answers":["unknown"],"fence":"str-order","stderr_head":"","verdict":"unknown:str-order","oracle":null}
+{"path":"QF_S/kaluza/s-unk02.smt2","logic":"QF_S","bytes":220,"status":"unsat","rc":0,"wall_ms":95,"answers":["unknown"],"fence":"str-order","stderr_head":"","verdict":"unknown:str-order","oracle":null}
+{"path":"QF_S/kaluza/s-unk03.smt2","logic":"QF_S","bytes":320,"status":null,"rc":0,"wall_ms":100,"answers":["unknown"],"fence":"str-order","stderr_head":"","verdict":"unknown:str-order","oracle":null}
+{"path":"QF_S/kaluza/s-unv01.smt2","logic":"QF_S","bytes":260,"status":null,"rc":0,"wall_ms":512,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"unverified","oracle":{"z3":"timeout","cvc5":"unknown"}}
+{"path":"QF_S/kaluza/s-mal01.smt2","logic":"QF_S","bytes":180,"status":"sat","rc":0,"wall_ms":12,"answers":["sat","unsat"],"fence":null,"stderr_head":"","verdict":"malformed:answers=2","oracle":null}
+{"path":"QF_LRA/sc/lra-pe01.smt2","logic":"QF_LRA","bytes":130,"status":"sat","rc":2,"wall_ms":3,"answers":[],"fence":null,"stderr_head":"(error \"unknown symbol foo\")","verdict":"parse-error","oracle":null}
+{"path":"QF_LRA/sc/lra-pe02.smt2","logic":"QF_LRA","bytes":230,"status":"unsat","rc":2,"wall_ms":4,"answers":[],"fence":null,"stderr_head":"(error \"unknown symbol bar\")","verdict":"parse-error","oracle":null}
+{"path":"QF_LRA/sc/lra-pe03.smt2","logic":"QF_LRA","bytes":330,"status":null,"rc":2,"wall_ms":5,"answers":[],"fence":null,"stderr_head":"(error \"unknown symbol baz2\")","verdict":"parse-error","oracle":null}
+{"path":"QF_LRA/sc/lra-pe04.smt2","logic":"QF_LRA","bytes":430,"status":"sat","rc":2,"wall_ms":6,"answers":[],"fence":null,"stderr_head":"line 7: unexpected token |foo|","verdict":"parse-error","oracle":null}
+{"path":"QF_LRA/sc/lra-to03.smt2","logic":"QF_LRA","bytes":6000,"status":"unsat","rc":124,"wall_ms":20003,"answers":[],"fence":null,"stderr_head":"","verdict":"timeout","oracle":null}
+{"path":"QF_LRA/sc/lra-to04.smt2","logic":"QF_LRA","bytes":5000,"status":null,"rc":124,"wall_ms":20004,"answers":[],"fence":null,"stderr_head":"","verdict":"timeout","oracle":null}
