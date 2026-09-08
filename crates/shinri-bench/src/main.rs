@@ -58,7 +58,10 @@ run [--logics A,B] [--timeout S] [--mem-mb M] [--jobs N] [--run-id ID]
   --results DIR     Results root (default: bench/results)
 
   An existing results file for the same run-id and limits is resumed: the
-  instances it already records are skipped.
+  instances it already records are skipped. `Fixture::same_run` keys that on
+  the commit sha, which carries a `-dirty` suffix whenever the working tree
+  has uncommitted changes — so a rebuilt solver never resumes another
+  build's rows.
 
 rerun <RESULTS.jsonl> --verdict v1,v2 [--timeout S] [--mem-mb M] [--jobs N]
       [--run-id ID] [--solver PATH] [--corpus DIR] [--results DIR]
@@ -121,6 +124,18 @@ fn number<T: std::str::FromStr>(flag: &str, args: &mut Iter<'_, String>) -> Resu
         .map_err(|_| format!("{flag}: not a number: {raw}"))
 }
 
+/// The value of a `--logics` pair. An explicitly given list that names no
+/// logic is a mistake, not a request for all of them (an empty `logics`
+/// field means "every manifest logic").
+fn logics_value(flag: &str, args: &mut Iter<'_, String>) -> Result<Vec<String>, String> {
+    let raw = value(flag, args)?;
+    let logics = list(&raw);
+    if logics.is_empty() {
+        return Err(format!("{flag}: no logic names in {raw:?}"));
+    }
+    Ok(logics)
+}
+
 /// `A,B, C` → `["A", "B", "C"]`; empty entries are dropped.
 fn list(raw: &str) -> Vec<String> {
     raw.split(',')
@@ -181,7 +196,7 @@ fn parse_fetch_args(argv: &[String]) -> Result<FetchArgs, String> {
     let mut args = argv.iter();
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--logics" => out.logics = list(&value("--logics", &mut args)?),
+            "--logics" => out.logics = logics_value("--logics", &mut args)?,
             "--mirror" => out.mirror = Some(value("--mirror", &mut args)?),
             "--dry-run" => out.dry_run = true,
             "--manifest" => out.manifest = PathBuf::from(value("--manifest", &mut args)?),
@@ -206,7 +221,7 @@ fn parse_run_args(argv: &[String]) -> Result<RunArgs, String> {
     let mut args = argv.iter();
     while let Some(a) = args.next() {
         match a.as_str() {
-            "--logics" => out.logics = list(&value("--logics", &mut args)?),
+            "--logics" => out.logics = logics_value("--logics", &mut args)?,
             "--timeout" => out.timeout_s = number("--timeout", &mut args)?,
             "--mem-mb" => out.mem_mb = number("--mem-mb", &mut args)?,
             "--jobs" => out.jobs = number("--jobs", &mut args)?,
@@ -316,7 +331,13 @@ fn cmd_run(a: RunArgs) -> Result<(), String> {
         instances.len(),
         logics.len()
     );
-    let fixture = build_fixture(&version, a.timeout_s, a.mem_mb, a.jobs, record);
+    let fixture = build_fixture(
+        &version,
+        a.timeout_s,
+        a.mem_mb,
+        a.jobs,
+        corpus_provenance(&a.corpus, record),
+    );
     let cfg = run_config(solver, a.timeout_s, a.mem_mb, a.jobs);
     execute(instances, fixture, &a.results, &a.run_id, &cfg)
 }
@@ -380,7 +401,13 @@ fn cmd_rerun(a: RerunArgs) -> Result<(), String> {
         instances.len(),
         a.source.display()
     );
-    let fixture = build_fixture(&version, a.timeout_s, a.mem_mb, a.jobs, corpus_record());
+    let fixture = build_fixture(
+        &version,
+        a.timeout_s,
+        a.mem_mb,
+        a.jobs,
+        corpus_provenance(&a.corpus, corpus_record()),
+    );
     let cfg = run_config(solver, a.timeout_s, a.mem_mb, a.jobs);
     execute(instances, fixture, &results_root, &a.run_id, &cfg)
 }
@@ -471,7 +498,18 @@ fn manifest_context(explicit: &[String]) -> Result<(Vec<String>, String), String
     }
 }
 
-/// Just the fixture's corpus record — a rerun takes its instance list from
+/// The fixture's `corpus` field. The pinned Zenodo record describes the
+/// repo's own corpus and nothing else, so a run pointed elsewhere with
+/// `--corpus` is described by that path instead.
+fn corpus_provenance(corpus: &Path, record: String) -> String {
+    if corpus == Path::new(DEFAULT_CORPUS) {
+        record
+    } else {
+        corpus.display().to_string()
+    }
+}
+
+/// Just the manifest's corpus record — a rerun takes its instance list from
 /// the source results file, so it needs no logic list.
 fn corpus_record() -> String {
     corpus::load_manifest(Path::new(DEFAULT_MANIFEST))
@@ -536,22 +574,42 @@ fn probe_version(program: &str) -> Result<String, String> {
         .to_string())
 }
 
+/// The fixture's `sha`: the HEAD commit, marked `-dirty` when the working
+/// tree carries uncommitted changes. `-` if git cannot answer.
 fn git_sha() -> String {
+    match (
+        git_output(&["rev-parse", "--short=12", "HEAD"]),
+        git_output(&["status", "--porcelain"]),
+    ) {
+        (Some(sha), Some(porcelain)) if !sha.is_empty() => sha_with_dirty_flag(&sha, &porcelain),
+        _ => "-".to_string(),
+    }
+}
+
+/// Trimmed stdout of `git <args>`, or `None` if git could not be run or
+/// exited non-zero. An empty-but-successful run is `Some("")` — that is
+/// exactly what a clean `git status --porcelain` looks like.
+fn git_output(args: &[&str]) -> Option<String> {
     let out = Command::new("git")
-        .args(["rev-parse", "--short=12", "HEAD"])
+        .args(args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
-        .output();
-    match out {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            if s.is_empty() {
-                "-".to_string()
-            } else {
-                s
-            }
-        }
-        _ => "-".to_string(),
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// A sha alone does not identify a solver built from a modified tree, and
+/// `Fixture::same_run` keys resume on it — two different builds must not
+/// share one fixture header, so a dirty tree gets its own sha.
+fn sha_with_dirty_flag(sha: &str, porcelain: &str) -> String {
+    if porcelain.trim().is_empty() {
+        sha.to_string()
+    } else {
+        format!("{sha}-dirty")
     }
 }
 
@@ -775,6 +833,10 @@ mod tests {
         assert!(parse_run_args(&argv(&["--timeout", "soon"])).is_err());
         assert!(parse_run_args(&argv(&["--timeout", "0"])).is_err());
         assert!(parse_run_args(&argv(&["--mem-mb", "0"])).is_err());
+        // An explicit but empty list is a typo, not "every logic".
+        assert!(parse_run_args(&argv(&["--logics", ""])).is_err());
+        assert!(parse_run_args(&argv(&["--logics", ",,"])).is_err());
+        assert!(parse_fetch_args(&argv(&["--logics", ""])).is_err());
         assert!(parse_run_args(&argv(&["--jobs", "0"])).is_err());
         assert!(parse_run_args(&argv(&["--run-id", "a/b"])).is_err());
         assert!(parse_run_args(&argv(&["--nope"])).is_err());
@@ -843,6 +905,39 @@ mod tests {
             &Verdict::Correct,
             &["wrong".to_string(), "correct".to_string()]
         ));
+    }
+
+    #[test]
+    fn dirty_tree_gets_its_own_sha() {
+        // Clean tree: `git status --porcelain` says nothing.
+        assert_eq!(sha_with_dirty_flag("abc123", ""), "abc123");
+        assert_eq!(sha_with_dirty_flag("abc123", "\n  \n"), "abc123");
+        // Any modification must not compare equal to the committed sha —
+        // `Fixture::same_run` would otherwise resume one build into another.
+        assert_eq!(
+            sha_with_dirty_flag("abc123", " M crates/shinri-bench/src/main.rs"),
+            "abc123-dirty"
+        );
+        assert_eq!(sha_with_dirty_flag("abc123", "?? new.rs"), "abc123-dirty");
+        assert_ne!(
+            sha_with_dirty_flag("abc123", " M x.rs"),
+            sha_with_dirty_flag("abc123", "")
+        );
+    }
+
+    #[test]
+    fn corpus_field_describes_where_the_instances_came_from() {
+        let record = || "10.5281/zenodo.11061097".to_string();
+        // The repo corpus is the one the manifest actually pins.
+        assert_eq!(
+            corpus_provenance(Path::new("bench/corpus"), record()),
+            "10.5281/zenodo.11061097"
+        );
+        // Anywhere else, the record would be a false provenance claim.
+        assert_eq!(
+            corpus_provenance(Path::new("/tmp/other"), record()),
+            "/tmp/other"
+        );
     }
 
     #[test]
