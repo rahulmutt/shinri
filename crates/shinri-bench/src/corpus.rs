@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use crate::archive::{extract_tar, ZstdStream};
@@ -215,6 +215,32 @@ fn count_smt2_files(dir: &Path) -> io::Result<u64> {
     Ok(n)
 }
 
+/// Find the extracted logic tree inside `staging`. The Zenodo archives'
+/// true top-level directory is `non-incremental/<logic>/`, not
+/// `<logic>/` — check the direct shape first, then the `non-incremental`
+/// nesting, and error (listing what actually is at the staging
+/// top-level, to help debugging) if neither is present.
+fn locate_logic_tree(staging: &Path, logic: &str) -> Result<PathBuf, String> {
+    let direct = staging.join(logic);
+    if direct.is_dir() {
+        return Ok(direct);
+    }
+    let nested = staging.join("non-incremental").join(logic);
+    if nested.is_dir() {
+        return Ok(nested);
+    }
+    let mut entries: Vec<String> = fs::read_dir(staging)
+        .map_err(|e| format!("reading staging dir {}: {e}", staging.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    entries.sort();
+    Err(format!(
+        "{logic}: archive contains neither {logic}/ nor non-incremental/{logic}/ \
+         (staging top-level entries: {entries:?})"
+    ))
+}
+
 /// The archive's on-disk file name, as published in the manifest (e.g.
 /// `QF_AX.tar.zst`), recovered from `url` (`.../<file>/content`).
 fn archive_filename(url: &str) -> &str {
@@ -342,24 +368,42 @@ fn fetch_one(
     }
     eprintln!("{logic}: md5 ok ({digest})");
 
-    // A half-extracted tree from a previously killed run must not survive
-    // to poison this extraction — but only when it isn't already known
-    // good (`.verified` present, which also means we'd have skipped
-    // above; this covers the case where a stale `.verified` had a
-    // different, now-superseded md5).
+    // Extract into a per-archive staging directory, not straight into
+    // `corpus_dir`: the Zenodo archives' actual top-level directory is
+    // `non-incremental/<logic>/`, not `<logic>/` (R10) — `locate_logic_tree`
+    // below sorts that out before anything lands at its final home.
+    // Removed-and-recreated fresh so a half-extracted staging tree from a
+    // previously killed run can't poison this extraction.
+    let staging = corpus_dir.join(".extract").join(logic);
+    if staging.exists() {
+        fs::remove_dir_all(&staging)
+            .map_err(|e| format!("removing stale staging {}: {e}", staging.display()))?;
+    }
+    fs::create_dir_all(&staging)
+        .map_err(|e| format!("creating staging {}: {e}", staging.display()))?;
+
+    let file = File::open(&dl_path).map_err(|e| format!("opening {}: {e}", dl_path.display()))?;
+    let zstd = ZstdStream::new(BufReader::new(file));
+    extract_tar(zstd, &staging).map_err(|e| format!("extracting: {e}"))?;
+
+    let found = locate_logic_tree(&staging, logic)?;
+
+    // A half-extracted tree at the final `<corpus>/<logic>` location from
+    // a previously killed run must not survive the move — but only when
+    // it isn't already known good (`.verified` present, which also means
+    // we'd have skipped above; this covers the case where a stale
+    // `.verified` had a different, now-superseded md5).
     if logic_dir.exists() && !verified_path.exists() {
         fs::remove_dir_all(&logic_dir)
             .map_err(|e| format!("removing stale {}: {e}", logic_dir.display()))?;
     }
-
-    let file = File::open(&dl_path).map_err(|e| format!("opening {}: {e}", dl_path.display()))?;
-    let zstd = ZstdStream::new(BufReader::new(file));
-    extract_tar(zstd, corpus_dir).map_err(|e| format!("extracting: {e}"))?;
-
-    if !logic_dir.is_dir() {
-        return Err(format!(
-            "archive did not contain a top-level {logic}/ directory"
-        ));
+    fs::rename(&found, &logic_dir)
+        .map_err(|e| format!("moving {} to {}: {e}", found.display(), logic_dir.display()))?;
+    if let Err(e) = fs::remove_dir_all(&staging) {
+        eprintln!(
+            "{logic}: warning: failed to remove staging dir {}: {e}",
+            staging.display()
+        );
     }
 
     let count = count_smt2_files(&logic_dir).map_err(|e| format!("counting .smt2 files: {e}"))?;
@@ -434,6 +478,44 @@ mod tests {
         fetch(&m, &["QF_AX".into()], &dir, None, true).unwrap();
         assert!(!dir.exists());
         fetch(&m, &["QF_NOPE".into()], &dir, None, true).unwrap_err();
+    }
+
+    #[test]
+    fn locate_logic_tree_finds_direct_shape() {
+        let staging =
+            std::env::temp_dir().join(format!("shinri-bench-locate-direct-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(staging.join("QF_X")).unwrap();
+        let found = locate_logic_tree(&staging, "QF_X").unwrap();
+        assert_eq!(found, staging.join("QF_X"));
+        fs::remove_dir_all(&staging).unwrap();
+    }
+
+    #[test]
+    fn locate_logic_tree_finds_non_incremental_shape() {
+        let staging = std::env::temp_dir().join(format!(
+            "shinri-bench-locate-nonincr-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(staging.join("non-incremental").join("QF_X")).unwrap();
+        let found = locate_logic_tree(&staging, "QF_X").unwrap();
+        assert_eq!(found, staging.join("non-incremental").join("QF_X"));
+        fs::remove_dir_all(&staging).unwrap();
+    }
+
+    #[test]
+    fn locate_logic_tree_errors_when_neither_shape_present() {
+        let staging = std::env::temp_dir().join(format!(
+            "shinri-bench-locate-missing-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&staging);
+        fs::create_dir_all(staging.join("some_other_dir")).unwrap();
+        let err = locate_logic_tree(&staging, "QF_X").unwrap_err();
+        assert!(err.contains("QF_X"));
+        assert!(err.contains("some_other_dir"));
+        fs::remove_dir_all(&staging).unwrap();
     }
 
     #[test]

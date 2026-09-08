@@ -159,6 +159,11 @@ parse time — the harness's own wall clock covers the whole process.
 4. Write `bench/corpus/<LOGIC>/.verified` containing the archive sha256 so
    re-runs skip it.
 
+As built: the Zenodo archives unpack to `non-incremental/<LOGIC>/…`;
+`fetch` extracts into `bench/corpus/.extract/<LOGIC>/` and relocates the
+logic tree to `bench/corpus/<LOGIC>/`, so the on-disk layout is the one
+described here.
+
 `fetch --dry-run` validates the manifest and prints the URLs without network.
 
 **Pinning rule:** the manifest pins the *SMT-LIB 2024 non-incremental release*
