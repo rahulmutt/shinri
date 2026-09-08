@@ -120,8 +120,11 @@ pub fn classify(o: &Observed) -> Verdict {
     if o.rc == Some(101) || o.stderr.contains("panicked at") {
         return Verdict::Panic;
     }
-    // 3. Oom.
+    // 3. Oom. A read-time allocation failure surfaces as a plain
+    //    `error: out of memory` on stderr with rc 2, which rule 4 would
+    //    otherwise misfile as a parse error.
     if (o.stderr.contains("memory allocation of") && o.stderr.contains("failed"))
+        || o.stderr.to_ascii_lowercase().contains("out of memory")
         || o.rc == Some(134)
         || o.rc.is_none()
     {
@@ -346,6 +349,14 @@ mod tests {
             Verdict::Oom
         );
         assert_eq!(classify(&obs(None, &[], "", None)), Verdict::Oom); // SIGKILL before the limit
+    }
+    #[test]
+    fn read_failure_out_of_memory_is_oom() {
+        // rc 2 would hit rule 4 (ParseError); the stderr text must win.
+        assert_eq!(
+            classify(&obs(Some(2), &[], "error: out of memory", None)),
+            Verdict::Oom
+        );
     }
     #[test]
     fn timeout_is_timeout() {
