@@ -29,6 +29,8 @@ fn six_verdicts_from_the_stub_solver() {
         memory_max: "-".into(),
         corpus: "mini".into(),
         started: "now".into(),
+        solver: Some(stub.to_string_lossy().into_owned()),
+        solver_md5: None,
     };
     let (mut rf, skip) = ResultsFile::open(&out, &fx).unwrap();
     let cfg = RunConfig {

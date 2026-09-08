@@ -28,6 +28,11 @@ pub struct RunConfig {
 /// The most stderr we keep per row.
 const STDERR_HEAD_BYTES: usize = 2048;
 
+/// The most of the first stdout `(error …)` line we keep per row. The
+/// diagnostic is what splits the report's parse-error buckets (spec §6.3),
+/// and the CLI can embed a whole numeral in one, so it is bounded.
+const FIRST_ERROR_BYTES: usize = 512;
+
 /// Run one instance and classify it. Never panics; never returns an error.
 pub fn run_one(inst: &Instance, cfg: &RunConfig) -> Row {
     // Probe readability first: a permission or I/O error here is the
@@ -44,7 +49,7 @@ pub fn run_one(inst: &Instance, cfg: &RunConfig) -> Row {
         return bare_row(inst, Verdict::Malformed(format!("spawn: {err}")));
     }
 
-    let (answers, stdout_errors) = parse_answers(&exec.stdout);
+    let (answers, stdout_errors, first_error) = parse_answers(&exec.stdout);
     let fence = parse_stats_fence(&exec.stderr);
     let mut stderr_head = strip_stats(&exec.stderr, STDERR_HEAD_BYTES);
 
@@ -100,6 +105,7 @@ pub fn run_one(inst: &Instance, cfg: &RunConfig) -> Row {
         wall_ms: exec.wall_ms,
         answers,
         stdout_errors,
+        first_error,
         fence,
         stderr_head,
         verdict,
@@ -118,6 +124,7 @@ fn bare_row(inst: &Instance, verdict: Verdict) -> Row {
         wall_ms: 0,
         answers: Vec::new(),
         stdout_errors: 0,
+        first_error: None,
         fence: None,
         stderr_head: String::new(),
         verdict,
@@ -209,19 +216,28 @@ pub fn strip_stats(stderr: &str, max: usize) -> String {
         .split_inclusive('\n')
         .filter(|line| !line.trim_start().starts_with("stats:"))
         .collect();
-    let mut end = max.min(kept.len());
-    while end > 0 && !kept.is_char_boundary(end) {
-        end -= 1;
-    }
-    kept[..end].to_string()
+    truncate_on_char_boundary(&kept, max)
 }
 
-/// The solver's answers in order, plus the number of `(error …)` lines that
-/// preceded the first one. Anything else on stdout — `success` acks, models,
-/// banners — is ignored.
-pub fn parse_answers(stdout: &str) -> (Vec<Answer>, usize) {
+/// `s` cut to the largest character boundary at or below `max` bytes.
+fn truncate_on_char_boundary(s: &str, max: usize) -> String {
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s[..end].to_string()
+}
+
+/// The solver's answers in order, the number of `(error …)` lines that
+/// preceded the first one, and the first such line verbatim (bounded by
+/// [`FIRST_ERROR_BYTES`]). The diagnostics arrive on *stdout*, the CLI's
+/// response channel, so keeping only the count would leave the report
+/// unable to tell one parse failure from another (slice 46 review C2).
+/// Anything else on stdout — `success` acks, models, banners — is ignored.
+pub fn parse_answers(stdout: &str) -> (Vec<Answer>, usize, Option<String>) {
     let mut answers = Vec::new();
     let mut errors = 0usize;
+    let mut first_error: Option<String> = None;
     for line in stdout.lines() {
         let trimmed = line.trim();
         match trimmed {
@@ -231,11 +247,14 @@ pub fn parse_answers(stdout: &str) -> (Vec<Answer>, usize) {
             _ => {
                 if answers.is_empty() && trimmed.starts_with("(error") {
                     errors += 1;
+                    if first_error.is_none() {
+                        first_error = Some(truncate_on_char_boundary(trimmed, FIRST_ERROR_BYTES));
+                    }
                 }
             }
         }
     }
-    (answers, errors)
+    (answers, errors, first_error)
 }
 
 #[cfg(test)]
@@ -246,13 +265,43 @@ mod tests {
     fn answers_and_error_count() {
         assert_eq!(
             parse_answers("success\n(error \"x\")\nunsat\n"),
-            (vec![Answer::Unsat], 1)
+            (vec![Answer::Unsat], 1, Some("(error \"x\")".to_string()))
         );
         assert_eq!(
             parse_answers("sat\n(error \"after\")\n"),
-            (vec![Answer::Sat], 0)
+            (vec![Answer::Sat], 0, None)
         );
-        assert_eq!(parse_answers("(define-fun x () Int 3)\n"), (vec![], 0));
+        assert_eq!(
+            parse_answers("(define-fun x () Int 3)\n"),
+            (vec![], 0, None)
+        );
+    }
+
+    #[test]
+    fn the_first_error_line_is_kept_verbatim_and_bounded() {
+        // The live shape (QF_ABV/20200415-Yurichev/t3.smt2): two errors, the
+        // first one is the one the report buckets on.
+        let (answers, n, first) = parse_answers(
+            "(error \"sort error: Arity { expected: 2, found: 64 }\")\n\
+             (error \"sort error: Arity { expected: 2, found: 16 }\")\n\
+             sat\n",
+        );
+        assert_eq!(answers, vec![Answer::Sat]);
+        assert_eq!(n, 2);
+        assert_eq!(
+            first.as_deref(),
+            Some("(error \"sort error: Arity { expected: 2, found: 64 }\")")
+        );
+
+        // A 100k-digit numeral in the diagnostic (the live
+        // `invalid BV numeral suffix` shape) must not be stored whole, and
+        // the cut must land on a character boundary: 9 ASCII bytes then
+        // two-byte characters puts byte 512 mid-character.
+        let long = format!("(error \"9{}\")", "é".repeat(400));
+        let (_, _, first) = parse_answers(&long);
+        let first = first.unwrap();
+        assert_eq!(first.len(), FIRST_ERROR_BYTES - 1);
+        assert!(first.starts_with("(error \"9é"));
     }
 
     #[test]

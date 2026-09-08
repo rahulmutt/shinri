@@ -85,6 +85,50 @@ fn diag_line<'a>(text: &'a str, marker: &str) -> &'a str {
     }
 }
 
+/// `(error "msg")` → `msg`; anything else unchanged. The wrapper is
+/// identical on every parse-error row and `normalise_diag` collapses a whole
+/// `"…"` string to `S`, so keying on the raw line would put every parse
+/// failure in one bucket (slice 46 review C2).
+fn error_payload(line: &str) -> &str {
+    let trimmed = line.trim();
+    trimmed
+        .strip_prefix("(error \"")
+        .and_then(|rest| rest.strip_suffix("\")"))
+        .unwrap_or(trimmed)
+}
+
+/// The bucket key for a `panic` row: `<file>: <normalised message>`.
+///
+/// Rust prints `thread '<name>' (<tid>) panicked at <file>:<line>:<col>:` and
+/// the message on the *next* line. Keying on the location alone merges every
+/// distinct panic in a file (`normalise_diag` turns `624:22` into `N:N`), so
+/// the message is what distinguishes the buckets and the line/column are
+/// dropped entirely (review I1). A crash with no `panicked at` line at all —
+/// a stack overflow, say — falls back to its first non-empty line.
+fn panic_key(stderr: &str) -> String {
+    let mut lines = stderr.lines();
+    while let Some(line) = lines.next() {
+        let Some((_, rest)) = line.split_once("panicked at") else {
+            continue;
+        };
+        // The path never contains `:` in this repo, so the first component
+        // is the file and everything after it is `line:col:`.
+        let file = rest.trim().split(':').next().unwrap_or("").trim();
+        if file.is_empty() {
+            break;
+        }
+        let message = lines
+            .next()
+            .map(str::trim)
+            .filter(|m| !m.is_empty() && !m.starts_with("note:"));
+        return match message {
+            Some(m) => format!("{file}: {}", normalise_diag(m)),
+            None => file.to_string(),
+        };
+    }
+    normalise_diag(diag_line(stderr, "panicked at"))
+}
+
 /// Verdict counts for one logic (or for the `all` aggregate).
 #[derive(Default, Clone)]
 struct Counts {
@@ -225,6 +269,12 @@ fn render_fixture(
             out.push_str("| field | value |\n| --- | --- |\n");
             let _ = writeln!(out, "| sha | {} |", cell(&f.sha));
             let _ = writeln!(out, "| version | {} |", cell(&f.version));
+            if let Some(solver) = &f.solver {
+                let _ = writeln!(out, "| solver | {} |", cell(solver));
+            }
+            if let Some(md5) = &f.solver_md5 {
+                let _ = writeln!(out, "| solver_md5 | {} |", cell(md5));
+            }
             let _ = writeln!(out, "| timeout_s | {} |", f.timeout_s);
             let _ = writeln!(out, "| mem_mb | {} |", f.mem_mb);
             let _ = writeln!(out, "| jobs | {} |", f.jobs);
@@ -297,14 +347,19 @@ fn matrix_row(out: &mut String, name: &str, c: &Counts, walls: &[u64]) {
 fn gap_key(row: &Row) -> Option<Cow<'_, str>> {
     match &row.verdict {
         Verdict::Correct | Verdict::Wrong | Verdict::StatusSuspect => None,
-        Verdict::ParseError => Some(Cow::Owned(format!(
-            "parse-error:{}",
-            normalise_diag(diag_line(&row.stderr_head, "(error"))
-        ))),
-        Verdict::Panic => Some(Cow::Owned(format!(
-            "panic:{}",
-            normalise_diag(diag_line(&row.stderr_head, "panicked at"))
-        ))),
+        Verdict::ParseError => {
+            // The diagnostic is on stdout, kept per row as `first_error`;
+            // older rows (and rows whose error reached stderr) fall back.
+            let raw = match row.first_error.as_deref() {
+                Some(e) if !e.trim().is_empty() => e,
+                _ => diag_line(&row.stderr_head, "(error"),
+            };
+            Some(Cow::Owned(format!(
+                "parse-error:{}",
+                normalise_diag(error_payload(raw))
+            )))
+        }
+        Verdict::Panic => Some(Cow::Owned(format!("panic:{}", panic_key(&row.stderr_head)))),
         Verdict::Unknown(tag) => Some(Cow::Owned(format!("unknown:{tag}"))),
         Verdict::Malformed(reason) => Some(Cow::Owned(format!("malformed:{reason}"))),
         Verdict::Timeout => Some(Cow::Borrowed("timeout")),
@@ -508,9 +563,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn render_handles_no_correct_rows() {
-        let r = Row {
+    fn bare(verdict: Verdict) -> Row {
+        Row {
             path: "QF_X/a.smt2".into(),
             logic: "QF_X".into(),
             bytes: 1,
@@ -519,14 +573,87 @@ mod tests {
             wall_ms: 20000,
             answers: vec![],
             stdout_errors: 0,
+            first_error: None,
             fence: None,
             stderr_head: String::new(),
-            verdict: Verdict::Timeout,
+            verdict,
             oracle: None,
-        };
-        let md = render(None, &[r]);
+        }
+    }
+
+    #[test]
+    fn render_handles_no_correct_rows() {
+        let md = render(None, &[bare(Verdict::Timeout)]);
         assert!(md.contains("| QF_X |"));
         assert!(md.contains("n/a"));
+    }
+
+    #[test]
+    fn parse_error_buckets_split_on_the_stored_stdout_diagnostic() {
+        let key = |first: &str| {
+            let mut r = bare(Verdict::ParseError);
+            r.first_error = Some(first.to_string());
+            gap_key(&r).unwrap().into_owned()
+        };
+        // Two arity errors differing only in numbers share a bucket …
+        assert_eq!(
+            key("(error \"sort error: Arity { expected: 2, found: 64 }\")"),
+            key("(error \"sort error: Arity { expected: 2, found: 3 }\")")
+        );
+        assert_eq!(
+            key("(error \"sort error: Arity { expected: 2, found: 64 }\")"),
+            "parse-error:sort error: Arity { expected: N, found: N }"
+        );
+        // … a different diagnostic does not.
+        assert_ne!(
+            key("(error \"sort error: Arity { expected: 2, found: 64 }\")"),
+            key("(error \"invalid BV numeral suffix `394020061963`\")")
+        );
+        // Older rows with nothing stored still bucket, on stderr or `-`.
+        let mut old = bare(Verdict::ParseError);
+        old.stderr_head = "(error \"unknown symbol foo\")".into();
+        assert_eq!(
+            gap_key(&old).unwrap(),
+            "parse-error:unknown symbol foo".to_string()
+        );
+        assert_eq!(
+            gap_key(&bare(Verdict::ParseError)).unwrap(),
+            "parse-error:-".to_string()
+        );
+    }
+
+    #[test]
+    fn panic_buckets_key_on_the_file_and_the_message_not_the_line() {
+        let key = |stderr: &str| {
+            let mut r = bare(Verdict::Panic);
+            r.stderr_head = stderr.to_string();
+            gap_key(&r).unwrap().into_owned()
+        };
+        // The live shape: blank line, location with tid, message, note.
+        assert_eq!(
+            key("\nthread 'main' (3676870) panicked at crates/shinri-bv/src/blast/mod.rs:624:22:\ninternal error: entered unreachable code: non-BV builtin reached blast_word\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n"),
+            "panic:crates/shinri-bv/src/blast/mod.rs: internal error: entered unreachable code: non-BV builtin reached blast_word"
+        );
+        // Same file, different bug → different bucket (was one before I1).
+        assert_ne!(
+            key("thread 'main' (1) panicked at crates/shinri-bv/src/blast/mod.rs:624:22:\ninternal error: entered unreachable code: non-BV builtin reached blast_word\n"),
+            key("thread 'main' (2) panicked at crates/shinri-bv/src/blast/mod.rs:99:1:\nindex out of bounds: the len is 64 but the index is 64\n")
+        );
+        // Same bug at a moved line → one bucket.
+        assert_eq!(
+            key("thread 'main' (1) panicked at crates/shinri-bv/src/blast/mod.rs:624:22:\nindex out of bounds: the len is 64 but the index is 64\n"),
+            key("thread 'main' (2) panicked at crates/shinri-bv/src/blast/mod.rs:701:9:\nindex out of bounds: the len is 32 but the index is 32\n")
+        );
+        // No message line: the file alone.
+        assert_eq!(
+            key("thread 'main' (1) panicked at crates/shinri-bv/src/blast/mod.rs:624:22:\n"),
+            "panic:crates/shinri-bv/src/blast/mod.rs"
+        );
+        // No `panicked at` at all: the stack-overflow abort.
+        assert_eq!(
+            key("\nthread 'main' (3691292) has overflowed its stack\nfatal runtime error: stack overflow, aborting\n"),
+            "panic:thread 'main' (N) has overflowed its stack"
+        );
     }
 
     #[test]

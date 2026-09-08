@@ -15,6 +15,7 @@
 //! the 64 KiB pipe buffer on either stream cannot deadlock the harness.
 
 use std::io::Read;
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::time::Instant;
 
@@ -28,7 +29,15 @@ pub struct Limits {
 /// The outcome of one limited invocation.
 #[derive(Clone, Debug, Default)]
 pub struct Exec {
-    /// Exit status, or `None` if the process was terminated by a signal.
+    /// Exit status in shell vocabulary: the process's own exit code, or
+    /// `128 + signal` when it died on a signal (`134` = SIGABRT, `137` =
+    /// SIGKILL, `139` = SIGSEGV). `None` only if the platform reports
+    /// neither — unreachable on unix.
+    ///
+    /// The derivation matters: coreutils `timeout` re-raises the child's
+    /// fatal signal on itself when it did *not* time out, so
+    /// `ExitStatus::code()` alone is `None` for every solver abort and every
+    /// crash would be indistinguishable (slice 46 review C1).
     pub rc: Option<i32>,
     pub stdout: String,
     pub stderr: String,
@@ -94,7 +103,10 @@ pub fn run_limited(program: &str, args: &[&str], limits: &Limits) -> Exec {
     let wall_ms = start.elapsed().as_millis() as u64;
 
     let rc = match status {
-        Ok(status) => status.code(),
+        // `code()` is `None` for a signal death; recover the signal and
+        // report it as the shell's `128 + n` so 134/137/139 stay tellable
+        // apart downstream (see `Exec::rc`).
+        Ok(status) => status.code().or_else(|| status.signal().map(|s| 128 + s)),
         Err(e) => {
             return Exec {
                 spawn_error: Some(format!("wait {program}: {e}")),
@@ -104,9 +116,12 @@ pub fn run_limited(program: &str, args: &[&str], limits: &Limits) -> Exec {
         }
     };
 
-    // 124 is `timeout`'s own "expired" status. 137 (128+KILL) or a signal
-    // death only count as a timeout if the budget had actually elapsed —
-    // otherwise it is an abort/OOM kill and must classify as such.
+    // 124 is `timeout`'s own "expired" status. 137 (128+KILL) only counts as
+    // a timeout if the budget had actually elapsed — otherwise it is an
+    // OOM kill and must classify as such. The `rc.is_none()` arm is
+    // unreachable now that a signal death yields `Some(128 + n)` above; it
+    // is kept as a belt-and-braces guard for a platform that reports
+    // neither a code nor a signal.
     let budget_ms = limits.timeout_s.saturating_mul(1000);
     let killed_by_timeout = rc == Some(124)
         || (rc == Some(137) && wall_ms >= budget_ms)
@@ -139,4 +154,30 @@ pub fn tools_available() -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Slice 46 review C1: under the `timeout` wrapper an aborting child's
+    /// `ExitStatus::code()` is `None`; `rc` must still say *which* signal.
+    #[test]
+    fn a_signal_death_is_reported_as_128_plus_the_signal() {
+        if tools_available().is_err() {
+            eprintln!("skipping: prlimit/timeout unavailable");
+            return;
+        }
+        let limits = Limits {
+            timeout_s: 5,
+            mem_mb: 256,
+        };
+        let abort = run_limited("sh", &["-c", "kill -ABRT $$"], &limits);
+        assert_eq!(abort.rc, Some(134), "SIGABRT must surface as 134");
+        assert!(!abort.killed_by_timeout);
+        let segv = run_limited("sh", &["-c", "kill -SEGV $$"], &limits);
+        assert_eq!(segv.rc, Some(139), "SIGSEGV must surface as 139");
+        let clean = run_limited("sh", &["-c", "exit 3"], &limits);
+        assert_eq!(clean.rc, Some(3));
+    }
 }

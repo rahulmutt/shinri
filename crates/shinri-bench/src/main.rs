@@ -24,6 +24,9 @@ const DEFAULT_RESULTS: &str = "bench/results";
 const DEFAULT_TIMEOUT_S: u64 = 20;
 const DEFAULT_MEM_MB: u64 = 3072;
 const DEFAULT_JOBS: usize = 6;
+/// Upper bound on `--jobs`: past this the pool is pure contention, and a
+/// wild value would panic inside `std::thread::scope`.
+const MAX_JOBS: usize = 256;
 /// The release build the mise tasks produce; anything else falls back to
 /// whatever `shinri` is on `PATH`.
 const BUILT_SOLVER: &str = "target/release/shinri";
@@ -50,7 +53,7 @@ run [--logics A,B] [--timeout S] [--mem-mb M] [--jobs N] [--run-id ID]
     [--solver PATH] [--corpus DIR] [--results DIR]
   --timeout S       Per-instance wall-clock budget in seconds (default: 20)
   --mem-mb M        Per-instance address-space limit in MiB (default: 3072)
-  --jobs N          Worker threads (default: 6)
+  --jobs N          Worker threads, 1..=256 (default: 6)
   --run-id ID       Results go to <results>/<ID>/results.jsonl
                     (default: the UTC start time, YYYYMMDDTHHMMSSZ)
   --solver PATH     Solver to benchmark (default: target/release/shinri if
@@ -301,6 +304,11 @@ fn check_limits(timeout_s: u64, mem_mb: u64, jobs: usize, run_id: &str) -> Resul
     if jobs == 0 {
         return Err("--jobs must be at least 1".to_string());
     }
+    // `std::thread::scope` panics if the OS refuses a thread, and "never
+    // panic on user input" outranks honouring an absurd `--jobs`.
+    if jobs > MAX_JOBS {
+        return Err(format!("--jobs must be at most {MAX_JOBS} (got {jobs})"));
+    }
     if run_id.is_empty() || run_id.contains('/') || run_id.contains('\\') || run_id.starts_with('.')
     {
         return Err(format!("--run-id must be a plain directory name: {run_id}"));
@@ -332,6 +340,7 @@ fn cmd_run(a: RunArgs) -> Result<(), String> {
         logics.len()
     );
     let fixture = build_fixture(
+        &solver,
         &version,
         a.timeout_s,
         a.mem_mb,
@@ -402,6 +411,7 @@ fn cmd_rerun(a: RerunArgs) -> Result<(), String> {
         a.source.display()
     );
     let fixture = build_fixture(
+        &solver,
         &version,
         a.timeout_s,
         a.mem_mb,
@@ -468,6 +478,7 @@ fn run_config(solver: String, timeout_s: u64, mem_mb: u64, jobs: usize) -> RunCo
 }
 
 fn build_fixture(
+    solver: &str,
     version: &str,
     timeout_s: u64,
     mem_mb: u64,
@@ -484,7 +495,38 @@ fn build_fixture(
         memory_max: read_first_line("/sys/fs/cgroup/memory.max"),
         corpus,
         started: iso_timestamp(now_secs()),
+        solver: Some(solver.to_string()),
+        solver_md5: solver_md5(solver),
     }
+}
+
+/// The digest of the benchmarked binary: the repo sha alone cannot tell a
+/// debug build from a release one, or a stale binary from a rebuilt one, and
+/// `same_run` uses this to refuse resuming across them (review I2). A
+/// failure to hash is a warning, not a run-stopper.
+fn solver_md5(solver: &str) -> Option<String> {
+    let resolved = which(solver);
+    match corpus::md5_of(&resolved) {
+        Ok(md5) => Some(md5),
+        Err(e) => {
+            eprintln!("shinri-bench: warning: cannot hash solver {solver}: {e}");
+            None
+        }
+    }
+}
+
+/// `md5sum` needs a path; a bare program name is looked up on `PATH`.
+fn which(program: &str) -> PathBuf {
+    if program.contains('/') {
+        return PathBuf::from(program);
+    }
+    std::env::var_os("PATH")
+        .map(|paths| std::env::split_paths(&paths).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|dir| dir.join(program))
+        .find(|candidate| candidate.is_file())
+        .unwrap_or_else(|| PathBuf::from(program))
 }
 
 /// The manifest supplies both the default logic list and the fixture's
@@ -838,6 +880,14 @@ mod tests {
         assert!(parse_run_args(&argv(&["--logics", ",,"])).is_err());
         assert!(parse_fetch_args(&argv(&["--logics", ""])).is_err());
         assert!(parse_run_args(&argv(&["--jobs", "0"])).is_err());
+        // Unbounded `--jobs` panics inside `std::thread::scope` when the OS
+        // refuses a thread; a user-input value must never do that.
+        assert!(parse_run_args(&argv(&["--jobs", "257"])).is_err());
+        assert!(parse_run_args(&argv(&["--jobs", "1000000"])).is_err());
+        assert!(parse_run_args(&argv(&["--jobs", "256"])).is_ok());
+        assert!(
+            parse_rerun_args(&argv(&["a.jsonl", "--verdict", "oom", "--jobs", "257"])).is_err()
+        );
         assert!(parse_run_args(&argv(&["--run-id", "a/b"])).is_err());
         assert!(parse_run_args(&argv(&["--nope"])).is_err());
         assert!(parse_run_args(&argv(&["extra"])).is_err());

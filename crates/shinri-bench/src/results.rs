@@ -21,12 +21,19 @@ pub struct Fixture {
     pub memory_max: String,
     pub corpus: String,
     pub started: String,
+    /// The resolved `--solver` path. Optional: files written before the
+    /// field existed have neither this nor `solver_md5`.
+    pub solver: Option<String>,
+    /// `md5sum` of that binary, so two different builds of the same repo sha
+    /// cannot resume into one results file (slice 46 review I2). `None` when
+    /// the digest could not be taken.
+    pub solver_md5: Option<String>,
 }
 
 impl Fixture {
     pub fn to_json(&self) -> String {
-        format!(
-            "{{\"fixture\":{{\"sha\":{},\"version\":{},\"timeout_s\":{},\"mem_mb\":{},\"jobs\":{},\"cpu_max\":{},\"memory_max\":{},\"corpus\":{},\"started\":{}}}}}",
+        let mut out = format!(
+            "{{\"fixture\":{{\"sha\":{},\"version\":{},\"timeout_s\":{},\"mem_mb\":{},\"jobs\":{},\"cpu_max\":{},\"memory_max\":{},\"corpus\":{},\"started\":{}",
             json::escape(&self.sha),
             json::escape(&self.version),
             self.timeout_s,
@@ -36,7 +43,17 @@ impl Fixture {
             json::escape(&self.memory_max),
             json::escape(&self.corpus),
             json::escape(&self.started),
-        )
+        );
+        // Emitted only when known, so a fixture without them serialises
+        // byte-for-byte as it did before the fields existed.
+        if let Some(solver) = &self.solver {
+            out.push_str(&format!(",\"solver\":{}", json::escape(solver)));
+        }
+        if let Some(md5) = &self.solver_md5 {
+            out.push_str(&format!(",\"solver_md5\":{}", json::escape(md5)));
+        }
+        out.push_str("}}");
+        out
     }
 
     pub fn from_json(line: &str) -> Option<Fixture> {
@@ -71,13 +88,23 @@ impl Fixture {
             memory_max: str_field("memory_max").unwrap_or_default(),
             corpus: str_field("corpus").unwrap_or_default(),
             started: str_field("started").unwrap_or_default(),
+            solver: str_field("solver"),
+            solver_md5: str_field("solver_md5"),
         })
     }
 
     /// Two fixtures belong to the same run iff the corpus snapshot and the
-    /// run limits match: `sha`, `timeout_s`, `mem_mb`, `jobs`.
+    /// run limits match: `sha`, `timeout_s`, `mem_mb`, `jobs` — plus the
+    /// solver binary's digest when *both* sides carry one, so a debug and a
+    /// release build of the same sha are not merged (review I2). A file
+    /// written before the field existed stays resumable.
     pub fn same_run(&self, other: &Fixture) -> bool {
-        self.sha == other.sha
+        let same_binary = match (&self.solver_md5, &other.solver_md5) {
+            (Some(a), Some(b)) => a == b,
+            _ => true,
+        };
+        same_binary
+            && self.sha == other.sha
             && self.timeout_s == other.timeout_s
             && self.mem_mb == other.mem_mb
             && self.jobs == other.jobs
@@ -97,6 +124,10 @@ pub struct Row {
     /// row so a `parse-error` can be told apart from a clean one later
     /// without re-running the corpus.
     pub stdout_errors: usize,
+    /// The first of those `(error …)` lines verbatim (≤512 B). The report
+    /// splits parse-error buckets on it; it is `None` on rows written before
+    /// the field existed and on rows that saw no stdout error.
+    pub first_error: Option<String>,
     pub fence: Option<String>,
     pub stderr_head: String,
     pub verdict: Verdict,
@@ -128,6 +159,10 @@ impl Row {
             Some(f) => json::escape(f),
             None => "null".to_string(),
         };
+        let first_error = match &self.first_error {
+            Some(e) => json::escape(e),
+            None => "null".to_string(),
+        };
         let oracle = match &self.oracle {
             Some(o) => format!(
                 "{{\"z3\":{},\"cvc5\":{}}}",
@@ -137,7 +172,7 @@ impl Row {
             None => "null".to_string(),
         };
         format!(
-            "{{\"path\":{},\"logic\":{},\"bytes\":{},\"status\":{},\"rc\":{},\"wall_ms\":{},\"answers\":{},\"stdout_errors\":{},\"fence\":{},\"stderr_head\":{},\"verdict\":{},\"oracle\":{}}}",
+            "{{\"path\":{},\"logic\":{},\"bytes\":{},\"status\":{},\"rc\":{},\"wall_ms\":{},\"answers\":{},\"stdout_errors\":{},\"first_error\":{},\"fence\":{},\"stderr_head\":{},\"verdict\":{},\"oracle\":{}}}",
             json::escape(&self.path),
             json::escape(&self.logic),
             self.bytes,
@@ -146,6 +181,7 @@ impl Row {
             self.wall_ms,
             answers,
             self.stdout_errors,
+            first_error,
             fence,
             json::escape(&self.stderr_head),
             json::escape(&self.verdict.key()),
@@ -201,6 +237,11 @@ impl Row {
             Some(JsonVal::Num(n)) => n as usize,
             _ => 0,
         };
+        // Absent in files written before the field existed.
+        let first_error = match get("first_error") {
+            Some(JsonVal::Str(s)) => Some(s),
+            _ => None,
+        };
         let fence = match get("fence") {
             Some(JsonVal::Str(s)) => Some(s),
             _ => None,
@@ -243,6 +284,7 @@ impl Row {
             wall_ms,
             answers,
             stdout_errors,
+            first_error,
             fence,
             stderr_head,
             verdict,
@@ -365,6 +407,8 @@ mod tests {
             memory_max: "34359738368".into(),
             corpus: "zenodo.11061097".into(),
             started: "2026-09-08T00:00:00Z".into(),
+            solver: Some("target/release/shinri".into()),
+            solver_md5: Some("d41d8cd98f00b204e9800998ecf8427e".into()),
         }
     }
 
@@ -378,6 +422,7 @@ mod tests {
             wall_ms: 12,
             answers: vec![Answer::Sat],
             stdout_errors: 3,
+            first_error: Some("(error \"sort error: Arity { expected: 2, found: 64 }\")".into()),
             fence: None,
             stderr_head: "line1\nline2\\".into(),
             verdict: Verdict::Unverified,
@@ -398,6 +443,7 @@ mod tests {
         assert_eq!(back.oracle, r.oracle);
         assert_eq!(back.answers, r.answers);
         assert_eq!(back.stdout_errors, r.stdout_errors);
+        assert_eq!(back.first_error, r.first_error);
     }
 
     #[test]
@@ -406,6 +452,7 @@ mod tests {
         let older = r#"{"path":"a.smt2","logic":"QF_UF","bytes":7,"status":null,"rc":0,"wall_ms":12,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"unverified","oracle":null}"#;
         let back = Row::from_json(older).expect("older rows stay readable");
         assert_eq!(back.stdout_errors, 0);
+        assert_eq!(back.first_error, None);
         assert_eq!(back.answers, vec![Answer::Sat]);
     }
 
@@ -415,6 +462,37 @@ mod tests {
         let back = Fixture::from_json(&f.to_json()).unwrap();
         assert!(f.same_run(&back));
         assert_eq!(back.started, f.started);
+        assert_eq!(back.solver.as_deref(), Some("target/release/shinri"));
+        assert_eq!(
+            back.solver_md5.as_deref(),
+            Some("d41d8cd98f00b204e9800998ecf8427e")
+        );
+    }
+
+    #[test]
+    fn same_run_tolerates_a_missing_digest_but_not_a_different_one() {
+        // The in-progress baseline's fixture line predates both fields; it
+        // must stay resumable against a fixture that now carries them.
+        let mut older = fixture();
+        older.solver = None;
+        older.solver_md5 = None;
+        assert!(older.same_run(&fixture()));
+        assert!(fixture().same_run(&older));
+        // Two different builds of the same sha are two different runs.
+        let mut other_build = fixture();
+        other_build.solver_md5 = Some("00000000000000000000000000000000".into());
+        assert!(!fixture().same_run(&other_build));
+    }
+
+    #[test]
+    fn a_fixture_without_a_solver_serialises_as_it_did_before_the_fields() {
+        let mut f = fixture();
+        f.solver = None;
+        f.solver_md5 = None;
+        assert!(!f.to_json().contains("solver"));
+        let back = Fixture::from_json(&f.to_json()).unwrap();
+        assert_eq!(back.solver, None);
+        assert_eq!(back.solver_md5, None);
     }
 
     #[test]

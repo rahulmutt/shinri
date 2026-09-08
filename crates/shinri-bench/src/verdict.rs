@@ -97,6 +97,8 @@ impl Verdict {
 
 /// What the runner observed about one solver invocation.
 pub struct Observed<'a> {
+    /// Shell-vocabulary status: the exit code, or `128 + signal` for a
+    /// signal death (see `process::Exec::rc`).
     pub rc: Option<i32>,
     /// process.rs sets this from rc 124/137 + elapsed.
     pub killed_by_timeout: bool,
@@ -111,26 +113,55 @@ pub struct Observed<'a> {
     pub stdout_errors: usize,
 }
 
+/// A signal death in the shell's `128 + n` vocabulary (`process::Exec::rc`).
+/// 129..=192 covers signals 1..=64.
+fn signal_of(rc: Option<i32>) -> Option<i32> {
+    match rc {
+        Some(rc) if (129..=192).contains(&rc) => Some(rc - 128),
+        _ => None,
+    }
+}
+
 pub fn classify(o: &Observed) -> Verdict {
     // 1. Timeout.
     if o.killed_by_timeout {
         return Verdict::Timeout;
     }
-    // 2. Panic.
-    if o.rc == Some(101) || o.stderr.contains("panicked at") {
+    // 2. Panic — including the two crashes that abort without unwinding, so
+    //    print no `panicked at` line and die on SIGABRT (rc 134): a stack
+    //    overflow and any other `fatal runtime error`. Both are hard
+    //    blockers, not perf (slice 46 review C1).
+    if o.rc == Some(101)
+        || o.stderr.contains("panicked at")
+        || o.stderr.contains("has overflowed its stack")
+        || o.stderr.contains("fatal runtime error")
+    {
         return Verdict::Panic;
     }
     // 3. Oom. A read-time allocation failure surfaces as a plain
-    //    `error: out of memory` on stderr with rc 2, which rule 4 would
-    //    otherwise misfile as a parse error.
+    //    `error: out of memory` on stderr with rc 2, which rule 5 would
+    //    otherwise misfile as a parse error. rc 134 (SIGABRT) without any
+    //    panic text is Rust's allocation-failure abort; rc 137 (SIGKILL)
+    //    *before* the budget elapsed is plausibly the cgroup OOM killer —
+    //    at or after the budget `killed_by_timeout` already caught it.
     if (o.stderr.contains("memory allocation of") && o.stderr.contains("failed"))
         || o.stderr.to_ascii_lowercase().contains("out of memory")
         || o.rc == Some(134)
-        || o.rc.is_none()
+        || (o.rc == Some(137) && !o.killed_by_timeout)
     {
         return Verdict::Oom;
     }
-    // 4. ParseError. Spec §5: an `(error …)` line on stdout before the
+    // 4. Any other signal death. Never `Oom` without evidence and never
+    //    `Panic` without a panic: an unattributed crash is recorded as
+    //    malformed so it is ranked as a harness/solver anomaly rather than
+    //    silently counted as perf.
+    if let Some(sig) = signal_of(o.rc) {
+        return Verdict::Malformed(format!("signal={sig}"));
+    }
+    if o.rc.is_none() {
+        return Verdict::Malformed("signal".to_string());
+    }
+    // 5. ParseError. Spec §5: an `(error …)` line on stdout before the
     //    first answer, with no qualifier about what follows it. A CLI that
     //    reports a sort error, drops the offending assertions and then
     //    answers `sat` answered a *different* problem — that is a parse
@@ -139,16 +170,16 @@ pub fn classify(o: &Observed) -> Verdict {
     if o.stdout_errors > 0 || o.rc == Some(2) {
         return Verdict::ParseError;
     }
-    // 5. Malformed answer count.
+    // 6. Malformed answer count.
     if o.answers.len() != 1 {
         return Verdict::Malformed(format!("answers={}", o.answers.len()));
     }
     let a = o.answers[0];
-    // 6. Unknown answer.
+    // 7. Unknown answer.
     if a == Answer::Unknown {
         return Verdict::Unknown(o.fence.unwrap_or("-").to_string());
     }
-    // 7. Decided answer.
+    // 8. Decided answer.
     match o.status {
         None | Some(Answer::Unknown) => classify_decided_no_status(a, o.oracle),
         Some(s) if s == a => Verdict::Correct,
@@ -353,16 +384,63 @@ mod tests {
     }
     #[test]
     fn allocation_failure_is_oom() {
+        // The live shape: SIGABRT (rc 134) plus Rust's allocation message.
         assert_eq!(
             classify(&obs(
                 Some(134),
                 &[],
-                "memory allocation of 4294967296 bytes failed",
+                "memory allocation of 268435456 bytes failed\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n",
                 None
             )),
             Verdict::Oom
         );
-        assert_eq!(classify(&obs(None, &[], "", None)), Verdict::Oom); // SIGKILL before the limit
+        // Was `Oom` before slice 46's review C1: an rc the harness cannot
+        // attribute is not evidence of memory pressure, so it must not be
+        // ranked as perf.
+        assert_eq!(
+            classify(&obs(None, &[], "", None)),
+            Verdict::Malformed("signal".into())
+        );
+    }
+    #[test]
+    fn stack_overflow_is_a_panic_not_an_oom() {
+        // The live shape (18 rows in the first baseline): an abort with no
+        // `panicked at` line and no allocation text.
+        assert_eq!(
+            classify(&obs(
+                Some(134),
+                &[],
+                "\nthread 'main' (3691292) has overflowed its stack\nfatal runtime error: stack overflow, aborting\n",
+                Some(Unsat)
+            )),
+            Verdict::Panic
+        );
+    }
+    #[test]
+    fn sigkill_before_the_budget_is_oom() {
+        // The cgroup OOM killer: SIGKILL, no stderr, budget not elapsed.
+        assert_eq!(classify(&obs(Some(137), &[], "", None)), Verdict::Oom);
+    }
+    #[test]
+    fn sigkill_at_the_budget_is_a_timeout() {
+        let mut ob = obs(Some(137), &[], "", None);
+        ob.killed_by_timeout = true;
+        assert_eq!(classify(&ob), Verdict::Timeout);
+    }
+    #[test]
+    fn an_unattributed_signal_is_malformed() {
+        assert_eq!(
+            classify(&obs(Some(139), &[], "", None)),
+            Verdict::Malformed("signal=11".into())
+        );
+        assert_eq!(
+            classify(&obs(Some(135), &[], "", Some(Sat))),
+            Verdict::Malformed("signal=7".into())
+        );
+    }
+    #[test]
+    fn rc_two_alone_is_a_parse_error() {
+        assert_eq!(classify(&obs(Some(2), &[], "", None)), Verdict::ParseError);
     }
     #[test]
     fn read_failure_out_of_memory_is_oom() {

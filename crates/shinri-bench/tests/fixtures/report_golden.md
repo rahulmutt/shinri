@@ -6,6 +6,8 @@
 | --- | --- |
 | sha | 0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c |
 | version | shinri 0.1.0 |
+| solver | target/release/shinri |
+| solver_md5 | 9e107d9d372bb6826bd81d3542a419d6 |
 | timeout_s | 20 |
 | mem_mb | 3072 |
 | jobs | 6 |
@@ -35,7 +37,7 @@ QF_BV: 2, QF_LRA: 2
 - `QF_LRA/sc/lra-to03.smt2` (6000 bytes)
 - `QF_BV/core/bv-to02.smt2` (7000 bytes)
 
-### parse-error:(error S) — 3
+### parse-error:sort error: Arity { expected: N, found: N } — 3
 
 QF_LRA: 3
 
@@ -63,13 +65,13 @@ QF_BV: 1
 
 - `QF_BV/core/bv-oom01.smt2` (9000 bytes)
 
-### panic:thread 'main' panicked at crates/shinri-bv/src/blast.rs:N:N: — 1
+### panic:crates/shinri-bv/src/blast/mod.rs: internal error: entered unreachable code: non-BV builtin reached blast_word — 1
 
 QF_BV: 1
 
 - `QF_BV/core/bv-panic01.smt2` (250 bytes)
 
-### parse-error:line N: unexpected token S — 1
+### parse-error:invalid BV numeral suffix `N` — 1
 
 QF_LRA: 1
 
