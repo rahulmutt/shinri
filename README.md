@@ -26,6 +26,9 @@ Defined in `mise.toml` (CI runs these same tasks — they cannot drift):
 | `mise run test-full` | full suite including exhaustive/slow tests (nightly tier) |
 | `mise run fuzz-smoke` | short libFuzzer run per fuzz target (`FUZZ_SECONDS` overrides 60s) |
 | `mise run mutants` | mutation-test one crate (`MUTANTS_PACKAGE=shinri-num mise run mutants`) |
+| `mise run bench-fetch` | download + verify the pinned SMT-LIB 2024 corpus into `bench/corpus` (`BENCH_LOGICS`, `BENCH_MIRROR`) |
+| `mise run bench-run` | benchmark shinri over `bench/corpus` (`BENCH_LOGICS`, `BENCH_TIMEOUT`, `BENCH_MEM_MB`, `BENCH_JOBS`, `BENCH_RUN_ID`) |
+| `mise run bench-report` | render `bench/results/$BENCH_RUN_ID/report.md` |
 | `mise run ci` | everything the blocking CI tier runs |
 
 ## Test tiers
@@ -65,5 +68,6 @@ Dependency-ordered, foundations first:
 | `shinri-parser` | SMT-LIB 2.6 frontend: lexer + recursive descent |
 | `shinri-frontend` | neutral SMT-LIB command IR (parser → solver bridge) |
 | `shinri-cli` | command-line binary |
+| `shinri-bench` | SMT-LIB corpus benchmark harness (fetch / run / rerun / report) |
 
 Agent contributors: see [AGENTS.md](AGENTS.md).

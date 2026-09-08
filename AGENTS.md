@@ -21,6 +21,9 @@ tasks, so never duplicate their command lines elsewhere.
   report that as green coverage.
 - `mise run test-full` is the local equivalent of the nightly tier
   (~1 h: the div exhaustive alone is ~54 min).
+- `bench-*` tasks are manual (never in `ci`); the corpus lives in
+  git-ignored `bench/corpus/`; the baseline report is in
+  `docs/superpowers/research/`.
 - nextest filters: use the expression form `-E 'test(<name>)'`, not a
   positional `mod::name` filter — it matches nothing on the pinned nextest
   0.9.140. To select a whole integration-test binary use
