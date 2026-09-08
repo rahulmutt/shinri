@@ -241,6 +241,27 @@ fn locate_logic_tree(staging: &Path, logic: &str) -> Result<PathBuf, String> {
     ))
 }
 
+/// Move the freshly extracted `found` tree into its final `logic_dir`
+/// location, replacing whatever tree is already there.
+///
+/// Safe to call unconditionally (i.e. even if `logic_dir` exists): by the
+/// time `fetch_one` reaches this call, its skip check at the top has
+/// already established that the archive we just downloaded and extracted
+/// does *not* match `logic_dir`'s current `.verified` — either
+/// `.verified` is absent (nothing has been verified there, e.g. a
+/// half-extracted tree from a killed run), or its content doesn't equal
+/// `archive.md5` (a previously verified tree whose pinned md5 has since
+/// been superseded). Either way, whatever is at `logic_dir` right now
+/// must not survive this move.
+fn relocate_logic_tree(found: &Path, logic_dir: &Path) -> Result<(), String> {
+    if logic_dir.exists() {
+        fs::remove_dir_all(logic_dir)
+            .map_err(|e| format!("removing stale {}: {e}", logic_dir.display()))?;
+    }
+    fs::rename(found, logic_dir)
+        .map_err(|e| format!("moving {} to {}: {e}", found.display(), logic_dir.display()))
+}
+
 /// The archive's on-disk file name, as published in the manifest (e.g.
 /// `QF_AX.tar.zst`), recovered from `url` (`.../<file>/content`).
 fn archive_filename(url: &str) -> &str {
@@ -388,17 +409,7 @@ fn fetch_one(
 
     let found = locate_logic_tree(&staging, logic)?;
 
-    // A half-extracted tree at the final `<corpus>/<logic>` location from
-    // a previously killed run must not survive the move — but only when
-    // it isn't already known good (`.verified` present, which also means
-    // we'd have skipped above; this covers the case where a stale
-    // `.verified` had a different, now-superseded md5).
-    if logic_dir.exists() && !verified_path.exists() {
-        fs::remove_dir_all(&logic_dir)
-            .map_err(|e| format!("removing stale {}: {e}", logic_dir.display()))?;
-    }
-    fs::rename(&found, &logic_dir)
-        .map_err(|e| format!("moving {} to {}: {e}", found.display(), logic_dir.display()))?;
+    relocate_logic_tree(&found, &logic_dir)?;
     if let Err(e) = fs::remove_dir_all(&staging) {
         eprintln!(
             "{logic}: warning: failed to remove staging dir {}: {e}",
@@ -516,6 +527,40 @@ mod tests {
         assert!(err.contains("QF_X"));
         assert!(err.contains("some_other_dir"));
         fs::remove_dir_all(&staging).unwrap();
+    }
+
+    #[test]
+    fn relocate_logic_tree_replaces_a_stale_tree_with_a_different_verified_md5() {
+        let root =
+            std::env::temp_dir().join(format!("shinri-bench-relocate-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let found = root.join("staging").join("QF_X");
+        let logic_dir = root.join("corpus").join("QF_X");
+
+        // The freshly extracted tree, about to be moved into place.
+        fs::create_dir_all(&found).unwrap();
+        fs::write(found.join("new.smt2"), b"(check-sat)").unwrap();
+
+        // A stale tree already at the destination, verified against an
+        // md5 that has since been superseded by a re-pin in the manifest
+        // — this is exactly the ENOTEMPTY-repro scenario from the R10
+        // follow-up review: `.verified` exists, but for the wrong md5.
+        fs::create_dir_all(&logic_dir).unwrap();
+        fs::write(logic_dir.join("old.smt2"), b"(check-sat)").unwrap();
+        fs::write(
+            logic_dir.join(".verified"),
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+        )
+        .unwrap();
+
+        relocate_logic_tree(&found, &logic_dir).unwrap();
+
+        assert!(logic_dir.join("new.smt2").is_file());
+        assert!(!logic_dir.join("old.smt2").exists());
+        assert!(!logic_dir.join(".verified").exists());
+        assert!(!found.exists());
+
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
