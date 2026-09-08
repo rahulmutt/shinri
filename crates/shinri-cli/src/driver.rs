@@ -59,6 +59,7 @@ impl OutChannel {
 pub struct Presentation {
     pub print_success: bool,
     pub regular: OutChannel,
+    pub stats: bool,
 }
 
 impl Default for Presentation {
@@ -66,6 +67,7 @@ impl Default for Presentation {
         Presentation {
             print_success: true,
             regular: OutChannel::Stdout,
+            stats: false,
         }
     }
 }
@@ -94,6 +96,13 @@ impl Driver {
             parser: StreamingParser::new(),
             pres: Presentation::default(),
         }
+    }
+
+    /// A driver with `--stats` reporting enabled or disabled.
+    pub fn with_stats(stats: bool) -> Driver {
+        let mut driver = Driver::new();
+        driver.pres.stats = stats;
+        driver
     }
 
     /// Feed a chunk and execute every complete command it completes.
@@ -141,7 +150,23 @@ impl Driver {
         }
 
         let exiting = matches!(cmd, Command::Exit);
-        match self.solver.execute(cmd) {
+        let is_check_sat = matches!(cmd, Command::CheckSat);
+        let started = std::time::Instant::now();
+        let resp = self.solver.execute(cmd);
+        if self.pres.stats && is_check_sat {
+            let outcome = match &resp {
+                CommandResponse::Sat => "sat",
+                CommandResponse::Unsat => "unsat",
+                _ => "unknown",
+            };
+            eprintln!(
+                "stats: cmd=check-sat wall_ms={} outcome={} fence={}",
+                started.elapsed().as_millis(),
+                outcome,
+                self.solver.last_fence().unwrap_or("-")
+            );
+        }
+        match resp {
             CommandResponse::None => self.success()?,
             CommandResponse::Sat => self.pres.regular.write_line("sat")?,
             CommandResponse::Unsat => self.pres.regular.write_line("unsat")?,

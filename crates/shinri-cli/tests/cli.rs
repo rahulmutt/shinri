@@ -143,3 +143,92 @@ fn streaming_agrees_with_known_oracle_scripts() {
         assert_eq!(code, Some(0));
     }
 }
+
+/// Run with extra args and stdin; return (stdout, stderr, code).
+fn run_with(args: &[&str], stdin_text: &str) -> (String, String, Option<i32>) {
+    let mut child = bin()
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(stdin_text.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    (
+        String::from_utf8(out.stdout).unwrap(),
+        String::from_utf8(out.stderr).unwrap(),
+        out.status.code(),
+    )
+}
+
+const SAT_SCRIPT: &str = "(set-option :print-success false)\
+(set-logic QF_LRA)(declare-fun x () Real)(assert (> x 0.0))(check-sat)";
+
+const FENCED_SCRIPT: &str = "(set-option :print-success false)\
+(set-logic QF_S)(declare-fun a () String)(declare-fun b () String)\
+(assert (str.< a b))(check-sat)";
+
+#[test]
+fn stats_line_shape_on_sat() {
+    let (stdout, stderr, code) = run_with(&["--stats"], SAT_SCRIPT);
+    assert_eq!(stdout, "sat\n");
+    assert_eq!(code, Some(0));
+    let lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with("stats:")).collect();
+    assert_eq!(lines.len(), 1, "stderr: {stderr:?}");
+    let fields: Vec<&str> = lines[0].split(' ').collect();
+    assert_eq!(fields[0], "stats:");
+    assert_eq!(fields[1], "cmd=check-sat");
+    assert!(fields[2].starts_with("wall_ms="));
+    fields[2]["wall_ms=".len()..].parse::<u64>().unwrap();
+    assert_eq!(fields[3], "outcome=sat");
+    assert_eq!(fields[4], "fence=-");
+    assert_eq!(fields.len(), 5);
+}
+
+#[test]
+fn stats_line_names_the_fence_on_unknown() {
+    let (stdout, stderr, _) = run_with(&["--stats"], FENCED_SCRIPT);
+    assert_eq!(stdout, "unknown\n");
+    assert!(
+        stderr.contains("outcome=unknown fence=str-order"),
+        "stderr: {stderr:?}"
+    );
+}
+
+#[test]
+fn stats_does_not_change_stdout() {
+    for script in [SAT_SCRIPT, FENCED_SCRIPT, UNSAT_SCRIPT] {
+        let (plain, _, _) = run_with(&[], script);
+        let (with, stderr, _) = run_with(&["--stats"], script);
+        assert_eq!(plain, with);
+        assert_eq!(
+            stderr.lines().filter(|l| l.starts_with("stats:")).count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn no_stats_line_without_the_flag() {
+    let (_, stderr, _) = run_with(&[], SAT_SCRIPT);
+    assert!(!stderr.contains("stats:"));
+}
+
+#[test]
+fn stats_one_line_per_check_sat() {
+    let (_, stderr, _) = run_with(
+        &["--stats"],
+        "(set-option :print-success false)(set-logic QF_LRA)(declare-fun x () Real)\
+         (push 1)(assert (> x 0.0))(check-sat)(pop 1)(assert (< x 0.0))(check-sat)",
+    );
+    assert_eq!(
+        stderr.lines().filter(|l| l.starts_with("stats:")).count(),
+        2
+    );
+}

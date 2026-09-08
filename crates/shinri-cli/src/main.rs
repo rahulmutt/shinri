@@ -15,7 +15,7 @@ fn main() -> ExitCode {
             println!("shinri {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
-        Ok(args::Invocation::Run { input }) => run(input),
+        Ok(args::Invocation::Run { input, stats }) => run(input, stats),
         Err(e) => {
             let msg = match e {
                 args::ArgError::Unknown(a) => format!("error: unknown argument '{a}'"),
@@ -27,8 +27,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(input: args::Input) -> ExitCode {
-    let mut driver = driver::Driver::new();
+fn run(input: args::Input, stats: bool) -> ExitCode {
+    let mut driver = driver::Driver::with_stats(stats);
     let result = match input {
         args::Input::File(path) => run_file(&mut driver, &path),
         args::Input::Stdin => run_stdin(&mut driver),
