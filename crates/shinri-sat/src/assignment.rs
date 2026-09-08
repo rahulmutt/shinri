@@ -98,12 +98,8 @@ impl Assignment {
     /// Clear every variable to Unset / level 0, preserving the variable count
     /// and saved phases (used by the conservative push/pop rebuild).
     pub fn reset(&mut self) {
-        for v in &mut self.value {
-            *v = LBool::Unset;
-        }
-        for l in &mut self.level {
-            *l = 0;
-        }
+        self.value.fill(LBool::Unset);
+        self.level.fill(0);
     }
 }
 
