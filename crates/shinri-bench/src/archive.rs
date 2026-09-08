@@ -206,13 +206,19 @@ fn parse_pax_path(body: &[u8]) -> io::Result<Option<String>> {
         let rec_len: usize = len_str.parse().map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidData, "malformed pax record length")
         })?;
-        if rec_len == 0 || digit_start + rec_len > body.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "malformed pax record: length out of range",
-            ));
-        }
-        let record_end = digit_start + rec_len;
+        // `rec_len` comes from archive-controlled digits and can parse to
+        // a huge value (e.g. near `usize::MAX`) while still being
+        // "well-formed" text — use checked arithmetic so that case is a
+        // rejected record, not an overflow panic under debug/test builds.
+        let record_end = match digit_start.checked_add(rec_len) {
+            Some(end) if rec_len > 0 && end <= body.len() => end,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "malformed pax record: length out of range",
+                ));
+            }
+        };
         // Record shape is "<len> key=value\n"; `pos` is right after the
         // digits, so `pos + 1` skips the single space separator.
         let kv_start = pos + 1;
@@ -652,6 +658,18 @@ mod tests {
         assert_ne!(truncated, long);
         assert!(!dest.join(&truncated).exists());
         std::fs::remove_dir_all(dest).unwrap();
+    }
+
+    #[test]
+    fn parse_pax_path_rejects_huge_record_length_without_overflow_panic() {
+        // Re-review reproduction: a well-formed leading record ("6 a=1\n"),
+        // then a second record whose decimal length is u64::MAX — parses
+        // fine as a usize but `digit_start + rec_len` overflows under
+        // debug/test `overflow-checks = true` unless the addition is
+        // checked. Must reject the record, not panic.
+        let body = b"6 a=1\n18446744073709551615 path=x\n";
+        let result = parse_pax_path(body);
+        assert!(result.is_err(), "expected Err, got {result:?}");
     }
 
     #[test]
