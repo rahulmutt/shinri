@@ -124,6 +124,12 @@ pub struct Solver {
     /// occurring in no assertion has no model data either, and defaulting it is
     /// exactly what §1 defect 3 asks for.
     last_outcome: Option<SolveOutcome>,
+    /// Slice 46: which fence produced the most recent `Unknown`, as a short
+    /// stable tag (see the tag table in the slice-46 plan). `None` whenever
+    /// the last `check_sat` decided, or nothing has been solved yet. Read by
+    /// `shinri-cli --stats` so a benchmark run can attribute every `unknown`
+    /// to the guard that raised it.
+    last_fence: Option<&'static str>,
 }
 
 /// One user-declared function. `arity == 0` entries are the ones `get-model`
@@ -242,6 +248,7 @@ impl Solver {
             special_reals: rustc_hash::FxHashMap::default(),
             theory_guard_bailouts: 0,
             last_outcome: None,
+            last_fence: None,
         }
     }
 
@@ -393,6 +400,11 @@ impl Solver {
     /// oracle to compare the cuts-on solver against the B1 baseline.
     pub fn set_stage_b(&mut self, on: bool) {
         self.stage_b = on;
+    }
+
+    /// The fence tag behind the most recent `Unknown` (slice 46), or `None`.
+    pub fn last_fence(&self) -> Option<&'static str> {
+        self.last_fence
     }
 
     /// Execute one IR command and return the response.
@@ -722,6 +734,7 @@ impl Solver {
     /// too. Wrapping is the only way to catch them all without touching each
     /// return site.
     pub fn check_sat(&mut self) -> SolveOutcome {
+        self.last_fence = None;
         let outcome = self.check_sat_inner();
         self.last_outcome = Some(outcome);
         outcome
@@ -763,6 +776,7 @@ impl Solver {
         // fragment even if the symbol never appears in an assertion — RegLan
         // must never reach model construction. Sound Unknown.
         if self.ctx.any_fun_sig_mentions(self.ctx.reglan_sort()) {
+            self.last_fence = Some("reglan-decl");
             return SolveOutcome::Unknown;
         }
 
@@ -785,6 +799,7 @@ impl Solver {
         let mut int_conv_repairs: Vec<shinri_str::int_conv::IntConvRepair> = Vec::new();
         if crate::string_stage::uses_strings(&self.ctx, &assertions) {
             if crate::string_stage::fenced(&self.ctx, &assertions) {
+                self.last_fence = Some("str-fenced");
                 return SolveOutcome::Unknown;
             }
             // ── Slice 12: string predicates (prefixof/suffixof/contains) ──────
@@ -810,9 +825,11 @@ impl Solver {
                 &assertions,
             );
             if shinri_str::indexof_replace::has_unreduced_indexof_replace(&self.ctx, &assertions) {
+                self.last_fence = Some("str-indexof-replace");
                 return SolveOutcome::Unknown;
             }
             if shinri_str::predicates::has_unrewritable_str_predicate(&self.ctx, &assertions) {
+                self.last_fence = Some("str-predicate-polarity");
                 return SolveOutcome::Unknown;
             }
             // ── Slice 15 + 17: str.to_int / str.from_int ─────────────────────
@@ -833,6 +850,7 @@ impl Solver {
             assertions = decided;
             int_conv_repairs = repairs;
             if shinri_str::int_conv::has_unreduced_int_conv(&self.ctx, &assertions) {
+                self.last_fence = Some("str-int-conv");
                 return SolveOutcome::Unknown;
             }
             // ── Slice 18: str.to_code / str.from_code / str.is_digit ─────────
@@ -845,6 +863,7 @@ impl Solver {
             // points — see the module docs) fences to sound Unknown.
             assertions = shinri_str::code_conv::rewrite_code_conv(&mut self.ctx, &assertions);
             if shinri_str::code_conv::has_unreduced_code_conv(&self.ctx, &assertions) {
+                self.last_fence = Some("str-code-conv");
                 return SolveOutcome::Unknown;
             }
             // ── Slice 23: str.< / str.<= lexicographic ordering ──────────────
@@ -855,6 +874,7 @@ impl Solver {
             // sound Unknown.
             assertions = shinri_str::order::rewrite_str_order(&mut self.ctx, &assertions);
             if shinri_str::order::has_unreduced_str_order(&self.ctx, &assertions) {
+                self.last_fence = Some("str-order");
                 return SolveOutcome::Unknown;
             }
             // ── Slices 19–21: RegLan + str.in_re ─────────────────────────────
@@ -867,6 +887,7 @@ impl Solver {
             // DECLARING RegLan symbols were already fenced after word_norm.
             assertions = shinri_str::regex::rewrite_ground_in_re(&mut self.ctx, &assertions);
             if shinri_str::regex::has_unsupported_regex(&self.ctx, &assertions) {
+                self.last_fence = Some("str-regex");
                 return SolveOutcome::Unknown;
             }
             // Soundness fence for the substr/str.at seam: a `str.substr`/`str.at`
@@ -883,6 +904,7 @@ impl Solver {
                 .iter()
                 .any(|&a| shinri_str::reduce::has_unfoldable_substr_or_at(&self.ctx, a))
             {
+                self.last_fence = Some("str-substr-at");
                 return SolveOutcome::Unknown;
             }
             // Not fenced: rewrite positive-only predicate atoms to existential
@@ -901,6 +923,7 @@ impl Solver {
         // scope → fence → Unknown. (Model stashing is Task 11; SAT just returns Sat.)
         if crate::abv_stage::uses_arrays_over_bv(&self.ctx, &assertions) {
             if crate::abv_stage::fenced(&self.ctx, &assertions) {
+                self.last_fence = Some("abv-fenced");
                 return SolveOutcome::Unknown;
             }
             // Fence 1 (slice 44 §4). `abv_stage` builds its own
@@ -908,6 +931,7 @@ impl Solver {
             // atom collection, so pass `assertions` (a superset) rather than a
             // collected atom set — the conservative bias this stage keeps.
             if !crate::bv_stage::uf_args_supported(&self.ctx, &assertions, false) {
+                self.last_fence = Some("abv-uf-args");
                 return SolveOutcome::Unknown;
             }
             // Fence 2 (slice 44 §4). `abv_stage` does its own atom collection
@@ -915,6 +939,7 @@ impl Solver {
             if crate::bv_stage::uf_congruence_cost(&self.ctx, &assertions)
                 > crate::bv_stage::UF_CONGRUENCE_BUDGET
             {
+                self.last_fence = Some("abv-uf-budget");
                 return SolveOutcome::Unknown;
             }
             let assertions_owned = assertions.clone();
@@ -950,7 +975,10 @@ impl Solver {
             return match outcome {
                 shinri_abv::AbvOutcome::Sat => SolveOutcome::Sat,
                 shinri_abv::AbvOutcome::Unsat => SolveOutcome::Unsat,
-                shinri_abv::AbvOutcome::Unknown => SolveOutcome::Unknown,
+                shinri_abv::AbvOutcome::Unknown => {
+                    self.last_fence = Some("abv-engine");
+                    SolveOutcome::Unknown
+                }
             };
         }
 
@@ -997,6 +1025,7 @@ impl Solver {
         // operand is left unconstrained.
         let bridge = admissible;
         if uses_fp && !bridge && crate::fp_stage::uses_crossing_conversion(&self.ctx, &assertions) {
+            self.last_fence = Some("fp-crossing-conversion");
             return SolveOutcome::Unknown;
         }
 
@@ -1007,11 +1036,13 @@ impl Solver {
         let lowered_bv: Option<shinri_bv::Lowered> = if uses_bv && !uses_fp {
             let bv_atoms = crate::bv_stage::collect_bv_atoms(&self.ctx, &assertions);
             if crate::bv_stage::has_non_bv_theory_atom(&self.ctx, &assertions, &bv_atoms) {
+                self.last_fence = Some("bv-non-bv-atom");
                 return SolveOutcome::Unknown;
             }
             // Fence 1 (slice 44 §4): no FP sink on this path, so FP-sorted
             // arguments are not admitted either.
             if !crate::bv_stage::uf_args_supported(&self.ctx, &bv_atoms, false) {
+                self.last_fence = Some("bv-uf-args");
                 return SolveOutcome::Unknown;
             }
             // Fence 2 (slice 44 §4). The Ackermann congruence encoding is
@@ -1020,6 +1051,7 @@ impl Solver {
             if crate::bv_stage::uf_congruence_cost(&self.ctx, &bv_atoms)
                 > crate::bv_stage::UF_CONGRUENCE_BUDGET
             {
+                self.last_fence = Some("bv-uf-budget");
                 return SolveOutcome::Unknown;
             }
             Some(shinri_bv::lower(&mut self.ctx, &bv_atoms))
@@ -1063,6 +1095,7 @@ impl Solver {
                     &bv_atoms,
                 )
             {
+                self.last_fence = Some("fp-non-bvfp-atom");
                 return SolveOutcome::Unknown;
             }
             // Positive-enumeration safety: every FP atom's word must be a
@@ -1072,12 +1105,14 @@ impl Solver {
             // is no longer a live example here: word_norm (slice 5)
             // eliminates it before atom collection ever runs.
             if !crate::fp_stage::fp_atoms_fully_supported(&self.ctx, &fp_atoms) {
+                self.last_fence = Some("fp-atoms-unsupported");
                 return SolveOutcome::Unknown;
             }
             // Slice 4e: BV atoms can now embed FP subterms (fp.to_ubv/
             // fp.to_sbv). Any unsupported FP shape reachable through a BV
             // atom must fence BEFORE lowering, same argument as above.
             if !crate::fp_stage::bv_atoms_fp_supported(&self.ctx, &bv_atoms) {
+                self.last_fence = Some("fp-bv-atoms-unsupported");
                 return SolveOutcome::Unknown;
             }
             // Fence 1 (slice 44 §4). `allow_fp_args` is true here: the Lowerer's
@@ -1093,12 +1128,14 @@ impl Solver {
             // `allow_fp_args` to each, which would fence valid queries.
             let uf_atoms: Vec<TermId> = fp_atoms.iter().chain(bv_atoms.iter()).copied().collect();
             if !crate::bv_stage::uf_args_supported(&self.ctx, &uf_atoms, true) {
+                self.last_fence = Some("fpbv-uf-args");
                 return SolveOutcome::Unknown;
             }
             // Fence 2 (slice 44 §4), same budget as the pure-BV path above.
             if crate::bv_stage::uf_congruence_cost(&self.ctx, &uf_atoms)
                 > crate::bv_stage::UF_CONGRUENCE_BUDGET
             {
+                self.last_fence = Some("fpbv-uf-budget");
                 return SolveOutcome::Unknown;
             }
             Some(shinri_fp::lower_mixed(&mut self.ctx, &fp_atoms, &bv_atoms))
@@ -1267,13 +1304,23 @@ impl Solver {
         }
 
         if refused || mixed || lira {
+            self.last_fence = Some(if refused {
+                "theory-refused"
+            } else if mixed {
+                "theory-mixed-sort"
+            } else {
+                "theory-lira"
+            });
             return SolveOutcome::Unknown;
         }
 
         let solve_result = sat.solve();
         self.theory_guard_bailouts += sat.theory_guard_bailouts();
         match solve_result {
-            SolveResult::Unknown => SolveOutcome::Unknown,
+            SolveResult::Unknown => {
+                self.last_fence = Some("sat-budget");
+                SolveOutcome::Unknown
+            }
             SolveResult::Unsat { .. } => SolveOutcome::Unsat,
             SolveResult::Sat => {
                 let mb = sat.theory_mut().build_model();
@@ -1424,6 +1471,7 @@ impl Solver {
                 // rather than report a wrong SAT. Only runs on the string path and
                 // only over fully string-valued atoms (no overhead elsewhere).
                 if on_string_path && !self.string_model_satisfies(&lowered, &model) {
+                    self.last_fence = Some("str-model-rejected");
                     return SolveOutcome::Unknown;
                 }
                 self.last_model = Some(model);

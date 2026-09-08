@@ -129,6 +129,9 @@ where the tag is a short `&'static str` naming the predicate
 change; no existing test can observe the difference. A public
 `Solver::last_fence(&self) -> Option<&'static str>` exposes it.
 
+As built: 25 sites, not twelve — the count in the design was the string-path
+range only. Tags are enumerated in the plan's Task 1 table.
+
 `shinri-cli` gains `--stats`. After every `check-sat` response it writes one
 line to **stderr**:
 
