@@ -1,6 +1,6 @@
 # Slice 46 — SMT-LIB benchmark harness and the 2024 baseline
 
-**Status:** approved design, not yet implemented
+**Status:** approved design; plan written (`docs/superpowers/plans/2026-09-08-shinri-slice46-smtlib-bench-harness.md`)
 **Date:** 2026-09-08
 **Area:** new crate `shinri-bench` (workspace binary); `shinri-cli` gains a
 `--stats` flag; `shinri-solver` records which `Unknown` fence fired; three new
@@ -12,6 +12,24 @@ dependency, no change to the blocking CI tier.
 the official corpus. Slices 1–45 were each driven by hand-written probe
 queries and the z3/cvc5 oracle generators; this slice replaces "what should we
 build next?" guesswork with a ranked, reproducible gap list.
+
+> **As-built deltas (recorded 2026-09-08, before implementation, from the
+> plan's research):**
+>
+> 1. **md5, not sha256.** Zenodo publishes an md5 per file
+>    (`files[].checksum`), so `bench/manifest.toml` stores md5 and `fetch`
+>    verifies with coreutils `md5sum` instead of an in-crate sha256 (§4.1).
+> 2. **In-process zstd, not `tar --zstd`.** The pod has no `zstd` binary and
+>    mise cannot provide one (facebook/zstd ships no Linux release binaries),
+>    so `shinri-bench` decodes with the pure-Rust `ruzstd 0.9.0` crate
+>    (MIT, `default-features = false`) and a hand-rolled ustar reader. This
+>    is the one dependency in the tooling crate; solver crates stay at zero
+>    (§3).
+> 3. **25 fence sites, not twelve.** The design counted the string-path
+>    range only; the plan's Task 1 table enumerates every
+>    `SolveOutcome::Unknown` site in `check_sat_inner` (§3.1).
+> 4. **Zenodo record pinned:** `10.5281/zenodo.11061097`, version
+>    2024.04.23 — reachable again after the design-time 504s.
 
 ## 1. Summary
 
