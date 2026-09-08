@@ -225,6 +225,17 @@ One JSON object per line, hand-serialised; all strings escaped per RFC 8259.
   `sat`/`unsat`/`unknown`/`timeout`; only present when consulted.
 - `verdict`: §5, lower-case with the fence tag folded into `unknown:<tag>`.
 
+> **As built.** Two fields were added to the row: `stdout_errors` (count of
+> `(error …` stdout lines seen before the first answer) and `first_error`
+> (the first such line, truncated to ≤512 bytes, or `null` when none was
+> seen). Readers default both when absent, so results files written before
+> the fields existed stay readable. The fixture object also gained two
+> optional fields: `solver` (the resolved `--solver` path) and `solver_md5`
+> (`md5sum` of that binary); `Fixture::same_run` additionally requires equal
+> `solver_md5` when *both* sides carry one, so a debug and a release build of
+> the same repo sha are not merged into one results file — a file written
+> before the fields existed stays resumable.
+
 The first line of the file is the fixture object: `{"fixture":{…}}`.
 
 ## 5. Adjudication and verdicts
@@ -247,6 +258,24 @@ answers.
 | `Unverified` | decided, `:status` absent/`unknown`, z3 (and cvc5) timed out or answered `unknown` | flagged, **not** counted as correct |
 | `Malformed` | `answers.len() ≠ 1` and none of the above, file unreadable, spawn failure, invalid UTF-8 output | excluded from rates |
 
+> **As built.** The harness never sees a raw shell exit code for a signal
+> death: `timeout` re-raises the child's own fatal signal on itself when it
+> did not time out, so `process.rs` recovers the signal and reports
+> `rc = 128 + signal` (134 = SIGABRT, 137 = SIGKILL) — that is the vocabulary
+> the table's rc entries above are read in. `Panic` also fires on stderr
+> `has overflowed its stack` / `fatal runtime error`, because a Rust stack
+> overflow aborts with rc 134 and no `panicked at` line — it is a crash, not
+> memory pressure, and must not fall into `Oom`. `Oom` also fires on stderr
+> `out of memory` (the CLI's read-time allocation failure under `prlimit`,
+> rc 2) and on SIGKILL observed before the wall budget elapsed; any other
+> signal death that matches neither is `Malformed("signal=N")` and is never
+> counted as perf. `ParseError` fires on any `(error …)` stdout line seen
+> before the first answer, even when a decided answer follows — that answer
+> is about a mutilated problem and is not trusted. `classify`'s actual
+> precedence is: Timeout → Panic → Oom → unattributed signal → ParseError →
+> Malformed (answer count) → Unknown → decided (`Correct`/`Wrong`/
+> `StatusSuspect`/`Unverified`).
+
 **Oracle rule.** z3 is run at the same wall limit only when
 (a) `:status` is absent/`unknown` and shinri decided, or
 (b) shinri's answer contradicts `:status`.
@@ -259,6 +288,14 @@ list reproduces with `z3 <file>`. Oracle processes run under the same
 
 Priority order for the baseline's "next slices" section is fixed:
 `Wrong` > `Panic` > `ParseError` > `Unknown` (by count) > `Timeout`/`Oom`.
+
+> **As built — not implemented.** In the baseline a large share of `Wrong`
+> rows have `z3: timeout`, and per the rule above cvc5 is then never
+> consulted (cvc5 only runs when z3 *agrees* with shinri on a `:status`
+> contradiction). A future amendment could run cvc5 whenever z3 cannot
+> decide on a contradiction, so every `Wrong` row carries at least one
+> decided independent answer. This is a recommendation for a later slice;
+> the rule above is unchanged.
 
 ## 6. Report
 
@@ -275,6 +312,18 @@ Priority order for the baseline's "next slices" section is fixed:
    quoted symbols → `S`, so `unknown symbol foo` and `unknown symbol bar`
    merge. Each bucket lists its per-logic split and three example paths
    (smallest by bytes — the cheapest reproducers).
+
+   > **As built.** `ParseError` buckets key on the `(error "…")` payload
+   > with the wrapper stripped, then run through the same normalisation
+   > (digits/hex/binary literals → `N`, quoted strings and `|…|` symbols →
+   > `S`). A bare identifier inside the message (e.g. `undeclared symbol
+   > foo`) is *not* normalised, so such diagnostics still split one bucket
+   > per identifier — a known limitation, but strictly better than the
+   > single collapsed bucket the raw un-normalised line would give. `Panic`
+   > buckets key on `<file>: <normalised message line>`, with the
+   > `line:col:` location dropped entirely (two panics at different lines in
+   > the same file with the same message merge; two different messages in
+   > the same file do not).
 4. **Wrong-answer table** — every `Wrong` and `StatusSuspect` row: path,
    `:status`, shinri, z3, cvc5. Empty table is printed explicitly.
 5. **Perf tail** — `Timeout`+`Oom` by logic and by file-size decile; the 20
@@ -323,6 +372,15 @@ reproducible.
 - `shinri-solver` — `last_fence()` is `None` after `Sat`/`Unsat` and `Some`
   after each of the twelve fences, using the smallest probe already in the
   test suite for each fence (existing tests, one extra assertion each).
+
+  > **As built.** Fence tags are pinned by a new `tests/fence_tags.rs` (6
+  > probes: decided sat/unsat carry no tag, three representative fenced
+  > queries each carry their named tag, and one push/pop case shows the tag
+  > is cleared by the next `check-sat`) rather than one assertion added to
+  > each existing test per fence. `--stats` coverage (line shape, byte-for-
+  > byte stdout with and without the flag, one `stats:` line per
+  > `check-sat`, `fence=-` on a decided query, a fenced query naming its
+  > tag) lives in `crates/shinri-cli/tests/cli.rs`, not `script_e2e`.
 
 **Integration (blocking tier, seconds):** `runner` end-to-end on
 `crates/shinri-bench/tests/corpus/` — six files driven through a stub solver
