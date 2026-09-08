@@ -1,0 +1,96 @@
+# SMT-LIB release 2024 (non-incremental benchmarks), version 2024.04.23
+# https://doi.org/10.5281/zenodo.11061097
+# md5 is what Zenodo publishes for each file; `shinri-bench fetch` verifies it
+# after download and refuses to extract a mismatch.
+record = "10.5281/zenodo.11061097"
+base_url = "https://zenodo.org/api/records/11061097/files/"
+
+[[archive]]
+logic = "QF_BV"
+file = "QF_BV.tar.zst"
+size = 1734941977
+md5 = "3104e6a73841bccab5a2b0960afa8576"
+
+[[archive]]
+logic = "QF_ABV"
+file = "QF_ABV.tar.zst"
+size = 139559467
+md5 = "1522a83775e718596fc86d4fa6bf7551"
+
+[[archive]]
+logic = "QF_AUFBV"
+file = "QF_AUFBV.tar.zst"
+size = 1184909
+md5 = "83c6c9bf34bd38a078c389cecf7ed0a3"
+
+[[archive]]
+logic = "QF_UFBV"
+file = "QF_UFBV.tar.zst"
+size = 87797101
+md5 = "50d22090ac82e882761f0648f109485f"
+
+[[archive]]
+logic = "QF_FP"
+file = "QF_FP.tar.zst"
+size = 7534342
+md5 = "d690d40fb847d889ed3b69e34ce82382"
+
+[[archive]]
+logic = "QF_BVFP"
+file = "QF_BVFP.tar.zst"
+size = 1033258
+md5 = "c9aa57f04510048611ad0ad027c8ef76"
+
+[[archive]]
+logic = "QF_LRA"
+file = "QF_LRA.tar.zst"
+size = 182105257
+md5 = "acded5157ed73f2672d1421f205b7209"
+
+[[archive]]
+logic = "QF_LIA"
+file = "QF_LIA.tar.zst"
+size = 688955075
+md5 = "d71191111a0d80d6558a8784058d081c"
+
+[[archive]]
+logic = "QF_UF"
+file = "QF_UF.tar.zst"
+size = 54287659
+md5 = "3ce26e05264581931a583bae96b87f34"
+
+[[archive]]
+logic = "QF_UFLIA"
+file = "QF_UFLIA.tar.zst"
+size = 18901126
+md5 = "26d8d7e71c33b10c9767beebddb5da9e"
+
+[[archive]]
+logic = "QF_UFLRA"
+file = "QF_UFLRA.tar.zst"
+size = 162815543
+md5 = "efcc423fd0f50e9b7942779d02e376ed"
+
+[[archive]]
+logic = "QF_AX"
+file = "QF_AX.tar.zst"
+size = 131549
+md5 = "6d323ea02eb4d74e8ac77420bf94e3cb"
+
+[[archive]]
+logic = "QF_S"
+file = "QF_S.tar.zst"
+size = 2909837
+md5 = "e7a201b1fff6c952f278154d6513a0c0"
+
+[[archive]]
+logic = "QF_SLIA"
+file = "QF_SLIA.tar.zst"
+size = 31834010
+md5 = "277e586bf556ee33dc638348bc6de50a"
+
+[[archive]]
+logic = "QF_DT"
+file = "QF_DT.tar.zst"
+size = 43959596
+md5 = "34701f2c49bf4669a550ac8124b8cad0"
