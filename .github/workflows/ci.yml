@@ -16,6 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2 # single source of toolchain+tools: mise.toml
+        with:
+          version: 2026.9.2 # pinned: the action otherwise follows mise.jdx.dev/VERSION, which can point at an unpublished release
         env:
           GITHUB_TOKEN: ${{ github.token }} # mise github backend → avoid API rate limits resolving z3/cvc5 releases
       - uses: Swatinem/rust-cache@v2
@@ -46,6 +48,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+        with:
+          version: 2026.9.2
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
@@ -62,6 +66,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+        with:
+          version: 2026.9.2
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
@@ -82,6 +88,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+        with:
+          version: 2026.9.2
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
@@ -99,6 +107,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+        with:
+          version: 2026.9.2
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
@@ -118,6 +128,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+        with:
+          version: 2026.9.2
         env:
           GITHUB_TOKEN: ${{ github.token }}
       - uses: Swatinem/rust-cache@v2
