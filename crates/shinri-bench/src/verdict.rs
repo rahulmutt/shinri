@@ -130,8 +130,13 @@ pub fn classify(o: &Observed) -> Verdict {
     {
         return Verdict::Oom;
     }
-    // 4. ParseError.
-    if (o.stdout_errors > 0 && o.answers.is_empty()) || o.rc == Some(2) {
+    // 4. ParseError. Spec §5: an `(error …)` line on stdout before the
+    //    first answer, with no qualifier about what follows it. A CLI that
+    //    reports a sort error, drops the offending assertions and then
+    //    answers `sat` answered a *different* problem — that is a parse
+    //    failure, not a soundness bug, so this must precede the answer
+    //    rules below.
+    if o.stdout_errors > 0 || o.rc == Some(2) {
         return Verdict::ParseError;
     }
     // 5. Malformed answer count.
@@ -323,6 +328,15 @@ mod tests {
     fn error_before_answer_is_parse_error() {
         let mut ob = obs(Some(0), &[], "", None);
         ob.stdout_errors = 1;
+        assert_eq!(classify(&ob), Verdict::ParseError);
+    }
+    #[test]
+    fn error_before_answer_wins_over_the_answer() {
+        // QF_ABV/20200415-Yurichev/t3.smt2: two `(error …)` lines (dropped
+        // assertions) and then `sat`. Contradicting `:status` must not make
+        // that a `wrong` — the answer is about a mutilated problem.
+        let mut ob = obs(Some(0), &[Sat], "", Some(Unsat));
+        ob.stdout_errors = 2;
         assert_eq!(classify(&ob), Verdict::ParseError);
     }
     #[test]

@@ -93,6 +93,10 @@ pub struct Row {
     pub rc: Option<i32>,
     pub wall_ms: u64,
     pub answers: Vec<Answer>,
+    /// `(error …)` lines seen on stdout before the first answer; kept per
+    /// row so a `parse-error` can be told apart from a clean one later
+    /// without re-running the corpus.
+    pub stdout_errors: usize,
     pub fence: Option<String>,
     pub stderr_head: String,
     pub verdict: Verdict,
@@ -133,7 +137,7 @@ impl Row {
             None => "null".to_string(),
         };
         format!(
-            "{{\"path\":{},\"logic\":{},\"bytes\":{},\"status\":{},\"rc\":{},\"wall_ms\":{},\"answers\":{},\"fence\":{},\"stderr_head\":{},\"verdict\":{},\"oracle\":{}}}",
+            "{{\"path\":{},\"logic\":{},\"bytes\":{},\"status\":{},\"rc\":{},\"wall_ms\":{},\"answers\":{},\"stdout_errors\":{},\"fence\":{},\"stderr_head\":{},\"verdict\":{},\"oracle\":{}}}",
             json::escape(&self.path),
             json::escape(&self.logic),
             self.bytes,
@@ -141,6 +145,7 @@ impl Row {
             rc,
             self.wall_ms,
             answers,
+            self.stdout_errors,
             fence,
             json::escape(&self.stderr_head),
             json::escape(&self.verdict.key()),
@@ -191,6 +196,11 @@ impl Row {
                 .collect(),
             _ => Vec::new(),
         };
+        // Absent in files written before the field existed.
+        let stdout_errors = match get("stdout_errors") {
+            Some(JsonVal::Num(n)) => n as usize,
+            _ => 0,
+        };
         let fence = match get("fence") {
             Some(JsonVal::Str(s)) => Some(s),
             _ => None,
@@ -232,6 +242,7 @@ impl Row {
             rc,
             wall_ms,
             answers,
+            stdout_errors,
             fence,
             stderr_head,
             verdict,
@@ -366,6 +377,7 @@ mod tests {
             rc: Some(0),
             wall_ms: 12,
             answers: vec![Answer::Sat],
+            stdout_errors: 3,
             fence: None,
             stderr_head: "line1\nline2\\".into(),
             verdict: Verdict::Unverified,
@@ -385,6 +397,16 @@ mod tests {
         assert_eq!(back.verdict, r.verdict);
         assert_eq!(back.oracle, r.oracle);
         assert_eq!(back.answers, r.answers);
+        assert_eq!(back.stdout_errors, r.stdout_errors);
+    }
+
+    #[test]
+    fn stdout_errors_defaults_to_zero_on_older_rows() {
+        // A line written before the field existed must still parse.
+        let older = r#"{"path":"a.smt2","logic":"QF_UF","bytes":7,"status":null,"rc":0,"wall_ms":12,"answers":["sat"],"fence":null,"stderr_head":"","verdict":"unverified","oracle":null}"#;
+        let back = Row::from_json(older).expect("older rows stay readable");
+        assert_eq!(back.stdout_errors, 0);
+        assert_eq!(back.answers, vec![Answer::Sat]);
     }
 
     #[test]

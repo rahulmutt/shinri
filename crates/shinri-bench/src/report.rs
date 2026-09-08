@@ -518,6 +518,7 @@ mod tests {
             rc: Some(124),
             wall_ms: 20000,
             answers: vec![],
+            stdout_errors: 0,
             fence: None,
             stderr_head: String::new(),
             verdict: Verdict::Timeout,
