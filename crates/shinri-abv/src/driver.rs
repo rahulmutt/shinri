@@ -40,6 +40,11 @@ pub enum AbvOutcome {
     Sat,
     Unsat,
     Unknown,
+    /// The loop reached a fixpoint and reported `Sat`, but the post-solve
+    /// array-model gate (`crate::validate`) found the model violates an array
+    /// axiom, so the `Sat` is spurious. SOUND downgrade to `Unknown` at the
+    /// solver boundary — never reported as `sat`.
+    ModelRejected,
 }
 
 /// Run the abstraction–refinement loop. `bridge` already holds the blasted

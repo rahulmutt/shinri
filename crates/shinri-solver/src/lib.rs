@@ -979,6 +979,14 @@ impl Solver {
                     self.last_fence = Some("abv-engine");
                     SolveOutcome::Unknown
                 }
+                // Slice 47. The refinement loop's fixpoint is on the LEMMA SET, not on
+                // the array axioms, so it can report Sat on a model that no array
+                // realises. `validate` catches that; a spurious Sat becomes a SOUND
+                // Unknown rather than a wrong answer. Mirrors `str-model-rejected`.
+                shinri_abv::AbvOutcome::ModelRejected => {
+                    self.last_fence = Some("abv-model-rejected");
+                    SolveOutcome::Unknown
+                }
             };
         }
 
