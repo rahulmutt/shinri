@@ -64,10 +64,16 @@ one of those two files and a section inside it.
   (16,016), account for 42,379 rows, almost entirely QF_SLIA.
 - QF_AX is 551 of 551 `unknown` on `theory-refused` — an entire logic with no
   implementation behind it.
-- Worst decided-rates: QF_AX 0.0%, QF_FP 0.5%, QF_UFLRA 3.4%, QF_UFLIA 15.6%.
-  Best: QF_BVFP 98.7%, QF_UF 94.7%, QF_DT 90.2%.
+- Worst correct-rates (the matrix's `decided%` column): QF_AX 0.0%, QF_FP
+  0.5%, QF_UFLRA 3.4%, QF_UFLIA 15.6%. Best: QF_BVFP 98.7%, QF_UF 94.7%,
+  QF_DT 90.2%.
 
 ## Per-logic matrix
+
+This table is copied verbatim from the report. Its `decided%` column is, per
+spec §6.2, `correct / (total − malformed)` — a correct-rate, not the
+`correct` + `wrong` + `unverified` "answered" figure the headline above uses;
+it counts a `wrong` or `unverified` answer as not decided.
 
 | logic | total | correct | wrong | status-suspect | parse-error | panic | oom | timeout | unknown | unverified | malformed | decided% | median ms | p90 ms |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -129,7 +135,9 @@ other column is unaffected.
 
 ## Ranked gaps (by count)
 
-Every non-`correct` verdict bucketed and sorted by count, per spec §9.2. The
+Every non-`correct`, non-`wrong` verdict bucketed and sorted by count, per
+spec §9.2; `wrong` (742 rows) is a non-`correct` verdict too, but it has its
+own section below, "## Wrong answers", and is not repeated here. The
 `parse-error` rows and the `panic`/`oom` split come from
 `2026-09-09-smtlib-2024-rerun-report.md › ## Ranked gaps`, because the
 baseline predates the parse-error diagnostic and the signal-aware exit code;
@@ -174,19 +182,19 @@ The buckets reconcile with the per-logic matrix: `parse-error` sums to 44,009,
 `unverified` to 1,371 — 133,035 rows, which with 123,894 `correct` and 742
 `wrong` is the corpus's 257,671.
 
-Buckets below 100 rows are listed here for completeness and are **not** filed
-as slices below. There are seven of them — `unknown:abv-fenced` 62,
+Nine buckets are below 100 rows. Seven of them are listed here for
+completeness and are **not** filed as slices below — `unknown:abv-fenced` 62,
 `unknown:theory-lira` 36, `parse-error:unknown operator !` 34,
 `unknown:bv-uf-budget` 23, `unknown:abv-uf-args` 13, `unknown:bv-uf-args` 9
 and `parse-error:(error S` 3 — 180 rows in total, 0.07% of the corpus, and
-none of them gates a logic. The one exception to the cut is
-`str.replace_re` (98) and `str.replace_re_all` (97): they are filed as a
-single 195-row slice below because they are a prerequisite for the regex
-work, not because either count clears the bar on its own. The five `unknown`
-fences among those seven are where the ABV engine (`abv-fenced`), the LIRA
-path (`theory-lira`) and the BV/array UF handling (`bv-uf-budget`,
-`abv-uf-args`, `bv-uf-args`) hit their own limits, at a scale that does not
-yet justify a slice.
+none of them gates a logic. The other two, `str.replace_re` (98) and
+`str.replace_re_all` (97), are filed as a single 195-row slice below even
+though both are under the 100-row bar, because they are a prerequisite for
+the regex work, not because either count clears it on its own. The five
+`unknown` fences among the seven unfiled buckets are where the ABV engine
+(`abv-fenced`), the LIRA path (`theory-lira`) and the BV/array UF handling
+(`bv-uf-budget`, `abv-uf-args`, `bv-uf-args`) hit their own limits, at a scale
+that does not yet justify a slice.
 
 ## Next slices (spec §5 priority order)
 
@@ -273,7 +281,7 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
    parse-error:unsupported command: define-sort — 39994`. This is a
    **parser** gap, not an FP-theory gap: the FP engine never runs on these
    files. It alone gates 99% of QF_FP
-   (39,994 of 40,407 rows; the logic's decided-rate is 0.5%).
+   (39,994 of 40,407 rows; the logic's correct-rate is 0.5%).
    Cheapest reproducer:
    `target/release/shinri QF_FP/wintersteiger/abs/abs-has-solution-8522.smt2`
    (622 bytes).
@@ -299,10 +307,11 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
    | `(error S` | 3 | QF_BV 3 | `QF_BV/brummayerbiere/bitrev2048.smt2` (29049 B) |
 
    The two `sort error` buckets (2,292 rows) are the QF_LRA/QF_UFLRA story —
-   together they are why QF_UFLRA sits at 3.4% decided. `bvcomp` and the BV
-   numeral suffix are the QF_BV story: 1,281 of the 1,366 rows in those two
-   buckets are QF_BV. `unknown operator !` is the SMT-LIB annotation form `(! t :named n)`, which the parser should
-   accept and strip.
+   together they are why QF_UFLRA's correct-rate sits at 3.4%. `bvcomp` and
+   the BV numeral suffix are the QF_BV story: 1,281 of the 1,366 rows in
+   those two buckets are QF_BV. `unknown operator !` is the SMT-LIB
+   annotation form `(! t :named n)`, which the parser should accept and
+   strip.
    Proposed slices, in the order the counts suggest: *"Real/Int sort
    checking: fix `NotApplicable` and `Mismatch` on meti-tarski and FFT"*;
    *"BV literals and `bvcomp`: accept `bvN` numerals with an index and lower
@@ -422,8 +431,11 @@ cvc5 is never asked in-run. The cvc5 answers above come from the hand re-runs,
 not from the run.
 
 Not all 742 rows were reproduced by hand; the counts above are the exact
-evidence each group carries. A per-family spot-check of 11 rows is recorded
-separately.
+evidence each group carries. A spot-check of 11 rows, all QF_ABV and covering
+its 4 families (`dwp_formulas`, `brummayerbiere`, `brummayerbiere2`,
+`calc2`), confirms the harness's recorded in-run z3 answers against a fresh
+invocation; the per-row evidence for those 11 rows is the oracle column of
+`2026-09-09-smtlib-2024-baseline-report.md › ## Wrong answers`.
 
 | logic | family | rows | evidence |
 | --- | --- | ---: | --- |
@@ -550,13 +562,14 @@ entry points into that set.
   was done: 652 rows carry the in-run oracle answer the harness recorded, and
   are cited as such rather than re-run; the 90 rows whose in-run z3 timed out
   were hand-re-run against both oracles at a longer budget (62 QF_ABV at
-  120 s, 28 QF_DT at 300 s); and an 11-row per-family sample was hand-run
-  across families as a spot-check that the harness's recorded answers match a
-  fresh invocation. 742 rows × 2 oracles × 120 s is up to 49 CPU-hours and
-  would have re-derived, for the 652, an answer the run already holds on
-  record; the 90 undecided-in-run rows were the only ones where a hand re-run
-  could add evidence, so the budget went there. Every `Wrong` row is filed as
-  a named follow-up slice, per the other half of §9.3.
+  120 s, 28 QF_DT at 300 s); and an 11-row sample, all QF_ABV and covering
+  its 4 families, was hand-run as a spot-check that the harness's recorded
+  answers match a fresh invocation. 742 rows × 2 oracles × 120 s is up to
+  49 CPU-hours and would have re-derived, for the 652, an answer the run
+  already holds on record; the 90 undecided-in-run rows were the only ones
+  where a hand re-run could add evidence, so the budget went there. Every
+  `Wrong` row is filed as a named follow-up slice, per the other half of
+  §9.3.
 - **`status-suspect` is 0.** No row had shinri contradict `:status` with both
   oracles agreeing with shinri. The `wrong` count is therefore not diluted by
   bad benchmark metadata in the corpus, at least not detectably.
