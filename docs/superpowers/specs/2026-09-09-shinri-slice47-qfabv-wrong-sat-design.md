@@ -40,10 +40,27 @@ slice:
 * `wchains002ue.smt2` (1,421 B) — **16 `store`s and zero `select`s**: pure
   store-chain equality.
 
-The second shape has a nameable defect. `check::extensionality`'s positive
-branch (`crates/shinri-abv/src/check.rs:125`) enforces array agreement only
-over `accessed_indices`, and `accessed_indices`
-(`crates/shinri-abv/src/check.rs:99`) is built **solely from `c.selects`**:
+Neither shape is yet diagnosed, and the reason is worth recording because an
+earlier draft of this spec got it wrong.
+
+`wchains002ue` asserts a store-chain **dis**equality, not an equality. Its
+single assert is
+
+```
+(not (= (bvand (bvand (bvnot (ite (= CHAIN1 CHAIN2) #b1 #b0)) ...) ...) #b0))
+```
+
+so the model is forced to set the array-eq proxy **false**. `CHAIN1` and
+`CHAIN2` are 8-deep `store` chains over the *same* base `a1`, writing the same
+eight `(index, value)` pairs in opposite orders; the instance is `unsat`
+because those writes commute under the formula's alignment constraints on `v6`
+and `v7`. A false proxy routes through `extensionality`'s **negative** branch
+(`crates/shinri-abv/src/check.rs:153`), which mints a witness index and emits
+`p ∨ (a[w] ≠ b[w])` — that branch **is** implemented.
+
+There is a real latent defect in the positive branch —
+`accessed_indices` (`crates/shinri-abv/src/check.rs:99`) builds the
+extensionality index set **solely from `c.selects`**:
 
 ```rust
 fn accessed_indices(ctx: &Context, c: &Collected, a: TermId, b: TermId) -> Vec<TermId> {
@@ -57,14 +74,14 @@ fn accessed_indices(ctx: &Context, c: &Collected, a: TermId, b: TermId) -> Vec<T
 }
 ```
 
-With no selects the list is empty, the `Some(true)` branch emits no lemmas at
-all, and every array-equality proxy is a **free Boolean** the SAT layer may set
-at will. Store indices are never added to the index set. The negative branch
-mints a witness, so array *dis*equality is enforced and array *equality* is
-not.
+so with no selects the `Some(true)` branch emits nothing and a *positively*
+asserted array equality is unconstrained. But that is **not** what
+`wchains002ue` exercises, and this spec does not claim it as the cause of any
+measured row. It is a defect to fix and fence on its own terms (§4), not a
+diagnosis.
 
-The `bubsort` shape is **not yet diagnosed**. Two hypotheses are recorded in §9,
-written down so task 3 can confirm or discard them; this slice bisects rather than guesses.
+§9 records two hypotheses for the shapes that *are* measured. Both are
+hypotheses.
 
 Because the number of independent causes is unknown, the slice restores
 soundness **first**, with a model gate that is independent of how many causes
@@ -121,16 +138,30 @@ of a second implementation of BV semantics to keep in sync with the blaster.
 This argument is load-bearing, so §3.4 pins the grammar it assumes and makes
 every term outside that grammar a conservative rejection.
 
-### 3.2 Array values
+### 3.2 Arrays are PARTIAL: what a model actually pins
 
-Evaluate every array-sorted term to a concrete finite function
-`(default: Integer, overrides: BTreeMap<Integer, Integer>)`:
+The obvious move — reuse `array_model` (`crates/shinri-abv/src/model.rs:108`)
+— is **wrong**, twice over, and the validator must not do it:
 
-* a **declared array constant** — its `ArrayModel`
-  (`crates/shinri-abv/src/model.rs`), already assembled on the SAT path for
-  `get-model`; `points` become the overrides and `default` the default;
-* `store(A, i, e)` — the value of `A` with the single point
-  `val(i) ↦ val(e)` inserted (replacing any existing entry at that index);
+* it pins `default: Integer::from(0u64)` unconditionally, which is a
+  *rendering* choice for `get-model` output, not a semantic commitment. The
+  model does not claim unwritten entries are zero;
+* it silently drops conflicting reads (`model.rs:136`, `if !seen.contains(&iv)`
+  — first occurrence wins), so it would **mask** exactly the
+  functional-consistency violations C1 exists to catch.
+
+The correct notion is a **partial** map. Only indices touched by a read or a
+store are pinned; every other entry is free, and a free entry can be given any
+value, so it can never witness a violation.
+
+For an array-sorted term `A`, compute `base(A)` and `pins(A)`:
+
+* `A` a declared array constant — `base(A) = A`, and
+  `pins(A) = { val(i) ↦ val(read_of[sel]) }` over every `sel = select(A, i)`
+  in `abs.read_of`. Two selects on `A` whose index values coincide but whose
+  read values differ are a **C1 violation**, not a first-wins dedup;
+* `A = store(B, i, e)` — `base(A) = base(B)` and
+  `pins(A) = pins(B)` with `val(i) ↦ val(e)` overriding any existing entry;
 * anything else — conservative rejection, per §3.4.
 
 Index and element values come from `bridge.value_bv`, which blasts on demand
@@ -138,40 +169,54 @@ and reads the current SAT model for **any** BV-sorted term
 (`crates/shinri-solver/src/abv_stage.rs:580`–`:611`), so no separate BV
 evaluator is needed.
 
-### 3.3 The three checks
+### 3.3 The checks — reject only DEFINITE violations
 
-**C1 — read soundness.** For every `(sel, r)` in `abs.read_of` where
-`sel = select(A, i)`: require
+The governing rule: the gate rejects only when the model is **definitely** not
+realizable. Where the pinned data leaves an entry free, the model has genuine
+freedom and the gate must stay silent. A gate that rejected on
+underdetermination would turn correct answers into fenced unknowns — sound,
+but the regression §7's criterion 2 exists to catch.
 
-```
-lookup(value_of(A), val(i)) == val(r)
-```
+**C1 — read soundness.** For every `sel = select(A, i)` with read var `r`: if
+`pins(A)` has an entry at `val(i)`, require it to equal `val(r)`. No entry
+means no constraint.
 
-where `lookup` returns the override at that index if present and the default
-otherwise. This is the array axiom itself, so it subsumes both functional
-consistency and read-over-write: it holds for *every* pair of reads and every
-store chain, not only for the pairs some lemma rule happened to enumerate.
+This is the array axiom itself, so it subsumes both functional consistency and
+read-over-write: for `A` a bare constant it is the functional-consistency
+conflict check, and for `A` a store chain it is read-over-write, unfolded to
+the bottom of the chain in one step rather than one level per refinement round.
 
-**C2 — equality soundness.** For every array-eq atom `(= a b)` with proxy `p`:
-require `bridge.value_bool(p)` to agree with whether `value_of(a)` and
-`value_of(b)` are equal **as functions** — equal defaults, and equal lookups
-across the union of the two override index sets. (Two finite-support functions
-over a BV index space agree everywhere iff they agree on the union of their
-supports and share a default; the support is always a strict subset of the
-`2^w` index space at the widths in this corpus, and §3.4 rejects the degenerate
-case rather than reasoning about it.)
+**C2-pos — a positively asserted equality that the pins refute.** For an
+array-eq atom `(= a b)` whose proxy is **true**: reject if there is an index
+`k` at which `pins(a)` and `pins(b)` are **both** defined and differ. If only
+one side is pinned at `k` the other side is free there, so the equality is
+still satisfiable and the gate stays silent.
 
-C2 is precisely the check `wchains002ue` fails today: with zero selects nothing
-constrains the proxies, so the model asserts an array equality that its own
-array values contradict.
+**C2-neg — a negatively asserted equality that the pins force.** For an
+array-eq atom `(= a b)` whose proxy is **false**: reject if the two arrays are
+**definitely equal**, which holds when
+
+1. `base(a) == base(b)`, and
+2. every index in `keys(pins(a)) ∪ keys(pins(b))` is pinned on **both** sides
+   with equal values.
+
+Under those two conditions the arrays agree at every pinned index and both fall
+through to the *same* base everywhere else, so no assignment to the free
+entries can separate them — the disequality is unsatisfiable. A one-sided pin
+at any index leaves that entry free on the other side, the arrays can be
+separated there, and the gate stays silent.
+
+C2-neg is the check `wchains002ue` needs: its two chains share the base `a1`
+and write the same index set, so their pins coincide and the asserted
+disequality is definitely violated.
 
 **C3 — proxy totality.** Every proxy in `abs.eq_proxy` must have a value in the
 model. A proxy with no assignment means the abstraction's Boolean skeleton did
 not force it, which is the same unconstrained-freedom failure as C2; treat a
 missing value as a rejection rather than as "don't care".
 
-If C1, C2 and C3 all hold, the model is a genuine QF_ABV witness and the `sat`
-stands. If any fails, the `sat` is spurious.
+If C1, C2-pos, C2-neg and C3 all pass, the model is a genuine QF_ABV witness
+and the `sat` stands. If any fails, the `sat` is spurious.
 
 ### 3.4 The grammar, and conservative rejection
 
@@ -182,11 +227,11 @@ failed check) when it meets an array-sorted term that is neither, including:
 
 * an array-sorted `ite`;
 * an array-sorted uninterpreted application, nullary or otherwise;
-* an array whose `ArrayModel` could not be assembled;
 * an array-eq atom whose operands have different index or element widths;
-* an index or element term for which `bridge.value_bv` returns `None`;
-* an array whose override support size equals `2^index_width` (the degenerate
-  case C2's argument excludes).
+* an index or element term for which `bridge.value_bv` returns `None`, so the
+  pin cannot be computed;
+* a `store` chain that bottoms out in anything other than a declared array
+  constant.
 
 Rejecting here costs at most a `sat` → `Unknown` downgrade on a shape the
 engine may well be handling correctly. That is the right trade: an unfenced
@@ -228,19 +273,25 @@ already-computed array models and already-blasted BV values. QF_ABV's median
 solve is 12 ms and its p90 is 173 ms, so the pass is noise. §7 gates on the
 measured p90 anyway rather than on this assertion.
 
-## 4. The fix, so far as it is known
+## 4. The fixes, so far as they are known
 
-**Confirmed:** `accessed_indices` (`check.rs:99`) must also collect the store
-index terms along the store chains of both operands, not only the indices of
-selects whose base is syntactically `a` or `b`. For `a = b` where either side
-is a store chain, agreement has to be enforced at every index either chain
-writes; today those indices are invisible to the positive branch, which is why
-a formula with no selects at all constrains nothing.
+**No cause of a measured wrong answer is confirmed.** §1 explains why the
+earlier candidate does not survive contact with its reproducer. Task 3 bisects
+with the §3.5 rejection reason and fixes what it finds; §9 records the
+hypotheses so they are confirmed or discarded rather than rediscovered.
 
-**Not yet diagnosed:** the `bubsort` shape. §6 records the hypotheses; task 3
-bisects with the §3.5 rejection reason and fixes what it finds. This spec
-deliberately does not pre-commit a fix for a cause it has not observed — the
-recorded history here is that plan-stage code sketches ship soundness bugs.
+One **independent latent defect** is confirmed and is fixed on its own terms,
+not as a diagnosis: `accessed_indices` (`crates/shinri-abv/src/check.rs:99`)
+must also collect the store index terms along the store chains of both
+operands, not only the indices of selects whose base is syntactically `a` or
+`b`. Today a positively asserted equality between two store chains with no
+selects over them is enforced at zero indices. No row in the measured 359 is
+known to depend on this; it gets a generator shape (§5 task 1) and a unit
+fence (§6.1), and if it turns out to fix measured rows, so much the better.
+
+This spec deliberately does not pre-commit a fix for a cause it has not
+observed. The recorded history here is that plan-stage code sketches ship
+soundness bugs.
 
 ## 5. Tasks
 
@@ -253,7 +304,11 @@ is how 359 wrong answers survived a green oracle suite. Add:
 
 * array equalities whose operands are `store` chains of depth ≥ 2, over both
   the same and different base arrays;
-* an instance shape with **zero selects**, so the `wchains` case is generated;
+* array **dis**equalities between two store chains over the **same** base that
+  write the same index set in different orders — the `wchains002ue` shape, and
+  the one C2-neg exists for;
+* an instance shape with **zero selects**, so both chain shapes are generated
+  with no read to rescue them;
 * store chains that write the same index twice (later write wins).
 
 **Acceptance: the extended generator must FAIL on pre-slice `main`.** A green
@@ -266,8 +321,9 @@ fence, and the §6.1 unit fences. After this commit shinri is **sound** on all
 359 rows regardless of whether any later task succeeds.
 
 **Task 3 — bisect and fix.** Drive the §3.5 rejection reason over the five
-named reproducers (§8), fix each cause it names, starting with the §4
-confirmed one. Each fix lands with a regression pin (§6.2).
+named reproducers (§8), fix each cause it names. Also land the §4 latent
+`accessed_indices` fix, which is independent of the bisect. Each fix lands with
+a regression pin (§6.2).
 
 **Task 4 — measure.**
 
@@ -284,9 +340,17 @@ compared against the committed `baseline-8de004d44944` numbers. Iterate tasks
 ### 6.1 Fences for the gate
 
 One unit test per §3.4 bullet, each constructing the term shape directly and
-asserting the gate rejects rather than passes; one test each for C1, C2 and C3
-rejecting a hand-built spurious model; and one test that a genuine model
-passes all three (so the gate is not vacuously rejecting everything).
+asserting the gate rejects rather than passes. One test each for C1, C2-pos,
+C2-neg and C3 rejecting a hand-built spurious model.
+
+Then the tests that matter more, because §3.3's whole design is "reject only
+definite violations" and the failure mode is over-rejection:
+
+* C1 stays silent when `pins(A)` has no entry at the read's index;
+* C2-pos stays silent when only **one** side is pinned at the differing index;
+* C2-neg stays silent when the two chains have **different** bases, and again
+  when they share a base but some index is pinned on one side only;
+* a genuine model passes every check, so the gate is not vacuously rejecting.
 
 ### 6.2 Regression pins
 
@@ -345,7 +409,7 @@ All paths relative to `bench/corpus/`.
 
 | shape | file | size | evidence |
 | --- | --- | ---: | --- |
-| store chain, 0 selects | `QF_ABV/brummayerbiere/wchains002ue.smt2` | 1,421 B | in-run z3 `unsat` |
+| store-chain **dis**equality, same base, 0 selects | `QF_ABV/brummayerbiere/wchains002ue.smt2` | 1,421 B | in-run z3 `unsat` |
 | selects over nested stores | `QF_ABV/brummayerbiere/bubsort002un.smt2` | 1,260 B | in-run z3 `unsat` |
 | `dwp_formulas` (283 rows) | `QF_ABV/dwp_formulas/try5_small_difret_functions_wp_chgrp.i_ring_empty.il.wp.smt2` | 1,472 B | in-run z3 `unsat` |
 | `brummayerbiere2` | `QF_ABV/brummayerbiere2/countbitstable016.smt2` | 11,203 B | z3 `unsat` at 120 s |
@@ -353,8 +417,8 @@ All paths relative to `bench/corpus/`.
 
 ## 9. Hypotheses recorded, not adopted
 
-Two candidate causes for the `bubsort` shape, written down so task 3 can
-confirm or discard them rather than rediscover them. **Neither is a finding.**
+Candidate causes, written down so task 3 can confirm or discard them rather
+than rediscover them. **None is a finding.**
 
 1. `functional_consistency` (`check.rs:40`) relates two selects only when
    their base arrays are **syntactically identical** (`if ax != ay { continue }`).
