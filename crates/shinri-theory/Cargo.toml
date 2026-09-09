@@ -11,7 +11,7 @@ rustc-hash = "2"
 
 [dev-dependencies]
 proptest = "1"
-easy-smt = "0.2"
+easy-smt = "0.3"
 
 [features]
 # Differential oracle harness (Task 15). Off by default; needs a `z3` binary on PATH.
