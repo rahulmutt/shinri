@@ -94,13 +94,20 @@ const N_ITERS: usize = 200;
 //           generator never reached before this slice (it only equated bare
 //           array constants and only ever wrote `Store` as the direct operand
 //           of a `Select`):
-//             kind 4: (= chain0 chain1) — same-base depth-2 store chains that
-//                     write the SAME two indices to SWAPPED elements. With
-//                     `(distinct i0 i1)` and `(distinct e0 e1)` forced, the
-//                     two chains are DETERMINISTICALLY unequal, so this is
-//                     UNSAT — it targets the accessed_indices/§4 latent
-//                     defect: a positively-asserted equality with no selects
-//                     over it is checked at zero indices.
+//             kind 4: (= chain0 chain1) — depth-2 store chains, same base
+//                     half the time (`same_base`) and different bases (a0,
+//                     a1) the other half, per the task's binding requirement
+//                     to cover both. same_base writes the SAME two indices to
+//                     SWAPPED elements: with `(distinct i0 i1)` and
+//                     `(distinct e0 e1)` forced, the two chains are
+//                     DETERMINISTICALLY unequal, so this is UNSAT — it
+//                     targets the accessed_indices/§4 latent defect: a
+//                     positively-asserted equality with no selects over it is
+//                     checked at zero indices. !same_base writes the SAME
+//                     writes over two DIFFERENT bases and is deliberately NOT
+//                     forced UNSAT (two free base arrays can always be
+//                     equated) — it exercises the cross-array store-chain
+//                     path as genuine SAT-leaning coverage.
 //             kind 5: (not (= chain_fwd chain_rev))  — the `wchains002ue`
 //                     shape: the SAME base, writing the SAME 3 indices in
 //                     opposite orders, with `(distinct i0 i1 i2)` forced so
@@ -317,31 +324,54 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String, bool) {
                 dump.push_str("\n(assert (distinct a0 a1 a2))");
             }
             4 => {
-                // Slice 47 shape A: EQUALITY asserted between two same-base
-                // store chains that write the SAME two indices to SWAPPED
-                // elements. Forcing `(distinct i0 i1)` and `(distinct e0 e1)`
-                // makes the two chains DETERMINISTICALLY unequal (at i0 one
-                // chain holds e0, the other e1, and e0≠e1), so this assert is
-                // genuinely UNSAT — for ANY values respecting the distinctness.
-                // This targets the §4 latent defect named in the design doc:
-                // `accessed_indices` (crates/shinri-abv/src/check.rs:99) builds
-                // its positive-equality check set solely from `c.selects`, so
+                // Slice 47 shape A: EQUALITY asserted between two store
+                // chains, same base half the time and different bases
+                // otherwise — the brief's binding requirement is BOTH.
+                //
+                // same_base=true: two same-base chains write the SAME two
+                // indices to SWAPPED elements. Forcing `(distinct i0 i1)` and
+                // `(distinct e0 e1)` makes the two chains DETERMINISTICALLY
+                // unequal (at i0 one chain holds e0, the other e1, and
+                // e0≠e1, regardless of the shared base) — genuinely UNSAT for
+                // ANY values respecting the distinctness. This targets the §4
+                // latent defect named in the design doc: `accessed_indices`
+                // (crates/shinri-abv/src/check.rs:99) builds its
+                // positive-equality check set solely from `c.selects`, so
                 // with none present here, the false equality is enforced at
-                // zero indices and can slip through as `sat`.
-                let distinct_idx = s.app(Op::Builtin(BuiltinOp::Distinct), &[idxs[0], idxs[1]]);
-                s.assert(distinct_idx);
-                dump.push_str("\n(assert (distinct i0 i1))");
-                let distinct_elt = s.app(Op::Builtin(BuiltinOp::Distinct), &[elts[0], elts[1]]);
-                s.assert(distinct_elt);
-                dump.push_str("\n(assert (distinct e0 e1))");
+                // zero indices and can slip through as `sat`. This is the arm
+                // that currently produces this task's failing instance.
+                //
+                // same_base=false: two DIFFERENT base arrays (a0, a1) write
+                // the SAME writes each. This is deliberately NOT forced
+                // UNSAT: two free base arrays can always be made to agree
+                // (e.g. a0=a1), so the equality is legitimately
+                // SAT-satisfiable — exercising the cross-array store-chain
+                // path (distinct from the same-base rewrite reasoning above)
+                // is the point, not manufacturing another hard UNSAT.
+                let same_base = rng.below(2) == 0;
+                if same_base {
+                    let distinct_idx = s.app(Op::Builtin(BuiltinOp::Distinct), &[idxs[0], idxs[1]]);
+                    s.assert(distinct_idx);
+                    dump.push_str("\n(assert (distinct i0 i1))");
+                    let distinct_elt = s.app(Op::Builtin(BuiltinOp::Distinct), &[elts[0], elts[1]]);
+                    s.assert(distinct_elt);
+                    dump.push_str("\n(assert (distinct e0 e1))");
 
-                let w0 = [(0usize, 0usize), (1usize, 1usize)];
-                let w1 = [(0usize, 1usize), (1usize, 0usize)];
-                let (c0, t0) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w0);
-                let (c1, t1) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w1);
-                let atom = s.eq(c0, c1);
-                s.assert(atom);
-                dump.push_str(&format!("\n(assert (= {t0} {t1}))"));
+                    let w0 = [(0usize, 0usize), (1usize, 1usize)];
+                    let w1 = [(0usize, 1usize), (1usize, 0usize)];
+                    let (c0, t0) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w0);
+                    let (c1, t1) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w1);
+                    let atom = s.eq(c0, c1);
+                    s.assert(atom);
+                    dump.push_str(&format!("\n(assert (= {t0} {t1}))"));
+                } else {
+                    let w = [(0usize, 0usize), (1usize, 1usize)];
+                    let (c0, t0) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w);
+                    let (c1, t1) = store_chain(&mut s, arrays[1], "a1", &idxs, &elts, &w);
+                    let atom = s.eq(c0, c1);
+                    s.assert(atom);
+                    dump.push_str(&format!("\n(assert (= {t0} {t1}))"));
+                }
             }
             5 => {
                 // Slice 47 shape B (`wchains002ue`): disequality between two
