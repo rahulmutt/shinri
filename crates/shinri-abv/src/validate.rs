@@ -11,7 +11,14 @@
 //! can be given any value, so it can never witness a violation. Rejecting an
 //! underdetermined entry would turn correct `sat` answers into fenced
 //! `Unknown`s, which is a regression, not a fix.
+//!
+//! The pass order matters and is fixed: EVERY pin is derived first
+//! (`Gate::derive_base_pins`), and only then does any check run. Reads through
+//! a store chain contribute pins to the chain's BASE array (see
+//! `derive_base_pins`), so a check that ran while pins were still being
+//! discovered could consult an incomplete pin set.
 
+use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 
 use rustc_hash::FxHashMap;
@@ -41,6 +48,17 @@ pub enum Rejection {
     Unsupported { term: TermId, why: &'static str },
 }
 
+/// An array-sorted term resolved against the model: the declared constant its
+/// store chain bottoms out in, and the writes that chain lays over it.
+///
+/// `overlay` is keyed by the model's INDEX VALUES, with a later (more outward)
+/// write to the same value winning, so it is the chain's own contribution to
+/// the term's extension and nothing else.
+struct Chain {
+    base: TermId,
+    overlay: BTreeMap<Integer, Integer>,
+}
+
 /// The pinned entries of an array term: `base` is the declared array constant
 /// at the bottom of the store chain, `points` the indices the model pins.
 /// PARTIAL by construction — an index absent from `points` is FREE, and a free
@@ -51,6 +69,10 @@ struct Pins {
 }
 
 /// True if `t` is a nullary uninterpreted constant — a DECLARED array.
+///
+/// Arity > 0 is deliberately NOT accepted: an array-sorted uninterpreted
+/// application is outside the §3.4 grammar, because its extension is not
+/// determined by the model's BV assignments the way a declared constant's is.
 fn is_declared_const(ctx: &Context, t: TermId) -> bool {
     match ctx.term_node(t) {
         TermNode::App { op, args, .. } => {
@@ -60,124 +82,245 @@ fn is_declared_const(ctx: &Context, t: TermId) -> bool {
     }
 }
 
-/// One `validate` pass over one model.
+/// Resolve an array-sorted term against the model. Anything outside the §3.4
+/// grammar — a store chain over a declared constant — is a conservative reject.
 ///
-/// It exists to hold two caches. `reads_by_base` buckets `abs.read_of` by the
-/// array term each select reads from, and `base_memo` holds the read pins of
-/// each declared base array once they have been derived. Without them the base
-/// read-scan reruns for every select, which is quadratic in the number of
-/// selects (ruling R7) — the caches change no verdict, only the cost of
-/// reaching it.
+/// The walk is iterative rather than recursive so a long store chain (BMC
+/// instances build them thousands deep) cannot overflow the stack. It descends
+/// WITHOUT reading any value first, so failures are reported in the order a
+/// bottom-up evaluation would report them: a malformed base before any missing
+/// store value, and an inner store before an outer one. Each frame carries the
+/// index and element terms it was matched with, so no frame is re-decoded (and
+/// the gate holds no `expect` that a re-decode will succeed).
+fn resolve_chain(ctx: &Context, bridge: &dyn SatBridge, t: TermId) -> Result<Chain, Rejection> {
+    let mut frames: Vec<(TermId, TermId, TermId)> = Vec::new(); // (store, index, elem)
+    let mut cur = t;
+    let base = loop {
+        if is_declared_const(ctx, cur) {
+            break cur;
+        }
+        match store_parts(ctx, cur) {
+            Some((inner, i, e)) => {
+                frames.push((cur, i, e));
+                cur = inner;
+            }
+            None => {
+                return Err(Rejection::Unsupported {
+                    term: cur,
+                    why: "array term is neither a declared constant nor a store chain",
+                })
+            }
+        }
+    };
+
+    let mut overlay: BTreeMap<Integer, Integer> = BTreeMap::new();
+    for &(frame, i, e) in frames.iter().rev() {
+        let (Some((_, iv)), Some((_, ev))) = (bridge.value_bv(ctx, i), bridge.value_bv(ctx, e))
+        else {
+            // Ruling R9. A SELECT with no value is silence (see
+            // `Gate::derive_base_pins`) but a STORE with no value MUST reject,
+            // and the reason is stronger than "be conservative": a silently
+            // dropped store pin CORRUPTS the pin set, and C2-neg's definiteness
+            // argument reads that set. Two chains differing only at an index
+            // whose value is unknown would then look pinned-identically and
+            // `DiseqPinsForceEqual` would fire on a model that is NOT
+            // definitely equal. Under-pinning a store therefore turns into
+            // OVER-rejection elsewhere, which is the failure mode this slice
+            // cannot afford. Spec §3.4 lists the select and store cases
+            // together; that is loose wording, and this is the asymmetry.
+            return Err(Rejection::Unsupported {
+                term: frame,
+                why: "store index or element has no value in the model",
+            });
+        };
+        // A later write to the same index WINS.
+        overlay.insert(iv, ev);
+    }
+    Ok(Chain { base, overlay })
+}
+
+/// One `validate` pass over one model: the derived pin state plus its caches.
+///
+/// `chains` memoizes the resolution of each array term. `base_pins` holds the
+/// entries the model FORCES on each declared base array; deriving it once,
+/// up front, is both the correctness requirement (see `derive_base_pins`) and
+/// ruling R7's cost requirement — the alternative is re-deriving a base's pins
+/// once per select, which is quadratic in the number of selects.
 struct Gate<'a> {
     ctx: &'a Context,
     bridge: &'a dyn SatBridge,
-    reads_by_base: FxHashMap<TermId, Vec<(TermId, TermId)>>,
-    base_memo: FxHashMap<TermId, BTreeMap<Integer, Integer>>,
+    chains: FxHashMap<TermId, Chain>,
+    base_pins: FxHashMap<TermId, BTreeMap<Integer, Integer>>,
 }
 
 impl<'a> Gate<'a> {
-    fn new(ctx: &'a Context, abs: &Abstraction, bridge: &'a dyn SatBridge) -> Self {
-        let mut reads_by_base: FxHashMap<TermId, Vec<(TermId, TermId)>> = FxHashMap::default();
-        for (&sel, &r) in &abs.read_of {
-            if let Some((base, idx)) = select_parts(ctx, sel) {
-                reads_by_base.entry(base).or_default().push((idx, r));
-            }
-        }
+    fn new(ctx: &'a Context, bridge: &'a dyn SatBridge) -> Self {
         Gate {
             ctx,
             bridge,
-            reads_by_base,
-            base_memo: FxHashMap::default(),
+            chains: FxHashMap::default(),
+            base_pins: FxHashMap::default(),
         }
     }
 
-    /// Pins contributed by the READS on one array term, derived once and cached.
-    ///
-    /// This is where functional consistency is checked, and it is why the gate
-    /// must NOT reuse `crate::model::array_model`: that function dedups
-    /// first-wins (`model.rs:136`) and would silently swallow the conflict this
-    /// detects. A conflict is returned rather than cached, so the first scan of
-    /// a conflicting base still reports it — memoization must not swallow it.
-    fn base_pins(&mut self, arr: TermId) -> Result<&BTreeMap<Integer, Integer>, Rejection> {
-        if !self.base_memo.contains_key(&arr) {
-            let reads: &[(TermId, TermId)] = self
-                .reads_by_base
-                .get(&arr)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
-            let mut points: BTreeMap<Integer, Integer> = BTreeMap::new();
-            for &(idx, r) in reads {
-                let (Some((_, iv)), Some((_, rv))) = (
-                    self.bridge.value_bv(self.ctx, idx),
-                    self.bridge.value_bv(self.ctx, r),
-                ) else {
-                    // No value ⇒ nothing pinned. Not a violation.
-                    continue;
-                };
-                match points.get(&iv) {
-                    Some(prev) if prev != &rv => {
-                        return Err(Rejection::ReadConflict {
-                            array: arr,
-                            index: iv,
-                        });
-                    }
-                    Some(_) => {}
-                    None => {
-                        points.insert(iv, rv);
-                    }
-                }
-            }
-            self.base_memo.insert(arr, points);
+    /// The resolved chain of an array term, derived once and cached.
+    fn chain(&mut self, t: TermId) -> Result<&Chain, Rejection> {
+        match self.chains.entry(t) {
+            Entry::Occupied(o) => Ok(o.into_mut()),
+            Entry::Vacant(v) => Ok(v.insert(resolve_chain(self.ctx, self.bridge, t)?)),
         }
-        Ok(&self.base_memo[&arr])
     }
 
-    /// Compute the pins of an array-sorted term, walking its store chain down to
-    /// a declared constant. Anything outside that grammar is a conservative
-    /// reject.
+    /// Derive every entry the model FORCES on the declared base arrays, and
+    /// check functional consistency (C1) while doing it.
     ///
-    /// The walk is iterative rather than recursive so a long store chain (BMC
-    /// instances build them thousands deep) cannot overflow the stack. It
-    /// descends WITHOUT reading any value first, so the order in which failures
-    /// are reported matches a bottom-up evaluation: a malformed base before any
-    /// missing store value, and an inner store before an outer one.
-    fn pins(&mut self, t: TermId) -> Result<Pins, Rejection> {
-        let mut frames: Vec<TermId> = Vec::new(); // store terms, outermost first
-        let mut cur = t;
-        let base = loop {
-            if is_declared_const(self.ctx, cur) {
-                break cur;
+    /// A read is attributed to the BASE of its chain, not to the chain term
+    /// (ruling R8). If `select(chain, j)` has index value `jv` and NO frame of
+    /// that chain writes `jv`, then `chain[jv] == base[jv]` by the store axiom,
+    /// so the model's read value forces `base[jv]`. Without this, two reads
+    /// through DIFFERENT chains over the SAME base at the same index value
+    /// would each see an empty pin set and the gate would stay silent on a
+    /// definite violation — a hole `check.rs::functional_consistency` does not
+    /// cover either, since it skips pairs whose syntactic arrays differ.
+    ///
+    /// The converse is the fence: a read whose index IS written by a frame is
+    /// SHADOWED. It observes the chain's own write, says nothing whatever about
+    /// the base, and must NOT be attributed — attributing it would invent a
+    /// base pin the model never committed to and turn correct answers into
+    /// fenced unknowns.
+    ///
+    /// This is also why the gate must NOT reuse `crate::model::array_model`:
+    /// that function dedups conflicting reads first-wins (`model.rs:136`) and
+    /// would silently swallow the conflict detected here.
+    fn derive_base_pins(&mut self, abs: &Abstraction) -> Result<(), Rejection> {
+        for (&sel, &r) in &abs.read_of {
+            let Some((arr, idx)) = select_parts(self.ctx, sel) else {
+                continue;
+            };
+            let idx_val = self.bridge.value_bv(self.ctx, idx);
+            let read_val = self.bridge.value_bv(self.ctx, r);
+            // Resolve unconditionally: an array term outside the grammar is a
+            // reject whether or not this particular read pins anything.
+            let ch = self.chain(arr)?;
+            let base = ch.base;
+            let (Some((_, iv)), Some((_, rv))) = (idx_val, read_val) else {
+                // Ruling R9. A read with no index or no value pins nothing, so
+                // there is no violation here to detect. Silence is correct;
+                // rejecting would be over-rejection on an underdetermined entry.
+                continue;
+            };
+            if ch.overlay.contains_key(&iv) {
+                // Shadowed by the chain's own write — says nothing about `base`.
+                continue;
             }
-            match store_parts(self.ctx, cur) {
-                Some((inner, _, _)) => {
-                    frames.push(cur);
-                    cur = inner;
+            let points = self.base_pins.entry(base).or_default();
+            match points.get(&iv) {
+                Some(prev) if prev != &rv => {
+                    return Err(Rejection::ReadConflict {
+                        array: base,
+                        index: iv,
+                    });
                 }
+                Some(_) => {}
                 None => {
+                    points.insert(iv, rv);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// C1 read soundness: a read must agree with whatever its array term is
+    /// already pinned to at the read's index — the chain's own write if there
+    /// is one, else the base's pin. An unpinned index is FREE, and the check
+    /// stays silent there.
+    fn check_reads(&mut self, abs: &Abstraction) -> Result<(), Rejection> {
+        for (&sel, &r) in &abs.read_of {
+            let Some((arr, idx)) = select_parts(self.ctx, sel) else {
+                continue;
+            };
+            let idx_val = self.bridge.value_bv(self.ctx, idx);
+            let read_val = self.bridge.value_bv(self.ctx, r);
+            let ch = self.chain(arr)?;
+            let base = ch.base;
+            let (Some((_, iv)), Some((_, rv))) = (idx_val, read_val) else {
+                continue;
+            };
+            let pinned = ch.overlay.get(&iv).cloned();
+            let pinned =
+                pinned.or_else(|| self.base_pins.get(&base).and_then(|p| p.get(&iv)).cloned());
+            if let Some(p) = pinned {
+                if p != rv {
+                    return Err(Rejection::ReadMismatch { select: sel });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The full pin map of an array term: the base's derived pins with the
+    /// chain's writes laid over them.
+    fn pins(&mut self, t: TermId) -> Result<Pins, Rejection> {
+        let ch = self.chain(t)?;
+        let base = ch.base;
+        let overlay = ch.overlay.clone();
+        let mut points = self.base_pins.get(&base).cloned().unwrap_or_default();
+        points.extend(overlay);
+        Ok(Pins { base, points })
+    }
+
+    /// C2 / C3 over the array equality atoms.
+    fn check_array_eqs(&mut self, abs: &Abstraction, c: &Collected) -> Result<(), Rejection> {
+        for &atom in &c.array_eqs {
+            let (a, b) = array_pair(self.ctx, atom)?;
+            let Some(&proxy) = abs.eq_proxy.get(&atom) else {
+                continue;
+            };
+            // §3.4: mismatched or non-BV index/element sorts are outside the
+            // grammar — the gate reasons about BV index VALUES, and a sort with
+            // no bit width has none.
+            match (array_widths(self.ctx, a), array_widths(self.ctx, b)) {
+                (Some(wa), Some(wb)) if wa == wb => {}
+                _ => {
                     return Err(Rejection::Unsupported {
-                        term: cur,
-                        why: "array term is neither a declared constant nor a store chain",
+                        term: atom,
+                        why: "array-eq operands have mismatched or non-BV index/element widths",
                     })
                 }
             }
-        };
 
-        let mut points = self.base_pins(base)?.clone();
-        for &frame in frames.iter().rev() {
-            let (_, i, e) = store_parts(self.ctx, frame).expect("frame was matched as a store");
-            let (Some((_, iv)), Some((_, ev))) = (
-                self.bridge.value_bv(self.ctx, i),
-                self.bridge.value_bv(self.ctx, e),
-            ) else {
-                return Err(Rejection::Unsupported {
-                    term: frame,
-                    why: "store index or element has no value in the model",
-                });
+            // C3 — proxy totality.
+            let Some(pv) = self.bridge.value_bool(proxy) else {
+                return Err(Rejection::ProxyUnassigned { atom });
             };
-            // A later write to the same index WINS.
-            points.insert(iv, ev);
+
+            let pa = self.pins(a)?;
+            let pb = self.pins(b)?;
+
+            if pv {
+                // C2-pos: reject only where BOTH sides are pinned and differ.
+                for (k, va) in &pa.points {
+                    if let Some(vb) = pb.points.get(k) {
+                        if va != vb {
+                            return Err(Rejection::EqPinsDiffer { atom });
+                        }
+                    }
+                }
+            } else {
+                // C2-neg: reject only when the arrays are DEFINITELY equal, i.e.
+                // they share a base AND every index in the union of the two pin
+                // sets is pinned on both sides with equal values. A one-sided
+                // pin leaves that entry free on the other side, so the
+                // disequality is still satisfiable and the gate must stay silent.
+                if pa.base == pb.base
+                    && pa.points.len() == pb.points.len()
+                    && pa.points.iter().all(|(k, va)| pb.points.get(k) == Some(va))
+                {
+                    return Err(Rejection::DiseqPinsForceEqual { atom });
+                }
+            }
         }
-        Ok(Pins { base, points })
+        Ok(())
     }
 }
 
@@ -212,7 +355,8 @@ fn array_pair(ctx: &Context, atom: TermId) -> Result<(TermId, TermId), Rejection
     })
 }
 
-/// Index/element widths of an array-sorted term.
+/// Index/element widths of an array-sorted term. `None` when either component
+/// sort is not a bitvector (a nested array index, say), which §3.4 excludes.
 fn array_widths(ctx: &Context, arr: TermId) -> Option<(u32, u32)> {
     match ctx.sort_node(ctx.sort_of(arr)) {
         SortNode::Array(i, e) => Some((ctx.bv_width(*i)?, ctx.bv_width(*e)?)),
@@ -232,79 +376,13 @@ pub fn validate(
     c: &Collected,
     bridge: &dyn SatBridge,
 ) -> Result<(), Rejection> {
-    let mut gate = Gate::new(ctx, abs, bridge);
-
-    // C1 — read soundness. Covers functional consistency (conflicting reads on
-    // a bare constant, caught inside `base_pins`) and read-over-write (a read
-    // through a chain that disagrees with the chain's pin), in one pass.
-    for (&sel, &r) in &abs.read_of {
-        let Some((arr, idx)) = select_parts(ctx, sel) else {
-            continue;
-        };
-        let p = gate.pins(arr)?;
-        let (Some((_, iv)), Some((_, rv))) = (bridge.value_bv(ctx, idx), bridge.value_bv(ctx, r))
-        else {
-            // An index or read with no value pins nothing, so nothing can be
-            // contradicted here.
-            continue;
-        };
-        if let Some(pinned) = p.points.get(&iv) {
-            if pinned != &rv {
-                return Err(Rejection::ReadMismatch { select: sel });
-            }
-        }
-    }
-
-    // C2 / C3 — the array equality atoms.
-    for &atom in &c.array_eqs {
-        let (a, b) = array_pair(ctx, atom)?;
-        let Some(&proxy) = abs.eq_proxy.get(&atom) else {
-            continue;
-        };
-        // §3.4: mismatched widths are outside the grammar.
-        match (array_widths(ctx, a), array_widths(ctx, b)) {
-            (Some(wa), Some(wb)) if wa == wb => {}
-            _ => {
-                return Err(Rejection::Unsupported {
-                    term: atom,
-                    why: "array-eq operands have mismatched or non-BV index/element widths",
-                })
-            }
-        }
-
-        // C3 — proxy totality.
-        let Some(pv) = bridge.value_bool(proxy) else {
-            return Err(Rejection::ProxyUnassigned { atom });
-        };
-
-        let pa = gate.pins(a)?;
-        let pb = gate.pins(b)?;
-
-        if pv {
-            // C2-pos: reject only where BOTH sides are pinned and differ.
-            for (k, va) in &pa.points {
-                if let Some(vb) = pb.points.get(k) {
-                    if va != vb {
-                        return Err(Rejection::EqPinsDiffer { atom });
-                    }
-                }
-            }
-        } else {
-            // C2-neg: reject only when the arrays are DEFINITELY equal, i.e.
-            // they share a base AND every index in the union of the two pin
-            // sets is pinned on both sides with equal values. A one-sided pin
-            // leaves that entry free on the other side, so the disequality is
-            // still satisfiable and the gate must stay silent.
-            if pa.base == pb.base
-                && pa.points.len() == pb.points.len()
-                && pa.points.iter().all(|(k, va)| pb.points.get(k) == Some(va))
-            {
-                return Err(Rejection::DiseqPinsForceEqual { atom });
-            }
-        }
-    }
-
-    Ok(())
+    let mut gate = Gate::new(ctx, bridge);
+    // Derive first, check second. Every check below reads the base pin set, and
+    // reads through a store chain contribute to it, so no check may run until
+    // the whole set exists.
+    gate.derive_base_pins(abs)?;
+    gate.check_reads(abs)?;
+    gate.check_array_eqs(abs, c)
 }
 
 #[cfg(test)]
@@ -755,6 +833,226 @@ mod tests {
         b.bv.insert(i, bv(3));
         b.bv.insert(e, bv(9));
         b.bv.insert(abs.read_of[&sel], bv(9)); // agrees with the store pin
+
+        assert!(validate(&ctx, &abs, &c, &b).is_ok());
+    }
+
+    /// §3.4: an array-sorted uninterpreted application with arity > 0 is
+    /// outside the grammar — its extension is not determined by the model's BV
+    /// assignments the way a declared constant's is (ruling R10: a NULLARY one
+    /// is a declared array constant and must keep being accepted).
+    #[test]
+    fn unsupported_array_sorted_uninterpreted_application_is_rejected() {
+        let mut ctx = Context::new();
+        let a_s = arr_sort(&mut ctx);
+        let s8 = ctx.bv_sort(8);
+        let i = uconst(&mut ctx, "i", s8);
+        let g = ctx.declare_fun("g", &[s8], a_s);
+        let ga = ctx.mk_app(Op::Uninterpreted(g), &[i]).unwrap();
+        let sel = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[ga, i])
+            .unwrap();
+        let other = uconst(&mut ctx, "o", s8);
+        let atom = ctx.mk_eq(sel, other).unwrap();
+        let c = collect(&ctx, &[atom]);
+        let abs = abstract_arrays(&mut ctx, &[atom], &c);
+
+        let mut b = FakeBridge::default();
+        b.bv.insert(i, bv(1));
+        b.bv.insert(abs.read_of[&sel], bv(1));
+        b.bv.insert(other, bv(1));
+
+        assert!(matches!(
+            validate(&ctx, &abs, &c, &b),
+            Err(Rejection::Unsupported { .. })
+        ));
+    }
+
+    /// §3.4: the gate reasons about BV index VALUES, so an array whose index
+    /// sort has no bit width — here a nested `(Array (Array _ _) _)` — is
+    /// outside the grammar. This is the "non-BV" half of `array_widths`.
+    #[test]
+    fn unsupported_non_bv_array_index_sort_is_rejected() {
+        let mut ctx = Context::new();
+        let inner = arr_sort(&mut ctx);
+        let e = ctx.bv_sort(8);
+        let nested = ctx.array_sort(inner, e); // (Array (Array (_ BitVec 8) (_ BitVec 8)) (_ BitVec 8))
+        let a = uconst(&mut ctx, "a", nested);
+        let b_arr = uconst(&mut ctx, "b", nested);
+        let atom = ctx.mk_eq(a, b_arr).unwrap();
+        let c = collect(&ctx, &[atom]);
+        let abs = abstract_arrays(&mut ctx, &[atom], &c);
+        assert_eq!(c.array_eqs, vec![atom]);
+
+        let mut b = FakeBridge::default();
+        // Assigned, so `ProxyUnassigned` cannot be what fires.
+        b.boolv.insert(abs.eq_proxy[&atom], true);
+
+        assert!(matches!(
+            validate(&ctx, &abs, &c, &b),
+            Err(Rejection::Unsupported { .. })
+        ));
+    }
+
+    /// §3.4 / ruling R9: a STORE whose element has no value in the model must
+    /// reject. Dropping the pin silently would corrupt the pin set that
+    /// C2-neg's definiteness argument reads, so under-pinning here would turn
+    /// into OVER-rejection there. Contrast `c1_silent_when_a_read_is_unassigned`.
+    #[test]
+    fn unsupported_store_element_with_no_model_value_is_rejected() {
+        let mut ctx = Context::new();
+        let a_s = arr_sort(&mut ctx);
+        let s8 = ctx.bv_sort(8);
+        let a = uconst(&mut ctx, "a", a_s);
+        let i = uconst(&mut ctx, "i", s8);
+        let e = uconst(&mut ctx, "e", s8);
+        let st = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Store), &[a, i, e])
+            .unwrap();
+        let sel = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[st, i])
+            .unwrap();
+        let other = uconst(&mut ctx, "o", s8);
+        let atom = ctx.mk_eq(sel, other).unwrap();
+        let c = collect(&ctx, &[atom]);
+        let abs = abstract_arrays(&mut ctx, &[atom], &c);
+
+        let mut b = FakeBridge::default();
+        b.bv.insert(i, bv(3));
+        // `e` is deliberately left with no value.
+        b.bv.insert(abs.read_of[&sel], bv(4));
+        b.bv.insert(other, bv(4));
+
+        assert!(matches!(
+            validate(&ctx, &abs, &c, &b),
+            Err(Rejection::Unsupported { .. })
+        ));
+    }
+
+    /// §3.4: a store chain that BOTTOMS OUT in something other than a declared
+    /// constant is rejected. Distinct from `unsupported_array_ite_is_rejected`,
+    /// where the `ite` sits at the select's array position rather than under a
+    /// store.
+    #[test]
+    fn unsupported_store_chain_bottoming_out_in_an_ite_is_rejected() {
+        let mut ctx = Context::new();
+        let a_s = arr_sort(&mut ctx);
+        let s8 = ctx.bv_sort(8);
+        let a = uconst(&mut ctx, "a", a_s);
+        let b_arr = uconst(&mut ctx, "b", a_s);
+        let bool_s = ctx.bool_sort();
+        let p = uconst(&mut ctx, "p", bool_s);
+        let ite = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[p, a, b_arr])
+            .unwrap();
+        let i = uconst(&mut ctx, "i", s8);
+        let e = uconst(&mut ctx, "e", s8);
+        let st = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Store), &[ite, i, e])
+            .unwrap();
+        let sel = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[st, i])
+            .unwrap();
+        let other = uconst(&mut ctx, "o", s8);
+        let atom = ctx.mk_eq(sel, other).unwrap();
+        let c = collect(&ctx, &[atom]);
+        let abs = abstract_arrays(&mut ctx, &[atom], &c);
+
+        let mut b = FakeBridge::default();
+        b.bv.insert(i, bv(1));
+        b.bv.insert(e, bv(2));
+        b.bv.insert(abs.read_of[&sel], bv(2));
+        b.bv.insert(other, bv(2));
+
+        assert!(matches!(
+            validate(&ctx, &abs, &c, &b),
+            Err(Rejection::Unsupported { .. })
+        ));
+    }
+
+    /// Ruling R8: two reads through DIFFERENT store chains over the SAME base,
+    /// at the same index value, with neither chain writing that index. Both
+    /// reads see `base[jv]`, so different read values are a definite functional
+    /// -consistency violation. Before R8 both reads saw an empty pin set and the
+    /// gate stayed silent — and `check.rs::functional_consistency` misses this
+    /// shape too, because it skips pairs whose syntactic arrays differ.
+    #[test]
+    fn c1_rejects_reads_through_different_chains_over_one_base() {
+        let mut ctx = Context::new();
+        let a_s = arr_sort(&mut ctx);
+        let s8 = ctx.bv_sort(8);
+        let a = uconst(&mut ctx, "a", a_s);
+        let i = uconst(&mut ctx, "i", s8);
+        let e = uconst(&mut ctx, "e", s8);
+        let i2 = uconst(&mut ctx, "i2", s8);
+        let e2 = uconst(&mut ctx, "e2", s8);
+        let j = uconst(&mut ctx, "j", s8);
+        let k = uconst(&mut ctx, "k", s8);
+        let st1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Store), &[a, i, e])
+            .unwrap();
+        let st2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Store), &[a, i2, e2])
+            .unwrap();
+        let sel1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[st1, j])
+            .unwrap();
+        let sel2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[st2, k])
+            .unwrap();
+        let atom = ctx.mk_eq(sel1, sel2).unwrap();
+        let c = collect(&ctx, &[atom]);
+        let abs = abstract_arrays(&mut ctx, &[atom], &c);
+
+        let mut b = FakeBridge::default();
+        b.bv.insert(i, bv(1));
+        b.bv.insert(e, bv(5));
+        b.bv.insert(i2, bv(2));
+        b.bv.insert(e2, bv(6));
+        b.bv.insert(j, bv(7)); // neither chain writes 7 ...
+        b.bv.insert(k, bv(7)); // ... so both reads see a[7]
+        b.bv.insert(abs.read_of[&sel1], bv(1));
+        b.bv.insert(abs.read_of[&sel2], bv(2)); // a[7] cannot be both
+
+        assert!(matches!(
+            validate(&ctx, &abs, &c, &b),
+            Err(Rejection::ReadConflict { .. })
+        ));
+    }
+
+    /// Ruling R8's fence, and the way that fix could have become an
+    /// over-rejection. A read whose index IS written by its own chain is
+    /// SHADOWED: it observes the chain's write, not the base, and must NOT be
+    /// attributed to the base. Here `select(store(a,5,9), 5) = 9` coexists with
+    /// `select(a, 5) = 3`, which is perfectly consistent — `a[5]` is 3 and the
+    /// store overwrites it with 9. Attributing the shadowed read to `a` would
+    /// invent the pin `a[5] = 9` and fire a spurious `ReadConflict`.
+    #[test]
+    fn c1_silent_when_a_chain_read_is_shadowed_by_its_own_write() {
+        let mut ctx = Context::new();
+        let a_s = arr_sort(&mut ctx);
+        let s8 = ctx.bv_sort(8);
+        let a = uconst(&mut ctx, "a", a_s);
+        let i = uconst(&mut ctx, "i", s8);
+        let e = uconst(&mut ctx, "e", s8);
+        let m = uconst(&mut ctx, "m", s8);
+        let st = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Store), &[a, i, e])
+            .unwrap();
+        let shadowed = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[st, i])
+            .unwrap();
+        let direct = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[a, m]).unwrap();
+        let atom = ctx.mk_eq(shadowed, direct).unwrap();
+        let c = collect(&ctx, &[atom]);
+        let abs = abstract_arrays(&mut ctx, &[atom], &c);
+
+        let mut b = FakeBridge::default();
+        b.bv.insert(i, bv(5));
+        b.bv.insert(e, bv(9));
+        b.bv.insert(m, bv(5)); // the SAME index value as the store writes
+        b.bv.insert(abs.read_of[&shadowed], bv(9)); // sees the store's write
+        b.bv.insert(abs.read_of[&direct], bv(3)); // sees the base, freely
 
         assert!(validate(&ctx, &abs, &c, &b).is_ok());
     }
