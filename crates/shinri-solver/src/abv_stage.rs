@@ -270,6 +270,44 @@ struct RealBridge {
     atom_lit: FxHashMap<TermId, Lit>,
     /// Array-eq Bool proxy TermId → its fresh SAT var.
     proxy_var: FxHashMap<TermId, Var>,
+    /// The model of the last successful `solve`, indexed by `Var::index()`.
+    ///
+    /// Slice 47: the value readers MUST read this and not the live solver.
+    /// `Sat::add_clause` backtracks to level 0, so ANY clause added after a
+    /// solve — a lemma, or the definitional clauses of a word blasted on
+    /// demand — wipes the assignment. The old `value_bv` blasted lazily and
+    /// then read the live solver, so the first query for an unblasted word
+    /// destroyed the model and every subsequent query returned a fabricated
+    /// zero. All-zero index values make every check agree with itself, so the
+    /// refinement loop reached its "no new lemma" fixpoint in round 0 without
+    /// examining anything and reported `Sat`. A snapshot cannot be invalidated
+    /// by a later clause.
+    ///
+    /// A `Var` at or beyond `model.len()` was allocated AFTER the snapshot, so
+    /// the model says nothing about it; such a word reads as `None`, never as
+    /// zero. Within the snapshot an unassigned var is genuinely free (the SAT
+    /// solver assigns every var that reaches a clause), and `false` is as good
+    /// a choice as any.
+    model: Vec<Option<bool>>,
+    /// Words `value_bv` could not value against `model`. Drained and blasted at
+    /// the top of the next `solve`, so the next model does assign them.
+    ///
+    /// INVARIANT: every term in here is BV-sorted and free of array operations,
+    /// i.e. `blast_word` can encode it (`is_blastable`). A term that is not is
+    /// never queued, so `pending_words` cannot stay true forever.
+    pending: std::cell::RefCell<Vec<TermId>>,
+    /// Original word → the same word with every `select` replaced by its read
+    /// var. An index or element term may mention a `select` (`(select p (bvadd
+    /// x (select q #x03)))` is ordinary in the `egt` family); `blast_word`
+    /// cannot encode one, and the abstraction never built the word itself —
+    /// only the enclosing select's read var. Blasting the ABSTRACTED word gives
+    /// it the value the model already implies for its parts.
+    ///
+    /// Built once by `prewarm_array_words`, which owns the `&mut Context` the
+    /// rewrite needs. Words the refinement loop discovers later are either
+    /// already-aliased index terms (ROW-2 reuses the select's own index) or
+    /// fresh extensionality witnesses, which need no rewrite.
+    word_alias: FxHashMap<TermId, TermId>,
 }
 
 impl BlastState {
@@ -412,8 +450,168 @@ impl RealBridge {
             st: std::cell::RefCell::new(st),
             atom_lit,
             proxy_var,
+            model: Vec::new(),
+            pending: std::cell::RefCell::new(Vec::new()),
+            word_alias: FxHashMap::default(),
         }
     }
+
+    /// Queue every BV word the refinement checks and the post-solve gate will
+    /// read — each select's index, each read var, and every index/element term
+    /// along the store chain each select or array equality stands over — so the
+    /// FIRST solve already assigns them.
+    ///
+    /// Without this the loop still converges (an unvalued word makes its check
+    /// silent, `pending_words` forces another round, and the next model has
+    /// it), but `crate::abv_stage`'s post-solve gate runs OUTSIDE that loop:
+    /// a store element it cannot value is a §3.4 conservative rejection, i.e. a
+    /// correct `sat` fenced to `unknown`. Pre-warming keeps the gate's inputs
+    /// as complete as the checks' are.
+    fn prewarm_array_words(&mut self, ctx: &mut Context, abs: &shinri_abv::Abstraction) {
+        fn push_chain(ctx: &Context, mut t: TermId, out: &mut Vec<TermId>) {
+            while let TermNode::App {
+                op: Op::Builtin(BuiltinOp::Store),
+                args,
+                ..
+            } = ctx.term_node(t)
+            {
+                let k = ctx.children(*args);
+                out.push(k[1]);
+                out.push(k[2]);
+                t = k[0];
+            }
+        }
+        let mut words: Vec<TermId> = Vec::new();
+        for (&sel, &r) in &abs.read_of {
+            words.push(r);
+            if let TermNode::App {
+                op: Op::Builtin(BuiltinOp::Select),
+                args,
+                ..
+            } = ctx.term_node(sel)
+            {
+                let k = ctx.children(*args);
+                words.push(k[1]);
+                push_chain(ctx, k[0], &mut words);
+            }
+        }
+        for &atom in abs.eq_proxy.keys() {
+            if let TermNode::App {
+                op: Op::Builtin(BuiltinOp::Eq),
+                args,
+                ..
+            } = ctx.term_node(atom)
+            {
+                for side in ctx.children(*args).to_vec() {
+                    push_chain(ctx, side, &mut words);
+                }
+            }
+        }
+        let mut memo: FxHashMap<TermId, Option<TermId>> = FxHashMap::default();
+        let mut queued: Vec<TermId> = Vec::new();
+        for w in words {
+            if ctx.bv_width(ctx.sort_of(w)).is_none() {
+                continue;
+            }
+            // `abstract_word` needs `&mut Context` to build the rewritten term,
+            // which is why the prewarm — and not the `&self` value readers —
+            // owns this translation.
+            if let Some(a) = abstract_word(ctx, abs, w, &mut memo) {
+                if a != w {
+                    self.word_alias.insert(w, a);
+                }
+                queued.push(a);
+            }
+        }
+        self.pending.borrow_mut().extend(queued);
+    }
+
+    /// Queue extra BV words for blasting at the next solve. Used for terms the
+    /// array layer never reads but a CALLER does — the eliminated-ite symbols
+    /// `get-value` reports — so their bits exist in the model that is snapshot.
+    fn queue_words(&mut self, ctx: &Context, words: &[TermId]) {
+        let mut pending = self.pending.borrow_mut();
+        pending.extend(words.iter().copied().filter(|&w| is_blastable(ctx, w)));
+    }
+}
+
+/// True if `blast_word` can encode `t`: BV-sorted with no array operation
+/// anywhere beneath it. Iterative, so a deep store chain cannot overflow.
+fn is_blastable(ctx: &Context, t: TermId) -> bool {
+    if ctx.bv_width(ctx.sort_of(t)).is_none() {
+        return false;
+    }
+    let mut seen = rustc_hash::FxHashSet::default();
+    let mut stack = vec![t];
+    while let Some(cur) = stack.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        if let TermNode::App { op, args, .. } = ctx.term_node(cur) {
+            if matches!(
+                op,
+                Op::Builtin(BuiltinOp::Select) | Op::Builtin(BuiltinOp::Store)
+            ) {
+                return false;
+            }
+            stack.extend_from_slice(ctx.children(*args));
+        }
+    }
+    true
+}
+
+/// Rewrite `t` with every `select` subterm replaced by its abstraction read
+/// var, so the result is blastable. `None` when an array operation survives —
+/// a `store`, or a `select` the abstraction never gave a read var — in which
+/// case the word has no value and every caller treats that as silence.
+fn abstract_word(
+    ctx: &mut Context,
+    abs: &shinri_abv::Abstraction,
+    t: TermId,
+    memo: &mut FxHashMap<TermId, Option<TermId>>,
+) -> Option<TermId> {
+    if let Some(&r) = abs.read_of.get(&t) {
+        return Some(r);
+    }
+    if let Some(&m) = memo.get(&t) {
+        return m;
+    }
+    let out = match ctx.term_node(t).clone() {
+        TermNode::Const { .. } => Some(t),
+        TermNode::App { op, args, .. } => {
+            if matches!(
+                op,
+                Op::Builtin(BuiltinOp::Select) | Op::Builtin(BuiltinOp::Store)
+            ) {
+                None
+            } else {
+                let kids: Vec<TermId> = ctx.children(args).to_vec();
+                let mut rebuilt: Vec<TermId> = Vec::with_capacity(kids.len());
+                let mut changed = false;
+                for k in &kids {
+                    match abstract_word(ctx, abs, *k, memo) {
+                        Some(nk) => {
+                            changed |= nk != *k;
+                            rebuilt.push(nk);
+                        }
+                        None => {
+                            rebuilt.clear();
+                            break;
+                        }
+                    }
+                }
+                if rebuilt.len() != kids.len() {
+                    None
+                } else if changed {
+                    ctx.mk_app(op, &rebuilt).ok()
+                } else {
+                    Some(t)
+                }
+            }
+        }
+    };
+    memo.insert(t, out);
+    out
 }
 
 /// Tseitin-encode a Bool-sorted abstracted term over the `NoTheory` solver.
@@ -570,53 +768,101 @@ fn gate_ite(sat: &mut Sat, sel: Lit, a: Lit, b: Lit) -> Lit {
 }
 
 impl shinri_abv::SatBridge for RealBridge {
-    fn solve(&mut self) -> bool {
-        matches!(
+    fn solve(&mut self, ctx: &Context) -> bool {
+        // Blast every word a check (or the gate) asked for and could not value,
+        // BEFORE solving. `ensure_word` adds definitional clauses, and
+        // `Sat::add_clause` backtracks to level 0 — doing it here means the
+        // wipe lands on a model nobody is reading any more, and the model this
+        // solve produces actually assigns the new bits. `ensure_word` is
+        // idempotent, so a duplicate in `pending` costs a hash lookup.
+        let pending: Vec<TermId> = self.pending.borrow_mut().drain(..).collect();
+        {
+            let mut st = self.st.borrow_mut();
+            for t in pending {
+                st.ensure_word(ctx, t);
+            }
+        }
+        let sat = matches!(
             self.st.borrow_mut().sat.solve(),
             shinri_sat::SolveResult::Sat
-        )
+        );
+        // Snapshot the model while it is still on the trail. Every later
+        // `value_bv` / `value_bool` reads this, so no clause added afterwards
+        // can turn a real value into a fabricated zero.
+        self.model.clear();
+        if sat {
+            let st = self.st.borrow();
+            self.model
+                .extend((0..st.sat.num_vars()).map(|i| st.sat.value_of(Var::new(i as u32))));
+        }
+        sat
+    }
+
+    fn pending_words(&self) -> bool {
+        !self.pending.borrow().is_empty()
     }
 
     fn value_bv(&self, ctx: &Context, t: TermId) -> Option<(u32, shinri_num::Integer)> {
         // Only BV-sorted terms have bits. (A non-BV term — a Bool proxy, say —
         // has no width: return None.)
         let width = ctx.bv_width(ctx.sort_of(t))?;
-        let mut st = self.st.borrow_mut();
-        // Blast `t` on demand if it has never been blasted (e.g. an index or
-        // extensionality witness that only ever appeared inside an abstracted-away
-        // select). The current SAT model leaves the fresh bits unassigned, which
-        // `value_of` reports as `false` (an arbitrary but consistent value); the
-        // next solve assigns them and the relevant check re-runs. This is the
-        // brief's "blast it now" recipe, realized via interior mutability because
-        // the `SatBridge::value_bv` signature is `&self`.
-        //
-        // SAFETY/SOUNDNESS: `ensure_word` only ADDS definitional clauses (and, for
-        // a plain variable, no clauses at all) over fresh vars — it never removes
-        // or weakens a constraint, so it cannot turn a real UNSAT into SAT.
-        st.ensure_word(ctx, t);
-        let vars = st.var_bits.get(&t)?;
+        // An index or element word may mention a `select`; the prewarm recorded
+        // the blastable rewrite of it (see `word_alias`).
+        let t = self.word_alias.get(&t).copied().unwrap_or(t);
+        let st = self.st.borrow();
+        // READ-ONLY. The predecessor blasted `t` here, on demand, and then read
+        // the live solver — but `Sat::add_clause` backtracks to level 0, so
+        // that blast wiped the assignment and every value read afterwards was a
+        // fabricated zero (see the `model` field). A word this model cannot
+        // value is queued instead and blasted at the top of the next `solve`;
+        // `None` is silence for every caller, and `pending_words` makes the
+        // refinement loop take another round rather than mistake that silence
+        // for a fixpoint.
+        let Some(vars) = st.var_bits.get(&t) else {
+            drop(st);
+            // Only a blastable word may be queued. `blast_word` panics on an
+            // array operation, and a word that can never be blasted would keep
+            // `pending_words` true forever.
+            if is_blastable(ctx, t) {
+                self.pending.borrow_mut().push(t);
+            }
+            return None;
+        };
         debug_assert_eq!(vars.len() as u32, width, "var_bits width mismatch");
-        // Reconstruct each bit POLARITY-AWARE: the bit is `value_of(sat_var) == pos`.
+        // A bit whose var was allocated after the snapshot is NOT free — it is
+        // simply outside this model — so refuse to invent a value for it.
+        if vars.iter().any(|&(v, _)| v.index() >= self.model.len()) {
+            return None;
+        }
+        // Reconstruct each bit POLARITY-AWARE: the bit is `model[sat_var] == pos`.
         // This is correct for every blasted shape, including:
-        //   * constant 0-bits / `zero()`  → BitLit{var0, pos:false}: value_of(var0)
+        //   * constant 0-bits / `zero()`  → BitLit{var0, pos:false}: var0's value
         //     is always the pinned `true`, and `true == false` = bit 0 (correct);
         //   * constant 1-bits / `one()`    → BitLit{var0, pos:true}: `true == true` = 1;
         //   * negated signal bits (`bvnot`/`bvneg`/`zero_extend` high bits, …)
-        //     → BitLit{var:N, pos:false}: bit is `value_of(N) == false`.
+        //     → BitLit{var:N, pos:false}: bit is `value(N) == false`.
         // Dropping `pos` (the prior bug) misread every such bit and could starve a
         // ROW / functional-consistency lemma of a needed value → wrong verdict.
         let bits: Vec<bool> = vars
             .iter()
-            .map(|&(v, pos)| st.sat.value_of(v).unwrap_or(false) == pos)
+            .map(|&(v, pos)| self.model[v.index()].unwrap_or(false) == pos)
             .collect();
         Some((width, shinri_bv::model::pack(width, &bits)))
     }
 
     fn value_bool(&self, t: TermId) -> Option<bool> {
-        let st = self.st.borrow();
         let v = self.proxy_var.get(&t)?;
-        // An unassigned proxy var defaults to false (the abstraction left it free).
-        Some(st.sat.value_of(*v).unwrap_or(false))
+        // Read the snapshot, not the live solver, for the same reason `value_bv`
+        // does. A proxy var is allocated by `encode_skeleton` before the first
+        // solve, so it is always inside the snapshot; an unassigned one is free
+        // and defaults to false (the abstraction never forced it).
+        Some(
+            self.model
+                .get(v.index())
+                .copied()
+                .flatten()
+                .unwrap_or(false),
+        )
     }
 
     fn ensure_atom(&mut self, ctx: &mut Context, atom: TermId) {
@@ -730,16 +976,29 @@ pub fn solve_qfabv_with_models(
     let mut c = collect(ctx, assertions);
     let mut abs = abstract_arrays(ctx, assertions, &c);
     let mut bridge = RealBridge::new(ctx, &abs);
+    // Slice 47 T6: queue the index/element words the checks and the gate read,
+    // so the FIRST model already assigns them. See `prewarm_array_words`.
+    bridge.prewarm_array_words(ctx, &abs);
+    bridge.queue_words(ctx, internal_ite_syms);
     let outcome = refine(ctx, &mut abs, &mut c, &mut bridge);
-
-    if outcome != shinri_abv::AbvOutcome::Sat {
-        return (outcome, FxHashMap::default(), FxHashMap::default());
-    }
 
     // Slice 47: the refinement loop's fixpoint is on the LEMMA SET, not on the
     // array axioms, so it can report Sat on a model no array realises. Re-derive
     // the array pins from the model and reject a DEFINITE violation. Sound
     // downgrade: a rejected Sat becomes Unknown, never a wrong `sat`.
+    //
+    // The gate reads index and element words the refinement checks may never
+    // have touched; `prewarm_array_words` blasts them before the FIRST solve so
+    // the gate is not starved into a §3.4 conservative rejection. Re-entering
+    // `refine` to blast a straggler is deliberately NOT done: `refine` mints
+    // its extensionality witnesses as `$abv_wit_{n}` by position in a map local
+    // to the call, and a second call under a different model can hand the SAME
+    // name to a DIFFERENT atom. Two disequalities sharing one witness must then
+    // differ at the same index — an over-constraint that could turn a real
+    // `sat` into `unsat`. A fenced `unknown` is the sound alternative.
+    if outcome != shinri_abv::AbvOutcome::Sat {
+        return (outcome, FxHashMap::default(), FxHashMap::default());
+    }
     if let Err(reason) = validate(ctx, &abs, &c, &bridge) {
         // The reason is the bisect instrument (spec §3.5): it names WHICH axiom
         // the model breaks, so a failing corpus row can be attributed without a
@@ -785,6 +1044,7 @@ pub fn solve_qfabv_model_string(ctx: &mut Context, assertions: &[TermId], arr: T
     let mut c = collect(ctx, assertions);
     let mut abs = abstract_arrays(ctx, assertions, &c);
     let mut bridge = RealBridge::new(ctx, &abs);
+    bridge.prewarm_array_words(ctx, &abs);
     let outcome = refine(ctx, &mut abs, &mut c, &mut bridge);
     assert_eq!(
         outcome,
@@ -1160,6 +1420,40 @@ mod tests {
         let gt = ctx.mk_app(Op::Builtin(BuiltinOp::Gt), &[y, zero]).unwrap();
         assert!(uses_arrays_over_bv(&ctx, &[bv_atom, gt]));
         assert!(fenced(&ctx, &[bv_atom, gt]));
+    }
+
+    /// Slice 47 T6: a select whose INDEX mentions another select — the shape
+    /// `(select p (bvadd (select q k) #x01))`, ordinary in the `egt` family.
+    /// `blast_word` cannot encode a `select`, so handing it the raw index term
+    /// panics ("non-BV builtin reached blast_word"). The index must be rewritten
+    /// through `abstract_word` (every select replaced by its read var) before it
+    /// is blasted, which is what `RealBridge::prewarm_array_words` does.
+    ///
+    /// Before that rewrite this query panicked inside the post-solve gate, which
+    /// asks for the index value of every read.
+    #[test]
+    fn index_term_mentioning_a_select_is_valued_not_panicked() {
+        let mut ctx = Context::new();
+        let i8s = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i8s, i8s);
+        let p = uconst(&mut ctx, "p", arr);
+        let q = uconst(&mut ctx, "q", arr);
+        let k = uconst(&mut ctx, "k", i8s);
+        let sqk = ctx.mk_app(Op::Builtin(BuiltinOp::Select), &[q, k]).unwrap();
+        let one = ctx.mk_bv_const(8, shinri_num::Integer::from(1u64));
+        let idx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[sqk, one])
+            .unwrap();
+        let sel = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[p, idx])
+            .unwrap();
+        let ff = ctx.mk_bv_const(8, shinri_num::Integer::from(255u64));
+        let atom = ctx.mk_eq(sel, ff).unwrap();
+        assert_eq!(
+            solve_qfabv(&mut ctx, &[atom]),
+            shinri_abv::AbvOutcome::Sat,
+            "nothing constrains p or q; the gate must value the index, not crash"
+        );
     }
 
     #[test]
