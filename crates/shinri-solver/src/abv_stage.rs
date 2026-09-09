@@ -713,7 +713,8 @@ pub fn solve_qfabv_with_models(
     FxHashMap<TermId, shinri_theory::types::ModelVal>,
 ) {
     use shinri_abv::{
-        abstract_arrays, array_model, collect, normalize_array_atoms, refine, render, SatBridge,
+        abstract_arrays, array_model, collect, normalize_array_atoms, refine, render, validate,
+        SatBridge,
     };
     // SOUNDNESS: desugar n-ary + `distinct` array atoms into pairwise binary eqs
     // BEFORE collection/abstraction, so every array atom the pipeline sees is a
@@ -727,6 +728,24 @@ pub fn solve_qfabv_with_models(
 
     if outcome != shinri_abv::AbvOutcome::Sat {
         return (outcome, FxHashMap::default(), FxHashMap::default());
+    }
+
+    // Slice 47: the refinement loop's fixpoint is on the LEMMA SET, not on the
+    // array axioms, so it can report Sat on a model no array realises. Re-derive
+    // the array pins from the model and reject a DEFINITE violation. Sound
+    // downgrade: a rejected Sat becomes Unknown, never a wrong `sat`.
+    if let Err(reason) = validate(ctx, &abs, &c, &bridge) {
+        // The reason is the bisect instrument (spec §3.5): it names WHICH axiom
+        // the model breaks, so a failing corpus row can be attributed without a
+        // full re-run against an oracle.
+        if std::env::var_os("SHINRI_ABV_DEBUG").is_some() {
+            eprintln!("abv-model-rejected: {reason:?}");
+        }
+        return (
+            shinri_abv::AbvOutcome::ModelRejected,
+            FxHashMap::default(),
+            FxHashMap::default(),
+        );
     }
 
     // Build array models while `bridge`, `c`, and `abs` are still live.

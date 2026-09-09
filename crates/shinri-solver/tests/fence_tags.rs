@@ -83,3 +83,26 @@ fn fence_is_cleared_by_the_next_check_sat() {
     assert!(matches!(answers[1].0, CommandResponse::Sat));
     assert_eq!(answers[1].1, None);
 }
+
+/// Slice 47: a spurious QF_ABV `sat` is downgraded to a fenced Unknown rather
+/// than reported. `wchains002ue`-shaped: two store chains over the same base
+/// writing the same index set in opposite orders, asserted DISTINCT. The
+/// writes commute, so the assertion is unsat and any `sat` is spurious.
+#[test]
+fn qfabv_spurious_sat_is_tagged_or_decided() {
+    let (r, tag) = run("(set-logic QF_ABV)\
+         (declare-fun a () (Array (_ BitVec 4) (_ BitVec 4)))\
+         (declare-fun i () (_ BitVec 4))(declare-fun j () (_ BitVec 4))\
+         (declare-fun e () (_ BitVec 4))(declare-fun f () (_ BitVec 4))\
+         (assert (distinct i j))\
+         (assert (distinct (store (store a i e) j f) (store (store a j f) i e)))\
+         (check-sat)");
+    // The writes commute when i != j, so this is UNSAT. Either the engine
+    // decides it (best) or the gate downgrades it (sound). What must NEVER
+    // happen is a bare `sat`.
+    match r {
+        Some(CommandResponse::Unsat) => assert_eq!(tag, None),
+        Some(CommandResponse::Unknown) => assert_eq!(tag, Some("abv-model-rejected")),
+        other => panic!("QF_ABV commuting-store disequality must not be sat: {other:?}"),
+    }
+}
