@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap;
 use shinri_core::{BuiltinOp, Context, Op, SortNode, TermId, TermNode};
 
 /// The base array of a select term (`select(array, index)`), and its index.
-fn select_parts(ctx: &Context, sel: TermId) -> Option<(TermId, TermId)> {
+pub(crate) fn select_parts(ctx: &Context, sel: TermId) -> Option<(TermId, TermId)> {
     match ctx.term_node(sel) {
         TermNode::App {
             op: Op::Builtin(BuiltinOp::Select),
@@ -185,7 +185,7 @@ pub fn extensionality(
     lemmas
 }
 
-fn store_parts(ctx: &Context, t: TermId) -> Option<(TermId, TermId, TermId)> {
+pub(crate) fn store_parts(ctx: &Context, t: TermId) -> Option<(TermId, TermId, TermId)> {
     match ctx.term_node(t) {
         TermNode::App {
             op: Op::Builtin(BuiltinOp::Store),
