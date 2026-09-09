@@ -8,7 +8,7 @@ pub enum Input {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Invocation {
-    Run { input: Input },
+    Run { input: Input, stats: bool },
     Help,
     Version,
 }
@@ -27,15 +27,19 @@ Read an SMT-LIB 2.6 script from FILE, or from stdin if no FILE is given.
 Options:
   -h, --help       Print this help and exit
   -V, --version    Print version and exit
+      --stats      After each check-sat, print a `stats:` line on stderr
+                   (wall_ms, outcome, and the fence tag behind an unknown)
 ";
 
 /// Parse arguments (excluding the program name).
 pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation, ArgError> {
     let mut file: Option<String> = None;
+    let mut stats = false;
     for a in args {
         match a.as_str() {
             "-h" | "--help" => return Ok(Invocation::Help),
             "-V" | "--version" => return Ok(Invocation::Version),
+            "--stats" => stats = true,
             s if s.starts_with('-') && s != "-" => return Err(ArgError::Unknown(a)),
             _ => {
                 if file.is_some() {
@@ -49,7 +53,7 @@ pub fn parse_args<I: IntoIterator<Item = String>>(args: I) -> Result<Invocation,
         Some(f) => Input::File(f),
         None => Input::Stdin,
     };
-    Ok(Invocation::Run { input })
+    Ok(Invocation::Run { input, stats })
 }
 
 #[cfg(test)]
@@ -65,7 +69,8 @@ mod tests {
         assert_eq!(
             parse(&[]),
             Ok(Invocation::Run {
-                input: Input::Stdin
+                input: Input::Stdin,
+                stats: false
             })
         );
     }
@@ -75,7 +80,19 @@ mod tests {
         assert_eq!(
             parse(&["foo.smt2"]),
             Ok(Invocation::Run {
-                input: Input::File("foo.smt2".into())
+                input: Input::File("foo.smt2".into()),
+                stats: false
+            })
+        );
+    }
+
+    #[test]
+    fn stats_flag_sets_stats() {
+        assert_eq!(
+            parse(&["--stats", "a.smt2"]),
+            Ok(Invocation::Run {
+                input: Input::File("a.smt2".into()),
+                stats: true
             })
         );
     }

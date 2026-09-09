@@ -59,6 +59,24 @@ done
 description = "Mutation-test one crate (cargo-mutants); pick it via MUTANTS_PACKAGE, e.g. MUTANTS_PACKAGE=shinri-num mise run mutants"
 run = "mkdir -p target/mutants && cargo mutants --package \"$MUTANTS_PACKAGE\" --timeout 300 --output target/mutants"
 
+[tasks.bench-fetch]
+description = "Download + verify + extract the pinned SMT-LIB 2024 archives into bench/corpus (BENCH_LOGICS=A,B to subset; BENCH_MIRROR for a local mirror)"
+shell = "bash -c"
+run = "cargo run --release -p shinri-bench -- fetch ${BENCH_LOGICS:+--logics $BENCH_LOGICS} ${BENCH_MIRROR:+--mirror $BENCH_MIRROR}"
+
+[tasks.bench-run]
+description = "Run shinri over bench/corpus under limits (BENCH_LOGICS, BENCH_TIMEOUT=20, BENCH_MEM_MB=3072, BENCH_JOBS=6, BENCH_RUN_ID)"
+shell = "bash -c"
+run = [
+  "cargo build --release -p shinri-cli -p shinri-bench",
+  "target/release/shinri-bench run ${BENCH_LOGICS:+--logics $BENCH_LOGICS} --timeout ${BENCH_TIMEOUT:-20} --mem-mb ${BENCH_MEM_MB:-3072} --jobs ${BENCH_JOBS:-6} ${BENCH_RUN_ID:+--run-id $BENCH_RUN_ID}",
+]
+
+[tasks.bench-report]
+description = "Render bench/results/$BENCH_RUN_ID/report.md"
+shell = "bash -c"
+run = "cargo run --release -p shinri-bench -- report bench/results/$BENCH_RUN_ID"
+
 [tasks.ci]
 description = "Everything the blocking CI tier runs: lint, deny, secrets, test"
 depends = ["lint", "deny", "secrets", "test"]
