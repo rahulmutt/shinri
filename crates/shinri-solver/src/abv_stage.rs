@@ -703,6 +703,12 @@ fn collect_array_consts(ctx: &Context, assertions: &[TermId]) -> Vec<TermId> {
 /// each declared array constant `TermId` → its rendered SMT-LIB `store`-chain
 /// string, and `ite_sym_vals` maps each of `internal_ite_syms` → its assigned
 /// `ModelVal::BitVec`. On non-SAT outcomes both maps are empty.
+/// Slice 47: after `refine` reports `Sat` but before either map is built, the
+/// model runs through `shinri_abv::validate`, which re-derives the array pins
+/// and rejects a DEFINITE axiom violation. A rejected model downgrades the
+/// outcome to `AbvOutcome::ModelRejected` (surfaced by callers as a fenced
+/// `Unknown`, tag `"abv-model-rejected"`) and both maps come back empty, same
+/// as any other non-SAT outcome.
 pub fn solve_qfabv_with_models(
     ctx: &mut Context,
     assertions: &[TermId],
