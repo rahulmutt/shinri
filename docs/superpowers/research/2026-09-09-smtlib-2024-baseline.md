@@ -14,19 +14,38 @@ is the source in this document for parse-error diagnostics and for the
 panic/oom split; the baseline's own `parse-error:-` bucket carries no
 diagnostic because that field landed after the baseline run had started.
 
-Either run reproduces with `BENCH_RUN_ID=<run-id> mise run bench-run`; the
-corpus is pinned by md5 per archive in `bench/manifest.toml` (Zenodo record
-`10.5281/zenodo.11061097`, SMT-LIB release 2024, non-incremental). Raw JSONL
-is git-ignored. Every instance the solver answered reproduces with
-`target/release/shinri --stats <file>`; the oracles with `z3 <file>` and
-`cvc5 --lang smt2 <file>`.
+Both runs need `mise run bench-fetch` first, which downloads and verifies the
+Zenodo archives and extracts them into `bench/corpus/`. The baseline then
+reproduces with `BENCH_RUN_ID=baseline-8de004d44944 mise run bench-run`. There
+is no mise task for `rerun`; the re-run reproduces with the binary directly:
+
+```
+target/release/shinri-bench rerun bench/results/baseline-8de004d44944/results.jsonl \
+  --verdict oom,parse-error --timeout 20 --mem-mb 3072 --jobs 6 \
+  --run-id rerun-0fca46476479
+```
+
+`BENCH_RUN_ID=<run-id> mise run bench-report` renders that run's `report.md`
+from its `results.jsonl`.
+The corpus is pinned by md5 per archive in `bench/manifest.toml` (Zenodo
+record `10.5281/zenodo.11061097`, SMT-LIB release 2024, non-incremental). The
+baseline's fixture pins no `solver_md5` — that field landed with the re-run —
+so the baseline's binary is pinned only by its sha. Every instance the solver
+answered reproduces with `target/release/shinri --stats <file>`; the oracles
+with `z3 <file>` and `cvc5 --lang smt2 <file>`.
+
+Both runs' `report.md` are committed beside this document as
+`2026-09-09-smtlib-2024-baseline-report.md` and
+`2026-09-09-smtlib-2024-rerun-report.md`; every `Cites` pointer below names
+one of those two files and a section inside it.
 
 ## Headline
 
-- shinri decides 48.1% of the corpus: 123,894 `correct` out of 257,671, with
-  0 `malformed` rows. The remainder splits into 66,416 `unknown` (a fence
-  fired), 44,009 `parse-error`, 11,058 `timeout`, 8,082 `panic`, 2,099 `oom`,
-  742 `wrong` and 1,371 `unverified`.
+- shinri returns a decided answer on 126,007 of 257,671 rows (48.9%): 123,894
+  `correct`, 742 `wrong` and 1,371 `unverified`. The correct-rate is 48.1%,
+  and 742 of the answers are unsound. There are 0 `malformed` rows. The rows
+  with no answer split into 66,416 `unknown` (a fence fired), 44,009
+  `parse-error`, 11,058 `timeout`, 8,082 `panic` and 2,099 `oom`.
 - There are 742 soundness failures. 741 are a decided `sat` where the
   benchmark and/or an oracle says `unsat`; one is the reverse direction
   (`QF_S/20230329-automatark-lu/instance10773.smt2`, `:status sat`, shinri
@@ -80,9 +99,21 @@ figures are in the next section.
 
 The baseline binary derived no exit code when a child died from a signal, so
 every signal death landed in the `oom` bucket by the classifier's
-`rc == None` rule. The fix — recover the signal and report `rc = 128 + signal`
-— is in the merged code, and `rerun-0fca46476479` re-classifies the affected
-rows.
+`rc == None` rule. The fix has two halves. The first recovers the signal and
+reports it as `rc = 128 + signal`; every one of the 4,389 rows is a SIGABRT,
+so they all come back as `rc 134`. The second adds a
+`has overflowed its stack` / `fatal runtime error` clause to the `Panic` rule,
+which runs before the `Oom` rule.
+
+The second half is the one that produces the split, and the first half alone
+would not have. With the signal recovery but the old `Panic` rule, all 4,389
+rows carry `rc 134` and no `panicked at` line, so the `Oom` rule's
+`rc == Some(134)` arm catches every one of them and the 2,290 stack overflows
+stay misfiled as memory pressure. The two groups are told apart by stderr, not
+by exit code: the 2,290 carry `thread 'main' (N) has overflowed its stack` and
+`fatal runtime error: stack overflow`, and the 2,099 carry
+`memory allocation of N bytes failed`. Both halves are in the merged code, and
+`rerun-0fca46476479` re-classifies the affected rows.
 
 Of the 4,389 rows the baseline called `oom`:
 
@@ -91,11 +122,71 @@ Of the 4,389 rows the baseline called `oom`:
 | `panic` (Rust stack overflow) | 2290 | QF_BV 2180, QF_LIA 57, QF_ABV 53 |
 | `oom` (genuine allocation failure) | 2099 | QF_BV 1417, QF_LIA 519, QF_UFBV 80, QF_ABV 45, QF_FP 15, QF_UFLRA 10, QF_AUFBV 6, QF_UFLIA 5, QF_LRA 2 |
 
-The stack-overflow rows carry `thread 'main' (N) has overflowed its stack` on
-stderr. Corrected corpus totals are therefore **8,082 `panic`** (5,792 from
+Corrected corpus totals are therefore **8,082 `panic`** (5,792 from
 the blast `unreachable!`, 2,290 stack overflows) and **2,099 `oom`**. Read the
 per-logic matrix's `panic`/`oom` columns with that correction applied; every
 other column is unaffected.
+
+## Ranked gaps (by count)
+
+Every non-`correct` verdict bucketed and sorted by count, per spec §9.2. The
+`parse-error` rows and the `panic`/`oom` split come from
+`2026-09-09-smtlib-2024-rerun-report.md › ## Ranked gaps`, because the
+baseline predates the parse-error diagnostic and the signal-aware exit code;
+every other bucket comes from
+`2026-09-09-smtlib-2024-baseline-report.md › ## Ranked gaps`. Each report also
+lists three cheapest reproducers per bucket.
+
+| bucket | count | logics | source |
+| --- | ---: | --- | --- |
+| `parse-error:unsupported command: define-sort` | 39994 | QF_FP 39994 | re-run |
+| `unknown:str-indexof-replace` | 26363 | QF_S 80, QF_SLIA 26283 | baseline |
+| `unknown:str-predicate-polarity` | 16016 | QF_SLIA 16016 | baseline |
+| `timeout` | 11058 | QF_ABV 361, QF_AUFBV 19, QF_BV 5351, QF_BVFP 215, QF_DT 507, QF_FP 173, QF_LIA 3174, QF_LRA 181, QF_S 8, QF_SLIA 41, QF_UF 363, QF_UFBV 141, QF_UFLIA 523, QF_UFLRA 1 | baseline |
+| `panic:crates/shinri-bv/src/blast/mod.rs: internal error: entered unreachable code: non-BV builtin reached blast_word` | 5792 | QF_ABV 5787, QF_AUFBV 5 | baseline |
+| `unknown:sat-budget` | 5548 | QF_DT 11, QF_S 1353, QF_SLIA 4184 | baseline |
+| `unknown:theory-refused` | 5425 | QF_AX 551, QF_LIA 4764, QF_LRA 58, QF_SLIA 35, QF_UFLIA 17 | baseline |
+| `unknown:str-model-rejected` | 4290 | QF_S 1033, QF_SLIA 3257 | baseline |
+| `unknown:str-substr-at` | 3359 | QF_SLIA 3359 | baseline |
+| `unknown:reglan-decl` | 3287 | QF_SLIA 3287 | baseline |
+| `panic:thread 'main' (N) has overflowed its stack` | 2290 | QF_ABV 53, QF_BV 2180, QF_LIA 57 | re-run |
+| `oom` | 2099 | QF_ABV 45, QF_AUFBV 6, QF_BV 1417, QF_FP 15, QF_LIA 519, QF_LRA 2, QF_UFBV 80, QF_UFLIA 5, QF_UFLRA 10 | re-run |
+| `parse-error:sort error: NotApplicable` | 1858 | QF_LRA 762, QF_UFLRA 1096 | re-run |
+| `unknown:str-int-conv` | 1616 | QF_SLIA 1616 | baseline |
+| `unverified` | 1371 | QF_ABV 1, QF_BV 2, QF_BVFP 1, QF_DT 5, QF_FP 3, QF_LIA 3, QF_S 96, QF_SLIA 1260 | baseline |
+| ``parse-error:invalid BV numeral suffix `N` `` | 1129 | QF_ABV 22, QF_AUFBV 12, QF_BV 1045, QF_UFBV 50 | re-run |
+| `parse-error:sort error: Mismatch { expected: SortId(N), found: SortId(N) }` | 434 | QF_LRA 301, QF_UFLRA 133 | re-run |
+| `unknown:str-regex` | 369 | QF_S 343, QF_SLIA 26 | baseline |
+| `parse-error:unknown operator bvcomp` | 237 | QF_ABV 1, QF_BV 236 | re-run |
+| `parse-error:sort error: Arity { expected: N, found: N }` | 125 | QF_ABV 3, QF_AUFBV 1, QF_BV 117, QF_FP 4 | re-run |
+| `parse-error:unknown operator str.replace_re` | 98 | QF_SLIA 98 | re-run |
+| `parse-error:unknown operator str.replace_re_all` | 97 | QF_SLIA 97 | re-run |
+| `unknown:abv-fenced` | 62 | QF_ABV 62 | baseline |
+| `unknown:theory-lira` | 36 | QF_LRA 36 | baseline |
+| `parse-error:unknown operator !` | 34 | QF_UF 34 | re-run |
+| `unknown:bv-uf-budget` | 23 | QF_UFBV 23 | baseline |
+| `unknown:abv-uf-args` | 13 | QF_AUFBV 13 | baseline |
+| `unknown:bv-uf-args` | 9 | QF_AUFBV 1, QF_UFBV 8 | baseline |
+| `parse-error:(error S` | 3 | QF_BV 3 | re-run |
+
+The buckets reconcile with the per-logic matrix: `parse-error` sums to 44,009,
+`unknown` to 66,416, `panic` to 8,082, `timeout` to 11,058, `oom` to 2,099 and
+`unverified` to 1,371 — 133,035 rows, which with 123,894 `correct` and 742
+`wrong` is the corpus's 257,671.
+
+Buckets below 100 rows are listed here for completeness and are **not** filed
+as slices below. There are seven of them — `unknown:abv-fenced` 62,
+`unknown:theory-lira` 36, `parse-error:unknown operator !` 34,
+`unknown:bv-uf-budget` 23, `unknown:abv-uf-args` 13, `unknown:bv-uf-args` 9
+and `parse-error:(error S` 3 — 180 rows in total, 0.07% of the corpus, and
+none of them gates a logic. The one exception to the cut is
+`str.replace_re` (98) and `str.replace_re_all` (97): they are filed as a
+single 195-row slice below because they are a prerequisite for the regex
+work, not because either count clears the bar on its own. The five `unknown`
+fences among those seven are where the ABV engine (`abv-fenced`), the LIRA
+path (`theory-lira`) and the BV/array UF handling (`bv-uf-budget`,
+`abv-uf-args`, `bv-uf-args`) hit their own limits, at a scale that does not
+yet justify a slice.
 
 ## Next slices (spec §5 priority order)
 
@@ -103,7 +194,8 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
 (by count) > `Timeout`/`Oom`.
 
 1. **QF_ABV wrong answers — 359 instances, QF_ABV.**
-   Cites `## Wrong answers` (all 359 QF_ABV rows). Every one is `:status unsat`
+   Cites `2026-09-09-smtlib-2024-baseline-report.md ›
+   ## Wrong answers` (all 359 QF_ABV rows). Every one is `:status unsat`
    answered `sat`; 297 have an in-run z3 `unsat` on record and 62 rest on the
    hand adjudication below. Families: `dwp_formulas` 283, `brummayerbiere` 69,
    `brummayerbiere2` 5, `calc2` 2.
@@ -116,10 +208,14 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
    `abv` path in the same spirit as `str-model-rejected`.
 
 2. **QF_DT wrong answers — 328 instances, QF_DT.**
-   Cites `## Wrong answers` (QF_DT rows). All `:status unsat` answered `sat`.
+   Cites `2026-09-09-smtlib-2024-baseline-report.md ›
+   ## Wrong answers` (QF_DT rows). All `:status unsat` answered `sat`.
    Families: `20172804-Barrett` 166 (all with in-run z3 `unsat`) and
-   `20230720-blocksworld` 162 (134 with in-run z3 `unsat`, 28 with z3
-   `timeout` and no cvc5 second opinion).
+   `20230720-blocksworld` 162 (134 with in-run z3 `unsat`; the 28 that had z3
+   `timeout` in-run were hand-re-run at 300 s against both oracles on
+   2026-09-09 and 27 of them came back `unsat`, 1 undecided). The cluster is
+   independently confirmed, not `:status`-only: 327 of the 328 rows carry a
+   decided oracle `unsat`.
    Cheapest reproducer:
    `target/release/shinri QF_DT/20172804-Barrett/barrett-jsat/tests/v1/v1l30072.cvc.smt2`
    (966 bytes).
@@ -130,7 +226,8 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
 
 3. **The remaining 55 wrong answers — QF_SLIA 37, QF_UFLIA 11, QF_S 2,
    QF_LIA 2, QF_LRA 2, QF_BVFP 1.**
-   Cites `## Wrong answers` (non-ABV/DT rows). Four distinct causes, all
+   Cites `2026-09-09-smtlib-2024-baseline-report.md ›
+   ## Wrong answers` (non-ABV/DT rows). Four distinct causes, all
    small, all soundness:
    - QF_SLIA 37 (`20230329-denghang` 35, `20190311-str-small-rw-Noetzli` 2) —
      `:status unknown`, shinri `sat`, z3 `unsat`. Reproducer:
@@ -149,9 +246,9 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
 
 4. **Panic: `non-BV builtin reached blast_word` — 5,792 instances,
    QF_ABV 5,787 / QF_AUFBV 5.**
-   Cites `## Ranked gaps › panic:crates/shinri-bv/src/blast/mod.rs: internal
-   error: entered unreachable code: non-BV builtin reached blast_word —
-   5792`.
+   Cites `2026-09-09-smtlib-2024-baseline-report.md › ## Ranked gaps ›
+   panic:crates/shinri-bv/src/blast/mod.rs: internal error: entered
+   unreachable code: non-BV builtin reached blast_word — 5792`.
    Cheapest reproducer:
    `target/release/shinri QF_ABV/bench_ab/b334test0001.smt2` (722 bytes).
    Proposed slice: *"Blaster: reach a non-BV builtin in `blast_word` without
@@ -160,8 +257,8 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
 
 5. **Panic: stack overflow — 2,290 instances, QF_BV 2,180 / QF_LIA 57 /
    QF_ABV 53.**
-   Cites `rerun-0fca46476479` `## Ranked gaps › panic:thread 'main' (N) has
-   overflowed its stack — 2290`.
+   Cites `2026-09-09-smtlib-2024-rerun-report.md › ## Ranked gaps ›
+   panic:thread 'main' (N) has overflowed its stack — 2290`.
    Cheapest reproducer:
    `target/release/shinri QF_ABV/bmc-arrays/bf8.smt2` (493,591 bytes); the
    smallest QF_BV example is `QF_BV/bmc-bv/ex30.smt2` (565,248 bytes).
@@ -172,9 +269,10 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
    three logics.
 
 6. **`unsupported command: define-sort` — 39,994 instances, all QF_FP.**
-   Cites `rerun-0fca46476479` `## Ranked gaps › parse-error:unsupported
-   command: define-sort — 39994`. This is a **parser** gap, not an FP-theory
-   gap: the FP engine never runs on these files. It alone gates 99% of QF_FP
+   Cites `2026-09-09-smtlib-2024-rerun-report.md › ## Ranked gaps ›
+   parse-error:unsupported command: define-sort — 39994`. This is a
+   **parser** gap, not an FP-theory gap: the FP engine never runs on these
+   files. It alone gates 99% of QF_FP
    (39,994 of 40,407 rows; the logic's decided-rate is 0.5%).
    Cheapest reproducer:
    `target/release/shinri QF_FP/wintersteiger/abs/abs-has-solution-8522.smt2`
@@ -185,7 +283,8 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
    and 40k instances of measurement.
 
 7. **The remaining parse-error buckets — 4,015 instances.**
-   All from `rerun-0fca46476479` `## Ranked gaps`. In descending order:
+   All from `2026-09-09-smtlib-2024-rerun-report.md ›
+   ## Ranked gaps`. In descending order:
 
    | bucket | count | logics | cheapest reproducer |
    | --- | ---: | --- | --- |
@@ -212,7 +311,8 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
    slice 8 below).
 
 8. **String fences — 55,300 `unknown` rows across QF_S and QF_SLIA.**
-   Cites `## Ranked gaps` on the baseline. Ordered by count:
+   Cites `2026-09-09-smtlib-2024-baseline-report.md ›
+   ## Ranked gaps`. Ordered by count:
 
    | fence tag | count | logics |
    | --- | ---: | --- |
@@ -243,35 +343,40 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
    (3,359); *"`RegLan` declarations"* (3,287); *"`str.to_int` /
    `str.from_int`"* (1,616).
 
-9. **`unknown:theory-refused` — 5,425 instances, QF_LIA 4,764 / QF_AX 551 /
-   QF_LRA 58 / QF_SLIA 35 / QF_UFLIA 17.**
-   Cites `## Ranked gaps › unknown:theory-refused — 5425`.
-   QF_AX is 551 of 551 — an entire logic with no implementation; every QF_AX
-   row in the corpus is this one fence. The QF_LIA share (4,764) is the
-   larger count but a different cause: integer problems the linear-arithmetic
-   front end declines.
-   Cheapest reproducer for the QF_LIA share:
-   `QF_LIA/pb2010/normalized-1096.cudf.paranoid.smt2` (316 bytes).
-   Proposed slices: *"QF_AX: an extensional-array decision procedure"* (551
-   rows, a whole logic, and the only way QF_AX ever leaves 0.0%); and
-   *"QF_LIA `theory-refused`: characterise and shrink the refusal guard"*
-   (4,764 rows, 36% of QF_LIA).
+9. **`unknown:sat-budget` — 5,548 instances, QF_SLIA 4,184 / QF_S 1,353 /
+   QF_DT 11.**
+   Cites `2026-09-09-smtlib-2024-baseline-report.md ›
+   ## Ranked gaps › unknown:sat-budget — 5548`. These are rows where the SAT
+   search hit its budget rather than a missing feature, so they are a tuning
+   target, not a modelling one.
+   Cheapest reproducer:
+   `QF_SLIA/20190311-str-small-rw-Noetzli/str-pred-small-rw/str-pred-small-rw_135.smt2`
+   (731 bytes).
+   Proposed slice: *"Measure and raise the string `sat-budget`: how many of
+   the 5,548 decide at 2×/10× budget?"* — a measurement slice first; the
+   answer decides whether this is a budget knob or a propagation bug.
 
-10. **`unknown:sat-budget` — 5,548 instances, QF_SLIA 4,184 / QF_S 1,353 /
-    QF_DT 11.**
-    Cites `## Ranked gaps › unknown:sat-budget — 5548`. These are rows where
-    the SAT search hit its budget rather than a missing feature, so they are
-    a tuning target, not a modelling one.
-    Cheapest reproducer:
-    `QF_SLIA/20190311-str-small-rw-Noetzli/str-pred-small-rw/str-pred-small-rw_135.smt2`
-    (731 bytes).
-    Proposed slice: *"Measure and raise the string `sat-budget`: how many of
-    the 5,548 decide at 2×/10× budget?"* — a measurement slice first; the
-    answer decides whether this is a budget knob or a propagation bug.
+10. **`unknown:theory-refused` — 5,425 instances, QF_LIA 4,764 / QF_AX 551 /
+    QF_LRA 58 / QF_SLIA 35 / QF_UFLIA 17.**
+    Cites `2026-09-09-smtlib-2024-baseline-report.md ›
+    ## Ranked gaps › unknown:theory-refused — 5425`.
+    QF_AX is 551 of 551 — an entire logic with no implementation; every QF_AX
+    row in the corpus is this one fence. The QF_LIA share (4,764) is the
+    larger count but a different cause: integer problems the linear-arithmetic
+    front end declines.
+    Cheapest reproducer for the QF_LIA share:
+    `QF_LIA/pb2010/normalized-1096.cudf.paranoid.smt2` (316 bytes).
+    Proposed slices: *"QF_AX: an extensional-array decision procedure"* (551
+    rows, a whole logic, and the only way QF_AX ever leaves 0.0%); and
+    *"QF_LIA `theory-refused`: characterise and shrink the refusal guard"*
+    (4,764 rows, 36% of QF_LIA).
 
 11. **Timeout and oom — 11,058 `timeout` and 2,099 corrected `oom`.**
-    Cites `## Perf tail › timeout+oom by logic` and `## Ranked gaps ›
-    timeout — 11058` / `oom — 4389` (the latter superseded by the re-run).
+    Cites `2026-09-09-smtlib-2024-baseline-report.md ›
+    ## Perf tail › timeout+oom by logic` and the same file's
+    `## Ranked gaps › timeout — 11058` and `oom — 4389` (the latter
+    superseded by `2026-09-09-smtlib-2024-rerun-report.md ›
+    ## Ranked gaps › oom — 2099`).
     Worst logics by combined count: QF_BV 8,948 of 46,191 rows, QF_LIA 3,750
     of 13,306, QF_UFLIA 528 of 659 (80% of the logic), QF_DT 507, QF_ABV 459.
     Cheapest timeout reproducer: `QF_LIA/check/int_incompleteness1.smt2`
@@ -287,18 +392,38 @@ Priority is fixed by spec §5: `Wrong` > `Panic` > `ParseError` > `Unknown`
 
 **Evidence standard.** Every one of the 742 `wrong` rows carries the oracle
 answer that the run recorded, per spec §5's oracle rule. 652 rows have an
-in-run z3 answer that is decided and contradicts shinri. The other 90 have
-z3 `timeout` at the run's 20 s limit; of those, 62 (all QF_ABV) were re-run
-by hand at 120 s against both oracles. That hand re-run gives 18 rows an
-independent decided `unsat` — 9 from z3 only, 4 from both z3 and cvc5, 5 from
-cvc5 only — and leaves **44 undecided by both solvers**; those 44 rest on the
-benchmark's own `:status unsat` and on nothing else. The remaining 28
-z3-`timeout` rows (all `QF_DT/20230720-blocksworld`) were not hand-re-run and
-also rest on `:status` alone. A per-family spot-check of 11 rows is recorded
-separately.
+in-run z3 answer that is decided and contradicts shinri. The other 90 have z3
+`timeout` at the run's 20 s limit, and all 90 were re-run by hand against both
+oracles at a longer budget: the 62 QF_ABV rows at 120 s on 2026-09-08T23:57Z,
+the 28 `QF_DT/20230720-blocksworld` rows at 300 s on 2026-09-09T11:15Z.
+
+| group | rows | decided by an oracle, against shinri | undecided by both oracles |
+| --- | ---: | ---: | ---: |
+| in-run z3 decided | 652 | 652 | 0 |
+| QF_ABV hand re-run at 120 s | 62 | 18 | 44 |
+| QF_DT hand re-run at 300 s | 28 | 27 | 1 |
+| **total** | **742** | **697** | **45** |
+
+All 652 in-run answers are `unsat` except one, the corpus's single wrong
+`unsat`, where z3 says `sat`. The QF_ABV 18 break down as 9 from z3 only, 4
+from both z3 and cvc5, and 5 from cvc5 only. The QF_DT 27 break down as 7
+from both z3 and cvc5 and 20 from z3 only; the single undecided row is
+`QF_DT/20230720-blocksworld/blocksworld_from_5_4_17_to_12_6_8_negated_goal_bmc_16.smt2`,
+where both oracles time out at 300 s. So 697 of the 742 rows carry a decided
+independent solver answer contradicting shinri, and 45 rest on the benchmark's
+own `:status unsat` and on nothing else.
+
+Every one of the 742 rows shows `cvc5: -` in
+`2026-09-09-smtlib-2024-baseline-report.md › ## Wrong answers`. That is the
+adjudication rule, not a missing run: spec §5 consults cvc5 only
+when z3 *agrees* with shinri on a `:status` contradiction, which is the
+`StatusSuspect` test. A row where z3 contradicts shinri is already `Wrong`, so
+cvc5 is never asked in-run. The cvc5 answers above come from the hand re-runs,
+not from the run.
 
 Not all 742 rows were reproduced by hand; the counts above are the exact
-evidence each group carries. The hand adjudication is dated 2026-09-08T23:57Z.
+evidence each group carries. A per-family spot-check of 11 rows is recorded
+separately.
 
 | logic | family | rows | evidence |
 | --- | --- | ---: | --- |
@@ -307,7 +432,7 @@ evidence each group carries. The hand adjudication is dated 2026-09-08T23:57Z.
 | QF_ABV | `brummayerbiere2` | 5 | all z3 `timeout` in-run; hand-adjudicated (1 decided `unsat`, 4 undecided) |
 | QF_ABV | `calc2` | 2 | in-run z3 `unsat` |
 | QF_DT | `20172804-Barrett` | 166 | in-run z3 `unsat` |
-| QF_DT | `20230720-blocksworld` | 162 | 134 in-run z3 `unsat`; 28 z3 `timeout`, not hand-re-run — `:status unsat` only |
+| QF_DT | `20230720-blocksworld` | 162 | 134 in-run z3 `unsat`; 28 z3 `timeout`, hand-adjudicated at 300 s (27 decided `unsat`, 1 undecided) |
 | QF_SLIA | `20230329-denghang` | 35 | `:status unknown`; in-run z3 `unsat` is the sole evidence |
 | QF_UFLIA | `mathsat/Wisa` | 9 | in-run z3 `unsat` |
 | QF_SLIA | `20190311-str-small-rw-Noetzli` | 2 | `:status unknown`; in-run z3 `unsat` is the sole evidence |
@@ -420,19 +545,32 @@ entry points into that set.
   signal death fell into `oom`). The re-run's per-logic matrix shows 0
   decided by construction — it only re-runs rows that were already failures —
   and must not be read as a regression.
+- **As built — spec §9.3.** The success criterion asks that every `Wrong` row
+  be reproduced by hand with `z3`/`cvc5`. That was not done for all 742. What
+  was done: 652 rows carry the in-run oracle answer the harness recorded, and
+  are cited as such rather than re-run; the 90 rows whose in-run z3 timed out
+  were hand-re-run against both oracles at a longer budget (62 QF_ABV at
+  120 s, 28 QF_DT at 300 s); and an 11-row per-family sample was hand-run
+  across families as a spot-check that the harness's recorded answers match a
+  fresh invocation. 742 rows × 2 oracles × 120 s is up to 49 CPU-hours and
+  would have re-derived, for the 652, an answer the run already holds on
+  record; the 90 undecided-in-run rows were the only ones where a hand re-run
+  could add evidence, so the budget went there. Every `Wrong` row is filed as
+  a named follow-up slice, per the other half of §9.3.
 - **`status-suspect` is 0.** No row had shinri contradict `:status` with both
   oracles agreeing with shinri. The `wrong` count is therefore not diluted by
   bad benchmark metadata in the corpus, at least not detectably.
 - **`unverified` (1,371) is not a wrong answer.** It means shinri decided,
   `:status` was absent or `unknown`, and the oracle could not confirm the
   answer within the same budget. QF_SLIA carries 1,260 of them and QF_S 96.
-  These rows are excluded from `correct`, so the 48.1% decided rate is a
+  These rows are excluded from `correct`, so the 48.1% correct-rate is a
   lower bound on this measure.
 - **`:status` is benchmark metadata, not ground truth.** For the 44 QF_ABV
-  and 28 QF_DT rows where no oracle decided, `:status` is the only evidence
-  that shinri is wrong. It is strong evidence — these families are old and
-  widely used — but a slice that fails to reproduce a bug on one of those 72
-  rows should suspect the metadata before concluding the bug is fixed.
+  and 1 QF_DT rows where no oracle decided even at the longer hand budget,
+  `:status` is the only evidence that shinri is wrong. It is strong evidence
+  — these families are old and widely used — but a slice that fails to
+  reproduce a bug on one of those 45 rows should suspect the metadata before
+  concluding the bug is fixed.
 - **The 20 s / 3072 MB budget shapes the tail.** `timeout` (11,058) and `oom`
   (2,099 corrected) are budget-relative counts, not statements about
   decidability; a longer budget moves rows between `timeout` and `correct`.
@@ -442,11 +580,15 @@ entry points into that set.
   (`10.5281/zenodo.11061097`, release 2024.04.23), the per-logic archive md5
   and the extracted `.smt2` count, so a later run diffs against this document
   only if it uses the same archives. Raw `results.jsonl` for both runs is
-  git-ignored (69 MB for the baseline).
+  git-ignored (69 MB for the baseline); both runs' rendered `report.md` are
+  committed beside this document as `2026-09-09-smtlib-2024-baseline-report.md`
+  and `2026-09-09-smtlib-2024-rerun-report.md`, so every `Cites` pointer above
+  resolves inside the repository.
 - **Fences that never fired.** `str-fenced`, `str-code-conv`, `str-order`,
   `abv-uf-budget`, `abv-engine`, `fp-crossing-conversion`, `bv-non-bv-atom`,
   `fp-non-bvfp-atom`, `fp-atoms-unsupported`, `fp-bv-atoms-unsupported`,
-  `fpbv-uf-args`, `fpbv-uf-budget`, `theory-mixed-sort` and
-  `bv-uf-args`/`abv-uf-args` beyond the 22 rows listed do not appear in the
-  ranked gaps at all. Absence here means the fence was never reached on this
-  corpus, which is a real signal about where the remaining work is not.
+  `fpbv-uf-args`, `fpbv-uf-budget` and `theory-mixed-sort` do not appear in
+  the ranked gaps at all. Absence here means the fence was never reached on
+  this corpus, which is a real signal about where the remaining work is not.
+  `bv-uf-args` and `abv-uf-args` did fire, 22 times between them; they are in
+  the ranked gap list above.
