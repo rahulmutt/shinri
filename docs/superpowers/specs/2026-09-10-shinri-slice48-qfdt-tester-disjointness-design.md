@@ -154,6 +154,19 @@ such restriction, so the conflict channel is the one that fits.
 
 ### 3.2 `asserted_testers` becomes level-indexed
 
+> **Superseded by §11 ("What actually shipped").** This section is the
+> design as originally proposed and as Task 2 (`e5cc3eea`) built it: ONE
+> levelled record shared by both `tester_clash` and `instantiate_constructor`.
+> The `slice48` corpus re-measure found that sharing silently retracted
+> `instantiate_constructor`'s guarded lemmas on every `pop`, turning an
+> `unsat` blocksworld instance into a wrong `sat` (+28 wrong rows across the
+> family) — read §11's "What actually shipped" subsection before trusting
+> anything below as the shipped behaviour. The code ships **two** records,
+> split by consumer, not the single record this section describes; treat this
+> section as historical design intent, not current fact. `crates/shinri-dt/src/lib.rs`'s
+> field docs on `instantiation_testers_monotone` / `conflict_testers_per_level`
+> are the authority on what the running solver actually does.
+
 This retires a documented invariant, and it is the substantive risk of the
 slice.
 
@@ -197,6 +210,17 @@ fences (§5.2).
 
 ### 3.3 `instantiate_constructor`'s presence test
 
+> **Superseded by §11 ("What actually shipped").** This section's premise —
+> that `tester_clash` and `instantiate_constructor` read the SAME record, so a
+> disagreeing constructor reaching this line is unreachable — is false of the
+> shipped code. The two consumers now read different records
+> (`instantiation_testers_monotone` for this function,
+> `conflict_testers_per_level` for `tester_clash`), so a tester retracted from
+> the per-level record but still present in the monotone one CAN legitimately
+> reach this line with a disagreeing constructor; that state is normal, not a
+> bug. The `debug_assert` this section prescribes below was **removed** in the
+> fix wave for exactly that reason — see §11.
+
 `lib.rs:402` reads `if self.ctor_of_class(cx, t).is_some() { continue; }` — it
 skips on *any* constructor in the class and never compares symbols. Today that
 is a live gap. Once `tester_clash` runs earlier in the same `check` call, a
@@ -208,6 +232,7 @@ symbols agree and a comment naming `tester_clash` as the reason — the slice-38
 pattern: a defensive fence that is end-to-end unreachable, kept because it is
 zero-cost, with unit tests rather than a live branch as its proof. Converting it
 into a second conflict site would duplicate `tester_clash` for no measured gain.
+**(Superseded — see the marker above: this `debug_assert` was removed.)**
 
 ## 4. Tasks
 
@@ -216,7 +241,8 @@ into a second conflict site would duplicate `tester_clash` for no measured gain.
    any fix.
 2. **`tester_clash` in `check`** (§3.1), with its unit fences.
 3. **Level-indexed `asserted_testers`** (§3.2), with its backtracking fences
-   (§5.2).
+   (§5.2). **As shipped, this became a split into two records by consumer,
+   not one shared levelled record — see §11.**
 4. **`instantiate_constructor` defensive fence** (§3.3).
 5. **e2e repro fences** (§5.3), including the negative over-fire guard.
 6. **QF_DT corpus re-run and report** (§6), including the blocksworld
@@ -367,11 +393,20 @@ watch.
 
 ## 9. Queued for the next slice
 
-* **`20230720-blocksworld`, 162 wrong rows.** No testers anywhere in the family,
-  so §3's rule cannot be the cause; the five obvious candidate shapes all answer
-  correctly. Needs a genuine bisect on a 21–53 KB instance — the cheapest is
-  `blocksworld_from_0_18_1_to_17_2_0_negated_goal_bmc_5.smt2` (21,247 B, answers
-  in 0.95 s). Whatever §6 measures about these rows is the starting evidence.
+> **Updated by §11's re-measure (run-id `slice48b`, fixed code).** The bullets
+> below are as written before any measurement; see §11's "Re-measured after
+> the fix wave" subsection for the current, measured queue, including two
+> items §11 adds: the pre-existing `shinri-euf` congruence-loss defect that
+> now explains blocksworld's one clean `correct → wrong` regression, and
+> `qfdt_oracle` generator's blind spot for it.
+
+* **`20230720-blocksworld`, 162 wrong rows (baseline).** No testers anywhere in
+  the family, so §3's rule cannot be the cause; the five obvious candidate
+  shapes all answer correctly. Needs a genuine bisect on a 21–53 KB instance —
+  the cheapest is `blocksworld_from_0_18_1_to_17_2_0_negated_goal_bmc_5.smt2`
+  (21,247 B, answers in 0.95 s). Whatever §6/§11 measures about these rows is
+  the starting evidence — as measured, this family's premise (that it is
+  fully untouched by this slice) is false; see §11.
 * **QF_DT's 507 `timeout`, 11 `unknown`, 5 `unverified` rows** — unchanged in kind from
   baseline, out of scope per §2, still in the slice-46 queue.
 
@@ -384,7 +419,9 @@ watch.
 * The datatype theory — slices 39
   (`2026-07-23-shinri-slice39-datatypes-foundation-design.md`), 40
   (`2026-07-24-shinri-slice40-tester-case-split-design.md`, which introduced
-  `asserted_testers` and the monotone justification §3.2 retires) and 41
+  `asserted_testers` and the monotone justification §3.2 retires — slice 48's
+  fix wave then reinstated a monotone record for `instantiate_constructor`
+  alongside a new per-level one for `tester_clash`; see §11) and 41
   (`2026-07-24-shinri-slice41-datatype-acyclicity-design.md`).
 * The preceding queue item —
   `docs/superpowers/specs/2026-09-09-shinri-slice47-qfabv-wrong-sat-design.md`
@@ -393,12 +430,23 @@ watch.
 
 ## 11. Measured outcomes
 
+**This section records THREE states, in order: the pre-fix measurement below
+(commit `17f2ac31092a`, run-id `slice48`), which found that Task 2's
+level-indexed `asserted_testers` (§3.2 as originally written) had itself
+introduced a wrong-`sat` regression; "What actually shipped", the fix wave
+that followed; and the fixed-code re-measure (commit `f27a340ceb77`, run-id
+`slice48b`) that closes this section. Do not read the "pre-fix" subsection
+below as a description of the shipped code — §3.2 and §3.3 carry their own
+superseded-by-§11 markers for the same reason.**
+
+### Pre-fix measurement (run-id `slice48`, commit `17f2ac31092a`) — SUPERSEDED, kept for history
+
 Closing QF_DT re-run, run-id `slice48`, measured at commit `17f2ac31092a`
 (same 8,700 paths as the baseline). Full narrative, transition matrix and
 family breakdowns:
 `docs/superpowers/research/2026-09-10-smtlib-2024-qfdt-slice48-report.md`.
 
-### Success criteria
+#### Success criteria (pre-fix)
 
 | criterion | baseline | slice48 | verdict |
 | --- | ---: | ---: | --- |
@@ -472,7 +520,7 @@ the premise that this slice's blast radius excludes blocksworld is
 discarded as stated; the shared `asserted_testers` record is live for that
 family too.
 
-### Approach B's un-banking trigger fired
+### Approach B's un-banking trigger fired (pre-fix)
 
 §8 named its un-banking condition precisely: "a `correct → timeout`
 transition (criterion 2) or a material rise in QF_DT `timeout`." This run
@@ -483,10 +531,191 @@ count only fell modestly (507 → 489, -18) despite 137 Barrett rows leaving
 (propagating `¬is-D(t)` instead of rediscovering the same conflict on every
 branch) as a live candidate rather than a deferred efficiency nice-to-have.
 
-### Hypotheses this run discarded
+### Hypotheses this run discarded (pre-fix)
 
 | hypothesis | verdict |
 | --- | --- |
 | §1/§9 — blocksworld's 162 wrong rows are a bug fully independent of this slice's changes, since the family has zero tester syntax | **DISCARDED as stated.** The family's *source* has no testers, but `exhaustiveness_split` mints them internally, and Task 2's `asserted_testers` refactor measurably flipped one blocksworld row (bisected to `e5cc3eea`). The 162/190-row bug itself is still unexplained and still queued, but the "fully independent" framing is wrong. |
 | word_norm's ite-elimination hides a `typed/`-family tester from `asserted_testers` | **NOT CONFIRMED.** Plausible structurally (a DT-sorted `ite` becomes a fresh symbol plus a Boolean-`ite` defining assertion, routing the tester through ordinary Tseitin clauses rather than a direct assert), but not reproduced by a hand-built minimal case. |
 | `DtSolver::assert`'s negative-tester no-op (`lib.rs:888`, unchanged since slice 39) is exploitable on 2-constructor datatypes | **NOT CONFIRMED.** A hand-built `¬is-cons(x) ∧ x = cons(...)` case (both assertion orders) answers `unsat` correctly — the exhaustiveness split's sibling-constructor literal appears to close this gap in the simple case. The `typed/` family's actual mechanism remains unidentified. |
+
+### What actually shipped (supersedes §3.2, §3.3)
+
+The fix wave (commit `f27a340ceb77`) did **not** implement §3.2 as written.
+Instead of one levelled `asserted_testers` record shared by both consumers,
+`crates/shinri-dt/src/lib.rs` now carries **two** records, split by consumer,
+with deliberately opposite retraction disciplines:
+
+* `instantiation_testers_monotone: FxHashSet<TermId>` — the trigger set for
+  `instantiate_constructor` ALONE. Never popped. This restores exactly
+  slice 40's original monotone semantics (same type, same insertion order),
+  because that consumer's lemma is GUARDED (`is-C(t) ⇒ t = C(sel..(t))`, valid
+  at level 0 on every branch), so a stale entry can only re-offer an inert
+  tautology — never an unsound one — while a *missing* entry costs a lost
+  instantiation, which is exactly how the blocksworld regression happened
+  (§11's "Re-measured after the fix wave", "root cause of the pre-fix
+  regression").
+* `conflict_testers_per_level: Vec<(TermId, Lit)>` + `conflict_tester_set` +
+  `tester_marks` — the trigger set for `tester_clash` ALONE, backtrack-accurate
+  by construction (§3.2's original reasoning for why a conflict-citing record
+  must be levelled). `push`/`pop` retract this one only.
+
+Both fields carry doc comments naming their single consumer, the discipline
+that consumer requires and why, the commit that briefly merged them
+(`e5cc3eea`), the corpus regression that merging caused, and the fences that
+pin the split (`crates/shinri-dt/src/lib.rs:36-98`, roughly). The struct-level
+doc says explicitly: "Do NOT merge this with `conflict_testers_per_level`."
+
+§3.3's prescribed `debug_assert_eq!(csym, ctor)` was **removed**, not kept: with
+the records split, `instantiate_constructor` can legitimately observe a class
+whose constructor disagrees with a tester that is still in the monotone record
+but has been retracted from the per-level one — `tester_clash` (reading the
+per-level record) has correctly gone silent about it, and `instantiate_constructor`
+(reading the monotone record) correctly still sees the stale entry and skips.
+That is normal operation, not the unreachable state §3.3 assumed, so asserting
+the constructors agree there is no longer a valid invariant; the removal is
+documented in place with a comment naming this reasoning.
+
+### Re-measured after the fix wave (run-id `slice48b`, commit `f27a340ceb77`)
+
+Full narrative, three-way transition matrix and per-family closure arithmetic:
+`docs/superpowers/research/2026-09-10-smtlib-2024-qfdt-slice48-report.md`,
+"Re-measure after the fix wave" section. HEAD advanced once more after this
+run, to `f8b605e957e0` ("final-review fix wave — comments and test strength");
+that commit's message states no executable logic changed outside two test
+bodies, so this measurement remains representative of current HEAD.
+
+#### Success criteria — baseline / pre-fix / fixed
+
+| # | criterion | baseline | pre-fix (`slice48`) | fixed (`slice48b`) | gate | verdict |
+| --- | --- | ---: | ---: | ---: | --- | --- |
+| 1 | `20172804-Barrett` wrong rows | 166 | 32 | **31** | 0 (hard gate) | **MISS** |
+| 2 | `correct → {timeout,unknown,oom}` | — | 6 | **7** | 0 (hard gate) | **MISS** |
+| 3 | QF_DT `correct` | 7,849 | 7,978 | **7,978** | ≥ 7,849 | **PASS** |
+| 4 | generator failed pre-slice, passes now | — | yes | yes (carried forward, not re-run) | yes | **PASS** |
+| 5 | `20230720-blocksworld` wrong rows | 162 | 190 | **169** | measured, not gated | measured |
+
+**Both hard gates are still missed, and are decomposed here rather than
+relaxed.**
+
+**Criterion 1 (31, not 0).** The fix wave repairs exactly one of the 32
+pre-fix Barrett wrong rows: `barrett-jsat/typed/v3/typed_v3l70051.cvc.smt2`
+(the pre-fix `correct → wrong` regression bisected to `c0957d4b`, Task 3
+itself) is `correct` again in `slice48b`, at the same 9 ms it took at
+baseline. The other 31 residual `typed/` wrong rows are byte-for-byte the
+same 31 files, unchanged in verdict — this fix wave does not touch whatever
+mechanism produces them; that bisect is still open and still queued (§9).
+
+**Criterion 2 (7, not 6) — the trigger fired in an unexpected direction.**
+Comparing `slice48` → `slice48b` directly on the 6 pre-fix `correct → timeout`
+rows: one of them, `barrett-jsat/typed/v3/typed_v3l90023.cvc.smt2`, is
+**cured** by the split — 14 ms at baseline, timed out at 20,004 ms pre-fix,
+back to 18 ms fixed (the record split removed the redundant `tester_clash`
+churn that caused the pre-fix timeout on this specific file). But the fix wave
+also **introduces two new** `correct → timeout` rows that were fine at both
+baseline and pre-fix: `barrett-jsat/tests/v1/v1l60099.cvc.smt2` (37 ms
+baseline, 39 ms pre-fix, 20,006 ms fixed — the first timeout ever recorded in
+the `tests/` subfamily, previously believed 100% clean) and
+`20230720-blocksworld/blocksworld_from_3_5_0_to_8_0_0_negated_goal_bmc_14.smt2`
+(4,368 ms baseline, already a slow 18,315 ms pre-fix, now 20,006 ms fixed — an
+already-marginal file pushed over the cap). Net: 6 − 1 (cured) + 2 (new) = 7.
+Both new rows are a genuine, if small, performance cost of the split, not a
+correctness trade — no wrong answer became either of these timeouts.
+
+**Criterion 2, beyond its literal scope — the `correct → wrong` count.**
+Baseline → fixed has exactly **one** `correct → wrong` row (down from 2
+pre-fix): `20230720-blocksworld/blocksworld_from_6_0_2_to_2_5_1_negated_goal_bmc_2.smt2`
+(`unsat` at 47 ms baseline → `sat` at 27 ms pre-fix → `sat` at 30 ms fixed,
+deterministic, unchanged by the fix wave). This is the SAME file the pre-fix
+report bisected to `e5cc3eea` (Task 2's levelling, before `tester_clash`
+existed) — the fix wave's record split does not touch it because its cause is
+a **different, pre-existing defect in `shinri-euf`**, not in `shinri-dt`'s
+tester bookkeeping: `EGraph::add_term` (`crates/shinri-euf/src/egraph.rs:137`)
+records its signature-table insert on the undo log, so a term first
+registered above decision level 0 loses its congruence registration on the
+next backtrack, and the `seen_terms` guard blocks re-registration forever
+after. The selector applications `instantiate_injectivity_selectors` mints
+mid-search (e.g. `top(stack C empty)` / `top(stack H empty)`) are bound this
+way at level ≥ 1, so two `stack` applications can be merged into one class
+while their `top` selector applications are never merged by congruence —
+injectivity never derives the resulting equality, and `constructor_clash`
+never fires. `Euf::new_var` already documents this exact class of bug ("the
+I1 soundness bug") for the ⊤/⊥ sentinels and works around it by registering at
+level 0; the general case was never fixed. It reproduces on `main` via a
+9-line reduced query (`docs/superpowers/research/2026-09-10-smtlib-2024-qfdt-slice48-report.md`
+carries it in full). **`blocksworld_from_6_0_2_to_2_5_1_negated_goal_bmc_2.smt2`
+still answers `sat` because of this `shinri-euf` defect, not because of
+anything slice 48 changed** — Task 2's levelling only happened to steer the
+search into it (five-variant isolation, same report, proves the levelling
+change ALONE is sufficient to flip this file, independent of `tester_clash`).
+This is a shared-core defect needing its own slice with the full unfiltered
+oracle, not a `shinri-dt` fix; see §9 and the report's "Queued for the next
+slice".
+
+**Criterion 3 — 7,978, unchanged from pre-fix, PASS.** The fix wave neither
+gains nor loses a `correct` verdict at the QF_DT-total level relative to
+pre-fix (individual files move between `correct` and other verdicts as
+described above, but they net to zero at this granularity).
+
+**Criterion 4 — carried forward, not re-run.** No `shinri-dt` production
+logic changed between the `slice48b` run's binary (`f27a340ceb77`) and the
+original evidence (commit `90a061b8`'s pre-slice failure, `c0957d4b`'s fixed
+pass); re-running the same oracle binary would show the same result at
+non-trivial cost, so the pre-fix report's verbatim failing instance and the
+17/17-passing `qfdt_oracle` run (300 iters, 0 mismatches) are cited, not
+reproduced. **Its 0 mismatches is not coverage of the `shinri-euf` defect
+above** — see §9.
+
+**Criterion 5 — 169, still measured not gated; the §1/§9 premise remains
+discarded as stated.** Blocksworld wrong rows moved 162 (baseline) → 190
+(pre-fix) → **169** (fixed): the fix wave's record split shifts 28 pre-fix
+`wrong` rows to an honest `timeout` and 7 pre-fix `timeout` rows newly
+complete as `wrong`, netting −21 from the pre-fix count, but still +7 over
+baseline. The family remains perturbed relative to baseline by the shared
+`asserted_testers`/instantiation-tester bookkeeping this slice touches, via
+internal `exhaustiveness_split` minting rather than any corpus-file syntax —
+exactly as the pre-fix measurement found. The family's own 162/190/169-row
+bug is still unexplained and still queued (§9); only the one clean
+`correct → wrong` regression (above) has an identified cause, and that cause
+is `shinri-euf`, not this family's pre-existing bug.
+
+#### Full transition matrix, baseline → fixed (`slice48b`), changed cells only
+
+| baseline | fixed | count | families |
+| --- | --- | ---: | --- |
+| `wrong` | `correct` | 134 | 20172804-Barrett 134 |
+| `timeout` | `wrong` | 17 | 20230720-blocksworld 17 |
+| `wrong` | `timeout` | 12 | 20230720-blocksworld 11, 20172804-Barrett 1 |
+| `correct` | `timeout` | 7 | 20172804-Barrett 6, 20230720-blocksworld 1 |
+| `unverified` | `timeout` | 5 | 20230720-blocksworld 5 |
+| `timeout` | `correct` | 3 | 20172804-Barrett 3 |
+| `correct` | `wrong` | 1 | 20230720-blocksworld 1 |
+| `timeout` | `unverified` | 1 | 20230720-blocksworld 1 |
+
+Unchanged: 8,520 of 8,700. Every verdict count above closes exactly against
+the per-family before/after totals (arithmetic shown in the research report).
+
+### Queued for the next slice (fixed-code state — supersedes §9 above)
+
+* **The pre-existing `shinri-euf` congruence-loss defect** —
+  `EGraph::add_term` (`crates/shinri-euf/src/egraph.rs:137`), described in full
+  above and in the research report. Reproduces on `main`. Needs its own slice
+  with the full unfiltered oracle (shared-core change).
+* **`qfdt_oracle`'s generator blind spot.** `gen_instance` only emits
+  top-level ground conjuncts, so every literal lands at decision level 0 and
+  the generator structurally cannot produce the shape either live defect
+  needs (a selector-app equality, or a tester, derived above level 0). Extend
+  it to emit disjunction-/`ite`-guarded testers and record-shaped datatypes;
+  the next slice's generator work must FAIL on this branch's HEAD for the
+  `shinri-euf` defect before it is believed to cover it.
+* **The 32 (now 31) residual `20172804-Barrett/.../typed/` wrong rows** — the
+  fix wave did not move this bisect forward; still needs a targeted bisect on
+  one of the 31 files (unchanged from the pre-fix queue).
+* **The 6 (now 7) `correct → timeout` Barrett/blocksworld rows and Approach B**
+  — the fix wave's own churn added 2 more `correct → timeout` rows rather than
+  resolving the un-banking trigger; Approach B (§8) remains a live candidate,
+  now with a slightly stronger signal.
+* **`20230720-blocksworld`'s own 162/190/169-row bug** — still unexplained,
+  still needs a genuine bisect on a 21–53 KB instance (unchanged from §9).
+* **QF_DT's remaining `timeout`/`unknown` rows** — out of scope per §2, still
+  in the slice-46 queue.
