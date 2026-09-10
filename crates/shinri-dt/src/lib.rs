@@ -474,7 +474,20 @@ impl DtSolver {
             let Some(&t) = targs.first() else {
                 continue;
             };
-            if self.ctor_of_class(cx, t).is_some() {
+            if let Some((csym, _)) = self.ctor_of_class(cx, t) {
+                // Slice 48: unreachable with a DISAGREEING symbol — `tester_clash`
+                // runs earlier in this same `check` call and returns a Conflict
+                // for exactly that state, and this loop iterates the same
+                // `asserted_testers` record. Kept as a zero-cost fence rather
+                // than a second conflict site, which would duplicate
+                // `tester_clash` for no measured gain. The unit tests below are
+                // the proof, not this branch.
+                debug_assert_eq!(
+                    csym, ctor,
+                    "instantiate_constructor reached a class whose constructor \
+                     disagrees with an asserted tester — tester_clash should \
+                     have conflicted first"
+                );
                 continue; // class already has a constructor app
             }
             let Some(sels) = cx.terms.dt_selectors(ctor).map(<[SymbolId]>::to_vec) else {
@@ -2204,6 +2217,47 @@ mod tests {
             tcheck_name(&verdict),
             "Conflict",
             "a retracted tester must not produce a conflict citing its literal"
+        );
+    }
+
+    /// Slice 48 / slice 38 pattern: the `debug_assert` in
+    /// `instantiate_constructor` is end-to-end unreachable, and this is its
+    /// proof. The state that would trip it — an asserted tester over a class
+    /// holding a different constructor — is intercepted by `tester_clash`,
+    /// so `check` returns Conflict and never reaches the instantiation loop.
+    /// A debug build would panic here if the ordering ever regressed.
+    #[test]
+    fn instantiate_constructor_never_sees_a_disagreeing_constructor() {
+        let mut ctx = Context::new();
+        let (list, nil, _cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_cons_x);
+        dt.new_var(&mut cx, Var::new(1), nil_t);
+
+        let _ = dt.assert(&mut cx, Lit::new(v, true));
+        let (xn, nn) = (cx.eq.intern(x), cx.eq.intern(nil_t));
+        let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
+
+        // Runs under `cfg(debug_assertions)` in the test profile: reaching the
+        // instantiation loop in this state would panic on the debug_assert.
+        let verdict = dt.check(&mut cx, Effort::Full);
+        assert_eq!(
+            tcheck_name(&verdict),
+            "Conflict",
+            "tester_clash must intercept before instantiate_constructor runs"
         );
     }
 }
