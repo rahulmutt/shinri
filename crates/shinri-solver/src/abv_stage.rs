@@ -619,13 +619,17 @@ fn abstract_word(
 /// subterms were already given a blastable rewrite reaches `blast_word`/
 /// `blast_atom` as that rewrite, never as the raw select-mentioning original.
 ///
-/// A direct membership check first: `word_alias` is keyed by the WHOLE word
-/// prewarm queued (an index or store-chain element), and lemma atoms built
-/// from `select_parts`/`store_parts` (e.g. `functional_consistency`'s
-/// `(= ix iy)`) hand those exact `TermId`s straight to `ensure_atom`, so the
-/// common case resolves in one lookup. The recursive fallback handles a term
-/// that mentions an already-aliased word as a PROPER subterm rather than
-/// being one itself.
+/// A direct membership check first, but that top-level hit is the rare case
+/// in practice: `word_alias` is keyed by BV-sorted words only (prewarm never
+/// queues a non-BV term), while every atom `ensure_atom` is actually called
+/// with is a Bool-sorted (dis)equality or comparison — so the lookup on `t`
+/// itself always misses for the atom, and it is the RECURSIVE branch, over
+/// the atom's BV-sorted children (e.g. `functional_consistency`'s `ix`/`iy`
+/// in `(= ix iy)`), that does the real work. The top-level check earns its
+/// keep on the recursive calls themselves: `ix`/`iy` are exactly the
+/// `TermId`s `select_parts`/`store_parts` returned, i.e. the same words
+/// `prewarm_array_words` queued, so those calls resolve in one lookup rather
+/// than re-walking a term prewarm already rewrote.
 ///
 /// Unlike `abstract_word`, this takes no `&Abstraction` — `ensure_atom` only
 /// has `&mut Context` — so it can only route through words prewarm already
@@ -936,7 +940,8 @@ impl shinri_abv::SatBridge for RealBridge {
         // from `select_parts`. Such a term may mention a `select` beneath it
         // (`(select p (bvadd x (select q #x03)))` is ordinary in the `egt` and
         // `dwp_formulas` families); `blast_word` cannot encode that and panics
-        // ("non-BV builtin reached blast_word: Select").
+        // ("non-BV builtin reached blast_word" — an instrumented build that
+        // prints the offending op reports `Select`).
         //
         // `prewarm_array_words` already computed the blastable rewrite for
         // every index/element word the checks read — that is exactly what
@@ -1527,6 +1532,93 @@ mod tests {
             solve_qfabv(&mut ctx, &[atom]),
             shinri_abv::AbvOutcome::Sat,
             "nothing constrains p or q; the gate must value the index, not crash"
+        );
+    }
+
+    /// Slice 47 T7 regression guard: `functional_consistency` builds its
+    /// `(i=j) -> (ri=rj)` lemma from the RAW select-index terms
+    /// (`select_parts`), and `prewarm_array_words`' `word_alias` made an
+    /// index that mentions a nested select VALUABLE even though `blast_word`
+    /// still can't encode it directly — which is exactly the shape that used
+    /// to reach `ensure_atom` unaliased and panic ("non-BV builtin reached
+    /// blast_word"). `(distinct (select p (bvadd x sqk)) (select p (bvadd sqk
+    /// x)))` reads `p` at two syntactically different but value-equal
+    /// indices (`bvadd` is commutative), so `functional_consistency` forces
+    /// the two reads equal — contradicting `distinct` — UNSAT.
+    #[test]
+    fn ensure_atom_aliases_select_mentioning_functional_consistency_index() {
+        let mut ctx = Context::new();
+        let i8s = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i8s, i8s);
+        let p = uconst(&mut ctx, "p", arr);
+        let q = uconst(&mut ctx, "q", arr);
+        let x = uconst(&mut ctx, "x", i8s);
+        let three = ctx.mk_bv_const(8, shinri_num::Integer::from(3u64));
+        let sqk = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[q, three])
+            .unwrap();
+        let idx1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, sqk])
+            .unwrap();
+        let idx2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[sqk, x])
+            .unwrap();
+        let sel1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[p, idx1])
+            .unwrap();
+        let sel2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[p, idx2])
+            .unwrap();
+        let dist = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[sel1, sel2])
+            .unwrap();
+        assert_eq!(
+            solve_qfabv(&mut ctx, &[dist]),
+            shinri_abv::AbvOutcome::Unsat,
+            "commuted-but-value-equal indices force the reads equal, contradicting distinct"
+        );
+    }
+
+    /// Companion to the guard above, over the identical select-mentions-a-select
+    /// shape: swap one operand so the two indices are no longer provably equal
+    /// (`(bvadd x sqk)` vs `(bvadd y sqk)`, unrelated `x`/`y` — not the
+    /// commuted form). `functional_consistency` must NOT force the reads
+    /// equal here, so the query stays SAT; this catches an over-constraint in
+    /// the alias path (aliasing two index terms to the same read var when
+    /// they are not, in fact, forced equal) turning a real `sat` into a wrong
+    /// `unsat`.
+    #[test]
+    fn ensure_atom_alias_does_not_over_constrain_distinct_indices() {
+        let mut ctx = Context::new();
+        let i8s = ctx.bv_sort(8);
+        let arr = ctx.array_sort(i8s, i8s);
+        let p = uconst(&mut ctx, "p", arr);
+        let q = uconst(&mut ctx, "q", arr);
+        let x = uconst(&mut ctx, "x", i8s);
+        let y = uconst(&mut ctx, "y", i8s);
+        let three = ctx.mk_bv_const(8, shinri_num::Integer::from(3u64));
+        let sqk = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[q, three])
+            .unwrap();
+        let idx1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[x, sqk])
+            .unwrap();
+        let idx2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::BvAdd), &[y, sqk])
+            .unwrap();
+        let sel1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[p, idx1])
+            .unwrap();
+        let sel2 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Select), &[p, idx2])
+            .unwrap();
+        let dist = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Distinct), &[sel1, sel2])
+            .unwrap();
+        assert_eq!(
+            solve_qfabv(&mut ctx, &[dist]),
+            shinri_abv::AbvOutcome::Sat,
+            "x != y is not forced, so the indices need not coincide; distinct reads stay satisfiable"
         );
     }
 
