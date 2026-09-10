@@ -390,3 +390,103 @@ watch.
   `docs/superpowers/specs/2026-09-09-shinri-slice47-qfabv-wrong-sat-design.md`
   and its report, whose success-criteria post-mortem shaped §6.
 * The trail pattern §3.2 mirrors — `crates/shinri-str/src/trail.rs`.
+
+## 11. Measured outcomes
+
+Closing QF_DT re-run, run-id `slice48`, measured at commit `17f2ac31092a`
+(same 8,700 paths as the baseline). Full narrative, transition matrix and
+family breakdowns:
+`docs/superpowers/research/2026-09-10-smtlib-2024-qfdt-slice48-report.md`.
+
+### Success criteria
+
+| criterion | baseline | slice48 | verdict |
+| --- | ---: | ---: | --- |
+| 1. `20172804-Barrett` wrong = 0 | 166 | **32** | **MISS** |
+| 2. `correct → {timeout,unknown,oom}` = 0 | — | **6** | **MISS** |
+| 3. QF_DT `correct` ≥ 7,849 | 7849 | **7978** (+129) | **PASS** |
+| 4. randomized generator failed pre-slice, passes now | — | yes | **PASS** |
+| 5. `20230720-blocksworld` wrong (measured, not gated) | 162 | **190** (+28) | measured — premise contradicted |
+
+**Criterion 1 was missed, and decomposed rather than relaxed.** The 166
+baseline Barrett wrong rows split cleanly on a directory boundary: all 37
+`barrett-jsat/tests/` rows (non-`ite`-encoded, including the spec's own named
+corpus reproducer `v1l30072.cvc.smt2`) are fixed 100%. All 32 residual/new
+wrong rows are in `barrett-jsat/typed/` (nested-`ite`-encoded assertions):
+97 of 129 `typed/` baseline-wrong rows were fixed, 1 became an honest
+timeout, 31 remain wrong, and 1 previously-`correct` `typed/` row newly
+regressed to `wrong` — 31 + 1 = 32. Two candidate mechanisms were
+investigated (word_norm's ite-elimination structurally routing a `typed/`
+tester's truth value away from `asserted_testers`, and `DtSolver::assert`'s
+unconditional `if !lit.is_positive() { return None; }` at `lib.rs:888`,
+unchanged since slice 39, which never records or checks a negative tester)
+but **neither was confirmed**: a hand-built minimal negative-tester case
+answers correctly in both assertion orders. The real mechanism needs a
+targeted bisect on one of the 31 residual `typed/` files — queued, not
+solved here.
+
+**Criterion 2 was missed, and decomposed rather than relaxed.** All 6
+`correct → timeout` rows are Barrett `typed/` instances, all small
+(1,293–2,828 B) and fast at baseline (4–14 ms). None overlap the
+`wrong → timeout` set, so unlike slice 47's criterion-3 miss there is no
+"wrong answer became an honest timeout" component here — all 6 are a
+genuine performance cost: re-running `tester_clash` on every `check()` call
+adds enough case-split churn on these particular shapes to blow the 20 s
+budget on formulas that solved in single-digit milliseconds before. Beyond
+this criterion's literal scope, 2 `correct → wrong` rows were also found
+(1 Barrett, 1 blocksworld) — a more severe regression than a timeout; both
+were bisected (below).
+
+**Criterion 4's evidence.** `qfdt_random_matches_z3` failed on pre-slice code
+(task 1's report, commit `90a061b8`, verbatim): `QF_DT SOUNDNESS
+DISAGREEMENT (iter 44): shinri=sat z3=unsat` on an instance combining a
+positive tester, two negated testers and a selector-collapse equality.
+`cargo nextest run -p shinri-solver --features oracle -E
+'binary(qfdt_oracle)'` now discovers 17 tests, all 17 pass, including
+`qfdt_random_matches_z3: 300 iters, 144 sat / 152 unsat / 4 skipped, 0
+mismatches`. The full unfiltered oracle gate (`cargo nextest run -p
+shinri-solver --features oracle`) ran 651 discovered, 651 passed, 0 failed,
+3 skipped at the same HEAD.
+
+**Criterion 5 — the premise was wrong, and this run says so plainly.** §1
+and §9 claimed blocksworld is untouched by this slice because its corpus
+files contain zero `(_ is C)` syntax. That is true of the *source*, but
+`DtSolver::exhaustiveness_split` (`lib.rs:416`) mints tester atoms
+**internally** for every multi-constructor datatype term whose class isn't
+yet determined — exactly the machinery blocksworld's 21-constructor
+enums/records exercise — and those internally-minted testers flow through
+the same `assert`/`asserted_testers` bookkeeping Task 2 changed from a
+monotone `HashSet` to a level-indexed `Vec`. Measured effect: blocksworld
+wrong rows rose 162 → 190 (+28, mostly previously-`timeout` rows now
+completing), and one instance
+(`blocksworld_from_6_0_2_to_2_5_1_negated_goal_bmc_2.smt2`) flipped
+deterministically from a fast correct `unsat` (47 ms) to a fast wrong `sat`
+(27 ms) — reproduced identically across 3 reruns. Bisecting in isolated git
+worktrees (no source modified) pins this flip to **`e5cc3eea`, Task 2**,
+*before* `tester_clash` (Task 3) exists — so the family is not immune to
+this slice's changes even though Task 3's new rule never fires on it. A
+second `correct → wrong` row, Barrett's `typed/v3l70051.cvc.smt2`, bisects
+to a **different** commit, `c0957d4b` (Task 3 itself). Per spec §6 this
+criterion is measured, not gated, so neither finding blocks the merge — but
+the premise that this slice's blast radius excludes blocksworld is
+discarded as stated; the shared `asserted_testers` record is live for that
+family too.
+
+### Approach B's un-banking trigger fired
+
+§8 named its un-banking condition precisely: "a `correct → timeout`
+transition (criterion 2) or a material rise in QF_DT `timeout`." This run
+produced the first half of that condition directly (6 `correct → timeout`
+rows), and the second half is at least suggestive: QF_DT's overall `timeout`
+count only fell modestly (507 → 489, -18) despite 137 Barrett rows leaving
+`wrong`/`timeout` for `correct`. The next slice should treat Approach B
+(propagating `¬is-D(t)` instead of rediscovering the same conflict on every
+branch) as a live candidate rather than a deferred efficiency nice-to-have.
+
+### Hypotheses this run discarded
+
+| hypothesis | verdict |
+| --- | --- |
+| §1/§9 — blocksworld's 162 wrong rows are a bug fully independent of this slice's changes, since the family has zero tester syntax | **DISCARDED as stated.** The family's *source* has no testers, but `exhaustiveness_split` mints them internally, and Task 2's `asserted_testers` refactor measurably flipped one blocksworld row (bisected to `e5cc3eea`). The 162/190-row bug itself is still unexplained and still queued, but the "fully independent" framing is wrong. |
+| word_norm's ite-elimination hides a `typed/`-family tester from `asserted_testers` | **NOT CONFIRMED.** Plausible structurally (a DT-sorted `ite` becomes a fresh symbol plus a Boolean-`ite` defining assertion, routing the tester through ordinary Tseitin clauses rather than a direct assert), but not reproduced by a hand-built minimal case. |
+| `DtSolver::assert`'s negative-tester no-op (`lib.rs:888`, unchanged since slice 39) is exploitable on 2-constructor datatypes | **NOT CONFIRMED.** A hand-built `¬is-cons(x) ∧ x = cons(...)` case (both assertion orders) answers `unsat` correctly — the exhaustiveness split's sibling-constructor literal appears to close this gap in the simple case. The `typed/` family's actual mechanism remains unidentified. |
