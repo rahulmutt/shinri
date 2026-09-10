@@ -60,8 +60,9 @@ pub struct DtSolver {
     /// the tester atoms internally, so "this file has no testers" is never a
     /// reason to believe this record is unused. The unit fence
     /// `popped_tester_survives_for_instantiation_but_not_for_conflict` pins
-    /// the split; `blocksworld_instantiation_survives_backtrack_unsat` in
-    /// `crates/shinri-solver/tests/qfdt_e2e.rs` pins the end-to-end verdict.
+    /// the split; `lost_instantiation_after_backtrack_is_a_wrong_sat` and
+    /// `instantiation_survives_backtracking_or_completeness_is_lost` in
+    /// `crates/shinri-solver/tests/qfdt_e2e.rs` pin the end-to-end verdict.
     instantiation_testers_monotone: FxHashSet<TermId>,
     /// Slice 48: tester atoms asserted true on the CURRENT branch — the
     /// trigger set for `tester_clash` ALONE.
@@ -70,11 +71,12 @@ pub struct DtSolver {
     /// is the opposite of `instantiation_testers_monotone`'s, and for a reason
     /// that is specific to this consumer: `tester_clash` cites the recorded
     /// entry inside a `TCheck::Conflict`, whose `EqLeaf::Asserted(lit)` names a
-    /// literal conflict analysis expects to be FALSE under the current
-    /// assignment. A stale entry would hand the SAT seam a clause it cannot
-    /// analyse. `TheoryCtx` exposes no trail, so the record itself must be
-    /// accurate. `popped_asserted_tester_does_not_conflict_at_check` is the
-    /// fence.
+    /// literal conflict analysis expects to be TRUE under the current
+    /// assignment — `Combiner::expand_conflict` negates every such antecedent
+    /// to build the clause handed to SAT, so a stale (no-longer-true) entry
+    /// would hand the SAT seam a clause it cannot analyse. `TheoryCtx` exposes
+    /// no trail, so the record itself must be accurate.
+    /// `popped_asserted_tester_does_not_conflict_at_check` is the fence.
     ///
     /// Fix round 1 (Finding A): each entry pairs the tester atom with the
     /// exact `Lit` `assert` was called with, rather than the atom alone.
@@ -438,8 +440,9 @@ impl DtSolver {
     /// Exhaustiveness (slice 40): a watched datatype class with no constructor
     /// application IS some constructor — offer the tester disjunction
     /// `is-C1(t) ∨ … ∨ is-Cn(t)`. Guard-free: it is a T-tautology whose
-    /// at-most-one companion is the assert-time tester disjointness (slice 39).
-    /// Deduped per watched term. Nullary constructors get a `Some(true)` phase
+    /// at-most-one companion is the tester disjointness rule, enforced at
+    /// BOTH trigger points — `assert` (slice 39) and `tester_clash` in `check`
+    /// (slice 48). Deduped per watched term. Nullary constructors get a `Some(true)` phase
     /// preference so the SAT search tries finite models first, which bounds the
     /// instantiation descent on recursive types.
     fn exhaustiveness_split(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
@@ -555,11 +558,20 @@ impl DtSolver {
             // Guard by ¬is-C(t). An asserted tester always has a SAT var; the
             // `else { continue; }` is defensive and simply skips to the next
             // asserted tester rather than abandoning the whole loop if not.
+            //
+            // Re-deriving the var from the atom via `var_of_atom` here is fine
+            // even though `tester_clash` (above) deliberately avoids the same
+            // pattern: `tester_clash`'s var feeds a `TCheck::Conflict`, where a
+            // duplicate-var-per-atom hazard in `AtomRegistry` could cite the
+            // WRONG var and corrupt an explanation. Here the var only guards a
+            // `Split` that is a tautology at level 0 for ANY var carrying this
+            // atom, so recovering a different-but-still-valid var makes the
+            // lemma redundant at worst, never unsound.
             let Some(var) = cx.atoms.var_of_atom(tst) else {
                 continue;
             };
             if !self.emitted.insert(lemma) {
-                continue; // already offered on this branch
+                continue; // already offered, ever — `emitted` is monotone and never popped
             }
             return Some(TCheck::Split {
                 atoms: vec![lemma],
@@ -2276,10 +2288,15 @@ mod tests {
         let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
 
         let verdict = dt.check(&mut cx, Effort::Full);
-        assert_ne!(
+        assert_eq!(
             tcheck_name(&verdict),
-            "Conflict",
-            "a retracted tester must not produce a conflict citing its literal"
+            "Sat",
+            "a retracted tester must not produce a conflict citing its literal, \
+             and with x's class already determined (merged into nil) there is \
+             nothing left for any other rule to split on either — this also \
+             catches a regression where `instantiate_constructor` stops \
+             skipping the (retracted-but-monotone) tester and emits a `Split` \
+             over a class it disagrees with"
         );
     }
 
@@ -2376,47 +2393,72 @@ mod tests {
     /// constructor, the verdict is a Conflict, never a lemma over a class that
     /// already disagrees.
     ///
-    /// RETARGETED by the fix wave. Slice 48's Task 4 read this as proving the
-    /// instantiation loop can NEVER see a disagreeing constructor, and pinned
-    /// that with a `debug_assert_eq!`. That was only true while both consumers
-    /// shared one record. They no longer do — `instantiate_constructor` reads
-    /// the monotone record, so a RETRACTED tester legitimately reaches the loop
-    /// over a disagreeing class (see
-    /// `popped_asserted_tester_does_not_conflict_at_check`) and is simply
-    /// skipped. The assert is gone; the ordering claim, which is what this test
-    /// actually exercises, is unchanged and still asserted below.
+    /// RETARGETED by the fix wave. Slice 48's Task 4 originally pinned this
+    /// with a `debug_assert_eq!` inside `instantiate_constructor`, on the
+    /// premise that both consumers shared one record so the loop could NEVER
+    /// see a disagreeing constructor. The fix wave split the records and
+    /// deleted that assert — see `popped_asserted_tester_does_not_conflict_at_check`
+    /// for the state where a RETRACTED-but-still-monotone tester legitimately
+    /// reaches the loop over a disagreeing class and is simply skipped.
+    ///
+    /// With the assert gone this test needs its own reason to exist alongside
+    /// `asserted_tester_conflicting_with_a_later_merge_is_rejected_at_check`,
+    /// which already pins a single live disagreeing tester producing a
+    /// Conflict at `check`. This one instead asserts TWO live testers before
+    /// `check` runs — `is-cons(x)`, whose class agrees with it, alongside
+    /// `is-nil(y)`, whose class disagrees — both merged into the same `cons`
+    /// application. `conflict_testers_per_level` therefore holds an agreeing
+    /// entry ahead of the disagreeing one, and `tester_clash`'s loop must skip
+    /// the former (`if csym == ctor { continue; }`) rather than stopping or
+    /// misreading it, to still reach the latter and preempt
+    /// `instantiate_constructor` with a Conflict. A single-tester fixture
+    /// cannot exercise that loop-continuation.
     #[test]
     fn live_tester_clash_intercepts_before_instantiate_constructor() {
         let mut ctx = Context::new();
-        let (list, nil, _cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let (list, nil, cons, _head, _tail, is_nil, is_cons) = list_dt(&mut ctx);
+        let int_sort = ctx.int_sort();
+        let one = uconst(&mut ctx, "one", int_sort);
         let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let cons_t = ctx.mk_app(Op::Uninterpreted(cons), &[one, nil_t]).unwrap();
         let x = uconst(&mut ctx, "x", list);
+        let y = uconst(&mut ctx, "y", list);
         let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+        let is_nil_y = ctx.mk_app(Op::Uninterpreted(is_nil), &[y]).unwrap();
 
         let mut dt = DtSolver::default();
         let mut eq = EqualityEngine::default();
         let mut atoms = AtomRegistry::default();
-        let v = Var::new(0);
-        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let vx = Var::new(0);
+        let vy = Var::new(1);
+        atoms.register(vx, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        atoms.register(vy, is_nil_y, shinri_theory::types::Owner::Datatypes);
         let mut cx = TheoryCtx {
             terms: &mut ctx,
             eq: &mut eq,
             atoms: &atoms,
         };
-        dt.new_var(&mut cx, v, is_cons_x);
-        dt.new_var(&mut cx, Var::new(1), nil_t);
+        dt.new_var(&mut cx, vx, is_cons_x);
+        dt.new_var(&mut cx, vy, is_nil_y);
+        dt.new_var(&mut cx, Var::new(2), cons_t);
 
-        let _ = dt.assert(&mut cx, Lit::new(v, true));
-        let (xn, nn) = (cx.eq.intern(x), cx.eq.intern(nil_t));
-        let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
+        // Assert the AGREEING tester first, so it lands ahead of the
+        // disagreeing one in `conflict_testers_per_level`.
+        let _ = dt.assert(&mut cx, Lit::new(vx, true)); // is-cons(x)
+        let _ = dt.assert(&mut cx, Lit::new(vy, true)); // is-nil(y)
 
-        // Runs under `cfg(debug_assertions)` in the test profile: reaching the
-        // instantiation loop in this state would panic on the debug_assert.
+        // Both classes merge into the SAME cons application: x agrees with
+        // its tester, y does not.
+        let (xn, yn, cn) = (cx.eq.intern(x), cx.eq.intern(y), cx.eq.intern(cons_t));
+        let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
+        let _ = cx.eq.merge(yn, cn, EqJust::Definitional);
+
         let verdict = dt.check(&mut cx, Effort::Full);
         assert_eq!(
             tcheck_name(&verdict),
             "Conflict",
-            "tester_clash must intercept before instantiate_constructor runs"
+            "tester_clash must skip the agreeing entry and still find the \
+             disagreeing one, preempting instantiate_constructor"
         );
     }
 }
