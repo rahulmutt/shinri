@@ -293,6 +293,54 @@ impl DtSolver {
         None
     }
 
+    /// Tester disjointness, slice 48: an asserted `is-D(t)` whose class holds a
+    /// `C(..)` with `C != D` is a conflict — re-checked here after EVERY merge.
+    ///
+    /// `assert` (`fn assert`, below) carries the same rule at the other trigger
+    /// point, and BOTH are kept deliberately. `assert` catches the clash more
+    /// cheaply when the constructor is already in the class; this one catches
+    /// the merges `assert` structurally cannot see, because they arrive through
+    /// the shared `EqualityEngine` — from `collapse_lemma`, from
+    /// `instantiate_constructor`, or from EUF congruence — rather than as a
+    /// DT-owned literal. Before slice 48 only `assert` existed, which made the
+    /// verdict depend on the order SAT asserted the literals in: `is-cons(x) ∧
+    /// x = nil` answered `sat` one way round and `unsat` the other.
+    ///
+    /// The consequence in the disagreeing direction is the NEGATIVE literal
+    /// `¬is-D(t)`, and `TCheck::Split` carries only positive atoms — which is
+    /// why this is a conflict rule and not a lemma.
+    fn tester_clash(&self, cx: &mut TheoryCtx) -> Option<TCheck> {
+        for &tst in &self.asserted_testers {
+            let Some((tsym, targs)) = Self::uapp(cx.terms, tst) else {
+                continue;
+            };
+            let Some(DtRole::Tester { ctor }) = cx.terms.dt_role(tsym) else {
+                continue;
+            };
+            let Some(&t) = targs.first() else {
+                continue;
+            };
+            let Some((csym, capp)) = self.ctor_of_class(cx, t) else {
+                continue; // no constructor in the class — nothing to clash with
+            };
+            if csym == ctor {
+                continue; // agrees
+            }
+            // The literal that put `tst` in the record. `asserted_testers` holds
+            // only POSITIVELY asserted testers (`assert` returns early on a
+            // negative literal), so the polarity is `true` by construction.
+            let Some(var) = cx.atoms.var_of_atom(tst) else {
+                continue;
+            };
+            let tn = cx.eq.intern(t);
+            let cn = cx.eq.intern(capp);
+            let mut leaves = vec![EqLeaf::Asserted(Lit::new(var, true))];
+            cx.eq.explain(tn, cn, &mut leaves);
+            return Some(TCheck::Conflict(leaves));
+        }
+        None
+    }
+
     /// `is-C(t)` where `t`'s class holds `C(a1..an)` is a valid UNIT tautology
     /// — but ONLY when written over the constructor application itself, the
     /// same rewrite `collapse_lemma` performs. `t ≡ C(..)` may hold only on
@@ -844,6 +892,9 @@ impl TheorySolver for DtSolver {
             return TCheck::Sat;
         }
         if let Some(conflict) = self.constructor_clash(cx) {
+            return conflict;
+        }
+        if let Some(conflict) = self.tester_clash(cx) {
             return conflict;
         }
         // Injectivity: for same-constructor pairs in one class, instantiate the
@@ -2050,6 +2101,88 @@ mod tests {
             dt.asserted_testers().len(),
             1,
             "the same tester asserted twice must be recorded once"
+        );
+    }
+    /// Slice 48: the disjointness rule re-fires in `check` after a merge that
+    /// arrived AFTER the tester was asserted — the case `assert`'s one-shot
+    /// check structurally cannot see.
+    #[test]
+    fn asserted_tester_conflicting_with_a_later_merge_is_rejected_at_check() {
+        let mut ctx = Context::new();
+        let (list, nil, _cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_cons_x);
+        dt.new_var(&mut cx, Var::new(1), nil_t);
+
+        // Tester FIRST, while x's class is still constructor-free: `assert`
+        // sees nothing to clash with and returns None.
+        let at_assert = dt.assert(&mut cx, Lit::new(v, true));
+        assert!(
+            at_assert.is_none(),
+            "no constructor in the class yet — assert must not conflict"
+        );
+
+        // The merge arrives afterwards.
+        let (xn, nn) = (cx.eq.intern(x), cx.eq.intern(nil_t));
+        let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
+
+        let verdict = dt.check(&mut cx, Effort::Full);
+        assert_eq!(
+            tcheck_name(&verdict),
+            "Conflict",
+            "is-cons(x) with x ≡ nil must conflict at check time"
+        );
+    }
+
+    /// The stale-record guard, stated as behaviour rather than as bookkeeping:
+    /// a tester asserted inside a popped scope must NOT produce a conflict,
+    /// even though the merge that would clash with it is still in the engine.
+    #[test]
+    fn popped_asserted_tester_does_not_conflict_at_check() {
+        let mut ctx = Context::new();
+        let (list, nil, _cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_cons_x);
+        dt.new_var(&mut cx, Var::new(1), nil_t);
+
+        dt.push(); // level 1
+        let _ = dt.assert(&mut cx, Lit::new(v, true));
+        dt.pop(0); // the tester is retracted; the merge below is not
+
+        let (xn, nn) = (cx.eq.intern(x), cx.eq.intern(nil_t));
+        let _ = cx.eq.merge(xn, nn, EqJust::Definitional);
+
+        let verdict = dt.check(&mut cx, Effort::Full);
+        assert_ne!(
+            tcheck_name(&verdict),
+            "Conflict",
+            "a retracted tester must not produce a conflict citing its literal"
         );
     }
 }

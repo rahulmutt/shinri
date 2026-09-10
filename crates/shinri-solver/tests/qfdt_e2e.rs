@@ -392,3 +392,89 @@ fn uninterpreted_field_chain_is_fast() {
     assert_eq!(out, vec!["sat"]);
     assert!(elapsed.as_secs() < 5, "control query took {elapsed:?}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 48: tester disjointness re-checked after every merge.
+// Before slice 48 these answered `sat` because the disjointness rule ran only
+// in `assert`, against the class as it stood at that instant.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn tester_conflicting_with_later_merge_is_unsat() {
+    // is-cons(x) AND x = nil. Inside one `and`, so the assert order is SAT's
+    // to choose — this is the minimal form of the 166 Barrett wrong answers.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)\
+         (assert (and ((_ is cons) x) (= x nil)))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn tester_conflicting_with_earlier_merge_is_unsat() {
+    // The same formula with the conjuncts swapped. It already answered `unsat`
+    // before slice 48; pinned so the ORDER-DEPENDENCE itself cannot come back.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)\
+         (assert (and (= x nil) ((_ is cons) x)))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn tester_conflicting_through_transitive_merge_is_unsat() {
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)(declare-fun y () List)\
+         (assert (and ((_ is cons) x) (= x y) (= y nil)))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn tester_over_selector_collapse_is_unsat() {
+    // is-cons(tail(cons 1 nil)). The class of `tail(cons 1 nil)` gains its
+    // constructor `nil` from collapse_lemma, INSIDE check — so `assert` is
+    // never re-entered. This is the corpus reproducer's shape
+    // (QF_DT/20172804-Barrett/.../v1l30072.cvc.smt2, `is-cons(children(node null))`).
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}\
+         (assert ((_ is cons) (tail (cons 1 nil))))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn tester_over_selector_of_a_free_variable_stays_sat() {
+    // The over-fire guard. `tail(x)` with `x` free has no established
+    // constructor, so is-cons(tail(x)) is satisfiable. A disjointness rule that
+    // fires on a merely CANDIDATE constructor turns this into a wrong `unsat` —
+    // trading a wrong-sat cluster for a wrong-unsat one. Passes before slice 48
+    // and must keep passing.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)\
+         (assert ((_ is cons) (tail x)))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn barrett_v1l30072_body_is_unsat() {
+    // The corpus reproducer's assert, verbatim, with its own datatype block.
+    // 966 B file; answers `sat` before slice 48, `:status unsat`, z3 unsat.
+    let out = run_script(
+        "(set-logic QF_DT)\
+         (declare-datatypes ((nat 0)(list 0)(tree 0)) (((succ (pred nat)) (zero))\
+         ((cons (car tree) (cdr list)) (null))\
+         ((node (children list)) (leaf (data nat)))))\
+         (declare-fun x1 () nat)(declare-fun x2 () list)(declare-fun x3 () tree)\
+         (assert (and (and (= (children (leaf zero)) null) \
+         ((_ is cons) (children (node null)))) (not ((_ is null) x2))))\
+         (check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
