@@ -442,3 +442,131 @@ than rediscover them. **None is a finding.**
   `docs/superpowers/specs/2026-06-23-shinri-qfabv-design.md`.
 * The string-path precedent for a post-solve model gate —
   `crates/shinri-solver/src/lib.rs:1474` (`str-model-rejected`).
+
+## 11. Measured outcomes
+
+Closing QF_ABV re-run, run-id `slice47`, measured at commit `ddabe7b3` (same
+15,148 paths as the baseline). Full narrative, transition matrix and family
+breakdowns:
+`docs/superpowers/research/2026-09-09-smtlib-2024-qfabv-slice47-report.md`.
+
+### Success criteria
+
+| criterion | baseline | slice47 | verdict |
+| --- | ---: | ---: | --- |
+| 1. `wrong` = 0 | 359 | **0** | **PASS** |
+| 2. `correct` ≥ 8,454 | 8,454 | **12,359** (+3,905) | **PASS** |
+| 3. `timeout` ≤ 361 | 361 | **524** (+163) | **FAIL** |
+| 4. `abv-model-rejected` fires on 0 rows | n/a | **0** | **PASS** |
+| 5. extended generator failed pre-slice, passes now | — | yes | **PASS** |
+| 6. panic / parse-error / oom reported, movement explained | 5787 / 26 / 98 | 2127 / 24 / 52 | reported below |
+
+**Criterion 3 was missed, plainly.** `timeout` rose from 361 to 524 and the
+cap is not relaxed. It is decomposed rather than left as a bare number: of
+the 524, 333 were already `timeout` at baseline, and of the +163 that newly
+entered the bucket, 62 were previously `wrong` (a wrong answer becoming an
+honest timeout is this slice's purpose), 64 were previously `panic`, 3 were
+`parse-error`/`unverified`, and only **62 were previously `correct`** (28
+rows left the bucket in the other direction). The criterion counts every
+timeout alike; the slice's actual effect on the bucket is overwhelmingly
+"wrong answers and crashes became honest timeouts". The 62
+`correct → timeout` rows (dwp_formulas 36, brummayerbiere 14,
+brummayerbiere2 8, brummayerbiere3 3, stp 1) are a real regression and are
+queued for the next slice, not absorbed into a passing verdict.
+
+**Criterion 5's evidence.** `qfabv_oracle::qfabv_matches_z3` failed on
+pre-slice `main` (task 1's report, verbatim):
+`QF_ABV SOUNDNESS DISAGREEMENT (iter 3): shinri=Sat z3=unsat` on
+`(= (store (store a0 i0 e0) i1 e1) (store (store a0 i0 e1) i1 e0))` with
+`i0 != i1`, `e0 != e1`. `cargo nextest run -p shinri-solver --features
+oracle -E 'test(qfabv)'` now discovers 7 tests, all 7 pass, including
+`qfabv_matches_z3` in 3.141 s.
+
+**`abv-model-rejected` fired on 0 rows** in the closing re-run — criterion
+4's PASS condition. The gate never actually downgraded a corpus `sat`; every
+changed row changed through a fix the gate's rejection reason pointed the
+bisect at. The 21 unit fences in `validate.rs` are the executable record of
+§3.4's grammar restrictions and did not fire on any real corpus row either.
+
+**Criterion 6 — the panic movement, and §2's superseded expectation.** §2
+scoped the 5,787 `blast_word` panics out of this slice and expected them
+"reported unchanged". That expectation is superseded: the fix for the real
+cause (below) required `prewarm_array_words` to blast index/element terms
+before the first solve, and some of those terms mention a nested `select`
+that `blast_word` cannot encode. Pairing the prewarm with `abstract_word` —
+which rewrites such a term through its abstraction read-var before blasting
+— is what converts a large slice of the panic bucket into real answers:
+3,917 `panic → correct` transitions, 3,883 of them `egt`. `panic` fell from
+5,787 to 2,127 (raw) as a welcome side effect of a fix this slice needed for
+a different reason, not the unchanged count §2 anticipated. `parse-error`
+(26 → 24) and `oom` (98 → 52) moved slightly as second-order effects of the
+same transition churn; neither is attributed to a new defect.
+
+### Both §9 hypotheses discarded; the real cause was neither
+
+| hypothesis | verdict |
+| --- | --- |
+| §9 #1 — `functional_consistency` relates two selects only when their base arrays are syntactically identical | **DISCARDED as the cause of any measured row.** The restriction is real but was never reached — the checks never had a usable model to compare against. |
+| §9 #2 — `refine` returns `Sat` at a lemma-set fixpoint that is not an axiom fixpoint | **DISCARDED as stated.** The loop does stop early, but not because a round's guards happened to agree with a real model — it stops because the model it read was fabricated. |
+
+**The real cause.** `Sat::add_clause` backtracks to decision level 0 on any
+clause added after a solve, destroying the assignment. `RealBridge::value_bv`
+blasted words **on demand** and then read the **live** solver — so the first
+query for a word that had never been blasted (an index or element term that
+only ever appeared inside an abstracted-away `select`/`store`) wiped the
+model, and every subsequent value read was
+`value_of(v).unwrap_or(false)`: a fabricated `0`. An all-zero pseudo-model is
+internally consistent with every array axiom, so round 0 of `refine` emitted
+no lemma and reported `Sat` in round 0 without examining anything real.
+
+The same corrupted values reached the model gate: `validate` reads the same
+`value_bv`, so on `bubsort002un.smt2` it built its store-chain overlay and
+its read comparisons from the same fabricated zeros and passed every check
+on garbage — that is why the gate had a hole on that row. The two
+rejections the gate *did* produce during the bisect
+(`wchains002ue`'s `DiseqPinsForceEqual`, the minimal reproducer's
+`ReadMismatch`) were sound outcomes but were also derived from the same
+fabricated model, not genuine findings. The fix makes the value readers work
+from a post-solve snapshot that is never mutated; a word the snapshot cannot
+value returns `None` and is queued for the next solve instead of reading as
+zero. `validate.rs` and `check.rs` were not changed — the diagnosis did not
+call for it.
+
+### The retracted claim
+
+Commit `60b41c74`'s message states shinri is "sound on the 359 measured
+QF_ABV wrong answers from here, whatever the remaining tasks find." That was
+**false when written** and was retracted in the very next commit's message,
+`b88a8349`: `bubsort002un.smt2`, one of the 359 measured rows, passed every
+`validate` check and was still answered `sat`, because — as the bisect later
+found — the checks were reading a fabricated model. Recorded here so the
+claim is not repeated or rediscovered as new.
+
+### Post-measurement correction
+
+The `ddabe7b3` measurement's transition matrix shows 264 `correct → panic`
+rows, all `dwp_formulas`, all the same `blast_word` message: the same
+`prewarm_array_words` fix newly unlocked a dead branch of
+`functional_consistency`'s lemma construction, and the write path that lemma
+goes through (`RealBridge::ensure_atom`) never applied the aliasing rewrite
+that the read path did, so it handed a raw select-mentioning term straight
+to `blast_word`. Commits `741410ac` and `bdf85f59` fix this by running the
+same aliasing rewrite in `ensure_atom`. This was **not** re-measured by a
+full corpus re-run; it was verified by direct per-file measurement of all
+264 regressed rows against the fixed binary (20 s timeout each), and all 264
+came back `sat`, matching baseline's correct verdict — full recovery, no
+new panics, timeouts, unknowns or wrong answers. So the shipped code's real
+numbers (at `bdf85f59`, this branch's HEAD) are approximately `panic` 1,863
+and `correct` 12,623 — the raw table above, corrected by that 264-row swing
+in the single direction it moved. No other bucket is affected.
+
+### Queued for the next slice
+
+* The 62 `correct → timeout` rows behind criterion 3's miss.
+* The remaining `blast_word` panic bucket (2,127 raw / ≈1,863 shipped) —
+  still out of scope per §2; `check.rs` can still reach `blast_word` through
+  a route this slice did not touch (raw index terms in lemma construction
+  outside `ensure_atom`), deliberately deferred to the panic-bucket slice
+  (slice-46 queue rank 4).
+* The 53 stack-overflow rows and 24 `parse-error` rows, unchanged in kind,
+  tracked under the slice-46 queue's existing ranks.
