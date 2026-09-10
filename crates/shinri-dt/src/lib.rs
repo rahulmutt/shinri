@@ -13,9 +13,14 @@ use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
 /// Datatype theory solver. Holds no union-find: all equality state lives in the
 /// shared `EqualityEngine`, and every derived fact is emitted as a lemma or a
-/// conflict. The watch sets are monotone (assignment-independent), but the
-/// assertion record `asserted_testers` is per-level, so `push`/`pop` are NOT
-/// no-ops — see that field's doc for why slice 48 had to level it.
+/// conflict. The watch sets are monotone (assignment-independent). Asserted
+/// testers are recorded TWICE, in two records with deliberately OPPOSITE
+/// retraction disciplines — `instantiation_testers_monotone` and
+/// `conflict_testers_per_level`; `push`/`pop` maintain the second one only, so
+/// they are NOT no-ops. Read both field docs before touching either: the slice
+/// 48 fix wave exists because the two were briefly merged into one levelled
+/// record, which silently retracted instantiation lemmas and turned an `unsat`
+/// blocksworld instance into a wrong `sat`.
 #[derive(Default)]
 pub struct DtSolver {
     /// Constructor applications `C(a1..an)` seen in registered atoms.
@@ -34,19 +39,42 @@ pub struct DtSolver {
     /// been emitted, so `check` reaches a fixpoint instead of re-offering the
     /// same split. Monotone — the `emitted`/watch-set discipline of slice 39.
     split_done: FxHashSet<TermId>,
-    /// Slice 40, corrected by slice 48: tester atoms asserted true — the
-    /// trigger set for `instantiate_constructor` AND for `tester_clash`.
+    /// Slice 40, restored by the slice 48 fix wave: tester atoms ever asserted
+    /// true — the trigger set for `instantiate_constructor` ALONE.
     ///
-    /// PER-LEVEL, unlike every other field on this struct. The watch sets
-    /// (`ctor_apps`, `sel_apps`, `testers`, `dt_terms`, `emitted`,
-    /// `split_done`) are assignment-independent and stay monotone; this one is
-    /// a record of the current branch's assertions and must be retracted with
-    /// it. Slice 40 could leave it monotone because a stale entry only
-    /// re-emitted a GUARDED (hence inert) lemma. Slice 48 feeds it into
-    /// `TCheck::Conflict`, whose `EqLeaf::Asserted(lit)` names a literal that
-    /// conflict analysis expects to be false under the current assignment — a
-    /// stale entry would hand the SAT seam a clause it cannot analyse.
-    /// `TheoryCtx` exposes no trail, so the record itself must be accurate.
+    /// MONOTONE. Never popped, exactly like the watch sets above. This is
+    /// deliberate and load-bearing, not an oversight: the only consumer emits
+    /// the GUARDED tautology `is-C(t) ⇒ t = C(sel1(t), …, seln(t))`, whose
+    /// guard makes it valid at level 0 on every branch. A "stale" entry here
+    /// therefore re-offers an inert lemma at worst — it can never be unsound —
+    /// while a MISSING entry costs a constructor instantiation, and a lost
+    /// instantiation on an `unsat` instance is a wrong `sat`.
+    ///
+    /// Do NOT merge this with `conflict_testers_per_level`. Slice 48's Task 2
+    /// did exactly that (commit `e5cc3eea`): levelling this record for
+    /// `tester_clash`'s benefit retracted instantiation lemmas from THIS
+    /// consumer too, flipping
+    /// `QF_DT/20230720-blocksworld/blocksworld_from_6_0_2_to_2_5_1_negated_goal_bmc_2.smt2`
+    /// from `unsat` to a wrong `sat` (+28 wrong rows across the family). The
+    /// family has no `(_ is C)` syntax at all — `exhaustiveness_split` MINTS
+    /// the tester atoms internally, so "this file has no testers" is never a
+    /// reason to believe this record is unused. The unit fence
+    /// `popped_tester_survives_for_instantiation_but_not_for_conflict` pins
+    /// the split; `blocksworld_instantiation_survives_backtrack_unsat` in
+    /// `crates/shinri-solver/tests/qfdt_e2e.rs` pins the end-to-end verdict.
+    instantiation_testers_monotone: FxHashSet<TermId>,
+    /// Slice 48: tester atoms asserted true on the CURRENT branch — the
+    /// trigger set for `tester_clash` ALONE.
+    ///
+    /// PER-LEVEL: `push`/`pop` retract it with the SAT trail. That discipline
+    /// is the opposite of `instantiation_testers_monotone`'s, and for a reason
+    /// that is specific to this consumer: `tester_clash` cites the recorded
+    /// entry inside a `TCheck::Conflict`, whose `EqLeaf::Asserted(lit)` names a
+    /// literal conflict analysis expects to be FALSE under the current
+    /// assignment. A stale entry would hand the SAT seam a clause it cannot
+    /// analyse. `TheoryCtx` exposes no trail, so the record itself must be
+    /// accurate. `popped_asserted_tester_does_not_conflict_at_check` is the
+    /// fence.
     ///
     /// Fix round 1 (Finding A): each entry pairs the tester atom with the
     /// exact `Lit` `assert` was called with, rather than the atom alone.
@@ -57,14 +85,15 @@ pub struct DtSolver {
     /// actually asserted. Storing the asserted `Lit` verbatim makes that
     /// class of bug structurally impossible rather than merely believed
     /// unreachable.
-    asserted_testers: Vec<(TermId, Lit)>,
-    /// Membership index for `asserted_testers`, preserving the dedup that
-    /// `assert` relied on when this was a set. Still keyed on the atom, not
-    /// the pair — the level/dedup semantics are unchanged by Finding A.
-    asserted_tester_set: FxHashSet<TermId>,
-    /// `asserted_testers.len()` at the moment each open scope began.
+    conflict_testers_per_level: Vec<(TermId, Lit)>,
+    /// Membership index for `conflict_testers_per_level`, preserving the dedup
+    /// that `assert` relied on when this was a set. Keyed on the atom, not the
+    /// pair — the level/dedup semantics are unchanged by Finding A.
+    conflict_tester_set: FxHashSet<TermId>,
+    /// `conflict_testers_per_level.len()` at the moment each open scope began.
     /// `push`/`pop` maintain it; the semantics mirror
-    /// `crates/shinri-str/src/trail.rs`'s `pop_to`.
+    /// `crates/shinri-str/src/trail.rs`'s `pop_to`. There is no counterpart for
+    /// `instantiation_testers_monotone` by design — it is never truncated.
     tester_marks: Vec<usize>,
     /// Test-only instrumentation: total `collect` invocations (including
     /// early returns on an already-seen term), so a test can pin that the
@@ -321,7 +350,7 @@ impl DtSolver {
     /// `¬is-D(t)`, and `TCheck::Split` carries only positive atoms — which is
     /// why this is a conflict rule and not a lemma.
     fn tester_clash(&self, cx: &mut TheoryCtx) -> Option<TCheck> {
-        for &(tst, lit) in &self.asserted_testers {
+        for &(tst, lit) in &self.conflict_testers_per_level {
             let Some((tsym, targs)) = Self::uapp(cx.terms, tst) else {
                 continue;
             };
@@ -463,7 +492,11 @@ impl DtSolver {
     /// testers (not all watched testers) is the laziness lever: only the
     /// branch's chosen constructor is ever instantiated.
     fn instantiate_constructor(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
-        let asserted: Vec<TermId> = self.asserted_testers.iter().map(|&(t, _)| t).collect();
+        let asserted: Vec<TermId> = self
+            .instantiation_testers_monotone
+            .iter()
+            .copied()
+            .collect();
         for tst in asserted {
             let Some((tsym, targs)) = Self::uapp(cx.terms, tst) else {
                 continue;
@@ -474,21 +507,22 @@ impl DtSolver {
             let Some(&t) = targs.first() else {
                 continue;
             };
-            if let Some((csym, _)) = self.ctor_of_class(cx, t) {
-                // Slice 48: unreachable with a DISAGREEING symbol — `tester_clash`
-                // runs earlier in this same `check` call and returns a Conflict
-                // for exactly that state, and this loop iterates the same
-                // `asserted_testers` record. Kept as a zero-cost fence rather
-                // than a second conflict site, which would duplicate
-                // `tester_clash` for no measured gain. The unit tests below are
-                // the proof, not this branch.
-                debug_assert_eq!(
-                    csym, ctor,
-                    "instantiate_constructor reached a class whose constructor \
-                     disagrees with an asserted tester — tester_clash should \
-                     have conflicted first"
-                );
-                continue; // class already has a constructor app
+            if self.ctor_of_class(cx, t).is_some() {
+                // The class already has a constructor app, so there is nothing
+                // to instantiate. The constructor may DISAGREE with `ctor`
+                // here, and that is not a defect: this loop reads the MONOTONE
+                // record, so `tst` may have been retracted from the branch
+                // while `tester_clash` (which reads the per-level record) has
+                // correctly stayed silent about it. Skipping is the whole
+                // response — the disagreeing-and-still-asserted case is
+                // `tester_clash`'s, and `check` runs it first.
+                //
+                // Slice 48's Task 4 asserted `csym == ctor` here on the premise
+                // that both consumers share one record. The fix wave split the
+                // records, so that premise is gone and the assert would fire on
+                // the legitimate popped-tester state
+                // (`popped_asserted_tester_does_not_conflict_at_check`).
+                continue;
             }
             let Some(sels) = cx.terms.dt_selectors(ctor).map(<[SymbolId]>::to_vec) else {
                 continue;
@@ -853,13 +887,24 @@ impl DtSolver {
     pub(crate) fn collect_calls(&self) -> u32 {
         self.collect_calls
     }
-    /// Fix round 1 (Finding A): the backing field is now `Vec<(TermId, Lit)>`
-    /// (atom paired with the exact asserted `Lit`); this accessor still
-    /// projects out just the atoms so the existing `.contains(&term)` /
-    /// `.len()` call sites need no changes.
+    /// The MONOTONE record `instantiate_constructor` reads. Never retracted.
     #[cfg(test)]
-    pub(crate) fn asserted_testers(&self) -> Vec<TermId> {
-        self.asserted_testers.iter().map(|&(t, _)| t).collect()
+    pub(crate) fn instantiation_testers(&self) -> Vec<TermId> {
+        self.instantiation_testers_monotone
+            .iter()
+            .copied()
+            .collect()
+    }
+    /// The PER-LEVEL record `tester_clash` reads. Fix round 1 (Finding A): the
+    /// backing field is `Vec<(TermId, Lit)>` (atom paired with the exact
+    /// asserted `Lit`); this accessor projects out just the atoms so the
+    /// existing `.contains(&term)` / `.len()` call sites need no changes.
+    #[cfg(test)]
+    pub(crate) fn conflict_testers(&self) -> Vec<TermId> {
+        self.conflict_testers_per_level
+            .iter()
+            .map(|&(t, _)| t)
+            .collect()
     }
 }
 
@@ -893,13 +938,19 @@ impl TheorySolver for DtSolver {
         let DtRole::Tester { ctor } = cx.terms.dt_role(tsym)? else {
             return None;
         };
-        // Slice 40: record the positive tester so `instantiate_constructor`
-        // (in `check`) can introduce `t = C(sel(t)…)` on this branch. Fix
-        // round 1 (Finding A): store `lit` itself, not just the atom — `assert`
+        // Record the positive tester in BOTH records — they have opposite
+        // retraction disciplines and one consumer each; see the field docs.
+        // Monotone: slice 40's trigger set for `instantiate_constructor`, whose
+        // lemma is guarded and hence sound on every branch, so it must survive
+        // backtracking. Per-level: slice 48's trigger set for `tester_clash`,
+        // which cites the entry in a `TCheck::Conflict` and so must hold only
+        // literals the current trail still asserts. Fix round 1 (Finding A):
+        // the per-level entry stores `lit` itself, not just the atom — `assert`
         // has the exact asserted `Lit` in hand here, and `tester_clash` (in
         // `check`) cites it directly rather than reconstructing one later.
-        if self.asserted_tester_set.insert(atom) {
-            self.asserted_testers.push((atom, lit));
+        self.instantiation_testers_monotone.insert(atom);
+        if self.conflict_tester_set.insert(atom) {
+            self.conflict_testers_per_level.push((atom, lit));
         }
         let &t = targs.first()?;
         let (csym, capp) = self.ctor_of_class(cx, t)?;
@@ -988,7 +1039,8 @@ impl TheorySolver for DtSolver {
     }
 
     fn push(&mut self) {
-        self.tester_marks.push(self.asserted_testers.len());
+        self.tester_marks
+            .push(self.conflict_testers_per_level.len());
     }
 
     /// ABSOLUTE target level, matching `EqualityEngine`/`UndoLog` and the
@@ -1002,8 +1054,8 @@ impl TheorySolver for DtSolver {
             restore = self.tester_marks.pop();
         }
         if let Some(n) = restore {
-            for (t, _) in self.asserted_testers.drain(n..) {
-                self.asserted_tester_set.remove(&t);
+            for (t, _) in self.conflict_testers_per_level.drain(n..) {
+                self.conflict_tester_set.remove(&t);
             }
         }
     }
@@ -2037,11 +2089,17 @@ mod tests {
         }
     }
 
-    /// Slice 48: the assertion record is per-level. A tester asserted inside a
-    /// scope must be gone once that scope is popped — spec §3.2. Until this
-    /// slice the record was monotone, which was sound only while it fed a
-    /// GUARDED lemma; slice 48 feeds it into a CONFLICT, and a stale entry
-    /// would cite a literal the trail no longer holds.
+    /// Slice 48: the CONFLICT-citing record is per-level. A tester asserted
+    /// inside a scope must be gone from it once that scope is popped — spec
+    /// §3.2. Slice 48 feeds this record into a `TCheck::Conflict`, and a stale
+    /// entry would cite a literal the trail no longer holds.
+    ///
+    /// RETARGETED by the fix wave: this fence originally read the single
+    /// `asserted_testers` record and now reads `conflict_testers()`. The
+    /// assertion is unchanged and unweakened — the record it names is the one
+    /// that genuinely needs levelling. `instantiate_constructor`'s record must
+    /// NOT behave this way; that is pinned by
+    /// `popped_tester_survives_for_instantiation_but_not_for_conflict`.
     #[test]
     fn asserted_tester_recorded_in_a_scope_is_dropped_on_pop() {
         let mut ctx = Context::new();
@@ -2065,20 +2123,22 @@ mod tests {
         dt.push(); // level 2
         let _ = dt.assert(&mut cx, Lit::new(v, true));
         assert!(
-            dt.asserted_testers().contains(&is_cons_x),
+            dt.conflict_testers().contains(&is_cons_x),
             "the level-2 assertion must be recorded"
         );
 
         dt.pop(1);
         assert!(
-            !dt.asserted_testers().contains(&is_cons_x),
+            !dt.conflict_testers().contains(&is_cons_x),
             "popping to level 1 must discard a level-2 assertion"
         );
     }
 
-    /// The mirror case: a level-0 assertion is permanent, so `pop(0)` must NOT
-    /// discard it. This is the off-by-one that `pop_to` semantics decide, and
-    /// the reason it gets its own fence.
+    /// The mirror case on the per-level record: a level-0 assertion is
+    /// permanent, so `pop(0)` must NOT discard it. This is the off-by-one that
+    /// `pop_to` semantics decide, and the reason it gets its own fence.
+    /// RETARGETED by the fix wave to `conflict_testers()`; the assertion is
+    /// unchanged.
     #[test]
     fn level_zero_asserted_tester_survives_pop_to_zero() {
         let mut ctx = Context::new();
@@ -2103,13 +2163,16 @@ mod tests {
         dt.push(); // level 1
         dt.pop(0);
         assert!(
-            dt.asserted_testers().contains(&is_cons_x),
+            dt.conflict_testers().contains(&is_cons_x),
             "a level-0 assertion is permanent and must survive pop(0)"
         );
     }
 
-    /// The record must not grow a duplicate when the same tester is asserted
-    /// twice in one scope — `assert` relied on set semantics before slice 48.
+    /// The per-level record must not grow a duplicate when the same tester is
+    /// asserted twice in one scope — `assert` relied on set semantics before
+    /// slice 48. RETARGETED by the fix wave to `conflict_testers()` (the
+    /// monotone record is an `FxHashSet` and dedups structurally); the
+    /// assertion is unchanged.
     #[test]
     fn asserted_tester_is_recorded_once_per_scope() {
         let mut ctx = Context::new();
@@ -2132,7 +2195,7 @@ mod tests {
         let _ = dt.assert(&mut cx, Lit::new(v, true));
         let _ = dt.assert(&mut cx, Lit::new(v, true));
         assert_eq!(
-            dt.asserted_testers().len(),
+            dt.conflict_testers().len(),
             1,
             "the same tester asserted twice must be recorded once"
         );
@@ -2220,14 +2283,110 @@ mod tests {
         );
     }
 
-    /// Slice 48 / slice 38 pattern: the `debug_assert` in
-    /// `instantiate_constructor` is end-to-end unreachable, and this is its
-    /// proof. The state that would trip it — an asserted tester over a class
-    /// holding a different constructor — is intercepted by `tester_clash`,
-    /// so `check` returns Conflict and never reaches the instantiation loop.
-    /// A debug build would panic here if the ordering ever regressed.
+    /// Slice 48 fix wave — THE invariant the record split exists to establish.
+    ///
+    /// One tester, asserted inside a scope, then popped. Afterwards it must be:
+    ///   * STILL in the monotone record, so `instantiate_constructor` keeps
+    ///     offering the guarded lemma `is-C(t) ⇒ t = C(sel…(t))`. That lemma is
+    ///     valid at level 0 on every branch, so keeping it is sound; DROPPING it
+    ///     costs completeness, and lost completeness on an `unsat` instance is a
+    ///     wrong `sat` (the blocksworld regression, commit `e5cc3eea`).
+    ///   * GONE from the per-level record, so `tester_clash` cannot cite a
+    ///     literal the trail no longer holds inside a `TCheck::Conflict`.
+    ///
+    /// Both halves are asserted here, on the same tester, in the same state —
+    /// so the two disciplines cannot be quietly merged back into one record
+    /// without this failing.
     #[test]
-    fn instantiate_constructor_never_sees_a_disagreeing_constructor() {
+    fn popped_tester_survives_for_instantiation_but_not_for_conflict() {
+        let mut ctx = Context::new();
+        let (list, _nil, cons, head, tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_cons_x);
+
+        dt.push(); // level 1
+        assert!(dt.assert(&mut cx, Lit::new(v, true)).is_none());
+        assert!(
+            dt.instantiation_testers().contains(&is_cons_x)
+                && dt.conflict_testers().contains(&is_cons_x),
+            "assert must populate BOTH records"
+        );
+
+        dt.pop(0); // retract the branch that asserted it
+
+        assert!(
+            dt.instantiation_testers().contains(&is_cons_x),
+            "the monotone record must NOT be retracted — its consumer's lemma \
+             is guarded, and dropping it loses completeness"
+        );
+        assert!(
+            !dt.conflict_testers().contains(&is_cons_x),
+            "the per-level record MUST be retracted — its consumer cites the \
+             entry in a conflict"
+        );
+
+        // The invariant stated as behaviour, not bookkeeping: the guarded
+        // instantiation lemma is still offered after the pop.
+        match dt.check(&mut cx, Effort::Full) {
+            TCheck::Split {
+                atoms: lemma,
+                guard,
+                ..
+            } => {
+                let head_x = cx.terms.mk_app(Op::Uninterpreted(head), &[x]).unwrap();
+                let tail_x = cx.terms.mk_app(Op::Uninterpreted(tail), &[x]).unwrap();
+                let capp = cx
+                    .terms
+                    .mk_app(Op::Uninterpreted(cons), &[head_x, tail_x])
+                    .unwrap();
+                let expected = cx.terms.mk_eq(x, capp).unwrap();
+                assert_eq!(
+                    lemma,
+                    vec![expected],
+                    "the guarded instantiation must survive the pop"
+                );
+                assert_eq!(
+                    guard,
+                    Some(Lit::new(v, true).negate()),
+                    "and stay guarded by ¬is-cons(x), which is what makes \
+                     keeping it sound"
+                );
+            }
+            other => panic!(
+                "expected the guarded instantiation Split after pop, got {}",
+                tcheck_name(&other)
+            ),
+        }
+    }
+
+    /// `check` must run `tester_clash` BEFORE `instantiate_constructor`: while
+    /// a tester is LIVE on the branch and its class holds a different
+    /// constructor, the verdict is a Conflict, never a lemma over a class that
+    /// already disagrees.
+    ///
+    /// RETARGETED by the fix wave. Slice 48's Task 4 read this as proving the
+    /// instantiation loop can NEVER see a disagreeing constructor, and pinned
+    /// that with a `debug_assert_eq!`. That was only true while both consumers
+    /// shared one record. They no longer do — `instantiate_constructor` reads
+    /// the monotone record, so a RETRACTED tester legitimately reaches the loop
+    /// over a disagreeing class (see
+    /// `popped_asserted_tester_does_not_conflict_at_check`) and is simply
+    /// skipped. The assert is gone; the ordering claim, which is what this test
+    /// actually exercises, is unchanged and still asserted below.
+    #[test]
+    fn live_tester_clash_intercepts_before_instantiate_constructor() {
         let mut ctx = Context::new();
         let (list, nil, _cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
         let nil_t = ctx.mk_app(Op::Uninterpreted(nil), &[]).unwrap();
