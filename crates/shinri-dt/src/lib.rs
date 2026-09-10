@@ -47,9 +47,20 @@ pub struct DtSolver {
     /// conflict analysis expects to be false under the current assignment — a
     /// stale entry would hand the SAT seam a clause it cannot analyse.
     /// `TheoryCtx` exposes no trail, so the record itself must be accurate.
-    asserted_testers: Vec<TermId>,
+    ///
+    /// Fix round 1 (Finding A): each entry pairs the tester atom with the
+    /// exact `Lit` `assert` was called with, rather than the atom alone.
+    /// `tester_clash` cites this stored `Lit` directly instead of
+    /// reconstructing one from `cx.atoms.var_of_atom(atom)` — `AtomRegistry`
+    /// is first-registration-wins on `by_atom`, so re-deriving the var from
+    /// the atom could in principle recover a DIFFERENT var than the one SAT
+    /// actually asserted. Storing the asserted `Lit` verbatim makes that
+    /// class of bug structurally impossible rather than merely believed
+    /// unreachable.
+    asserted_testers: Vec<(TermId, Lit)>,
     /// Membership index for `asserted_testers`, preserving the dedup that
-    /// `assert` relied on when this was a set.
+    /// `assert` relied on when this was a set. Still keyed on the atom, not
+    /// the pair — the level/dedup semantics are unchanged by Finding A.
     asserted_tester_set: FxHashSet<TermId>,
     /// `asserted_testers.len()` at the moment each open scope began.
     /// `push`/`pop` maintain it; the semantics mirror
@@ -310,7 +321,7 @@ impl DtSolver {
     /// `¬is-D(t)`, and `TCheck::Split` carries only positive atoms — which is
     /// why this is a conflict rule and not a lemma.
     fn tester_clash(&self, cx: &mut TheoryCtx) -> Option<TCheck> {
-        for &tst in &self.asserted_testers {
+        for &(tst, lit) in &self.asserted_testers {
             let Some((tsym, targs)) = Self::uapp(cx.terms, tst) else {
                 continue;
             };
@@ -326,15 +337,14 @@ impl DtSolver {
             if csym == ctor {
                 continue; // agrees
             }
-            // The literal that put `tst` in the record. `asserted_testers` holds
-            // only POSITIVELY asserted testers (`assert` returns early on a
-            // negative literal), so the polarity is `true` by construction.
-            let Some(var) = cx.atoms.var_of_atom(tst) else {
-                continue;
-            };
+            // `lit` is the exact literal `assert` recorded alongside `tst` —
+            // cited verbatim, never reconstructed from the atom via
+            // `var_of_atom`, so a duplicate-var-per-atom hazard in
+            // `AtomRegistry` (first-registration-wins on `by_atom`) cannot
+            // make this cite the wrong var.
             let tn = cx.eq.intern(t);
             let cn = cx.eq.intern(capp);
-            let mut leaves = vec![EqLeaf::Asserted(Lit::new(var, true))];
+            let mut leaves = vec![EqLeaf::Asserted(lit)];
             cx.eq.explain(tn, cn, &mut leaves);
             return Some(TCheck::Conflict(leaves));
         }
@@ -352,7 +362,8 @@ impl DtSolver {
     /// conditional fact into a permanent level-0 one (the SAT layer pins a
     /// guard-free unit `Split` at level 0) — a wrong-UNSAT hazard.
     /// (The negative direction `¬is-D(t)` cannot ride `Split`, whose atoms are
-    /// positive; it is handled at assert time instead — see `assert`.)
+    /// positive; it is handled at assert time and, since slice 48, again in
+    /// `check` — see `assert` and `tester_clash`.)
     fn tester_lemma(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
         let testers: Vec<TermId> = self.testers.iter().copied().collect();
         let ctors: Vec<TermId> = self.ctor_apps.iter().copied().collect();
@@ -452,7 +463,7 @@ impl DtSolver {
     /// testers (not all watched testers) is the laziness lever: only the
     /// branch's chosen constructor is ever instantiated.
     fn instantiate_constructor(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
-        let asserted: Vec<TermId> = self.asserted_testers.clone();
+        let asserted: Vec<TermId> = self.asserted_testers.iter().map(|&(t, _)| t).collect();
         for tst in asserted {
             let Some((tsym, targs)) = Self::uapp(cx.terms, tst) else {
                 continue;
@@ -829,9 +840,13 @@ impl DtSolver {
     pub(crate) fn collect_calls(&self) -> u32 {
         self.collect_calls
     }
+    /// Fix round 1 (Finding A): the backing field is now `Vec<(TermId, Lit)>`
+    /// (atom paired with the exact asserted `Lit`); this accessor still
+    /// projects out just the atoms so the existing `.contains(&term)` /
+    /// `.len()` call sites need no changes.
     #[cfg(test)]
-    pub(crate) fn asserted_testers(&self) -> &[TermId] {
-        &self.asserted_testers
+    pub(crate) fn asserted_testers(&self) -> Vec<TermId> {
+        self.asserted_testers.iter().map(|&(t, _)| t).collect()
     }
 }
 
@@ -844,9 +859,12 @@ impl TheorySolver for DtSolver {
     }
 
     /// Tester disjointness: an asserted `is-D(t)` whose class already holds a
-    /// `C(..)` with `C != D` is an immediate conflict. Handled here rather
-    /// than in `check` because the consequence `¬is-D(t)` is a NEGATIVE
-    /// literal and `TCheck::Split` carries only positive atoms.
+    /// `C(..)` with `C != D` is an immediate conflict. Checked here as soon
+    /// as the tester is asserted, because the consequence `¬is-D(t)` is a
+    /// NEGATIVE literal and `TCheck::Split` carries only positive atoms.
+    /// Slice 48 added a second copy of this same rule, `tester_clash`, which
+    /// `check` re-runs after every merge — see its doc for why both trigger
+    /// points are kept rather than one being deleted.
     ///
     /// `assert` is straight-line, not a loop, so the loop-abandonment hazard
     /// the file's `let..else { continue; }` house style guards against does
@@ -863,9 +881,12 @@ impl TheorySolver for DtSolver {
             return None;
         };
         // Slice 40: record the positive tester so `instantiate_constructor`
-        // (in `check`) can introduce `t = C(sel(t)…)` on this branch.
+        // (in `check`) can introduce `t = C(sel(t)…)` on this branch. Fix
+        // round 1 (Finding A): store `lit` itself, not just the atom — `assert`
+        // has the exact asserted `Lit` in hand here, and `tester_clash` (in
+        // `check`) cites it directly rather than reconstructing one later.
         if self.asserted_tester_set.insert(atom) {
-            self.asserted_testers.push(atom);
+            self.asserted_testers.push((atom, lit));
         }
         let &t = targs.first()?;
         let (csym, capp) = self.ctor_of_class(cx, t)?;
@@ -968,7 +989,7 @@ impl TheorySolver for DtSolver {
             restore = self.tester_marks.pop();
         }
         if let Some(n) = restore {
-            for t in self.asserted_testers.drain(n..) {
+            for (t, _) in self.asserted_testers.drain(n..) {
                 self.asserted_tester_set.remove(&t);
             }
         }
