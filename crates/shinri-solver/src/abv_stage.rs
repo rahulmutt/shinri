@@ -614,6 +614,61 @@ fn abstract_word(
     out
 }
 
+/// Rewrite `t` (and every subterm of `t`) through `word_alias` — the table
+/// `prewarm_array_words` built via `abstract_word` — so a term whose select
+/// subterms were already given a blastable rewrite reaches `blast_word`/
+/// `blast_atom` as that rewrite, never as the raw select-mentioning original.
+///
+/// A direct membership check first: `word_alias` is keyed by the WHOLE word
+/// prewarm queued (an index or store-chain element), and lemma atoms built
+/// from `select_parts`/`store_parts` (e.g. `functional_consistency`'s
+/// `(= ix iy)`) hand those exact `TermId`s straight to `ensure_atom`, so the
+/// common case resolves in one lookup. The recursive fallback handles a term
+/// that mentions an already-aliased word as a PROPER subterm rather than
+/// being one itself.
+///
+/// Unlike `abstract_word`, this takes no `&Abstraction` — `ensure_atom` only
+/// has `&mut Context` — so it can only route through words prewarm already
+/// resolved. Per the `word_alias` field's invariant, everything the
+/// refinement loop discovers AFTER prewarm is either already one of those
+/// words (ROW-2 reuses a select's own index) or mentions no select at all
+/// (a fresh extensionality witness), so this is complete for every atom
+/// `ensure_atom` is actually called with.
+fn alias_word(
+    ctx: &mut Context,
+    word_alias: &FxHashMap<TermId, TermId>,
+    t: TermId,
+    memo: &mut FxHashMap<TermId, TermId>,
+) -> TermId {
+    if let Some(&a) = word_alias.get(&t) {
+        return a;
+    }
+    if let Some(&m) = memo.get(&t) {
+        return m;
+    }
+    let out = match ctx.term_node(t).clone() {
+        TermNode::Const { .. } => t,
+        TermNode::App { op, args, .. } => {
+            let kids: Vec<TermId> = ctx.children(args).to_vec();
+            let mut changed = false;
+            let mut rebuilt: Vec<TermId> = Vec::with_capacity(kids.len());
+            for k in &kids {
+                let nk = alias_word(ctx, word_alias, *k, memo);
+                changed |= nk != *k;
+                rebuilt.push(nk);
+            }
+            if changed {
+                ctx.mk_app(op, &rebuilt)
+                    .expect("alias substitution preserves sorts")
+            } else {
+                t
+            }
+        }
+    };
+    memo.insert(t, out);
+    out
+}
+
 /// Tseitin-encode a Bool-sorted abstracted term over the `NoTheory` solver.
 /// BV atoms resolve to their pre-blasted surrogate lit; array-eq proxies (and
 /// any other Bool leaf) resolve to a fresh SAT var; connectives are encoded
@@ -876,7 +931,26 @@ impl shinri_abv::SatBridge for RealBridge {
         if self.proxy_var.contains_key(&atom) {
             return;
         }
-        let lit = self.st.borrow_mut().ensure_atom_lit(ctx, atom);
+        // A lemma atom's own children can be raw (non-aliased) index/element
+        // terms — e.g. `functional_consistency`'s `(= ix iy)` built directly
+        // from `select_parts`. Such a term may mention a `select` beneath it
+        // (`(select p (bvadd x (select q #x03)))` is ordinary in the `egt` and
+        // `dwp_formulas` families); `blast_word` cannot encode that and panics
+        // ("non-BV builtin reached blast_word: Select").
+        //
+        // `prewarm_array_words` already computed the blastable rewrite for
+        // every index/element word the checks read — that is exactly what
+        // `word_alias` holds. `value_bv` applies it before reading; this path
+        // must apply it too before blasting, or a term `value_bv` can value
+        // (because it goes through the alias) reaches `blast_atom` unaliased
+        // and panics on the very select the alias exists to route around.
+        // Slice 47 regression: prewarm made such words VALUABLE (`value_bv`
+        // returns `Some`) where they used to read as `None`, which unlocked
+        // `functional_consistency`'s `continue`-on-`None` guard — so this
+        // panic is new even though `ensure_atom` itself did not change.
+        let mut memo = FxHashMap::default();
+        let aliased = alias_word(ctx, &self.word_alias, atom, &mut memo);
+        let lit = self.st.borrow_mut().ensure_atom_lit(ctx, aliased);
         self.atom_lit.insert(atom, lit);
     }
 
