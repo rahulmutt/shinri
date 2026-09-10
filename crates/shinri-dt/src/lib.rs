@@ -33,12 +33,27 @@ pub struct DtSolver {
     /// been emitted, so `check` reaches a fixpoint instead of re-offering the
     /// same split. Monotone — the `emitted`/watch-set discipline of slice 39.
     split_done: FxHashSet<TermId>,
-    /// Slice 40: tester atoms asserted true — the trigger set for
-    /// `instantiate_constructor`. Monotone (never popped): a stale entry from a
-    /// backtracked branch only re-emits a GUARDED (hence inert) lemma, never an
-    /// unsound one, so retraction is unnecessary and `push`/`pop` stay no-ops.
-    /// Populated by `assert`; consumed by `instantiate_constructor`.
-    asserted_testers: FxHashSet<TermId>,
+    /// Slice 40, corrected by slice 48: tester atoms asserted true — the
+    /// trigger set for `instantiate_constructor` AND for `tester_clash`.
+    ///
+    /// PER-LEVEL, unlike every other field on this struct. The watch sets
+    /// (`ctor_apps`, `sel_apps`, `testers`, `dt_terms`, `emitted`,
+    /// `split_done`) are assignment-independent and stay monotone; this one is
+    /// a record of the current branch's assertions and must be retracted with
+    /// it. Slice 40 could leave it monotone because a stale entry only
+    /// re-emitted a GUARDED (hence inert) lemma. Slice 48 feeds it into
+    /// `TCheck::Conflict`, whose `EqLeaf::Asserted(lit)` names a literal that
+    /// conflict analysis expects to be false under the current assignment — a
+    /// stale entry would hand the SAT seam a clause it cannot analyse.
+    /// `TheoryCtx` exposes no trail, so the record itself must be accurate.
+    asserted_testers: Vec<TermId>,
+    /// Membership index for `asserted_testers`, preserving the dedup that
+    /// `assert` relied on when this was a set.
+    asserted_tester_set: FxHashSet<TermId>,
+    /// `asserted_testers.len()` at the moment each open scope began.
+    /// `push`/`pop` maintain it; the semantics mirror
+    /// `crates/shinri-str/src/trail.rs`'s `pop_to`.
+    tester_marks: Vec<usize>,
     /// Test-only instrumentation: total `collect` invocations (including
     /// early returns on an already-seen term), so a test can pin that the
     /// `seen` guard keeps the walk linear in DAG size instead of exponential
@@ -388,7 +403,7 @@ impl DtSolver {
     /// testers (not all watched testers) is the laziness lever: only the
     /// branch's chosen constructor is ever instantiated.
     fn instantiate_constructor(&mut self, cx: &mut TheoryCtx) -> Option<TCheck> {
-        let asserted: Vec<TermId> = self.asserted_testers.iter().copied().collect();
+        let asserted: Vec<TermId> = self.asserted_testers.clone();
         for tst in asserted {
             let Some((tsym, targs)) = Self::uapp(cx.terms, tst) else {
                 continue;
@@ -765,6 +780,10 @@ impl DtSolver {
     pub(crate) fn collect_calls(&self) -> u32 {
         self.collect_calls
     }
+    #[cfg(test)]
+    pub(crate) fn asserted_testers(&self) -> &[TermId] {
+        &self.asserted_testers
+    }
 }
 
 impl TheorySolver for DtSolver {
@@ -796,7 +815,9 @@ impl TheorySolver for DtSolver {
         };
         // Slice 40: record the positive tester so `instantiate_constructor`
         // (in `check`) can introduce `t = C(sel(t)…)` on this branch.
-        self.asserted_testers.insert(atom);
+        if self.asserted_tester_set.insert(atom) {
+            self.asserted_testers.push(atom);
+        }
         let &t = targs.first()?;
         let (csym, capp) = self.ctor_of_class(cx, t)?;
         if csym == ctor {
@@ -880,8 +901,26 @@ impl TheorySolver for DtSolver {
         }
     }
 
-    fn push(&mut self) {}
-    fn pop(&mut self, _level: usize) {}
+    fn push(&mut self) {
+        self.tester_marks.push(self.asserted_testers.len());
+    }
+
+    /// ABSOLUTE target level, matching `EqualityEngine`/`UndoLog` and the
+    /// `shinri-str` trail. Truncating to the mark taken when the FIRST
+    /// discarded scope opened is what makes `pop(0)` keep level-0 assertions
+    /// (no mark was ever taken for level 0) while discarding everything a
+    /// scope introduced.
+    fn pop(&mut self, level: usize) {
+        let mut restore = None;
+        while self.tester_marks.len() > level {
+            restore = self.tester_marks.pop();
+        }
+        if let Some(n) = restore {
+            for t in self.asserted_testers.drain(n..) {
+                self.asserted_tester_set.remove(&t);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1910,5 +1949,106 @@ mod tests {
             }
             other => panic!("expected a datatype model value, got {other:?}"),
         }
+    }
+
+    /// Slice 48: the assertion record is per-level. A tester asserted inside a
+    /// scope must be gone once that scope is popped — spec §3.2. Until this
+    /// slice the record was monotone, which was sound only while it fed a
+    /// GUARDED lemma; slice 48 feeds it into a CONFLICT, and a stale entry
+    /// would cite a literal the trail no longer holds.
+    #[test]
+    fn asserted_tester_recorded_in_a_scope_is_dropped_on_pop() {
+        let mut ctx = Context::new();
+        let (list, _nil, _cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_cons_x);
+
+        dt.push(); // level 1
+        dt.push(); // level 2
+        let _ = dt.assert(&mut cx, Lit::new(v, true));
+        assert!(
+            dt.asserted_testers().contains(&is_cons_x),
+            "the level-2 assertion must be recorded"
+        );
+
+        dt.pop(1);
+        assert!(
+            !dt.asserted_testers().contains(&is_cons_x),
+            "popping to level 1 must discard a level-2 assertion"
+        );
+    }
+
+    /// The mirror case: a level-0 assertion is permanent, so `pop(0)` must NOT
+    /// discard it. This is the off-by-one that `pop_to` semantics decide, and
+    /// the reason it gets its own fence.
+    #[test]
+    fn level_zero_asserted_tester_survives_pop_to_zero() {
+        let mut ctx = Context::new();
+        let (list, _nil, _cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_cons_x);
+
+        // Asserted at level 0, before any scope is opened.
+        let _ = dt.assert(&mut cx, Lit::new(v, true));
+        dt.push(); // level 1
+        dt.pop(0);
+        assert!(
+            dt.asserted_testers().contains(&is_cons_x),
+            "a level-0 assertion is permanent and must survive pop(0)"
+        );
+    }
+
+    /// The record must not grow a duplicate when the same tester is asserted
+    /// twice in one scope — `assert` relied on set semantics before slice 48.
+    #[test]
+    fn asserted_tester_is_recorded_once_per_scope() {
+        let mut ctx = Context::new();
+        let (list, _nil, _cons, _head, _tail, _is_nil, is_cons) = list_dt(&mut ctx);
+        let x = uconst(&mut ctx, "x", list);
+        let is_cons_x = ctx.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
+
+        let mut dt = DtSolver::default();
+        let mut eq = EqualityEngine::default();
+        let mut atoms = AtomRegistry::default();
+        let v = Var::new(0);
+        atoms.register(v, is_cons_x, shinri_theory::types::Owner::Datatypes);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        dt.new_var(&mut cx, v, is_cons_x);
+
+        let _ = dt.assert(&mut cx, Lit::new(v, true));
+        let _ = dt.assert(&mut cx, Lit::new(v, true));
+        assert_eq!(
+            dt.asserted_testers().len(),
+            1,
+            "the same tester asserted twice must be recorded once"
+        );
     }
 }
