@@ -13,8 +13,9 @@ use shinri_theory::{Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
 /// Datatype theory solver. Holds no union-find: all equality state lives in the
 /// shared `EqualityEngine`, and every derived fact is emitted as a lemma or a
-/// conflict. Watch sets are monotone (assignment-independent), so `push`/`pop`
-/// are no-ops — the `shinri-arrays` pattern.
+/// conflict. The watch sets are monotone (assignment-independent), but the
+/// assertion record `asserted_testers` is per-level, so `push`/`pop` are NOT
+/// no-ops — see that field's doc for why slice 48 had to level it.
 #[derive(Default)]
 pub struct DtSolver {
     /// Constructor applications `C(a1..an)` seen in registered atoms.
