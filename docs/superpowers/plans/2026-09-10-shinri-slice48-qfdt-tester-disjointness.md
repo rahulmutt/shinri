@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- **Branch:** all work on `slice48-qfdt-tester-disjointness`, branched from `main` at `c9df881a`. PR to `main`, merge commit when CI is green, then delete the branch remote and local.
+- **Branch:** all work on `slice48-qfdt-tester-disjointness`, branched from `main` at `d3f1fb96` (the spec+plan pair). PR to `main`, merge commit when CI is green, then delete the branch remote and local.
 - **Pure-Rust mandate:** no native-link dependencies. `deny.toml` bans `rug`, `gmp-mpfr-sys`, `z3-sys`, `cadical-rs`. This slice adds **no** dependency of any kind.
 - **Oracle feature gate:** `crates/shinri-solver/tests/qfdt_oracle.rs` is `#![cfg(feature = "oracle")]`. Every oracle command carries `--features oracle`. **Without it the file compiles to zero tests and the run reads as green.** Always confirm a non-zero discovered count before believing a result.
 - **nextest filters:** use the expression form. `-E 'binary(qfdt_oracle)'` selects a whole integration-test binary; `-E 'test(<name>)'` selects by test name. A positional `mod::name` filter matches nothing on the pinned nextest 0.9.140.
