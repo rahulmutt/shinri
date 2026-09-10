@@ -2,11 +2,11 @@
 use crate::abstraction::Abstraction;
 use crate::collect::Collected;
 use crate::driver::{Lemma, LemmaLit, SatBridge};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Op, SortNode, TermId, TermNode};
 
 /// The base array of a select term (`select(array, index)`), and its index.
-fn select_parts(ctx: &Context, sel: TermId) -> Option<(TermId, TermId)> {
+pub(crate) fn select_parts(ctx: &Context, sel: TermId) -> Option<(TermId, TermId)> {
     match ctx.term_node(sel) {
         TermNode::App {
             op: Op::Builtin(BuiltinOp::Select),
@@ -95,7 +95,22 @@ fn index_width(ctx: &Context, arr: TermId) -> u32 {
     }
 }
 
-/// Index terms of all selects whose base array is `a` or `b`.
+/// Push every index written along `t`'s store chain into `out`.
+fn store_chain_indices(ctx: &Context, t: TermId, out: &mut Vec<TermId>) {
+    let mut cur = t;
+    while let Some((inner, i, _e)) = store_parts(ctx, cur) {
+        out.push(i);
+        cur = inner;
+    }
+}
+
+/// Index terms relevant to extensionality over `a` and `b`: the indices of all
+/// selects whose base is `a` or `b`, PLUS every index either operand's store
+/// chain writes.
+///
+/// Slice 47: the store-chain half was missing, so an equality between two store
+/// chains with no selects over them was enforced at ZERO indices — the positive
+/// branch emitted nothing and the proxy was a free Boolean.
 fn accessed_indices(ctx: &Context, c: &Collected, a: TermId, b: TermId) -> Vec<TermId> {
     let mut out = Vec::new();
     for &sel in &c.selects {
@@ -105,6 +120,18 @@ fn accessed_indices(ctx: &Context, c: &Collected, a: TermId, b: TermId) -> Vec<T
             }
         }
     }
+    store_chain_indices(ctx, a, &mut out);
+    store_chain_indices(ctx, b, &mut out);
+    // `out` is built by concatenating three sources (selects, then chain `a`,
+    // then chain `b`); duplicates across those sources are not adjacent, so
+    // `Vec::dedup` (which only removes CONSECUTIVE duplicates) would leave
+    // most repeats in place — e.g. an index both selected and re-written
+    // further down the same chain, or shared between `a`'s and `b`'s chains.
+    // Use a full O(n) first-occurrence dedup instead: with more indices now
+    // in play (the whole point of this fix), redundant duplicate lemmas are
+    // exactly the cost this task is asked to watch for.
+    let mut seen = FxHashSet::default();
+    out.retain(|&idx| seen.insert(idx));
     out
 }
 
@@ -185,7 +212,7 @@ pub fn extensionality(
     lemmas
 }
 
-fn store_parts(ctx: &Context, t: TermId) -> Option<(TermId, TermId, TermId)> {
+pub(crate) fn store_parts(ctx: &Context, t: TermId) -> Option<(TermId, TermId, TermId)> {
     match ctx.term_node(t) {
         TermNode::App {
             op: Op::Builtin(BuiltinOp::Store),
@@ -283,6 +310,34 @@ mod tests {
     fn uconst(ctx: &mut Context, n: &str, s: shinri_core::SortId) -> TermId {
         let f = ctx.declare_fun(n, &[], s);
         ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+    }
+
+    /// Slice 47: extensionality's positive branch must enforce agreement at the
+    /// indices a store CHAIN writes, not only at indices some `select` reads.
+    /// With no selects at all the old code enforced nothing.
+    #[test]
+    fn accessed_indices_includes_store_chain_indices() {
+        let mut ctx = Context::new();
+        let arr_s = arr(&mut ctx);
+        let s8 = ctx.bv_sort(8);
+        let a = uconst(&mut ctx, "a", arr_s);
+        let i = uconst(&mut ctx, "i", s8);
+        let j = uconst(&mut ctx, "j", s8);
+        let e = uconst(&mut ctx, "e", s8);
+        let f = uconst(&mut ctx, "f", s8);
+        let c0 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Store), &[a, i, e])
+            .unwrap();
+        let c1 = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Store), &[a, j, f])
+            .unwrap();
+        let atom = ctx.mk_eq(c0, c1).unwrap();
+        let c = collect(&ctx, &[atom]);
+
+        let got = accessed_indices(&ctx, &c, c0, c1);
+
+        assert!(got.contains(&i), "store index i must be an accessed index");
+        assert!(got.contains(&j), "store index j must be an accessed index");
     }
 
     #[test]

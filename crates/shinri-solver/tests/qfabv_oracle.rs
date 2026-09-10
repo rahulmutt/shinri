@@ -88,7 +88,65 @@ const N_ITERS: usize = 200;
 //           Exercises blast_bv_ATOM's Uninterpreted arm on the ABV path. The
 //           select-argument kinds are the ABV-specific shape: the argument is
 //           only a plain word after `abstract_arrays` replaces the read.
+//
+//   Atom 2 additionally (slice 47, kinds 4/5/6): store-CHAIN (dis)equality —
+//           the shape behind the 359 QF_ABV wrong-`sat` answers, which the
+//           generator never reached before this slice (it only equated bare
+//           array constants and only ever wrote `Store` as the direct operand
+//           of a `Select`):
+//             kind 4: (= chain0 chain1) — depth-2 store chains, same base
+//                     half the time (`same_base`) and different bases (a0,
+//                     a1) the other half, per the task's binding requirement
+//                     to cover both. same_base writes the SAME two indices to
+//                     SWAPPED elements: with `(distinct i0 i1)` and
+//                     `(distinct e0 e1)` forced, the two chains are
+//                     DETERMINISTICALLY unequal, so this is UNSAT — it
+//                     targets the accessed_indices/§4 latent defect: a
+//                     positively-asserted equality with no selects over it is
+//                     checked at zero indices. !same_base writes the SAME
+//                     writes over two DIFFERENT bases and is deliberately NOT
+//                     forced UNSAT (two free base arrays can always be
+//                     equated) — it exercises the cross-array store-chain
+//                     path as genuine SAT-leaning coverage.
+//             kind 5: (not (= chain_fwd chain_rev))  — the `wchains002ue`
+//                     shape: the SAME base, writing the SAME 3 indices in
+//                     opposite orders, with `(distinct i0 i1 i2)` forced so
+//                     the writes provably commute. The two chains therefore
+//                     DETERMINISTICALLY denote the same array, so this is
+//                     UNSAT — it must refute the negative extensionality
+//                     branch rather than let it hand back a witness.
+//             kind 6: (= chain_twice chain_once) — a chain that writes the
+//                     same index twice (later write wins) equated against the
+//                     single-write chain it must equal.
+//
+//   Slice 47 zero-select instances: 1 instance in 4 (`zero_select`) omits
+//           every Select-bearing atom (0, 1, 3, and the select-argument arms
+//           of 5), leaving Atom 2's store-chain (dis)equality as the ONLY
+//           array constraint — so a `select`-anchored rescue can't paper over
+//           a store-chain defect.
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Build a `store` chain of writes over `base`, applied in order (so a later
+/// write to the same index wins), returning both the shinri term and its
+/// exactly-equivalent SMT-LIB2 text. Building both in lockstep — rather than
+/// the term here and a separately hand-written dump string at the call site —
+/// is what keeps shinri and the oracle compared on the same formula.
+fn store_chain(
+    s: &mut Solver,
+    base: shinri_core::TermId,
+    base_text: &str,
+    idxs: &[shinri_core::TermId],
+    elts: &[shinri_core::TermId],
+    writes: &[(usize, usize)],
+) -> (shinri_core::TermId, String) {
+    let mut acc = base;
+    let mut text = base_text.to_string();
+    for &(i, e) in writes {
+        acc = s.app(Op::Builtin(BuiltinOp::Store), &[acc, idxs[i], elts[e]]);
+        text = format!("(store {text} i{i} e{e})");
+    }
+    (acc, text)
+}
 
 /// Generate one QF_AUFBV instance.
 ///
@@ -163,8 +221,14 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String, bool) {
          \n(declare-fun q ((_ BitVec {width}) (_ BitVec {width})) Bool)"
     ));
 
+    // Slice 47: 1 instance in 4 carries NO select at all, so Atom 2's
+    // store-chain (dis)equality is the only thing constraining the arrays —
+    // a `select`-anchored rescue can't paper over a store-chain defect.
+    // `wchains002ue` is this shape (paired with Atom 2 kind 5).
+    let zero_select = rng.below(4) == 0;
+
     // ── Atom 0: store-select witness ─────────────────────────────────────────
-    {
+    if !zero_select {
         let ai = rng.below(N_ARR as u64) as usize;
         let si = rng.below(N_IDX as u64) as usize;
         let se = rng.below(N_ELT as u64) as usize;
@@ -196,7 +260,7 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String, bool) {
     }
 
     // ── Atom 1: functional-consistency ──────────────────────────────────────
-    {
+    if !zero_select {
         let ai = rng.below(N_ARR as u64) as usize;
         let p = rng.below(N_IDX as u64) as usize;
         let q = rng.below(N_IDX as u64) as usize;
@@ -226,9 +290,12 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String, bool) {
     // witness path. `kind` selects among:
     //   0: (= a0 a1)            1: (distinct a0 a1)
     //   2: (= a0 a1 a2)         3: (distinct a0 a1 a2)
+    //   4/5/6 (slice 47): store-CHAIN (dis)equality — see the file header note
+    //   above Atom 2. This is the ONLY block guaranteed to run regardless of
+    //   `zero_select`, so an instance is never empty of array constraints.
     // BV-array (dis)equality is IN SCOPE: the fence allows it (is_bv_array=true).
     {
-        let kind = rng.below(4);
+        let kind = rng.below(7);
         match kind {
             0 => {
                 let atom = s.eq(arrays[0], arrays[1]);
@@ -248,13 +315,105 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String, bool) {
                 s.assert(atom);
                 dump.push_str("\n(assert (= a0 a1 a2))");
             }
-            _ => {
+            3 => {
                 let atom = s.app(
                     Op::Builtin(BuiltinOp::Distinct),
                     &[arrays[0], arrays[1], arrays[2]],
                 );
                 s.assert(atom);
                 dump.push_str("\n(assert (distinct a0 a1 a2))");
+            }
+            4 => {
+                // Slice 47 shape A: EQUALITY asserted between two store
+                // chains, same base half the time and different bases
+                // otherwise — the brief's binding requirement is BOTH.
+                //
+                // same_base=true: two same-base chains write the SAME two
+                // indices to SWAPPED elements. Forcing `(distinct i0 i1)` and
+                // `(distinct e0 e1)` makes the two chains DETERMINISTICALLY
+                // unequal (at i0 one chain holds e0, the other e1, and
+                // e0≠e1, regardless of the shared base) — genuinely UNSAT for
+                // ANY values respecting the distinctness. This targets the §4
+                // latent defect named in the design doc: `accessed_indices`
+                // (crates/shinri-abv/src/check.rs:99) builds its
+                // positive-equality check set solely from `c.selects`, so
+                // with none present here, the false equality is enforced at
+                // zero indices and can slip through as `sat`. This is the arm
+                // that currently produces this task's failing instance.
+                //
+                // same_base=false: two DIFFERENT base arrays (a0, a1) write
+                // the SAME writes each. This is deliberately NOT forced
+                // UNSAT: two free base arrays can always be made to agree
+                // (e.g. a0=a1), so the equality is legitimately
+                // SAT-satisfiable — exercising the cross-array store-chain
+                // path (distinct from the same-base rewrite reasoning above)
+                // is the point, not manufacturing another hard UNSAT.
+                let same_base = rng.below(2) == 0;
+                if same_base {
+                    let distinct_idx = s.app(Op::Builtin(BuiltinOp::Distinct), &[idxs[0], idxs[1]]);
+                    s.assert(distinct_idx);
+                    dump.push_str("\n(assert (distinct i0 i1))");
+                    let distinct_elt = s.app(Op::Builtin(BuiltinOp::Distinct), &[elts[0], elts[1]]);
+                    s.assert(distinct_elt);
+                    dump.push_str("\n(assert (distinct e0 e1))");
+
+                    let w0 = [(0usize, 0usize), (1usize, 1usize)];
+                    let w1 = [(0usize, 1usize), (1usize, 0usize)];
+                    let (c0, t0) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w0);
+                    let (c1, t1) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w1);
+                    let atom = s.eq(c0, c1);
+                    s.assert(atom);
+                    dump.push_str(&format!("\n(assert (= {t0} {t1}))"));
+                } else {
+                    let w = [(0usize, 0usize), (1usize, 1usize)];
+                    let (c0, t0) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w);
+                    let (c1, t1) = store_chain(&mut s, arrays[1], "a1", &idxs, &elts, &w);
+                    let atom = s.eq(c0, c1);
+                    s.assert(atom);
+                    dump.push_str(&format!("\n(assert (= {t0} {t1}))"));
+                }
+            }
+            5 => {
+                // Slice 47 shape B (`wchains002ue`): disequality between two
+                // store chains over the SAME base writing the SAME 3-index set
+                // in OPPOSITE orders. The real reproducer forces its two write
+                // locations (v6, v7) to be pairwise 4-byte-aligned, which
+                // guarantees they are either identical or fully disjoint —
+                // here, with a 3-element idx pool, `(distinct i0 i1 i2)` forces
+                // outright disjoint locations directly, which is the stronger
+                // and simpler way to get the same guarantee: writing 3
+                // pairwise-distinct locations in either order always produces
+                // the same final array, so the negated equality is
+                // DETERMINISTICALLY UNSAT — the case the negative
+                // extensionality branch must refute rather than hand back a
+                // spurious witness for.
+                let distinct_idx = s.app(
+                    Op::Builtin(BuiltinOp::Distinct),
+                    &[idxs[0], idxs[1], idxs[2]],
+                );
+                s.assert(distinct_idx);
+                dump.push_str("\n(assert (distinct i0 i1 i2))");
+
+                let w_fwd = [(0usize, 0usize), (1usize, 1usize), (2usize, 2usize)];
+                let w_rev = [(2usize, 2usize), (1usize, 1usize), (0usize, 0usize)];
+                let (c0, t0) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w_fwd);
+                let (c1, t1) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w_rev);
+                let eq_atom = s.eq(c0, c1);
+                let atom = s.app(Op::Builtin(BuiltinOp::Not), &[eq_atom]);
+                s.assert(atom);
+                dump.push_str(&format!("\n(assert (not (= {t0} {t1})))"));
+            }
+            _ => {
+                // Slice 47 shape C: a chain that writes the SAME index twice
+                // (the later write wins) equated against the single-write
+                // chain it must equal.
+                let w_twice = [(0usize, 0usize), (0usize, 1usize)];
+                let w_once = [(0usize, 1usize)];
+                let (c0, t0) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w_twice);
+                let (c1, t1) = store_chain(&mut s, arrays[0], "a0", &idxs, &elts, &w_once);
+                let atom = s.eq(c0, c1);
+                s.assert(atom);
+                dump.push_str(&format!("\n(assert (= {t0} {t1}))"));
             }
         }
     }
@@ -266,7 +425,7 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String, bool) {
     // not pinned). Choose two arrays and pin them equal at i{p} via two reads, then
     // assert (distinct ax ay): SAT iff there is a free index where they may differ.
     {
-        if rng.below(2) == 1 {
+        if !zero_select && rng.below(2) == 1 {
             let ax = rng.below(N_ARR as u64) as usize;
             let mut ay = rng.below(N_ARR as u64) as usize;
             if ay == ax {
@@ -355,7 +514,11 @@ fn gen_instance(rng: &mut Lcg) -> (Solver, String, bool) {
             let q = rng.below(N_IDX as u64) as usize;
             let ai = rng.below(N_ARR as u64) as usize;
             let neg = rng.below(2) == 1;
-            let (atom, text) = match rng.below(4) {
+            // Slice 47: kinds 2/3 below are select-bearing (the predicate's
+            // argument is a `select`), so under `zero_select` restrict the
+            // draw to kinds 0/1 only — the instance must carry NO select.
+            let kind_bound = if zero_select { 2 } else { 4 };
+            let (atom, text) = match rng.below(kind_bound) {
                 0 => {
                     let a = s.app(Op::Uninterpreted(pred1), &[idxs[p]]);
                     (a, format!("(p i{p})"))

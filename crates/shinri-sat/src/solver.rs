@@ -300,6 +300,15 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
         })
     }
 
+    /// How many variables the solver has allocated. A `Var` whose index is
+    /// below this was present in the assignment when the last solve finished;
+    /// one at or above it was allocated afterwards and the last model says
+    /// nothing about it. Callers that snapshot a model need that distinction —
+    /// see `shinri_solver::abv_stage::RealBridge`.
+    pub fn num_vars(&self) -> usize {
+        self.assign.num_vars()
+    }
+
     /// The Boolean value of a variable in the current assignment, if assigned.
     pub fn value_of(&self, v: Var) -> Option<bool> {
         match self.assign.value(v) {

@@ -22,9 +22,36 @@ pub struct Lemma(pub Vec<LemmaLit>);
 /// shinri-solver (Task 10) and by a fake in tests.
 pub trait SatBridge {
     /// Solve the current clause set. Returns true on SAT.
-    fn solve(&mut self) -> bool;
+    ///
+    /// `ctx` is passed so an implementation may blast any word `value_bv`
+    /// asked for since the previous solve BEFORE solving. That ordering is
+    /// load-bearing: adding a clause to the live SAT solver backtracks it to
+    /// level 0 and DESTROYS the model, so a bridge that blasts lazily from
+    /// inside `value_bv` would wipe the very model the checks are reading.
+    fn solve(&mut self, ctx: &Context) -> bool;
     /// Concrete value of a BV-sorted term in the latest SAT model.
+    ///
+    /// MUST NOT mutate the solver. `None` means "this model does not give the
+    /// term a value" — either it was never blasted, or its bits were allocated
+    /// after the model was taken. `functional_consistency` treats `None` as
+    /// silence, but ROW-1, ROW-2 and extensionality-positive
+    /// (`crates/shinri-abv/src/check.rs:163-164`, `:258`, `:278`) compare
+    /// `value_bv(..).map(|x| x.1) != value_bv(..).map(|x| x.1)` directly, so
+    /// `Some(v) != None` reads as a mismatch and eagerly emits a lemma there —
+    /// sound (the lemma is an entailed array axiom either way), but not
+    /// "every check treats `None` as silence". Tightening those three sites
+    /// to skip on any `None` (rather than treat it as a forced mismatch) is
+    /// queued as a follow-up slice: it changes which lemmas are emitted on
+    /// which round and needs a corpus re-measure, not just a doc fix. See
+    /// "Queued for the next slice" in
+    /// `docs/superpowers/specs/2026-09-09-shinri-slice47-qfabv-wrong-sat-design.md`.
     fn value_bv(&self, ctx: &Context, t: TermId) -> Option<(u32, shinri_num::Integer)>;
+    /// True when `value_bv` was asked, since the last solve, for a word the
+    /// model could not value. Solving again blasts those words first, so the
+    /// next round sees real values where this one saw `None`.
+    fn pending_words(&self) -> bool {
+        false
+    }
     /// Truth of an array-eq proxy term in the latest SAT model.
     fn value_bool(&self, t: TermId) -> Option<bool>;
     /// Ensure `atom` (a Bool-sorted BV (dis)equality) is blasted into the live
@@ -40,6 +67,11 @@ pub enum AbvOutcome {
     Sat,
     Unsat,
     Unknown,
+    /// The loop reached a fixpoint and reported `Sat`, but the post-solve
+    /// array-model gate (`crate::validate`) found the model violates an array
+    /// axiom, so the `Sat` is spurious. SOUND downgrade to `Unknown` at the
+    /// solver boundary — never reported as `sat`.
+    ModelRejected,
 }
 
 /// Run the abstraction–refinement loop. `bridge` already holds the blasted
@@ -53,8 +85,15 @@ pub fn refine<B: SatBridge>(
 ) -> AbvOutcome {
     let mut added: FxHashSet<Lemma> = FxHashSet::default();
     let mut witnesses: FxHashMap<TermId, TermId> = FxHashMap::default();
+    // Defensive fence on the word-driven rounds below. Each such round is
+    // charged to at least one word entering the bridge's blasted set, and that
+    // set only grows, so the bound is never reached by a terminating instance;
+    // it exists so a bridge that mis-reports `pending_words` degrades to a
+    // SOUND `Unknown` instead of spinning.
+    const MAX_WORD_ROUNDS: u32 = 10_000;
+    let mut word_rounds: u32 = 0;
     loop {
-        if !bridge.solve() {
+        if !bridge.solve(ctx) {
             return AbvOutcome::Unsat;
         }
 
@@ -72,6 +111,7 @@ pub fn refine<B: SatBridge>(
         // Register any selects minted this round (recorded in abs.read_of) into c.
         sync_new_selects(ctx, abs, c);
 
+        let round_len = round.len();
         let mut progress = false;
         for lemma in round {
             if added.insert(lemma.clone()) {
@@ -82,8 +122,32 @@ pub fn refine<B: SatBridge>(
                 progress = true;
             }
         }
+        if std::env::var_os("SHINRI_ABV_DEBUG").is_some() {
+            eprintln!(
+                "abv round: emitted={} added_total={} progress={} pending_words={}",
+                round_len,
+                added.len(),
+                progress,
+                bridge.pending_words()
+            );
+        }
         if !progress {
-            return AbvOutcome::Sat;
+            // A round that emitted no lemma has NOT necessarily examined the
+            // model: a check whose index or element word had no value in this
+            // model skipped silently (`value_bv` returns `None` rather than
+            // fabricating a zero). Solving again blasts those words first, so
+            // re-run rather than declaring a fixpoint on a model the checks
+            // could not read. Terminating: `pending_words` is only true when a
+            // word the bridge has NEVER blasted was queried, and solving blasts
+            // it, so each such round consumes at least one word from a finite
+            // set.
+            if !bridge.pending_words() {
+                return AbvOutcome::Sat;
+            }
+            word_rounds += 1;
+            if word_rounds >= MAX_WORD_ROUNDS {
+                return AbvOutcome::Unknown;
+            }
         }
     }
 }
@@ -198,7 +262,7 @@ pub(crate) mod fake {
         pub unsat_after: Option<usize>,
     }
     impl SatBridge for FakeBridge {
-        fn solve(&mut self) -> bool {
+        fn solve(&mut self, _ctx: &Context) -> bool {
             match self.unsat_after {
                 Some(n) => self.added.len() < n,
                 None => true,
