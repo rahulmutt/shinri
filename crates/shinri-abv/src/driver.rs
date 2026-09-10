@@ -33,7 +33,18 @@ pub trait SatBridge {
     ///
     /// MUST NOT mutate the solver. `None` means "this model does not give the
     /// term a value" — either it was never blasted, or its bits were allocated
-    /// after the model was taken. Every check treats `None` as silence.
+    /// after the model was taken. `functional_consistency` treats `None` as
+    /// silence, but ROW-1, ROW-2 and extensionality-positive
+    /// (`crates/shinri-abv/src/check.rs:163-164`, `:258`, `:278`) compare
+    /// `value_bv(..).map(|x| x.1) != value_bv(..).map(|x| x.1)` directly, so
+    /// `Some(v) != None` reads as a mismatch and eagerly emits a lemma there —
+    /// sound (the lemma is an entailed array axiom either way), but not
+    /// "every check treats `None` as silence". Tightening those three sites
+    /// to skip on any `None` (rather than treat it as a forced mismatch) is
+    /// queued as a follow-up slice: it changes which lemmas are emitted on
+    /// which round and needs a corpus re-measure, not just a doc fix. See
+    /// "Queued for the next slice" in
+    /// `docs/superpowers/specs/2026-09-09-shinri-slice47-qfabv-wrong-sat-design.md`.
     fn value_bv(&self, ctx: &Context, t: TermId) -> Option<(u32, shinri_num::Integer)>;
     /// True when `value_bv` was asked, since the last solve, for a word the
     /// model could not value. Solving again blasts those words first, so the

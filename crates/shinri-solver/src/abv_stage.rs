@@ -233,9 +233,24 @@ fn is_bv_predicate(op: &Op) -> bool {
 type Sat = shinri_sat::Solver<shinri_sat::NoTheory, shinri_core::NoProof, shinri_sat::Vmtf>;
 
 /// The blast-mutable interior of `RealBridge`. Held behind a `RefCell` so the
-/// `&self` `value_bv` can blast a not-yet-seen BV word on demand (the brief's
-/// recipe) — minting fresh SAT vars + definitional clauses and reading them back.
-/// `solve`/`ensure_atom`/`add_lemma` (all `&mut self`) `borrow_mut` it directly.
+/// `&self` `value_bv`/`value_bool` can `borrow()` and read `var_bits` (the
+/// already-blasted bit table) while `solve`/`ensure_atom`/`add_lemma` (all
+/// `&mut self`) `borrow_mut` it to actually blast and mutate it. `value_bv`
+/// itself never blasts: a word `var_bits` has no entry for is pushed onto
+/// `RealBridge::pending` (a separate field, its own `RefCell<Vec<TermId>>`)
+/// and returns `None`; the queue is drained and actually blasted at the top
+/// of the *next* `solve`.
+///
+/// Slice 47 removed the earlier design this comment used to describe: `&self`
+/// `value_bv` minting fresh SAT vars and definitional clauses for a
+/// not-yet-seen word on demand ("the brief's recipe"), then reading them
+/// straight back from the live solver. That blast-then-read-live sequence
+/// was the bug (§11 of
+/// `docs/superpowers/specs/2026-09-09-shinri-slice47-qfabv-wrong-sat-design.md`):
+/// `Sat::add_clause` backtracks to level 0, so the definitional clauses just
+/// added destroyed the very assignment being read, and every later read came
+/// back a fabricated `0`. Blasting on the `value_bv` read path is exactly
+/// what this slice removed — do not reintroduce it.
 struct BlastState {
     sat: Sat,
     blaster: shinri_bv::Blaster,
@@ -250,7 +265,11 @@ struct BlastState {
     bitvar_to_sat: Vec<Option<Var>>,
     /// BV term (read var, index, element, …) → its blasted bits (LSB→MSB), each
     /// stored as `(sat_var, pos)` so the bit's POLARITY is preserved. A bit's
-    /// concrete value is `sat.value_of(sat_var) == pos`. Polarity MUST be retained:
+    /// concrete value is read from the post-solve snapshot, not the live
+    /// solver: `RealBridge::value_bv` computes it as
+    /// `model[sat_var.index()].unwrap_or(false) == pos`, where `model` is
+    /// `RealBridge::model` (see its doc for why the live solver is wrong
+    /// here). Polarity MUST be retained:
     /// the blaster uses `var 0` (pinned true) for both 0-bits (`pos=false`) and
     /// 1-bits (`pos=true`), and emits negated signal bits (`bvnot`/`bvneg`/
     /// `zero_extend` high bits, …) as `BitLit{var:N, pos:false}`. Dropping `pos`
@@ -366,16 +385,30 @@ impl BlastState {
         self.map_bitlit(bl)
     }
 
-    /// Blast a BV-sorted WORD term on demand and replay its new clauses. Used by
-    /// `value_bv` so an index/witness word that only ever appeared inside an
-    /// abstracted-away select still has SAT bits to read.
+    /// Blast a BV-sorted WORD term and replay its new clauses, so an
+    /// index/witness word that only ever appeared inside an abstracted-away
+    /// select ends up with SAT bits to read.
     ///
-    /// Takes `&Context` (not `&mut`) because the `SatBridge::value_bv` seam is
-    /// `&self`. We therefore blast the term AS WRITTEN (no `shinri_bv::rewrite`,
-    /// which needs `&mut Context`). This is sound: `blast_word` handles every BV
-    /// operator directly, so the un-rewritten blast is semantically identical;
-    /// rewrite is only a normalization/CSE pass. The blasted words queried here
-    /// are plain BV variables (indices / witnesses), so rewrite is a no-op anyway.
+    /// NOT used by `value_bv` (post-slice-47 correction: it no longer calls
+    /// this or any other blasting path — it only reads the post-solve
+    /// snapshot and queues what it cannot value). The only caller is
+    /// `RealBridge::solve`, which drains `RealBridge::pending` — populated by
+    /// `value_bv` and by `prewarm_array_words` — and calls this on each
+    /// queued word before handing control to the SAT solver.
+    ///
+    /// Takes `&Context` (not `&mut`), so it blasts the term AS WRITTEN (no
+    /// `shinri_bv::rewrite`, which needs `&mut Context`). This is sound, and
+    /// for a narrower reason than "the words here are plain variables" — that
+    /// no longer holds: since `prewarm_array_words` started queuing
+    /// arbitrary compound index/element terms (an index may itself mention a
+    /// `select`, rewritten through `word_alias` first), the words reaching
+    /// this function are not all plain variables. The soundness argument now
+    /// rests entirely on `shinri_bv::rewrite` being a *simplification* pass
+    /// only (constant folding and algebraic identities), never a desugaring
+    /// one — `blast_word` already handles every BV operator directly, so an
+    /// un-rewritten blast is semantically identical to a rewritten one and
+    /// costs at most some duplicated encoding effort, never a missing
+    /// operator or a wrong value.
     fn ensure_word(&mut self, ctx: &Context, t: TermId) {
         if self.var_bits.contains_key(&t) {
             return;

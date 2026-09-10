@@ -164,10 +164,19 @@ For an array-sorted term `A`, compute `base(A)` and `pins(A)`:
   `pins(A) = pins(B)` with `val(i) ↦ val(e)` overriding any existing entry;
 * anything else — conservative rejection, per §3.4.
 
-Index and element values come from `bridge.value_bv`, which blasts on demand
-and reads the current SAT model for **any** BV-sorted term
-(`crates/shinri-solver/src/abv_stage.rs:580`–`:611`), so no separate BV
-evaluator is needed.
+Index and element values come from `bridge.value_bv`. **Post-slice
+correction (see §11 "The real cause"):** `value_bv` does not blast on
+demand and does not read the current SAT model — that description was the
+bug. It reads an immutable post-solve snapshot (`RealBridge::model`) taken
+once, right after `solve` returns and before any further clause can
+backtrack the solver and destroy the assignment; a word the snapshot cannot
+value returns `None` (never a fabricated value) and is queued in `pending`
+for the top of the next solve. So the gate does not get "any" BV-sorted
+term for free — a word absent from both the snapshot and `word_alias`
+reads as `None`, which §3.3–§3.4 already treat as silence or rejection.
+No separate BV evaluator is still needed; the gate reads the same snapshot
+the refinement loop does, it just does not get to assume every word in it
+is already valued.
 
 ### 3.3 The checks — reject only DEFINITE violations
 
@@ -269,9 +278,11 @@ be answered by a full corpus re-run against z3.
 ### 3.6 Cost
 
 One pass over `abs.read_of` and `abs.eq_proxy` per QF_ABV `sat`, reusing
-already-computed array models and already-blasted BV values. QF_ABV's median
-solve is 12 ms and its p90 is 173 ms, so the pass is noise. §7 gates on the
-measured p90 anyway rather than on this assertion.
+already-blasted BV values (the §3.2 snapshot) and building its own `pins(A)`
+partial map from them — **not** `array_model`, which §3.2 rules out as a
+source for the gate. QF_ABV's median solve is 12 ms and its p90 is 173 ms,
+so the pass is noise. §7 gates on the measured p90 anyway rather than on
+this assertion.
 
 ## 4. The fixes, so far as they are known
 
@@ -319,6 +330,12 @@ done.
 §3, the `AbvOutcome` variant, the `abv_stage` hook, the `abv-model-rejected`
 fence, and the §6.1 unit fences. After this commit shinri is **sound** on all
 359 rows regardless of whether any later task succeeds.
+
+**Superseded — see §11 "The retracted claim"**: the gate did not achieve
+this; `validate` read the same fabricated model that produced the wrong
+`sat` in the first place, so a row could pass every check here and still be
+wrong (`bubsort002un.smt2` did exactly that). The claim stands above
+unedited because this project retracts rather than rewrites.
 
 **Task 3 — bisect and fix.** Drive the §3.5 rejection reason over the five
 named reproducers (§8), fix each cause it names. Also land the §4 latent
@@ -570,3 +587,14 @@ in the single direction it moved. No other bucket is affected.
   (slice-46 queue rank 4).
 * The 53 stack-overflow rows and 24 `parse-error` rows, unchanged in kind,
   tracked under the slice-46 queue's existing ranks.
+* `SatBridge::value_bv`'s doc says every check treats `None` as silence;
+  three sites don't. ROW-1, ROW-2 and extensionality-positive
+  (`crates/shinri-abv/src/check.rs:163-164`, `:258`, `:278`) compare
+  `value_bv(..).map(|x| x.1) != value_bv(..).map(|x| x.1)` directly, so
+  `Some(v) != None` reads as a mismatch and eagerly emits a lemma — sound
+  (the emitted lemma is an entailed array axiom either way), but not the
+  documented contract. Tightening those three sites to
+  `let (Some(_), Some(_)) = (…, …) else { continue }` is the better end
+  state; it is deferred here because it changes which lemmas are emitted on
+  which refinement round and needs a corpus re-measure, not a code change
+  made incidentally during a comments-only pass.
