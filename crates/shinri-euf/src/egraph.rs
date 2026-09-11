@@ -32,6 +32,20 @@ enum Undo {
         winner: usize,
         loser: usize,
         count: usize,
+        /// The spliced apps, in debug builds only (empty in release), so undo
+        /// can assert that the tail block it moves back is exactly them
+        /// (slice 49, spec §3.2).
+        moved: Vec<AppId>,
+    },
+    /// `index_app` ran above level 0: `app` was pushed onto `use_list[r]` for
+    /// each `r` in `reps` (in order) and, if `inserted_sig` is set, installed
+    /// as `lookup[sig]`. Undo removes exactly those writes and queues `app` on
+    /// `reindex`. Registration (`apps`, `terms`, `seen_terms`) is permanent;
+    /// only this index is level-scoped (slice 49, spec §3.1–3.2).
+    AppIndexed {
+        app: AppId,
+        reps: Vec<ENodeId>,
+        inserted_sig: Option<Signature>,
     },
 }
 
@@ -57,6 +71,12 @@ pub struct EGraph {
     /// re-checks arg equality (`eq.find(pa) == eq.find(pb)`) and skips stale
     /// entries. Any NEW consumer of `pending` MUST apply the same staleness check,
     /// or reintroduce the "explain: a,b not connected" unsound-merge bug.
+    ///
+    /// CONTRACT (slice 49, spec §3.4): `pending` must be drained before every
+    /// decision `push`. An entry enqueued at level L but drained at L+1 has its
+    /// merge undone by the pop back to L, and the entry is gone, so a congruence
+    /// that holds at L would be lost. The SAT loop honours this: it always runs
+    /// `propagate()` before `theory.push()`, and `Euf::propagate` calls `close`.
     pending: Vec<PendingEntry>,
     undo: shinri_core::UndoLog<Undo>,
     /// Set when an interned term is a function application (vs a plain leaf).
@@ -73,6 +93,12 @@ pub struct EGraph {
     prop_records: Vec<(ENodeId, ENodeId)>,
     /// Vars already propagated (avoid re-emitting), append-only within a solve.
     propagated: rustc_hash::FxHashSet<u32>,
+    /// Apps whose index a `pop` undid (`Undo::AppIndexed`), in undo (LIFO)
+    /// order. `flush_reindex` re-indexes them against the current classes at
+    /// the next entry point that holds the equality engine; `pop` itself
+    /// cannot, because `TheorySolver::pop` has no `TheoryCtx` (slice 49,
+    /// spec §3.3).
+    reindex: Vec<AppId>,
 }
 
 impl EGraph {
@@ -98,6 +124,7 @@ impl EGraph {
     pub fn pop(&mut self, level: usize) {
         let lookup = &mut self.lookup;
         let use_list = &mut self.use_list;
+        let reindex = &mut self.reindex;
         self.undo.pop_to(level, |u| match u {
             Undo::LookupInsert(sig) => {
                 lookup.remove(&sig);
@@ -109,15 +136,43 @@ impl EGraph {
                 winner,
                 loser,
                 count,
+                moved,
             } => {
                 debug_assert!(use_list[winner].len() >= count, "use-splice underflow");
                 let total = use_list[winner].len();
-                let moved = use_list[winner].split_off(total - count);
+                let block = use_list[winner].split_off(total - count);
+                debug_assert_eq!(
+                    block, moved,
+                    "use-splice undo: the tail block is not the spliced apps"
+                );
                 debug_assert!(
                     use_list[loser].is_empty(),
                     "loser use-list not empty on undo"
                 );
-                use_list[loser] = moved;
+                use_list[loser] = block;
+            }
+            Undo::AppIndexed {
+                app,
+                reps,
+                inserted_sig,
+            } => {
+                for rep in reps.iter().rev() {
+                    let popped = use_list[rep.index()].pop();
+                    debug_assert_eq!(
+                        popped,
+                        Some(app),
+                        "app-indexed undo: use-list tail is not the app"
+                    );
+                }
+                if let Some(sig) = inserted_sig {
+                    let removed = lookup.remove(&sig);
+                    debug_assert_eq!(
+                        removed,
+                        Some(app),
+                        "app-indexed undo: lookup entry is not the app"
+                    );
+                }
+                reindex.push(app);
             }
         });
     }
@@ -135,6 +190,10 @@ impl EGraph {
     /// Recursively intern `t` and all subterms, recording app structure.
     /// Returns the e-node of `t`. Idempotent (interning dedups).
     pub fn add_term(&mut self, cx: &mut TheoryCtx, t: TermId) -> ENodeId {
+        // Re-index anything a pop un-indexed before touching the index. This
+        // runs BEFORE the guard: a queued app must be indexed even when this
+        // call returns early (slice 49, spec §3.3).
+        self.flush_reindex(cx.eq);
         // Guard: process each distinct TermId exactly once.
         if !self.seen_terms.insert(t) {
             return cx.eq.intern(t);
@@ -155,40 +214,76 @@ impl EGraph {
                     arg_nodes.push(self.add_term(cx, ct));
                 }
                 let app_id = self.apps.len() as AppId;
-                for &an in &arg_nodes {
-                    // Push the new app onto the use-list of the arg's CURRENT
-                    // REPRESENTATIVE, not the raw arg node. Use-lists are maintained
-                    // at class representatives: `recanonicalize_use_list` drains a
-                    // loser's use-list into the winner on merge and records a
-                    // `UseSplice` undo that asserts the loser's list is empty when
-                    // unwound. If we pushed onto a raw arg node that is already a
-                    // *loser* of an earlier same-level merge, that list would be
-                    // non-empty at undo time → "loser use-list not empty on undo"
-                    // panic. Interning a fresh app mid-search (e.g. a string F-split
-                    // skolem or an empty-length-link disjunct) is exactly when this
-                    // happens. Keying by the representative keeps the invariant.
-                    let rep = cx.eq.find(an);
-                    self.ensure_node(rep);
-                    self.use_list[rep.index()].push(app_id);
-                }
                 self.apps.push(AppNode {
                     node,
                     op,
                     args: arg_nodes,
                 });
                 self.is_app[node.index()] = true;
-                // Initial signature; a collision means an existing congruent app.
-                let sig = self.signature(cx.eq, app_id);
-                if let Some(&other) = self.lookup.get(&sig) {
-                    if other != app_id {
-                        self.enqueue_congruence(cx.eq, other, app_id);
-                    }
-                } else {
-                    self.lookup.insert(sig, app_id);
-                }
+                self.index_app(cx.eq, app_id);
                 node
             }
             None => node,
+        }
+    }
+
+    /// Index `app` against the CURRENT classes: push it onto the use-list of
+    /// each argument's representative, then install its signature or enqueue a
+    /// congruence with the app already holding it.
+    ///
+    /// Keyed by the representative, not the raw argument node. Use-lists live
+    /// at class representatives: `recanonicalize_use_list` drains a loser's
+    /// list into the winner and its `UseSplice` undo asserts the loser's list
+    /// is empty, so pushing onto a raw node that is currently a loser would
+    /// panic on undo. Interning a fresh app mid-search (a DT injectivity
+    /// selector, a string F-split skolem, an empty-length-link disjunct) is
+    /// exactly when that happens.
+    ///
+    /// The representative is only valid at THIS level, so above level 0 the
+    /// writes are logged as one `AppIndexed`. Without that record a pop leaves
+    /// the app on a list its argument no longer belongs to, and a later
+    /// re-merge never re-signs it: the wrong-`sat` of slice 49 (spec §1.2).
+    fn index_app(&mut self, eq: &EqualityEngine, app: AppId) {
+        let args = self.apps[app as usize].args.clone();
+        let mut reps = Vec::with_capacity(args.len());
+        for an in args {
+            let rep = eq.find(an);
+            self.ensure_node(rep);
+            self.use_list[rep.index()].push(app);
+            reps.push(rep);
+        }
+        let sig = self.signature(eq, app);
+        let inserted_sig = match self.lookup.get(&sig).copied() {
+            Some(other) if other != app => {
+                self.enqueue_congruence(eq, other, app);
+                None
+            }
+            Some(_) => None,
+            None => {
+                self.lookup.insert(sig.clone(), app);
+                Some(sig)
+            }
+        };
+        if self.undo.level() > 0 {
+            self.undo.record(Undo::AppIndexed {
+                app,
+                reps,
+                inserted_sig,
+            });
+        }
+    }
+
+    /// Re-index every app a `pop` un-indexed, in registration order (`reindex`
+    /// holds them in undo order, which is reversed). O(1) when the queue is
+    /// empty. A collision found here is only enqueued; the caller's drain, or
+    /// the next `close`/`merge_eq`, closes it.
+    fn flush_reindex(&mut self, eq: &EqualityEngine) {
+        if self.reindex.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.reindex);
+        for app in queued.into_iter().rev() {
+            self.index_app(eq, app);
         }
     }
 
@@ -222,6 +317,7 @@ impl EGraph {
         b: ENodeId,
         just: EqJust,
     ) -> Option<Vec<EqLeaf>> {
+        self.flush_reindex(eq);
         if let Some(c) = self.do_merge(eq, a, b, MergeJust::Asserted(just)) {
             return Some(c);
         }
@@ -236,6 +332,7 @@ impl EGraph {
         b: ENodeId,
         just: EqJust,
     ) -> Option<Vec<EqLeaf>> {
+        self.flush_reindex(eq);
         match eq.assert_diseq(a, b, just) {
             Ok(()) => None,
             Err(conflict) => {
@@ -367,11 +464,16 @@ impl EGraph {
                 }
             }
         }
-        self.use_list[winner.index()].extend(moved);
+        self.use_list[winner.index()].extend(moved.iter().copied());
         self.undo.record(Undo::UseSplice {
             winner: winner.index(),
             loser: loser.index(),
             count,
+            moved: if cfg!(debug_assertions) {
+                moved
+            } else {
+                Vec::new()
+            },
         });
     }
 

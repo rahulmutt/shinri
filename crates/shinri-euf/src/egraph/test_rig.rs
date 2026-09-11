@@ -2,7 +2,7 @@
 //! spec §4.1). A child module of `egraph`, so it reads private fields.
 
 use super::{AppId, EGraph};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{Context, Lit, Op, SortId, SymbolId, TermId, Var};
 use shinri_theory::types::{ENodeId, EqJust, EqLeaf};
 use shinri_theory::{AtomRegistry, EqualityEngine, TheoryCtx};
@@ -16,10 +16,26 @@ impl EGraph {
     /// * (I-lookup) `lookup` holds its current signature, naming either the
     ///   app itself or an app in the same class or linked to it through live,
     ///   non-stale `pending` entries.
+    /// * (I-queue) no app in `reindex` is on a use-list or named by `lookup`.
     ///
     /// Not meaningful between a returned conflict and the `pop` that follows
     /// it: a conflict can consume a `pending` entry whose merge never happened.
     pub(crate) fn check_index(&self, eq: &EqualityEngine) -> Result<(), String> {
+        // (I-queue) Apps a pop un-indexed are on no use-list and named by no
+        // lookup entry until `flush_reindex` runs.
+        let queued: FxHashSet<AppId> = self.reindex.iter().copied().collect();
+        for (idx, list) in self.use_list.iter().enumerate() {
+            if let Some(app) = list.iter().find(|a| queued.contains(a)) {
+                return Err(format!(
+                    "(I-queue) queued app {app} is still on use_list[{idx}]"
+                ));
+            }
+        }
+        if let Some((sig, app)) = self.lookup.iter().find(|(_, a)| queued.contains(a)) {
+            return Err(format!(
+                "(I-queue) queued app {app} is still lookup[{sig:?}]"
+            ));
+        }
         let mut on_lists: FxHashMap<AppId, Vec<usize>> = FxHashMap::default();
         for (idx, list) in self.use_list.iter().enumerate() {
             for &app in list {
@@ -48,6 +64,9 @@ impl EGraph {
 
         for (i, a) in self.apps.iter().enumerate() {
             let app = i as AppId;
+            if queued.contains(&app) {
+                continue;
+            }
             let mut want: Vec<usize> = a.args.iter().map(|&x| eq.find(x).index()).collect();
             want.sort_unstable();
             let mut have = on_lists.get(&app).cloned().unwrap_or_default();
