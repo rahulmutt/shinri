@@ -350,6 +350,16 @@ impl EGraph {
         }
     }
 
+    /// Re-index anything a pop un-indexed, then close every pending
+    /// congruence. Congruences found at registration (`add_term`) or re-index
+    /// (`flush_reindex`) time are only enqueued, and only `merge_eq` drains
+    /// otherwise, so without this a collision with no later merge never closes.
+    /// Called from `Euf::propagate` and `Euf::check` (slice 49, spec §3.4).
+    pub fn close(&mut self, eq: &mut EqualityEngine) -> Option<Vec<EqLeaf>> {
+        self.flush_reindex(eq);
+        self.drain_pending(eq)
+    }
+
     /// Intern the ⊤/⊥ sentinels once and assert them distinct (level 0, Definitional).
     /// Idempotent: subsequent calls return the cached pair.
     pub fn truth_nodes(
