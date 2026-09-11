@@ -158,6 +158,13 @@ impl TheorySolver for Euf {
         cx: &mut TheoryCtx,
         out: &mut Vec<(Lit, TheoryJust)>,
     ) -> Option<Vec<EqLeaf>> {
+        // Close congruences enqueued outside `merge_eq` before scanning for
+        // forced equalities. This also upholds `EGraph.pending`'s
+        // drain-before-push contract: the SAT loop always propagates before a
+        // decision push (slice 49, spec §3.4).
+        if let Some(conflict) = self.inner.close(cx.eq) {
+            return Some(conflict);
+        }
         let props = self.inner.collect_eq_propagations(cx.eq);
         for (vi, tag) in props {
             let lit = Lit::new(Var::new(vi), true);
@@ -171,8 +178,13 @@ impl TheorySolver for Euf {
         }
         None
     }
-    fn check(&mut self, _cx: &mut TheoryCtx, _e: Effort) -> TCheck {
-        TCheck::Sat
+    fn check(&mut self, cx: &mut TheoryCtx, _e: Effort) -> TCheck {
+        // Same closure as `propagate`: a final check must not report
+        // consistency over an undrained congruence (slice 49, spec §3.4).
+        match self.inner.close(cx.eq) {
+            Some(leaves) => TCheck::Conflict(leaves),
+            None => TCheck::Sat,
+        }
     }
     fn explain(&mut self, cx: &mut TheoryCtx, tag: u32, exp: &mut Explainer) {
         let (a, b) = self.inner.prop_record(tag);
@@ -406,5 +418,112 @@ mod tests {
             m.get(u_term).is_some(),
             "EUF must still assign uninterpreted-sorted terms"
         );
+    }
+
+    struct RegistrationCollision {
+        ctx: shinri_core::Context,
+        atoms: shinri_theory::AtomRegistry,
+        v_ab: Var,
+        v_ff: Var,
+    }
+
+    /// Spec §4.2 case 9. Level 1: assert a = b, THEN register the atom
+    /// (= f(a) f(b)) (as `bind_fresh` does mid-search) and assert it false.
+    /// Registration enqueues the f(a)/f(b) collision and nothing drains it, so
+    /// the disequality is accepted.
+    fn registration_collision() -> (Euf, shinri_theory::EqualityEngine, RegistrationCollision) {
+        use shinri_core::{Context, Op};
+        use shinri_theory::types::Owner;
+        use shinri_theory::{AtomRegistry, EqualityEngine};
+
+        let mut ctx = Context::new();
+        let u = ctx.declare_sort("U");
+        let a_sym = ctx.declare_fun("a", &[], u);
+        let a = ctx.mk_app(Op::Uninterpreted(a_sym), &[]).unwrap();
+        let b_sym = ctx.declare_fun("b", &[], u);
+        let b = ctx.mk_app(Op::Uninterpreted(b_sym), &[]).unwrap();
+        let f = ctx.declare_fun("f", &[u], u);
+        let fa = ctx.mk_app(Op::Uninterpreted(f), &[a]).unwrap();
+        let fb = ctx.mk_app(Op::Uninterpreted(f), &[b]).unwrap();
+        let eq_ab = ctx.mk_eq(a, b).unwrap();
+        let eq_ff = ctx.mk_eq(fa, fb).unwrap();
+
+        let mut atoms = AtomRegistry::default();
+        let (v_ab, v_ff) = (Var::new(0), Var::new(1));
+        atoms.register(v_ab, eq_ab, Owner::Euf);
+        atoms.register(v_ff, eq_ff, Owner::Euf);
+
+        let mut c = RegistrationCollision {
+            ctx,
+            atoms,
+            v_ab,
+            v_ff,
+        };
+        let mut euf = Euf::default();
+        let mut eq = EqualityEngine::default();
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut c.ctx,
+                eq: &mut eq,
+                atoms: &c.atoms,
+            };
+            euf.new_var(&mut cx, v_ab, eq_ab);
+        }
+        eq.push();
+        euf.push();
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut c.ctx,
+                eq: &mut eq,
+                atoms: &c.atoms,
+            };
+            assert!(euf.assert(&mut cx, Lit::new(v_ab, true)).is_none());
+            euf.new_var(&mut cx, v_ff, eq_ff);
+            assert!(
+                euf.assert(&mut cx, Lit::new(v_ff, false)).is_none(),
+                "the disequality is accepted: the collision is still undrained"
+            );
+        }
+        (euf, eq, c)
+    }
+
+    fn assert_cites_both(leaves: &[EqLeaf], c: &RegistrationCollision) {
+        assert!(
+            leaves.contains(&EqLeaf::Asserted(Lit::new(c.v_ab, true))),
+            "the conflict must cite a = b: {leaves:?}"
+        );
+        assert!(
+            leaves.contains(&EqLeaf::Asserted(Lit::new(c.v_ff, false))),
+            "the conflict must cite f(a) != f(b): {leaves:?}"
+        );
+    }
+
+    #[test]
+    fn registration_time_collision_is_closed_by_propagate() {
+        let (mut euf, mut eq, mut c) = registration_collision();
+        let mut cx = TheoryCtx {
+            terms: &mut c.ctx,
+            eq: &mut eq,
+            atoms: &c.atoms,
+        };
+        let mut out = Vec::new();
+        let leaves = euf.propagate(&mut cx, &mut out).expect(
+            "a = b forces f(a) = f(b); with f(a) != f(b) asserted, propagate must report the conflict",
+        );
+        assert_cites_both(&leaves, &c);
+    }
+
+    #[test]
+    fn registration_time_collision_is_closed_by_check() {
+        let (mut euf, mut eq, mut c) = registration_collision();
+        let mut cx = TheoryCtx {
+            terms: &mut c.ctx,
+            eq: &mut eq,
+            atoms: &c.atoms,
+        };
+        match euf.check(&mut cx, Effort::Full) {
+            TCheck::Conflict(leaves) => assert_cites_both(&leaves, &c),
+            _ => panic!("a = b forces f(a) = f(b); with f(a) != f(b) asserted, check must report the conflict"),
+        }
     }
 }
