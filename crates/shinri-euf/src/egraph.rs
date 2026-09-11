@@ -480,6 +480,8 @@ impl EGraph {
 }
 
 #[cfg(test)]
+mod index_props;
+#[cfg(test)]
 mod index_tests;
 #[cfg(test)]
 mod test_rig;

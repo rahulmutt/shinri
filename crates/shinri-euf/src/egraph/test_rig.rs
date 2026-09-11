@@ -144,6 +144,23 @@ impl Rig {
         r
     }
 
+    pub(crate) fn diseq(&mut self, a: TermId, b: TermId) -> Option<Vec<EqLeaf>> {
+        let (na, nb) = (self.eq.intern(a), self.eq.intern(b));
+        let j = self.just();
+        let r = self.g.assert_diseq(&mut self.eq, na, nb, j);
+        self.eq.drain_merges(&mut Vec::new());
+        r
+    }
+
+    /// Close pending congruences using only APIs that exist before slice 49:
+    /// `merge_eq(k, k)` returns before merging and then drains `pending` (the
+    /// idiom of `stale_pending_congruence_not_drained_after_backtrack`). After
+    /// slice 49, `merge_eq` flushes the re-index queue first, so this behaves
+    /// like `EGraph::close`.
+    pub(crate) fn drain(&mut self, k: TermId) -> Option<Vec<EqLeaf>> {
+        self.merge(k, k)
+    }
+
     pub(crate) fn push(&mut self) {
         self.eq.push();
         self.g.push();
