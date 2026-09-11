@@ -622,10 +622,41 @@ criterion's "boundary noise" is a decision to make before merge.
   none `sat`.
 * **§9's Approach B un-banking trigger did not fire.** QF_DT has 0
   `correct → timeout` rows, and nothing attributes any QF_DT timeout to
-  re-index churn.
+  re-index churn — but the trigger cannot see churn on the 86 blocksworld
+  `wrong → timeout` rows, where churn is most plausible, so that statement
+  is true but untested (see Queued, below).
 * **Task 4's note said to watch QF_UF and QF_S for backtrack-path cost.**
   No changed QF_UF or QF_S row is confirmed slower on the branch. The one
   sequential gap, `PEQ003_size7` (+1.7 s), disappears under concurrent load
   (Δ < 0.1 s). Unchanged rows were not A/B-timed.
 * **Slice 48's root-cause text is corrected** (§1.1) in the slice-49
   report. The historical slice-48 report is unchanged.
+
+### Queued
+
+* **⊤≠⊥ sentinel can be lost when the first predicate atom is registered
+  above level 0.** Found and reproduced by the whole-branch review, outside
+  this slice's diff. `Euf::new_var`'s catch-all arm
+  (`crates/shinri-euf/src/solver.rs:100`) calls `EGraph::truth_nodes`, which
+  asserts ⊤≠⊥ in the equality engine at the *current* decision level but
+  caches `truth` permanently. `bind_fresh` can reach that arm mid-search —
+  interned Boolean connectives and DT tester atoms route to EUF
+  (`crates/shinri-theory/src/combiner.rs:387`) — so a pop below that level
+  drops the disequality and it is never reinstalled: `p(a)`, `¬p(b)`, `a=b`
+  can then be accepted with no conflict. The existing I1 comment ("the
+  combiner registers atoms at level 0") assumes what `bind_fresh` breaks.
+  Reproduced at the `Euf` level only (a `shinri-euf` test: register `a=b` at
+  level 0; register `p(a)`, `p(b)` at level 1; pop to 0; assert `p(a)`,
+  `¬p(b)`, `a=b` → no conflict from `assert`, `propagate` or `check`), on
+  both pre-slice `9240b873` and `1c4298ae`. No end-to-end wrong answer has
+  been demonstrated; it needs a named e2e repro before it is a diagnosis of
+  any corpus row. Fix direction (suggestion, unbuilt): install the sentinels
+  at `set_truth_terms` time / before solving so the diseq lives at level 0.
+  Same class as slice 49: registration-created state scoped to the current
+  level.
+* **Approach B's un-bank trigger cannot see the churn it would need to.**
+  Spec §9 un-banks Approach B only if criterion 6 attributes
+  `correct → timeout` rows to re-index churn. That trigger never sees
+  churn on the 86 blocksworld `wrong → timeout` rows, where churn is most
+  plausible. Measure a re-index counter on 2–3 of the rows still unanswered
+  at 120 s to settle it.

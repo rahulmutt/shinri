@@ -59,7 +59,9 @@ enum MergeJust {
 #[derive(Default)]
 pub struct EGraph {
     apps: Vec<AppNode>,
-    /// Per-ENodeId apps that use it directly as an argument (by original node id).
+    /// Per class representative: apps that use a member of that class as an
+    /// argument (keyed by the argument's representative at indexing time; see
+    /// `index_app`).
     use_list: Vec<Vec<AppId>>,
     lookup: FxHashMap<Signature, AppId>,
     /// Congruence work-queue: pairs of app nodes to merge, with arg pairs.

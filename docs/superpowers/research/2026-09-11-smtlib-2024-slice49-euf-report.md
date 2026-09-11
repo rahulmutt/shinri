@@ -69,8 +69,9 @@ count closes under `new = old − outbound + inbound` (shown inline).
   unchanged. On every changed row, `9240b873` gives the same answer as the
   branch, and no row answers on base but not on the branch. These are
   13.8–20 s instances crossing the 20 s boundary against a three-slice-old
-  baseline. QF_S `correct` is **−2**. Neither row is a change
-  in shinri's output (criterion 5).
+  baseline. QF_S `correct` is **−2**: one row's timeout does not reproduce
+  on either binary, the other is an oracle-side verdict change with an
+  identical shinri answer (criterion 5).
 - **Criteria:** 1 PASS, 2 PASS, 2b `unsat` (correct), 3 PASS (0), 4 PASS (0 ≤ 200).
   **5 is MISSED on the literal count for QF_S (16,023 < 16,025).**
   Decomposed below: neither row is an answer the slice lost, but neither
@@ -212,7 +213,8 @@ merge.
 | `QF_S/20230329-automatark-lu/instance10273.smt2` (`:status unknown`) | shinri `unsat` 11 ms; oracle z3 `unsat`: `correct` | shinri `unsat` 22 ms; oracle z3 **`timeout`**: `unverified` | `unsat` 13 ms / `unsat` 12 ms | `unsat` 12–14 ms / `unsat` 11–13 ms | **shinri's answer is identical.** `:status` is `unknown`, so the verdict rests on the z3 oracle, which runs under the same 20 s limit. z3 4.16.0 alone takes **14,815 / 14,574 / 14,516 ms** here (3 sequential runs), and in this run it timed out |
 
 **What the decomposition shows:** 0 of the 2 rows is an answer the slice
-lost. One is an oracle-side verdict flip with byte-identical solver output.
+lost. One is an oracle-side verdict flip with an identical answer from the
+solver.
 The other is a timeout that neither binary reproduces. **What it does not
 show:** neither row passes the brief's operational exclusion test, so the
 hard gate is missed as written. Whether a same-answer oracle flip and an
@@ -472,13 +474,38 @@ Spec §10's list, updated with what this run showed.
 - **`pending` is not backtracked** (§3.4). Unchanged. Only the
   drain-before-push contract keeps it safe. The raw user-scope SAT `push` is
   still the one caller that could break it.
+- **⊤≠⊥ sentinel can be lost when the first predicate atom is registered
+  above level 0.** Found and reproduced by the whole-branch review, outside
+  this slice's diff. `Euf::new_var`'s catch-all arm
+  (`crates/shinri-euf/src/solver.rs:100`) calls `EGraph::truth_nodes`, which
+  asserts ⊤≠⊥ in the equality engine at the *current* decision level but
+  caches `truth` permanently. `bind_fresh` can reach that arm mid-search —
+  interned Boolean connectives and DT tester atoms route to EUF
+  (`crates/shinri-theory/src/combiner.rs:387`) — so a pop below that level
+  drops the disequality and it is never reinstalled: `p(a)`, `¬p(b)`, `a=b`
+  can then be accepted with no conflict. The existing I1 comment ("the
+  combiner registers atoms at level 0") assumes what `bind_fresh` breaks.
+  **Reproduced at the `Euf` level only** (a `shinri-euf` test: register
+  `a=b` at level 0; register `p(a)`, `p(b)` at level 1; pop to 0; assert
+  `p(a)`, `¬p(b)`, `a=b` → no conflict from `assert`, `propagate` or
+  `check`), on both pre-slice `9240b873` and `1c4298ae`. **No end-to-end
+  wrong answer has been demonstrated**; it needs a named e2e repro before it
+  is a diagnosis of any corpus row. Fix direction (suggestion, unbuilt):
+  install the sentinels at `set_truth_terms` time / before solving so the
+  diseq lives at level 0. Same class as slice 49: registration-created
+  state scoped to the current level.
 - **Blocksworld's 86 new `timeout` rows** (formerly `wrong`). The family
   has 384 timeouts in total, of which 297 were already timeouts at
   `slice48b`. A 120 s re-run answered 8 of the 86 `unsat` (18.0–98.9 s,
   all `bmc_7`/`bmc_8`), none `sat`, and left 78 unanswered. Nothing here
   attributes them to re-index churn. Spec §9's Approach B un-banking trigger
   is "criterion 6 attributes QF_DT `correct → timeout` rows to re-index
-  churn". It did **not** fire: QF_DT has 0 `correct → timeout` rows.
+  churn". It did **not** fire: QF_DT has 0 `correct → timeout` rows — but
+  that trigger cannot see churn on the 86 blocksworld `wrong → timeout`
+  rows, where churn is most plausible, so "nothing attributes them to
+  re-index churn" is true but untested. A future slice should measure a
+  re-index counter on 2–3 of the rows still unanswered at 120 s to settle
+  it.
 - **Slice 48's QF_DT residuals, which moved.** All 31 Barrett `typed/`
   wrong rows are now `correct`, and 6 of the 7 slice-48 `correct → timeout`
   rows are `correct`. These leave the queue as wrong or timeout rows. The
@@ -488,7 +515,7 @@ Spec §10's list, updated with what this run showed.
   is needed for a queue item now.
 - **Slice 48's QF_DT residuals, which did not move.**
   `blocksworld_from_3_5_0_to_8_0_0_negated_goal_bmc_14.smt2` is still
-  `timeout`. Blocksworld's other 297 slice48b timeouts and Bouvier's 200
+  `timeout`. Blocksworld's other 296 slice48b timeouts and Bouvier's 200
   are all unchanged.
 - **QF_S `instance10273` is an oracle-boundary row.** z3 needs about 14.5 s
   (3 sequential runs, unloaded) against a 20 s oracle limit, so its verdict can flip between `correct`
