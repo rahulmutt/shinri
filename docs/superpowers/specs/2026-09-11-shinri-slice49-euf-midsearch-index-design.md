@@ -245,6 +245,23 @@ Merges produced by `close` go through `eq.merge_congruence`, the same path as
 `merge_eq`'s congruence merges, so they reach the combiner's merge-event
 consumers unchanged.
 
+**The drain-before-push contract.** `pending` is not backtracked. Suppose a
+collision is enqueued at level L, the solver pushes, the entry is drained at
+L+1, and the solver pops back to L. The congruence merge is undone and the
+entry is gone, so a congruence that holds at L is lost. `close` makes this
+unreachable in the shipped solver: the SAT loop always runs `propagate()`
+(boolean BCP plus a theory-propagation fixpoint,
+`crates/shinri-sat/src/solver.rs:1158`, called at the top of every search
+iteration, `:537`) before it calls `theory.push()` for a decision
+(`solver.rs:618–635`). `Combiner::propagate` calls `euf.propagate`,
+which now closes, and nothing registers EUF terms inside a propagate round.
+So `pending` is empty at every decision push. The contract is recorded in a
+comment on `EGraph.pending`, and the property test (§6.2) models it by draining
+before every `push`. It is not enforced by assertion. The raw SAT-API
+user-scope `push` is documented as unreached by the shipped pipeline
+(`combiner.rs` `pop` comment), and it is the one caller that could break the
+contract. §10 records it.
+
 ### 3.5 What does not change
 
 * `pending`'s staleness guard (`egraph.rs:286`) and its sole-consumer note.
@@ -367,6 +384,10 @@ dev-dependency (`crates/shinri-euf/Cargo.toml:15`).
   flushes first, so `drain` behaves like `close`.
 * **Conflicts.** On a returned conflict the trace pops one level, or ends if
   at level 0, as the SAT solver would.
+* **`push` drains first** (§3.4's contract), exactly as the SAT loop propagates
+  before deciding. Without it, the test reports the documented
+  `pending`-not-backtracked loss, which the shipped solver cannot reach, as a
+  failure.
 * **Reference.** After each `drain`, recompute from scratch a naive congruence
   closure over the live asserted equalities (a per-level stack) and all
   registered terms. Then assert:
@@ -502,6 +523,11 @@ candidate is §10's `combiner.rs:185`, if it proves live.
   backtrack, and EUF's use-lists would not reflect the merge while it holds.
   **Unverified:** it needs a named repro reaching the arm above level 0 before
   it is a diagnosis.
+* **`pending` is not backtracked** (§3.4). Only the drain-before-push contract
+  keeps it safe. A future caller that pushes without propagating (the raw
+  user-scope SAT API) would reopen a congruence loss. The durable fix would be
+  an undo entry that re-enqueues a congruence merge's `pending` entry when
+  that merge is undone, with the existing staleness guard filtering it.
 * **Slice 48's other QF_DT residuals** — the 31 Barrett `typed/` wrong rows,
   the rest of blocksworld's wrong rows, and the 7 `correct → timeout` rows —
   unless §7 shows this slice moved them. The report states what moved.
