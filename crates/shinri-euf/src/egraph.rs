@@ -480,6 +480,11 @@ impl EGraph {
 }
 
 #[cfg(test)]
+mod index_tests;
+#[cfg(test)]
+mod test_rig;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use shinri_core::{Context, Op};

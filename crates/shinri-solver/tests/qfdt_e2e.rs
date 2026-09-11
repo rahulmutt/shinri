@@ -579,3 +579,56 @@ fn lost_instantiation_after_backtrack_is_a_wrong_sat() {
          this answers a wrong `sat`"
     );
 }
+
+#[test]
+fn injectivity_over_selector_minted_under_a_case_split_is_unsat() {
+    // Slice 49 (spec §1). `(right u) = (right q)` is derived only inside an
+    // `ite` whose branches are equal, so `(stack C empty)` and
+    // `(stack H empty)` merge above decision level 0. DT's injectivity rule
+    // then mints `top(..)`/`rest(..)` on both applications mid-search. EUF
+    // filed those apps under the merged class with no undo record, lost them
+    // on the next backtrack, never re-derived `top(stack C empty) =
+    // top(stack H empty)` (so `C = H` never surfaced), and answered `sat`.
+    // Delta-debugged by slice 48 from
+    // QF_DT/20230720-blocksworld/blocksworld_from_6_0_2_to_2_5_1_negated_goal_bmc_2.smt2;
+    // z3 and cvc5 both answer `unsat`.
+    let out = run_script(
+        "(set-logic QF_DT)\
+         (declare-datatypes ((E 0)) (((A) (C) (H))))\
+         (declare-datatypes ((T 0)) (((stack (top E) (rest T)) (empty))))\
+         (declare-datatypes ((R 0)) (((R (right T)))))\
+         (declare-fun p () R)(declare-fun q () R)(declare-fun u () R)(declare-fun c () E)\
+         (assert (= (right p) (stack C empty)))\
+         (assert (= q p))\
+         (assert (ite (= c A) (= (right u) (right q)) (= (right u) (right q))))\
+         (assert (= (right u) (stack H empty)))\
+         (check-sat)",
+    );
+    assert_eq!(
+        out,
+        vec!["unsat"],
+        "a selector application minted while a same-constructor merge holds only \
+         inside a case split must keep its congruence across backtracking"
+    );
+}
+
+#[test]
+fn injectivity_over_selector_with_the_equality_as_a_unit_is_unsat() {
+    // Guard for the test above: the same query with the `ite` replaced by its
+    // unit equality. Every literal is then at level 0, so this was already
+    // `unsat` before slice 49; it pins that the fix does not depend on the
+    // `ite`.
+    let out = run_script(
+        "(set-logic QF_DT)\
+         (declare-datatypes ((E 0)) (((A) (C) (H))))\
+         (declare-datatypes ((T 0)) (((stack (top E) (rest T)) (empty))))\
+         (declare-datatypes ((R 0)) (((R (right T)))))\
+         (declare-fun p () R)(declare-fun q () R)(declare-fun u () R)(declare-fun c () E)\
+         (assert (= (right p) (stack C empty)))\
+         (assert (= q p))\
+         (assert (= (right u) (right q)))\
+         (assert (= (right u) (stack H empty)))\
+         (check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
