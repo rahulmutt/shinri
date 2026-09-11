@@ -553,3 +553,79 @@ candidate is §10's `combiner.rs:185`, if it proves live.
   `stale_pending_congruence_not_drained_after_backtrack`.
 * The ⊤/⊥ precedent for "registration must survive backtracking" —
   `Euf::new_var`'s I1 note (`crates/shinri-euf/src/solver.rs:92–99`).
+
+## 12. Measured outcomes
+
+Run-id `slice49` at `c6cb4219ef8a` (Task 5 HEAD), with §7's limits: 20 s,
+3072 MB, 6 jobs, about 1 h 58 min wall-clock. There are 37,086 same-path
+rows against the §7 comparison runs (0 missing, 0 extra). Every changed row
+was A/B-run on pre-slice `9240b873` (the branch merge base) and on the
+branch. The full narrative, per-row tables and A/B data are in
+`docs/superpowers/research/2026-09-11-smtlib-2024-slice49-euf-report.md`.
+
+### Criteria
+
+| # | criterion | gate | measured | verdict |
+| --- | --- | --- | --- | --- |
+| 1 | Tasks 1–3's tests and Task 5's §4.2 case 9 failed on pre-slice `main` and pass now | hard | all four failed first (task reports 1, 2, 3, 5) and all pass in the Task 6 gates (`mise run test` 1,532 passed; unfiltered oracle 656 passed) | **PASS** |
+| 2 | §1 repro answers `unsat` | hard | e2e pin green; direct run: base `sat`, branch `unsat`, z3 `unsat` | **PASS** |
+| 2b | `blocksworld_…_bmc_2.smt2` answers `unsat` | measured | `unsat`, 16 ms, `correct`; A/B base `sat`, branch `unsat` | **`unsat`** |
+| 3 | `correct → wrong`, all five logics | 0, hard | **0** | **PASS** |
+| 4 | QF_DT `wrong` ≤ 200 | hard | **0**. Barrett `typed/` 31 → 0 (all `correct`); blocksworld 169 → 0 (83 `correct`, 86 `timeout`) | **PASS** |
+| 5 | per-logic `correct` ≥ comparison run | hard | QF_DT 8,105 ≥ 7,978; QF_UF 7,111 ≥ 7,106; QF_UFLIA 104 ≥ 103; QF_UFLRA 44 = 44; **QF_S 16,023 < 16,025** | **MISS (QF_S −2), decomposed** |
+| 6 | `correct → {timeout, unknown, oom}` | measured | 6 rows (QF_UF 5, QF_S 1), plus 1 QF_S `correct → unverified`. 0 rows answer on base but not on the branch, in either A/B | 0 rows of slice cost |
+| 7 | `* → wrong` from a non-`correct` verdict | measured | **0 rows** | 0 |
+| 8 | QF_UFLIA and QF_S wrong rows | measured | QF_UFLIA **11**, QF_S **2** (the same paths as the baseline) | measured |
+
+**Criterion 5 is missed as written, not relaxed.** QF_S is 2 rows short,
+and neither row meets the brief's exclusion test ("base also fails to answer
+within 20 s"):
+
+* `QF_S/20230329-automatark-lu/instance10357.smt2` (`correct → timeout`).
+  In the corpus run it took 20,017 ms. In the A/B, base and branch both
+  answer `sat`: 12,181 / 12,117 ms sequential, and 13.1–13.2 s on both
+  under 6-way concurrent load. No binary reproduces the timeout.
+* `QF_S/20230329-automatark-lu/instance10273.smt2` (`correct → unverified`).
+  shinri answers `unsat` in both runs. `:status` is `unknown`, so the
+  verdict comes from z3, and z3 timed out this time. Run alone, z3 takes
+  about 14.5 s against its 20 s limit.
+
+Neither row is an answer the slice lost. Whether they count as the
+criterion's "boundary noise" is a decision to make before merge.
+
+### Transitions that actually happened
+
+| logic | before → after | count | A/B evidence |
+| --- | --- | ---: | --- |
+| QF_DT | `wrong → correct` | 114 (blocksworld 83, Barrett `typed/` 31) | base `sat` on 114 of 114; branch `unsat` on 114 of 114 |
+| QF_DT | `wrong → timeout` | 86 (blocksworld) | base `sat` on 86 of 86 (median 3.6 s). Branch at 20 s: 85 no answer, 1 `unsat`. **Branch at 120 s: 8 `unsat`, 0 `sat`, 78 no answer** |
+| QF_DT | `timeout → correct` | 13 (Barrett) | base times out on 13 of 13; branch answers in ≤ 10 ms. Includes 6 of slice 48's 7 `correct → timeout` rows |
+| QF_DT | `unverified → timeout` | 1 (blocksworld `bmc_17`) | base `sat` (`:status unknown`); branch no answer at 20 s or 120 s |
+| QF_UF | `timeout → correct` 10, `correct → timeout` 5 | 15 | base and branch give the same answer on every row in the sequential A/B; 20 s-boundary churn against the older baseline |
+| QF_UFLIA | `timeout → correct` | 1 | base answers too (15.6 s against 15.3 s) |
+| QF_S | `correct → timeout` 1, `correct → unverified` 1 | 2 | see criterion 5 |
+
+### Premises this run discarded or qualified
+
+* **"Only `bmc_2` is traced" held, but the corpus moved far more than one
+  row.** Pre-slice `main` gives the wrong `sat` on all 200 slice-48 wrong
+  rows. The branch gives it on none of them in any A/B run (20 s, and 120 s
+  for the rows now in `timeout`). That shows the slice
+  changed those 200 answers. It does not show that §1.2 is the mechanism
+  for any row but `bmc_2`. Section 3's two changes (index undo and re-index,
+  and `close` at `propagate`/`check`) both alter search trajectories, and
+  no other row was traced. The 199 others are **unattributed**.
+* **§1.4's blast radius did not become 200 correct answers.** 114 wrong
+  rows became `correct`, and 86 blocksworld rows became `timeout`. The
+  timeouts are an honest non-answer in place of a fast wrong one, not a
+  correctness win. Within 120 s the branch answered 8 of them `unsat` and
+  none `sat`.
+* **§9's Approach B un-banking trigger did not fire.** QF_DT has 0
+  `correct → timeout` rows, and nothing attributes any QF_DT timeout to
+  re-index churn.
+* **Task 4's note said to watch QF_UF and QF_S for backtrack-path cost.**
+  No changed QF_UF or QF_S row is confirmed slower on the branch. The one
+  sequential gap, `PEQ003_size7` (+1.7 s), disappears under concurrent load
+  (Δ < 0.1 s). Unchanged rows were not A/B-timed.
+* **Slice 48's root-cause text is corrected** (§1.1) in the slice-49
+  report. The historical slice-48 report is unchanged.
