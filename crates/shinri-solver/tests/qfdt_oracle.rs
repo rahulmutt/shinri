@@ -428,3 +428,125 @@ fn qfdt_random_matches_z3() {
     assert!(n_sat > 0, "generator produced no sat instances");
     assert!(n_unsat > 0, "generator produced no unsat instances");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 49: guarded-record generator.
+//
+// `gen_instance` above emits only top-level ground conjuncts, so every literal
+// lands at decision level 0 and EUF never registers a term mid-search. The
+// slice-49 defect (spec §1.2) needs exactly that: a selector application
+// minted by DT's injectivity rule while a same-constructor merge holds only
+// inside a case split. This generator wraps equalities over a record of a
+// constructor-bearing datatype in `ite`/`or` guards, including the degenerate
+// both-branches-equal guard the reduced repro uses.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const GUARDED_RECORD: &str = "(declare-datatypes ((E 0)) (((A) (C) (H))))\
+(declare-datatypes ((T 0)) (((stack (top E) (rest T)) (empty))))\
+(declare-datatypes ((R 0)) (((R (right T)))))\
+(declare-fun p () R)(declare-fun q () R)(declare-fun u () R)\
+(declare-fun c () E)(declare-fun e1 () E)(declare-fun t1 () T)";
+
+const RECS: [&str; 3] = ["p", "q", "u"];
+const ENUMS: [&str; 3] = ["A", "C", "H"];
+
+fn gr_rec(rng: &mut Lcg) -> &'static str {
+    RECS[rng.below(3) as usize]
+}
+
+fn gr_enum(rng: &mut Lcg) -> &'static str {
+    ["A", "C", "H", "e1", "c"][rng.below(5) as usize]
+}
+
+fn gr_stack(rng: &mut Lcg) -> String {
+    match rng.below(5) {
+        0 => format!("(stack {} empty)", gr_enum(rng)),
+        1 => format!("(right {})", gr_rec(rng)),
+        2 => "empty".into(),
+        3 => "t1".into(),
+        _ => format!("(stack {} t1)", gr_enum(rng)),
+    }
+}
+
+fn gr_atom(rng: &mut Lcg) -> String {
+    match rng.below(5) {
+        0 => {
+            let (x, y) = (gr_rec(rng), gr_rec(rng));
+            format!("(= {x} {y})")
+        }
+        1 => {
+            let (x, e) = (gr_rec(rng), gr_enum(rng));
+            format!("(= (top (right {x})) {e})")
+        }
+        _ => {
+            let x = gr_rec(rng);
+            format!("(= (right {x}) {})", gr_stack(rng))
+        }
+    }
+}
+
+fn gr_guarded(rng: &mut Lcg) -> String {
+    let b1 = gr_atom(rng);
+    let b2 = if rng.below(2) == 0 {
+        b1.clone()
+    } else {
+        gr_atom(rng)
+    };
+    if rng.below(2) == 0 {
+        let k = ENUMS[rng.below(3) as usize];
+        format!("(ite (= c {k}) {b1} {b2})")
+    } else {
+        format!("(or {b1} {b2})")
+    }
+}
+
+fn gen_guarded_record(rng: &mut Lcg) -> String {
+    let n = 3 + rng.below(4) as usize;
+    let mut asserts = String::new();
+    for _ in 0..n {
+        let c = if rng.below(2) == 0 {
+            gr_guarded(rng)
+        } else {
+            gr_atom(rng)
+        };
+        asserts.push_str(&format!("(assert {c})"));
+    }
+    format!("(set-logic QF_DT){GUARDED_RECORD}{asserts}(check-sat)")
+}
+
+#[test]
+fn qfdt_random_guarded_records_match_z3() {
+    let mut rng = Lcg(0xD7_0000_0049u64);
+    let (mut n_sat, mut n_unsat, mut n_skipped) = (0usize, 0usize, 0usize);
+
+    for it in 0..N_ITERS {
+        let src = gen_guarded_record(&mut rng);
+        let ours = shinri_answer(&src);
+        if ours == "unknown" {
+            n_skipped += 1; // our incompleteness fence — not a disagreement
+            continue;
+        }
+        let theirs = z3_answer(&src);
+        if theirs == "unknown" {
+            n_skipped += 1; // no ground truth
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_DT SOUNDNESS DISAGREEMENT (guarded records, iter {it}): shinri={ours} z3={theirs}\n\
+             Reproduce with this instance:\n{src}"
+        );
+        if ours == "sat" {
+            n_sat += 1;
+        } else {
+            n_unsat += 1;
+        }
+    }
+
+    println!(
+        "qfdt_random_guarded_records_match_z3: {N_ITERS} iters, {n_sat} sat / {n_unsat} unsat / \
+         {n_skipped} skipped, 0 mismatches"
+    );
+    assert!(n_sat > 0, "generator produced no sat instances");
+    assert!(n_unsat > 0, "generator produced no unsat instances");
+}
