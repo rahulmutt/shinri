@@ -392,3 +392,190 @@ fn uninterpreted_field_chain_is_fast() {
     assert_eq!(out, vec!["sat"]);
     assert!(elapsed.as_secs() < 5, "control query took {elapsed:?}");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 48: tester disjointness re-checked after every merge.
+// Before slice 48 these answered `sat` because the disjointness rule ran only
+// in `assert`, against the class as it stood at that instant.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn tester_conflicting_with_later_merge_is_unsat() {
+    // is-cons(x) AND x = nil. Inside one `and`, so the assert order is SAT's
+    // to choose — this is the minimal form of the 166 Barrett wrong answers.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)\
+         (assert (and ((_ is cons) x) (= x nil)))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn tester_conflicting_with_earlier_merge_is_unsat() {
+    // The same formula with the conjuncts swapped. It already answered `unsat`
+    // before slice 48; pinned so the ORDER-DEPENDENCE itself cannot come back.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)\
+         (assert (and (= x nil) ((_ is cons) x)))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn tester_conflicting_through_transitive_merge_is_unsat() {
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)(declare-fun y () List)\
+         (assert (and ((_ is cons) x) (= x y) (= y nil)))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn tester_over_selector_collapse_is_unsat() {
+    // is-cons(tail(cons 1 nil)). The class of `tail(cons 1 nil)` gains its
+    // constructor `nil` from collapse_lemma, INSIDE check — so `assert` is
+    // never re-entered. This is the corpus reproducer's shape
+    // (QF_DT/20172804-Barrett/.../v1l30072.cvc.smt2, `is-cons(children(node null))`).
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}\
+         (assert ((_ is cons) (tail (cons 1 nil))))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn tester_over_selector_of_a_free_variable_stays_sat() {
+    // The over-fire guard. `tail(x)` with `x` free has no established
+    // constructor, so is-cons(tail(x)) is satisfiable. A disjointness rule that
+    // fires on a merely CANDIDATE constructor turns this into a wrong `unsat` —
+    // trading a wrong-sat cluster for a wrong-unsat one. Passes before slice 48
+    // and must keep passing.
+    let out = run_script(&format!(
+        "(set-logic QF_UFDTLIA){LIST}(declare-fun x () List)\
+         (assert ((_ is cons) (tail x)))\
+         (check-sat)"
+    ));
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn barrett_v1l30072_body_is_unsat() {
+    // The corpus reproducer's assert, verbatim, with its own datatype block.
+    // 966 B file; answers `sat` before slice 48, `:status unsat`, z3 unsat.
+    let out = run_script(
+        "(set-logic QF_DT)\
+         (declare-datatypes ((nat 0)(list 0)(tree 0)) (((succ (pred nat)) (zero))\
+         ((cons (car tree) (cdr list)) (null))\
+         ((node (children list)) (leaf (data nat)))))\
+         (declare-fun x1 () nat)(declare-fun x2 () list)(declare-fun x3 () tree)\
+         (assert (and (and (= (children (leaf zero)) null) \
+         ((_ is cons) (children (node null)))) (not ((_ is null) x2))))\
+         (check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn instantiation_survives_backtracking_or_completeness_is_lost() {
+    // Slice 48 fix wave — the end-to-end fence for the record split in
+    // `DtSolver` (`crates/shinri-dt/src/lib.rs`).
+    //
+    // `instantiate_constructor` fires off a record of asserted testers and
+    // offers ONE guarded lemma `is-C(t) ⇒ t = C(sel…(t))` per `check` call. The
+    // seam backtracks a level after installing each split, so the testers that
+    // were asserted on that level — including the ones whose lemma had not been
+    // offered yet — are retracted. Slice 48's Task 2 made that record per-level
+    // for `tester_clash`'s benefit, which retracted those pending triggers from
+    // `instantiate_constructor` too: the lemma is simply never offered, the
+    // class never becomes constructor-determined, and the §5.2 completeness
+    // fence bails to `Unknown`. Lost instantiation IS lost completeness.
+    //
+    // This query is `sat` (z3 4.16.0 agrees, as does `main`). On the branch
+    // before the fix it answers `unknown` — deterministically, three runs out
+    // of three. The trigger is the tester `((_ is cons) (f1 r1))` sitting
+    // behind a disjunction, so SAT asserts it at a decision level > 0 and a
+    // backtrack can retract it before its lemma is offered; at level 0 (see
+    // `asserted_tester_instantiates_guarded_constructor` in `shinri-dt`) the
+    // levelling is invisible, which is why the whole slice's unit fences missed
+    // this.
+    //
+    // Reduced from a randomized QF_DT search over the shape of
+    // `QF_DT/20230720-blocksworld` (record-of-datatype + selector chains +
+    // testers behind disjunctions).
+    let out = run_script(
+        "(set-logic QF_DT)\
+         (declare-datatypes ((E 0)) (((A) (B) (C))))\
+         (declare-datatypes ((L 0)) (((cons (hd E) (tl L)) (nil))))\
+         (declare-datatypes ((R 0)) (((mk (f1 L) (f2 L)))))\
+         (declare-fun l1 () L)(declare-fun r1 () R)(declare-fun e0 () E)\
+         (assert (not (and (= (f1 r1) (f2 r1)) (= e0 A))))\
+         (assert (= r1 (mk (cons C nil) nil)))\
+         (assert (or (or ((_ is cons) (f1 r1)) (= C A)) (= (hd l1) (hd nil))))\
+         (check-sat)",
+    );
+    assert_eq!(
+        out,
+        vec!["sat"],
+        "a constructor instantiation whose tester was asserted above level 0 \
+         must survive backtracking; retracting it costs completeness and this \
+         answers `unknown`"
+    );
+}
+
+#[test]
+fn lost_instantiation_after_backtrack_is_a_wrong_sat() {
+    // Slice 48 fix wave — THE end-to-end regression fence for the record split
+    // in `DtSolver` (`crates/shinri-dt/src/lib.rs`), in the polarity that makes
+    // it a soundness bug rather than an incompleteness one.
+    //
+    // Verdicts, all three runs of three, both oracles agreeing:
+    //   z3 4.16.0 `unsat`, cvc5 1.3.4 `unsat`, `main` `unsat`,
+    //   slice-48 branch HEAD before this fix **`sat`** — a WRONG SAT,
+    //   after the fix `unsat`.
+    //
+    // Mechanism. `instantiate_constructor` reads a record of asserted testers
+    // and offers ONE guarded lemma `is-C(t) => t = C(sel..(t))` per `check`
+    // call; the seam backtracks a level after installing each split, so every
+    // tester asserted on that level is retracted — including the ones whose
+    // lemma had not been offered yet. Task 2 made that record per-level for
+    // `tester_clash`'s benefit, which silently retracted those pending triggers
+    // from `instantiate_constructor` too. The lemma is never offered, the
+    // instantiation never happens, and the refutation that needed it is lost:
+    // fewer instantiations on an `unsat` instance IS a wrong `sat`.
+    //
+    // Every tester here sits behind a disjunction or an `ite`, so SAT asserts it
+    // at a decision level > 0 — which is the only place the levelling is
+    // observable. At level 0 nothing is ever popped, which is why every unit
+    // fence in this slice (all of which assert at level 0) stayed green while
+    // the corpus regressed.
+    //
+    // Reduced by delta-debugging from a randomized QF_DT search over the shape
+    // of `QF_DT/20230720-blocksworld` (record-of-datatype, selector chains,
+    // testers behind disjunctions).
+    let out = run_script(
+        "(set-logic QF_DT)\
+         (declare-datatypes ((E 0)) (((A) (B) (C))))\
+         (declare-datatypes ((L 0)) (((cons (hd E) (tl L)) (nil))))\
+         (declare-datatypes ((R 0)) (((mk (f1 L) (f2 L)))))\
+         (declare-fun l0 () L)(declare-fun l1 () L)(declare-fun l2 () L)\
+         (declare-fun r0 () R)(declare-fun e0 () E)\
+         (assert (or (and (= r0 (mk l1 l0)) ((_ is cons) (cons e0 (tl nil)))) (= nil (f1 r0))))\
+         (assert (or ((_ is cons) l1) (not (= (tl l1) nil))))\
+         (assert (not ((_ is nil) (cons C (f1 r0)))))\
+         (assert (ite (or ((_ is nil) nil) ((_ is nil) nil)) (and (= (cons (hd (f2 r0)) (cons A nil)) (tl (tl (f2 r0)))) (= l0 l0)) (not (= nil (cons e0 l2)))))\
+         (assert (or (ite ((_ is nil) (cons A (tl l2))) ((_ is nil) nil) (= (cons A (f1 r0)) (cons e0 l2))) (not ((_ is cons) (cons B l1)))))\
+         (assert (= B e0))\
+         (check-sat)",
+    );
+    assert_eq!(
+        out,
+        vec!["unsat"],
+        "a constructor instantiation whose tester was asserted above level 0 \
+         must survive backtracking; retracting it loses the refutation and \
+         this answers a wrong `sat`"
+    );
+}

@@ -265,3 +265,166 @@ fn qfdt_oracle_cyclic_mutual() {
          (assert (= x (cons 1 y)))(assert (= y (cons 2 x)))",
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 48: randomized generator.
+//
+// The fixed shapes above cannot find the slice-48 defect, because tester
+// disjointness was order-dependent: the SAME formula answered `sat` or `unsat`
+// depending on which conjunct SAT asserted first, and every hand-written shape
+// here happens to use the order that worked. The generator's load-bearing
+// dimension is therefore CONJUNCT ORDER — it shuffles, and it alternates
+// between separate `(assert ..)` commands and one `(and ..)`.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A tiny deterministic LCG so the corpus is reproducible without `rand`.
+/// Copied verbatim from tests/qfabv_oracle.rs to match the existing convention.
+struct Lcg(u64);
+impl Lcg {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+        self.0 >> 16
+    }
+    fn below(&mut self, n: u64) -> u64 {
+        self.next() % n
+    }
+}
+
+const N_ITERS: usize = 300;
+
+/// The Barrett family, names copied verbatim from
+/// `QF_DT/20172804-Barrett/barrett-jsat/tests/v1/v1l30072.cvc.smt2`, plus a
+/// flat enum standing in for the blocksworld-style enums.
+const BARRETT: &str = "(declare-datatypes ((nat 0)(list 0)(tree 0)) (\
+((succ (pred nat)) (zero))\
+((cons (car tree) (cdr list)) (null))\
+((node (children list)) (leaf (data nat)))))\
+(declare-datatype Color ((red) (green) (blue)))\
+(declare-fun n1 () nat)(declare-fun l1 () list)(declare-fun l2 () list)\
+(declare-fun t1 () tree)(declare-fun c1 () Color)";
+
+fn nat_term(rng: &mut Lcg, depth: u32) -> String {
+    match rng.below(if depth == 0 { 3 } else { 4 }) {
+        0 => "zero".into(),
+        1 => "n1".into(),
+        2 => format!("(data {})", tree_term(rng, depth.saturating_sub(1))),
+        _ => format!("(succ {})", nat_term(rng, depth - 1)),
+    }
+}
+
+fn list_term(rng: &mut Lcg, depth: u32) -> String {
+    match rng.below(if depth == 0 { 4 } else { 6 }) {
+        0 => "null".into(),
+        1 => "l1".into(),
+        2 => "l2".into(),
+        // A selector applied to a possibly-WRONG constructor: where the corpus
+        // reproducer v1l30072 lives.
+        3 => format!("(children {})", tree_term(rng, depth.saturating_sub(1))),
+        4 => format!("(cdr {})", list_term(rng, depth - 1)),
+        _ => format!(
+            "(cons {} {})",
+            tree_term(rng, depth - 1),
+            list_term(rng, depth - 1)
+        ),
+    }
+}
+
+fn tree_term(rng: &mut Lcg, depth: u32) -> String {
+    match rng.below(if depth == 0 { 2 } else { 4 }) {
+        0 => "t1".into(),
+        1 => format!(
+            "(leaf {})",
+            if depth == 0 {
+                "zero".into()
+            } else {
+                nat_term(rng, depth - 1)
+            }
+        ),
+        2 => format!("(car {})", list_term(rng, depth - 1)),
+        _ => format!("(node {})", list_term(rng, depth - 1)),
+    }
+}
+
+/// One conjunct. Testers and equalities are drawn from the same pool so a
+/// generated instance mixes both — the mix is what the defect needs.
+fn conjunct(rng: &mut Lcg) -> String {
+    let d = 2;
+    let body = match rng.below(9) {
+        0 => format!("(= {} {})", list_term(rng, d), list_term(rng, d)),
+        1 => format!("(= {} {})", tree_term(rng, d), tree_term(rng, d)),
+        2 => format!("(= {} {})", nat_term(rng, d), nat_term(rng, d)),
+        3 => format!("((_ is cons) {})", list_term(rng, d)),
+        4 => format!("((_ is null) {})", list_term(rng, d)),
+        5 => format!("((_ is node) {})", tree_term(rng, d)),
+        6 => format!("((_ is leaf) {})", tree_term(rng, d)),
+        7 => format!("((_ is succ) {})", nat_term(rng, d)),
+        _ => {
+            let k = ["red", "green", "blue"][rng.below(3) as usize];
+            format!("(= c1 {k})")
+        }
+    };
+    if rng.below(4) == 0 {
+        format!("(not {body})")
+    } else {
+        body
+    }
+}
+
+fn gen_instance(rng: &mut Lcg) -> String {
+    let n = 2 + rng.below(4) as usize;
+    let mut cs: Vec<String> = (0..n).map(|_| conjunct(rng)).collect();
+    // Fisher-Yates over the LCG: the order dimension the fixed shapes lack.
+    for i in (1..cs.len()).rev() {
+        let j = rng.below((i + 1) as u64) as usize;
+        cs.swap(i, j);
+    }
+    let asserts = if rng.below(2) == 0 {
+        // Separate commands: SAT sees them in file order.
+        cs.iter()
+            .map(|c| format!("(assert {c})"))
+            .collect::<String>()
+    } else {
+        // One conjunction: the assert order is SAT's to choose. This is the
+        // encoding the minimal reproducer uses.
+        format!("(assert (and {}))", cs.join(""))
+    };
+    format!("(set-logic QF_DT){BARRETT}{asserts}(check-sat)")
+}
+
+#[test]
+fn qfdt_random_matches_z3() {
+    let mut rng = Lcg(0xD7_0000_0048u64);
+    let (mut n_sat, mut n_unsat, mut n_skipped) = (0usize, 0usize, 0usize);
+
+    for it in 0..N_ITERS {
+        let src = gen_instance(&mut rng);
+        let ours = shinri_answer(&src);
+        if ours == "unknown" {
+            n_skipped += 1; // our incompleteness fence — not a disagreement
+            continue;
+        }
+        let theirs = z3_answer(&src);
+        if theirs == "unknown" {
+            n_skipped += 1; // no ground truth
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_DT SOUNDNESS DISAGREEMENT (iter {it}): shinri={ours} z3={theirs}\n\
+             Reproduce with this instance:\n{src}"
+        );
+        if ours == "sat" {
+            n_sat += 1;
+        } else {
+            n_unsat += 1;
+        }
+    }
+
+    println!(
+        "qfdt_random_matches_z3: {N_ITERS} iters, {n_sat} sat / {n_unsat} unsat / \
+         {n_skipped} skipped, 0 mismatches"
+    );
+    // Both directions must be exercised, or the oracle proves nothing.
+    assert!(n_sat > 0, "generator produced no sat instances");
+    assert!(n_unsat > 0, "generator produced no unsat instances");
+}
