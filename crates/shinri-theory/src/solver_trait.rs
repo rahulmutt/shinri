@@ -108,6 +108,12 @@ pub trait TheorySolver: Default {
         0
     }
 
+    /// Install the canonical ⊤/⊥ Bool terms and any permanent state they need
+    /// (EUF: the Definitional ⊤≠⊥ disequality) NOW, at the solve's base level,
+    /// before any atom is registered (slice 50). `bind_fresh` can register atoms
+    /// mid-search, so this must not wait for the first predicate atom.
+    fn install_truth_terms(&mut self, _cx: &mut TheoryCtx, _t_true: TermId, _t_false: TermId) {}
+
     /// Intern every Real-sorted UF-application subterm of an ARITH atom `atom`
     /// into THIS theory so congruence applies and they join the shared set S
     /// (CRITICAL-2). A UF-app used directly inside a linear arith term (e.g.

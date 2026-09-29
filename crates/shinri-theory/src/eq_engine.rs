@@ -453,6 +453,11 @@ impl EqualityEngine {
         out.append(&mut self.merges);
     }
 
+    /// The current decision level (number of un-popped `push`es).
+    pub fn level(&self) -> usize {
+        self.undo.level()
+    }
+
     pub fn push(&mut self) {
         self.undo.push_level();
         self.diseq_undo.push_level();

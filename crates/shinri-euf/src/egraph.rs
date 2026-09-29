@@ -373,6 +373,12 @@ impl EGraph {
         if let Some(tf) = self.truth {
             return tf;
         }
+        debug_assert_eq!(
+            cx.eq.level(),
+            0,
+            "⊤/⊥ sentinels must be installed at the base level (slice 50): \
+             call install_truth_terms before solving"
+        );
         let tn = cx.eq.intern(t_true);
         let fln = cx.eq.intern(t_false);
         // Ensure the EGraph's use_list and is_app arrays cover these nodes.
