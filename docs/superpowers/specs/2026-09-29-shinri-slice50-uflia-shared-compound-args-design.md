@@ -325,3 +325,77 @@ combination-soundness hole and turns 11 rows into `unknown`, never `correct`.
   `crates/shinri-euf/src/egraph.rs:367` (`truth_nodes`),
   `crates/shinri-euf/src/solver.rs:18,89–103` (`set_truth_terms`, `new_var`),
   `crates/shinri-solver/src/lib.rs:1238–1243`.
+
+## 12. Measured outcomes
+
+Full report: `docs/superpowers/research/2026-09-29-smtlib-2024-slice50-uflia-report.md`.
+
+**Comparison run used.** The `slice49` and `baseline-8de004d44944` runs named
+in §7 are not on this machine. Every logic was therefore compared against a
+same-machine base run, `slice50-base`, built from merge base `1fe3658`. Both
+runs used 20 s / 3072 MB / 6 jobs and `taskset -c 12-23`. The base run
+overlapped with cargo builds and tests on cores 0–11, while the branch run
+had an idle machine. So every changed boundary row, in both directions, was
+A/B-timed on both binaries. The same-path check found 121,481 common paths,
+0 missing and 0 extra.
+
+| # | criterion | gate | outcome |
+| --- | --- | --- | --- |
+| 1 | Tasks 1–3's tests red on pre-slice `main`, green now | hard | **PASS** |
+| 2 | §1.2 repro and `xs-05-08-4-2-5-4` answer `unsat` | hard | **PASS**: the repro answers `unsat`, and so does the Wisa row, standalone in 19.9–27.3 s. That Wisa row is a 20 s `timeout` in the corpus run |
+| 3 | `correct → wrong`, all six logics | 0, hard | **PASS: 0** |
+| 4 | QF_UFLIA `wrong` ≤ 11 | hard | **PASS: 11 → 0**, all `→ timeout`. At 120 s: 4 `unsat`, 7 no answer, 0 `sat` |
+| 5 | per-logic `correct` ≥ comparison run | hard | **MISSED**: after exclusions, QF_SLIA −14, QF_UFLIA −3, QF_UF −3. QF_DT, QF_S and QF_UFLRA pass |
+| 6 | `correct → {timeout, unknown, oom}` | measured | 29 rows. 19 confirmed slower on the branch: QF_SLIA 16 `→ unknown:sat-budget`, QF_UFLIA Wisa 2, and QF_UF `SEQ038_size6` by 0.4 s. 3 are boundary noise and 7 do not reproduce on either binary |
+| 7 | `* → wrong` from non-`correct` | measured | 0 rows |
+| 8 | QF_SLIA `wrong`; QF_S 2 wrong rows | measured | QF_SLIA 37 → 37 and QF_S 2 → 2, same paths |
+
+**Transitions that happened** (base → branch, changed cells only):
+
+- QF_UFLIA:
+  - `wrong → timeout` 11 (Wisa 9, wisas 2)
+  - `correct → timeout` 5 (Hash 3, Wisa 2)
+  - `timeout → correct` 2 (Hash)
+  - `oom → timeout` 3 (Certora)
+- QF_SLIA:
+  - `correct → unknown:sat-budget` 16 (Jiang 7, Leetcode 9)
+  - `unverified → correct` 23 (oracle flips)
+  - `unknown:sat-budget → correct` 2 (Reynolds)
+  - `unknown:sat-budget → timeout` 2
+- QF_UF:
+  - `correct → timeout` 8
+  - `timeout → correct` 2
+- QF_DT: `timeout → correct` 3.
+- QF_S:
+  - `timeout → correct` 2
+  - `unverified → correct` 3
+  - `timeout → str-model-rejected` 1
+- QF_UFLRA: none.
+
+**Premises this run discarded or confirmed.**
+
+- **§3.1 called `mark_constrained(v_t)` the safe choice and the class join
+  "only a performance refinement". That is not borne out.**
+  - An instrumented build and a diagnostic toggle trace 18 lost
+    `correct` rows to it:
+    - The 16 QF_SLIA rows trip `STRING_PATH_PIVOT_BUDGET` (2,000 cumulative
+      pivots), which pre-slice does not.
+    - The 2 Wisa `sat` rows blow up to more than 1.18 M final checks in 90 s.
+  - With `v_t` left unmarked (diagnostic only; unsound per §1.3), all 18
+    answer `sat`.
+  - Marking the leaves (the final-review fix) is not what causes it.
+  - **§9's un-banking trigger for the unit-difference class join has
+    fired.** Whether the join recovers these rows is unmeasured.
+- §9's approach-B trigger does not fire: no QF_UFLIA row is left `wrong`.
+- §1.4 named QF_SLIA's 37 wrong rows as a candidate beneficiary. None moved.
+- As §7 expected, no QF_DT or QF_UF row is attributable to the sentinel task.
+  QF_DT's +3 is base-run load: both binaries answer in the A/B. QF_UF's −3
+  after exclusions is 16.5–20 s boundary rows with no trace.
+- Fewer rows moved into `correct` than §1.4's blast radius might suggest. The
+  slice converted 11 wrong answers into non-answers, not into `correct`
+  (4 answer correctly given 120 s). Three A/B-confirmed rows moved into
+  `correct` with no traced cause: QF_UFLIA `hash_sat_03_12` and QF_SLIA
+  Reynolds ×2.
+
+**Decision needed before merge:** criterion 5 is a hard gate and is missed.
+Per the brief, it is left missed for a user decision, not relaxed.
