@@ -1957,6 +1957,64 @@ mod nelson_oppen_tests {
         );
     }
 
+    // ----- Slice 50: compound shared terms (spec §3) -----
+
+    fn int_num_no(ctx: &mut Context, n: i128) -> TermId {
+        let int = ctx.int_sort();
+        ctx.mk_numeral(Rational::from_int(n.into()), int)
+    }
+
+    /// Builds `a <= 0 ∧ a >= 0` (vars 0, 1) and returns `(a, (+ a 1), 1)`.
+    fn a_pinned_to_zero(h: &mut Harness) -> (TermId, TermId, TermId) {
+        let a = int_var_no(&mut h.ctx, "a");
+        let zero = int_num_no(&mut h.ctx, 0);
+        let one = int_num_no(&mut h.ctx, 1);
+        let t = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Add), &[a, one])
+            .unwrap();
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[a, zero])
+            .unwrap();
+        let ge = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[a, zero])
+            .unwrap();
+        h.assert_atom(0, le);
+        h.assert_atom(1, ge);
+        (a, t, one)
+    }
+
+    /// Spec §1.3: `ensure_shared_var((+ a 1))` must define the shared var as
+    /// `a + 1`, mark it constrained, and let arith entail `(+ a 1) = 1` when
+    /// `a = 0`. On `main` it is a free, unconstrained var: its value is
+    /// arbitrary and the entailment probe skips it.
+    #[test]
+    fn compound_shared_term_is_defined_by_its_linearization() {
+        let mut h = Harness::new();
+        let (_a, t, one) = a_pinned_to_zero(&mut h);
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, t);
+        h.arith.ensure_shared_var(&ctx, one);
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+        let tv = h.arith.vars.problem_var(t);
+        assert_eq!(
+            h.arith.value[tv.index()],
+            dr(1),
+            "(+ a 1) must take a + 1 = 1"
+        );
+        assert!(
+            h.arith.is_constrained(tv),
+            "a defined compound shared var is constrained (spec §3.1)"
+        );
+        let got = pairset(&h.arith.entailed_equalities(&ctx, &[t, one]));
+        assert!(
+            got.contains(&(t.index().min(one.index()), t.index().max(one.index()))),
+            "a = 0 must entail (+ a 1) = 1: {got:?}"
+        );
+    }
+
     #[test]
     fn interface_equality_alone_leaves_both_sides_unconstrained() {
         // T4b: an EUF→arith interface equality pins `x - y = 0` — a real

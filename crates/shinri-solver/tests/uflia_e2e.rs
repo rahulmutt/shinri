@@ -116,3 +116,149 @@ fn int_free_arrangement_sat() {
     s.assert(dist);
     assert_eq!(s.check_sat(), SolveOutcome::Sat);
 }
+
+// ----- Slice 50: compound UF arguments (spec §1.2, Review Focus 1–5) -----
+
+/// Assert `a = a_val`, `f(k) = 5`, `¬(f(arg) = 5)` with `arg = build(s, a)`,
+/// and return the verdict. `build` may declare and assert extra context.
+fn slice50_case(
+    a_val: i128,
+    k: i128,
+    build: impl FnOnce(&mut Solver, shinri_core::TermId) -> shinri_core::TermId,
+) -> SolveOutcome {
+    let mut s = Solver::new();
+    let a = int_const(&mut s, "a");
+    let f = int_fun1(&mut s, "f");
+    let av = int_num(&mut s, a_val);
+    let kn = int_num(&mut s, k);
+    let five = int_num(&mut s, 5);
+    let arg = build(&mut s, a);
+    let fk = s.app(Op::Uninterpreted(f), &[kn]);
+    let farg = s.app(Op::Uninterpreted(f), &[arg]);
+    let a_eq = s.eq(a, av);
+    let fk_eq = s.eq(fk, five);
+    let farg_eq = s.eq(farg, five);
+    let not_farg = s.app(Op::Builtin(BuiltinOp::Not), &[farg_eq]);
+    s.assert(a_eq);
+    s.assert(fk_eq);
+    s.assert(not_farg);
+    s.check_sat()
+}
+
+/// Spec §1.2: a=0 ∧ f(1)=5 ∧ ¬f(a+1)=5 ⇒ UNSAT (z3: unsat). Was `sat` with
+/// `(+ a 1) ↦ 0`: the compound argument had no arithmetic definition.
+#[test]
+fn slice50_compound_arg_add_unsat() {
+    let got = slice50_case(0, 1, |s, a| {
+        let one = int_num(s, 1);
+        s.app(Op::Builtin(BuiltinOp::Add), &[a, one])
+    });
+    assert_eq!(got, SolveOutcome::Unsat);
+}
+
+/// Spec §1.2 variant: a=1 ∧ f(1)=5 ∧ ¬f(a+0)=5 ⇒ UNSAT (z3: unsat).
+#[test]
+fn slice50_compound_arg_add_zero_unsat() {
+    let got = slice50_case(1, 1, |s, a| {
+        let zero = int_num(s, 0);
+        s.app(Op::Builtin(BuiltinOp::Add), &[a, zero])
+    });
+    assert_eq!(got, SolveOutcome::Unsat);
+}
+
+/// Spec §1.2 variant: a=0 ∧ f(0)=5 ∧ ¬f(2·a)=5 ⇒ UNSAT (z3: unsat).
+#[test]
+fn slice50_compound_arg_mul_unsat() {
+    let got = slice50_case(0, 0, |s, a| {
+        let two = int_num(s, 2);
+        s.app(Op::Builtin(BuiltinOp::Mul), &[two, a])
+    });
+    assert_eq!(got, SolveOutcome::Unsat);
+}
+
+/// The Wisa shape `(- (- fmt1 2) fmt0)`: a=3 ∧ b=0 ∧ f(1)=5 ∧ ¬f((a−2)−b)=5
+/// ⇒ UNSAT (z3: unsat).
+#[test]
+fn slice50_compound_arg_nested_sub_unsat() {
+    let got = slice50_case(3, 1, |s, a| {
+        let b = int_const(s, "b");
+        let zero = int_num(s, 0);
+        let two = int_num(s, 2);
+        let b_eq = s.eq(b, zero);
+        s.assert(b_eq);
+        let a2 = s.app(Op::Builtin(BuiltinOp::Sub), &[a, two]);
+        s.app(Op::Builtin(BuiltinOp::Sub), &[a2, b])
+    });
+    assert_eq!(got, SolveOutcome::Unsat);
+}
+
+/// Review Focus 2: a=7 ∧ f(0)=5 ∧ ¬f(a−a)=5 ⇒ UNSAT (z3: unsat). The row
+/// cancels to `v = 0` (the degenerate `comb == [(v, 1)]` branch).
+#[test]
+fn slice50_cancelling_arg_unsat() {
+    let got = slice50_case(7, 0, |s, a| s.app(Op::Builtin(BuiltinOp::Sub), &[a, a]));
+    assert_eq!(got, SolveOutcome::Unsat);
+}
+
+/// Review Focus 3: a=0 ∧ g(1)=4 ∧ f(5)=5 ∧ ¬f(g(a+1)+1)=5 ⇒ UNSAT (z3: unsat).
+/// `g(a+1)` is a linearization leaf and must share its arith var with the
+/// shared term `g(a+1)`; `a+1` is itself a defined compound.
+#[test]
+fn slice50_nested_uf_leaf_unsat() {
+    let got = slice50_case(0, 5, |s, a| {
+        let g = int_fun1(s, "g");
+        let one = int_num(s, 1);
+        let four = int_num(s, 4);
+        let g1 = s.app(Op::Uninterpreted(g), &[one]);
+        let g1_eq = s.eq(g1, four);
+        s.assert(g1_eq);
+        let a1 = s.app(Op::Builtin(BuiltinOp::Add), &[a, one]);
+        let ga1 = s.app(Op::Uninterpreted(g), &[a1]);
+        s.app(Op::Builtin(BuiltinOp::Add), &[ga1, one])
+    });
+    assert_eq!(got, SolveOutcome::Unsat);
+}
+
+/// Review Focus 4: a=0 ∧ f(1)=5 ∧ ¬f(a+2)=5 ⇒ SAT (z3: sat). f(2) is free; the
+/// definitional row must not over-constrain.
+#[test]
+fn slice50_compound_arg_sat_direction() {
+    let got = slice50_case(0, 1, |s, a| {
+        let two = int_num(s, 2);
+        s.app(Op::Builtin(BuiltinOp::Add), &[a, two])
+    });
+    assert_eq!(got, SolveOutcome::Sat);
+}
+
+/// Review Focus 1: a=b+1 ∧ ¬(f(a+1)=f(b+2)) ⇒ UNSAT (z3: unsat). The two
+/// arguments are structurally different and neither is a numeral: only an
+/// arith entailment between two DEFINED shared vars can merge them. (`a=b` with
+/// `f(a+1)` vs `f(b+1)` is already unsat on `main` via EUF congruence over `+`.)
+#[test]
+fn slice50_two_compound_args_equal_unsat() {
+    let mut s = Solver::new();
+    let a = int_const(&mut s, "a");
+    let b = int_const(&mut s, "b");
+    let f = int_fun1(&mut s, "f");
+    let one = int_num(&mut s, 1);
+    let two = int_num(&mut s, 2);
+    let b_plus_1 = s.app(Op::Builtin(BuiltinOp::Add), &[b, one]);
+    let a1 = s.app(Op::Builtin(BuiltinOp::Add), &[a, one]);
+    let b2 = s.app(Op::Builtin(BuiltinOp::Add), &[b, two]);
+    let fa1 = s.app(Op::Uninterpreted(f), &[a1]);
+    let fb2 = s.app(Op::Uninterpreted(f), &[b2]);
+    let a_eq = s.eq(a, b_plus_1);
+    let ff = s.eq(fa1, fb2);
+    let not_ff = s.app(Op::Builtin(BuiltinOp::Not), &[ff]);
+    s.assert(a_eq);
+    s.assert(not_ff);
+    assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+}
+
+/// Review Focus 5 (guard, not red): a nonlinear argument is outside QF_UFLIA.
+/// It must stay opaque and must not reach `linearize`'s "nonlinear reached
+/// normalize" debug assertion. Any verdict is acceptable; a panic is not.
+#[test]
+fn slice50_nonlinear_arg_does_not_panic() {
+    let _ = slice50_case(0, 0, |s, a| s.app(Op::Builtin(BuiltinOp::Mul), &[a, a]));
+}
