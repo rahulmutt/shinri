@@ -754,10 +754,15 @@ impl Arith {
     /// dropped by `sanitize_conflict`, so every conflict core stays justified by
     /// input literals.
     ///
-    /// `v` is marked constrained: it can no longer shift on its own, and slice
-    /// 42's filter would otherwise hide it from `entailed_equalities` and MBTC
-    /// (spec §3.1, *Constrainedness*). That errs toward more probing, the
-    /// documented sound direction.
+    /// `v` and every linearization leaf `xᵢ` are marked constrained. The row
+    /// couples them: `v` can no longer shift on its own, and neither can a
+    /// leaf that occurs in no arith atom (e.g. `a` in `(+ a 1)`), because
+    /// shifting it moves the constrained `v`. Slice 42's premise — a free
+    /// class can shift ±1 and still be a model — fails for such row-coupled
+    /// leaves, so its filter would otherwise hide pairs containing them from
+    /// `entailed_equalities` and MBTC, yielding a wrong `sat` (spec §3.1,
+    /// *Constrainedness*). That errs toward more probing, the documented sound
+    /// direction.
     fn define_shared_compound(&mut self, ctx: &Context, t: TermId, v: ArithVar) {
         let (raw, c) = crate::normalize::linearize(ctx, &mut self.vars, t);
         // `linearize` is sort-blind (as in `new_var`): stamp Int leaves here.
@@ -772,6 +777,10 @@ impl Arith {
         // `linearize` may have interned new leaf vars: cover them in
         // `value`/bounds on every path, including the degenerate one.
         self.grow_value();
+        // Row-coupled leaves cannot shift independently (see doc above).
+        for (x, _) in &raw {
+            self.mark_constrained(*x);
+        }
         let mut pairs = Vec::with_capacity(raw.len() + 1);
         pairs.push((v, Rational::one()));
         pairs.extend(raw.into_iter().map(|(x, q)| (x, -q)));
@@ -2155,6 +2164,28 @@ mod nelson_oppen_tests {
         assert!(
             got.contains(&(t.index().min(one.index()), t.index().max(one.index()))),
             "a = 0 must entail (+ a 1) = 1: {got:?}"
+        );
+    }
+
+    /// Final-review fix: the definitional row ties each linearization leaf to
+    /// the constrained `v_t`, so a leaf in no arith atom (here `a`) can no
+    /// longer shift on its own. It must be marked constrained too, or slice
+    /// 42's filter hides every pair containing it.
+    #[test]
+    fn compound_definition_constrains_its_leaves() {
+        let mut h = Harness::new();
+        let a = int_var_no(&mut h.ctx, "a");
+        let one = h.ctx.mk_numeral(Rational::one(), h.ctx.int_sort());
+        let t = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Add), &[a, one])
+            .unwrap();
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, t);
+        let av = h.arith.vars.problem_var(a);
+        assert!(
+            h.arith.is_constrained(av),
+            "a leaf of a defined compound shared term is constrained"
         );
     }
 

@@ -632,3 +632,39 @@ fn injectivity_over_selector_with_the_equality_as_a_unit_is_unsat() {
     );
     assert_eq!(out, vec!["unsat"]);
 }
+
+#[test]
+fn slice50_dt_injective_compound_leaf_unsat() {
+    // Injectivity equates the shared compound `(+ a 1)` with `z = 1`, so the
+    // definitional row forces `a = 0` and `f a = f 0 = 5`. `a` occurs in no
+    // arith atom: unless the row marks it constrained, slice 42's filter hides
+    // `a = 0` from entailment and MBTC, and the query comes back a wrong `sat`.
+    let out = run_script(
+        "(set-logic QF_UFDTLIA)\
+         (declare-datatype Box ((mk (val Int))))\
+         (declare-fun f (Int) Int)(declare-fun a () Int)(declare-fun z () Int)\
+         (assert (= (mk (+ a 1)) (mk z)))\
+         (assert (= z 1))\
+         (assert (= (f 0) 5))\
+         (assert (not (= (f a) 5)))\
+         (check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn slice50_dt_selector_compound_leaf_unsat() {
+    // Selector variant: `val b = (* 2 a) = 4` forces `a = 2`, so `f a = f 2 = 5`.
+    // `a` again occurs only under the shared compound `(* 2 a)`.
+    let out = run_script(
+        "(set-logic QF_UFDTLIA)\
+         (declare-datatype Box ((mk (val Int))))\
+         (declare-fun f (Int) Int)(declare-fun a () Int)(declare-fun b () Box)\
+         (assert (= b (mk (* 2 a))))\
+         (assert (= (val b) 4))\
+         (assert (= (f 2) 5))\
+         (assert (not (= (f a) 5)))\
+         (check-sat)",
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
