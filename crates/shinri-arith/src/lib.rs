@@ -368,6 +368,23 @@ impl Arith {
         self.pivot_budget = n;
     }
 
+    /// Intern the slack for `comb` and, only if it is freshly minted, define
+    /// its tableau row. Returns `(slack, is_new)`. Every production
+    /// `slack_var` call goes through here, so an existing slack is always
+    /// already defined. The guard matters because the tableau is never popped
+    /// and `Tableau::define_slack` early-returns only for a BASIC slack: an
+    /// existing slack that a pivot moved out of the basis would otherwise get a
+    /// second row while still being a column of other rows (slice 50).
+    fn intern_slack(&mut self, comb: &LinComb) -> (ArithVar, bool) {
+        let before = self.vars.len();
+        let s = self.vars.slack_var(comb);
+        let is_new = self.vars.len() > before;
+        if is_new {
+            self.tableau.define_slack(s, comb);
+        }
+        (s, is_new)
+    }
+
     /// Reduce a normalized atom to a *bound on one variable*. For a single-term
     /// comb `{x:c}` the bound is on `x` (rhs divided by c, kind flipped if c<0);
     /// for ≥2-term combs a slack var is interned and defined as a tableau row.
@@ -378,8 +395,7 @@ impl Arith {
             let scaled = rhs.clone() / c.clone();
             (*x, scaled, c.is_negative())
         } else {
-            let s = self.vars.slack_var(comb);
-            self.tableau.define_slack(s, comb);
+            let (s, _) = self.intern_slack(comb);
             (s, rhs.clone(), false)
         }
     }
@@ -753,6 +769,9 @@ impl Arith {
                 }
             }
         }
+        // `linearize` may have interned new leaf vars: cover them in
+        // `value`/bounds on every path, including the degenerate one.
+        self.grow_value();
         let mut pairs = Vec::with_capacity(raw.len() + 1);
         pairs.push((v, Rational::one()));
         pairs.extend(raw.into_iter().map(|(x, q)| (x, -q)));
@@ -763,13 +782,10 @@ impl Arith {
             debug_assert!(comb.0[0].0 == v && comb.0[0].1 == Rational::one());
             v
         } else {
-            // The row is permanent (the tableau is never popped), so define it
-            // only when the slack is freshly minted: a re-call after a pivot
-            // moved `s` out of the basis must not install a second row for it.
-            let before = self.vars.len();
-            let s = self.vars.slack_var(&comb);
-            if self.vars.len() > before {
-                self.tableau.define_slack(s, &comb);
+            // The row is permanent (the tableau is never popped); a re-call
+            // after a pivot must not install a second row (`intern_slack`).
+            let (s, is_new) = self.intern_slack(&comb);
+            if is_new {
                 self.grow_value();
                 self.recompute_basic_values();
             }
@@ -870,8 +886,7 @@ impl Arith {
         // consistent for the new slacks before snapshotting.
         for &(i, j) in &candidates {
             let comb = Self::diff_comb(items[i].1, items[j].1);
-            let s = self.vars.slack_var(&comb);
-            self.tableau.define_slack(s, &comb);
+            self.intern_slack(&comb);
         }
         self.grow_value();
         self.recompute_basic_values();
@@ -1074,8 +1089,7 @@ impl Arith {
         // over-approximates constrainedness (more probing, the sound direction).
         self.union_interface_class(av, bv);
         let comb = Self::diff_comb(av, bv);
-        let s = self.vars.slack_var(&comb);
-        self.tableau.define_slack(s, &comb);
+        let (s, _) = self.intern_slack(&comb);
         self.grow_value();
         self.recompute_basic_values();
         // Encode the interface equality as a fixed bound s = 0; the justification
@@ -2175,6 +2189,71 @@ mod nelson_oppen_tests {
             got.contains(&(t.index().min(one.index()), t.index().max(one.index()))),
             "after pop + re-ensure: a = 0 must entail (+ a 1) = 1: {got:?}"
         );
+    }
+
+    /// Tableau invariant: one row per basic var, and no basic var appears as a
+    /// column of any row.
+    fn assert_tableau_invariant(arith: &Arith, what: &str) {
+        let tab = &arith.tableau;
+        assert_eq!(tab.basic.len(), tab.rows.len(), "{what}: basic/rows desync");
+        for (b, row) in &tab.rows {
+            assert!(tab.is_basic(*b), "{what}: row owner {b:?} not basic");
+            for j in row.vars() {
+                assert!(
+                    !tab.is_basic(j),
+                    "{what}: basic {j:?} is a column of {b:?}'s row"
+                );
+            }
+        }
+    }
+
+    /// Slice 50 fix round 1: `Tableau::define_slack` only early-returns for a
+    /// BASIC slack, and the tableau is never popped. A diff slack that a pivot
+    /// moved out of the basis must not be re-defined when its interning path
+    /// (`assert_interface_equality`, `entailed_equalities`) runs again: that
+    /// would give it a second row while it is still a column elsewhere.
+    #[test]
+    fn existing_diff_slack_is_not_redefined_after_pivot() {
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let one = num(&mut h.ctx, 1);
+        let ge = h.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, one]).unwrap();
+        h.assert_atom(0, ge); // x >= 1
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        // Defines s = x - y (basic, value 1) and pins it to 0: check_full must
+        // pivot s out of the basis (x sits at its lower bound, y is free).
+        assert!(h
+            .arith
+            .assert_interface_equality(&ctx, x, y, just)
+            .is_none());
+        let comb = Arith::diff_comb(h.arith.vars.problem_var(x), h.arith.vars.problem_var(y));
+        let s = h.arith.vars.slack_var(&comb);
+        assert!(
+            !h.arith.tableau.is_basic(s),
+            "precondition: the diff slack was pivoted out of the basis"
+        );
+        assert_tableau_invariant(&h.arith, "after first interface equality");
+
+        h.arith.push();
+        assert!(h
+            .arith
+            .assert_interface_equality(&ctx, x, y, just)
+            .is_none());
+        assert!(
+            !h.arith.tableau.is_basic(s),
+            "re-assert must not re-basify s"
+        );
+        assert_tableau_invariant(&h.arith, "after re-asserted interface equality");
+
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+        let _ = h.arith.entailed_equalities(&ctx, &[x, y]);
+        assert!(
+            !h.arith.tableau.is_basic(s),
+            "entailment must not re-basify s"
+        );
+        assert_tableau_invariant(&h.arith, "after entailed_equalities");
     }
 
     #[test]
