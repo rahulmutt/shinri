@@ -1,11 +1,9 @@
 {
   "name": "shinri",
-  "image": "ghcr.io/rahulmutt/dev:sha-046ace1",
+  "image": "ghcr.io/rahulmutt/dev:sha-8041006",
   "workspaceFolder": "/workspace",
   "remoteUser": "dev",
   "containerEnv": {
-    "CARGO_HOME": "/home/dev/.cargo",
-    "RUSTUP_HOME": "/home/dev/.rustup",
     "INSTALL_DEVENV": "true",
   },
   "postCreateCommand": "post-create.sh",
