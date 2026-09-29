@@ -318,15 +318,16 @@ impl TheorySolver for Euf {
         })
     }
 
-    /// EUF→arith: mint an explanation tag for a currently-equal pair `(a, b)`.
-    /// PRECONDITION: `a` and `b` are equal in `cx.eq` (the combiner checks
-    /// `are_equal` first). Resolvable via this theory's `explain`, which expands
-    /// `a = b` to its input-literal antecedents over the live proof forest.
+    /// Install ⊤/⊥ and the Definitional ⊤≠⊥ at the base level (slice 50, spec §4).
     fn install_truth_terms(&mut self, cx: &mut TheoryCtx, t_true: TermId, t_false: TermId) {
         self.set_truth_terms(t_true, t_false);
         self.inner.truth_nodes(cx, t_true, t_false);
     }
 
+    /// EUF→arith: mint an explanation tag for a currently-equal pair `(a, b)`.
+    /// PRECONDITION: `a` and `b` are equal in `cx.eq` (the combiner checks
+    /// `are_equal` first). Resolvable via this theory's `explain`, which expands
+    /// `a = b` to its input-literal antecedents over the live proof forest.
     fn mint_eq_tag(&mut self, cx: &mut TheoryCtx, a: TermId, b: TermId) -> u32 {
         let an = cx.eq.intern(a);
         let bn = cx.eq.intern(b);
