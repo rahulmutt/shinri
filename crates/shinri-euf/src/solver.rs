@@ -89,14 +89,14 @@ impl TheorySolver for Euf {
             _ => {
                 // Predicate application (or any other EUF atom term).
                 self.inner.add_term(cx, atom);
-                // Register the ⊤/⊥ sentinels and the Definitional ⊤≠⊥ diseq NOW,
-                // at level 0 (registration always happens before solving). This
-                // guarantees ⊤≠⊥ is installed exactly once at decision level 0 and
-                // survives all backtracking — asserting it lazily inside `assert`
-                // would record its undo at whatever level the first predicate atom
-                // appears, letting a pop drop it (the I1 soundness bug). Only do so
-                // when the truth terms are available (standalone EUF sets them via
-                // `set_truth_terms`; the combiner registers atoms at level 0).
+                // The ⊤/⊥ sentinels and the Definitional ⊤≠⊥ diseq must live at
+                // level 0: an undo recorded at a higher level would let a pop drop
+                // ⊤≠⊥ while `truth` stays cached (the I1 bug, and slice 50 §1.5).
+                // The solver installs them eagerly via `install_truth_terms` before
+                // encoding, so this call is a cache hit in production; `bind_fresh`
+                // CAN reach this arm above level 0. It remains for standalone EUF
+                // (tests that only call `set_truth_terms`), where `truth_nodes`
+                // debug-asserts it runs at the base level.
                 if let Some((t_true, t_false)) = self.truth_terms {
                     self.inner.truth_nodes(cx, t_true, t_false);
                 }
@@ -318,6 +318,12 @@ impl TheorySolver for Euf {
         })
     }
 
+    /// Install ⊤/⊥ and the Definitional ⊤≠⊥ at the base level (slice 50, spec §4).
+    fn install_truth_terms(&mut self, cx: &mut TheoryCtx, t_true: TermId, t_false: TermId) {
+        self.set_truth_terms(t_true, t_false);
+        self.inner.truth_nodes(cx, t_true, t_false);
+    }
+
     /// EUF→arith: mint an explanation tag for a currently-equal pair `(a, b)`.
     /// PRECONDITION: `a` and `b` are equal in `cx.eq` (the combiner checks
     /// `are_equal` first). Resolvable via this theory's `explain`, which expands
@@ -525,5 +531,137 @@ mod tests {
             TCheck::Conflict(leaves) => assert_cites_both(&leaves, &c),
             _ => panic!("a = b forces f(a) = f(b); with f(a) != f(b) asserted, check must report the conflict"),
         }
+    }
+
+    // ----- Slice 50: ⊤≠⊥ must live at level 0 (spec §4) -----
+
+    struct SentinelWorld {
+        ctx: shinri_core::Context,
+        atoms: shinri_theory::AtomRegistry,
+        t_true: TermId,
+        t_false: TermId,
+        eq_ab: TermId,
+        pa: TermId,
+        pb: TermId,
+        v_ab: Var,
+        v_pa: Var,
+        v_pb: Var,
+    }
+
+    fn sentinel_world() -> SentinelWorld {
+        use shinri_core::{Context, Op};
+        use shinri_theory::types::Owner;
+        use shinri_theory::AtomRegistry;
+
+        let mut ctx = Context::new();
+        let u = ctx.declare_sort("U");
+        let bool_s = ctx.bool_sort();
+        let a_sym = ctx.declare_fun("a", &[], u);
+        let a = ctx.mk_app(Op::Uninterpreted(a_sym), &[]).unwrap();
+        let b_sym = ctx.declare_fun("b", &[], u);
+        let b = ctx.mk_app(Op::Uninterpreted(b_sym), &[]).unwrap();
+        let p = ctx.declare_fun("p", &[u], bool_s);
+        let pa = ctx.mk_app(Op::Uninterpreted(p), &[a]).unwrap();
+        let pb = ctx.mk_app(Op::Uninterpreted(p), &[b]).unwrap();
+        let eq_ab = ctx.mk_eq(a, b).unwrap();
+        let t_true = ctx.mk_const_bool(true);
+        let t_false = ctx.mk_const_bool(false);
+        let mut atoms = AtomRegistry::default();
+        let (v_ab, v_pa, v_pb) = (Var::new(0), Var::new(1), Var::new(2));
+        atoms.register(v_ab, eq_ab, Owner::Euf);
+        atoms.register(v_pa, pa, Owner::Euf);
+        atoms.register(v_pb, pb, Owner::Euf);
+        SentinelWorld {
+            ctx,
+            atoms,
+            t_true,
+            t_false,
+            eq_ab,
+            pa,
+            pb,
+            v_ab,
+            v_pa,
+            v_pb,
+        }
+    }
+
+    /// The slice-49 report's repro, in combiner order: `a = b` registered at
+    /// level 0; `p(a)`, `p(b)` registered at level 1 (as `bind_fresh` does);
+    /// pop to 0; assert `p(a)`, `¬p(b)`, `a = b`. Returns whether assert,
+    /// propagate or check reported a conflict.
+    fn sentinel_sequence_conflicts(
+        euf: &mut Euf,
+        eq: &mut shinri_theory::EqualityEngine,
+        w: &mut SentinelWorld,
+    ) -> bool {
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut w.ctx,
+                eq: &mut *eq,
+                atoms: &w.atoms,
+            };
+            euf.new_var(&mut cx, w.v_ab, w.eq_ab);
+        }
+        eq.push();
+        euf.push();
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut w.ctx,
+                eq: &mut *eq,
+                atoms: &w.atoms,
+            };
+            euf.new_var(&mut cx, w.v_pa, w.pa);
+            euf.new_var(&mut cx, w.v_pb, w.pb);
+        }
+        eq.pop(0);
+        euf.pop(0);
+        let mut cx = TheoryCtx {
+            terms: &mut w.ctx,
+            eq: &mut *eq,
+            atoms: &w.atoms,
+        };
+        let mut conflict = false;
+        conflict |= euf.assert(&mut cx, Lit::new(w.v_pa, true)).is_some();
+        conflict |= euf.assert(&mut cx, Lit::new(w.v_pb, false)).is_some();
+        conflict |= euf.assert(&mut cx, Lit::new(w.v_ab, true)).is_some();
+        let mut out = Vec::new();
+        conflict |= euf.propagate(&mut cx, &mut out).is_some();
+        conflict |= matches!(euf.check(&mut cx, Effort::Full), TCheck::Conflict(_));
+        conflict
+    }
+
+    /// Spec §4: with the eager install, ⊤≠⊥ lives at level 0 and the
+    /// sequence conflicts. Red on `main`: `install_truth_terms` does not exist.
+    #[test]
+    fn eager_truth_install_survives_midsearch_registration() {
+        let mut w = sentinel_world();
+        let mut euf = Euf::default();
+        let mut eq = shinri_theory::EqualityEngine::default();
+        {
+            let mut cx = TheoryCtx {
+                terms: &mut w.ctx,
+                eq: &mut eq,
+                atoms: &w.atoms,
+            };
+            euf.install_truth_terms(&mut cx, w.t_true, w.t_false);
+        }
+        assert!(
+            sentinel_sequence_conflicts(&mut euf, &mut eq, &mut w),
+            "p(a), ¬p(b), a = b must conflict: ⊤≠⊥ must survive the pop"
+        );
+    }
+
+    /// Spec §4 step 4: the lazy install above the base level is now a loud
+    /// failure in debug builds, not a silently level-scoped ⊤≠⊥. Red on
+    /// `main`: nothing panics, and the sequence is silently accepted.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "⊤/⊥ sentinels must be installed at the base level")]
+    fn lazy_truth_install_above_base_level_is_rejected() {
+        let mut w = sentinel_world();
+        let mut euf = Euf::default();
+        let mut eq = shinri_theory::EqualityEngine::default();
+        euf.set_truth_terms(w.t_true, w.t_false);
+        let _ = sentinel_sequence_conflicts(&mut euf, &mut eq, &mut w);
     }
 }

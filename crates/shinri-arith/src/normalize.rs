@@ -6,9 +6,8 @@
 //! `Normalized` bundles a `LinComb` with its relation and right-hand-side
 //! constant.
 //!
-//! The functions `normalize_atom` / `linearize` / `canonicalize` are added in
-//! Task 4; this file only provides the type definitions so that `vars.rs` can
-//! compile.
+//! `linearize` and `canonicalize` are also used by `Arith::ensure_shared_var`
+//! to define compound shared terms (slice 50).
 
 use crate::vars::{ArithVar, VarStore};
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
@@ -103,7 +102,7 @@ impl std::hash::Hash for LinComb {
 // ---------------------------------------------------------------------------
 
 /// Accumulate `t` into (variable part, constant part). Assumes linear, Real input.
-fn linearize(
+pub(crate) fn linearize(
     terms: &Context,
     vars: &mut VarStore,
     t: TermId,
@@ -202,7 +201,7 @@ fn linearize(
 
 /// Collapse a raw variable list into a canonical `LinComb` (sum duplicates,
 /// drop zero coeffs, sort by var).
-fn canonicalize(mut raw: Vec<(ArithVar, Rational)>) -> LinComb {
+pub(crate) fn canonicalize(mut raw: Vec<(ArithVar, Rational)>) -> LinComb {
     raw.sort_by_key(|p| p.0);
     let mut out: Vec<(ArithVar, Rational)> = Vec::with_capacity(raw.len());
     for (v, c) in raw {

@@ -1663,6 +1663,115 @@ fn differential_qf_uflia_small() {
     }
 }
 
+/// Slice 50: UF applications over COMPOUND linear arguments (`f(c + d)`,
+/// `f(2·c)`), mixed with pins `c = k` and ground values `f(k) = m`. The
+/// generators above only ever apply `f` to a bare constant, so they could not
+/// reach the undefined-compound-shared-var defect (spec §1.3).
+#[test]
+fn differential_qf_uflia_compound_args() {
+    let mut rng = Lcg(0x5150);
+    let (mut n_sat, mut n_unsat) = (0usize, 0usize);
+    for iter in 0..200 {
+        let mut s = Solver::new();
+        let int = s.int_sort();
+        let consts: Vec<_> = (0..2)
+            .map(|i| s.declare_const(&format!("c{i}"), int))
+            .collect();
+        let f = s.declare_fun("f", &[int], int);
+
+        let mut ctx = easy_smt::ContextBuilder::new()
+            .solver("z3", ["-smt2", "-in"])
+            .build()
+            .unwrap();
+        let zint = ctx.atom("Int");
+        let z_consts: Vec<_> = (0..2)
+            .map(|i| ctx.declare_const(format!("c{i}"), zint).unwrap())
+            .collect();
+        let _zf = ctx.declare_fun("f", vec![zint], zint).unwrap();
+        let zf = ctx.atom("f");
+
+        let mut script = Vec::new();
+        let n_lits = 2 + rng.below(4) as usize;
+        for _ in 0..n_lits {
+            let i = rng.below(2) as usize;
+            match rng.below(3) {
+                // Pin: c_i = k, k ∈ [0, 3)
+                0 => {
+                    let k = rng.below(3) as i128;
+                    let kn = s.numeral(Rational::from_int(k.into()), int);
+                    let e = s.eq(consts[i], kn);
+                    s.assert(e);
+                    ctx.assert(ctx.eq(z_consts[i], ctx.numeral(k as i32)))
+                        .unwrap();
+                    script.push(format!("(= c{i} {k})"));
+                }
+                // Ground value: f(k) = m, k ∈ [-1, 4), m ∈ [0, 2)
+                1 => {
+                    let k = rng.below(5) as i32 - 1;
+                    let m = rng.below(2) as i128;
+                    let kn = s.numeral(Rational::from_int((k as i128).into()), int);
+                    let mn = s.numeral(Rational::from_int(m.into()), int);
+                    let fk = s.app(Op::Uninterpreted(f), &[kn]);
+                    let e = s.eq(fk, mn);
+                    s.assert(e);
+                    let zfk = ctx.list(vec![zf, z_int(&ctx, k)]);
+                    ctx.assert(ctx.eq(zfk, ctx.numeral(m as i32))).unwrap();
+                    script.push(format!("(= (f {k}) {m})"));
+                }
+                // Compound: [¬] f(arg) = m with arg ∈ {c_i + d, 2·c_i}
+                _ => {
+                    let m = rng.below(2) as i128;
+                    let neg = rng.below(2) == 1;
+                    let (arg, zarg, txt) = if rng.below(2) == 0 {
+                        let d = rng.below(3) as i32 - 1;
+                        let dn = s.numeral(Rational::from_int((d as i128).into()), int);
+                        (
+                            s.app(Op::Builtin(BuiltinOp::Add), &[consts[i], dn]),
+                            ctx.plus(z_consts[i], z_int(&ctx, d)),
+                            format!("(+ c{i} {d})"),
+                        )
+                    } else {
+                        let two = s.numeral(Rational::from_int(2i128.into()), int);
+                        (
+                            s.app(Op::Builtin(BuiltinOp::Mul), &[two, consts[i]]),
+                            ctx.times(ctx.numeral(2), z_consts[i]),
+                            format!("(* 2 c{i})"),
+                        )
+                    };
+                    let mn = s.numeral(Rational::from_int(m.into()), int);
+                    let fa = s.app(Op::Uninterpreted(f), &[arg]);
+                    let e = s.eq(fa, mn);
+                    let lit = if neg {
+                        s.app(Op::Builtin(BuiltinOp::Not), &[e])
+                    } else {
+                        e
+                    };
+                    s.assert(lit);
+                    let ze = ctx.eq(ctx.list(vec![zf, zarg]), ctx.numeral(m as i32));
+                    ctx.assert(if neg { ctx.not(ze) } else { ze }).unwrap();
+                    let body = format!("(= (f {txt}) {m})");
+                    script.push(if neg { format!("(not {body})") } else { body });
+                }
+            }
+        }
+
+        let ours = s.check_sat();
+        let theirs = ctx.check().unwrap();
+        match (ours, theirs) {
+            (SolveOutcome::Unknown, _) => {}
+            (SolveOutcome::Sat, easy_smt::Response::Sat) => n_sat += 1,
+            (SolveOutcome::Unsat, easy_smt::Response::Unsat) => n_unsat += 1,
+            (o, t) => panic!(
+                "DISAGREEMENT (QF_UFLIA compound args) iter {iter}: shinri={o:?} z3={t:?}\n{}",
+                script.join("\n")
+            ),
+        }
+    }
+    eprintln!("compound-args oracle: sat {n_sat}, unsat {n_unsat}");
+    assert!(n_unsat > 0, "generator must produce some UNSAT instances");
+    assert!(n_sat > 0, "generator must produce some SAT instances");
+}
+
 // Minimal standalone reproducer for the WRONG-SAT soundness bug found in Task 9.
 // Instance: x1=-1 (from -x1=1) AND x1≠-1 → should be UNSAT.
 // With Stage-B ON, shinri incorrectly returns SAT.

@@ -376,3 +376,50 @@ fn nary_congruence_conflict() {
         "a=c ∧ b=d ⇒ g(a,b)=g(c,d) contradicts ≠"
     );
 }
+
+/// Slice 50 (spec §4): the solver's path. `Combiner::install_truth_terms` at
+/// level 0, then `bind_fresh` registers the predicate atoms at level 1 (as a
+/// mid-search split does), pop, then assert p(a), ¬p(b), a = b ⇒ conflict.
+#[test]
+fn combiner_truth_install_survives_bind_fresh_and_pop() {
+    use shinri_sat::{Effort, Theory, TheoryResult};
+    use shinri_theory::{Combiner, EmptyTheory};
+
+    let mut c: Combiner<Euf, EmptyTheory, EmptyTheory, EmptyTheory, EmptyTheory> =
+        Combiner::default();
+    let (t_true, t_false, eq_ab, pa, pb) = {
+        let ctx = c.context_mut();
+        let u = ctx.declare_sort("U");
+        let bool_s = ctx.bool_sort();
+        let a = uconst(ctx, "a", u);
+        let b = uconst(ctx, "b", u);
+        let p = ctx.declare_fun("p", &[u], bool_s);
+        let pa = ctx.mk_app(Op::Uninterpreted(p), &[a]).unwrap();
+        let pb = ctx.mk_app(Op::Uninterpreted(p), &[b]).unwrap();
+        let eq_ab = ctx.mk_eq(a, b).unwrap();
+        (
+            ctx.mk_const_bool(true),
+            ctx.mk_const_bool(false),
+            eq_ab,
+            pa,
+            pb,
+        )
+    };
+    let (v_ab, v_pa, v_pb) = (Var::new(0), Var::new(1), Var::new(2));
+    c.install_truth_terms(t_true, t_false);
+    c.register_atom(v_ab, eq_ab).unwrap();
+    Theory::push(&mut c);
+    c.bind_fresh(v_pa, pa);
+    c.bind_fresh(v_pb, pb);
+    Theory::pop(&mut c, 1);
+    Theory::assert(&mut c, Lit::new(v_pa, true));
+    Theory::assert(&mut c, Lit::new(v_pb, false));
+    Theory::assert(&mut c, Lit::new(v_ab, true));
+    let mut out = Vec::new();
+    let conflict = c.propagate(&mut out).is_some()
+        || matches!(c.check(Effort::Full), TheoryResult::Conflict(_));
+    assert!(
+        conflict,
+        "p(a), ¬p(b), a = b must conflict after bind_fresh + pop"
+    );
+}

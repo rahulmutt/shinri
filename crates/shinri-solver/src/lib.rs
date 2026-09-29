@@ -1235,12 +1235,11 @@ impl Solver {
             } else {
                 Some(surrogate_map)
             };
-        // set_truth_terms MUST be called before any atom encoding (Euf::new_var
-        // installs the level-0 ⊤≠⊥ diseq only if truth_terms is already Some,
-        // and assert panics if truth terms are unset).
+        // Install ⊤/⊥ AND EUF's ⊤≠⊥ now, at level 0, before any atom encoding
+        // (slice 50): `bind_fresh` can register EUF atoms mid-search, so the
+        // install must not wait for the first predicate atom.
         sat.theory_mut()
-            .euf_mut()
-            .set_truth_terms(self.t_true, self.t_false);
+            .install_truth_terms(self.t_true, self.t_false);
         sat.theory_mut().arith_mut().set_stage_b(self.stage_b);
         if on_string_path {
             // Bound integer branch-and-bound over unbounded `str.len` terms. Under

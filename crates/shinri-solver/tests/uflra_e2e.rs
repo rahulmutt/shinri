@@ -189,3 +189,27 @@ fn not_entailed_sat() {
     s.assert(dist);
     assert_eq!(s.check_sat(), SolveOutcome::Sat);
 }
+
+/// Slice 50 (spec §1.4): the compound-argument defect in QF_UFLRA.
+/// x = 1/2 ∧ f(1) = 5 ∧ ¬(f(x + 1/2) = 5) ⇒ UNSAT (z3: unsat).
+#[test]
+fn slice50_real_compound_arg_unsat() {
+    let mut s = Solver::new();
+    let x = real_const(&mut s, "x");
+    let f = real_fun1(&mut s, "f");
+    let real = s.real_sort();
+    let half = s.numeral(Rational::new(1i128.into(), 2i128.into()), real);
+    let one = real_num(&mut s, 1);
+    let five = real_num(&mut s, 5);
+    let xh = s.app(Op::Builtin(BuiltinOp::Add), &[x, half]);
+    let f1 = s.app(Op::Uninterpreted(f), &[one]);
+    let fxh = s.app(Op::Uninterpreted(f), &[xh]);
+    let x_eq = s.eq(x, half);
+    let f1_eq = s.eq(f1, five);
+    let fxh_eq = s.eq(fxh, five);
+    let not_fxh = s.app(Op::Builtin(BuiltinOp::Not), &[fxh_eq]);
+    s.assert(x_eq);
+    s.assert(f1_eq);
+    s.assert(not_fxh);
+    assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+}

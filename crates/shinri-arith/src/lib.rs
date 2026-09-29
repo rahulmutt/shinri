@@ -188,6 +188,57 @@ impl Default for Arith {
     }
 }
 
+/// Slice 50: `t` is a compound arithmetic application (`+`, `-`, unary `-`,
+/// `*`) rather than a numeral or an opaque leaf (UF application, `str.len`, …).
+fn is_compound_arith(ctx: &Context, t: TermId) -> bool {
+    use shinri_core::TermNode;
+    if ctx.numeral_value(t).is_some() {
+        return false;
+    }
+    matches!(
+        ctx.term_node(t),
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Neg | BuiltinOp::Mul),
+            ..
+        }
+    )
+}
+
+/// Slice 50: `t` is linear all the way down: every `*` has at most one
+/// non-numeral factor, which is itself linear. This is exactly the input
+/// `normalize::linearize` accepts without its "nonlinear reached normalize"
+/// debug assertion. Opaque leaves are linear.
+fn is_linear_arith(ctx: &Context, t: TermId) -> bool {
+    use shinri_core::TermNode;
+    if ctx.numeral_value(t).is_some() {
+        return true;
+    }
+    match ctx.term_node(t) {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Neg),
+            args,
+            ..
+        } => ctx.children(*args).iter().all(|&k| is_linear_arith(ctx, k)),
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::Mul),
+            args,
+            ..
+        } => {
+            let mut nonconst = ctx
+                .children(*args)
+                .iter()
+                .copied()
+                .filter(|&k| ctx.numeral_value(k).is_none());
+            match (nonconst.next(), nonconst.next()) {
+                (None, _) => true,
+                (Some(k), None) => is_linear_arith(ctx, k),
+                (Some(_), Some(_)) => false,
+            }
+        }
+        _ => true,
+    }
+}
+
 impl Arith {
     const MAX_CUTS_PER_NODE: usize = 4;
     const MAX_CUTS_TOTAL: usize = 10_000;
@@ -317,6 +368,23 @@ impl Arith {
         self.pivot_budget = n;
     }
 
+    /// Intern the slack for `comb` and, only if it is freshly minted, define
+    /// its tableau row. Returns `(slack, is_new)`. Every production
+    /// `slack_var` call goes through here, so an existing slack is always
+    /// already defined. The guard matters because the tableau is never popped
+    /// and `Tableau::define_slack` early-returns only for a BASIC slack: an
+    /// existing slack that a pivot moved out of the basis would otherwise get a
+    /// second row while still being a column of other rows (slice 50).
+    fn intern_slack(&mut self, comb: &LinComb) -> (ArithVar, bool) {
+        let before = self.vars.len();
+        let s = self.vars.slack_var(comb);
+        let is_new = self.vars.len() > before;
+        if is_new {
+            self.tableau.define_slack(s, comb);
+        }
+        (s, is_new)
+    }
+
     /// Reduce a normalized atom to a *bound on one variable*. For a single-term
     /// comb `{x:c}` the bound is on `x` (rhs divided by c, kind flipped if c<0);
     /// for ≥2-term combs a slack var is interned and defined as a tableau row.
@@ -327,8 +395,7 @@ impl Arith {
             let scaled = rhs.clone() / c.clone();
             (*x, scaled, c.is_negative())
         } else {
-            let s = self.vars.slack_var(comb);
-            self.tableau.define_slack(s, comb);
+            let (s, _) = self.intern_slack(comb);
             (s, rhs.clone(), false)
         }
     }
@@ -640,11 +707,15 @@ impl Arith {
         lit.var().index() as u32 >= SENTINEL_VAR_BASE
     }
 
-    /// Intern a problem var for the Real-sorted shared term `t`. If `t` is a
-    /// numeral, ALSO pin it with an unconditional fixed bound lower=upper=value,
-    /// marked Definitional (NO input Lit — uses a sentinel that `explain`
-    /// contributes nothing for). Plain vars / UF-application terms just get a
-    /// free problem var. (R4)
+    /// Intern the shared term `t` as a problem var (stamping Int-sortedness).
+    /// Numerals are pinned to their value (slice 42). Compound linear terms
+    /// (`(+ a 1)`, `(* 2 a)`, …) are pinned to their linearization by a
+    /// permanent row (slice 50, `define_shared_compound`); without it the var
+    /// is free and unrelated to its own arguments. Opaque leaves are left free.
+    ///
+    /// Pins are trailed bounds, so a pop can remove them. That is safe ONLY
+    /// because `drive_final_check` re-calls this for every shared term at EVERY
+    /// final check, before any `Sat`: keep it that way.
     pub fn ensure_shared_var(&mut self, ctx: &Context, t: TermId) {
         // Stamp Int-sortedness so shared Int terms (f-apps, numerals, vars) are
         // integral in the simplex / integer layer — required for QF_UFLIA.
@@ -670,6 +741,89 @@ impl Arith {
                 if !self.tableau.is_basic(v) {
                     self.value[v.index()] = dr;
                 }
+            }
+        } else if is_compound_arith(ctx, t) && is_linear_arith(ctx, t) {
+            self.define_shared_compound(ctx, t, v);
+        }
+    }
+
+    /// Slice 50 (spec §3.1): pin the compound shared term `t` (var `v`) to its
+    /// linearization `Σ qᵢ·xᵢ + c`, as the row `v − Σ qᵢ·xᵢ = c`: a permanent
+    /// tableau row over a slack pinned to `[c, c]`. If the row cancels to `v`
+    /// alone (e.g. `(- a a)`), `v` itself is pinned. The sentinel literal is
+    /// dropped by `sanitize_conflict`, so every conflict core stays justified by
+    /// input literals.
+    ///
+    /// `v` and every linearization leaf `xᵢ` are marked constrained. The row
+    /// couples them: `v` can no longer shift on its own, and neither can a
+    /// leaf that occurs in no arith atom (e.g. `a` in `(+ a 1)`), because
+    /// shifting it moves the constrained `v`. Slice 42's premise — a free
+    /// class can shift ±1 and still be a model — fails for such row-coupled
+    /// leaves, so its filter would otherwise hide pairs containing them from
+    /// `entailed_equalities` and MBTC, yielding a wrong `sat` (spec §3.1,
+    /// *Constrainedness*). That errs toward more probing, the documented sound
+    /// direction.
+    fn define_shared_compound(&mut self, ctx: &Context, t: TermId, v: ArithVar) {
+        let (raw, c) = crate::normalize::linearize(ctx, &mut self.vars, t);
+        // `linearize` is sort-blind (as in `new_var`): stamp Int leaves here.
+        let int_s = ctx.int_sort();
+        for (x, _) in &raw {
+            if let Some(xt) = self.vars.term_of(*x) {
+                if ctx.sort_of(xt) == int_s {
+                    self.vars.mark_int(*x);
+                }
+            }
+        }
+        // `linearize` may have interned new leaf vars: cover them in
+        // `value`/bounds on every path, including the degenerate one.
+        self.grow_value();
+        // Row-coupled leaves cannot shift independently (see doc above).
+        for (x, _) in &raw {
+            self.mark_constrained(*x);
+        }
+        let mut pairs = Vec::with_capacity(raw.len() + 1);
+        pairs.push((v, Rational::one()));
+        pairs.extend(raw.into_iter().map(|(x, q)| (x, -q)));
+        // `v` is interned by TermId `t`, never by one of `t`'s leaves, so it
+        // survives canonicalization with coefficient exactly 1.
+        let comb = crate::normalize::canonicalize(pairs);
+        let target = if comb.0.len() == 1 {
+            debug_assert!(comb.0[0].0 == v && comb.0[0].1 == Rational::one());
+            v
+        } else {
+            // The row is permanent (the tableau is never popped); a re-call
+            // after a pivot must not install a second row (`intern_slack`).
+            let (s, is_new) = self.intern_slack(&comb);
+            if is_new {
+                self.grow_value();
+                self.recompute_basic_values();
+            }
+            s
+        };
+        self.mark_constrained(v);
+        let dr = DeltaRational::from_rational(c);
+        // Idempotent, as for numerals: skip if already pinned to this value.
+        let already = matches!(self.bounds.lower(target), Some((lo, _)) if *lo == dr)
+            && matches!(self.bounds.upper(target), Some((hi, _)) if *hi == dr);
+        if !already {
+            // `target` carries no bound from any other source except an
+            // interface equality on the same diff slack, and
+            // `assert_interface_equality` always re-ensures (re-pins) first,
+            // at the same or a lower level. So neither tighten can conflict.
+            let def = self.fresh_sentinel();
+            let lo = self
+                .bounds
+                .tighten(target, BoundKind::Lower, dr.clone(), def);
+            let hi = self
+                .bounds
+                .tighten(target, BoundKind::Upper, dr.clone(), def);
+            debug_assert!(
+                !matches!(lo, TightenResult::Conflict { .. })
+                    && !matches!(hi, TightenResult::Conflict { .. }),
+                "slice 50: definitional pin conflicts with an existing bound"
+            );
+            if !self.tableau.is_basic(target) {
+                self.value[target.index()] = dr;
             }
         }
     }
@@ -741,8 +895,7 @@ impl Arith {
         // consistent for the new slacks before snapshotting.
         for &(i, j) in &candidates {
             let comb = Self::diff_comb(items[i].1, items[j].1);
-            let s = self.vars.slack_var(&comb);
-            self.tableau.define_slack(s, &comb);
+            self.intern_slack(&comb);
         }
         self.grow_value();
         self.recompute_basic_values();
@@ -945,8 +1098,7 @@ impl Arith {
         // over-approximates constrainedness (more probing, the sound direction).
         self.union_interface_class(av, bv);
         let comb = Self::diff_comb(av, bv);
-        let s = self.vars.slack_var(&comb);
-        self.tableau.define_slack(s, &comb);
+        let (s, _) = self.intern_slack(&comb);
         self.grow_value();
         self.recompute_basic_values();
         // Encode the interface equality as a fixed bound s = 0; the justification
@@ -1955,6 +2107,184 @@ mod nelson_oppen_tests {
             h.arith.is_constrained(fv),
             "a pinned numeral IS constrained"
         );
+    }
+
+    // ----- Slice 50: compound shared terms (spec §3) -----
+
+    fn int_num_no(ctx: &mut Context, n: i128) -> TermId {
+        let int = ctx.int_sort();
+        ctx.mk_numeral(Rational::from_int(n.into()), int)
+    }
+
+    /// Builds `a <= 0 ∧ a >= 0` (vars 0, 1) and returns `(a, (+ a 1), 1)`.
+    fn a_pinned_to_zero(h: &mut Harness) -> (TermId, TermId, TermId) {
+        let a = int_var_no(&mut h.ctx, "a");
+        let zero = int_num_no(&mut h.ctx, 0);
+        let one = int_num_no(&mut h.ctx, 1);
+        let t = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Add), &[a, one])
+            .unwrap();
+        let le = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Le), &[a, zero])
+            .unwrap();
+        let ge = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ge), &[a, zero])
+            .unwrap();
+        h.assert_atom(0, le);
+        h.assert_atom(1, ge);
+        (a, t, one)
+    }
+
+    /// Spec §1.3: `ensure_shared_var((+ a 1))` must define the shared var as
+    /// `a + 1`, mark it constrained, and let arith entail `(+ a 1) = 1` when
+    /// `a = 0`. On `main` it is a free, unconstrained var: its value is
+    /// arbitrary and the entailment probe skips it.
+    #[test]
+    fn compound_shared_term_is_defined_by_its_linearization() {
+        let mut h = Harness::new();
+        let (_a, t, one) = a_pinned_to_zero(&mut h);
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, t);
+        h.arith.ensure_shared_var(&ctx, one);
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+        let tv = h.arith.vars.problem_var(t);
+        assert_eq!(
+            h.arith.value[tv.index()],
+            dr(1),
+            "(+ a 1) must take a + 1 = 1"
+        );
+        assert!(
+            h.arith.is_constrained(tv),
+            "a defined compound shared var is constrained (spec §3.1)"
+        );
+        let got = pairset(&h.arith.entailed_equalities(&ctx, &[t, one]));
+        assert!(
+            got.contains(&(t.index().min(one.index()), t.index().max(one.index()))),
+            "a = 0 must entail (+ a 1) = 1: {got:?}"
+        );
+    }
+
+    /// Final-review fix: the definitional row ties each linearization leaf to
+    /// the constrained `v_t`, so a leaf in no arith atom (here `a`) can no
+    /// longer shift on its own. It must be marked constrained too, or slice
+    /// 42's filter hides every pair containing it.
+    #[test]
+    fn compound_definition_constrains_its_leaves() {
+        let mut h = Harness::new();
+        let a = int_var_no(&mut h.ctx, "a");
+        let one = h.ctx.mk_numeral(Rational::one(), h.ctx.int_sort());
+        let t = h
+            .ctx
+            .mk_app(Op::Builtin(BuiltinOp::Add), &[a, one])
+            .unwrap();
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.ensure_shared_var(&ctx, t);
+        let av = h.arith.vars.problem_var(a);
+        assert!(
+            h.arith.is_constrained(av),
+            "a leaf of a defined compound shared term is constrained"
+        );
+    }
+
+    /// Spec §3.2: the pin is trailed, so a pop below the level it was installed
+    /// at removes it. The combiner re-calls `ensure_shared_var` for every
+    /// shared term at every final check; that re-call must re-install the pin
+    /// (an "already defined" flag that skipped it would leave `(+ a 1)` free).
+    #[test]
+    fn compound_definition_is_reinstalled_after_pop() {
+        let mut h = Harness::new();
+        let (_a, t, one) = a_pinned_to_zero(&mut h);
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        h.arith.push(); // level 1
+        h.arith.ensure_shared_var(&ctx, t);
+        h.arith.ensure_shared_var(&ctx, one);
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+        let tv = h.arith.vars.problem_var(t);
+        assert_eq!(h.arith.value[tv.index()], dr(1), "level 1: (+ a 1) = 1");
+
+        h.arith.pop(0);
+        // Next final check, as `drive_final_check` does it:
+        h.arith.ensure_shared_var(&ctx, t);
+        h.arith.ensure_shared_var(&ctx, one);
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+        assert_eq!(
+            h.arith.value[tv.index()],
+            dr(1),
+            "after pop + re-ensure: (+ a 1) must again equal a + 1"
+        );
+        let got = pairset(&h.arith.entailed_equalities(&ctx, &[t, one]));
+        assert!(
+            got.contains(&(t.index().min(one.index()), t.index().max(one.index()))),
+            "after pop + re-ensure: a = 0 must entail (+ a 1) = 1: {got:?}"
+        );
+    }
+
+    /// Tableau invariant: one row per basic var, and no basic var appears as a
+    /// column of any row.
+    fn assert_tableau_invariant(arith: &Arith, what: &str) {
+        let tab = &arith.tableau;
+        assert_eq!(tab.basic.len(), tab.rows.len(), "{what}: basic/rows desync");
+        for (b, row) in &tab.rows {
+            assert!(tab.is_basic(*b), "{what}: row owner {b:?} not basic");
+            for j in row.vars() {
+                assert!(
+                    !tab.is_basic(j),
+                    "{what}: basic {j:?} is a column of {b:?}'s row"
+                );
+            }
+        }
+    }
+
+    /// Slice 50 fix round 1: `Tableau::define_slack` only early-returns for a
+    /// BASIC slack, and the tableau is never popped. A diff slack that a pivot
+    /// moved out of the basis must not be re-defined when its interning path
+    /// (`assert_interface_equality`, `entailed_equalities`) runs again: that
+    /// would give it a second row while it is still a column elsewhere.
+    #[test]
+    fn existing_diff_slack_is_not_redefined_after_pivot() {
+        let mut h = Harness::new();
+        let x = real_var(&mut h.ctx, "x");
+        let y = real_var(&mut h.ctx, "y");
+        let one = num(&mut h.ctx, 1);
+        let ge = h.ctx.mk_app(Op::Builtin(BuiltinOp::Ge), &[x, one]).unwrap();
+        h.assert_atom(0, ge); // x >= 1
+        let ctx = std::mem::replace(&mut h.ctx, Context::new());
+        let just = TheoryJust { theory: 0, tag: 0 };
+        // Defines s = x - y (basic, value 1) and pins it to 0: check_full must
+        // pivot s out of the basis (x sits at its lower bound, y is free).
+        assert!(h
+            .arith
+            .assert_interface_equality(&ctx, x, y, just)
+            .is_none());
+        let comb = Arith::diff_comb(h.arith.vars.problem_var(x), h.arith.vars.problem_var(y));
+        let s = h.arith.vars.slack_var(&comb);
+        assert!(
+            !h.arith.tableau.is_basic(s),
+            "precondition: the diff slack was pivoted out of the basis"
+        );
+        assert_tableau_invariant(&h.arith, "after first interface equality");
+
+        h.arith.push();
+        assert!(h
+            .arith
+            .assert_interface_equality(&ctx, x, y, just)
+            .is_none());
+        assert!(
+            !h.arith.tableau.is_basic(s),
+            "re-assert must not re-basify s"
+        );
+        assert_tableau_invariant(&h.arith, "after re-asserted interface equality");
+
+        assert!(matches!(h.arith.check_full(), TCheck::Sat));
+        let _ = h.arith.entailed_equalities(&ctx, &[x, y]);
+        assert!(
+            !h.arith.tableau.is_basic(s),
+            "entailment must not re-basify s"
+        );
+        assert_tableau_invariant(&h.arith, "after entailed_equalities");
     }
 
     #[test]

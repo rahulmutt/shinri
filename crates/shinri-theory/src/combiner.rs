@@ -90,6 +90,17 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
         &mut self.euf
     }
 
+    /// Install ⊤/⊥ and EUF's ⊤≠⊥ at the base level, before solving (slice 50,
+    /// spec §4). Must be called before any atom is encoded.
+    pub fn install_truth_terms(&mut self, t_true: TermId, t_false: TermId) {
+        let mut cx = TheoryCtx {
+            terms: &mut self.terms,
+            eq: &mut self.eq,
+            atoms: &self.atoms,
+        };
+        self.euf.install_truth_terms(&mut cx, t_true, t_false);
+    }
+
     /// Mutable access to the arith theory slot (mirrors `euf_mut`). Used by the
     /// solver to set the Plan B2 Stage-B gate before solving.
     pub fn arith_mut(&mut self) -> &mut A {
