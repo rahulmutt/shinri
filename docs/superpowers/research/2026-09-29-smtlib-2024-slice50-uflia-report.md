@@ -84,17 +84,20 @@ re-run on the branch with a 120 s timeout, 6 at a time.
     `SEQ038_size6`) is boundary rows at 16.5–20 s that both binaries answer,
     or nearly answer, in the A/B. They do not meet the brief's exclusion test
     ("base also fails"), so they stay in the count.
-- **Spec §9's un-banking trigger for the unit-difference class join has
-  fired.** Criterion 6's A/B plus the instrumented runs attribute 18
-  `correct → {unknown, timeout}` rows to the extra probing caused by marking
-  compound shared terms constrained. This does not show that the class join
-  would recover them. It is the trigger the spec named.
+- **Spec §9's un-banking trigger for the unit-difference class join fired,
+  and the join was built (Task 8) and not adopted.** Criterion 6's A/B plus
+  the instrumented runs attributed 18 `correct → {unknown, timeout}` rows to
+  the extra probing caused by marking compound shared terms constrained. The
+  join recovered none of them (see "Un-banked §9 class join: tried, not
+  adopted").
 - **Real improvements (A/B-confirmed):** QF_UFLIA `mathsat/Hash/hash_sat_03_12`
   (pre-slice no answer in 20 s, branch `sat` 9.8 s). QF_SLIA
   `20180523-Reynolds/kaluza/sat/small/{indexof.corecstrs,search}.readable`
   (pre-slice `unknown`, branch `sat` in 61 and 10 ms). No cause is claimed.
   Every other `→ correct` row is noise from the base run's load: 26 oracle
   flips, and 8 rows that both binaries answer or both fail in the A/B.
+- **Criterion 5 miss: accepted (decided exception, not a relaxation).** See
+  "Un-banked §9 class join: tried, not adopted".
 - **Criteria:** 1 PASS, 2 PASS (on the answer; the corpus row is a 20 s
   `timeout`), 3 PASS (0), 4 PASS (11 → 0), **5 MISSED** (QF_SLIA −14,
   QF_UFLIA −3, QF_UF −3 after exclusions), 6 measured (19 rows confirmed
@@ -451,17 +454,47 @@ Post-fix: PASS in 3.7 s, `compound-args oracle: sat 153, unsat 47`.
 oracle`), after the final fix: **669 passed, 3 skipped**. The discovered count
 is non-zero.
 
+## Un-banked §9 class join: tried, not adopted
+
+Criterion 6 un-banked spec §9's unit-difference class join, and it was built
+as Task 8. It recovered 0 of the 29 `correct → non-correct` rows. A narrower
+variant (a per-class "definitionally joined" flag) recovered 1 of 29, which is
+`SEQ038_size9` in QF_UF and is timing noise. The 11 formerly-wrong QF_UFLIA
+rows all still time out, and none answers `sat`. All 16 QF_SLIA `unknown` rows
+and both Wisa `sat → timeout` rows are unchanged under every build tried.
+
+- **Why it does not help.** The join fires (instrumentation shows, for
+  example, all 63 definitional rows of one `findAnagrams` row are unit
+  differences). But a leaf like `a` is almost always already constrained by
+  its own atoms, so joining the compound into its class is equivalent to
+  marking it. The cost is the probing the fix needs, not the marking
+  mechanism. The Task 6 diagnostic (skipping `mark_constrained(v_t)` restores
+  the rows) holds only because skipping is unsound: it leaves `v_t` a free
+  singleton, which the join by design does not.
+- **§9's "only a performance refinement" is incomplete.** A definitional join
+  breaks slice 42's C2 argument. With `a` free, `(+ a 0)` and `a`, or
+  `(+ a 1)` and `(- (+ a 2) 1)`, share a class and are always equal, and EUF
+  does not know it. So the join needs same-class pairs to be probed. That
+  patch conflicts with two slice-42 tests,
+  `free_class_pair_joined_by_interface_equality_is_not_probed` and
+  `mbtc_skips_a_free_class_pair`. The join was not committed.
+- **Decision (user, 2026-09-29): accept the criterion-5 miss and merge.** The
+  slice removes 11 wrong answers and has 0 `correct → wrong`, at the cost of
+  about 20 `correct` rows becoming `unknown` or `timeout` (QF_SLIA −14,
+  QF_UFLIA −3, QF_UF −3 after exclusions). This is recorded as a decided
+  exception to criterion 5, not a relaxation of it.
+
 ## Queued for the next slice
 
-- **The unit-difference class join (spec §9) is un-banked by this run.**
-  It has 18 traced `correct → {unknown, timeout}` rows (QF_SLIA ×16 via the
-  string-path pivot budget, QF_UFLIA Wisa ×2 via final-check blow-up), and
-  all of them are attributed to `mark_constrained(v_t)` probing. It is still
-  unmeasured whether the class join recovers them. The `findAnagrams` rows'
-  compound terms are nested `(- (str.len p) 1)` chains, and the `slent` rows
-  contain `(+ x 1)`, `(+ x 0)` and `(- x y)`. The class join covers only the
-  `v_t − x = c` shape, so whether it covers enough of these is unmeasured. An alternative is to re-examine whether the
-  string-path pivot budget should count probe pivots at all.
+- **The unit-difference class join is closed as not effective. Do not
+  re-queue it** (see "Un-banked §9 class join: tried, not adopted").
+- **QF_SLIA `STRING_PATH_PIVOT_BUDGET`.** The 16 lost QF_SLIA rows exhaust the
+  budget (2,000). Pre-slice already peaked at 1,938 on those rows, so they sit
+  near a fixed-budget cliff. An option is to re-examine whether the budget
+  should count probe pivots at all.
+- **Wisa final-check blow-up.** The 2 Wisa `correct → timeout` rows make more
+  than 1.18 M `define_shared_compound` calls in 90 s. The work is to reduce
+  entailment/MBTC probing cost over compound shared terms.
 - **Wisa rows that moved** (`wrong → timeout`, 11): the four that reach
   `unsat` in 27–35 s (`xs-05-08-4-2-5-4`, `xs-05-12-1-4-2-1`,
   `xs-05-16-1-5-4-3`, `xs-05-20-5-1-4-2`) and the seven with no answer at 120

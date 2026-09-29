@@ -384,8 +384,8 @@ A/B-timed on both binaries. The same-path check found 121,481 common paths,
   - With `v_t` left unmarked (diagnostic only; unsound per §1.3), all 18
     answer `sat`.
   - Marking the leaves (the final-review fix) is not what causes it.
-  - **§9's un-banking trigger for the unit-difference class join has
-    fired.** Whether the join recovers these rows is unmeasured.
+  - **§9's un-banking trigger for the unit-difference class join fired, and
+    the join was built (Task 8) and not adopted.** See the next paragraph.
 - §9's approach-B trigger does not fire: no QF_UFLIA row is left `wrong`.
 - §1.4 named QF_SLIA's 37 wrong rows as a candidate beneficiary. None moved.
 - As §7 expected, no QF_DT or QF_UF row is attributable to the sentinel task.
@@ -397,5 +397,33 @@ A/B-timed on both binaries. The same-path check found 121,481 common paths,
   `correct` with no traced cause: QF_UFLIA `hash_sat_03_12` and QF_SLIA
   Reynolds ×2.
 
-**Decision needed before merge:** criterion 5 is a hard gate and is missed.
-Per the brief, it is left missed for a user decision, not relaxed.
+**Un-banked §9 class join: tried, not adopted.** Task 8 built the
+unit-difference class join. It recovered 0 of the 29 `correct → non-correct`
+rows (1 of 29 in a narrower variant, which is QF_UF timing noise). The 11
+formerly-wrong QF_UFLIA rows all still time out, and none answers `sat`. The
+join fires, but a leaf like `a` is almost always already constrained by its own
+atoms, so joining the compound into its class is equivalent to marking it. The
+cost is the probing the fix needs, not the marking mechanism. The Task 6
+diagnostic holds only because skipping `mark_constrained(v_t)` is unsound.
+Also, §9's "only a performance refinement" is incomplete: a definitional join
+breaks slice 42's C2 argument (`(+ a 0)` and `a`, or `(+ a 1)` and
+`(- (+ a 2) 1)`, with `a` free share a class, are always equal, and EUF does
+not know it). The join therefore needs same-class pairs probed, and that patch
+conflicts with two slice-42 tests
+(`free_class_pair_joined_by_interface_equality_is_not_probed`,
+`mbtc_skips_a_free_class_pair`). The join was not committed. It is closed as
+not effective and is not to be re-queued.
+
+**Criterion 5: decided exception (user, 2026-09-29).** The miss is accepted
+and the slice merges: 11 wrong answers removed and 0 `correct → wrong`, at the
+cost of about 20 `correct` rows becoming `unknown` or `timeout` (QF_SLIA −14,
+QF_UFLIA −3, QF_UF −3 after exclusions). This is a decided exception, not a
+relaxation of the criterion.
+
+**Queued from this run.**
+
+- The 16 QF_SLIA rows exhaust `STRING_PATH_PIVOT_BUDGET` (2,000). Pre-slice
+  already peaked at 1,938 on those rows, so they sit near a fixed-budget cliff.
+- The 2 Wisa rows' final-check blow-up (more than 1.18 M
+  `define_shared_compound` calls in 90 s): reduce entailment/MBTC probing cost
+  over compound shared terms.
