@@ -358,3 +358,32 @@ In `slice52_probes.rs`:
   - `crates/shinri-solver/tests/slice34_probes.rs`, `qfs_differential.rs`,
     `qfs_fuzz_corpus.rs`
 - Corpus: `QF_SLIA/20190311-str-small-rw-Noetzli/str-pred-small-rw/str-pred-small-rw_370.smt2`, `_458.smt2`.
+
+## 12. Measured outcomes
+
+Run `slice52` (QF_S + QF_SLIA, 103,335 rows, fixture `fec6fb9dc574`,
+`solver_md5 bc7ee313…`) against `slice51`. Full report:
+`docs/superpowers/research/2026-09-30-smtlib-2024-slice52-str-bool-eq-report.md`.
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | `str-pred-small-rw_370` and `_458` `wrong → correct` (`unsat`) | **PASS**: both `unsat` (7 ms, 6 ms) |
+| 2 | QF_S + QF_SLIA `wrong` 2 → 0 | **PASS**: 2 → 0 |
+| 3 | 0 rows `* → wrong` | **PASS: 0** rows, no escalation |
+| 4 | every `correct → unknown/timeout` row listed and triaged; `unknown:sat-budget` delta | **DONE**: 313 rows, all `unknown` (298 `sat-budget`, 15 `str-model-rejected`), 0 `timeout`; `sat-budget` +5 (QF_S), +497 (QF_SLIA). All are `:status unknown` rows that answered `sat` on slice 51 (z3 `sat`); 309 of 313 flip at Task 4 (H3 gate) |
+| 5 | standard gates green, oracle count non-zero | **PASS**: test 1,611 passed / 8 skipped; oracle 701 discovered, 697 passed, 4 skipped; lint and `ci` green |
+
+`correct`: QF_S 16,058 → 16,061 (+3, oracle-noise `unverified → correct`),
+QF_SLIA 24,815 → 24,562 (−253: +2 Noetzli, +58 other inbound, −313
+`correct → unknown`). parse-error 195 → 195 (same rows).
+
+Deviations from the spec text: z3 answers `sat` (not `unsat`) for the AB (H2)
+script, so `ab_prefix_h2` is a soundness check (§1.2/§8 were wrong); H1 needed
+a length link (`str.len(v) ≈ 0` merged with the H1 merge, gated to H1 only;
+a model-builder override was reverted after a wrong `sat`); `distinct_form`
+and `xor_form` are a sound `unknown` (re-pinned to "not sat") and
+`bool_proxy` is a known wrong `sat` (`#[ignore]`d), all three a minted-branch
+completeness gap; the Noetzli pair passes by search order (swapping the
+disjuncts gives `unknown`). New queued items: the 313 lost `sat` rows (H3
+gate), the minted-branch gap, the R10/H3-contributor-map/combiner deferred
+items; see the report's *Queued for the next slice*.
