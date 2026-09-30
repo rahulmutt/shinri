@@ -301,3 +301,23 @@ surrogates.
   - `crates/shinri-str/src/code_conv.rs:17`
   - `crates/shinri-solver/tests/qfs_differential.rs:172` (`ALPHABET`)
 - SMT-LIB 2.6 theory of Unicode strings, § string literals.
+
+## 12. Measured outcomes
+
+Run `slice51` (QF_S + QF_SLIA, 103,335 rows, fixture `924ecc98cd06`,
+`solver_md5 4347bd57…`) against `slice50`. Full report:
+`docs/superpowers/research/2026-09-30-smtlib-2024-slice51-escapes-report.md`.
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | `instance10773` `sat`, `instance09174` `unsat` | **PASS**: both `wrong → correct` |
+| 2 | no denghang row `wrong`; 31 answer `unsat` | **PASS**: 31 `unsat`; 4 `unknown:str-model-rejected` (`instance46836`, `51681`, `52132`, `55189`); 0 `wrong` |
+| 3 | `wrong` 39 → ≤ 2, only the Noetzli pair | **PASS**: 39 → 2, `str-pred-small-rw_370`, `_458` |
+| 4 | 0 `* → wrong`, or escalated | **PASS: 0** rows, no escalation |
+| 5 | every `correct → unknown/timeout` row listed and triaged | **DONE**: 76 rows, all `unknown` (68 `str-model-rejected`, 8 `sat-budget`), 0 `timeout`; all contain escapes; representative traced to the `string_model_satisfies` fence (sound) |
+| 6 | standard gates green | **PASS**: test 1,576 passed / 7 skipped; oracle 677/677 (3 skipped); lint and `ci` green |
+
+`correct`: QF_S 16,025 → 16,058, QF_SLIA 24,798 → 24,815. parse-error
+195 → 195 (same rows, `str.replace_re`/`str.replace_re_all`); the surrogate
+diagnostic fired on 0 corpus files. New queued item: premature string SAT on
+decoded control-character regexes, caught by the self-check (68 rows).
