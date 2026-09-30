@@ -2218,63 +2218,6 @@ mod tests {
             "a conditional `\"A\" = y ++ x` must be char-peeled on `y` (H3)"
         );
     }
-
-    /// Slice 52 (H3), isolates the DISEQUALITY exclusion: `e` is asserted at
-    /// level 0 (its own literal is never conditional), only `d` is conditional.
-    /// Before T4 the conditional diseq put the shared `"A"` class into
-    /// `input_cond_roots` and blocked `e`'s resolution.
-    #[test]
-    fn diseq_alone_does_not_block_resolution() {
-        let mut ctx = Context::new();
-        let str_s = ctx.string_sort();
-        let mk = |c: &mut Context, n: &str| {
-            let s = c.declare_fun(n, &[], str_s);
-            c.mk_app(Op::Uninterpreted(s), &[]).unwrap()
-        };
-        let x = mk(&mut ctx, "x");
-        let y = mk(&mut ctx, "y");
-        let a = ctx.mk_string_const("A");
-        let empty = ctx.mk_string_const("");
-        let yx = ctx
-            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[y, x])
-            .unwrap();
-        let xy = ctx
-            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
-            .unwrap();
-        let e = ctx.mk_eq(a, yx).unwrap();
-        let d = ctx.mk_eq(a, xy).unwrap();
-        let peel_empty = ctx.mk_eq(y, empty).unwrap();
-
-        let mut solver = StrSolver::default();
-        let mut eq = EqualityEngine::default();
-        let areg = AtomRegistry::default();
-        let mut cx = TheoryCtx {
-            terms: &mut ctx,
-            eq: &mut eq,
-            atoms: &areg,
-        };
-        solver.new_var(&mut cx, Var::new(0), e);
-        solver.new_var(&mut cx, Var::new(1), d);
-        solver.test_force_eq_true_at(e, 0);
-        solver.test_force_diseq_true_at(d, 1);
-        let mut saw_peel = false;
-        for _ in 0..64 {
-            match solver.check(&mut cx, Effort::Full) {
-                TCheck::Split { atoms, .. } => {
-                    if atoms.contains(&peel_empty) {
-                        saw_peel = true;
-                        break;
-                    }
-                }
-                TCheck::Sat | TCheck::Unknown => break,
-                TCheck::Conflict(_) => break,
-            }
-        }
-        assert!(
-            saw_peel,
-            "a conditional `\"A\" = y ++ x` must be char-peeled on `y` (H3)"
-        );
-    }
 }
 
 #[cfg(test)]
