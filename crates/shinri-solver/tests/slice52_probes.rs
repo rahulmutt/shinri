@@ -188,3 +188,21 @@ fn ctrl_repeated_var() {
     let (x, _y) = sat_model(r#"(assert (= "" (str.++ x x y)))"#);
     assert_eq!(x, "");
 }
+
+/// H1 must not hide a string/arith length conflict. z3: unsat (`len y = 0`
+/// forces `x = "A"`, contradicting `x != "A"`). Must never be `sat`.
+#[test]
+fn h1_len_linked_not_sat() {
+    let v = verdict(
+        r#"(assert (= "A" (str.++ y x)))(assert (= (+ (str.len y) 1) 1))(assert (not (= x "A")))"#,
+    );
+    assert_ne!(v, "sat", "wrong sat: len y = 0 is violated by any model");
+}
+
+/// Satisfiable variant: the only model is y = "" and x = "A". Red since H1
+/// (unknown): the arith side is not told len(!strk) = 0 after the merge.
+#[test]
+fn ctrl_h1_len_linked() {
+    let (x, y) = sat_model(r#"(assert (= "A" (str.++ y x)))(assert (= (+ (str.len y) 1) 1))"#);
+    assert_eq!((x.as_str(), y.as_str()), ("A", ""));
+}

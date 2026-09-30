@@ -841,7 +841,7 @@ fn resolve_inner(
             None
         };
 
-        // SLICE 52 (H1): `[] = [v1, …, vn]` (n ≥ 2, every atom a free variable)
+        // SLICE 52 (H1): `[] = [v1, …, vn]` (n ≥ 2, every atom a free atom: non-constant, non-concat)
         // ENTAILS `vi ≈ ""` for every i — a concatenation is empty iff every
         // part is. Report ONE per round: the first atom not already `≈ ""`.
         // Later rounds report the rest; the `same` check makes the choice
@@ -849,9 +849,22 @@ fn resolve_inner(
         // `vs[0]` looped in the spike). If every atom is already `≈ ""`, fall
         // through to `Done`. Minted `!strk*` skolems are ALLOWED here, unlike
         // the slice-34 alias case above: that exclusion stops a var–var CLASS
-        // UNION from replacing an F-split the model builder needs, and a merge
+        // UNION from replacing an F-split the model builder needs; a merge
         // into `""` is a constant fact, not a union (spec §3.2). The driver
         // cites `nf_ante` alongside `just`, as for every `Propagate`.
+        //
+        // KNOWN LIMIT (found in T3 review): the merge is conditional (it cites
+        // the equation literal and, after a char-peel/F-split, the minted
+        // `y = "A" ++ !strk` literal), but the arith side only learns
+        // `len(v) = 0` from a dl0-entailed class constant (`length::next_axiom`),
+        // and `TCheck::Split` carries a single guard literal, so no sound
+        // multi-antecedent length lemma is emitted here. Arith may therefore
+        // choose lengths inconsistent with the merge (e.g. `len y = 0` while
+        // `y = "A" ++ !strk`, `!strk ≈ ""`); the post-solve model gate then
+        // turns the result into a sound `unknown` (`"A" = y ++ x` with
+        // `len y = 0`, sat at base, is `unknown` now). The model builder must
+        // NOT paper over this by overriding arith lengths: that hides a real
+        // string/arith conflict (wrong `sat`).
         let empty_vs_vars = match (l_res.is_empty(), r_res.is_empty()) {
             (true, false) => Some(r_res),
             (false, true) => Some(l_res),
