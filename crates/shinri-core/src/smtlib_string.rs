@@ -115,7 +115,7 @@ mod tests {
 
     #[test]
     fn decode_every_escape_form() {
-        assert_eq!(dec(r"a"), "a");
+        assert_eq!(dec("\\u0061"), "a");
         assert_eq!(dec(r"\u{61}"), "a");
         assert_eq!(dec(r"\u{061}"), "a");
         assert_eq!(dec(r"\u{0061}"), "a");
@@ -128,7 +128,8 @@ mod tests {
     #[test]
     fn decode_alphabet_boundaries() {
         assert_eq!(dec(r"\u{2FFFF}"), "\u{2FFFF}");
-        assert_eq!(dec(r"퟿"), "\u{D7FF}");
+        assert_eq!(dec("\\uD7FF"), "\u{D7FF}");
+        assert_eq!(dec(r"\u{d7ff}"), "\u{D7FF}");
         assert_eq!(dec(r"\u{E000}"), "\u{E000}");
         // d₄ = 3: not an escape; kept literally (9 chars).
         assert_eq!(dec(r"\u{30000}"), r"\u{30000}");
