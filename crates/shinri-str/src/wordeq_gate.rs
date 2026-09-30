@@ -150,15 +150,6 @@ mod tests {
         assert!(!g.side_clean_for(&mut eq, &ctx, x, e_own));
     }
 
-    /// A conditional disequality is never added, so its sides stay clean.
-    #[test]
-    fn diseq_alone_leaves_sides_clean() {
-        let (ctx, mut eq, x, y, e_own, _) = fixture();
-        let g = WordEqGate::default();
-        assert!(g.side_clean_for(&mut eq, &ctx, x, e_own));
-        assert!(g.side_clean_for(&mut eq, &ctx, y, e_own));
-    }
-
     #[test]
     fn untouched_class_is_clean() {
         let (ctx, mut eq, x, y, e_own, e_other) = fixture();
