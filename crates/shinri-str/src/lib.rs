@@ -14,6 +14,7 @@ pub mod reduce;
 pub mod regex;
 mod trail;
 pub mod wordeq;
+mod wordeq_gate;
 pub use fuel::Fuel;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -322,6 +323,32 @@ impl TheorySolver for StrSolver {
                         all_cond_roots.insert(r);
                         input_cond_roots.insert(r);
                     }
+                }
+            }
+        }
+
+        // Slice 52 (H3): the word-equation resolution gate's own view (see
+        // `wordeq_gate.rs`). Same sources as `input_cond_roots` MINUS
+        // disequalities (they merge nothing), keyed by contributor so an
+        // equation is not blocked by its own literal. `input_cond_roots` and
+        // `all_cond_roots` are unchanged for every other reader.
+        let mut wordeq_gate = crate::wordeq_gate::WordEqGate::default();
+        for (i, &(atom, _)) in self.eq_true.iter().enumerate() {
+            if *self.eq_levels.get(i).unwrap_or(&u32::MAX) > 0 && !self.minted_eqs.contains(&atom) {
+                let (a, b) = crate::wordeq::diseq_sides(cx.terms, atom);
+                for side in [a, b] {
+                    let n = cx.eq.intern(side);
+                    let r = cx.eq.find(n);
+                    wordeq_gate.add(r, crate::wordeq_gate::CondSrc::Eq(atom));
+                }
+            }
+        }
+        for &(var, word, level) in &self.prop_merge_info {
+            if level > 0 {
+                for side in [var, word] {
+                    let n = cx.eq.intern(side);
+                    let r = cx.eq.find(n);
+                    wordeq_gate.add(r, crate::wordeq_gate::CondSrc::Propagation);
                 }
             }
         }
@@ -773,8 +800,13 @@ impl TheorySolver for StrSolver {
             // (ungated) direct/transitive distinct-const checks above; any SAT this
             // admits is re-validated by the model gate; skipped ⟹ saturated (no
             // fabricated verdict).
-            if side_clean(cx.eq, cx.terms, l, &input_cond_roots)
-                && side_clean(cx.eq, cx.terms, r, &input_cond_roots)
+            // Slice 52: this gate now reads `wordeq_gate` (own literal exempt,
+            // disequalities excluded); see wordeq_gate.rs.
+            // Slice 52 (H3): gate on `wordeq_gate`, not `input_cond_roots`: this
+            // equation's OWN literal is cited by everything resolution emits,
+            // and conditional disequalities merge nothing (spec §3.3).
+            if wordeq_gate.side_clean_for(cx.eq, cx.terms, l, atom)
+                && wordeq_gate.side_clean_for(cx.eq, cx.terms, r, atom)
             {
                 // Build the EqLeaf justification from the asserted equality literal.
                 // This feeds `expand_conflict` so the conflict clause cites the right
@@ -930,6 +962,7 @@ impl TheorySolver for StrSolver {
                         // into `cond_roots` above via `prop_merge_info`. Branch-locality
                         // is structural: the merge is scoped by EqualityEngine::push/pop,
                         // and the tag by the str trail (Task 2).
+                        let (pre_v, pre_w) = (cx.eq.find(vn), cx.eq.find(wn));
                         match cx.eq.merge(
                             vn,
                             wn,
@@ -952,10 +985,15 @@ impl TheorySolver for StrSolver {
                                 // BOTH sets eagerly — the SAME conservative classification the
                                 // fold-in applies, just applied intra-check. Chained
                                 // propagations each re-insert their own current root.
+                                let r = cx.eq.find(vn);
+                                // Slice 52: carry contributors across the union
+                                // at ANY level, so a merge never launders a dirty
+                                // class clean for the word-equation gate.
+                                wordeq_gate.on_merge(pre_v, pre_w, r);
                                 if level > 0 {
-                                    let r = cx.eq.find(vn);
                                     all_cond_roots.insert(r);
                                     input_cond_roots.insert(r);
+                                    wordeq_gate.add(r, crate::wordeq_gate::CondSrc::Propagation);
                                 }
                                 // Slice 52 (H1): a merge into `""` must reach arith as
                                 // `len(var) = 0`, else arith picks lengths inconsistent
@@ -1769,6 +1807,19 @@ impl StrSolver {
         self.diseq_levels.push(0);
     }
 
+    /// Like `test_force_eq_true`, at an explicit decision `level` (> 0 means
+    /// conditional — the case the E1 gates reason about).
+    pub fn test_force_eq_true_at(&mut self, atom: TermId, level: u32) {
+        self.eq_true.push((atom, Lit::new(Var::new(0), true)));
+        self.eq_levels.push(level);
+    }
+
+    /// Like `test_force_diseq_true`, at an explicit decision `level`.
+    pub fn test_force_diseq_true_at(&mut self, atom: TermId, level: u32) {
+        self.diseq_true.push((atom, Lit::new(Var::new(1), true)));
+        self.diseq_levels.push(level);
+    }
+
     /// Override the fuel budget. Used only in unit tests to force exhaustion.
     pub fn test_set_fuel(&mut self, n: u32) {
         self.fuel = Fuel { remaining: n };
@@ -2109,6 +2160,64 @@ mod tests {
             "positive StrLeq atom must record is_lt = false (relation, not polarity)"
         );
         assert_eq!(solver.order_levels, vec![0, 0]);
+    }
+
+    /// Slice 52 (H3): a CONDITIONAL word equation `"A" = y ++ x` must still be
+    /// resolved (char-peel `y = "" ∨ y = "A" ++ k`), even with a conditional
+    /// sibling disequality `"A" ≠ x ++ y` on the shared `"A"` class. Before
+    /// the fix, the gate counted the equation's own literal and the
+    /// disequality as conditional merges and never resolved it.
+    #[test]
+    fn conditional_equation_is_resolved_despite_own_literal_and_diseq() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mk = |c: &mut Context, n: &str| {
+            let s = c.declare_fun(n, &[], str_s);
+            c.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let x = mk(&mut ctx, "x");
+        let y = mk(&mut ctx, "y");
+        let a = ctx.mk_string_const("A");
+        let empty = ctx.mk_string_const("");
+        let yx = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[y, x])
+            .unwrap();
+        let xy = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
+        let e = ctx.mk_eq(a, yx).unwrap();
+        let d = ctx.mk_eq(a, xy).unwrap();
+        let peel_empty = ctx.mk_eq(y, empty).unwrap();
+
+        let mut solver = StrSolver::default();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        solver.new_var(&mut cx, Var::new(0), e);
+        solver.new_var(&mut cx, Var::new(1), d);
+        solver.test_force_eq_true_at(e, 1);
+        solver.test_force_diseq_true_at(d, 1);
+        let mut saw_peel = false;
+        for _ in 0..64 {
+            match solver.check(&mut cx, Effort::Full) {
+                TCheck::Split { atoms, .. } => {
+                    if atoms.contains(&peel_empty) {
+                        saw_peel = true;
+                        break;
+                    }
+                }
+                TCheck::Sat | TCheck::Unknown => break,
+                TCheck::Conflict(_) => break,
+            }
+        }
+        assert!(
+            saw_peel,
+            "a conditional `\"A\" = y ++ x` must be char-peeled on `y` (H3)"
+        );
     }
 }
 
