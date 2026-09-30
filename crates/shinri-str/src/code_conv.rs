@@ -18,8 +18,8 @@
 //! (`0xD800..=0xDFFF`) even though the SMT-LIB alphabet includes them —
 //! `from_code(<surrogate k>)` never folds and `to_code(s) = <surrogate k>`
 //! never rewrites; both survive to the fence. Input literals cannot contain
-//! surrogates (the parser does not decode `\u{...}` escapes), so the
-//! literal side of an equality needs no surrogate case.
+//! surrogates (the parser rejects a surrogate `\u` escape as unsupported,
+//! slice 51), so the literal side of an equality needs no surrogate case.
 
 use rustc_hash::FxHashMap;
 use shinri_core::{BuiltinOp, Context, Integer, Op, Rational, TermId, TermNode};

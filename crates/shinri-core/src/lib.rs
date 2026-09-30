@@ -7,6 +7,7 @@ pub mod context;
 pub mod error;
 pub mod ids;
 pub mod proof;
+pub mod smtlib_string;
 pub mod sort;
 pub mod symbol;
 pub mod term;

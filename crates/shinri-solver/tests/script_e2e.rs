@@ -1649,3 +1649,95 @@ fn lt_with_constant_pins_is_unsat_via_folding() {
     );
     assert_eq!(out, vec!["unsat"]);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 51: SMT-LIB 2.6 `\u` escapes in string literals (spec §1.2, §3).
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn slice51_escape_decodes_to_same_char_sat() {
+    // Spec §1.2: "\u{61}" IS "a". Pre-slice the escape was 6 literal chars.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-const X String)
+           (assert (= X "\u{61}"))(assert (= X "a"))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn slice51_control_char_is_not_a_letter_unsat() {
+    // Spec §1.2, minimised from QF_S instance10773: undecoded "\u{1}" contains
+    // the letter `u`, so it wrongly matched Σ*[a-z]Σ*.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-const X String)
+           (assert (= X "\u{1}"))
+           (assert (str.in_re X (re.++ (re.* re.allchar) (re.range "a" "z") (re.* re.allchar))))
+           (check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn slice51_newline_escape_is_one_char_unsat() {
+    // Minimised from QF_S instance09174: after the letter pair "am" only ONE
+    // char ("\u{a}") follows, so ..{4} cannot match. Undecoded, five follow.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-const X String)
+           (assert (str.in_re X (re.++ (str.to_re "1:00 am") (str.to_re "\u{a}"))))
+           (assert (str.in_re X (re.++ (re.* re.allchar) (re.range "a" "z") (re.range "a" "z")
+                                       ((_ re.loop 4 4) re.allchar) (re.* re.allchar))))
+           (check-sat)"#,
+    );
+    assert_eq!(out, vec!["unsat"]);
+}
+
+#[test]
+fn slice51_escaped_range_endpoints_sat() {
+    // Review Focus 1: escaped re.range endpoints are single characters.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-const X String)
+           (assert (= X "q"))(assert (str.in_re X (re.range "\u{61}" "\u{7a}")))(check-sat)"#,
+    );
+    assert_eq!(out, vec!["sat"]);
+}
+
+#[test]
+fn slice51_get_value_encodes_control_and_backslash() {
+    // Spec §3.2: NUL and backslash print as \u{..}. The length pin makes this
+    // red on main, where the literal is 12 undecoded chars.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-const X String)
+           (assert (= X "\u{0}\u{5c}"))(assert (= (str.len X) 2))
+           (check-sat)(get-value (X))"#,
+    );
+    assert_eq!(
+        out,
+        vec!["sat".to_string(), r#"((X "\u{0}\u{5c}"))"#.to_string()]
+    );
+}
+
+#[test]
+fn slice51_get_value_encodes_raw_newline() {
+    // Review Focus 5: a raw newline typed inside the literal prints escaped.
+    let out = run_script(
+        "(set-logic QF_S)(declare-const X String)\
+         (assert (= X \"a\n\"))(check-sat)(get-value (X))",
+    );
+    assert_eq!(
+        out,
+        vec!["sat".to_string(), r#"((X "a\u{a}"))"#.to_string()]
+    );
+}
+
+#[test]
+fn slice51_surrogate_escape_is_error() {
+    // Spec §3.1 rule 7 / §3.3: a surrogate escape is a clean error, never a verdict.
+    let out = run_script(
+        r#"(set-logic QF_S)(declare-const X String)
+           (assert (= X "\u{d800}"))(check-sat)"#,
+    );
+    assert!(
+        out[0].starts_with("(error \"unsupported: surrogate"),
+        "expected a surrogate error first, got {out:?}"
+    );
+}

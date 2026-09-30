@@ -126,7 +126,7 @@ pub fn format_modelval(v: &ModelVal) -> String {
         }
         ModelVal::Num(r) => format_rational(r),
         ModelVal::Elem(_, idx) => format!("@elem{idx}"),
-        ModelVal::String(s) => format!("\"{}\"", s.replace('"', "\"\"")),
+        ModelVal::String(s) => shinri_core::smtlib_string::encode_literal(s),
         ModelVal::BitVec(width, val) => {
             if width % 4 == 0 {
                 // Format as #x with width/4 hex digits.
@@ -193,6 +193,10 @@ mod format_tests {
         assert_eq!(
             format_modelval(&ModelVal::String("a\"b".into())),
             "\"a\"\"b\""
+        );
+        assert_eq!(
+            format_modelval(&ModelVal::String("\n\\\u{0}".into())),
+            r#""\u{a}\u{5c}\u{0}""#
         );
     }
 

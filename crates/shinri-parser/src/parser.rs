@@ -1,6 +1,7 @@
 use crate::env::Env;
 use crate::lexer::{Lexer, Span, Token};
 use rustc_hash::FxHashSet;
+use shinri_core::smtlib_string::{decode_literal, LiteralError};
 use shinri_core::{Context, Rational, SortId, SymbolId, TermId};
 use shinri_frontend::Command;
 use shinri_num::Integer;
@@ -474,9 +475,16 @@ impl<'a> Parser<'a> {
                 Ok(ctx.mk_bv_const(width, value))
             }
             Token::Str(s) => {
-                // Strip outer quotes and unescape "" -> " (SMT-LIB string literal syntax).
-                let raw = &s[1..s.len() - 1];
-                let val = raw.replace("\"\"", "\"");
+                // Strip the outer quotes, then decode `""` and the 2.6 `\u`
+                // escapes. A surrogate escape is unrepresentable in `str`, so it
+                // is a clean error, never a verdict on a mis-read literal.
+                let body = &s[1..s.len() - 1];
+                let val = decode_literal(body).map_err(|LiteralError::Surrogate { .. }| {
+                    Diagnostic::new(
+                        sp.clone(),
+                        "unsupported: surrogate code point in string literal",
+                    )
+                })?;
                 Ok(ctx.mk_string_const(&val))
             }
             Token::Symbol(name) => self.resolve_leaf(ctx, &name, sp),

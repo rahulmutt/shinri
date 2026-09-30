@@ -21,3 +21,15 @@ fn roundtrips_core_terms() {
     roundtrip("(ite true 1.0 2.0)", |_, _| {});
     roundtrip("(= 1.0 1.0)", |_, _| {});
 }
+
+#[test]
+fn roundtrips_string_literals_with_escapes() {
+    // Slice 51: print must re-encode so that re-parse yields the same TermId.
+    roundtrip(r#""plain""#, |_, _| {});
+    roundtrip(r#""a""b""#, |_, _| {});
+    roundtrip(r#""\u{0}\u{a}\u{7f}é""#, |_, _| {});
+    // A decoded backslash followed by `u{61}` must NOT re-parse as "a".
+    roundtrip(r#""\u{5c}u{61}""#, |_, _| {});
+    roundtrip(r#""\u{2FFFF}""#, |_, _| {});
+    roundtrip(r#""\u{22}""""#, |_, _| {});
+}

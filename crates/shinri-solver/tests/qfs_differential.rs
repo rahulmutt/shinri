@@ -4594,3 +4594,147 @@ fn fence_uf_over_string() {
         "UF-over-string must fence to Unknown"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 51: escaped string literals. Each group spells ONE character several
+// ways, plain and escaped, all valid SMT-LIB 2.6 that z3 decodes identically.
+// A decoder mismatch between shinri and z3 surfaces as a verdict
+// disagreement or a witness failure.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const ESC_SPELLINGS: &[&[&str]] = &[
+    &["a", "\\u{61}", "\\u0061", "\\u{00061}"],
+    &["b", "\\u{62}", "\\u{0062}"],
+    &["\\u{0}", "\\u0000"],
+    &["\\u{a}", "\\u000A"],
+    &["\\u{5c}", "\\u005c"],
+    &["\\u{1f600}", "\\u{1F600}"],
+    &["\\u{22}", "\"\""],
+];
+
+const ESC_N_ITERS: usize = 200;
+
+struct EscGen {
+    rng: Lcg,
+}
+
+impl EscGen {
+    /// One character, spelled at random.
+    fn spelled_char(&mut self) -> &'static str {
+        let group = ESC_SPELLINGS[self.rng.below(ESC_SPELLINGS.len() as u64) as usize];
+        group[self.rng.below(group.len() as u64) as usize]
+    }
+
+    /// A quoted literal of `lo..=hi` characters.
+    fn lit(&mut self, lo: u64, hi: u64) -> String {
+        let n = lo + self.rng.below(hi - lo + 1);
+        let body: String = (0..n).map(|_| self.spelled_char()).collect();
+        format!("\"{body}\"")
+    }
+
+    fn atom(&mut self) -> String {
+        let v = ["s0", "s1"][self.rng.below(2) as usize];
+        match self.rng.below(7) {
+            0 => {
+                // Non-empty, like the base family's `lit`: `""` would reach the
+                // known empty-length seam, which is not what this test is for.
+                let l = self.lit(1, 3);
+                format!("(= {v} {l})")
+            }
+            1 => {
+                let (l, r) = (self.lit(1, 2), self.lit(1, 2));
+                format!("(= {v} (str.++ {l} {r}))")
+            }
+            2 => format!("(= (str.len {v}) {})", self.rng.below(4)),
+            3 => {
+                let l = self.lit(1, 2);
+                format!(
+                    "(str.in_re {v} (re.++ (re.* re.allchar) (str.to_re {l}) (re.* re.allchar)))"
+                )
+            }
+            4 => {
+                let c = self.lit(1, 1);
+                format!("(str.in_re {v} (re.range {c} {c}))")
+            }
+            5 => {
+                let l = self.lit(1, 2);
+                format!("(str.prefixof {l} {v})")
+            }
+            _ => "(= s0 s1)".to_owned(),
+        }
+    }
+
+    fn body(seed: u64) -> String {
+        let mut g = EscGen { rng: Lcg(seed) };
+        let mut s = String::from(
+            "(set-logic QF_S)\n(declare-const s0 String)\n(declare-const s1 String)\n",
+        );
+        for _ in 0..2 + g.rng.below(3) {
+            let a = g.atom();
+            if g.rng.below(3) == 0 {
+                s.push_str(&format!("(assert (not {a}))\n"));
+            } else {
+                s.push_str(&format!("(assert {a})\n"));
+            }
+        }
+        s
+    }
+}
+
+#[test]
+fn qfs_escaped_literals_match_z3() {
+    let mut rng = Lcg(0x51_51_0000_0001u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..ESC_N_ITERS {
+        let seed = rng.next();
+        let body = EscGen::body(seed);
+        let script = format!("{body}(check-sat)\n");
+        let ours = shinri_verdict(&script);
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&script);
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S ESCAPED-LITERAL DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{script}"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let lines = shinri_lines(&format!("{script}(get-value (s0 s1))\n"));
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        assert_eq!(
+                            z3_with_model(&body, &model),
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    // Equality, length, contains, single-char range and prefixof are all in
+    // the decided fragment. A low decided count means the generator drifted.
+    assert!(
+        n_sat + n_unsat > ESC_N_ITERS / 4,
+        "too few decided rows: {n_sat} sat / {n_unsat} unsat of {ESC_N_ITERS}"
+    );
+    println!(
+        "qfs_escaped_literals_match_z3: {ESC_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown / {n_z3skip} z3-unknown; {n_witness} witnesses; 0 disagreements"
+    );
+}
