@@ -9,9 +9,8 @@
 //! `distinct_form`, `xor_form`, `not_distinct_form`, and `bool_proxy` are unsat.
 //! `ab_prefix_h2` is sat in z3 (valid model x="B", y="A"); shinri today returns
 //! sat with a bogus model (H2 queued hole); after Task 2 the gate turns that into
-//! a sound `unknown`. After Task 4, `distinct_form` and `xor_form` are a sound
-//! `unknown` (asserted `!= sat`; the deep-nf propagate is queued), and
-//! `bool_proxy` remains a known wrong `sat`, `#[ignore]`d and queued.
+//! a sound `unknown`. `bool_proxy` is expected to stay red through Tasks 2 and 3
+//! and turn green at Task 4.
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
 
@@ -98,35 +97,25 @@ fn r2_both_vars_diseq() {
     );
 }
 
-/// z3 says unsat. After Task 4 this is a sound `unknown`: the minted branch
-/// `y = "A"++k` Saturates on a single-level normal form and never derives
-/// `[] = [k, x]`. A deep-nf re-resolve that emits only a cited Propagate is
-/// queued for a later slice. Must never be `sat`.
 #[test]
 fn distinct_form() {
-    assert_ne!(
+    assert_eq!(
         verdict(r#"(assert (distinct (= "A" (str.++ y x)) (= "A" (str.++ x y))))"#),
-        "sat"
+        "unsat"
     );
 }
 
-/// z3 says unsat. After Task 4 this is a sound `unknown`: the minted branch
-/// `y = "A"++k` Saturates on a single-level normal form and never derives
-/// `[] = [k, x]`. A deep-nf re-resolve that emits only a cited Propagate is
-/// queued for a later slice. Must never be `sat`.
 #[test]
 fn xor_form() {
-    assert_ne!(
+    assert_eq!(
         verdict(r#"(assert (xor (= "A" (str.++ y x)) (= "A" (str.++ x y))))"#),
-        "sat"
+        "unsat"
     );
 }
 
-/// Known wrong `sat` (z3: unsat), queued: the model gate cannot evaluate the
-/// Bool constant `p` (spec §9 audit), and the minted-branch deep-nf propagate
-/// (see `distinct_form`) is not derived. Kept asserting `unsat` but ignored.
+/// Stays red (returns `sat`) through Tasks 2 and 3: the gate cannot evaluate the
+/// Bool constant `p` (spec §9 audit). It turns green (unsat) at Task 4 (H3).
 #[test]
-#[ignore = "known wrong sat, queued: eval_bool cannot evaluate the Bool constant p (spec §9 audit) and the minted-branch deep-nf propagate"]
 fn bool_proxy() {
     assert_eq!(
         verdict(

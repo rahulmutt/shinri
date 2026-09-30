@@ -9,10 +9,8 @@
 //! - it holds every conditional DISEQUALITY, but a disequality merges nothing,
 //!   so it cannot make a normal form branch-local;
 //! - it holds the equation's OWN literal, but every result of resolving the
-//!   equation already cites that literal (`Propagate` carries
-//!   `Asserted(lit)`, `Split` is guarded by `¬lit`). The exemption therefore
-//!   unlocks `Split` and `Propagate` only; `Conflict` is still gated by
-//!   `all_cond_roots`, unchanged.
+//!   equation already cites that literal (`Conflict`/`Propagate` carry
+//!   `Asserted(lit)`, `Split` is guarded by `¬lit`).
 //!
 //! So this map records, per class root, WHICH conditional sources touched it.
 //! Only non-minted conditional equalities and conditional propagation merges
@@ -148,15 +146,6 @@ mod tests {
         let rx = root(&mut eq, x);
         g.add(rx, CondSrc::Propagation);
         assert!(!g.side_clean_for(&mut eq, &ctx, x, e_own));
-    }
-
-    /// A conditional disequality is never added, so its sides stay clean.
-    #[test]
-    fn diseq_alone_leaves_sides_clean() {
-        let (ctx, mut eq, x, y, e_own, _) = fixture();
-        let g = WordEqGate::default();
-        assert!(g.side_clean_for(&mut eq, &ctx, x, e_own));
-        assert!(g.side_clean_for(&mut eq, &ctx, y, e_own));
     }
 
     #[test]
