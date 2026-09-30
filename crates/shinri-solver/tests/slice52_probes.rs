@@ -4,8 +4,11 @@
 //! Written BEFORE the implementation. On `main` (`7bd2279`) every `unsat` pin
 //! fails: `sat` for the Bool-`=`/`distinct`/proxy forms, and `unknown`
 //! (`str-model-rejected`) for R1, R2 and `xor`. The SAT controls pass, and
-//! each control's model is re-checked here by hand. z3 4.16.0 confirms every
-//! `unsat` pin.
+//! each control's model is re-checked here by hand. z3 4.16.0 confirms
+//! `noetzli_370`, `noetzli_458`, `r1_unit_diseq`, `distinct_form`, `xor_form`,
+//! `not_distinct_form`, and `bool_proxy` are unsat. `ab_prefix_h2` is sat in z3
+//! with a bogus model (H2 queued hole); shinri today produces the same bogus sat;
+//! after Task 2 the gate turns that into a sound `unknown`.
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
 
@@ -108,8 +111,8 @@ fn xor_form() {
     );
 }
 
-/// Stays `sat` after Task 2: the gate cannot evaluate the Bool constant `p`
-/// (spec §9 audit). It turns `unsat` at Task 4 (H3).
+/// Stays red (returns `sat`) through Tasks 2 and 3: the gate cannot evaluate the
+/// Bool constant `p` (spec §9 audit). It turns green (unsat) at Task 4 (H3).
 #[test]
 fn bool_proxy() {
     assert_eq!(
@@ -131,15 +134,30 @@ fn not_distinct_form() {
     );
 }
 
-/// H2 (constant-prefix residual) is QUEUED (spec §9). Today it answers `sat`
-/// with a bogus model. After Task 2 the gate turns it into a sound `unknown`.
-/// If a later slice fixes H2, change this to `unsat` on purpose.
+/// Soundness check for H2 (constant-prefix residual, queued per spec §9). z3 says
+/// sat with a valid model (x="B", y="A"). shinri today produces a bogus sat with an
+/// invalid model. After Task 2 the gate turns that into a sound `unknown`. If a later
+/// slice solves H2, it will produce a correct `sat` or `unsat`.
 #[test]
 fn ab_prefix_h2() {
-    assert_ne!(
-        verdict(r#"(assert (not (= (= "AB" (str.++ y x)) (= "AB" (str.++ x y)))))"#),
-        "sat"
-    );
+    let out = run_script(&format!(
+        "(set-option :produce-models true){XY}(assert (not (= (= \"AB\" (str.++ y x)) (= \"AB\" (str.++ x y)))))(check-sat)(get-model)"
+    ));
+    let verdict = out.first().cloned().unwrap_or_default();
+    assert_ne!(verdict, "unsat");
+    if verdict == "sat" {
+        let model = &out[1];
+        let x = model_str(model, "x");
+        let y = model_str(model, "y");
+        // With z3's model (x="B", y="A"): y++x="AB", x++y="BA".
+        // Assertion: ¬((y++x="AB") = (x++y="AB"))
+        // ≡ ¬(true = false) ≡ ¬false ≡ true ✓
+        assert_ne!(
+            format!("{y}{x}") == "AB",
+            format!("{x}{y}") == "AB",
+            "model must satisfy the assertion: y={y}, x={x}"
+        );
+    }
 }
 
 #[test]
