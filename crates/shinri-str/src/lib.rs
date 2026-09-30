@@ -800,11 +800,10 @@ impl TheorySolver for StrSolver {
             // (ungated) direct/transitive distinct-const checks above; any SAT this
             // admits is re-validated by the model gate; skipped ⟹ saturated (no
             // fabricated verdict).
-            // Slice 52: this gate now reads `wordeq_gate` (own literal exempt,
-            // disequalities excluded); see wordeq_gate.rs.
-            // Slice 52 (H3): gate on `wordeq_gate`, not `input_cond_roots`: this
-            // equation's OWN literal is cited by everything resolution emits,
-            // and conditional disequalities merge nothing (spec §3.3).
+            // Slice 52 (H3): this gate reads `wordeq_gate`, not
+            // `input_cond_roots`: the equation's OWN literal is cited by
+            // everything resolution emits, and conditional disequalities merge
+            // nothing (spec §3.3); see wordeq_gate.rs.
             if wordeq_gate.side_clean_for(cx.eq, cx.terms, l, atom)
                 && wordeq_gate.side_clean_for(cx.eq, cx.terms, r, atom)
             {
