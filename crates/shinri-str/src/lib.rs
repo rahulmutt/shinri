@@ -123,6 +123,9 @@ pub struct StrSolver {
     memb_minted_eqs: FxHashSet<TermId>,
     /// Counter for fresh string skolem variables minted by F-split.
     fresh_ctr: u32,
+    /// Set once an H1 propagation merged a var into `""`: arith then needs the
+    /// numeral 0 as a shared term to receive `len(var) = 0`. Monotone.
+    empty_merged: bool,
     fuel: Fuel,
     trail: trail::Trail,
 }
@@ -953,41 +956,42 @@ impl TheorySolver for StrSolver {
                                     all_cond_roots.insert(r);
                                     input_cond_roots.insert(r);
                                 }
+                                // Slice 52 (H1): a merge into `""` must reach arith as
+                                // `len(var) = 0`, else arith picks lengths inconsistent
+                                // with it (the model gate then yields `unknown`). Merge
+                                // `str.len(var)` with the numeral 0 in the SHARED engine
+                                // under the SAME tag, so the N-O exchange forwards it to
+                                // arith and the conflict/explain path cites every
+                                // antecedent of the merge (no global lemma, no guard).
+                                if cx.terms.string_const_value(word) == Some("") {
+                                    let len_v = cx
+                                        .terms
+                                        .mk_app(Op::Builtin(BuiltinOp::StrLen), &[var])
+                                        .expect("str.len(var) well-sorted");
+                                    let int_s = cx.terms.int_sort();
+                                    let zero = cx.terms.mk_numeral(
+                                        shinri_core::Rational::from_int(0i128.into()),
+                                        int_s,
+                                    );
+                                    self.len_terms.insert(len_v);
+                                    self.empty_merged = true;
+                                    let (ln, zn) = (cx.eq.intern(len_v), cx.eq.intern(zero));
+                                    if let Err(conflict) = cx.eq.merge(
+                                        ln,
+                                        zn,
+                                        EqJust::Interface(TheoryJust {
+                                            theory: <StrSolver as TheorySolver>::THEORY_ID,
+                                            tag,
+                                        }),
+                                    ) {
+                                        return TCheck::Conflict(prop_merge_conflict(
+                                            cx.eq, conflict, tag,
+                                        ));
+                                    }
+                                }
                             }
                             Err(conflict) => {
-                                // The merge united a KNOWN-DISEQUAL pair — e.g.
-                                // `y ≈ "ab"` against an asserted `distinct y "ab"`.
-                                // Assemble the conflict in the SAME three parts as
-                                // `Egraph::conflict_leaves` (shinri-euf/src/egraph.rs:441-479);
-                                // this is that pattern specialised to a merge whose
-                                // justification is a single Interface tag.
-                                let mut cf: Vec<EqLeaf> = Vec::new();
-                                // Part 1: why `var = word` was being merged. Our
-                                // justification IS the interface tag, which the
-                                // Combiner expands via StrSolver::explain back to
-                                // `just` (the antecedent set we just allocated).
-                                cf.push(EqLeaf::Interface(TheoryJust {
-                                    theory: <StrSolver as TheorySolver>::THEORY_ID,
-                                    tag,
-                                }));
-                                // Part 2: bridge the merged nodes to the disequality's
-                                // ASSERTED endpoints. Orient by representative — pair
-                                // `a` with whichever endpoint is already in a's class.
-                                let ra = cx.eq.find(conflict.a);
-                                let (a_end, b_end) = if cx.eq.find(conflict.diseq_lhs) == ra {
-                                    (conflict.diseq_lhs, conflict.diseq_rhs)
-                                } else {
-                                    (conflict.diseq_rhs, conflict.diseq_lhs)
-                                };
-                                cx.eq.explain(conflict.a, a_end, &mut cf);
-                                cx.eq.explain(conflict.b, b_end, &mut cf);
-                                // Part 3: the disequality that was violated.
-                                match conflict.diseq {
-                                    EqJust::Asserted(l) => cf.push(EqLeaf::Asserted(l)),
-                                    EqJust::Interface(j) => cf.push(EqLeaf::Interface(j)),
-                                    EqJust::Congruence(_) | EqJust::Definitional => {}
-                                }
-                                return TCheck::Conflict(cf);
+                                return TCheck::Conflict(prop_merge_conflict(cx.eq, conflict, tag));
                             }
                         }
                     }
@@ -1486,10 +1490,12 @@ impl TheorySolver for StrSolver {
         // justification. We add `0` ONLY in the presence of an empty-side
         // disequality, so unrelated queries see no extra shared term (and the MBTC
         // arrangement set is unperturbed for them).
-        let has_empty_diseq = self.diseq_true.iter().any(|&(atom, _)| {
-            let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
-            cx.terms.string_const_value(l) == Some("") || cx.terms.string_const_value(r) == Some("")
-        });
+        let has_empty_diseq = self.empty_merged
+            || self.diseq_true.iter().any(|&(atom, _)| {
+                let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
+                cx.terms.string_const_value(l) == Some("")
+                    || cx.terms.string_const_value(r) == Some("")
+            });
         if has_empty_diseq {
             let int_s = cx.terms.int_sort();
             let zero = cx
@@ -1501,6 +1507,43 @@ impl TheorySolver for StrSolver {
         }
         out
     }
+}
+
+/// Assemble the conflict for a propagation merge (justified by the single
+/// Interface `tag`) that united a known-disequal pair, in the same three parts
+/// as `Egraph::conflict_leaves` (shinri-euf/src/egraph.rs:441-479).
+fn prop_merge_conflict(
+    eq: &mut EqualityEngine,
+    conflict: shinri_theory::types::EqConflict,
+    tag: u32,
+) -> Vec<EqLeaf> {
+    let mut cf: Vec<EqLeaf> = Vec::new();
+    // Part 1: why `var = word` was being merged. Our
+    // justification IS the interface tag, which the
+    // Combiner expands via StrSolver::explain back to
+    // `just` (the antecedent set we just allocated).
+    cf.push(EqLeaf::Interface(TheoryJust {
+        theory: <StrSolver as TheorySolver>::THEORY_ID,
+        tag,
+    }));
+    // Part 2: bridge the merged nodes to the disequality's
+    // ASSERTED endpoints. Orient by representative — pair
+    // `a` with whichever endpoint is already in a's class.
+    let ra = eq.find(conflict.a);
+    let (a_end, b_end) = if eq.find(conflict.diseq_lhs) == ra {
+        (conflict.diseq_lhs, conflict.diseq_rhs)
+    } else {
+        (conflict.diseq_rhs, conflict.diseq_lhs)
+    };
+    eq.explain(conflict.a, a_end, &mut cf);
+    eq.explain(conflict.b, b_end, &mut cf);
+    // Part 3: the disequality that was violated.
+    match conflict.diseq {
+        EqJust::Asserted(l) => cf.push(EqLeaf::Asserted(l)),
+        EqJust::Interface(j) => cf.push(EqLeaf::Interface(j)),
+        EqJust::Congruence(_) | EqJust::Definitional => {}
+    }
+    cf
 }
 
 impl StrSolver {
@@ -2065,6 +2108,61 @@ mod tests {
             "positive StrLeq atom must record is_lt = false (relation, not polarity)"
         );
         assert_eq!(solver.order_levels, vec![0, 0]);
+    }
+}
+
+#[cfg(test)]
+mod slice52_h1_len_tests {
+    use super::*;
+    use shinri_theory::AtomRegistry;
+
+    /// H1 merges `x ≈ ""`; the driver must ALSO merge `str.len(x)` with the
+    /// numeral 0 in the shared engine (so arith learns `len x = 0`) and expose
+    /// 0 as a shared term. `"" = x ++ y` propagates `x` first, then `y`.
+    #[test]
+    fn empty_residual_merge_links_length_to_zero() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let mut var = |n: &str| {
+            let sym = ctx.declare_fun(n, &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap()
+        };
+        let (x, y) = (var("x_h1len"), var("y_h1len"));
+        let cat = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
+        let empty = ctx.mk_string_const("");
+        let atom = ctx.mk_eq(empty, cat).unwrap();
+        let int_s = ctx.int_sort();
+        let zero = ctx.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
+        let len_x = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
+        let len_y = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[y]).unwrap();
+
+        let mut s = StrSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        s.test_force_str_term(x);
+        s.test_force_str_term(y);
+        s.test_force_eq_true(atom);
+        // Each check round reports one propagation (x first, then y); extra
+        // rounds after the length axioms settle.
+        for _ in 0..20 {
+            let _ = s.check(&mut cx, Effort::Full);
+        }
+        let zn = cx.eq.intern(zero);
+        for len in [len_x, len_y] {
+            let ln = cx.eq.intern(len);
+            assert!(
+                cx.eq.are_equal(ln, zn),
+                "len of a merged-empty var must be 0"
+            );
+        }
+        assert!(s.shared_arith_terms(&mut cx).contains(&zero));
     }
 }
 

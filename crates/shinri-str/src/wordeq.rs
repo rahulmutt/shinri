@@ -853,18 +853,14 @@ fn resolve_inner(
         // into `""` is a constant fact, not a union (spec §3.2). The driver
         // cites `nf_ante` alongside `just`, as for every `Propagate`.
         //
-        // KNOWN LIMIT (found in T3 review): the merge is conditional (it cites
-        // the equation literal and, after a char-peel/F-split, the minted
-        // `y = "A" ++ !strk` literal), but the arith side only learns
-        // `len(v) = 0` from a dl0-entailed class constant (`length::next_axiom`),
-        // and `TCheck::Split` carries a single guard literal, so no sound
-        // multi-antecedent length lemma is emitted here. Arith may therefore
-        // choose lengths inconsistent with the merge (e.g. `len y = 0` while
-        // `y = "A" ++ !strk`, `!strk ≈ ""`); the post-solve model gate then
-        // turns the result into a sound `unknown` (`"A" = y ++ x` with
-        // `len y = 0`, sat at base, is `unknown` now). The model builder must
-        // NOT paper over this by overriding arith lengths: that hides a real
-        // string/arith conflict (wrong `sat`).
+        // Arith link (found in T3 review): the merge is conditional, and arith
+        // only learns `len(v) = 0` from a dl0 class constant, so on its own it
+        // could pick lengths inconsistent with the merge (`len y = 0` while
+        // `y = "A" ++ !strk`, `!strk ≈ ""`) and the model gate would downgrade a
+        // genuine `sat` to `unknown`. The `Propagate` driver (lib.rs) therefore
+        // also merges `str.len(v)` with the numeral 0 under the same tag. The
+        // model builder must NOT override arith lengths instead: that would hide
+        // a real string/arith conflict (wrong `sat`).
         let empty_vs_vars = match (l_res.is_empty(), r_res.is_empty()) {
             (true, false) => Some(r_res),
             (false, true) => Some(l_res),
