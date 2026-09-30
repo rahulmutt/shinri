@@ -5,10 +5,12 @@
 //! fails: `sat` for the Bool-`=`/`distinct`/proxy forms, and `unknown`
 //! (`str-model-rejected`) for R1, R2 and `xor`. The SAT controls pass, and
 //! each control's model is re-checked here by hand. z3 4.16.0 confirms
-//! `noetzli_370`, `noetzli_458`, `r1_unit_diseq`, `distinct_form`, `xor_form`,
-//! `not_distinct_form`, and `bool_proxy` are unsat. `ab_prefix_h2` is sat in z3
-//! with a bogus model (H2 queued hole); shinri today produces the same bogus sat;
-//! after Task 2 the gate turns that into a sound `unknown`.
+//! `noetzli_370`, `noetzli_458`, `r1_unit_diseq`, `r2_both_vars_diseq`,
+//! `distinct_form`, `xor_form`, `not_distinct_form`, and `bool_proxy` are unsat.
+//! `ab_prefix_h2` is sat in z3 (valid model x="B", y="A"); shinri today returns
+//! sat with a bogus model (H2 queued hole); after Task 2 the gate turns that into
+//! a sound `unknown`. `bool_proxy` is expected to stay red through Tasks 2 and 3
+//! and turn green at Task 4.
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
 
@@ -149,9 +151,10 @@ fn ab_prefix_h2() {
         let model = &out[1];
         let x = model_str(model, "x");
         let y = model_str(model, "y");
-        // With z3's model (x="B", y="A"): y++x="AB", x++y="BA".
-        // Assertion: ¬((y++x="AB") = (x++y="AB"))
-        // ≡ ¬(true = false) ≡ ¬false ≡ true ✓
+        // Check if shinri's model satisfies the assertion.
+        // z3's valid model (x="B", y="A"): y++x="AB", x++y="BA",
+        // ¬((y++x="AB") = (x++y="AB")) ≡ ¬(true = false) ≡ true ✓
+        // shinri's bogus model today does not satisfy this check.
         assert_ne!(
             format!("{y}{x}") == "AB",
             format!("{x}{y}") == "AB",
