@@ -1672,6 +1672,19 @@ impl Solver {
             return None;
         }
         let sort0 = self.ctx.sort_of(kids[0]);
+        // Slice 52: a Bool-sorted `=`/`distinct` (iff/xor over two formulas —
+        // the Noetzli shape `(= (= "A" y++x) (= "A" x++y))`). Before this arm it
+        // fell through to `None`, which the gate reads as SATISFIED, so a bogus
+        // model passed. Same three-valued rule as the `xor` arm of `eval_bool`.
+        if sort0 == self.ctx.bool_sort() {
+            let a = self.eval_bool(kids[0], model)?;
+            let b = self.eval_bool(kids[1], model)?;
+            return match op {
+                Op::Builtin(BuiltinOp::Eq) => Some(a == b),
+                Op::Builtin(BuiltinOp::Distinct) => Some(a != b),
+                _ => None,
+            };
+        }
         if sort0 == self.ctx.string_sort() {
             let a = self.eval_str_val(model, kids[0])?;
             let b = self.eval_str_val(model, kids[1])?;
@@ -3442,5 +3455,77 @@ mod bv_model_tests {
             "expected x=3 in model, got: {m}"
         );
         // No panic is the main assertion; y may or may not appear.
+    }
+}
+
+#[cfg(test)]
+mod slice52_gate_tests {
+    use super::*;
+    use shinri_core::{BuiltinOp, Op, TermId};
+    use shinri_theory::types::ModelVal;
+
+    /// `(x, y, e1, e2)` with `e1 = (= "A" (str.++ y x))`, `e2 = (= "A" (str.++ x y))`.
+    fn noetzli_atoms(s: &mut Solver) -> (TermId, TermId, TermId, TermId) {
+        let ss = s.ctx_mut().string_sort();
+        let xf = s.declare_fun("x", &[], ss);
+        let x = s.app(Op::Uninterpreted(xf), &[]);
+        let yf = s.declare_fun("y", &[], ss);
+        let y = s.app(Op::Uninterpreted(yf), &[]);
+        let a = s.ctx_mut().mk_string_const("A");
+        let yx = s.app(Op::Builtin(BuiltinOp::StrConcat), &[y, x]);
+        let xy = s.app(Op::Builtin(BuiltinOp::StrConcat), &[x, y]);
+        let e1 = s.eq(a, yx);
+        let e2 = s.eq(a, xy);
+        (x, y, e1, e2)
+    }
+
+    fn model(pairs: &[(TermId, &str)]) -> Model {
+        let mut m = Model::default();
+        for &(t, v) in pairs {
+            m.values.insert(t, ModelVal::String(v.to_owned()));
+        }
+        m
+    }
+
+    #[test]
+    fn bool_eq_of_two_false_atoms_is_true() {
+        let mut s = Solver::new();
+        let (x, y, e1, e2) = noetzli_atoms(&mut s);
+        let m = model(&[(x, ""), (y, "E")]);
+        let iff = s.eq(e1, e2);
+        assert_eq!(s.eval_bool(iff, &m), Some(true));
+        let not_iff = s.app(Op::Builtin(BuiltinOp::Not), &[iff]);
+        assert_eq!(s.eval_bool(not_iff, &m), Some(false));
+    }
+
+    /// The exact Noetzli `_370` escape: the bogus model must be REJECTED.
+    #[test]
+    fn gate_rejects_noetzli_bogus_model() {
+        let mut s = Solver::new();
+        let (x, y, e1, e2) = noetzli_atoms(&mut s);
+        let iff = s.eq(e1, e2);
+        let assertion = s.app(Op::Builtin(BuiltinOp::Not), &[iff]);
+        let m = model(&[(x, ""), (y, "E")]);
+        assert!(!s.string_model_satisfies(&[assertion], &m));
+    }
+
+    #[test]
+    fn bool_distinct_of_two_true_atoms_is_false() {
+        let mut s = Solver::new();
+        let (x, y, e1, e2) = noetzli_atoms(&mut s);
+        let m = model(&[(x, ""), (y, "A")]);
+        let d = s.app(Op::Builtin(BuiltinOp::Distinct), &[e1, e2]);
+        assert_eq!(s.eval_bool(d, &m), Some(false));
+    }
+
+    /// Three-valued: an un-valued leaf makes the Bool `=` undecided, never a
+    /// fabricated verdict.
+    #[test]
+    fn bool_eq_with_unvalued_side_is_none() {
+        let mut s = Solver::new();
+        let (x, _y, e1, e2) = noetzli_atoms(&mut s);
+        let m = model(&[(x, "")]); // y un-valued
+        let iff = s.eq(e1, e2);
+        assert_eq!(s.eval_bool(iff, &m), None);
     }
 }
