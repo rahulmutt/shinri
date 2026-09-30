@@ -170,28 +170,34 @@ set of classes that some conditional input literal could have merged.
 **Two contributors that cannot cause that failure:**
 
 1. **Conditional disequalities merge nothing.** They cannot make a normal form
-   branch-local. They stop contributing to `input_cond_roots`. **They still
-   contribute to `all_cond_roots`**, which gates the global same-word
-   conflicts, so that gate keeps its current conservatism.
+   branch-local, so they do not contribute to the word-equation gate's view
+   (below). **`input_cond_roots` and `all_cond_roots` are unchanged**: the
+   membership channel (`memb::memb_check`), the order channel
+   (`order_engine::order_fold_check`) and the global same-word conflicts keep
+   reading them exactly as today.
 2. **The equation's own literal.** Every result of resolving equation `e`
    already carries `lit(e)`: `Conflict` and `Propagate` cite
    `EqLeaf::Asserted(lit)`, and `Split` is guarded by `¬lit`. A merge caused
    only by `e` is therefore covered by its own citation.
 
-**Mechanics.** Replace the plain set with a contributor map,
+**Mechanics.** Add a second structure, used **only** by the word-equation
+gate at `lib.rs:773`: a contributor map,
 `input_cond_contrib: FxHashMap<ENodeId, SmallVec<[CondSrc; 2]>>` with
 `enum CondSrc { Eq(TermId), Propagation }`, mapping each root to what touched
-it: a conditional input equality atom, or a level > 0 propagation merge. For equation `e`, a side
-is clean iff its root is absent, or every contributor to it is `e`.
-`side_clean` takes a predicate (or the map plus the exempt atom) instead of the
-set.
+it: a conditional input equality atom, or a level > 0 propagation merge. Only conditional
+(level > 0), non-minted `eq_true` atoms and level > 0 propagation merges are
+added. For equation `e`, a side is clean iff no flattened atom's root has a
+contributor other than `CondSrc::Eq(e)`. The map lives in a new focused module
+`crates/shinri-str/src/wordeq_gate.rs`; `side_clean` itself is unchanged.
 
-- The propagation fold-in (`prop_merge_info`) and the intra-check `Ok(())`-arm
-  insertion stay, recorded as `CondSrc::Propagation`, which is never exempt.
-- The debug-only E1 soundness invariant after the construction gets the same
-  own-literal exemption, so debug builds keep checking it.
-- Other readers of `input_cond_roots`, if any, keep today's semantics
-  (they treat any contributor as dirty). The plan lists every reader.
+- The propagation fold-in (`prop_merge_info`) feeds the map as
+  `CondSrc::Propagation`, which is never exempt.
+- At the intra-check propagation merge (the `Ok(())` arm), the map moves the
+  contributors of both pre-merge roots onto the post-merge root (at any
+  level), and adds `CondSrc::Propagation` when level > 0. This is at least as
+  conservative as the existing set insertion.
+- The debug-only E1 soundness invariant checks antecedent kinds, not set
+  membership, so it needs no change.
 
 **Fallback (agreed).** If the §6.3 oracle/fuzz runs find a wrong `unsat`, or
 the §7 bench shows any `* → wrong` row, §3.3 is dropped. §3.1 and §3.2 still
@@ -256,11 +262,13 @@ This binary is not oracle-gated.
 
 - **`qfs_differential.rs`:** a new generator family: `=`, `distinct` and `xor`
   over pairs of word equations, whose sides are a constant (length 0–2) and a
-  permuted concat of 2–3 variables. Verdicts are checked against z3 and cvc5,
-  and `sat` models are replayed.
+  permuted concat of 2–3 variables. Verdicts are checked against z3 (the
+  harness is z3-only), and `sat` models are replayed through z3.
 - **`qfs_fuzz_corpus.rs`** (already `#[ignore]`d; it enumerates the ce1..ce8
   class of word equations under `(or …)`): add Bool `=`/`distinct`/`xor`
-  combinations of word equations to its assertion generator. Run it
+  combinations of word equations to its assertion generator, behind the env
+  switch `E1_BOOLEQ=1` so the default sample (and its seed sequence) is
+  unchanged. Run it
   explicitly with `--ignored` before and after T4. **Any new WRONG-UNSAT or
   WRONG-SAT class is a stop**: triage it; if §3.3 caused it, take the fallback.
 - Run with `cargo nextest run -p shinri-solver --features oracle`, and record
