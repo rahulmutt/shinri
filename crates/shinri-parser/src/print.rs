@@ -36,17 +36,9 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
                 }
             }
             ConstVal::String(_) => {
-                // Render as SMT-LIB string literal: "" wraps, internal " is escaped as "".
+                // The inverse of the parser's decode_literal (slice 51).
                 let s = ctx.string_const_value(t).unwrap();
-                out.push('"');
-                for ch in s.chars() {
-                    if ch == '"' {
-                        out.push_str("\"\"");
-                    } else {
-                        out.push(ch);
-                    }
-                }
-                out.push('"');
+                out.push_str(&shinri_core::smtlib_string::encode_literal(s));
             }
             ConstVal::Float(_) => {
                 let (eb, sb, bits) = ctx.fp_const_value(t).expect("Float const");
