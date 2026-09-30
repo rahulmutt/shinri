@@ -43,6 +43,10 @@ pub enum StepResult {
         var: TermId,
         word: TermId,
         just: Vec<EqLeaf>,
+        /// Slice 52: set ONLY by the H1 empty-residual block. The driver then
+        /// also links `str.len(var)` to 0 for arith; every slice-33/34
+        /// single-atom Propagate leaves it `false` (behaviour unchanged).
+        link_len: bool,
     },
     Conflict(Vec<EqLeaf>),
     /// A GUARDED F-split. `atoms` are the fresh-positive disjuncts
@@ -830,6 +834,7 @@ fn resolve_inner(
                 var: l_res[0],
                 word: r_res[0],
                 just,
+                link_len: false,
             };
         }
 
@@ -874,6 +879,7 @@ fn resolve_inner(
                         var: v,
                         word: empty,
                         just,
+                        link_len: true,
                     };
                 }
             }
@@ -891,7 +897,12 @@ fn resolve_inner(
                 );
             }
             let word = terms.mk_string_const(&w);
-            return StepResult::Propagate { var, word, just };
+            return StepResult::Propagate {
+                var,
+                word,
+                just,
+                link_len: false,
+            };
         }
     }
 
@@ -1690,7 +1701,9 @@ mod tests {
             &mut emitted,
         );
         match r {
-            StepResult::Propagate { var, word, just } => {
+            StepResult::Propagate {
+                var, word, just, ..
+            } => {
                 assert_eq!(var, x, "left residual must be reported as `var`");
                 assert_eq!(word, y, "right residual must be reported as `word`");
                 assert!(
@@ -1919,7 +1932,9 @@ mod tests {
             &mut emitted,
         );
         match r {
-            StepResult::Propagate { var, word, just } => {
+            StepResult::Propagate {
+                var, word, just, ..
+            } => {
                 assert_eq!(var, x, "left residual must be reported as `var`");
                 assert_eq!(word, y, "right residual must be reported as `word`");
                 assert!(
@@ -2239,7 +2254,9 @@ mod tests {
         let x = declare_str_var(&mut ctx, "x_h1");
         let y = declare_str_var(&mut ctx, "y_h1");
         match run_empty_vs(&mut ctx, &mut eq, &[x, y]) {
-            StepResult::Propagate { var, word, just } => {
+            StepResult::Propagate {
+                var, word, just, ..
+            } => {
                 assert_eq!(var, x);
                 assert_eq!(ctx.string_const_value(word), Some(""));
                 assert!(just

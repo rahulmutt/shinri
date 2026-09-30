@@ -199,8 +199,8 @@ fn h1_len_linked_not_sat() {
     assert_ne!(v, "sat", "wrong sat: len y = 0 is violated by any model");
 }
 
-/// Satisfiable variant: the only model is y = "" and x = "A". Red since H1
-/// (unknown): the arith side is not told len(!strk) = 0 after the merge.
+/// Satisfiable variant: the only model is y = "" and x = "A". H1 links
+/// len(v) = 0 to arith after each merge into "", so this stays sat.
 #[test]
 fn ctrl_h1_len_linked() {
     let (x, y) = sat_model(r#"(assert (= "A" (str.++ y x)))(assert (= (+ (str.len y) 1) 1))"#);

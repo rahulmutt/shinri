@@ -894,6 +894,7 @@ impl TheorySolver for StrSolver {
                         var,
                         word,
                         mut just,
+                        link_len,
                     } => {
                         // Cite the normal-form substitution antecedents ALONGSIDE the
                         // asserted equation literal. Under-citing here is the ce2
@@ -963,7 +964,7 @@ impl TheorySolver for StrSolver {
                                 // under the SAME tag, so the N-O exchange forwards it to
                                 // arith and the conflict/explain path cites every
                                 // antecedent of the merge (no global lemma, no guard).
-                                if cx.terms.string_const_value(word) == Some("") {
+                                if link_len {
                                     let len_v = cx
                                         .terms
                                         .mk_app(Op::Builtin(BuiltinOp::StrLen), &[var])
@@ -2118,7 +2119,7 @@ mod slice52_h1_len_tests {
 
     /// H1 merges `x ≈ ""`; the driver must ALSO merge `str.len(x)` with the
     /// numeral 0 in the shared engine (so arith learns `len x = 0`) and expose
-    /// 0 as a shared term. `"" = x ++ y` propagates `x` first, then `y`.
+    /// 0 as a shared term. `"" = x ++ y` propagates `x` (H1), then `y` (single-atom path).
     #[test]
     fn empty_residual_merge_links_length_to_zero() {
         let mut ctx = Context::new();
@@ -2155,14 +2156,54 @@ mod slice52_h1_len_tests {
             let _ = s.check(&mut cx, Effort::Full);
         }
         let zn = cx.eq.intern(zero);
-        for len in [len_x, len_y] {
-            let ln = cx.eq.intern(len);
-            assert!(
-                cx.eq.are_equal(ln, zn),
-                "len of a merged-empty var must be 0"
-            );
-        }
+        // Only `x` comes from the H1 block; once `x ≈ ""` the residual `[] = [y]`
+        // is the unchanged single-atom path, which does not link the length.
+        let ln = cx.eq.intern(len_x);
+        assert!(cx.eq.are_equal(ln, zn), "len of an H1-merged var must be 0");
+        let yn = cx.eq.intern(len_y);
+        assert!(!cx.eq.are_equal(yn, zn), "single-atom y stays unlinked");
         assert!(s.shared_arith_terms(&mut cx).contains(&zero));
+    }
+
+    /// Spec §4: the slice-33 single-atom path (`[x] = []`, which also folds to
+    /// `word = ""`) must stay unchanged: no len link, 0 not exposed.
+    #[test]
+    fn single_atom_empty_propagate_has_no_len_link() {
+        let mut ctx = Context::new();
+        let str_s = ctx.string_sort();
+        let sym = ctx.declare_fun("x_h1single", &[], str_s);
+        let x = ctx.mk_app(Op::Uninterpreted(sym), &[]).unwrap();
+        let empty = ctx.mk_string_const("");
+        let atom = ctx.mk_eq(x, empty).unwrap();
+        let int_s = ctx.int_sort();
+        let zero = ctx.mk_numeral(shinri_core::Rational::from_int(0i128.into()), int_s);
+        let len_x = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
+
+        let mut s = StrSolver::default();
+        let mut eq = EqualityEngine::default();
+        let atoms = AtomRegistry::default();
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &atoms,
+        };
+        s.test_force_str_term(x);
+        s.test_force_eq_true(atom);
+        for _ in 0..20 {
+            let _ = s.check(&mut cx, Effort::Full);
+        }
+        let (xn, en) = (cx.eq.intern(x), cx.eq.intern(empty));
+        assert!(
+            cx.eq.are_equal(xn, en),
+            "the single-atom Propagate still merges"
+        );
+        let (ln, zn) = (cx.eq.intern(len_x), cx.eq.intern(zero));
+        assert!(
+            !cx.eq.are_equal(ln, zn),
+            "single-atom path must not link len"
+        );
+        assert!(!s.empty_merged);
+        assert!(!s.shared_arith_terms(&mut cx).contains(&zero));
     }
 }
 
