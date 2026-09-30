@@ -31,4 +31,5 @@ fn roundtrips_string_literals_with_escapes() {
     // A decoded backslash followed by `u{61}` must NOT re-parse as "a".
     roundtrip(r#""\u{5c}u{61}""#, |_, _| {});
     roundtrip(r#""\u{2FFFF}""#, |_, _| {});
+    roundtrip(r#""\u{22}""""#, |_, _| {});
 }

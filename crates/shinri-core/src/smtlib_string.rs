@@ -8,6 +8,7 @@
 /// this bound.
 const MAX_ESCAPE: u32 = 0x2FFFF;
 
+/// Why a string-literal body failed to decode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LiteralError {
     /// A well-formed escape denotes a surrogate (U+D800..=U+DFFF). The SMT-LIB
@@ -219,6 +220,15 @@ mod tests {
         fn encode_emits_printable_ascii_or_out_of_alphabet_chars(s in any::<String>()) {
             for c in encode_literal(&s).chars() {
                 prop_assert!((' '..='~').contains(&c) || (c as u32) > MAX_ESCAPE, "{:?}", c);
+            }
+        }
+
+        #[test]
+        fn decode_never_panics_on_hostile_bodies(
+            b in "[\\\\u{}0-9a-fA-Fg\"é\u{10000}\u{30000}]{0,40}"
+        ) {
+            if let Ok(v) = decode_literal(&b) {
+                prop_assert_eq!(decode_literal(body(&encode_literal(&v))), Ok(v));
             }
         }
     }
