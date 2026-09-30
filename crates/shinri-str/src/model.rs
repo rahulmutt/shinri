@@ -281,26 +281,15 @@ fn value_concat(
         let mut off = 0usize;
         let mut out = String::new();
         let n_kids = kids.len();
-        // Pre-resolve every operand: when exactly ONE operand is unpinned it
-        // must take whatever the pinned operands leave of `word` (the concat
-        // equals `word`), independent of a possibly-unlinked arith length.
-        let pre: Vec<Option<String>> = kids
-            .iter()
-            .map(|&k| resolve_pinned(terms, eq, known, k, m, memo, in_progress))
-            .collect();
-        let sole_unpinned = pre.iter().filter(|p| p.is_none()).count() == 1;
-        let pinned_len: usize = pre.iter().flatten().map(|v| v.chars().count()).sum();
         for (idx, &k) in kids.iter().enumerate() {
             // Resolve the operand's value if it is itself pinned (constant / class
             // constant / nested anchored concat); otherwise slice it out of `word`
             // by its model length.
-            let pinned = pre[idx].clone();
+            let pinned = resolve_pinned(terms, eq, known, k, m, memo, in_progress);
             let piece = match pinned {
                 Some(v) => v,
                 None => {
-                    let len = if sole_unpinned {
-                        chars.len().saturating_sub(pinned_len)
-                    } else if idx + 1 == n_kids {
+                    let len = if idx + 1 == n_kids {
                         // Last operand absorbs the remainder (robust to a missing
                         // length in the model).
                         chars.len().saturating_sub(off)
