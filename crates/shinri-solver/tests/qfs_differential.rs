@@ -4882,12 +4882,14 @@ struct CglGen {
 }
 
 impl CglGen {
-    fn lit(&mut self) -> String {
-        let n = self.rng.below(3);
+    /// A non-empty literal (length 1..=2) over a small alphabet, so that
+    /// equalities between independently drawn literals hit often.
+    fn lit1(&mut self) -> String {
+        let n = 1 + self.rng.below(2);
         let body: String = (0..n)
-            .map(|_| ["A", "B", "C"][self.rng.below(3) as usize])
+            .map(|_| ["A", "B"][self.rng.below(2) as usize])
             .collect();
-        format!("\"{body}\"")
+        body
     }
 
     fn body(seed: u64) -> String {
@@ -4905,38 +4907,69 @@ impl CglGen {
         }
         let (p, q, r) = (xs[0], xs[1], xs[2]);
         s.push_str(&format!("(assert (= v (str.++ {p} {q})))\n"));
-        let l = g.lit();
+        // Constants: head value lp, tail value lr, and the value lq the word
+        // equation on v tries to force onto Q. lq == lr half the time, so the
+        // leaf equality (= Q R) and the v equation are in genuine
+        // agreement/conflict rather than independent.
+        let lp = g.lit1();
+        let lr = g.lit1();
+        let lq = if g.rng.below(2) == 0 {
+            lr.clone()
+        } else {
+            g.lit1()
+        };
+        // Top-level concat equation: consistent with (lp, lr) 3/4 of the time
+        // (which forces R), otherwise a random constant.
+        let l = if g.rng.below(4) != 0 {
+            format!("\"{lp}{lr}\"")
+        } else {
+            format!("\"{}\"", g.lit1())
+        };
         if g.rng.below(2) == 0 {
             s.push_str(&format!("(assert (= (str.++ {p} {r}) {l}))\n"));
         } else {
             s.push_str(&format!("(assert (= (str.++ {r} {p}) {l}))\n"));
         }
+        // Pin the head (makes the leaf equality decidable once Q is pinned).
+        if g.rng.below(3) != 0 {
+            s.push_str(&format!("(assert (= {p} \"{lp}\"))\n"));
+        }
+        // Pin Q so that the verdict is determined by the Boolean wrapper.
+        if g.rng.below(2) == 0 {
+            let lq2 = if g.rng.below(2) == 0 {
+                lq.clone()
+            } else {
+                g.lit1()
+            };
+            s.push_str(&format!("(assert (= {q} \"{lq2}\"))\n"));
+        }
         let a = format!("(= {q} {r})");
-        let b = match g.rng.below(4) {
-            0 => format!("(= v {})", g.lit()),
-            1 => "(= v (str.++ s t))".to_string(),
-            2 => format!("(= (str.++ s {}) v)", g.lit()),
-            _ => format!("(= v (str.++ s t)) (= s {})", g.lit()),
+        let b = match g.rng.below(8) {
+            0..=3 => format!("(= v \"{lp}{lq}\")"),
+            4 => "(= v (str.++ s t))".to_string(),
+            5 | 6 => format!("(= (str.++ s \"{lq}\") v)"),
+            _ => format!("(and (= v (str.++ s t)) (= s \"{lp}\"))"),
         };
-        let b = if b.contains(") (") {
-            format!("(and {b})")
-        } else {
-            b
-        };
-        let core = match g.rng.below(6) {
+        // The last three shapes put a unit literal next to the disjunction, so
+        // the conditional atoms are forced at level 0/1 (decidable, and
+        // contradictory when the forced value disagrees with the pins).
+        let core = match g.rng.below(9) {
             0 => format!("(or {a} {b})"),
             1 => format!("(= {a} {b})"),
             2 => format!("(distinct {a} {b})"),
             3 => format!("(xor {a} {b})"),
             4 => format!("(or (not {a}) {b})"),
+            5 => format!("(and (or {a} {b}) (not {a}))"),
+            6 => format!("(and (or {a} {b}) (not {b}))"),
+            7 => format!("(and (or (not {a}) (not {b})) {a})"),
             _ => format!("(not (= {a} {b}))"),
         };
         s.push_str(&format!("(assert {core})\n"));
         if g.rng.below(3) == 0 {
             s.push_str(&format!(
-                "(assert (or (= s {}) (= t {})))\n",
-                g.lit(),
-                g.lit()
+                "(assert (or (= s \"{}\") (= t \"{}\")))\n",
+                g.lit1(),
+                g.lit1()
             ));
         }
         s
@@ -4995,8 +5028,8 @@ fn qfs_congruence_linked_word_eqs_match_z3() {
     );
     assert!(n_sat > 0, "congruence family produced zero SAT instances");
     assert!(
-        n_unsat > 0,
-        "congruence family produced zero UNSAT instances"
+        n_unsat >= 10,
+        "congruence family produced only {n_unsat} UNSAT instances (floor 10)"
     );
     assert!(
         n_witness > 0,
