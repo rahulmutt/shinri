@@ -2,7 +2,7 @@
 //! (Task E1). Differential vs z3, with delta-debug MINIMIZATION and shape DEDUP,
 //! so it enumerates the *class* of soundness bugs, not a single repro.
 //!
-//! Run:
+//! Run (add `E1_BOOLEQ=1` to mix in Bool `=`/`distinct`/`xor` over word equations):
 //!   cargo test -p shinri-solver --features oracle --test qfs_fuzz_corpus \
 //!       -- --nocapture --ignored e1_enumerate_wrong_verdicts
 //!
@@ -252,7 +252,25 @@ impl Gen {
     }
     /// One assertion drawn from the whole fragment. Positive predicates only
     /// (negative/mixed fence to Unknown by design, so are non-disagreements).
+    fn bool_eq_assertion(&mut self) -> String {
+        let a = format!("(= {} {})", self.word_term(), self.word_term());
+        let b = format!("(= {} {})", self.word_term(), self.word_term());
+        let op = ["=", "distinct", "xor"][self.rng.below(3) as usize];
+        let core = format!("({op} {a} {b})");
+        if self.rng.below(2) == 0 {
+            format!("(not {core})")
+        } else {
+            core
+        }
+    }
+
     fn assertion(&mut self) -> String {
+        // Slice 52: Bool `=`/`distinct`/`xor` over two word equations (the
+        // Noetzli shape), opt-in so the default sample and seed sequence are
+        // unchanged.
+        if std::env::var_os("E1_BOOLEQ").is_some() && self.rng.below(4) == 0 {
+            return self.bool_eq_assertion();
+        }
         match self.rng.below(8) {
             0 => format!("(= {} {})", self.word_term(), self.word_term()),
             1 => format!("(distinct {} {})", self.word_term(), self.word_term()),
