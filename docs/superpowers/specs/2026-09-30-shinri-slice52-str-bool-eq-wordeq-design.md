@@ -221,9 +221,10 @@ ship, and H3 is queued with the evidence. The Noetzli pair then ends as
 2. **T2: model gate (§3.1).** Unit tests first: `eval_bool` on Bool `=` and
    `distinct` with both sides known true, known false, and one side unknown;
    `string_model_satisfies` rejects `_370`'s assertion under the model
-   `x = ""`, `y = "E"`. Then the change. After T2, `_370`, `_458`, the
-   `distinct` and Bool-proxy forms answer `unknown`, not `sat`, and the AB pin
-   passes.
+   `x = ""`, `y = "E"`. Then the change. After T2, `_370`, `_458` and the
+   `distinct` form answer `unknown`, not `sat`, and the AB pin passes. The
+   Bool-proxy form stays `sat` until T4: `eval_bool` cannot evaluate the
+   uninterpreted Bool constant `p`, which is part of the queued audit.
 3. **T3: H1 (§3.2).** Unit tests first in the `wordeq.rs` test module, next to
    the slice-33/34 `Propagate` tests (~1692-1900):
    - `[] = [x, y]` propagates `x ≈ ""`;
@@ -321,7 +322,8 @@ In `slice52_probes.rs`:
   and adds fuel-gated splits, for 0 known corpus rows. **Un-bank** when a
   corpus row or a fuzz shape needs it; the AB pin is the reproducer.
 - **`eval_bool` audit.** Close every other `None` that can hide a wrong `sat`
-  (string predicates, compound arithmetic, `str.<`). Declined in favour of the
+  (uninterpreted Bool constants such as the Bool-proxy `p`, string
+  predicates, compound arithmetic, `str.<`). Declined in favour of the
   minimal §3.1.
 
 ## 10. Queued for the next slice
