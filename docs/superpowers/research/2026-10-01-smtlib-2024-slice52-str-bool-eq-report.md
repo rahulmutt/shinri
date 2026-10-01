@@ -96,9 +96,10 @@ slice52-fallback  103335/103335  correct=40913 wrong=0 status-suspect=0 parse-er
 4. **Pins after the fallback.** `noetzli_370`, `noetzli_458`,
    `not_distinct_form`, `distinct_form` and `xor_form` are pinned "not sat"
    (z3 says `unsat`; the T2 gate gives a sound `unknown:str-model-rejected`).
-   `bool_proxy` is a known wrong `sat`, still asserting `unsat` and
-   `#[ignore]`d with the reason naming the `eval_bool` audit and the queued
-   H3 plus the deep-nf propagate (R11).
+   `bool_proxy` is a known wrong `sat` (z3: `unsat`), pinned as a passing
+   known-bug marker that asserts `sat` with a message naming the `eval_bool`
+   audit and the queued H3 plus the deep-nf propagate (R11, R16); flip it to
+   `unsat` when that work lands.
 5. **The Noetzli pair, under the fallback, is not search-order fragile**: it
    is `unknown` by construction (no H3). The R12 fragility applied to the
    dropped H3 run only.
@@ -328,8 +329,9 @@ distinct-by-class: wrong-sat=0 wrong-unsat=0 bad-model=0
 
 - `mise run lint`: clean (fmt `--check` and `clippy --workspace
   --all-targets -D warnings`).
-- `cargo nextest run -p shinri-solver -E 'binary(slice52_probes)'`: 14 run,
-  14 passed, 1 skipped (`bool_proxy`, ignored).
+- `cargo nextest run -p shinri-solver -E 'binary(slice52_probes)'`: 15 run,
+  15 passed, 0 skipped (`bool_proxy` runs as a passing known-bug marker).
+  After the final-review fixes, `mise run test` is 1,604 passed, 7 skipped.
 - `mise run test`: **1,603 tests run: 1,603 passed, 8 skipped** (7 slow, 268 s).
   The H3 head had 1,611: the difference is the 8 Task 4 tests removed by the
   revert.
