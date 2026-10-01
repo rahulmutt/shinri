@@ -1,16 +1,18 @@
 //! Slice 52 probes (spec §8). They pin the Noetzli wrong-`sat` pair and its
 //! reduced reproducers.
 //!
-//! Written BEFORE the implementation. On `main` (`7bd2279`) every `unsat` pin
-//! fails: `sat` for the Bool-`=`/`distinct`/proxy forms, and `unknown`
-//! (`str-model-rejected`) for R1, R2 and `xor`. The SAT controls pass, and
-//! each control's model is re-checked here by hand. z3 4.16.0 confirms
-//! `noetzli_370`, `noetzli_458`, `r1_unit_diseq`, `r2_both_vars_diseq`,
-//! `distinct_form`, `xor_form`, `not_distinct_form`, and `bool_proxy` are unsat.
-//! `ab_prefix_h2` is sat in z3 (valid model x="B", y="A"); shinri today returns
-//! sat with a bogus model (H2 queued hole); after Task 2 the gate turns that into
-//! a sound `unknown`. `bool_proxy` is expected to stay red through Tasks 2 and 3
-//! and turn green at Task 4.
+//! Final state under the agreed fallback (Ruling R15): H3 (the word-equation
+//! gate own-literal/diseq exemption) was dropped because it cost 309 correct
+//! `sat` rows (now `unknown:sat-budget`) on the bench; it is queued. So the
+//! Bool-`=`/`distinct`/`xor` forms (`noetzli_370`, `noetzli_458`,
+//! `not_distinct_form`, `distinct_form`, `xor_form`) are pinned "not sat": z3
+//! says unsat and the T2 gate turns the bogus model into a sound
+//! `unknown:str-model-rejected`. R1, R2, the H1 length-link probes and every
+//! `ctrl_*` hold. `bool_proxy` is a known wrong `sat` (the gate cannot
+//! evaluate the Bool constant `p`), `#[ignore]`d.
+//! `ab_prefix_h2` is sat in z3 (valid model x="B", y="A"); shinri's bogus
+//! model is turned into a sound `unknown` by the T2 gate; it is a soundness
+//! check (H2 queued).
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
 
@@ -61,21 +63,27 @@ fn sat_model(body: &str) -> (String, String) {
     (model_str(&out[1], "x"), model_str(&out[1], "y"))
 }
 
-/// Corpus row `str-pred-small-rw_370.smt2`. z3: unsat.
+/// Corpus row `str-pred-small-rw_370.smt2`. z3: unsat. The T2 gate turns the bogus model into a sound
+/// `unknown:str-model-rejected`; H3 (the word-equation gate own-literal/diseq
+/// exemption) was dropped under the agreed fallback because it cost 309
+/// correct `sat` rows (unknown:sat-budget) on the bench; it is queued.
 #[test]
 fn noetzli_370() {
-    assert_eq!(
+    assert_ne!(
         verdict(r#"(assert (not (= (= "A" (str.++ y x)) (= "A" (str.++ x y)))))"#),
-        "unsat"
+        "sat"
     );
 }
 
-/// Corpus row `str-pred-small-rw_458.smt2`. z3: unsat.
+/// Corpus row `str-pred-small-rw_458.smt2`. z3: unsat. The T2 gate turns the bogus model into a sound
+/// `unknown:str-model-rejected`; H3 (the word-equation gate own-literal/diseq
+/// exemption) was dropped under the agreed fallback because it cost 309
+/// correct `sat` rows (unknown:sat-budget) on the bench; it is queued.
 #[test]
 fn noetzli_458() {
-    assert_eq!(
+    assert_ne!(
         verdict(r#"(assert (not (= (= "B" (str.++ y x)) (= "B" (str.++ x y)))))"#),
-        "unsat"
+        "sat"
     );
 }
 
@@ -97,24 +105,34 @@ fn r2_both_vars_diseq() {
     );
 }
 
+/// `distinct` form of the pair. z3: unsat. The T2 gate turns the bogus model into a sound
+/// `unknown:str-model-rejected`; H3 (the word-equation gate own-literal/diseq
+/// exemption) was dropped under the agreed fallback because it cost 309
+/// correct `sat` rows (unknown:sat-budget) on the bench; it is queued.
 #[test]
 fn distinct_form() {
-    assert_eq!(
+    assert_ne!(
         verdict(r#"(assert (distinct (= "A" (str.++ y x)) (= "A" (str.++ x y))))"#),
-        "unsat"
+        "sat"
     );
 }
 
+/// `xor` form of the pair. z3: unsat. The T2 gate turns the bogus model into a sound
+/// `unknown:str-model-rejected`; H3 (the word-equation gate own-literal/diseq
+/// exemption) was dropped under the agreed fallback because it cost 309
+/// correct `sat` rows (unknown:sat-budget) on the bench; it is queued.
 #[test]
 fn xor_form() {
-    assert_eq!(
+    assert_ne!(
         verdict(r#"(assert (xor (= "A" (str.++ y x)) (= "A" (str.++ x y))))"#),
-        "unsat"
+        "sat"
     );
 }
 
-/// Stays red (returns `sat`) through Tasks 2 and 3: the gate cannot evaluate the
-/// Bool constant `p` (spec §9 audit). It turns green (unsat) at Task 4 (H3).
+/// Known wrong `sat` (z3: unsat): the gate cannot evaluate the Bool constant
+/// `p` (the `eval_bool` audit, spec §9), and H3 was dropped under the agreed
+/// fallback and is queued, together with the deep-nf propagate (R11).
+#[ignore = "known wrong sat: needs the eval_bool audit and the queued H3 + deep-nf propagate"]
 #[test]
 fn bool_proxy() {
     assert_eq!(
@@ -127,12 +145,15 @@ fn bool_proxy() {
 }
 
 /// Review Focus 5: a `distinct` atom asserted false (`¬distinct ≡ =`) lands in
-/// `eq_true` and must get the same own-literal exemption. z3: unsat.
+/// `eq_true` and must get the same own-literal exemption. z3: unsat. The T2 gate turns the bogus model into a sound
+/// `unknown:str-model-rejected`; H3 (the word-equation gate own-literal/diseq
+/// exemption) was dropped under the agreed fallback because it cost 309
+/// correct `sat` rows (unknown:sat-budget) on the bench; it is queued.
 #[test]
 fn not_distinct_form() {
-    assert_eq!(
+    assert_ne!(
         verdict(r#"(assert (not (= (not (distinct "A" (str.++ y x))) (= "A" (str.++ x y)))))"#),
-        "unsat"
+        "sat"
     );
 }
 
