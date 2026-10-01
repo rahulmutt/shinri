@@ -4738,3 +4738,301 @@ fn qfs_escaped_literals_match_z3() {
          {n_unknown} shinri-unknown / {n_z3skip} z3-unknown; {n_witness} witnesses; 0 disagreements"
     );
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 52: Bool `=` / `distinct` / `xor` over pairs of word equations — the
+// Noetzli `(not (= (= "A" y++x) (= "A" x++y)))` shape. Sides are a constant of
+// length 0..=2 and a permuted concat of 2..=3 variables. Sat AND Unsat must
+// agree with z3; Sat models are replayed through z3. Fresh seed — never
+// perturb existing families' seeds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const BEQ_SEED: u64 = 0x5252_0000_0001;
+const BEQ_N_ITERS: usize = 200;
+
+struct BeqGen {
+    rng: Lcg,
+}
+
+impl BeqGen {
+    fn lit(&mut self) -> String {
+        let n = self.rng.below(3);
+        let body: String = (0..n)
+            .map(|_| ["A", "B"][self.rng.below(2) as usize])
+            .collect();
+        format!("\"{body}\"")
+    }
+
+    /// A concat of 2..=3 distinct variables in a random order.
+    fn perm_concat(&mut self) -> String {
+        let mut vs = ["s0", "s1", "s2"];
+        let n = 2 + self.rng.below(2) as usize;
+        for i in (1..vs.len()).rev() {
+            let j = self.rng.below(i as u64 + 1) as usize;
+            vs.swap(i, j);
+        }
+        format!("(str.++ {})", vs[..n].join(" "))
+    }
+
+    /// Two word equations; half the time they share the constant (the
+    /// Noetzli shape, where the Bool combination is decided by commutation).
+    fn pair(&mut self) -> (String, String) {
+        let l1 = self.lit();
+        let l2 = if self.rng.below(2) == 0 {
+            l1.clone()
+        } else {
+            self.lit()
+        };
+        (
+            format!("(= {l1} {})", self.perm_concat()),
+            format!("(= {l2} {})", self.perm_concat()),
+        )
+    }
+
+    fn body(seed: u64) -> String {
+        let mut g = BeqGen { rng: Lcg(seed) };
+        let mut s = String::from(
+            "(set-logic QF_SLIA)\n(declare-const s0 String)\n(declare-const s1 String)\n(declare-const s2 String)\n",
+        );
+        for _ in 0..1 + g.rng.below(2) {
+            let (a, b) = g.pair();
+            let op = ["=", "distinct", "xor"][g.rng.below(3) as usize];
+            let core = format!("({op} {a} {b})");
+            if g.rng.below(2) == 0 {
+                s.push_str(&format!("(assert (not {core}))\n"));
+            } else {
+                s.push_str(&format!("(assert {core})\n"));
+            }
+        }
+        s
+    }
+}
+
+#[test]
+fn qfs_bool_eq_word_eqs_match_z3() {
+    let mut rng = Lcg(BEQ_SEED);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..BEQ_N_ITERS {
+        let seed = rng.next();
+        let body = BeqGen::body(seed);
+        let script = format!("{body}(check-sat)\n");
+        let ours = shinri_verdict(&script);
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&script);
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S BOOL-EQ WORD-EQ DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{script}"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let lines = shinri_lines(&format!("{script}(get-value (s0 s1 s2))\n"));
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        assert_eq!(
+                            z3_with_model(&body, &model),
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_bool_eq_word_eqs_match_z3: {BEQ_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown / {n_z3skip} z3-unknown; {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(n_sat > 0, "bool-eq family produced zero SAT instances");
+    assert!(n_unsat > 0, "bool-eq family produced zero UNSAT instances");
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Slice 52 (Ruling R13): congruence-linked conditional word equations. Top
+// level (dl0) links `v = P++Q` and `P++R = lit`; under a Boolean wrapper the
+// leaf equality `(= Q R)` and a word equation on `v` are decided at level > 0,
+// so the single-atom side of the word equation is tied to the leaf equality
+// only by congruence through the dl0 concat. Fresh seed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CGL_SEED: u64 = 0x5252_0000_0002;
+const CGL_N_ITERS: usize = 200;
+
+struct CglGen {
+    rng: Lcg,
+}
+
+impl CglGen {
+    /// A non-empty literal (length 1..=2) over a small alphabet, so that
+    /// equalities between independently drawn literals hit often.
+    fn lit1(&mut self) -> String {
+        let n = 1 + self.rng.below(2);
+        let body: String = (0..n)
+            .map(|_| ["A", "B"][self.rng.below(2) as usize])
+            .collect();
+        body
+    }
+
+    fn body(seed: u64) -> String {
+        let mut g = CglGen { rng: Lcg(seed) };
+        let mut s = String::from("(set-logic QF_SLIA)\n");
+        for v in ["v", "x", "y", "z", "s", "t"] {
+            s.push_str(&format!("(declare-const {v} String)\n"));
+        }
+        // Which of x/y/z play P (shared head), Q (tail of v), R (tail of the
+        // constant-side concat): a random ordered triple of distinct vars.
+        let mut xs = ["x", "y", "z"];
+        for i in (1..xs.len()).rev() {
+            let j = g.rng.below(i as u64 + 1) as usize;
+            xs.swap(i, j);
+        }
+        let (p, q, r) = (xs[0], xs[1], xs[2]);
+        s.push_str(&format!("(assert (= v (str.++ {p} {q})))\n"));
+        // Constants: head value lp, tail value lr, and the value lq the word
+        // equation on v tries to force onto Q. lq == lr half the time, so the
+        // leaf equality (= Q R) and the v equation are in genuine
+        // agreement/conflict rather than independent.
+        let lp = g.lit1();
+        let lr = g.lit1();
+        let lq = if g.rng.below(2) == 0 {
+            lr.clone()
+        } else {
+            g.lit1()
+        };
+        // Top-level concat equation: consistent with (lp, lr) 3/4 of the time
+        // (which forces R), otherwise a random constant.
+        let l = if g.rng.below(4) != 0 {
+            format!("\"{lp}{lr}\"")
+        } else {
+            format!("\"{}\"", g.lit1())
+        };
+        if g.rng.below(2) == 0 {
+            s.push_str(&format!("(assert (= (str.++ {p} {r}) {l}))\n"));
+        } else {
+            s.push_str(&format!("(assert (= (str.++ {r} {p}) {l}))\n"));
+        }
+        // Pin the head (makes the leaf equality decidable once Q is pinned).
+        if g.rng.below(3) != 0 {
+            s.push_str(&format!("(assert (= {p} \"{lp}\"))\n"));
+        }
+        // Pin Q so that the verdict is determined by the Boolean wrapper.
+        if g.rng.below(2) == 0 {
+            let lq2 = if g.rng.below(2) == 0 {
+                lq.clone()
+            } else {
+                g.lit1()
+            };
+            s.push_str(&format!("(assert (= {q} \"{lq2}\"))\n"));
+        }
+        let a = format!("(= {q} {r})");
+        let b = match g.rng.below(8) {
+            0..=3 => format!("(= v \"{lp}{lq}\")"),
+            4 => "(= v (str.++ s t))".to_string(),
+            5 | 6 => format!("(= (str.++ s \"{lq}\") v)"),
+            _ => format!("(and (= v (str.++ s t)) (= s \"{lp}\"))"),
+        };
+        // The last three shapes put a unit literal next to the disjunction, so
+        // the conditional atoms are forced at level 0/1 (decidable, and
+        // contradictory when the forced value disagrees with the pins).
+        let core = match g.rng.below(9) {
+            0 => format!("(or {a} {b})"),
+            1 => format!("(= {a} {b})"),
+            2 => format!("(distinct {a} {b})"),
+            3 => format!("(xor {a} {b})"),
+            4 => format!("(or (not {a}) {b})"),
+            5 => format!("(and (or {a} {b}) (not {a}))"),
+            6 => format!("(and (or {a} {b}) (not {b}))"),
+            7 => format!("(and (or (not {a}) (not {b})) {a})"),
+            _ => format!("(not (= {a} {b}))"),
+        };
+        s.push_str(&format!("(assert {core})\n"));
+        if g.rng.below(3) == 0 {
+            s.push_str(&format!(
+                "(assert (or (= s \"{}\") (= t \"{}\")))\n",
+                g.lit1(),
+                g.lit1()
+            ));
+        }
+        s
+    }
+}
+
+#[test]
+fn qfs_congruence_linked_word_eqs_match_z3() {
+    let mut rng = Lcg(CGL_SEED);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_z3skip, mut n_witness) =
+        (0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..CGL_N_ITERS {
+        let seed = rng.next();
+        let body = CglGen::body(seed);
+        let script = format!("{body}(check-sat)\n");
+        let ours = shinri_verdict(&script);
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            continue;
+        }
+        let theirs = z3_verdict(&script);
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "QF_S CONGRUENCE-LINKED WORD-EQ DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{script}"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let lines = shinri_lines(&format!("{script}(get-value (v x y z s t))\n"));
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        assert_eq!(
+                            z3_with_model(&body, &model),
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "qfs_congruence_linked_word_eqs_match_z3: {CGL_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown / {n_z3skip} z3-unknown; {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(n_sat > 0, "congruence family produced zero SAT instances");
+    assert!(
+        n_unsat >= 10,
+        "congruence family produced only {n_unsat} UNSAT instances (floor 10)"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+}

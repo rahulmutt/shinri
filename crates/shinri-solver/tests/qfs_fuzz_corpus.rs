@@ -2,7 +2,7 @@
 //! (Task E1). Differential vs z3, with delta-debug MINIMIZATION and shape DEDUP,
 //! so it enumerates the *class* of soundness bugs, not a single repro.
 //!
-//! Run:
+//! Run (add `E1_BOOLEQ=1` to mix in Bool `=`/`distinct`/`xor` over word equations):
 //!   cargo test -p shinri-solver --features oracle --test qfs_fuzz_corpus \
 //!       -- --nocapture --ignored e1_enumerate_wrong_verdicts
 //!
@@ -250,9 +250,27 @@ impl Gen {
             format!("(= {x} (str.++ {pre} {x}))")
         }
     }
+    fn bool_eq_assertion(&mut self) -> String {
+        let a = format!("(= {} {})", self.word_term(), self.word_term());
+        let b = format!("(= {} {})", self.word_term(), self.word_term());
+        let op = ["=", "distinct", "xor"][self.rng.below(3) as usize];
+        let core = format!("({op} {a} {b})");
+        if self.rng.below(2) == 0 {
+            format!("(not {core})")
+        } else {
+            core
+        }
+    }
+
     /// One assertion drawn from the whole fragment. Positive predicates only
     /// (negative/mixed fence to Unknown by design, so are non-disagreements).
     fn assertion(&mut self) -> String {
+        // Slice 52: Bool `=`/`distinct`/`xor` over two word equations (the
+        // Noetzli shape), opt-in so the default sample and seed sequence are
+        // unchanged.
+        if std::env::var_os("E1_BOOLEQ").is_some() && self.rng.below(4) == 0 {
+            return self.bool_eq_assertion();
+        }
         match self.rng.below(8) {
             0 => format!("(= {} {})", self.word_term(), self.word_term()),
             1 => format!("(distinct {} {})", self.word_term(), self.word_term()),
@@ -344,20 +362,29 @@ fn smt_escape(s: &str) -> String {
 
 /// Classify one instance. Returns `Some(class)` for a genuine disagreement.
 fn classify(inst: &Instance) -> Option<Class> {
+    classify_decided(inst).0
+}
+
+/// Like [`classify`], also returning the verdict when BOTH solvers decided
+/// (shinri's verdict; equal to z3's unless a disagreement is returned).
+fn classify_decided(inst: &Instance) -> (Option<Class>, Option<Verdict>) {
     let ours = shinri_verdict(&inst.check_script());
     if ours == Verdict::Unknown {
-        return None; // sound incompleteness
+        return (None, None); // sound incompleteness
     }
     let theirs = z3_verdict(&inst.check_script());
     if theirs == Verdict::Unknown {
-        return None;
+        return (None, None);
     }
     if ours != theirs {
-        return Some(if ours == Verdict::Sat {
-            Class::WrongSat
-        } else {
-            Class::WrongUnsat
-        });
+        return (
+            Some(if ours == Verdict::Sat {
+                Class::WrongSat
+            } else {
+                Class::WrongUnsat
+            }),
+            Some(ours),
+        );
     }
     // Agree. If SAT, witness-check shinri's model against z3.
     if ours == Verdict::Sat {
@@ -379,12 +406,22 @@ fn classify(inst: &Instance) -> Option<Class> {
                 }
                 script.push_str("(check-sat)\n");
                 if z3_verdict(&script) == Verdict::Unsat {
-                    return Some(Class::BadModel);
+                    return (Some(Class::BadModel), Some(ours));
                 }
             }
         }
     }
-    None
+    (None, Some(ours))
+}
+
+/// Textual detector for `bool_eq_assertion` output (consumes no RNG):
+/// `[(not] (op (= ..) (= ..))`. Default-sample assertions never start with
+/// an `(= (=` / `(distinct (=` / `(xor (=` pair.
+fn is_bool_eq_assertion(a: &str) -> bool {
+    let a = a.strip_prefix("(not ").unwrap_or(a);
+    ["(= (=", "(distinct (=", "(xor (="]
+        .iter()
+        .any(|p| a.starts_with(p))
 }
 
 // ── Delta-debug minimization ─────────────────────────────────────────────────
@@ -476,6 +513,7 @@ fn e1_enumerate_wrong_verdicts() {
     let mut rng = Lcg(seed);
 
     let (mut n_ws, mut n_wu, mut n_bm) = (0usize, 0usize, 0usize);
+    let (mut n_beq, mut n_beq_sat, mut n_beq_unsat) = (0usize, 0usize, 0usize);
     // shape -> (class, minimized body, first-seen raw body)
     let mut corpus: std::collections::BTreeMap<String, (Class, String)> =
         std::collections::BTreeMap::new();
@@ -486,7 +524,17 @@ fn e1_enumerate_wrong_verdicts() {
             rng: Lcg(rng.next()),
         }
         .instance();
-        if let Some(class) = classify(&inst) {
+        let has_beq = inst.assertions.iter().any(|a| is_bool_eq_assertion(a));
+        let (cls, decided) = classify_decided(&inst);
+        if has_beq {
+            n_beq += 1;
+            match decided {
+                Some(Verdict::Sat) => n_beq_sat += 1,
+                Some(Verdict::Unsat) => n_beq_unsat += 1,
+                _ => {}
+            }
+        }
+        if let Some(class) = cls {
             let mini = minimize(&inst, class);
             let sh = shape(&mini);
             match class {
@@ -511,6 +559,11 @@ fn e1_enumerate_wrong_verdicts() {
          raw disagreements: wrong-sat={n_ws} wrong-unsat={n_wu} bad-model={n_bm}\n\
          distinct minimized shapes: {}\n",
         corpus.len()
+    );
+    eprintln!(
+        "bool-eq coverage: {n_beq} of {n_iters} instances contained >=1 Bool-eq assertion; \
+         decided by both shinri and z3: {} ({n_beq_sat} sat / {n_beq_unsat} unsat)",
+        n_beq_sat + n_beq_unsat
     );
     let (mut cs, mut cu, mut cb) = (0, 0, 0);
     for (sh, (class, _)) in &corpus {

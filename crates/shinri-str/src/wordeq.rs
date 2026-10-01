@@ -43,6 +43,10 @@ pub enum StepResult {
         var: TermId,
         word: TermId,
         just: Vec<EqLeaf>,
+        /// Slice 52: set ONLY by the H1 empty-residual block. The driver then
+        /// also links `str.len(var)` to 0 for arith; every slice-33/34
+        /// single-atom Propagate leaves it `false` (behaviour unchanged).
+        link_len: bool,
     },
     Conflict(Vec<EqLeaf>),
     /// A GUARDED F-split. `atoms` are the fresh-positive disjuncts
@@ -830,6 +834,7 @@ fn resolve_inner(
                 var: l_res[0],
                 word: r_res[0],
                 just,
+                link_len: false,
             };
         }
 
@@ -840,6 +845,45 @@ fn resolve_inner(
         } else {
             None
         };
+
+        // SLICE 52 (H1): `[] = [v1, …, vn]` (n ≥ 2, every atom a free atom: non-constant, non-concat)
+        // ENTAILS `vi ≈ ""` for every i — a concatenation is empty iff every
+        // part is. Report ONE per round: the first atom not already `≈ ""`.
+        // Later rounds report the rest; the `same` check makes the choice
+        // advance, so this can never re-propagate the same merge (always taking
+        // `vs[0]` looped in the spike). If every atom is already `≈ ""`, fall
+        // through to `Done`. Minted `!strk*` skolems are ALLOWED here, unlike
+        // the slice-34 alias case above: that exclusion stops a var–var CLASS
+        // UNION from replacing an F-split the model builder needs; a merge
+        // into `""` is a constant fact, not a union (spec §3.2). The driver
+        // cites `nf_ante` alongside `just`, as for every `Propagate`.
+        //
+        // Arith link (found in T3 review): the merge is conditional, and arith
+        // only learns `len(v) = 0` from a dl0 class constant, so on its own it
+        // could pick lengths inconsistent with the merge (`len y = 0` while
+        // `y = "A" ++ !strk`, `!strk ≈ ""`) and the model gate would downgrade a
+        // genuine `sat` to `unknown`. The `Propagate` driver (lib.rs) therefore
+        // also merges `str.len(v)` with the numeral 0 under the same tag. The
+        // model builder must NOT override arith lengths instead: that would hide
+        // a real string/arith conflict (wrong `sat`).
+        let empty_vs_vars = match (l_res.is_empty(), r_res.is_empty()) {
+            (true, false) => Some(r_res),
+            (false, true) => Some(l_res),
+            _ => None,
+        };
+        if let Some(vs) = empty_vs_vars {
+            if vs.len() >= 2 && vs.iter().all(|&a| is_free_var(terms, a)) {
+                let empty = terms.mk_string_const("");
+                if let Some(&v) = vs.iter().find(|&&a| !same(terms, eq, a, empty)) {
+                    return StepResult::Propagate {
+                        var: v,
+                        word: empty,
+                        just,
+                        link_len: true,
+                    };
+                }
+            }
+        }
 
         if let Some((var, const_side)) = pair {
             // Fold the constant side to ONE interned constant. The empty side
@@ -853,7 +897,12 @@ fn resolve_inner(
                 );
             }
             let word = terms.mk_string_const(&w);
-            return StepResult::Propagate { var, word, just };
+            return StepResult::Propagate {
+                var,
+                word,
+                just,
+                link_len: false,
+            };
         }
     }
 
@@ -1652,7 +1701,9 @@ mod tests {
             &mut emitted,
         );
         match r {
-            StepResult::Propagate { var, word, just } => {
+            StepResult::Propagate {
+                var, word, just, ..
+            } => {
                 assert_eq!(var, x, "left residual must be reported as `var`");
                 assert_eq!(word, y, "right residual must be reported as `word`");
                 assert!(
@@ -1881,7 +1932,9 @@ mod tests {
             &mut emitted,
         );
         match r {
-            StepResult::Propagate { var, word, just } => {
+            StepResult::Propagate {
+                var, word, just, ..
+            } => {
                 assert_eq!(var, x, "left residual must be reported as `var`");
                 assert_eq!(word, y, "right residual must be reported as `word`");
                 assert!(
@@ -2167,6 +2220,127 @@ mod tests {
              either — mixed pairs are deliberately excluded, not forced by \
              the T4b diagnosis"
         );
+    }
+
+    // ── Slice 52 (H1): empty residual against several free atoms ─────────────
+    // `[] = [v1, …, vn]` (n ≥ 2) entails every `vi ≈ ""`. Report the first atom
+    // not already `≈ ""`; later rounds report the rest.
+
+    fn run_empty_vs(
+        ctx: &mut Context,
+        eq: &mut EqualityEngine,
+        rhs: &[shinri_core::TermId],
+    ) -> StepResult {
+        let lit = dummy_eqn_lit();
+        let lhs: [shinri_core::TermId; 0] = [];
+        let mut ctr = 0u32;
+        let mut emitted = FxHashSet::default();
+        resolve_equation(
+            ctx,
+            eq,
+            &lhs,
+            rhs,
+            vec![EqLeaf::Asserted(lit)],
+            lit,
+            &mut ctr,
+            &mut emitted,
+        )
+    }
+
+    #[test]
+    fn empty_vs_two_vars_propagates_first_to_empty() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_h1");
+        let y = declare_str_var(&mut ctx, "y_h1");
+        match run_empty_vs(&mut ctx, &mut eq, &[x, y]) {
+            StepResult::Propagate {
+                var, word, just, ..
+            } => {
+                assert_eq!(var, x);
+                assert_eq!(ctx.string_const_value(word), Some(""));
+                assert!(just
+                    .iter()
+                    .any(|l| matches!(l, EqLeaf::Asserted(a) if *a == dummy_eqn_lit())));
+            }
+            _ => panic!("`[] = [x, y]` must Propagate `x ≈ \"\"`"),
+        }
+    }
+
+    #[test]
+    fn empty_vs_two_vars_skips_atom_already_empty() {
+        use shinri_theory::types::EqJust;
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_h1s");
+        let y = declare_str_var(&mut ctx, "y_h1s");
+        let empty = ctx.mk_string_const("");
+        let (xn, en) = (eq.intern(x), eq.intern(empty));
+        let _ = eq.merge(xn, en, EqJust::Asserted(Lit::new(Var::new(1), true)));
+        match run_empty_vs(&mut ctx, &mut eq, &[x, y]) {
+            StepResult::Propagate { var, .. } => assert_eq!(var, y),
+            _ => panic!("with `x ≈ \"\"` known, `[] = [x, y]` must Propagate `y`"),
+        }
+    }
+
+    /// No loop: once every atom is `≈ ""`, nothing is propagated again.
+    #[test]
+    fn empty_vs_vars_all_already_empty_does_not_propagate() {
+        use shinri_theory::types::EqJust;
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_h1a");
+        let y = declare_str_var(&mut ctx, "y_h1a");
+        let empty = ctx.mk_string_const("");
+        let en = eq.intern(empty);
+        for (v, k) in [(x, 1u32), (y, 2u32)] {
+            let vn = eq.intern(v);
+            let _ = eq.merge(vn, en, EqJust::Asserted(Lit::new(Var::new(k), true)));
+        }
+        let r = run_empty_vs(&mut ctx, &mut eq, &[x, y]);
+        assert!(!matches!(
+            r,
+            StepResult::Propagate { .. } | StepResult::Conflict(_)
+        ));
+    }
+
+    /// Review Focus 3: a repeated variable propagates once.
+    #[test]
+    fn empty_vs_repeated_var_propagates_it() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_h1r");
+        match run_empty_vs(&mut ctx, &mut eq, &[x, x]) {
+            StepResult::Propagate { var, .. } => assert_eq!(var, x),
+            _ => panic!("`[] = [x, x]` must Propagate `x ≈ \"\"`"),
+        }
+    }
+
+    /// Spec §3.2: minted skolems are ALLOWED here (a merge into `""` is a
+    /// constant fact, not the class union the slice-34 exclusion guards).
+    #[test]
+    fn empty_vs_skolem_and_var_propagates_skolem() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let k = declare_str_var(&mut ctx, "!strk0");
+        let x = declare_str_var(&mut ctx, "x_h1k");
+        match run_empty_vs(&mut ctx, &mut eq, &[k, x]) {
+            StepResult::Propagate { var, .. } => assert_eq!(var, k),
+            _ => panic!("`[] = [!strk0, x]` must Propagate `!strk0 ≈ \"\"`"),
+        }
+    }
+
+    /// Unchanged: a non-empty constant in the residual still conflicts.
+    #[test]
+    fn empty_vs_var_and_nonempty_const_still_conflicts() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let x = declare_str_var(&mut ctx, "x_h1c");
+        let a = ctx.mk_string_const("A");
+        assert!(matches!(
+            run_empty_vs(&mut ctx, &mut eq, &[x, a]),
+            StepResult::Conflict(_)
+        ));
     }
 
     // ── Slice 14 root-fix: single-variable forced-length analysis ────────────
