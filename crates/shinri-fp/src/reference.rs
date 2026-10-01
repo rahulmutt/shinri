@@ -857,11 +857,13 @@ pub fn ref_add(eb: u32, sb: u32, a: &Integer, b: &Integer, mode: RoundMode) -> I
     let sum = ra.clone() + rb.clone();
     let zero = Rational::new(Integer::zero(), Integer::one());
     if sum == zero {
-        // IEEE exact-zero-sum sign rule: -0 iff both operands negative, else
-        // +0 except under roundTowardNegative which yields -0.
+        // IEEE 754 §6.3 exact-zero-sum sign rule: a sum of same-sign operands
+        // (only ±0 + ±0 can reach here that way) keeps that sign in every
+        // mode; an opposite-sign exact-zero sum is +0, except under
+        // roundTowardNegative which yields -0. `(+0)+(+0)` under RTN is +0.
         let sign_a = ref_is_negative(&ca);
         let sign_b = ref_is_negative(&cb);
-        let neg = (sign_a && sign_b) || matches!(mode, RoundMode::Rtn);
+        let neg = (sign_a && sign_b) || ((sign_a != sign_b) && matches!(mode, RoundMode::Rtn));
         return zero_pattern(eb, sb, neg);
     }
     round_rational(eb, sb, &sum, mode)

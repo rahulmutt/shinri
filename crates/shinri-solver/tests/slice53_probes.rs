@@ -215,3 +215,53 @@ fn keymaera_rows() {
         );
     }
 }
+
+/// Corpus row `QF_BVFP/ramalho/esbmc/Float-no-simp9-main.smt2` (z3 unsat;
+/// shinri `sat` at `2ceef06`), minimized. Cause: `fp.add` gave `(+0)+(+0) = -0`
+/// under roundTowardNegative (IEEE 754 §6.3: a same-sign zero sum keeps its
+/// sign; only an opposite-sign exact-zero sum is -0 under RTN), so ESBMC's
+/// `signbit(+0.0 + +0.0)` could be 1 when the rounding mode was RTN.
+#[test]
+fn ramalho_min_core() {
+    const SRC: &str = r#"(set-logic QF_BVFP)
+(declare-fun v0 () (_ BitVec 32))
+(declare-fun v1 () (_ FloatingPoint 11 53))
+(declare-fun v2 () Bool)
+(declare-fun v3 () (_ BitVec 32))
+(declare-fun v4 () Bool)
+(declare-fun v5 () Bool)
+(declare-fun v6 () (_ FloatingPoint 11 53))
+(declare-fun v7 () (_ BitVec 32))
+(declare-fun v8 () (_ BitVec 32))
+(declare-fun v9 () (_ BitVec 32))
+(declare-fun v10 () Bool)
+(declare-fun v11 () (_ FloatingPoint 11 53))
+(declare-fun v12 () (_ BitVec 32))
+(declare-fun v13 () (_ BitVec 32))
+(declare-fun v14 () (_ BitVec 32))
+(declare-fun v15 () Bool)
+(declare-fun v16 () (_ BitVec 32))
+(assert (let ((a!1 (ite (= v0 #x00000000) roundNearestTiesToEven (ite (= v0 #x00000001) roundTowardNegative (ite (= v0 #x00000002) roundTowardPositive roundTowardZero))))) (= (fp.add a!1 (fp #b0 #b00000000000 #x0000000000000) (fp #b0 #b00000000000 #x0000000000000)) v1)))
+(assert (= (= #x00000008 #x00000004) v2))
+(assert (let ((a!1 (not (not v4)))) (= a!1 v5)))
+(assert (= v1 v6))
+(assert (= (ite (fp.isNegative v6) #x00000001 #x00000000) v7))
+(assert (= (ite (not v5) v9 v7) v8))
+(assert (let ((a!1 (not (not (not v4))))) (= a!1 v10)))
+(assert (= v1 v11))
+(assert (= (ite (fp.isNegative v11) #x00000001 #x00000000) v12))
+(assert (= (ite (not v10) v14 v12) v13))
+(assert (= (= (ite v2 v3 (ite v4 v8 v13)) #x00000000) v15))
+(assert (not (=> (not v15) false)))"#;
+    assert_eq!(
+        run_script(&format!("{SRC}(check-sat)")),
+        vec!["unsat".to_string()]
+    );
+    // sat sibling: the same core without the negated claim stays satisfiable.
+    let sat_src = SRC.replace("(assert (not (=> (not v15) false)))", "");
+    assert_ne!(sat_src, SRC);
+    assert_eq!(
+        run_script(&format!("{sat_src}(check-sat)")),
+        vec!["sat".to_string()]
+    );
+}
