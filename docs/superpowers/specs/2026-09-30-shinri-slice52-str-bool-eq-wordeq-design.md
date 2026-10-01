@@ -372,12 +372,25 @@ exemption) was measured and dropped.** Final run `slice52-fallback`
 | 1 | `str-pred-small-rw_370` and `_458` (fallback wording) `wrong → unknown:str-model-rejected` | **PASS**: both (5 ms, 4 ms). The first-choice `unsat` was reached with H3 (`slice52` run, 7 ms, 6 ms) and not kept |
 | 2 | QF_S + QF_SLIA `wrong` 2 → 0 | **PASS**: 2 → 0 |
 | 3 | 0 rows `* → wrong` | **PASS: 0** rows, no escalation |
-| 4 | every `correct → unknown/timeout` row listed and triaged; `unknown:sat-budget` delta | **DONE**: 4 rows (Norn HammingDistance, all `unknown:sat-budget`, caused by Task 3 / H1), 0 `timeout`; `sat-budget` +5 (QF_S), +201 (QF_SLIA) |
+| 4 | every `correct → unknown/timeout` row listed and triaged; `unknown:sat-budget` delta | **DONE**: 4 rows (Norn HammingDistance, all `unknown:sat-budget`, caused by Task 3 / H1 acting on membership-minted equations), 0 `timeout`; `sat-budget` +5 (QF_S), +201 (QF_SLIA) |
 | 5 | standard gates green, oracle count non-zero | **PASS**: test 1,603 passed / 8 skipped; oracle 701 discovered, 697 passed, 4 skipped; lint and `ci` green |
 
-`correct`: QF_S 16,058 → 16,061 (+3), QF_SLIA 24,815 → 24,852 (+37), both from
-oracle-noise `unverified → correct` flips and a few Norn rows. parse-error
+**Credited gain: the solver's own gain is +2, not +40.** Raw `correct`:
+QF_S 16,058 → 16,061 (+3), QF_SLIA 24,815 → 24,852 (+37). About 35 of the
+QF_SLIA +37 are z3-timeout oracle noise (+44 / −9 between `unverified` and
+`correct`) and all of QF_S's +3 are noise. The gain attributable to the solver
+is the Norn rows, +6 −4 = **+2**, plus the Noetzli pair moving from `wrong` to
+`unknown`. The 4 lost Norn rows come from H1 also acting on
+regex-membership-minted equations (which the split path skips); skipping them
+restores the 4 but loses the 6 gains, so the code is kept (queued). parse-error
 195 → 195 (same rows).
+
+**Fallback-engine evidence.** The two new oracle families on the shipped
+engine: `qfs_bool_eq_word_eqs_match_z3` 118 sat / 14 unsat / 68 unknown, 0
+disagreements; `qfs_congruence_linked_word_eqs_match_z3` 55 sat / 36 unsat /
+109 unknown, 0 disagreements. The `E1_BOOLEQ` fuzz "before" run at `c91e221`
+already exercises the shipped engine (sources byte-identical to HEAD): 0 wrong,
+1,652 decided.
 
 **H3 measured and dropped.** The `slice52` run (H3 included, `fec6fb9`)
 took the Noetzli pair to `unsat` (+2) but cost **313 `correct → unknown`**
@@ -395,7 +408,7 @@ needed a length link (`str.len(v) ≈ 0` merged with the H1 merge, gated to H1
 only; a model-builder override was reverted after a wrong `sat`);
 `noetzli_370`, `noetzli_458`, `not_distinct_form`, `distinct_form` and
 `xor_form` are pinned "not sat" (a sound `unknown:str-model-rejected` without
-H3); `bool_proxy` is a known wrong `sat` (`#[ignore]`d), a minted-branch
+H3); `bool_proxy` is a known wrong `sat` (a passing marker asserting `sat`, R16), a minted-branch
 completeness gap queued with the deep-nf propagate (R11). New queued items:
 H3 narrowing, the 4 Norn rows lost to H1, the minted-branch gap, and the
 R10 / contributor-map / combiner deferred items; see the report's *Queued for

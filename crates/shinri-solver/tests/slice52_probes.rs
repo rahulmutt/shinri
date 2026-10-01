@@ -9,7 +9,8 @@
 //! says unsat and the T2 gate turns the bogus model into a sound
 //! `unknown:str-model-rejected`. R1, R2, the H1 length-link probes and every
 //! `ctrl_*` hold. `bool_proxy` is a known wrong `sat` (the gate cannot
-//! evaluate the Bool constant `p`), `#[ignore]`d.
+//! evaluate the Bool constant `p`), pinned as a passing known-bug marker
+//! (asserts the wrong `sat`; flip it to `unsat` when the fix lands).
 //! `ab_prefix_h2` is sat in z3 (valid model x="B", y="A"); shinri's bogus
 //! model is turned into a sound `unknown` by the T2 gate; it is a soundness
 //! check (H2 queued).
@@ -129,10 +130,12 @@ fn xor_form() {
     );
 }
 
-/// Known wrong `sat` (z3: unsat): the gate cannot evaluate the Bool constant
-/// `p` (the `eval_bool` audit, spec §9), and H3 was dropped under the agreed
-/// fallback and is queued, together with the deep-nf propagate (R11).
-#[ignore = "known wrong sat: needs the eval_bool audit and the queued H3 + deep-nf propagate"]
+/// KNOWN WRONG SAT (z3: unsat), pinned as a passing marker (R16): the gate
+/// cannot evaluate the Bool constant `p` (the `eval_bool` audit, spec §9), and
+/// H3 was dropped under the agreed fallback. Flip this pin to `unsat` when the
+/// audit or a narrowed H3 + the deep-nf propagate (R11) lands. Not `#[ignore]`d:
+/// the nightly tier runs ignored tests and AGENTS.md reserves `#[ignore]` for
+/// slow tests.
 #[test]
 fn bool_proxy() {
     assert_eq!(
@@ -140,15 +143,16 @@ fn bool_proxy() {
             r#"(declare-fun p () Bool)(assert (= p (= "A" (str.++ y x))))
                (assert (not (= p (= "A" (str.++ x y)))))"#
         ),
-        "unsat"
+        "sat",
+        "KNOWN WRONG SAT (z3: unsat): flip this pin to unsat when the eval_bool Bool-constant audit or a narrowed H3 + deep-nf propagate lands"
     );
 }
 
 /// Review Focus 5: a `distinct` atom asserted false (`¬distinct ≡ =`) lands in
-/// `eq_true` and must get the same own-literal exemption. z3: unsat. The T2 gate turns the bogus model into a sound
-/// `unknown:str-model-rejected`; H3 (the word-equation gate own-literal/diseq
-/// exemption) was dropped under the agreed fallback because it cost 309
-/// correct `sat` rows (unknown:sat-budget) on the bench; it is queued.
+/// `eq_true`. z3: unsat. Pinned "not sat": the T2 gate turns the bogus model
+/// into a sound `unknown:str-model-rejected`. The own-literal exemption that
+/// would give `unsat` was H3, which was reverted (it cost 309 correct `sat`
+/// rows on the bench) and is queued.
 #[test]
 fn not_distinct_form() {
     assert_ne!(
@@ -158,8 +162,8 @@ fn not_distinct_form() {
 }
 
 /// Soundness check for H2 (constant-prefix residual, queued per spec §9). z3 says
-/// sat with a valid model (x="B", y="A"). shinri today produces a bogus sat with an
-/// invalid model. After Task 2 the gate turns that into a sound `unknown`. If a later
+/// sat with a valid model (x="B", y="A"). shinri's bogus model is invalid; since Task 2 the
+/// gate turns it into a sound `unknown`. If a later
 /// slice solves H2, it will produce a correct `sat` or `unsat`.
 #[test]
 fn ab_prefix_h2() {

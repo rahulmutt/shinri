@@ -974,6 +974,13 @@ impl TheorySolver for StrSolver {
                                         shinri_core::Rational::from_int(0i128.into()),
                                         int_s,
                                     );
+                                    // The new Int-class root is deliberately NOT added to
+                                    // `all_cond_roots`/`input_cond_roots`: every
+                                    // conditional merge has the same congruence
+                                    // knock-on. The guarded unconditional channels
+                                    // (`next_axiom`'s `leaves_all_dl0`) treat
+                                    // cross-theory reasons as conditional, and
+                                    // `len_class_zero` cites the full explanation.
                                     self.len_terms.insert(len_v);
                                     self.empty_merged = true;
                                     let (ln, zn) = (cx.eq.intern(len_v), cx.eq.intern(zero));

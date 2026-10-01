@@ -58,7 +58,12 @@ slice52-fallback  103335/103335  correct=40913 wrong=0 status-suspect=0 parse-er
   `unknown` instead of a wrong `sat`. This is the fallback outcome; the
   `unsat` the first spec wanted needs H3, which is dropped (below).
 - **0 rows moved into `wrong`** from any verdict. There is no `ESCALATE`.
-- **`correct`: QF_S 16,058 → 16,061 (+3), QF_SLIA 24,815 → 24,852 (+37).**
+- **Credited gain, stated plainly: the solver's own `correct` gain is +2,
+  not +40.** About 35 of QF_SLIA's +37 are z3-timeout oracle noise
+  (+44 / −9 between `unverified` and `correct`), and all of QF_S's +3 are
+  noise. What the solver earned is the Norn rows, +6 −4 = **+2**, plus the
+  Noetzli pair moving from `wrong` to `unknown`.
+- **Raw deltas (kept): `correct` QF_S 16,058 → 16,061 (+3), QF_SLIA 24,815 → 24,852 (+37).**
   The gains are oracle-noise rows (3 + 44 `unverified → correct`) and 6
   Norn `unknown → correct`. Losses: 4 Norn `correct → unknown:sat-budget`
   and 9 `correct → unverified` (z3 oracle timeouts, same shinri answer).
@@ -179,8 +184,17 @@ The same 195 QF_SLIA `20230403-webapp` rows as `slice51`: identical path set
 **Triage.** These four are lost `sat` answers, not wrong answers. Bisecting
 with per-task release binaries (20 s limit): `sat` at `434d692` (branch
 point) and at Task 2 (`e61e81c`), `unknown` at Task 3 (`c91e221`). So they
-come from Task 3 (H1 and its length link), not from H3. The mechanism is not
-traced. Queued.
+come from Task 3 (H1 and its length link), not from H3.
+
+**Mechanism (traced in the final review).** H1's propagate also fires on
+equations minted by the regex-membership pass. The split path deliberately
+skips those (`crates/shinri-str/src/lib.rs` ~843, the D-wordeq-skip rule);
+H1 does not. A patch that skips membership-minted equations in H1 restores
+the 4 lost rows (`1190`, `147`, `151`, `828`) but loses the 6 Norn gains
+(`1172`, `1173`, `1178`, `1185`, `1188`, `453`). The mechanism nets +2, so
+the code is kept as is. Queued: decide deliberately whether H1 should act on
+membership-minted equations. The 213 `unknown:str-model-rejected →
+unknown:sat-budget` moves are probably the same mechanism (unverified).
 
 ## H3 measured and dropped
 
@@ -248,9 +262,18 @@ Row identifiers lost in the H3 run (paths `QF_SLIA/<family>/<dir>/<name>.smt2`):
 ## Oracle and fuzz evidence
 
 The fuzz and oracle evidence below was measured at Task 5 (`fec6fb9`,
-**with H3**), not on the fallback code. The fallback is the Task 3 engine
-(H1 only) plus the Task 5 test additions; the oracle suite and gates were
-re-run on it (see *Gates*), and the E1 fuzz was not re-run.
+**with H3**). The fallback is the Task 3 engine (H1 only) plus the Task 5
+test additions; the oracle suite and gates were re-run on it (see *Gates*).
+The `E1_BOOLEQ` fuzz "before" run at `c91e221` already exercises the shipped
+engine (the shinri-str and shinri-solver sources there are byte-identical to
+HEAD): 0 wrong verdicts, 1,652 decided. So "not re-run on the fallback" is no
+longer an evidence limit.
+
+**Fallback re-run of the two new oracle families** (final review, and re-run
+at the fix wave with the same numbers; `--features oracle`):
+`qfs_bool_eq_word_eqs_match_z3` 118 sat / 14 unsat / 68 unknown, 0
+disagreements; `qfs_congruence_linked_word_eqs_match_z3` 55 sat / 36 unsat /
+109 unknown, 0 disagreements.
 
 From the Task 5 report (`E1_BOOLEQ=1`, iters 4000, seed `0xe100000001`). The
 before run is a scratch worktree at `c91e221` with the same generator change;
@@ -328,8 +351,12 @@ New from this slice:
   `c25fbd2`, `c5cd62c`).
 - **4 Norn HammingDistance rows lost to Task 3 (H1).** `norn-benchmark-1190`,
   `-147`, `-151`, `-828`: `sat` at `e61e81c`, `unknown:sat-budget` at
-  `c91e221`. Mechanism not traced.
-- **`bool_proxy` wrong `sat`** (pre-existing, `#[ignore]`d), with
+  `c91e221`. Cause: H1 also acts on regex-membership-minted equations
+  (the split path skips them, D-wordeq-skip); skipping them in H1 restores
+  these 4 but loses 6 Norn gains. **Decide deliberately whether H1 should act
+  on membership-minted equations.**
+- **`bool_proxy` wrong `sat`** (pre-existing; pinned as a passing known-bug
+  marker asserting `sat`, R16), with
   `distinct_form` and `xor_form` (sound `unknown`): a minted-branch
   completeness gap. Needs a deep-nf re-resolve that emits only a cited
   `Propagate` (R11).
