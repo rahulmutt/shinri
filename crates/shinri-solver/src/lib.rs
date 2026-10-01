@@ -1164,6 +1164,11 @@ impl Solver {
 
         // Lower the assertions (arith =/distinct rewrites, Le/Ge companions; needs &mut ctx).
         // This never sees n-ary =/distinct at all now: word_norm (above) expands every sort to binary (slice 6); the arms below are defense in depth.
+        // Slice 53: theory axioms tying every arithmetic `=` atom to its Le/Ge
+        // in all polarities. Minted here, before the ctx is cloned into the
+        // Combiner. Kept apart from `lowered`: the string model gate below
+        // evaluates `lowered` as the user's assertions.
+        let eq_axioms = self.arith_eq_axioms(&assertions);
         let lowered: Vec<TermId> = assertions.into_iter().map(|a| self.lower(a)).collect();
 
         let mut sat_config = SolverConfig::default();
@@ -1272,7 +1277,11 @@ impl Solver {
             // Combiner BEFORE asserting any unit clauses. This ensures every term
             // is present in the EGraph when the first merge fires, so congruence
             // closure can observe all relevant use-lists.
-            let top_lits: Vec<shinri_core::Lit> = lowered.iter().map(|&a| enc.encode(a)).collect();
+            let top_lits: Vec<shinri_core::Lit> = lowered
+                .iter()
+                .chain(eq_axioms.iter())
+                .map(|&a| enc.encode(a))
+                .collect();
             // Phase 2: assert each top-level literal as a unit clause. Theory
             // assertions (merges, diseqs) now fire with the full egraph in place.
             for lit in &top_lits {
@@ -1827,6 +1836,102 @@ impl Solver {
         s == self.ctx.real_sort() || s == self.ctx.int_sort()
     }
 
+    /// Slice 53: every Int/Real binary `(= a b)` reachable through a Boolean
+    /// position of `roots` (`and`/`or`/`not`/`=>`/`xor`/`ite`, Bool `=` and
+    /// Bool `distinct`), in first-visit order, without duplicates. An n-ary
+    /// arithmetic `=` contributes its adjacent pairs, the same hash-consed
+    /// terms `lower` conjoins. Non-Bool terms are not entered (term-level
+    /// `ite` is already lifted by `word_norm`). Iterative: deep BMC formulas.
+    fn arith_eq_atoms(&mut self, roots: &[TermId]) -> Vec<TermId> {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let bool_sort = self.ctx.bool_sort();
+        let mut seen: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+        let mut emitted: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
+        let mut out = Vec::new();
+        let mut stack: Vec<TermId> = roots.iter().rev().copied().collect();
+        while let Some(t) = stack.pop() {
+            if !seen.insert(t) {
+                continue;
+            }
+            let TermNode::App {
+                op: Op::Builtin(op),
+                args,
+                ..
+            } = self.ctx.term_node(t).clone()
+            else {
+                continue;
+            };
+            let kids: Vec<TermId> = self.ctx.children(args).to_vec();
+            match op {
+                BuiltinOp::Eq if kids.len() >= 2 && self.is_arith_sorted(kids[0]) => {
+                    for w in kids.windows(2) {
+                        let e = self
+                            .ctx
+                            .mk_app(Op::Builtin(BuiltinOp::Eq), &[w[0], w[1]])
+                            .expect("Eq well-sorted");
+                        if emitted.insert(e) {
+                            out.push(e);
+                        }
+                    }
+                }
+                // `ite` is entered only when Bool-sorted (a term ite never
+                // reaches here: `word_norm` lifts it).
+                BuiltinOp::Ite if self.ctx.sort_of(t) == bool_sort => {
+                    stack.extend(kids.iter().rev());
+                }
+                // Bool connectives; `Eq`/`Distinct` over Bool children are
+                // iff/xor-like. Over any other sort they are leaves (the
+                // arithmetic `Eq` arm above already matched first).
+                BuiltinOp::And
+                | BuiltinOp::Or
+                | BuiltinOp::Not
+                | BuiltinOp::Implies
+                | BuiltinOp::Xor
+                | BuiltinOp::Eq
+                | BuiltinOp::Distinct
+                    if kids.iter().all(|&k| self.ctx.sort_of(k) == bool_sort) =>
+                {
+                    stack.extend(kids.iter().rev());
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// Slice 53 (spec §3.2): for each atom `E = (= a b)` of `arith_eq_atoms`,
+    /// the theory-valid clauses `E → a≤b`, `E → a≥b`, `a≤b ∧ a≥b → E`. They
+    /// make `E` mean `a = b` to arithmetic in every polarity (`lower` keeps
+    /// the `(and E Le Ge)` shape, which is then equivalent to `E` everywhere).
+    /// Not fed to the string model gate (it evaluates the user's assertions,
+    /// not solver axioms).
+    fn arith_eq_axioms(&mut self, roots: &[TermId]) -> Vec<TermId> {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let atoms = self.arith_eq_atoms(roots);
+        let mut out = Vec::with_capacity(atoms.len() * 3);
+        for e in atoms {
+            let TermNode::App { args, .. } = self.ctx.term_node(e).clone() else {
+                unreachable!("arith_eq_atoms returns Eq applications")
+            };
+            let (a, b) = {
+                let k = self.ctx.children(args);
+                (k[0], k[1])
+            };
+            let mut mk = |op: BuiltinOp, xs: &[TermId]| {
+                self.ctx.mk_app(Op::Builtin(op), xs).expect("well-sorted")
+            };
+            let le = mk(BuiltinOp::Le, &[a, b]);
+            let ge = mk(BuiltinOp::Ge, &[a, b]);
+            let ne = mk(BuiltinOp::Not, &[e]);
+            let nle = mk(BuiltinOp::Not, &[le]);
+            let nge = mk(BuiltinOp::Not, &[ge]);
+            out.push(mk(BuiltinOp::Or, &[ne, le]));
+            out.push(mk(BuiltinOp::Or, &[ne, ge]));
+            out.push(mk(BuiltinOp::Or, &[nle, nge, e]));
+        }
+        out
+    }
+
     /// Slice 9 (constant arm): mint the Real-bridge atom pairs for every admitted
     /// `fp.to_real` term whose operand resolves to a floating-point constant —
     /// either the operand is itself an fp literal, or a variable pinned by a
@@ -2272,12 +2377,18 @@ impl Solver {
     fn lower(&mut self, t: TermId) -> TermId {
         use shinri_core::{BuiltinOp, Op, TermNode};
         match self.ctx.term_node(t).clone() {
-            // ── Real equality: (= a b) → (and (= a b) (Le a b) (Ge a b)) ─────
+            // ── Arithmetic equality: (= a b) → (and (= a b) (Le a b) (Ge a b)) ─
             //
             // We keep the original Eq atom so EUF can see x=y for congruence
             // (needed for QF_UFLRA: x=y must reach EUF so congruence can derive
             // f(x)=f(y)). The Le/Ge atoms are also added so arith can reason
-            // about the bound constraint. Both are semantically equivalent to (= a b).
+            // about the bound constraint. On its own this conjunction is only
+            // equivalent to (= a b) in positive positions; slice 53 makes it
+            // equivalent in EVERY polarity through `arith_eq_axioms`
+            // (E ↔ Le ∧ Ge), which are asserted next to the lowered formulas.
+            // The conjunction shape is kept (rather than the bare E) because it
+            // preserves the pre-slice SAT encoding of positive equalities; the
+            // string engine's completeness is sensitive to that encoding.
             TermNode::App {
                 op: Op::Builtin(BuiltinOp::Eq),
                 args,
@@ -2290,7 +2401,9 @@ impl Solver {
                     // Arith-sorted (= a b c ...) : a == b == c == ...
                     // Chain adjacent pairs:
                     //   (= a b)∧(Le a b)∧(Ge a b) ∧ (= b c)∧(Le b c)∧(Ge b c) ∧ ...
-                    // The Eq atoms go to EUF for congruence; the Le/Ge go to Arith.
+                    // The Eq atoms go to EUF for congruence; the Le/Ge go to
+                    // Arith. The adjacent-pair Eq terms are the ones
+                    // `arith_eq_atoms` collects.
                     let mut conj: Vec<TermId> = Vec::with_capacity((kids.len() - 1) * 3);
                     for w in kids.windows(2) {
                         // Keep the original binary Eq for EUF.
@@ -2685,6 +2798,114 @@ mod tests {
         s.assert(distinct);
         s.assert(ab);
         assert_eq!(s.check_sat(), SolveOutcome::Unsat);
+    }
+
+    /// Slice 53: `arith_eq_atoms` finds Int/Real `=` atoms in every Boolean
+    /// position (not / => / xor / ite / Bool `=` / Bool `distinct`).
+    #[test]
+    fn arith_eq_atoms_finds_every_boolean_position() {
+        use shinri_core::{BuiltinOp, Op, Rational};
+        let mut s = Solver::new();
+        let (int, bool_) = (s.int_sort(), s.bool_sort());
+        let x = s.declare_const("x", int);
+        let y = s.declare_const("y", int);
+        let p = s.declare_const("p", bool_);
+        let n: Vec<TermId> = (1..=6)
+            .map(|k| s.numeral(Rational::from_int((k as i128).into()), int))
+            .collect();
+        let e: Vec<TermId> = n.iter().map(|&k| s.eq(x, k)).collect();
+        let e_y = s.eq(y, x);
+        let or = s.app(Op::Builtin(BuiltinOp::Or), &[e[0], p]);
+        let r1 = s.app(Op::Builtin(BuiltinOp::Not), &[or]);
+        let r2 = s.app(Op::Builtin(BuiltinOp::Implies), &[p, e[1]]);
+        let r3 = s.app(Op::Builtin(BuiltinOp::Xor), &[p, e_y]);
+        let r4 = s.app(Op::Builtin(BuiltinOp::Ite), &[p, e[2], e[3]]);
+        let r5 = s.eq(p, e[4]);
+        let r6 = s.app(Op::Builtin(BuiltinOp::Distinct), &[p, e[5]]);
+        let got = s.arith_eq_atoms(&[r1, r2, r3, r4, r5, r6]);
+        assert_eq!(got, vec![e[0], e[1], e_y, e[2], e[3], e[4], e[5]]);
+    }
+
+    /// Slice 53: shared atoms are reported once; Bool- and uninterpreted-sorted
+    /// `=` (also BV and String) are not arithmetic atoms.
+    #[test]
+    fn arith_eq_atoms_dedups_and_ignores_non_arith_eq() {
+        let mut s = Solver::new();
+        let (int, bool_) = (s.int_sort(), s.bool_sort());
+        let u = s.ctx_mut().declare_sort("U");
+        let x = s.declare_const("x", int);
+        let y = s.declare_const("y", int);
+        let p = s.declare_const("p", bool_);
+        let q = s.declare_const("q", bool_);
+        let a = s.declare_const("a", u);
+        let b = s.declare_const("b", u);
+        let exy = s.eq(x, y);
+        let pq = s.eq(p, q);
+        let ab = s.eq(a, b);
+        let bv = s.bv_sort(8);
+        let (bx, by) = (s.declare_const("bx", bv), s.declare_const("by", bv));
+        let bxy = s.eq(bx, by);
+        let str_sort = s.ctx_mut().string_sort();
+        let (sa, sb) = (
+            s.declare_const("sa", str_sort),
+            s.declare_const("sb", str_sort),
+        );
+        let sab = s.eq(sa, sb);
+        let got = s.arith_eq_atoms(&[exy, exy, pq, ab, bxy, sab]);
+        assert_eq!(got, vec![exy]);
+    }
+
+    /// Slice 53 (Review Focus 5): an n-ary `(= x y z)` yields the adjacent
+    /// pairs, the same hash-consed `Eq` terms `lower` conjoins (each next to
+    /// its `Le`/`Ge`).
+    #[test]
+    fn arith_eq_atoms_splits_nary_like_lower() {
+        use shinri_core::{BuiltinOp, Op};
+        let mut s = Solver::new();
+        let int = s.int_sort();
+        let x = s.declare_const("x", int);
+        let y = s.declare_const("y", int);
+        let z = s.declare_const("z", int);
+        let nary = s.app(Op::Builtin(BuiltinOp::Eq), &[x, y, z]);
+        let neg = s.app(Op::Builtin(BuiltinOp::Not), &[nary]);
+        let xy = s.eq(x, y);
+        let yz = s.eq(y, z);
+        assert_eq!(s.arith_eq_atoms(&[neg]), vec![xy, yz]);
+        let lowered = s.lower(nary);
+        let le_xy = s.app(Op::Builtin(BuiltinOp::Le), &[x, y]);
+        let ge_xy = s.app(Op::Builtin(BuiltinOp::Ge), &[x, y]);
+        let le_yz = s.app(Op::Builtin(BuiltinOp::Le), &[y, z]);
+        let ge_yz = s.app(Op::Builtin(BuiltinOp::Ge), &[y, z]);
+        let want = s.app(
+            Op::Builtin(BuiltinOp::And),
+            &[xy, le_xy, ge_xy, yz, le_yz, ge_yz],
+        );
+        assert_eq!(lowered, want);
+    }
+
+    /// Slice 53: a binary arithmetic `=` still lowers to `(and E Le Ge)`; its
+    /// three axioms (E ↔ Le ∧ Ge) are emitted in the documented order.
+    #[test]
+    fn binary_arith_eq_lowers_to_conj_with_three_axioms() {
+        use shinri_core::{BuiltinOp, Op};
+        let mut s = Solver::new();
+        let int = s.int_sort();
+        let x = s.declare_const("x", int);
+        let y = s.declare_const("y", int);
+        let e = s.eq(x, y);
+        let le = s.app(Op::Builtin(BuiltinOp::Le), &[x, y]);
+        let ge = s.app(Op::Builtin(BuiltinOp::Ge), &[x, y]);
+        let conj = s.app(Op::Builtin(BuiltinOp::And), &[e, le, ge]);
+        assert_eq!(s.lower(e), conj);
+        let ne = s.app(Op::Builtin(BuiltinOp::Not), &[e]);
+        let nle = s.app(Op::Builtin(BuiltinOp::Not), &[le]);
+        let nge = s.app(Op::Builtin(BuiltinOp::Not), &[ge]);
+        let want = vec![
+            s.app(Op::Builtin(BuiltinOp::Or), &[ne, le]),
+            s.app(Op::Builtin(BuiltinOp::Or), &[ne, ge]),
+            s.app(Op::Builtin(BuiltinOp::Or), &[nle, nge, e]),
+        ];
+        assert_eq!(s.arith_eq_axioms(&[e]), want);
     }
 
     /// lower() must rewrite Int-sorted (distinct a b) → (or (Lt a b) (Gt a b)),
