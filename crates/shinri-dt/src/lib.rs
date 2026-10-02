@@ -806,7 +806,7 @@ impl DtSolver {
     ) -> Option<String> {
         let (csym, capp) = self.ctor_of_class(cx, t)?;
         let (_, cargs) = Self::uapp(cx.terms, capp)?;
-        let name = cx.terms.symbol_name(csym).to_string();
+        let name = shinri_core::smtlib_print::quote_symbol(cx.terms.symbol_name(csym)).into_owned();
         if cargs.is_empty() {
             return Some(name);
         }

@@ -1,13 +1,149 @@
-use shinri_core::{BuiltinOp, ConstVal, Context, Op, TermId, TermNode};
+//! SMT-LIB 2.6 term and sort printing (slice 55; moved from
+//! `shinri-parser`). One printer for the parser's round-trip tests and for
+//! every solver output path (`get-value` echo, `get-model`), so they agree
+//! on one rule set — the same reason `smtlib_string` lives here.
+use std::borrow::Cow;
 
-/// Print a term as an s-expression that re-parses to the same id.
+use crate::{BuiltinOp, ConstVal, Context, Op, SortId, SortNode, TermId, TermNode};
+
+/// Node-visit budget for one `get-value` response (slice 43 T6 review
+/// finding 1). The term DAG is hash-consed and the parser's `let` binds a
+/// name to a TermId without duplicating it, so a LINEAR-size, SMALL-depth
+/// script can share a subterm at every level (`x_i := (g x_{i-1} x_{i-1})`).
+/// The printer has no memoization, so it re-walks a shared child once per
+/// occurrence: `2^N` node-visits for `N` levels, not `N`. Measured pre-budget
+/// with a 22-level chain (612-byte script): a 29 MB response in ~4.3s,
+/// roughly doubling per extra level (100 MB/16.5s at N=24). The depth cap
+/// does NOT bound this; the blowup is severe at depth 22-24.
+///
+/// The budget counts down by one per node visited (checked BEFORE recursing,
+/// so it bounds work done, not just output size); remaining subterms print
+/// as `|<truncated>|` once it hits zero. 100_000 is far more nodes than any
+/// human-written `get-value` target has, yet cuts an exponential chain off
+/// at roughly its 17th sharing level, so the worst case is sub-millisecond.
+///
+/// The budget is built ONCE PER `get-value` RESPONSE (in the
+/// `Command::GetValue` arm) and threaded through every label: `(get-value
+/// (t1 … tK))` with a per-term budget would bound each label but not the
+/// response. Measured on a 24_635-byte script whose K=40 labels all name the
+/// same 25-level `let`-shared term: 14.0 MB in 0.55s per-term, 350 KB in
+/// 0.017s shared — the multiplier is exactly K, bounded only by script
+/// length. Moved from `shinri-solver/src/tseitin.rs`.
+pub const DISPLAY_TERM_BUDGET: usize = 100_000;
+
+/// Printed in place of a subterm once the budget or the depth backstop is
+/// exhausted: a parseable symbol that is visibly not a real term (never a
+/// TermId index, which is what slice 55 removed).
+const TRUNCATED: &str = "|<truncated>|";
+
+/// Term depth is attacker-controlled (threat model); a mechanical backstop,
+/// mirroring `render_value`'s cap. The operative output bound is the budget.
+const MAX_DEPTH: u32 = 10_000;
+
+/// SMT-LIB 2.6 reserved words (§3.1), including every command name.
+const RESERVED: &[&str] = &[
+    "!",
+    "_",
+    "as",
+    "BINARY",
+    "DECIMAL",
+    "exists",
+    "HEXADECIMAL",
+    "forall",
+    "let",
+    "match",
+    "NUMERAL",
+    "par",
+    "STRING",
+    "assert",
+    "check-sat",
+    "check-sat-assuming",
+    "declare-const",
+    "declare-datatype",
+    "declare-datatypes",
+    "declare-fun",
+    "declare-sort",
+    "define-fun",
+    "define-fun-rec",
+    "define-funs-rec",
+    "define-sort",
+    "echo",
+    "exit",
+    "get-assertions",
+    "get-assignment",
+    "get-info",
+    "get-model",
+    "get-option",
+    "get-proof",
+    "get-unsat-assumptions",
+    "get-unsat-core",
+    "get-value",
+    "pop",
+    "push",
+    "reset",
+    "reset-assertions",
+    "set-info",
+    "set-logic",
+    "set-option",
+];
+
+fn is_simple_symbol(name: &str) -> bool {
+    const PUNCT: &str = "~!@$%^&*_+=<>.?/-";
+    let mut cs = name.chars();
+    let Some(first) = cs.next() else { return false };
+    (first.is_ascii_alphabetic() || PUNCT.contains(first))
+        && cs.all(|c| c.is_ascii_alphanumeric() || PUNCT.contains(c))
+}
+
+/// `name` bare if it is a simple SMT-LIB symbol (the lexer's rule) and not
+/// reserved, else `|name|`. A name containing `|` or `\` cannot be quoted;
+/// the lexer cannot produce one and internal names are simple.
+pub fn quote_symbol(name: &str) -> Cow<'_, str> {
+    if is_simple_symbol(name) && !RESERVED.contains(&name) {
+        Cow::Borrowed(name)
+    } else {
+        debug_assert!(
+            !name.contains(['|', '\\']),
+            "unquotable symbol name: {name:?}"
+        );
+        Cow::Owned(format!("|{name}|"))
+    }
+}
+
+/// A sort's SMT-LIB name with user sort / datatype names quoted.
+pub fn print_sort(ctx: &Context, s: SortId) -> String {
+    match ctx.sort_node(s) {
+        SortNode::Uninterpreted(sym) | SortNode::Datatype(sym) => {
+            quote_symbol(ctx.symbol_name(*sym)).into_owned()
+        }
+        SortNode::Array(i, e) => {
+            format!("(Array {} {})", print_sort(ctx, *i), print_sort(ctx, *e))
+        }
+        _ => ctx.sort_name(s),
+    }
+}
+
+/// Print a term as an s-expression that re-parses to the same id. Unbounded:
+/// for the parser and tests. Solver output paths use `print_term_budgeted`.
 pub fn print_term(ctx: &Context, t: TermId) -> String {
+    let mut budget = usize::MAX;
+    print_term_budgeted(ctx, t, &mut budget)
+}
+
+/// `print_term` with a node-visit budget shared by the caller across a whole
+/// response. Each visit costs one unit, checked before recursing.
+pub fn print_term_budgeted(ctx: &Context, t: TermId, budget: &mut usize) -> String {
     let mut s = String::new();
-    write_term(ctx, t, &mut s);
+    write_term(ctx, t, 0, budget, &mut s);
     s
 }
 
-fn write_term(ctx: &Context, t: TermId, out: &mut String) {
+fn write_term(ctx: &Context, t: TermId, depth: u32, budget: &mut usize, out: &mut String) {
+    if depth > MAX_DEPTH || *budget == 0 {
+        out.push_str(TRUNCATED);
+        return;
+    }
+    *budget -= 1;
     match ctx.term_node(t).clone() {
         TermNode::Const { val, sort } => match val {
             ConstVal::Bool(b) => out.push_str(if b { "true" } else { "false" }),
@@ -17,7 +153,9 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
                 out.push_str(&format!("(_ bv{value} {width})"));
             }
             ConstVal::Num(_) => {
-                // Minimal printer: assumes non-negative numerals; negatives are out of scope for round-trip (Phase 1).
+                // Negative numeral constants are unreachable from parsed input: the
+                // parser reads `(- n)` as `Neg`, which prints as `(- n)`
+                // (slice-55 Ruling 1).
                 let r = ctx.numeral_value(t).unwrap();
                 let numer = r.numer();
                 let denom = r.denom();
@@ -38,7 +176,7 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
             ConstVal::String(_) => {
                 // The inverse of the parser's decode_literal (slice 51).
                 let s = ctx.string_const_value(t).unwrap();
-                out.push_str(&shinri_core::smtlib_string::encode_literal(s));
+                out.push_str(&crate::smtlib_string::encode_literal(s));
             }
             ConstVal::Float(_) => {
                 let (eb, sb, bits) = ctx.fp_const_value(t).expect("Float const");
@@ -47,30 +185,40 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
             ConstVal::Rm(_) => {
                 let rm = ctx.rm_const_value(t).expect("RM const");
                 out.push_str(match rm {
-                    shinri_core::RoundingMode::Rne => "RNE",
-                    shinri_core::RoundingMode::Rna => "RNA",
-                    shinri_core::RoundingMode::Rtp => "RTP",
-                    shinri_core::RoundingMode::Rtn => "RTN",
-                    shinri_core::RoundingMode::Rtz => "RTZ",
+                    crate::RoundingMode::Rne => "RNE",
+                    crate::RoundingMode::Rna => "RNA",
+                    crate::RoundingMode::Rtp => "RTP",
+                    crate::RoundingMode::Rtn => "RTN",
+                    crate::RoundingMode::Rtz => "RTZ",
                 });
             }
         },
         TermNode::App { op, args, .. } => {
             let children: Vec<TermId> = ctx.children(args).to_vec();
             if children.is_empty() {
-                if let Op::Uninterpreted(sym) = op {
-                    out.push_str(ctx.symbol_name(sym));
+                match op {
+                    Op::Uninterpreted(sym) => out.push_str(&quote_symbol(ctx.symbol_name(sym))),
+                    Op::Builtin(b) => out.push_str(&builtin_name(b)),
                 }
                 return;
             }
             out.push('(');
             match op {
                 Op::Builtin(b) => out.push_str(&builtin_name(b)),
-                Op::Uninterpreted(sym) => out.push_str(ctx.symbol_name(sym)),
+                // A minted tester is not a bindable name in the parser; the
+                // re-parseable form is the SMT-LIB 2.6 `(_ is C)` indexed head.
+                Op::Uninterpreted(sym) => match ctx.dt_role(sym) {
+                    Some(crate::DtRole::Tester { ctor }) => {
+                        out.push_str("(_ is ");
+                        out.push_str(&quote_symbol(ctx.symbol_name(ctor)));
+                        out.push(')');
+                    }
+                    _ => out.push_str(&quote_symbol(ctx.symbol_name(sym))),
+                },
             }
             for c in children {
                 out.push(' ');
-                write_term(ctx, c, out);
+                write_term(ctx, c, depth + 1, budget, out);
             }
             out.push(')');
         }
@@ -258,7 +406,7 @@ mod tests {
 
     #[test]
     fn prints_fp_const_and_rm() {
-        use shinri_core::{Context, RoundingMode};
+        use crate::{Context, RoundingMode};
         use shinri_num::Integer;
         let mut ctx = Context::new();
         // Float32 +zero
@@ -274,8 +422,8 @@ mod tests {
 
     #[test]
     fn prints_indexof_and_replace() {
-        use shinri_core::{BuiltinOp, Op, Rational};
-        let mut ctx = shinri_core::Context::new();
+        use crate::{BuiltinOp, Op, Rational};
+        let mut ctx = crate::Context::new();
         let str_s = ctx.string_sort();
         let int_s = ctx.int_sort();
         let f = ctx.declare_fun("x", &[], str_s);
@@ -294,8 +442,8 @@ mod tests {
 
     #[test]
     fn prints_replace_all() {
-        use shinri_core::{BuiltinOp, Op};
-        let mut ctx = shinri_core::Context::new();
+        use crate::{BuiltinOp, Op};
+        let mut ctx = crate::Context::new();
         let str_s = ctx.string_sort();
         let x = {
             let f = ctx.declare_fun("x", &[], str_s);
@@ -311,8 +459,8 @@ mod tests {
 
     #[test]
     fn print_to_from_int_roundtrip() {
-        use shinri_core::{BuiltinOp, Op};
-        let mut ctx = shinri_core::Context::new();
+        use crate::{BuiltinOp, Op};
+        let mut ctx = crate::Context::new();
         let str_s = ctx.string_sort();
         let int_s = ctx.int_sort();
         let s = {
@@ -329,5 +477,126 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::StrFromInt), &[n])
             .unwrap();
         assert_eq!(print_term(&ctx, fi), "(str.from_int n)");
+    }
+
+    fn nullary(ctx: &mut Context, name: &str, sort: SortId) -> TermId {
+        let f = ctx.declare_fun(name, &[], sort);
+        ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+    }
+
+    #[test]
+    fn quote_symbol_table() {
+        for simple in ["x", "a.b", "<=>", "is-mk", "bool!0", "ite!3", "@x", "~q"] {
+            assert_eq!(quote_symbol(simple), simple, "{simple}");
+        }
+        for (raw, quoted) in [
+            ("a#b", "|a#b|"),
+            ("my sort", "|my sort|"),
+            ("0x", "|0x|"),
+            ("", "||"),
+            ("__ESBMC_rounding_mode&0#10", "|__ESBMC_rounding_mode&0#10|"),
+            ("let", "|let|"),
+            ("par", "|par|"),
+            ("assert", "|assert|"),
+            ("check-sat", "|check-sat|"),
+            ("_", "|_|"),
+            ("!", "|!|"),
+        ] {
+            assert_eq!(quote_symbol(raw), quoted, "{raw}");
+        }
+    }
+
+    #[test]
+    fn prints_tester_application_as_indexed_is() {
+        let mut ctx = Context::new();
+        let dt = ctx.declare_datatype_sort("B");
+        let mk = ctx.declare_fun("mk", &[], dt);
+        let is_mk = ctx.declare_fun("is-mk", &[dt], ctx.bool_sort());
+        ctx.dt_add_constructor(dt, mk, &[], is_mk);
+        let v = nullary(&mut ctx, "v", dt);
+        let app = ctx.mk_app(Op::Uninterpreted(is_mk), &[v]).unwrap();
+        assert_eq!(print_term(&ctx, app), "((_ is mk) v)");
+    }
+
+    #[test]
+    fn prints_quoted_symbols_in_terms() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let x = nullary(&mut ctx, "a#b", int);
+        let g = ctx.declare_fun("f g", &[int], int);
+        let app = ctx.mk_app(Op::Uninterpreted(g), &[x]).unwrap();
+        assert_eq!(print_term(&ctx, app), "(|f g| |a#b|)");
+    }
+
+    #[test]
+    fn prints_builtin_application() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let a = nullary(&mut ctx, "a", int);
+        let one = ctx.mk_numeral(crate::Rational::from_int(1i128.into()), int);
+        let sum = ctx.mk_app(Op::Builtin(BuiltinOp::Add), &[a, one]).unwrap();
+        assert_eq!(print_term(&ctx, sum), "(+ a 1)");
+    }
+
+    #[test]
+    fn prints_nullary_builtins() {
+        let mut ctx = Context::new();
+        for (op, name) in [
+            (BuiltinOp::ReNone, "re.none"),
+            (BuiltinOp::ReAll, "re.all"),
+            (BuiltinOp::ReAllChar, "re.allchar"),
+        ] {
+            let t = ctx.mk_app(Op::Builtin(op), &[]).unwrap();
+            assert_eq!(print_term(&ctx, t), name);
+        }
+    }
+
+    #[test]
+    fn print_sort_quotes_user_sorts() {
+        let mut ctx = Context::new();
+        let u = ctx.declare_sort("my sort");
+        let int = ctx.int_sort();
+        let arr = ctx.array_sort(int, u);
+        assert_eq!(print_sort(&ctx, u), "|my sort|");
+        assert_eq!(print_sort(&ctx, arr), "(Array Int |my sort|)");
+        assert_eq!(print_sort(&ctx, int), "Int");
+        let bv = ctx.bv_sort(8);
+        assert_eq!(print_sort(&ctx, bv), "(_ BitVec 8)");
+    }
+
+    #[test]
+    fn budget_truncates_with_placeholder_and_bounds_work() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let g = ctx.declare_fun("g", &[int, int], int);
+        let mut t = ctx.mk_numeral(crate::Rational::from_int(0i128.into()), int);
+        for _ in 0..30 {
+            t = ctx.mk_app(Op::Uninterpreted(g), &[t, t]).unwrap();
+        }
+        let mut budget = 1_000;
+        let s = print_term_budgeted(&ctx, t, &mut budget);
+        assert_eq!(budget, 0);
+        assert!(s.contains("|<truncated>|"), "{s}");
+        // <= 1 000 visited nodes (`(g ` ... `)`) plus <= 1 001 placeholders
+        // (13 bytes each) -- well under 32 bytes per budget unit.
+        assert!(
+            s.len() < 1_000 * 32,
+            "output not bounded: {} bytes",
+            s.len()
+        );
+        assert!(
+            !s.split([' ', '(', ')']).any(|tok| tok.len() > 1
+                && tok.starts_with('t')
+                && tok[1..].chars().all(|c| c.is_ascii_digit())),
+            "TermId index leaked: {s}"
+        );
+    }
+
+    #[test]
+    fn unbounded_print_never_truncates() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let a = nullary(&mut ctx, "a", int);
+        assert_eq!(print_term(&ctx, a), "a");
     }
 }

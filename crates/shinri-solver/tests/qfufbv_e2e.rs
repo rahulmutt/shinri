@@ -821,12 +821,13 @@ fn an_fp_to_bv_argument_still_decides_on_the_fp_path() {
 ///    channel below was observable. That is why this had to be measured after
 ///    the slice rather than predicted before it.
 ///
-/// 1. **The label renders, the value does not.** `display_term`
-///    (`crates/shinri-solver/src/tseitin.rs:483`) renders the application
-///    structurally, so the label is `(p x)`. `format_value` (`lib.rs:507`)
-///    then returns `None`: it is keyed by **TermId** and consults exactly
-///    three value channels — `last_model`, `eliminated_ite_vals`, and
-///    `abv_array_models` — and `(p x)`'s TermId is in none of them. The
+/// 1. **The label renders, the value does not.** the `get-value` printer
+///    (`shinri_core::smtlib_print`) renders the application
+///    structurally, so the label is `(p x)`. `format_value` then
+///    returns `None`: it is keyed by **TermId** and walks the five-step
+///    lookup chain (spec §3.3: the term, its `word_norm` rewrite, a purified
+///    Bool proxy, an internal rewrite target, the ABV array model), and
+///    `(p x)` is found at none of those steps. The
 ///    model builder produces values for blasted *variables*, not for atom
 ///    literals, which is why the argument `x` resolves (fact 2) and the
 ///    application does not. `get-value` then prints the established `?`
