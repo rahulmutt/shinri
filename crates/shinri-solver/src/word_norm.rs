@@ -12,15 +12,25 @@
 //!    adjacent pairs, `distinct` expands pairwise, both under `and`. The blast
 //!    arms are binary-only; unexpanded n-ary atoms were the confirmed
 //!    wrong-SAT family (design doc §1).
+//! 3. **Bool-argument purification** (slice 54): a Bool-sorted child of a
+//!    parent that is NOT a Boolean connective (UF and datatype applications,
+//!    `select`/`store`) — other than `true`/`false` or a nullary symbol —
+//!    becomes a fresh nullary Bool symbol `b` (`bool!<n>`) plus one appended
+//!    definition `(= b t)` (Bool `=` is iff for Tseitin). Without it the
+//!    argument was an opaque e-graph node, never tied to its truth value:
+//!    `(P (= x 1))`, `(not (P true))`, `(= x 1)` was a wrong `sat`. `b` takes
+//!    the same path as a user Bool constant (an EUF atom merged with ⊤/⊥), and
+//!    the definition puts `t` in a Boolean position (so slice 53's arithmetic
+//!    `=` axioms reach it).
 //!
 //! INVARIANTS (load-bearing; see design doc §4):
 //! - A term with no rewritten subterm is returned with its ORIGINAL TermId —
 //!   downstream stages key on TermIds.
 //! - Only Bool and String ites pass through untouched (see exclusions above);
 //!   n-ary `=`/`distinct` still expands for every sort (slice 6).
-//! - Fresh names `ite!<n>` are probed against the symbol table so they can
-//!   never alias a user symbol; model filtering keys on the `internal`
-//!   TermId set, never on the name.
+//! - Fresh names `ite!<n>` / `bool!<n>` are probed against the symbol table so
+//!   they can never alias a user symbol; model filtering keys on the
+//!   `internal` TermId set, never on the name.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Op, SortId, SortNode, TermId, TermNode};
@@ -37,6 +47,10 @@ pub struct WordNorm {
     /// This parallel map keyed by the original `t` closes that gap (item 4,
     /// slice 7). Get-value only; get-model output is unchanged.
     orig_ite: FxHashMap<TermId, TermId>,
+    /// Slice 54: compound Bool argument (post-child-rewrite) → its proxy
+    /// symbol. Solver-lifetime, like `ite_var`: a shared argument and repeated
+    /// check-sats reuse one proxy.
+    bool_arg_var: FxHashMap<TermId, TermId>,
     /// Every fresh symbol term ever minted — the model-output filter set.
     /// ALL model-surfacing loops in lib.rs check `internal`: the bv/fp/rm
     /// `var_bits` model-extraction loops (slice 5/6) and the two `mb`-based
@@ -81,6 +95,45 @@ fn eliminates_ite_sort(ctx: &Context, s: SortId) -> bool {
     !matches!(ctx.sort_node(s), SortNode::Bool | SortNode::String)
 }
 
+/// Slice 54: parents whose Bool-sorted children sit in a Boolean position
+/// (Tseitin encodes them as structure). Every other parent's Bool child is a
+/// term-position argument and is purified. `Ite` is listed for both shapes:
+/// a Bool ite is structure, and a term ite's condition stays Boolean in its
+/// elimination definition `(ite c (= w x) (= w y))`.
+fn is_bool_connective(op: Op) -> bool {
+    matches!(
+        op,
+        Op::Builtin(
+            BuiltinOp::Not
+                | BuiltinOp::And
+                | BuiltinOp::Or
+                | BuiltinOp::Implies
+                | BuiltinOp::Xor
+                | BuiltinOp::Eq
+                | BuiltinOp::Distinct
+                | BuiltinOp::Ite
+        )
+    )
+}
+
+/// Slice 54: a Bool-sorted argument needs a proxy unless it is already a
+/// single atom EUF links to ⊤/⊥: a Bool constant (`true`/`false`) or a
+/// nullary symbol (a user Bool constant, or an earlier proxy).
+fn needs_bool_proxy(ctx: &Context, t: TermId) -> bool {
+    if ctx.sort_of(t) != ctx.bool_sort() {
+        return false;
+    }
+    match ctx.term_node(t) {
+        TermNode::Const { .. } => false,
+        TermNode::App {
+            op: Op::Uninterpreted(_),
+            args,
+            ..
+        } => !ctx.children(*args).is_empty(),
+        TermNode::App { .. } => true,
+    }
+}
+
 impl WordNorm {
     /// Rewrite `assertions`; returns the rewritten set with all defining
     /// assertions for the ites encountered THIS call appended (deduped).
@@ -96,9 +149,9 @@ impl WordNorm {
         out
     }
 
-    fn fresh_var(&mut self, ctx: &mut Context, sort: SortId) -> TermId {
+    fn fresh_var(&mut self, ctx: &mut Context, sort: SortId, prefix: &str) -> TermId {
         loop {
-            let name = format!("ite!{}", self.ctr);
+            let name = format!("{prefix}{}", self.ctr);
             self.ctr += 1;
             if ctx.lookup_symbol(&name).is_some() {
                 continue; // user (or an earlier check) owns this name
@@ -117,6 +170,30 @@ impl WordNorm {
         }
     }
 
+    /// Slice 54: the proxy for argument `t`, appending `(= b t)` once per call.
+    fn bool_proxy(
+        &mut self,
+        ctx: &mut Context,
+        t: TermId,
+        defs: &mut Vec<TermId>,
+        seen_defs: &mut FxHashSet<TermId>,
+    ) -> TermId {
+        let b = if let Some(&b) = self.bool_arg_var.get(&t) {
+            b
+        } else {
+            let b = self.fresh_var(ctx, ctx.bool_sort(), "bool!");
+            self.bool_arg_var.insert(t, b);
+            b
+        };
+        let def = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Eq), &[b, t])
+            .expect("(= b t) over Bool is well-sorted");
+        if seen_defs.insert(def) {
+            defs.push(def);
+        }
+        b
+    }
+
     fn walk(
         &mut self,
         ctx: &mut Context,
@@ -133,10 +210,18 @@ impl WordNorm {
             return t;
         };
         let kids: Vec<TermId> = ctx.children(args).to_vec();
-        let new_kids: Vec<TermId> = kids
+        let mut new_kids: Vec<TermId> = kids
             .iter()
             .map(|&k| self.walk(ctx, k, memo, defs, seen_defs))
             .collect();
+        // Slice 54 (item 3): purify compound Bool arguments of non-connectives.
+        if !is_bool_connective(op) {
+            for k in new_kids.iter_mut() {
+                if needs_bool_proxy(ctx, *k) {
+                    *k = self.bool_proxy(ctx, *k, defs, seen_defs);
+                }
+            }
+        }
         // No-change ⇒ SAME TermId (hard requirement); otherwise rebuild.
         let rebuilt = if new_kids == kids {
             t
@@ -150,7 +235,7 @@ impl WordNorm {
                 let w = if let Some(&w) = self.ite_var.get(&rebuilt) {
                     w
                 } else {
-                    let w = self.fresh_var(ctx, ctx.sort_of(rebuilt));
+                    let w = self.fresh_var(ctx, ctx.sort_of(rebuilt), "ite!");
                     self.ite_var.insert(rebuilt, w);
                     w
                 };
@@ -671,5 +756,177 @@ mod tests {
             "expected false constant, got {:?}",
             ctx.term_node(out[0])
         );
+    }
+
+    // ── Slice 54: compound Bool arguments → proxy + (= b t) ─────────────────
+
+    fn int_var(ctx: &mut Context, name: &str) -> shinri_core::TermId {
+        let s = ctx.int_sort();
+        let f = ctx.declare_fun(name, &[], s);
+        ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+    }
+    /// Declares `name : Bool -> Bool` and returns the symbol.
+    fn bool_pred(ctx: &mut Context, name: &str) -> shinri_core::SymbolId {
+        let b = ctx.bool_sort();
+        ctx.declare_fun(name, &[b], b)
+    }
+
+    #[test]
+    fn compound_bool_argument_becomes_proxy_plus_definition() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let y = int_var(&mut ctx, "y");
+        let p = bool_pred(&mut ctx, "P");
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, y]).unwrap();
+        let pe = ctx.mk_app(Op::Uninterpreted(p), &[eq]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[pe]);
+        assert_eq!(wn.internal.len(), 1);
+        let b = *wn.internal.iter().next().unwrap();
+        let pb = ctx.mk_app(Op::Uninterpreted(p), &[b]).unwrap();
+        let def = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[b, eq]).unwrap();
+        assert_eq!(out, vec![pb, def]);
+        // The proxy is named bool!<n>.
+        let TermNode::App {
+            op: Op::Uninterpreted(sym),
+            ..
+        } = ctx.term_node(b).clone()
+        else {
+            panic!("proxy must be a nullary uninterpreted app");
+        };
+        assert_eq!(ctx.lookup_symbol("bool!0"), Some(sym));
+    }
+
+    #[test]
+    fn bare_constants_and_connective_children_are_not_purified() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let y = int_var(&mut ctx, "y");
+        let q = bool_var(&mut ctx, "q");
+        let p = bool_pred(&mut ctx, "P");
+        let t = ctx.mk_const_bool(true);
+        let pq = ctx.mk_app(Op::Uninterpreted(p), &[q]).unwrap();
+        let pt = ctx.mk_app(Op::Uninterpreted(p), &[t]).unwrap();
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, y]).unwrap();
+        let conj = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[eq, q]).unwrap();
+        let iff = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[q, eq]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[pq, pt, conj, iff]);
+        assert_eq!(
+            out,
+            vec![pq, pt, conj, iff],
+            "same TermIds, nothing appended"
+        );
+        assert!(wn.internal.is_empty());
+    }
+
+    #[test]
+    fn one_proxy_per_argument_term_across_parents_and_calls() {
+        let mut ctx = Context::new();
+        let q = bool_var(&mut ctx, "q");
+        let r = bool_var(&mut ctx, "r");
+        let p = bool_pred(&mut ctx, "P");
+        let g = bool_pred(&mut ctx, "G");
+        let qr = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[q, r]).unwrap();
+        let pqr = ctx.mk_app(Op::Uninterpreted(p), &[qr]).unwrap();
+        let gqr = ctx.mk_app(Op::Uninterpreted(g), &[qr]).unwrap();
+        let mut wn = WordNorm::default();
+        let out1 = wn.normalize(&mut ctx, &[pqr, gqr]);
+        assert_eq!(
+            wn.internal.len(),
+            1,
+            "P and G share one proxy for (and q r)"
+        );
+        assert_eq!(
+            out1.len(),
+            3,
+            "two rewritten atoms + ONE deduped definition"
+        );
+        // Second check-sat: same proxy, definition re-emitted.
+        let out2 = wn.normalize(&mut ctx, &[pqr]);
+        assert_eq!(wn.internal.len(), 1);
+        assert_eq!(out2.len(), 2);
+        assert_eq!(out2[1], out1[2], "same hash-consed definition");
+    }
+
+    #[test]
+    fn nested_bool_arguments_purify_bottom_up() {
+        // (P (P (and q r))): inner (and q r) → b0, then (P b0) → b1.
+        let mut ctx = Context::new();
+        let q = bool_var(&mut ctx, "q");
+        let r = bool_var(&mut ctx, "r");
+        let p = bool_pred(&mut ctx, "P");
+        let qr = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[q, r]).unwrap();
+        let inner = ctx.mk_app(Op::Uninterpreted(p), &[qr]).unwrap();
+        let outer = ctx.mk_app(Op::Uninterpreted(p), &[inner]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[outer]);
+        assert_eq!(wn.internal.len(), 2);
+        let b0 = ctx
+            .mk_app(Op::Uninterpreted(ctx.lookup_symbol("bool!0").unwrap()), &[])
+            .unwrap();
+        let b1 = ctx
+            .mk_app(Op::Uninterpreted(ctx.lookup_symbol("bool!1").unwrap()), &[])
+            .unwrap();
+        let pb0 = ctx.mk_app(Op::Uninterpreted(p), &[b0]).unwrap();
+        let pb1 = ctx.mk_app(Op::Uninterpreted(p), &[b1]).unwrap();
+        let def0 = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[b0, qr]).unwrap();
+        let def1 = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[b1, pb0]).unwrap();
+        assert_eq!(out, vec![pb1, def0, def1]);
+    }
+
+    #[test]
+    fn bool_ite_argument_is_purified_but_term_ite_condition_is_not() {
+        let mut ctx = Context::new();
+        let x = int_var(&mut ctx, "x");
+        let y = int_var(&mut ctx, "y");
+        let c = bool_var(&mut ctx, "c");
+        let p = bool_pred(&mut ctx, "P");
+        let f = ctx.declare_fun("f", &[ctx.bool_sort()], ctx.bool_sort());
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, y]).unwrap();
+        let fls = ctx.mk_const_bool(false);
+        // (f (ite c (P (= x y)) false)): (= x y) → b0 as P's argument; the Bool
+        // ite is Boolean structure (not eliminated) and is itself f's argument → b1.
+        let pe = ctx.mk_app(Op::Uninterpreted(p), &[eq]).unwrap();
+        let bite = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[c, pe, fls])
+            .unwrap();
+        let fb = ctx.mk_app(Op::Uninterpreted(f), &[bite]).unwrap();
+        let mut wn = WordNorm::default();
+        wn.normalize(&mut ctx, &[fb]);
+        assert_eq!(
+            wn.internal.len(),
+            2,
+            "one proxy for (= x y), one for the Bool ite"
+        );
+
+        // (= (ite (= x y) x y) x): Int term ite → ite!; its condition is NOT purified.
+        let tite = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Ite), &[eq, x, y])
+            .unwrap();
+        let atom = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[tite, x]).unwrap();
+        let mut wn2 = WordNorm::default();
+        wn2.normalize(&mut ctx, &[atom]);
+        assert_eq!(wn2.internal.len(), 1, "only the ite! symbol");
+        assert!(ctx.lookup_symbol("ite!0").is_some());
+    }
+
+    #[test]
+    fn bool_proxy_name_skips_user_declared_collision() {
+        let mut ctx = Context::new();
+        let bs = ctx.bool_sort();
+        ctx.declare_fun("bool!0", &[], bs);
+        let q = bool_var(&mut ctx, "q");
+        let r = bool_var(&mut ctx, "r");
+        let p = bool_pred(&mut ctx, "P");
+        let qr = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[q, r]).unwrap();
+        let pqr = ctx.mk_app(Op::Uninterpreted(p), &[qr]).unwrap();
+        let mut wn = WordNorm::default();
+        wn.normalize(&mut ctx, &[pqr]);
+        let b = *wn.internal.iter().next().unwrap();
+        let user = ctx
+            .mk_app(Op::Uninterpreted(ctx.lookup_symbol("bool!0").unwrap()), &[])
+            .unwrap();
+        assert_ne!(b, user, "proxy must not alias a user symbol");
     }
 }
