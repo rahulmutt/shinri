@@ -1,4 +1,8 @@
-use shinri_core::{BuiltinOp, ConstVal, Context, Op, TermId, TermNode};
+//! SMT-LIB 2.6 term and sort printing (slice 55; moved from
+//! `shinri-parser`). One printer for the parser's round-trip tests and for
+//! every solver output path (`get-value` echo, `get-model`), so they agree
+//! on one rule set — the same reason `smtlib_string` lives here.
+use crate::{BuiltinOp, ConstVal, Context, Op, SortId, SortNode, TermId, TermNode};
 
 /// Print a term as an s-expression that re-parses to the same id.
 pub fn print_term(ctx: &Context, t: TermId) -> String {
@@ -38,7 +42,7 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
             ConstVal::String(_) => {
                 // The inverse of the parser's decode_literal (slice 51).
                 let s = ctx.string_const_value(t).unwrap();
-                out.push_str(&shinri_core::smtlib_string::encode_literal(s));
+                out.push_str(&crate::smtlib_string::encode_literal(s));
             }
             ConstVal::Float(_) => {
                 let (eb, sb, bits) = ctx.fp_const_value(t).expect("Float const");
@@ -47,11 +51,11 @@ fn write_term(ctx: &Context, t: TermId, out: &mut String) {
             ConstVal::Rm(_) => {
                 let rm = ctx.rm_const_value(t).expect("RM const");
                 out.push_str(match rm {
-                    shinri_core::RoundingMode::Rne => "RNE",
-                    shinri_core::RoundingMode::Rna => "RNA",
-                    shinri_core::RoundingMode::Rtp => "RTP",
-                    shinri_core::RoundingMode::Rtn => "RTN",
-                    shinri_core::RoundingMode::Rtz => "RTZ",
+                    crate::RoundingMode::Rne => "RNE",
+                    crate::RoundingMode::Rna => "RNA",
+                    crate::RoundingMode::Rtp => "RTP",
+                    crate::RoundingMode::Rtn => "RTN",
+                    crate::RoundingMode::Rtz => "RTZ",
                 });
             }
         },
@@ -258,7 +262,7 @@ mod tests {
 
     #[test]
     fn prints_fp_const_and_rm() {
-        use shinri_core::{Context, RoundingMode};
+        use crate::{Context, RoundingMode};
         use shinri_num::Integer;
         let mut ctx = Context::new();
         // Float32 +zero
@@ -274,8 +278,8 @@ mod tests {
 
     #[test]
     fn prints_indexof_and_replace() {
-        use shinri_core::{BuiltinOp, Op, Rational};
-        let mut ctx = shinri_core::Context::new();
+        use crate::{BuiltinOp, Op, Rational};
+        let mut ctx = crate::Context::new();
         let str_s = ctx.string_sort();
         let int_s = ctx.int_sort();
         let f = ctx.declare_fun("x", &[], str_s);
@@ -294,8 +298,8 @@ mod tests {
 
     #[test]
     fn prints_replace_all() {
-        use shinri_core::{BuiltinOp, Op};
-        let mut ctx = shinri_core::Context::new();
+        use crate::{BuiltinOp, Op};
+        let mut ctx = crate::Context::new();
         let str_s = ctx.string_sort();
         let x = {
             let f = ctx.declare_fun("x", &[], str_s);
@@ -311,8 +315,8 @@ mod tests {
 
     #[test]
     fn print_to_from_int_roundtrip() {
-        use shinri_core::{BuiltinOp, Op};
-        let mut ctx = shinri_core::Context::new();
+        use crate::{BuiltinOp, Op};
+        let mut ctx = crate::Context::new();
         let str_s = ctx.string_sort();
         let int_s = ctx.int_sort();
         let s = {
