@@ -1177,7 +1177,7 @@ fn get_value_on_nested_eliminated_ite_returns_value() {
     // Item 4 (slice 7): the OUTER term of a nested eliminated ite. `ite_var` was
     // keyed by the child-rewritten ite, so the outer key embedded the inner
     // fresh var and never matched the user's original nested query term →
-    // get-value degraded to "?". With orig_ite keyed by the original term it
+    // get-value degraded to "?". With orig_rewrite keyed by the original term it
     // resolves. c,d true → inner (ite d x y)=x=#x0f → outer=#x0f.
     let (o, values) = run_values(
         "(declare-const c Bool)(declare-const d Bool)\
@@ -1250,7 +1250,7 @@ fn get_value_on_eliminated_rm_ite_returns_mode() {
 #[test]
 fn get_value_after_pop_errors_no_stale_value() {
     // Originally I3 (slice 6): pop()/Reset cleared last_model but NOT
-    // eliminated_ite_vals (nor abv_array_models), so after (pop 1) a
+    // internal_vals (nor abv_array_models), so after (pop 1) a
     // get-value on the eliminated ite served a STALE value while other vars
     // correctly returned "?". The fix was `Solver::pop` clearing those two
     // maps directly (`lib.rs:362-363`).
@@ -1261,7 +1261,7 @@ fn get_value_after_pop_errors_no_stale_value() {
     // `last_outcome == Some(Sat)` exactly like `get-model` (§4.B/§4.C). That
     // gate closes the pop→get-value window entirely, so a get-value after
     // `pop` with no intervening `check-sat` is now `CommandResponse::Error`
-    // regardless of whether `eliminated_ite_vals`/`abv_array_models` were
+    // regardless of whether `internal_vals`/`abv_array_models` were
     // ever cleared — this test NO LONGER exercises the I3 map-clearing fix;
     // it exercises the `last_outcome` gate instead (confirmed by disabling
     // `lib.rs:362-363` locally and re-running the full suite: all tests,

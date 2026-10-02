@@ -40,13 +40,12 @@ pub struct WordNorm {
     /// ite TermId (post-child-rewrite) → its fresh symbol term. Solver-lifetime:
     /// repeated check-sats and shared subterms reuse one symbol.
     ite_var: FxHashMap<TermId, TermId>,
-    /// Original (child-un-rewritten) eliminated-ite term → its fresh symbol.
-    /// `ite_var` is keyed by the POST-rewrite ite (needed for structural dedup
-    /// during the walk); a nested outer ite's post-rewrite key embeds the inner
-    /// fresh var and never matches the user's original get-value query term.
-    /// This parallel map keyed by the original `t` closes that gap (item 4,
-    /// slice 7). Get-value only; get-model output is unchanged.
-    orig_ite: FxHashMap<TermId, TermId>,
+    /// Every ORIGINAL term the walk changed → its rewritten term (slice 55;
+    /// replaces slice 7's ite-only `orig_ite`). `ite_var` is keyed by the
+    /// post-rewrite ite and a purified argument's parent is rebuilt, so the
+    /// user's original get-value query term matches neither; this map closes
+    /// that gap for every rewrite. Get-value only; never read by solving.
+    orig_rewrite: FxHashMap<TermId, TermId>,
     /// Slice 54: compound Bool argument (post-child-rewrite) → its proxy
     /// symbol. Solver-lifetime, like `ite_var`: a shared argument and repeated
     /// check-sats reuse one proxy.
@@ -75,10 +74,15 @@ impl WordNorm {
         &self.ite_var
     }
 
-    /// Original eliminated-ite term → internal fresh symbol, for get-value on
-    /// nested ites (item 4, slice 7).
-    pub(crate) fn orig_ite_map(&self) -> &FxHashMap<TermId, TermId> {
-        &self.orig_ite
+    /// Original term → rewritten term, for get-value (slice 55).
+    pub(crate) fn orig_rewrite_map(&self) -> &FxHashMap<TermId, TermId> {
+        &self.orig_rewrite
+    }
+
+    /// Compound Bool argument (post-child-rewrite) → its `bool!` proxy, for
+    /// get-value on the argument itself (slice 55).
+    pub(crate) fn bool_arg_map(&self) -> &FxHashMap<TermId, TermId> {
+        &self.bool_arg_var
     }
 }
 
@@ -251,10 +255,6 @@ impl WordNorm {
                 if seen_defs.insert(def) {
                     defs.push(def);
                 }
-                // Item 4 (slice 7): also key by the ORIGINAL term so get-value on
-                // a nested outer ite (whose original child was not yet rewritten)
-                // resolves. `t` is this ite's original id; `w` its fresh symbol.
-                self.orig_ite.insert(t, w);
                 w
             }
             Op::Builtin(BuiltinOp::Eq) if new_kids.len() > 2 => {
@@ -343,6 +343,9 @@ impl WordNorm {
             }
             _ => rebuilt,
         };
+        if result != t {
+            self.orig_rewrite.insert(t, result);
+        }
         memo.insert(t, result);
         result
     }
@@ -928,5 +931,29 @@ mod tests {
             .mk_app(Op::Uninterpreted(ctx.lookup_symbol("bool!0").unwrap()), &[])
             .unwrap();
         assert_ne!(b, user, "proxy must not alias a user symbol");
+    }
+
+    #[test]
+    fn orig_rewrite_records_purified_parent_and_skips_unchanged_terms() {
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let bs = ctx.bool_sort();
+        let xf = ctx.declare_fun("x", &[], int);
+        let x = ctx.mk_app(Op::Uninterpreted(xf), &[]).unwrap();
+        let pf = ctx.declare_fun("P", &[bs], bs);
+        let one = ctx.mk_numeral(shinri_core::Rational::from_int(1i128.into()), int);
+        let eq = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[x, one]).unwrap();
+        let p = ctx.mk_app(Op::Uninterpreted(pf), &[eq]).unwrap();
+        let mut wn = WordNorm::default();
+        wn.normalize(&mut ctx, &[p]);
+        let r = *wn.orig_rewrite_map().get(&p).expect("parent recorded");
+        assert_ne!(r, p);
+        assert!(
+            !wn.orig_rewrite_map().contains_key(&eq),
+            "unchanged arg recorded"
+        );
+        assert!(!wn.orig_rewrite_map().contains_key(&x));
+        let b = *wn.bool_arg_map().get(&eq).expect("proxy recorded");
+        assert!(wn.internal.contains(&b));
     }
 }

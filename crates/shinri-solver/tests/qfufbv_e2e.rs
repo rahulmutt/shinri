@@ -825,7 +825,7 @@ fn an_fp_to_bv_argument_still_decides_on_the_fp_path() {
 ///    (`shinri_core::smtlib_print`) renders the application
 ///    structurally, so the label is `(p x)`. `format_value` (`lib.rs:507`)
 ///    then returns `None`: it is keyed by **TermId** and consults exactly
-///    three value channels — `last_model`, `eliminated_ite_vals`, and
+///    three value channels — `last_model`, `internal_vals`, and
 ///    `abv_array_models` — and `(p x)`'s TermId is in none of them. The
 ///    model builder produces values for blasted *variables*, not for atom
 ///    literals, which is why the argument `x` resolves (fact 2) and the

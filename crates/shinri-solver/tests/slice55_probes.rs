@@ -141,3 +141,71 @@ fn e6_shared_let_chain_is_bounded_and_truncated() {
     assert!(out[1].contains("|<truncated>|"), "no placeholder");
     assert_no_leak(&out[1]);
 }
+
+// ── remap (e2, e3, e4, Review Focus 3, 4) ──────────────────────────────────
+
+const UFLIA: &str = "(set-logic QF_UFLIA)(declare-fun x () Int)(declare-fun y () Int)\
+    (declare-fun c () Bool)(declare-fun P (Bool) Bool)(declare-fun f (Bool) Int)";
+
+#[test]
+fn e2_purified_uf_argument_gets_value() {
+    let out = sat_then(&format!(
+        "{UFLIA}(assert (= (f (= x 1)) 7))(check-sat)(get-value ((f (= x 1))))"
+    ));
+    assert_eq!(out[0], "(((f (= x 1)) 7))");
+}
+
+#[test]
+fn e3_slice54_report_query() {
+    let out = sat_then(&format!(
+        "{UFLIA}(assert (P (= x 1)))(assert (not (P true)))(assert (= x 2))\
+         (check-sat)(get-value ((P (= x 1)) (= x 1) (P false)))"
+    ));
+    // (P (= x 1)) is asserted true; (= x 1) is false since x = 2. (P false)
+    // occurs in no assertion: `?` (no evaluator; V2 is queued).
+    assert_eq!(out[0], "(((P (= x 1)) true) ((= x 1) false) ((P false) ?))");
+}
+
+#[test]
+fn e4_ite_inside_purified_argument() {
+    let out = sat_then(&format!(
+        "{UFLIA}(assert (P (> (ite c x y) 0)))(assert c)(assert (= x 5))\
+         (check-sat)(get-value ((P (> (ite c x y) 0)) (> (ite c x y) 0) (ite c x y)))"
+    ));
+    assert_eq!(
+        out[0],
+        "(((P (> (ite c x y) 0)) true) ((> (ite c x y) 0) true) ((ite c x y) 5))"
+    );
+}
+
+#[test]
+fn stale_rewrite_after_pop_prints_unknown_value() {
+    let out = sat_then(&format!(
+        "{UFLIA}(push 1)(assert (= (f (= x 1)) 7))(check-sat)(pop 1)\
+         (assert (= x 3))(check-sat)(get-value ((f (= x 1))))"
+    ));
+    // out[0] is the first sat's (absent) output; the second check-sat line:
+    assert_eq!(out[0], "sat", "{out:?}");
+    assert_eq!(out[1], "(((f (= x 1)) ?))", "stale value served: {out:?}");
+}
+
+#[test]
+fn nary_eq_query_is_true_or_unknown() {
+    let out = sat_then(&format!(
+        "{UFLIA}(declare-fun z () Int)(assert (= x y z))(check-sat)(get-value ((= x y z)))"
+    ));
+    assert!(
+        out[0] == "(((= x y z) true))" || out[0] == "(((= x y z) ?))",
+        "wrong value for an asserted n-ary =: {out:?}"
+    );
+}
+
+#[test]
+fn unrewritten_bool_uf_application_unchanged() {
+    // Regression guard mirroring qfufbv_e2e.rs:866: a term the walk did not
+    // rewrite takes the old path; the remap must not invent a value.
+    let out = sat_then(&format!(
+        "{UFLIA}(assert (P c))(check-sat)(get-value ((P c)))"
+    ));
+    assert_eq!(out[0], "(((P c) true))");
+}

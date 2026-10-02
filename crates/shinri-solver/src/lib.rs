@@ -89,8 +89,11 @@ pub struct Solver {
     /// Word-level normalization state (slice 5): ite→fresh-symbol memo and
     /// the internal-symbol set excluded from model output.
     word_norm: crate::word_norm::WordNorm,
-    /// Eliminated-ite terms → model values (get-value fallback; slice 6).
-    eliminated_ite_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal>,
+    /// Values of `word_norm`-internal symbols (`ite!`, `bool!`) from the last
+    /// `sat`, keyed by the internal symbol. Never surfaced by `get-model`;
+    /// `format_value` reaches them through `orig_rewrite` / `bool_arg_var`
+    /// (slice 55; was the ite-only `eliminated_ite_vals`, slice 6).
+    internal_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal>,
     /// Pre-clone-minted Real-bridge rows (slice 9): for each admitted
     /// `fp.to_real` term, the atoms that pin `r`. All TermIds MUST be minted
     /// BEFORE `self.ctx` is cloned into the Combiner so they are in range for
@@ -242,7 +245,7 @@ impl Solver {
             declared: Vec::new(),
             declared_syms: rustc_hash::FxHashSet::default(),
             word_norm: crate::word_norm::WordNorm::default(),
-            eliminated_ite_vals: rustc_hash::FxHashMap::default(),
+            internal_vals: rustc_hash::FxHashMap::default(),
             pending_bridge: Vec::new(),
             bridge_name_counter: 0,
             special_reals: rustc_hash::FxHashMap::default(),
@@ -369,12 +372,12 @@ impl Solver {
         self.last_model = None;
         // Defense-in-depth, not currently load-bearing (T6 review finding 2 —
         // investigated, not asserted): both maps are read ONLY through
-        // `format_value` (`:458`), reachable ONLY from `Command::GetValue`'s
+        // `format_value` (`format_value`), reachable ONLY from `Command::GetValue`'s
         // post-gate branch and `value_of_declared` (`format_model`'s helper)
         // — both gated on `last_outcome == Some(Sat)`, and `last_outcome` is
         // set to `None` a few lines below, before this call returns. The only
         // way back to `Some(Sat)` is a fresh `check_sat()`, which
-        // unconditionally re-clears `eliminated_ite_vals` (`:645`) and
+        // unconditionally re-clears `internal_vals` (`:645`) and
         // re-sets-or-clears `abv_array_models` (`:817`/`:840`) on every call,
         // before `last_outcome` is written — overwriting whatever this clear
         // did. So today, deleting these two lines produces no observable
@@ -383,7 +386,7 @@ impl Solver {
         // bypasses the `last_outcome` gate — this was the original I3 fix
         // (slice 6), and removing it would silently reintroduce that defect
         // for such a caller.
-        self.eliminated_ite_vals.clear();
+        self.internal_vals.clear();
         self.abv_array_models.clear();
         // Same reasoning as `assert`: the assertion set changed, so the recorded
         // outcome no longer describes it.
@@ -474,7 +477,7 @@ impl Solver {
                 self.assertions.clear();
                 self.scopes.clear();
                 self.last_model = None;
-                self.eliminated_ite_vals.clear();
+                self.internal_vals.clear();
                 self.abv_array_models.clear();
                 self.declared.clear();
                 self.declared_syms.clear();
@@ -517,15 +520,42 @@ impl Solver {
         }
     }
 
+    /// Read-only value lookup for a `get-value` / `get-model` term (spec
+    /// §3.3). Never mints: a minted term would shift later TermIds, which is
+    /// verdict-observable across further `assert`/`check-sat` commands.
+    ///
+    /// 1. the term itself in the model;
+    /// 2. its `word_norm` rewrite in the model (e.g. `(f (= x 1))` →
+    ///    `(f bool!0)`);
+    /// 3. a purified Bool argument's proxy value (`(= x 1)` → `bool!0`);
+    /// 4. an internal symbol it was rewritten to (an eliminated ite);
+    /// 5. the ABV array model.
+    ///
+    /// A term rewritten in an earlier `check-sat` but absent from the last
+    /// one finds nothing at 2–4 (the model and `internal_vals` are per-solve),
+    /// so it prints `?` rather than a stale value.
     fn format_value(&self, t: TermId) -> Option<String> {
-        // Check BV/EUF model first.
-        if let Some(val) = self.last_model.as_ref().and_then(|m| m.get(t)) {
-            return Some(shinri_theory::model::format_modelval(val));
+        use shinri_theory::model::format_modelval;
+        let model = self.last_model.as_ref();
+        if let Some(v) = model.and_then(|m| m.get(t)) {
+            return Some(format_modelval(v));
         }
-        if let Some(val) = self.eliminated_ite_vals.get(&t) {
-            return Some(shinri_theory::model::format_modelval(val));
+        let r = self.word_norm.orig_rewrite_map().get(&t).copied();
+        if let Some(v) = r.and_then(|r| model.and_then(|m| m.get(r))) {
+            return Some(format_modelval(v));
         }
-        // Fall through to ABV array model (for array-sorted terms).
+        let arg = r.unwrap_or(t);
+        if let Some(v) = self
+            .word_norm
+            .bool_arg_map()
+            .get(&arg)
+            .and_then(|b| self.internal_vals.get(b))
+        {
+            return Some(format_modelval(v));
+        }
+        if let Some(v) = r.and_then(|r| self.internal_vals.get(&r)) {
+            return Some(format_modelval(v));
+        }
         self.abv_array_models.get(&t).cloned()
     }
 
@@ -563,7 +593,7 @@ impl Solver {
                 //
                 // (b) the symbol WAS interned, so it occurs in an assertion and
                 //     may be tightly constrained, but no value channel
-                //     (`last_model` / `eliminated_ite_vals` / `abv_array_models`)
+                //     (`last_model` / `internal_vals` / `abv_array_models`)
                 //     holds a value for it — the solver stage that decided this
                 //     query does not feed one for that symbol. The QF_ABV path
                 //     (which populates only `abv_array_models`) puts every
@@ -597,7 +627,7 @@ impl Solver {
 
     /// The assigned value of a declared 0-arity symbol, if some theory produced
     /// one. Uses `format_value`'s channel order (theory model, then the
-    /// eliminated-ite remap, then the ABV array model) but keyed by the symbol's
+    /// internal-symbol remap, then the ABV array model) but keyed by the symbol's
     /// own nullary application rather than an arbitrary term.
     ///
     /// The lookup is READ-ONLY (`Context::find_nullary_app` probes the hash-cons
@@ -760,7 +790,7 @@ impl Solver {
             Vmtf,
         >;
 
-        self.eliminated_ite_vals.clear();
+        self.internal_vals.clear();
 
         let mut assertions = self.assertions.clone();
 
@@ -946,33 +976,16 @@ impl Solver {
             let assertions_owned = assertions.clone();
             // Harvest the internal eliminated-ite symbols so the ABV stage can
             // return their BV values (item 5, slice 7).
-            let internal_ite_syms: Vec<TermId> = self
-                .word_norm
-                .ite_map()
-                .values()
-                .chain(self.word_norm.orig_ite_map().values())
-                .copied()
-                .collect();
+            let internal_ite_syms: Vec<TermId> =
+                self.word_norm.ite_map().values().copied().collect();
             let (outcome, array_models, ite_sym_vals) = crate::abv_stage::solve_qfabv_with_models(
                 &mut self.ctx,
                 &assertions_owned,
                 &internal_ite_syms,
             );
             self.abv_array_models = array_models;
-            // Remap original ite terms → their internal symbol's value.
-            let mut ite_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal> =
-                rustc_hash::FxHashMap::default();
-            for (&ite_t, &w) in self
-                .word_norm
-                .ite_map()
-                .iter()
-                .chain(self.word_norm.orig_ite_map().iter())
-            {
-                if let Some(v) = ite_sym_vals.get(&w) {
-                    ite_vals.insert(ite_t, v.clone());
-                }
-            }
-            self.eliminated_ite_vals = ite_vals;
+            // Keyed by the internal symbol; `format_value` remaps (slice 55).
+            self.internal_vals = ite_sym_vals;
             return match outcome {
                 shinri_abv::AbvOutcome::Sat => SolveOutcome::Sat,
                 shinri_abv::AbvOutcome::Unsat => SolveOutcome::Unsat,
@@ -1441,22 +1454,9 @@ impl Solver {
                         }
                     }
                 }
-                // Answer get-value on eliminated ites: remap each original ite
-                // term to its internal symbol's value.
-                let mut ite_vals: rustc_hash::FxHashMap<TermId, shinri_theory::types::ModelVal> =
-                    rustc_hash::FxHashMap::default();
-                for (&ite_t, &w) in self.word_norm.ite_map() {
-                    if let Some(v) = internal_vals.get(&w) {
-                        ite_vals.insert(ite_t, v.clone());
-                    }
-                }
-                // Item 4 (slice 7): original-term-keyed entries (nested outer ites).
-                for (&ite_t, &w) in self.word_norm.orig_ite_map() {
-                    if let Some(v) = internal_vals.get(&w) {
-                        ite_vals.insert(ite_t, v.clone());
-                    }
-                }
-                self.eliminated_ite_vals = ite_vals;
+                // Keyed by the internal symbol; `format_value` remaps
+                // original query terms through `orig_rewrite` (slice 55).
+                self.internal_vals = internal_vals;
                 // Slice 17 (R2): apply int-conv witness-rewrite model repairs
                 // BEFORE the string witness self-check. On a negative-polarity
                 // branch the engine may falsify the witness equality
