@@ -78,14 +78,18 @@ below close under `new = old − outbound + inbound`.
   each logic's credited net `correct` is ≥ 0: QF_BVFP +5, QF_LIA +4,
   QF_LRA +3, QF_S 0, QF_SLIA +37, QF_UFLIA +42, QF_UFLRA 0.
 - **105 `correct → unknown/timeout` rows, all triaged.** 97 are
-  solver-attributable and deterministic, and 8 are noise. The main loss
-  mechanism is new and is evidenced on the rows themselves. The **base**
-  binary reached these `unsat` answers on an *under-constrained* encoding,
-  because an arithmetic `E` under Bool `=` / `not` / `ite` was a free EUF
-  atom. Rewrite the file so the base binary encodes the same atom faithfully,
-  and the base binary loses the row too (rings, Reynolds; below). Those
-  `unsat` answers were sound, because an unsat relaxation implies unsat. They
-  were cheap only because the encoding dropped constraints.
+  solver-attributable and deterministic, and 8 are noise. The losses are
+  attributable to encoding these atoms faithfully. On `2ceef06` an arithmetic
+  `E` under Bool `=` / `not` / `ite` was a free EUF atom. When the file is
+  rewritten so that the base binary encodes the same atoms faithfully, the base
+  binary loses 4 of 4 rewritten Reynolds loss rows and 1 of 2 rewritten rings
+  rows. The other rings row stays `unsat` but slows from 3.8 s to 13.0 s. The
+  same change also produces gains in the same families: rings +4/−5, sc
+  +2/−1, Reynolds +101/−86. The effect is therefore search-order sensitivity
+  to the encoding, not a uniform cost of the added constraints. Any
+  refutation of the relaxed problem is also a refutation of the faithful one,
+  so the data does not show that the base refutations depended on the missing
+  constraints.
 - **The cost is concentrated in QF_SLIA Reynolds `kaluza/unsat/big`.** 86
   rows went `correct → unknown:sat-budget`, while 101 rows in the same
   directory went the other way (`unknown:sat-budget → correct`). The family
@@ -274,18 +278,20 @@ dispositions.
 8 are noise.** The 5 `correct → unverified` rows (not `LOSS` lines) are
 also triaged below; all are noise.
 
-### The mechanism: base `unsat` on an under-constrained encoding
+### Attribution: search-order sensitivity to the faithful encoding
 
 On `2ceef06`, an arithmetic `(= a b)` under a Bool `=` (iff), or in some
 other non-positive position, was an EUF atom with no arithmetic meaning. The
-SAT solver could choose its value freely. For `sat` that is the slice's
-wrong-answer bug. For `unsat` it is a **relaxation**: if the relaxed problem
-is already unsat, the answer is sound, and often cheaper, because the
-arithmetic search over that atom is skipped. The slice's axioms restore the
-missing constraints, so these rows now face the real, harder problem. Two
-rewrite experiments show this. Each changes only the syntax of the arithmetic
-`=` atoms, from `(= t c)` to the equivalent `(and (<= t c) (>= t c))`, so that
-the **base** binary also encodes them faithfully.
+SAT solver could choose its value freely. For `sat` answers, that is the
+slice's wrong-answer bug. For `unsat` answers, the base binary was refuting
+a relaxation. Those answers are sound, but any refutation of the relaxed
+problem is also a refutation of the faithful one, so the faithful problem is
+not inherently harder. What changed is the search: the axioms add clauses
+and atoms, so the solver explores a different order. Two rewrite experiments
+attribute the losses to that encoding change. Each changes only the syntax of
+the arithmetic `=` atoms, from `(= t c)` to the equivalent
+`(and (<= t c) (>= t c))`, so that the **base** binary also encodes them
+faithfully.
 
 - **rings** (all 17 `=` atoms are `(= o_k 1)` inside `(= (> t 4096) (= o_k 1))`):
 
@@ -301,7 +307,16 @@ the **base** binary also encodes them faithfully.
   `unknown fence=sat-budget` on the rewritten one, which is what the after
   binary gives on both.
 
-**The gains run the same way.** On gain rows 12235, 14030 and 17770, the base
+Under the rewrite, the base binary loses 1 of the 2 rings rows outright and
+slows on the other (3.8 s → 13.0 s). It loses all 4 Reynolds loss rows.
+
+**The same change produces gains in the same families,** which is why this
+is search-order sensitivity rather than a uniform cost of the added
+constraints. In rings, 4 rows gain (`ring_2exp10_4vars_1ite`,
+`2exp12_4vars_0ite`, `2exp14_4vars_3ite` and `2exp16_4vars_3ite`; base
+times out 3/3, after solves in 3–13 s) and 5 lose. In sc, `sc-13`/`sc-14`
+`.induction2` gain and `sc-15.induction` loses. Reynolds shows the same
+split. On gain rows 12235, 14030 and 17770, the base
 binary given the rewritten file answers `unsat`, like the after binary. On
 gain rows 18763 and 19250, it stays `sat-budget`, and the after binary given
 the rewritten file also falls back to `sat-budget`. The Reynolds family
@@ -314,7 +329,7 @@ depends on the exact encoding. In this family the slice moved 101 rows up and
 
 | logic | group | n | re-run (base ✓/3, after ✓/3) | disposition |
 | --- | --- | ---: | --- | --- |
-| QF_LIA | rings `ring_2exp{12,14,16}_*` → timeout | 5 | 5 × (3, 0); base 40 ms – 3.6 s | **attributable**: relaxation (rewrite experiment above) |
+| QF_LIA | rings `ring_2exp{12,14,16}_*` → timeout | 5 | 5 × (3, 0); base 40 ms – 3.6 s | **attributable**: faithful encoding (rewrite experiment above; search-order sensitive, since 4 rings rows gain) |
 | QF_LIA | calypto `problem-006045.cvc.1` → timeout | 1 | (3, 0); base ~16.9 s | **attributable** (deterministic; base is near the edge, and the faithful encoding is slower. Mechanism not traced beyond that) |
 | QF_LIA | calypto `problem-002666.cvc.1` → timeout | 1 | (3, 3); 17.7 s / 17.1 s | noise (20 s edge, base-run load) |
 | QF_LIA | mathsat `FISCHER{10-8,6-10,7-12,8-9,9-8}-fair` → timeout | 5 | 5 × (3, 3); 15–17 s both | noise |
@@ -322,7 +337,7 @@ depends on the exact encoding. In this family the slice moved 101 rows up and
 | QF_LRA | sc `sc-15.induction.cvc` → timeout | 1 | (3, 0); base ~8 s | **attributable** (deterministic slowdown) |
 | QF_LRA | TM `p5-driverlogNumeric_s8` → timeout | 1 | (2, 0); base 19.0–20 s | **attributable, at the edge** (counted against the slice, conservatively) |
 | QF_LRA | 2019-ezsmt `blending/13` → timeout | 1 | (2, 3) | noise (flips both ways) |
-| QF_SLIA | Reynolds `kaluza/unsat/big` → `sat-budget` | 86 | sample 16 × (3, 0); bench 11–68 ms | **attributable**: relaxation plus the string-engine order cliff (above). All `:status unknown`, base `unsat`, z3 `unsat` |
+| QF_SLIA | Reynolds `kaluza/unsat/big` → `sat-budget` | 86 | sample 16 × (3, 0); bench 11–68 ms | **attributable**: faithful encoding, through the string-engine order cliff (above). All `:status unknown`, base `unsat`, z3 `unsat` |
 | QF_SLIA | stringfuzz-lu `regex-050-{multiply-reverse-fuzz, translate-graft-translate, translate-rotate-fuzz}` → `str-model-rejected` | 3 | 3 × (3, 0); ≤ 12 ms | **attributable**: string-engine order sensitivity (below) |
 | QF_SLIA | `correct → unverified`: stringfuzz-lu 4, denghang `instance` 1 | 5 | 5 × (3, 3), same answer | noise (z3 oracle side; not a `LOSS` line) |
 
@@ -538,15 +553,16 @@ New from this slice:
   `07ac180`; z3 `unsat`). The string engine accepts a premature SAT that
   depends on the SAT decision order over its split atoms. Fix that first,
   then the bare-E simplification is safe.
-- **Losses from the faithful encoding** (base answers came from a relaxation;
-  see *The mechanism*). The reproducers are
+- **Losses attributable to the faithful encoding.** The cause is search-order
+  sensitivity, not a uniform cost: the same families also gain (rings +4/−5,
+  sc +2/−1, Reynolds +101/−86). See *Attribution*. The reproducers are
   `QF_LIA/rings/ring_2exp14_3vars_0ite_unsat.smt2` (46 ms at `2ceef06`;
   timeout now, and timeout on `2ceef06` too once the `(= o_k 1)` atoms are
   encoded faithfully) and
   `QF_SLIA/20180523-Reynolds/kaluza/unsat/big/21760.corecstrs.readable.smt2`
   (`unsat` → `unknown:sat-budget`). Also `calypto/problem-006045`,
   `sc/sc-15.induction.cvc` and `TM/p5-driverlogNumeric_s8`. These are
-  arithmetic search-performance items (an `ite`/iff-heavy LIA mod-ring
+  search-order/heuristic items in arithmetic (an `ite`/iff-heavy LIA mod-ring
   encoding) and string-budget items, not soundness items.
 - **Memory growth on large LIA/UFLIA instances.** On
   `nec-smt/large/handler_sigchld/prp-0-48.smt2` the after binary runs out of

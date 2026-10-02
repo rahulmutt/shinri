@@ -331,12 +331,14 @@ base binary solves them unloaded: SMPT 53, KLEE 31 and others), 8
   3 and CIRC 1; LRA 3; BVFP 4 (plausibly the `fp.add` circuit change).
 - Losses: Reynolds 86, stringfuzz 3, rings 5, calypto 1, sc 1 and TM 1.
 
-The loss mechanism is evidenced. On `2ceef06` these `unsat` answers were
-reached on an under-constrained encoding, because an arithmetic `E` under
-Bool `=`/`not` was a free EUF atom. That relaxation is sound for `unsat`. When
+The losses are attributable to encoding these atoms faithfully. On
+`2ceef06`, an arithmetic `E` under Bool `=`/`not` was a free EUF atom. When
 the atoms are rewritten so that the base binary encodes them faithfully, the
-base binary loses the same rows (rings: 46 ms → timeout; Reynolds: `unsat` →
-`sat-budget`). The stringfuzz trio is string-engine order sensitivity. For
+base binary loses them too: 4 of 4 Reynolds rows (`unsat` → `sat-budget`) and
+1 of 2 rings rows (46 ms → timeout; the other slows from 3.8 s to 13.0 s).
+The same change also produces gains in the same families (rings +4/−5, sc
++2/−1, Reynolds +101/−86). So the effect is search-order sensitivity to the
+encoding, not a uniform cost of the added constraints. The stringfuzz trio is string-engine order sensitivity. For
 example, `regex-050-translate-rotate-fuzz` has only a positive `(= (str.len x) 3)`,
 and its three axiom clauses alone move it from `unsat` to
 `str-model-rejected`. `timeout → oom` +127 is mostly load noise; 6 of 18
@@ -367,8 +369,9 @@ arctic-matrix, Certora), which is queued.
 - removal of the `Not(Eq)` arm, now that the timing condition is met;
 - the bare-E simplification, together with the string-engine order
   sensitivity (reproducer `regex-050-translate-rotate-fuzz.smt2`);
-- the faithful-encoding performance losses (rings `ring_2exp14_3vars_0ite_unsat`,
-  Reynolds `21760`);
+- the losses attributable to the faithful encoding, which are search-order
+  sensitive because the same families also gain (rings
+  `ring_2exp14_3vars_0ite_unsat`, Reynolds `21760`);
 - memory growth on large LIA/UFLIA instances;
 - the QF_LRA Int-literal `ite` `unknown`;
 - `(get-model)` not `|…|`-quoting symbols that need it;
