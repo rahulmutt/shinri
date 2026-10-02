@@ -12,8 +12,8 @@ touch solving. The bench confirms it is verdict-neutral on the four logics
   Every one is a resource-limit flip: 61 `timeout ↔ correct` (QF_UF 55,
   QF_DT 1, QF_UFLIA 5; see the transition table), 1 `timeout → oom` and 3
   `oom → timeout`. There is no `sat ↔ unsat` change and no `* → wrong`.
-- Per Ruling 3, all 65 rows were re-run 3× on **both** binaries (130 job
-  lines). No row gave a different *answer* on the two binaries; the only
+- Per Ruling 3, all 65 rows were re-run 3× on **both** binaries (65 rows × 2 binaries
+  × 3 runs = 390 runs). No row gave a different *answer* on the two binaries; the only
   differences are `unsat` ↔ no answer within 25 s, and they occur
   **within a single binary across its own 3 runs** (QG-classification
   `gensys_icl*` rows right at the 20 s limit). That is timing noise, not a
@@ -190,6 +190,10 @@ Raw re-run lines are kept in the session scratchpad, not committed.
    testers are reserved and never bound. The printer therefore prints a
    tester application as the SMT-LIB 2.6 form `((_ is <quoted ctor>) x)`
    (`DtRole::Tester`), and the parser is unchanged (threat-model surface).
+6. **Datatype constructor names in values are quoted (final-review fix).**
+   `render_value_inner` in `shinri-dt` printed the constructor name raw, so
+   `|mk a|` came out as `(mk a 0)`. It now goes through `quote_symbol`
+   (output-only; probe `e5_quoted_datatype_constructor_value`).
 6. **Ruling 7.** The "grep `orig_ite|eliminated_ite_vals` prints nothing"
    check is satisfied except for two history doc comments the brief itself
    required (`lib.rs:95`, `word_norm.rs:44`).
@@ -232,12 +236,21 @@ Ordered. Items 1–3 are new from slice 55; the rest are carried.
    memory-growth measurement (details under the slice-53 carry below).
 3. **V2 evaluator for unregistered query terms.** `get-value` prints `?` for
    built-in applications over unregistered terms (e.g. `(+ a 1)`, e1).
-4. **Slice-54 queue, carried** minus the two `get-value` items and the
+4. **Quoted declarations that shadow theory symbols.** The parser accepts
+   declarations that shadow theory symbols or `true`/`false` via quoting
+   (`(declare-fun |+| (Int) Int)` echoes `(+ x)`, which re-parses as builtin
+   `+`; `|true|` prints `(define-fun true () Int 0)`). Reject such
+   declarations (threat-model surface).
+5. **AGENTS.md >5 min slow tests.** `shinri-fp` float32 suites take up to
+   507 s on the blocking tier (pre-existing); ignore or split them per the
+   test-tier rules.
+6. **Slice-54 queue, carried** minus the two `get-value` items and the
    `get-model` quoting item, which slice 55 closed. Wording below is
    slice 54's; "this slice" there means slice 54.
 
 - **`clippy --features oracle` under Rust 1.99.** Pre-existing oracle test
-  files fail it (32 errors in 5 files, see Gates). Fix them, then add the
+  files fail it (18 errors in `qfs_differential` measured on this branch, see
+  Gates; slice 54 recorded 32 errors in 5 files). Fix them, then add the
   `--features oracle` clippy to `mise run lint`. Also in the queue:
   `nary_arith_oracle.rs`'s `raw_recv().expect(..)` accepts a z3 `(error ..)`
   ack (the same hole fixed in `bool_arg_oracle.rs` here); it is pre-existing

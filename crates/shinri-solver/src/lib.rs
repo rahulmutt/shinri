@@ -372,13 +372,13 @@ impl Solver {
         self.last_model = None;
         // Defense-in-depth, not currently load-bearing (T6 review finding 2 —
         // investigated, not asserted): both maps are read ONLY through
-        // `format_value` (`format_value`), reachable ONLY from `Command::GetValue`'s
+        // `format_value`, reachable ONLY from `Command::GetValue`'s
         // post-gate branch and `value_of_declared` (`format_model`'s helper)
         // — both gated on `last_outcome == Some(Sat)`, and `last_outcome` is
         // set to `None` a few lines below, before this call returns. The only
         // way back to `Some(Sat)` is a fresh `check_sat()`, which
-        // unconditionally re-clears `internal_vals` (`:645`) and
-        // re-sets-or-clears `abv_array_models` (`:817`/`:840`) on every call,
+        // unconditionally re-clears `internal_vals` and
+        // re-sets-or-clears `abv_array_models` in `check_sat` on every call,
         // before `last_outcome` is written — overwriting whatever this clear
         // did. So today, deleting these two lines produces no observable
         // difference through any current caller. Kept anyway: it costs

@@ -215,6 +215,9 @@ fn z3_outcome(logic: &str, src: &str) -> easy_smt::Response {
 /// original script plus `(assert (= term value))` for each non-`?` pair.
 /// z3 must answer `sat`: the echo re-parses in another solver and the
 /// values are jointly consistent with the assertions.
+///
+/// The splitter is not `|…|`/string-literal aware; a future family with such
+/// names fails loudly on the `pairs.len()` assert.
 fn get_value_pairs(logic: &str, src: &str, queries: &[String]) -> Vec<(String, String)> {
     let full = format!(
         "(set-logic {logic})\n{src}(get-value ({}))\n",

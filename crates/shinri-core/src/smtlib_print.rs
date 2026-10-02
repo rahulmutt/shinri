@@ -153,7 +153,9 @@ fn write_term(ctx: &Context, t: TermId, depth: u32, budget: &mut usize, out: &mu
                 out.push_str(&format!("(_ bv{value} {width})"));
             }
             ConstVal::Num(_) => {
-                // Minimal printer: assumes non-negative numerals; negatives are out of scope for round-trip (Phase 1).
+                // Negative numeral constants are unreachable from parsed input: the
+                // parser reads `(- n)` as `Neg`, which prints as `(- n)`
+                // (slice-55 Ruling 1).
                 let r = ctx.numeral_value(t).unwrap();
                 let numer = r.numer();
                 let denom = r.denom();

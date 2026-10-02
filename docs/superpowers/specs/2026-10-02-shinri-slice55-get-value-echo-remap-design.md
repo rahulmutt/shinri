@@ -312,7 +312,8 @@ with the exact commands.
   (*What changed versus the spec*, item 2; `## Queued for the next slice`).
 - Slice-54 spec: `docs/superpowers/specs/2026-10-02-shinri-slice54-uf-bool-arg-purify-design.md`.
 - Slice-50 spec §10: `docs/superpowers/specs/2026-09-29-shinri-slice50-uflia-shared-compound-args-design.md`.
-- Threat model (output-size bound): `docs/threat-model.md`.
+- Threat model: `docs/threat-model.md` (resource exhaustion is out of scope
+  there; the node-visit budget is defence in depth for output size).
 
 ## 11. Measured outcomes
 
@@ -334,6 +335,8 @@ Full evidence:
 - **Testers print as `((_ is C) x)`, not the legacy `is-C` (Task 1,
   Ruling 6).** Shinri's parser rejects `(is-C v)`; the printer emits the
   SMT-LIB 2.6 indexed form and the parser is unchanged.
+- **Datatype constructor names in values are quoted (final-review fix).**
+  `render_value_inner` now prints `|mk a|`, not `mk a`; output-only.
 - **Bench base is the slice-54 run** (binary built at `6212fa5`), not a
   fresh run at `a0d0fe9`.
 - **Oracle excludes `@`-valued pairs (Ruling 8).** They are counted as
