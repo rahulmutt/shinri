@@ -313,3 +313,33 @@ with the exact commands.
 - Slice-54 spec: `docs/superpowers/specs/2026-10-02-shinri-slice54-uf-bool-arg-purify-design.md`.
 - Slice-50 spec §10: `docs/superpowers/specs/2026-09-29-shinri-slice50-uflia-shared-compound-args-design.md`.
 - Threat model (output-size bound): `docs/threat-model.md`.
+
+## 11. Measured outcomes
+
+Full evidence:
+`docs/superpowers/research/2026-10-02-smtlib-2024-slice55-get-value-report.md`.
+
+| # | Criterion | Result |
+| --- | --- | --- |
+| 1 | e1–e7 pass | PASS (e1 observes `?` for `(+ a 1)`, Ruling 5) |
+| 2 | 0 rows change verdict | PASS under the operationalised reading (re-run changed rows 3× on both binaries; only reproducible differences count): 18,146 rows, 0 `wrong`, 65 recorded differences, all `timeout`/`oom` resource flips; the re-runs show no reproducible answer difference |
+| 3 | Oracle 0 disagreements, non-zero count | PASS: 22 tests run, DT 0/269/8, UFLIA 0/384/21, UFLRA 0/385/12 (disagreements / valued / abstract) |
+| 4 | `mise run ci` green, fmt clean | PASS: 1,676 passed, 7 skipped |
+
+### Deviations from this spec
+
+- **Negative numerals (§3.1, §6.2) dropped.** The parser reads `(- 3)` as
+  `Neg`, which already prints as `(- 3)`; no negative `ConstVal` is built
+  from source (Ruling 1).
+- **Testers print as `((_ is C) x)`, not the legacy `is-C` (Task 1,
+  Ruling 6).** Shinri's parser rejects `(is-C v)`; the printer emits the
+  SMT-LIB 2.6 indexed form and the parser is unchanged.
+- **Bench base is the slice-54 run** (binary built at `6212fa5`), not a
+  fresh run at `a0d0fe9`.
+- **Oracle excludes `@`-valued pairs (Ruling 8).** They are counted as
+  `n_abstract` and not sent to z3. They expose a pre-existing wrong `sat`
+  (a Bool constant as a UF argument, `(P q)` with `(not (P true))` and
+  `(not (P false))`), which this verdict-neutral slice does not fix. It is
+  the first item of the next slice's queue (see the report, *Defect found*).
+- **`bool!` proxies need no extra value loop** (Task 3 Step 1): `bool!0`
+  is already in `internal_vals`.
