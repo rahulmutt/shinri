@@ -314,9 +314,9 @@ QF_UFLIA, QF_UFLRA, QF_S and QF_SLIA: 137,586 rows, 0 missing, 0 extra, 20 s,
 | --- | --- | --- |
 | 1 | keymaera ×2, calypto ×2 `wrong → correct` | **PASS**: all four `unsat`; a re-run gives base `sat` 3/3 and after `unsat` 3/3 |
 | 2 | ramalho `wrong → correct` or marker | **PASS, fixed (branch 4a)**: `fp.add` zero sign under RTN (`07ac180`); minimized core 12 asserts / 1,362 B pinned as `ramalho_min_core` |
-| 3 | 0 rows `* → wrong` | **PASS: 0**, no escalation; 0 wrong answers from the after binary in 1,566 triage re-runs |
+| 3 | 0 rows `* → wrong` | **PASS: 0**, no escalation; 0 wrong answers from the after binary in 1,566 triage re-runs. This is a corpus measurement, not a claim that no wrong-`sat` shape remains: a theory atom used as a UF argument (e.g. `(P (= x 1))`, `(not (P true))`, `(= x 1)`) is still a wrong `sat` and is queued |
 | 4 | every `correct → unknown/timeout` row triaged; net `correct` ≥ 0 per logic | **PASS**: 105 rows triaged (97 solver-attributable, 8 noise); raw net BVFP +40, LIA +61, LRA +2, S 0, SLIA +32, UFLIA +43, UFLRA 0; credited net +5, +4, +3, 0, +37, +42, 0 |
-| 5 | oracle catches the defect at HEAD, 0 after; gates green | **PASS**: `differential_qf_lia_lra_polarity` 3 (LIA) and 4 (LRA) disagreements before, 0 and 0 after; oracle suite 720 discovered (717 passed, 3 skipped); lint, test (1,623 passed / 7 skipped), deny and secrets green |
+| 5 | oracle catches the defect at HEAD, 0 after; gates green | **PASS**: `differential_qf_lia_lra_polarity` 3 (LIA) and 4 (LRA) disagreements before, 0 and 0 after; oracle suite 720 discovered (717 passed, 3 skipped); lint, test (1,623 passed / 7 skipped), deny and secrets green. `ci` was run as its parts — lint, test, deny, secrets — see the report's *Gates*; the PR's CI run is the single-command confirmation |
 | 6 | median/p90 ms per logic vs base | **REPORTED**: on a controlled paired sample the median per-row ratio is 1.00 for BVFP, LRA, S, SLIA and UFLRA, 0.99 for LIA and 0.82 (faster) for UFLIA. Bench-level medians are confounded by load during the base run |
 
 **Credited gain: +91, not +178.** Raw `correct` went 63,271 → 63,449. Every
@@ -372,7 +372,15 @@ arctic-matrix, Certora), which is queued.
 - the losses attributable to the faithful encoding, which are search-order
   sensitive because the same families also gain (rings
   `ring_2exp14_3vars_0ite_unsat`, Reynolds `21760`);
-- memory growth on large LIA/UFLIA instances;
+- memory growth on large LIA/UFLIA instances (also measure the axioms minted
+  for `(not (= a b))` atoms that the `Not(Eq)` arm already rewrites, and the
+  Tseitin encoding of each axiom `or`);
+- a pre-existing wrong `sat` for a theory atom used as a UF argument
+  (reproducer `(P (= x 1))`, `(not (P true))`, `(= x 1)`, z3 `unsat`); one
+  direction is a proxy Bool variable for each Bool-sorted UF argument;
+- a pre-existing FP-to-Real bridge hang:
+  `(= p (= (fp.to_real x) 2.0))` with `p` and `x` pinned to 1.0 went from a
+  wrong `sat` to a timeout, and the positive form hangs on both binaries;
 - the QF_LRA Int-literal `ite` `unknown`;
 - `(get-model)` not `|…|`-quoting symbols that need it;
 - every slice-52 queue item.

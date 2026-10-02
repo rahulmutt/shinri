@@ -1840,8 +1840,11 @@ impl Solver {
     /// position of `roots` (`and`/`or`/`not`/`=>`/`xor`/`ite`, Bool `=` and
     /// Bool `distinct`), in first-visit order, without duplicates. An n-ary
     /// arithmetic `=` contributes its adjacent pairs, the same hash-consed
-    /// terms `lower` conjoins. Non-Bool terms are not entered (term-level
-    /// `ite` is already lifted by `word_norm`). Iterative: deep BMC formulas.
+    /// terms `lower` conjoins. Non-Bool terms are not entered: term-level
+    /// `ite` is already lifted by `word_norm`, and String-sorted `ite` is
+    /// eliminated by `shinri_str::reduce::reduce_assertions` on the string
+    /// path. Theory atoms used as UF arguments are therefore not collected
+    /// (queued, slice-53 report). Iterative: deep BMC formulas.
     fn arith_eq_atoms(&mut self, roots: &[TermId]) -> Vec<TermId> {
         use shinri_core::{BuiltinOp, Op, TermNode};
         let bool_sort = self.ctx.bool_sort();

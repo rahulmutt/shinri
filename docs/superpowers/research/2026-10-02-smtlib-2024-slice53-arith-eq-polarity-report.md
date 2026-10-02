@@ -135,9 +135,9 @@ below close under `new = old − outbound + inbound`.
 | --- | --- | --- | --- |
 | 1 | keymaera ×2, calypto ×2 `wrong → correct` (`unsat`) | **PASS** | all four `unsat` in `slice53` (keymaera 4 ms, calypto 2.0 s / 4.0 s); triage re-run: base `sat` 3/3, after `unsat` 3/3 |
 | 2 | ramalho `wrong → correct`, or marker + queued cause | **PASS (fixed branch, 4a)** | `wrong → correct` (796 ms); base `sat` 3/3, after `unsat` 3/3; cause: `fp.add` zero sign under RTN (*Ramalho*) |
-| 3 | 0 rows `* → wrong` in all 7 logics | **PASS: 0** | no changed cell ends in `wrong`; no `ESCALATE`; the 1,566 triage re-runs of the after binary contain 0 wrong answers |
+| 3 | 0 rows `* → wrong` in all 7 logics | **PASS: 0** | no changed cell ends in `wrong`; no `ESCALATE`; the 1,566 triage re-runs of the after binary contain 0 wrong answers. This is a corpus measurement. It does not claim that no wrong-`sat` shapes remain: a theory atom used as a UF argument is still a wrong `sat` (see *Queued for the next slice*) |
 | 4 | every `correct → unknown/timeout` row listed and triaged; net `correct` ≥ 0 per logic | **PASS** | 105 rows, all triaged (97 attributable, 8 noise); raw net ≥ 0 in every logic (+40, +61, +2, 0, +32, +43, 0), and credited net ≥ 0 in every logic (+5, +4, +3, 0, +37, +42, 0) |
-| 5 | §6.3 catches the defect at HEAD and shows 0 after; oracle discovered count non-zero; lint, test, `ci` green | **PASS** | before: QF_LIA 3, QF_LRA 4 disagreements; after: 0 / 0; oracle suite 720 discovered (717 passed, 3 skipped); see *Gates* |
+| 5 | §6.3 catches the defect at HEAD and shows 0 after; oracle discovered count non-zero; lint, test, `ci` green | **PASS** | before: QF_LIA 3, QF_LRA 4 disagreements; after: 0 / 0; oracle suite 720 discovered (717 passed, 3 skipped); `ci` green (run as its parts — lint, test, deny, secrets — see *Gates*; the PR's CI run is the single-command confirmation) |
 | 6 | median/p90 ms per logic reported against `slice53-base` | **REPORTED** | *Timing*: neutral, except QF_UFLIA faster |
 
 ## Per-logic matrix
@@ -293,7 +293,13 @@ the arithmetic `=` atoms, from `(= t c)` to the equivalent
 `(and (<= t c) (>= t c))`, so that the **base** binary also encodes them
 faithfully.
 
-- **rings** (all 17 `=` atoms are `(= o_k 1)` inside `(= (> t 4096) (= o_k 1))`):
+- **rings.** The rewrite changed only the `(= o_k 1)` atoms, each of which
+  sits inside a Bool iff `(= (> t 4096) (= o_k 1))`. There are 4 of them in
+  `ring_2exp14_3vars_0ite_unsat` and 6 in `ring_2exp12_4vars_2ite_unsat`.
+  Two kinds of atom were left as they were: the Bool-sorted iff `=` itself,
+  and the one top-level `(not (= ?v_i ?v_j))` in each file
+  (`(not (= ?v_1 ?v_9))` and `(not (= ?v_4 ?v_17))`), which the
+  `Not(Eq)` arm already handles in both binaries.
 
   | file | base, original | base, rewritten | after, original |
   | --- | --- | --- | --- |
@@ -479,8 +485,11 @@ above.
   | before (HEAD `2ceef06`, Task 2 Step 4) | 174 / 26 / 0 / **3** (first: iter 51, shinri `sat`, z3 `unsat`) | 168 / 32 / 0 / **4** (first: iter 60, nested `ite`/`xor`/Bool-`=`) |
   | after (`d9188f3`, Task 2 Step 10, final) | 171 / 29 / 0 / **0** | 164 / 36 / 0 / **0** |
 
-  Both sat and unsat counts are non-zero. The test runtime is 6.3 s, under
-  the 30 s target.
+  Both sat and unsat counts are non-zero. The test took 6.3 s when run
+  filtered and alone on an idle machine (Task 2 takeover). It took 11.97 s in
+  the loaded gate run, the unfiltered oracle suite on cores 0–11 next to the
+  live base run (`target/slice53-oracle.log`). Both are under the 30 s
+  target.
 - **Unit tests** (`lib.rs`): 4/4, including
   `arith_eq_atoms_splits_nary_like_lower` and
   `binary_arith_eq_lowers_to_conj_with_three_axioms`, which pins `(and E Le Ge)`
@@ -568,11 +577,40 @@ New from this slice:
   `nec-smt/large/handler_sigchld/prp-0-48.smt2` the after binary runs out of
   memory at about 4 s (3/3), while `2ceef06` times out at 20 s. The same
   holds for `arctic-matrix/constraint-2050620` and the two Certora rows.
-  Measure the axiom pass's term/clause growth on these instances.
+  Measure the axiom pass's term/clause growth on these instances. Two
+  plausible contributors are worth measuring together with the `Not(Eq)` arm
+  removal:
+  - Pure-arithmetic `(not (= a b))` atoms are still collected and get
+    3 axioms, even though the `Not(Eq)` arm rewrites them to `(or Lt Gt)`.
+    So E, Le and Ge are minted for nothing.
+  - Each axiom is a `TermId` `or` that goes through Tseitin, not a direct
+    clause.
 - **QF_LRA `ite` with Int-literal branches answers `unknown`** (R7): for
   example `(ite c 1 0)` in a Real context under a QF_LRA header. It is
   pre-existing and independent of this slice. `term_ite_condition` uses
   `1.0`/`0.0` until it is fixed.
+- **Wrong `sat`: a theory atom used as an argument of an uninterpreted
+  function** (pre-existing, found in the final review). `arith_eq_atoms`
+  does not enter non-Bool parents (spec §3.1), and the same gap exists for
+  other theory atoms. So an atom that is an argument of a UF is never tied
+  to its theory meaning. The reproducer is QF_UFLIA:
+  `(declare-fun P (Bool) Bool)`, `(assert (P (= x 1)))`,
+  `(assert (not (P true)))`, `(assert (= x 1))`. Both `2ceef06` and `07ac180`
+  answer `sat`, while z3 answers `unsat` (re-run in the final review). These
+  shapes behave the same way:
+  - `(distinct (f (= x 1)) (f true))` with `(= x 1)`;
+  - `(P (<= x 1))` in QF_UFLIA;
+  - `(P (= a b))` over an uninterpreted sort `U`.
+
+  A suggested direction is to tie each Bool-sorted UF argument to a proxy
+  Bool variable, so the argument becomes a Boolean position (`p ⇔ atom`,
+  with `P p` in place of `P atom`).
+- **FP-to-Real bridge hang** (pre-existing). The script is QF_FPLRA:
+  `(fp.eq x ((_ to_fp 5 11) RNE 1.0))`, `(= p (= (fp.to_real x) 2.0))`, `p`.
+  It was a wrong `sat` on `2ceef06`. It is now a timeout (> 20 s) on
+  `07ac180`, because the axioms now give the inner `=` its arithmetic meaning.
+  The plain positive form, `(= (fp.to_real x) 2.0)` with `x` pinned to 1.0,
+  also hangs (> 20 s) on **both** binaries. z3 answers `unsat` for both.
 - **`(get-model)` does not `|…|`-quote symbols that need it** (names with `#`
   or `:`, as in ESBMC's `__ESBMC_rounding_mode&0#10`), so the printed model is
   not re-parseable SMT-LIB. This was found during the ramalho triage.
