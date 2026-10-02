@@ -218,11 +218,15 @@ fn special_case(
     let any_inf = b.or2(ox.is_inf, oy.is_inf);
     let inf_sign = b.mux2(ox.is_inf, ox.sign, oy.sign);
     let inf_bits = inf_pattern_bits(b, eb, sb, inf_sign);
-    // Exact-zero finite result (cancellation, incl. both inputs zero) → IEEE sign
-    // rule, matching ref_add: neg iff (sign_a AND sign_b) OR roundTowardNegative.
+    // Exact-zero finite result (cancellation, incl. both inputs zero) → IEEE
+    // 754 §6.3 sign rule, matching ref_add: a same-sign zero sum keeps the
+    // operands' sign in every mode; an opposite-sign exact-zero sum is -0 iff
+    // roundTowardNegative. So neg iff (sign_a AND sign_b) OR (opp_sign AND RTN)
+    // — `(+0)+(+0)` under RTN is +0 (slice 53, ramalho wrong-sat).
     let both_neg = b.and2(ox.sign, oy.sign);
     let rtn = rm.sel[3];
-    let zero_neg = b.or2(both_neg, rtn);
+    let opp_rtn = b.and2(opp_sign, rtn);
+    let zero_neg = b.or2(both_neg, opp_rtn);
     let zero_bits = signed_zero_bits(b, eb, sb, zero_neg);
 
     // Priority: NaN > Inf > cancel_zero > normal.
@@ -288,6 +292,52 @@ mod tests {
             RoundMode::Rtp => shinri_core::RoundingMode::Rtp,
             RoundMode::Rtn => shinri_core::RoundingMode::Rtn,
             RoundMode::Rtz => shinri_core::RoundingMode::Rtz,
+        }
+    }
+
+    /// IEEE 754 §6.3: a sum of two zeros of the SAME sign keeps that sign in
+    /// every rounding mode; only an exact-zero sum of OPPOSITE-signed operands
+    /// takes -0 under roundTowardNegative. Expected values are hard-coded (not
+    /// `ref_add`) so a shared reference bug cannot mask an encoding bug.
+    /// Slice 53: `(+0)+(+0)` under RTN gave -0 (ramalho QF_BVFP wrong-sat).
+    #[test]
+    fn fp_add_signed_zero_sums_all_modes() {
+        let modes = [
+            RoundMode::Rne,
+            RoundMode::Rna,
+            RoundMode::Rtp,
+            RoundMode::Rtn,
+            RoundMode::Rtz,
+        ];
+        for (eb, sb) in [(3u32, 5u32), (8, 24), (11, 53)] {
+            let neg0 = 1u64 << (eb + sb - 1);
+            let one = ((1u64 << (eb - 1)) - 1) << (sb - 1);
+            for m in modes {
+                let opp = if m == RoundMode::Rtn { neg0 } else { 0 };
+                for (a, bb, want) in [
+                    (0, 0, 0),
+                    (neg0, neg0, neg0),
+                    (0, neg0, opp),
+                    (neg0, 0, opp),
+                    (one, one | neg0, opp),
+                ] {
+                    let mut bl = Blaster::new();
+                    let xv = const_bits(&bl, eb, sb, a);
+                    let yv = const_bits(&bl, eb, sb, bb);
+                    let sel = rm::literal(&bl, rmode(m));
+                    let word = fp_add(&mut bl, &xv, &yv, &sel, eb, sb);
+                    assert_eq!(
+                        eval_word(bl, &word),
+                        want,
+                        "fp.add ({eb},{sb}) a={a:#x} b={bb:#x} m={m:?}"
+                    );
+                    assert_eq!(
+                        ref_add(eb, sb, &Integer::from(a), &Integer::from(bb), m),
+                        Integer::from(want),
+                        "ref_add ({eb},{sb}) a={a:#x} b={bb:#x} m={m:?}"
+                    );
+                }
+            }
         }
     }
 
