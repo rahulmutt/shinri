@@ -17,18 +17,22 @@ taskset -c 12-23 target/release/shinri-bench run \
   --timeout 20 --mem-mb 3072 --jobs 6 \
   --solver target/slice54-base/shinri --run-id slice54-base
 # base, leg 2 (the 1,411 files leg 1 did not reach, copied to a corpus dir;
-# detached with setsid; the command line is reconstructed from the fixture
-# line, which records the solver, limits and corpus)
+# detached with setsid)
 taskset -c 12-23 target/release/shinri-bench run \
+  --logics QF_UFLIA,QF_UFLRA \
   --timeout 20 --mem-mb 3072 --jobs 6 \
   --solver target/slice54-base/shinri --corpus target/slice54-base/rest-corpus \
   --run-id slice54-base-rest
 
-# after (Task 4)
+# after (Task 4; frozen copy, launched detached under setsid/nohup so it
+# outlives the tool's 2 h limit)
 cargo build --release -p shinri-cli -p shinri-bench
-md5sum target/release/shinri   # 579f17b300bff4feec82b11bc8371fd3 = fixture solver_md5
-BENCH_LOGICS=QF_UF,QF_DT,QF_UFLIA,QF_UFLRA BENCH_RUN_ID=slice54 \
-  taskset -c 12-23 mise run bench-run
+cp target/release/shinri target/slice54-after/shinri
+md5sum target/slice54-after/shinri   # 579f17b300bff4feec82b11bc8371fd3 = fixture solver_md5
+taskset -c 12-23 target/release/shinri-bench run \
+  --logics QF_UF,QF_DT,QF_UFLIA,QF_UFLRA \
+  --timeout 20 --mem-mb 3072 --jobs 6 \
+  --solver target/slice54-after/shinri --run-id slice54
 BENCH_RUN_ID=slice54 mise run bench-report
 ```
 
@@ -38,7 +42,7 @@ All runs used the default limits: 20 s, 3072 MB, 6 jobs, cgroup `cpu.max`
 
 | run | solver | `solver_md5` | started | finished | wall-clock | rows |
 | --- | --- | --- | --- | --- | --- | ---: |
-| `slice54` (after) | `target/slice54-after/shinri` (= `target/release/shinri` @ `6212fa5`) | `579f17b300bff4feec82b11bc8371fd3` | 2026-10-02T14:10:43Z | 16:09:30Z | ~1 h 59 min | 18,146 |
+| `slice54` (after) | `target/slice54-after/shinri` (frozen copy of `target/release/shinri`, built from `6212fa5`) | `579f17b300bff4feec82b11bc8371fd3` | 2026-10-02T14:10:43Z | 16:09:30Z | ~1 h 59 min | 18,146 |
 | `slice54-base` (leg 1) | `target/slice54-base/shinri` (built from the `61be117` sources) | `84a83b41d8718df3cb0905a03b1980d6` | 2026-10-02T11:32:49Z | 13:33:02Z (killed) | ~2 h 00 min | 16,735 |
 | `slice54-base-rest` (leg 2) | same binary | `84a83b41d8718df3cb0905a03b1980d6` | 2026-10-02T13:33:24Z | 13:41:30Z | ~8 min | 1,411 |
 
