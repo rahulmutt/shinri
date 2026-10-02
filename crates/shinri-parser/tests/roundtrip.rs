@@ -33,3 +33,42 @@ fn roundtrips_string_literals_with_escapes() {
     roundtrip(r#""\u{2FFFF}""#, |_, _| {});
     roundtrip(r#""\u{22}""""#, |_, _| {});
 }
+
+/// Like `roundtrip`, but each parser first consumes `n_decls` declaration
+/// commands from `decls` (the parser's symbol environment is per-`Parser`).
+fn roundtrip_declared(decls: &str, n_decls: usize, term: &str) {
+    let mut ctx = Context::new();
+    let src1 = format!("{decls} {term}");
+    let mut p1 = Parser::new(&src1);
+    for _ in 0..n_decls {
+        p1.next_command(&mut ctx).unwrap().expect("decl 1");
+    }
+    let t1 = p1.parse_term_pub(&mut ctx).expect("parse 1");
+    let printed = print_term(&ctx, t1);
+    let src2 = format!("{decls} {printed}");
+    let mut p2 = Parser::new(&src2);
+    for _ in 0..n_decls {
+        p2.next_command(&mut ctx).unwrap().expect("decl 2");
+    }
+    let t2 = p2.parse_term_pub(&mut ctx).expect("parse 2");
+    assert_eq!(
+        t1, t2,
+        "roundtrip changed the term: {term:?} -> {printed:?}"
+    );
+}
+
+#[test]
+fn roundtrips_quoted_symbols_and_nullary_builtins() {
+    let decls = "(declare-sort |my sort| 0)(declare-fun |a#b| () |my sort|)\
+                 (declare-fun |let| () Int)(declare-fun |f g| (Int) Int)\
+                 (declare-fun s () String)";
+    for term in [
+        "|a#b|",
+        "(|f g| |let|)",
+        "(+ (|f g| 1) (- 3))",
+        "(str.in_re s re.none)",
+        "(str.in_re s (re.++ re.allchar re.all))",
+    ] {
+        roundtrip_declared(decls, 5, term);
+    }
+}
