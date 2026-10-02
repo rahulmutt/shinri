@@ -321,5 +321,60 @@ reasoned omission, not as coverage.
 
 ## 11. Measured outcomes
 
-Filled in by task 5 (criteria table with PASS/FAIL and evidence), as in
-slice 53 §12.
+Run `slice54` (fixture `6212fa5fcf84`, `solver_md5 579f17b3…`) against
+`slice54-base` (binary built at `b59f115` with Rust 1.99.0 from sources
+identical to `61be117` — the `crates` diff is empty — `solver_md5
+84a83b41…`). The harness records the checkout HEAD, not the binary's commit:
+the base legs' headers say `b59f115979ab` and `6212fa5fcf84`. Both runs
+cover QF_UF, QF_DT, QF_UFLIA and QF_UFLRA: 18,146 rows, 0 missing, 0 extra,
+20 s, 3072 MB, 6 jobs, `taskset -c 12-23`. Full report:
+`docs/superpowers/research/2026-10-02-smtlib-2024-slice54-uf-bool-arg-report.md`.
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | r1–r5, r7, s5 `unsat`; every `sat` sibling stays `sat` | **PASS**: `slice54_probes` 5/23 at HEAD `bc6d152` (18 failures: 17 wrong `sat`s and the post-mint length check), 23/23 after |
+| 2 | §6.3 disagreements > 0 at HEAD, 0 after; discovered > 0; existing oracle families 0 | **PASS**: `bool_arg_oracle` (3 tests) 29 / 20 / 12 disagreements (QF_DT / QF_UFLIA / QF_UFLRA) at HEAD, 0 / 0 / 0 after, sat and unsat both non-zero, 10.8 s; `differential_qf_uflia_compound_args` + `qfdt_oracle` 19/19; full oracle suite 749 run, 749 passed, 3 skipped (752 discovered = slice 53's 720 + 23 probes + 6 unit tests + 3 oracle tests) |
+| 3 | 0 rows `* → wrong` | **PASS: 0**; no `ESCALATE`; neither run has a `wrong` row; 0 wrong answers in 934 re-runs (triage 216, minting rows 30, timing sample 688) |
+| 4 | every `correct → unknown/timeout` row triaged; net `correct` ≥ 0 per logic | **PASS**: 4 rows (QF_UF QG-classification `correct → timeout`), all noise (3× per binary: same success count or after better, 20 s edge; none can mint a proxy); raw net QF_DT +1, QF_UF +171, QF_UFLIA +6, QF_UFLRA 0; credited net 0 in every logic |
+| 5 | fence pins hold; no `bool!` in `get-model` | **PASS**: the three `fence_pin_*` probes stay `unknown`; `get_model_has_no_proxy_symbols` passes |
+| 6 | `mise run lint`, `mise run test`, `ci` green | **PASS locally**: lint clean; test 1,652 passed / 7 skipped; deny and secrets rc 0. `ci` was run as its parts; the PR's CI run is the single-command confirmation |
+| 7 | rows that mint ≥ 1 proxy; median/p90 per logic vs base | **MEASURED**: upper bound 105 QF_UF files (Goel 59, CLEARSY 46) and 0 QF_DT (no Bool constructor field in the corpus; QF_UFLIA/QF_UFLRA 0); after macro expansion only **5** files (CLEARSY) apply a Bool-parameter function to a compound argument, all `correct` in both runs. Paired interleaved sample: median per-row ratio after/base 0.92 (QF_DT, ~20 ms rows), 0.99 (QF_UF, QF_UFLIA), 1.00 (QF_UFLRA) |
+
+**Credited gain: 0, raw +178.** `correct` went 15,152 → 15,330. None of the
+189 changed rows can mint a proxy, so their encoding is unchanged (§3.3).
+The interleaved re-runs show both binaries behave the same on them: the QF_UF
+QG-classification `timeout → correct` 173 (sampled 20) and the 4 losses are
+rows at the 20 s edge, where the base run's QF_UF section ran slower (median
+bench ratio after/base 0.69–1.06 by position, versus 0.99 interleaved). The
+mathsat `Hash` 6, blocksworld 1, PEQ 1 and SEQ 1 gains, and the Certora
+`oom`/`timeout` swaps, are noise the same way. The local corpus has no row
+whose answer the fix changes; the evidence for the fix is criteria 1 and 2.
+
+**Deviations from the spec text:**
+
+- **§6.3:** the oracle is three tests in `tests/bool_arg_oracle.rs`
+  (`QF_DT`, `QF_UFLIA`, `QF_UFLRA` families), not one
+  `differential_bool_arg`. The generator was not strengthened: it found
+  disagreements at HEAD as written.
+- **§6.2 / Review Focus 3:** `string_path_bool_arg_is_not_sat` came out
+  **`unsat`** (`unknown` was also acceptable); its `(= s "ab")` sibling is
+  `sat`.
+- **§4, `get-value`:** not unchanged. `(get-value ((P (= x 1))))` after a
+  `sat` prints `?` where HEAD printed `true`, because the assertion is
+  rewritten to `(P bool!n)` and `lib.rs` has no remap for it (as it has for
+  eliminated ites, `orig_ite_map` → `eliminated_ite_vals`). The fix needs
+  `lib.rs`, outside this slice's file scope; it is queued. No verdict
+  changes.
+- **§7, base run:** two legs with the same frozen binary and limits.
+  `slice54-base` (16,735 rows) was killed by the tool's 2 h background
+  limit; a resume was refused because the fixture header records the
+  checkout sha, which had moved. The remaining 1,411 QF_UFLIA/QF_UFLRA files
+  ran as `slice54-base-rest` (`--corpus target/slice54-base/rest-corpus`).
+  The base matrix and transitions combine both legs. Leg 1's QF_DT section
+  ran next to Tasks 2–3 on cores 0–11.
+- **§7:** QF_DT has no Bool constructor field in the local corpus, so it is
+  a control on the bench; the DT fix is covered by the probes and the QF_DT
+  oracle family.
+- Not a gate, queued: `cargo clippy --features oracle` fails on pre-existing
+  oracle test files under Rust 1.99 (`manual_is_multiple_of`,
+  `too_many_arguments`); `bool_arg_oracle.rs` is clean.
