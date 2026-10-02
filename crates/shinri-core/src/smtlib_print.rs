@@ -6,9 +6,29 @@ use std::borrow::Cow;
 
 use crate::{BuiltinOp, ConstVal, Context, Op, SortId, SortNode, TermId, TermNode};
 
-/// Node-visit budget for one `get-value` response (slice 43 T6: the labels
-/// can all name the same `let`-shared term, so the budget is shared across
-/// a response, not per label). Moved from `shinri-solver/src/tseitin.rs`.
+/// Node-visit budget for one `get-value` response (slice 43 T6 review
+/// finding 1). The term DAG is hash-consed and the parser's `let` binds a
+/// name to a TermId without duplicating it, so a LINEAR-size, SMALL-depth
+/// script can share a subterm at every level (`x_i := (g x_{i-1} x_{i-1})`).
+/// The printer has no memoization, so it re-walks a shared child once per
+/// occurrence: `2^N` node-visits for `N` levels, not `N`. Measured pre-budget
+/// with a 22-level chain (612-byte script): a 29 MB response in ~4.3s,
+/// roughly doubling per extra level (100 MB/16.5s at N=24). The depth cap
+/// does NOT bound this; the blowup is severe at depth 22-24.
+///
+/// The budget counts down by one per node visited (checked BEFORE recursing,
+/// so it bounds work done, not just output size); remaining subterms print
+/// as `|<truncated>|` once it hits zero. 100_000 is far more nodes than any
+/// human-written `get-value` target has, yet cuts an exponential chain off
+/// at roughly its 17th sharing level, so the worst case is sub-millisecond.
+///
+/// The budget is built ONCE PER `get-value` RESPONSE (in the
+/// `Command::GetValue` arm) and threaded through every label: `(get-value
+/// (t1 … tK))` with a per-term budget would bound each label but not the
+/// response. Measured on a 24_635-byte script whose K=40 labels all name the
+/// same 25-level `let`-shared term: 14.0 MB in 0.55s per-term, 350 KB in
+/// 0.017s shared — the multiplier is exactly K, bounded only by script
+/// length. Moved from `shinri-solver/src/tseitin.rs`.
 pub const DISPLAY_TERM_BUDGET: usize = 100_000;
 
 /// Printed in place of a subterm once the budget or the depth backstop is

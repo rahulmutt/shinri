@@ -292,7 +292,7 @@ fn get_value_labels_responses_with_the_requested_term() {
 /// T6 review finding 1 (security-relevant, exponential output amplification):
 /// the term DAG is hash-consed and the parser supports `let`
 /// (`shinri-parser/src/parser.rs:772`), which binds a name to a TermId
-/// without duplicating it. `display_term` has no memoization, so before the
+/// without duplicating it. the `get-value` printer (`smtlib_print`) has no memoization, so before the
 /// node-visit budget it re-walked a shared child once per occurrence in its
 /// parent — a chain of `x_i := (g x_{i-1} x_{i-1})` cost `2^N` node-visits
 /// for `N` levels, not `N`. Measured pre-fix: a 22-level chain (612-byte

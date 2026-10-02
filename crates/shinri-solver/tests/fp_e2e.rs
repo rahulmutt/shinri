@@ -1244,7 +1244,7 @@ fn get_value_on_eliminated_rm_ite_returns_mode() {
         "internal name leaked: {}",
         values[0]
     );
-    assert!(values[0].contains("RTZ"), "expected RTZ: {}", values[0]);
+    assert_eq!(values[0], "(((ite p RTZ RNE) RTZ))", "expected RTZ");
 }
 
 #[test]

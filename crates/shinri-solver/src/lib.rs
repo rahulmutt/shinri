@@ -456,12 +456,13 @@ impl Solver {
                 // labels can all name the same `let`-shared term, so a
                 // per-term budget bounds K labels at K× the documented size
                 // (measured, K=40: 14.0 MB per-term vs 350 KB shared).
-                let mut budget = crate::tseitin::DISPLAY_TERM_BUDGET;
+                let mut budget = shinri_core::smtlib_print::DISPLAY_TERM_BUDGET;
                 for (i, t) in ts.iter().enumerate() {
                     if i > 0 {
                         out.push(' ');
                     }
-                    let name = crate::tseitin::display_term(&self.ctx, *t, &mut budget);
+                    let name =
+                        shinri_core::smtlib_print::print_term_budgeted(&self.ctx, *t, &mut budget);
                     let v = self.format_value(*t).unwrap_or_else(|| "?".to_string());
                     out.push_str(&format!("({name} {v})"));
                 }
@@ -585,8 +586,8 @@ impl Solver {
             };
             out.push_str(&format!(
                 "(define-fun {} () {} {})",
-                d.name,
-                self.ctx.sort_name(d.result),
+                shinri_core::smtlib_print::quote_symbol(&d.name),
+                shinri_core::smtlib_print::print_sort(&self.ctx, d.result),
                 val
             ));
         }
@@ -1365,7 +1366,7 @@ impl Solver {
                 // Combiner runs over a *clone* of the context and may mint fresh
                 // terms (e.g. string-theory F-split skolems) whose TermIds are out
                 // of range for `self.ctx`. Surfacing them would make `get-model` /
-                // `display_term` index out of bounds.
+                // the `get-value` printer index out of bounds.
                 for (term, val) in mb.iter() {
                     if self.ctx.contains_term(term) {
                         if self.word_norm.internal.contains(&term) {

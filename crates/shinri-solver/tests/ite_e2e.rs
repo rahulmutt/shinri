@@ -191,11 +191,7 @@ fn get_value_on_eliminated_int_ite_returns_branch_value() {
         values[0]
     );
     assert!(!values[0].contains('?'), "no value produced: {}", values[0]);
-    assert!(
-        values[0].contains('2'),
-        "expected branch value 2: {}",
-        values[0]
-    );
+    assert_eq!(values[0], "(((ite b 2 0) 2))", "expected branch value 2");
 }
 
 /// Slice 10 model channel: get-model must NOT leak internal ite! symbols
