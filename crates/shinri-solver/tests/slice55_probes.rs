@@ -59,11 +59,8 @@ fn e1_builtin_echo() {
          (check-sat)(get-value ((+ a 1)))",
     );
     // The value of (+ a 1) is not a registered term; `?` is the honest
-    // fallback (a V2 evaluator is queued). The echo is what this pins.
-    assert!(
-        out[0] == "(((+ a 1) 1))" || out[0] == "(((+ a 1) ?))",
-        "{out:?}"
-    );
+    // fallback. A V2 evaluator would change this line deliberately.
+    assert_eq!(out[0], "(((+ a 1) ?))", "{out:?}");
 }
 
 #[test]
@@ -184,7 +181,8 @@ fn stale_rewrite_after_pop_prints_unknown_value() {
         "{UFLIA}(push 1)(assert (= (f (= x 1)) 7))(check-sat)(pop 1)\
          (assert (= x 3))(check-sat)(get-value ((f (= x 1))))"
     ));
-    // out[0] is the first sat's (absent) output; the second check-sat line:
+    // `sat_then` drops the first `sat`, so out[0] is the second check-sat's
+    // `sat` and out[1] is the get-value line.
     assert_eq!(out[0], "sat", "{out:?}");
     assert_eq!(out[1], "(((f (= x 1)) ?))", "stale value served: {out:?}");
 }
@@ -208,4 +206,16 @@ fn unrewritten_bool_uf_application_unchanged() {
         "{UFLIA}(assert (P c))(check-sat)(get-value ((P c)))"
     ));
     assert_eq!(out[0], "(((P c) true))");
+}
+
+#[test]
+fn e5_quoted_datatype_constructor_value() {
+    let out = sat_then(
+        "(set-logic QF_DT)(declare-datatypes ((|my dt| 0)) \
+         (((|mk a| (|fa b| Int)) (|nil x|))))\
+         (declare-fun v () |my dt|)(assert ((_ is |mk a|) v))\
+         (check-sat)(get-model)(get-value (v))",
+    );
+    assert_eq!(out[0], "((define-fun v () |my dt| (|mk a| 0)))", "{out:?}");
+    assert_eq!(out[1], "((v (|mk a| 0)))", "{out:?}");
 }
