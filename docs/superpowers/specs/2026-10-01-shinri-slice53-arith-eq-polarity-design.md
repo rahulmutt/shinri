@@ -301,4 +301,77 @@ queued.
 
 ## 12. Measured outcomes
 
-To be filled in from the `slice53` report.
+Run `slice53` (fixture `07ac180fe984`, `solver_md5 50af1137…`) against
+`slice53-base` (binary built from the `2ceef06` sources, `solver_md5
+d2daafb3…`; its fixture header says `807ec5b42502`, the checkout HEAD, because
+the harness records the checkout and not the binary's commit; the `crates`
+diff between the two is empty). Both runs cover QF_LIA, QF_LRA, QF_BVFP,
+QF_UFLIA, QF_UFLRA, QF_S and QF_SLIA: 137,586 rows, 0 missing, 0 extra, 20 s,
+3072 MB, 6 jobs. Full report:
+`docs/superpowers/research/2026-10-02-smtlib-2024-slice53-arith-eq-polarity-report.md`.
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | keymaera ×2, calypto ×2 `wrong → correct` | **PASS**: all four `unsat`; a re-run gives base `sat` 3/3 and after `unsat` 3/3 |
+| 2 | ramalho `wrong → correct` or marker | **PASS, fixed (branch 4a)**: `fp.add` zero sign under RTN (`07ac180`); minimized core 12 asserts / 1,362 B pinned as `ramalho_min_core` |
+| 3 | 0 rows `* → wrong` | **PASS: 0**, no escalation; 0 wrong answers from the after binary in 1,566 triage re-runs |
+| 4 | every `correct → unknown/timeout` row triaged; net `correct` ≥ 0 per logic | **PASS**: 105 rows triaged (97 solver-attributable, 8 noise); raw net BVFP +40, LIA +61, LRA +2, S 0, SLIA +32, UFLIA +43, UFLRA 0; credited net +5, +4, +3, 0, +37, +42, 0 |
+| 5 | oracle catches the defect at HEAD, 0 after; gates green | **PASS**: `differential_qf_lia_lra_polarity` 3 (LIA) and 4 (LRA) disagreements before, 0 and 0 after; oracle suite 720 discovered (717 passed, 3 skipped); lint, test (1,623 passed / 7 skipped), deny and secrets green |
+| 6 | median/p90 ms per logic vs base | **REPORTED**: on a controlled paired sample the median per-row ratio is 1.00 for BVFP, LRA, S, SLIA and UFLRA, 0.99 for LIA and 0.82 (faster) for UFLIA. Bench-level medians are confounded by load during the base run |
+
+**Credited gain: +91, not +178.** Raw `correct` went 63,271 → 63,449. Every
+changed row was re-run 3× per binary; Reynolds was a 16 + 16 stratified
+sample. That shows 96 `timeout → correct` rows were base-run load noise (the
+base binary solves them unloaded: SMPT 53, KLEE 31 and others), 8
+`correct → timeout` rows were the same noise in reverse, and the z3-oracle
+`unverified` flips net −1. The solver-attributable movement is +188 / −97:
+
+- Gains: the 5 formerly `wrong` rows; QF_UFLIA mathsat 42; QF_SLIA Reynolds
+  `kaluza/unsat/big` 101, Leetcode 16 and stringfuzz 9; LIA rings 4, nec-smt
+  3 and CIRC 1; LRA 3; BVFP 4 (plausibly the `fp.add` circuit change).
+- Losses: Reynolds 86, stringfuzz 3, rings 5, calypto 1, sc 1 and TM 1.
+
+The loss mechanism is evidenced. On `2ceef06` these `unsat` answers were
+reached on an under-constrained encoding, because an arithmetic `E` under
+Bool `=`/`not` was a free EUF atom. That relaxation is sound for `unsat`. When
+the atoms are rewritten so that the base binary encodes them faithfully, the
+base binary loses the same rows (rings: 46 ms → timeout; Reynolds: `unsat` →
+`sat-budget`). The stringfuzz trio is string-engine order sensitivity. For
+example, `regex-050-translate-rotate-fuzz` has only a positive `(= (str.len x) 3)`,
+and its three axiom clauses alone move it from `unsat` to
+`str-model-rejected`. `timeout → oom` +127 is mostly load noise; 6 of 18
+sampled rows run out of memory faster with the after binary (nec-smt large,
+arctic-matrix, Certora), which is queued.
+
+**Deviations from the spec text:**
+
+- **§3.3 not done (ruling R6).** `lower` keeps `(and E Le Ge)`; it does not
+  return the bare `E`. The bare-E lowering exposed a pre-existing order
+  sensitivity in the string engine: `probe_c_len_zero_var` and
+  `user_pfx_name_declared_before_any_mint_still_works` went to `unknown`.
+  Soundness comes from the three axioms. The §3.3 simplification is queued
+  together with that sensitivity.
+- **§5/§6.3:** the oracle family is in `tests/arith_polarity_oracle.rs`, not
+  in `oracle.rs`.
+- **§6.2 (ruling R7):** the Real case of `term_ite_condition` uses
+  `1.0`/`0.0` literals. With Int-literal `ite` branches, QF_LRA answers
+  `unknown`; that gap is pre-existing and queued.
+- **§7:** the base run was launched directly with `shinri-bench`, detached
+  with `setsid` (R1). The gates ran before the after-run, on cores 0–11,
+  while the base run was live (R9). Three probes passed at HEAD
+  (`nary_eq_under_implication`, `uflia_congruence_under_implication`,
+  `slia_len_eq_under_demorgan`); they are kept as regression pins.
+
+**Queued** (report, *Queued for the next slice*):
+
+- removal of the `Not(Eq)` arm, now that the timing condition is met;
+- the bare-E simplification, together with the string-engine order
+  sensitivity (reproducer `regex-050-translate-rotate-fuzz.smt2`);
+- the faithful-encoding performance losses (rings `ring_2exp14_3vars_0ite_unsat`,
+  Reynolds `21760`);
+- memory growth on large LIA/UFLIA instances;
+- the QF_LRA Int-literal `ite` `unknown`;
+- `(get-model)` not `|…|`-quoting symbols that need it;
+- every slice-52 queue item.
+
+Ramalho is fixed and not queued.
