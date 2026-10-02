@@ -108,10 +108,11 @@ fn tester_echo_reparses() {
         "(set-logic QF_DT)(declare-datatypes ((B 0)) (((mk (fa Bool)) (nil))))\
          (declare-fun v () B)(assert ((_ is mk) v))(check-sat)(get-value (((_ is mk) v)))",
     );
-    // Stored as the minted `is-mk` tester symbol (legacy form z3/cvc5 accept).
-    assert!(out[0].starts_with("(((is-mk v) "), "{out:?}");
+    // Stored as the minted `is-mk` tester symbol, printed as the SMT-LIB 2.6
+    // indexed form; the legacy `(is-mk v)` does not parse in shinri.
+    assert!(out[0].starts_with("((((_ is mk) v) "), "{out:?}");
     // The echoed label must re-parse in shinri.
-    let label = "(is-mk v)";
+    let label = "((_ is mk) v)";
     let re = run_script(&format!(
         "(set-logic QF_DT)(declare-datatypes ((B 0)) (((mk (fa Bool)) (nil))))\
          (declare-fun v () B)(assert {label})(check-sat)"

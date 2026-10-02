@@ -72,3 +72,25 @@ fn roundtrips_quoted_symbols_and_nullary_builtins() {
         roundtrip_declared(decls, 5, term);
     }
 }
+
+#[test]
+fn roundtrips_datatype_tester_application() {
+    // A datatype declaration cannot be replayed into one Context, so the
+    // re-parse runs in a fresh Context; identical declarations mint identical
+    // ids, so the TermIds are comparable.
+    let decls = "(declare-datatypes ((B 0)) (((mk (fa Bool)) (nil))))(declare-fun v () B)";
+    let parse = |term: &str| {
+        let mut ctx = Context::new();
+        let src = format!("{decls} {term}");
+        let mut p = Parser::new(&src);
+        for _ in 0..2 {
+            p.next_command(&mut ctx).unwrap().expect("decl");
+        }
+        let t = p.parse_term_pub(&mut ctx).expect("parse");
+        (print_term(&ctx, t), t)
+    };
+    let (printed, t1) = parse("((_ is mk) v)");
+    assert_eq!(printed, "((_ is mk) v)");
+    let (_, t2) = parse(&printed);
+    assert_eq!(t1, t2);
+}

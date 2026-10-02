@@ -203,7 +203,16 @@ fn write_term(ctx: &Context, t: TermId, depth: u32, budget: &mut usize, out: &mu
             out.push('(');
             match op {
                 Op::Builtin(b) => out.push_str(&builtin_name(b)),
-                Op::Uninterpreted(sym) => out.push_str(&quote_symbol(ctx.symbol_name(sym))),
+                // A minted tester is not a bindable name in the parser; the
+                // re-parseable form is the SMT-LIB 2.6 `(_ is C)` indexed head.
+                Op::Uninterpreted(sym) => match ctx.dt_role(sym) {
+                    Some(crate::DtRole::Tester { ctor }) => {
+                        out.push_str("(_ is ");
+                        out.push_str(&quote_symbol(ctx.symbol_name(ctor)));
+                        out.push(')');
+                    }
+                    _ => out.push_str(&quote_symbol(ctx.symbol_name(sym))),
+                },
             }
             for c in children {
                 out.push(' ');
@@ -493,6 +502,18 @@ mod tests {
         ] {
             assert_eq!(quote_symbol(raw), quoted, "{raw}");
         }
+    }
+
+    #[test]
+    fn prints_tester_application_as_indexed_is() {
+        let mut ctx = Context::new();
+        let dt = ctx.declare_datatype_sort("B");
+        let mk = ctx.declare_fun("mk", &[], dt);
+        let is_mk = ctx.declare_fun("is-mk", &[dt], ctx.bool_sort());
+        ctx.dt_add_constructor(dt, mk, &[], is_mk);
+        let v = nullary(&mut ctx, "v", dt);
+        let app = ctx.mk_app(Op::Uninterpreted(is_mk), &[v]).unwrap();
+        assert_eq!(print_term(&ctx, app), "((_ is mk) v)");
     }
 
     #[test]
