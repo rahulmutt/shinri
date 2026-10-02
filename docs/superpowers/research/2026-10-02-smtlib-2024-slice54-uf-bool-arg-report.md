@@ -8,7 +8,9 @@ the bench cannot show the fix itself: the defect is caught by the probes and
 the oracle (below). On the bench, the slice is neutral. Only **5 corpus files
 mint a proxy at all** (all QF_UF CLEARSY, all `correct` in both runs). None of
 the 189 changed rows can mint one, so every changed row is noise by
-construction, and the triage re-runs confirm it.
+construction; the triage re-runs (20 of the 173 QG-classification gains
+sampled, plus the 4 losses and the other changed-row groups, see below)
+are consistent with that.
 
 ```
 # base, leg 1 (Task 1; frozen binary copy)
@@ -121,18 +123,22 @@ close under `new = old − outbound + inbound` (below).
    family: QF_DT, QF_UFLIA, QF_UFLRA), not one `differential_bool_arg`
    (spec §6.3). The generator was used as written; it needed no
    strengthening, since it found 29/20/12 disagreements at HEAD.
-2. **`get-value` on a term with a purified argument now prints `?`**
-   (contradicts spec §4, "`get-value` output is unchanged"). For
-   `(P (= x 1))`, `(not (P true))`, `(= x 2)`, the query
-   `(get-value ((P (= x 1)) (= x 1) (P false)))` gave
+2. **`get-value` on any term that contains a purified argument now prints
+   `?`** (contradicts spec §4, "`get-value` output is unchanged"). The scope
+   is every term containing a compound Bool argument, of any sort, not only
+   Bool-valued ones. With `(= (f (= x 1)) 7)` asserted (QF_UFLIA, `f : Bool
+   -> Int`), `(get-value ((f (= x 1))))` prints `(((f t4) 7))` on the base
+   binary and `(((f t4) ?))` now. For `(P (= x 1))`, `(not (P true))`,
+   `(= x 2)`, the query `(get-value ((P (= x 1)) (= x 1) (P false)))` gave
    `(((P t4) true) (t4 @elem0) ((P t1) ?))` at HEAD and gives
    `(((P t4) ?) (t4 ?) ((P t1) ?))` now. The assertion is rewritten to
    `(P bool!n)`, and `lib.rs` has no remap for it like the one for eliminated
-   ites (`ite_map` / `orig_ite_map` → `eliminated_ite_vals`). The fix needs a
+   ites (`ite_map` / `orig_ite_map` -> `eliminated_ite_vals`). The fix needs a
    `lib.rs` change, which is outside this slice's file scope, so it is
-   queued. No verdict changes; `?` is the existing fallback for a term the
-   model cannot evaluate. (The `t4` internal-name echo is the carried
-   slice-50 item.)
+   queued as the first item of the next slice (it shares the evaluator path
+   with the slice-50 internal-name echo, so do them together). No verdict
+   changes; `?` is the existing fallback for a term the model cannot
+   evaluate. (The `t4` internal-name echo is the carried slice-50 item.)
 3. **The base run is two legs** (above).
 4. **`string_path_bool_arg_is_not_sat` is `unsat`**, not `unknown` (both
    were allowed). The `(= s "ab")` sibling is `sat`.
@@ -464,23 +470,30 @@ With lint and test, deny and secrets cover every dependency of
 `mise run ci`.
 
 Not a gate: `cargo clippy --features oracle` fails on **pre-existing** oracle
-test files under Rust 1.99 (`manual_is_multiple_of`, `too_many_arguments`);
+test files under Rust 1.99 (32 errors in 5 files with `--keep-going`:
+`qfs_differential.rs` 18, `fp_oracle.rs` 7, `qfbv_oracle.rs` 5,
+`nary_arith_oracle.rs` 1, `nary_oracle.rs` 1; mostly
+`inconsistent_digit_grouping`, plus `manual_is_multiple_of`,
+`too_many_arguments`, `wrong_self_convention`, `needless_borrows_for_generic_args`);
 the new `bool_arg_oracle.rs` is clean. CI and `mise run lint` do not lint
 with `--features oracle`. Queued.
 
 ## Queued for the next slice
 
-New from this slice:
+New from this slice (the first item is the first item of the next slice):
 
-- **`get-value` remap for purified arguments.** After the fix,
-  `(get-value ((P (= x 1))))` prints `?` where HEAD printed `true` (see
-  *What changed versus the spec*, item 2). Add a `lib.rs` remap from the
+- **`get-value` remap for purified arguments.** After the fix, every term
+  containing a compound Bool argument prints `?` (e.g. `((f t4) 7)` becomes
+  `((f t4) ?)`; see *What changed versus the spec*, item 2). Add a `lib.rs` remap from the
   original term to its purified form, the way `orig_ite_map` /
   `eliminated_ite_vals` handle eliminated ites. Do it together with the
   carried "`get-value` echoing internal names" item.
 - **`clippy --features oracle` under Rust 1.99.** Pre-existing oracle test
-  files fail it (`manual_is_multiple_of`, `too_many_arguments`). Fix them,
-  and consider linting with `--features oracle` in `mise run lint`.
+  files fail it (32 errors in 5 files, see Gates). Fix them, then add the
+  `--features oracle` clippy to `mise run lint`. Also in the queue:
+  `nary_arith_oracle.rs`'s `raw_recv().expect(..)` accepts a z3 `(error ..)`
+  ack (the same hole fixed in `bool_arg_oracle.rs` here); it is pre-existing
+  and was left untouched.
 - **Harness: a resume is refused when the checkout moved.** The fixture
   check compares the checkout sha, so a base run interrupted after a commit
   cannot be resumed under its run-id (this slice's two-leg base run).
@@ -628,10 +641,12 @@ From spec §10 (slice 52):
   `Owner::Shared` definitional merge; `pending` is not backtracked; the
   blocksworld re-index churn measurement; the `blast_word` panic bucket.
 - ~~Not re-measured since the baseline: `wrong` rows in QF_LIA (calypto, 2),
-  QF_LRA (keymaera, 2), QF_BVFP (ramalho, 1).~~ **Closed by this slice**
-  (all five `wrong → correct`).
+  QF_LRA (keymaera, 2), QF_BVFP (ramalho, 1).~~ **Closed by slice 53**
+  (all five `wrong → correct`; not this slice's credit).
 - Harness nit (carried): the fixture header records the checkout HEAD, not
-  the binary's commit. Here they differ for the base run (above).
+  the binary's commit. In slice 54 this applies to the base run (above: the recorded sha is
+  the moved checkout, the binary was built at `b59f115`); the carried nit is
+  about the harness in general, not only that run.
 
 Test-tier note (carried): the unfiltered oracle suite is dominated by
 `fp_oracle differential_qf_fp_rem` (~25–33 min), over the 5 min rule; it is an

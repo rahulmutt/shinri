@@ -181,7 +181,12 @@ fn z3_outcome(logic: &str, src: &str) -> easy_smt::Response {
         if t.starts_with("(declare-") || t.starts_with("(assert ") {
             let sexpr = ctx.atom(t);
             ctx.raw_send(sexpr).expect("z3 send failed");
-            ctx.raw_recv().expect("z3 ack failed");
+            let ack = ctx.raw_recv().expect("z3 ack failed");
+            let ack = ctx.display(ack).to_string();
+            assert!(
+                !ack.contains("error"),
+                "z3 rejected a generated line (assertion dropped): {ack}\n{t}"
+            );
         }
     }
     ctx.check().expect("z3 check-sat failed")

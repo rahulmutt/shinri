@@ -263,7 +263,10 @@ fn string_path_bool_arg_is_not_sat() {
         "(set-logic QF_SLIA)(declare-fun s () String)(declare-fun P (Bool) Bool)",
         "(assert (P (= (str.len s) 1)))(assert (not (P true)))(assert (= s \"a\"))",
     );
-    assert_ne!(v, "sat", "wrong sat on the string path");
+    assert!(
+        v == "unsat" || v == "unknown",
+        "expected unsat or unknown on the string path (not sat, not an error), got {v:?}"
+    );
 }
 
 /// Review Focus 4: mirrors script_e2e::post_mint_declaration_of_internal_name_is_rejected.
@@ -300,4 +303,17 @@ fn proxy_inside_eliminated_term_ite() {
         "(assert (= (ite p (f (= x 1)) 0) 7))(assert p)(assert (= x 1))(assert (= (f true) 5))",
         "(assert (= (ite p (f (= x 1)) 0) 7))(assert p)(assert (= x 1))(assert (= (f true) 7))",
     );
+}
+
+/// Fence pin (spec §11, replaces §3.5's "the bench confirms"): a Bool-element
+/// array `store` of a compound Bool value, pinned by a `select`, stays fenced.
+/// `unknown` on both the base and the fixed binary.
+#[test]
+fn fence_pin_qf_abv_bool_element_store_stays_unknown() {
+    let v = verdict(
+        "(set-logic QF_ABV)(declare-fun a () (Array (_ BitVec 4) Bool))\
+         (declare-fun b () (Array (_ BitVec 4) Bool))(declare-fun x () (_ BitVec 4))",
+        "(assert (= b (store a #x0 (= x #x1))))(assert (not (select b #x0)))(assert (= x #x1))",
+    );
+    assert_eq!(v, "unknown", "Bool-element array store must stay fenced");
 }

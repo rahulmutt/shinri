@@ -296,13 +296,16 @@ reasoned omission, not as coverage.
 
 ## 9. Queued for the next slice
 
+- **First:** `get-value` remap for purified arguments (`lib.rs`; §11), with
+  the slice-50 internal-name echo.
 - Slice 55: the slice-53 queue's first entry — remove the `Not(Eq)` arm,
   together with the bare-E simplification and the string-engine
   search-order sensitivity, and the axiom memory-growth measurement.
 - QF_UFBV / FP-path Bool arguments: blast a proxy as a 1-bit word instead of
   fencing.
 - Bool-element arrays (s3, s4).
-- `get-value` echoing internal names (carried).
+- `get-value` echoing internal names (carried), done together with the
+  `get-value` remap for purified arguments (§11), which is the first item.
 - Every other item carried in the slice-53 report's queue.
 
 ## 10. References
@@ -342,7 +345,9 @@ cover QF_UF, QF_DT, QF_UFLIA and QF_UFLRA: 18,146 rows, 0 missing, 0 extra,
 
 **Credited gain: 0, raw +178.** `correct` went 15,152 → 15,330. None of the
 189 changed rows can mint a proxy, so their encoding is unchanged (§3.3).
-The interleaved re-runs show both binaries behave the same on them: the QF_UF
+The interleaved re-runs of the sampled rows (20 of the 173 QG gains, all 4
+losses) show both binaries behave the same on them; the unsampled rows follow
+from the construction above: the QF_UF
 QG-classification `timeout → correct` 173 (sampled 20) and the 4 losses are
 rows at the 20 s edge, where the base run's QF_UF section ran slower (median
 bench ratio after/base 0.69–1.06 by position, versus 0.99 interleaved). The
@@ -359,12 +364,22 @@ whose answer the fix changes; the evidence for the fix is criteria 1 and 2.
 - **§6.2 / Review Focus 3:** `string_path_bool_arg_is_not_sat` came out
   **`unsat`** (`unknown` was also acceptable); its `(= s "ab")` sibling is
   `sat`.
-- **§4, `get-value`:** not unchanged. `(get-value ((P (= x 1))))` after a
-  `sat` prints `?` where HEAD printed `true`, because the assertion is
-  rewritten to `(P bool!n)` and `lib.rs` has no remap for it (as it has for
-  eliminated ites, `orig_ite_map` → `eliminated_ite_vals`). The fix needs
-  `lib.rs`, outside this slice's file scope; it is queued. No verdict
-  changes.
+- **§4, `get-value`:** not unchanged. Every term that contains a compound
+  Bool argument, of any sort, now prints `?`: `(get-value ((P (= x 1))))`
+  after a `sat` prints `?` where HEAD printed `true`, and with
+  `(= (f (= x 1)) 7)` asserted, `(get-value ((f (= x 1))))` prints
+  `(((f t4) ?))` where the base binary printed `(((f t4) 7))`. The cause is
+  that the assertion is rewritten to `(P bool!n)` and `lib.rs` has no remap
+  for it (as it has for eliminated ites, `orig_ite_map` →
+  `eliminated_ite_vals`). The fix needs `lib.rs`, outside this slice's file
+  scope; it is queued as the first item of the next slice, together with the
+  slice-50 internal-name echo (same evaluator path). No verdict changes.
+- **§3.5, ABV / Bool-element arrays:** "the bench confirms" is wrong: no
+  ABV logic was benched. It is replaced by the probe
+  `fence_pin_qf_abv_bool_element_store_stays_unknown` in
+  `slice54_probes.rs` (a `store` of a compound Bool value in QF_ABV, pinned
+  by a `select`, answers `unknown` on both the base and the fixed binary).
+  §3.5's original text is left as written.
 - **§7, base run:** two legs with the same frozen binary and limits.
   `slice54-base` (16,735 rows) was killed by the tool's 2 h background
   limit; a resume was refused because the fixture header records the
@@ -376,5 +391,8 @@ whose answer the fix changes; the evidence for the fix is criteria 1 and 2.
   a control on the bench; the DT fix is covered by the probes and the QF_DT
   oracle family.
 - Not a gate, queued: `cargo clippy --features oracle` fails on pre-existing
-  oracle test files under Rust 1.99 (`manual_is_multiple_of`,
-  `too_many_arguments`); `bool_arg_oracle.rs` is clean.
+  oracle test files under Rust 1.99: 32 errors in 5 files
+  (`qfs_differential.rs` 18, `fp_oracle.rs` 7, `qfbv_oracle.rs` 5,
+  `nary_arith_oracle.rs` 1, `nary_oracle.rs` 1; mostly
+  `inconsistent_digit_grouping`); `bool_arg_oracle.rs` is clean. Once they
+  are cleaned, add the `--features oracle` clippy to `mise run lint`.
