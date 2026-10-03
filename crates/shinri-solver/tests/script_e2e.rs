@@ -700,7 +700,7 @@ fn str_input_var_concat_length_decides() {
         out.get(1).is_some_and(|v| {
             // Extract the quoted string value and verify it starts with "ab" and has 3 chars.
             let str_val = v.split('"').nth(1).unwrap_or("");
-            str_val.starts_with("ab") && str_val.len() == 3
+            str_val.starts_with("ab") && str_val.chars().count() == 3
         }),
         "s must start with \"ab\" and have 3 characters, got {out:?}"
     );

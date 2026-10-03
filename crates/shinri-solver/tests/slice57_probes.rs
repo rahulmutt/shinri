@@ -34,6 +34,23 @@ fn run_script(src: &str) -> Vec<String> {
 
 const H: &str = "(set-logic QF_SLIA)(declare-fun x () String)(declare-fun y () String)";
 
+/// The `check-sat` verdict of `body` and the solver's fence tag after it.
+fn verdict_and_fence(body: &str) -> (String, Option<&'static str>) {
+    let mut solver = Solver::new();
+    let src = format!("{H}{body}(check-sat)");
+    let mut parser = Parser::new(&src);
+    let mut verdict = String::new();
+    while let Some(result) = parser.next_command(solver.ctx_mut()) {
+        match solver.execute(result.expect("probe parses")) {
+            CommandResponse::Sat => verdict = "sat".into(),
+            CommandResponse::Unsat => verdict = "unsat".into(),
+            CommandResponse::Unknown => verdict = "unknown".into(),
+            _ => {}
+        }
+    }
+    (verdict, solver.last_fence())
+}
+
 fn verdict(body: &str) -> String {
     run_script(&format!("{H}{body}(check-sat)"))
         .first()
@@ -206,13 +223,12 @@ fn strict_gate_confirms_lowered_str_lt() {
 /// gate is what keeps it `unknown`.
 #[test]
 fn strict_gate_keeps_unevaluable_unknown() {
-    assert_eq!(
-        verdict(
-            "(assert (= (str.len x) 3))(assert (str.prefixof \"cd\" x))\
-             (assert (<= (- (str.len x) (str.len y)) 1))"
-        ),
-        "unknown"
+    let (v, fence) = verdict_and_fence(
+        "(assert (= (str.len x) 3))(assert (str.prefixof \"cd\" x))\
+         (assert (<= (- (str.len x) (str.len y)) 1))",
     );
+    assert_eq!(v, "unknown");
+    assert_eq!(fence, Some("str-model-rejected"));
 }
 
 // ── Review Focus ────────────────────────────────────────────────────────────
@@ -230,9 +246,13 @@ fn rf1_input_disjunction_stays_sat() {
 /// Review Focus 2: the strict flag belongs to one model build only.
 #[test]
 fn rf2_strict_flag_does_not_leak_across_checks() {
+    // The second query's compound arithmetic is gate-unevaluable, and its
+    // default model passes the 3-valued gate: a leaked strict flag would
+    // reject it (`unknown`).
     let out = run_script(&format!(
         "{H}(push 1)(assert (= (str.len x) 3))(assert (str.prefixof \"cd\" x))(check-sat)(pop 1)\
-         (push 1)(assert (= (str.len x) 1))(assert (str.< x \"b\"))(check-sat)(pop 1)"
+         (push 1)(assert (= (str.len x) 1))(assert (<= (- (str.len x) (str.len y)) 1))\
+         (check-sat)(pop 1)"
     ));
     assert_eq!(out, vec!["sat".to_string(), "sat".to_string()]);
 }
