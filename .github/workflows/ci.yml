@@ -131,6 +131,14 @@ jobs:
       - name: Mutation-test ${{ steps.pick.outputs.crate }}
         run: |
           set +e
+          # The runner has died mid-run with "received a shutdown signal" on
+          # several nights, and the artifact upload never runs then. Stream
+          # memory/disk/top-process every 30 s into the live log so the next
+          # occurrence shows what was exhausted.
+          while true; do
+            echo "[res] $(date -u +%T) $(free -m | awk '/^Mem/{print "mem_used="$3"M avail="$7"M"}') $(df -m . | awk 'NR==2{print "disk_avail="$4"M"}') $(ps -eo rss=,comm= --sort=-rss | awk 'NR==1{print "top="$2":"int($1/1024)"M"}')"
+            sleep 30
+          done &
           MUTANTS_PACKAGE='${{ steps.pick.outputs.crate }}' mise run mutants
           code=$?
           case "$code" in
