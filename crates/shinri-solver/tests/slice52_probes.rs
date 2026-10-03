@@ -130,12 +130,12 @@ fn xor_form() {
     );
 }
 
-/// KNOWN WRONG SAT (z3: unsat), pinned as a passing marker (R16): the gate
-/// cannot evaluate the Bool constant `p` (the `eval_bool` audit, spec §9), and
-/// H3 was dropped under the agreed fallback. Flip this pin to `unsat` when the
-/// audit or a narrowed H3 + the deep-nf propagate (R11) lands. Not `#[ignore]`d:
-/// the nightly tier runs ignored tests and AGENTS.md reserves `#[ignore]` for
-/// slow tests.
+/// Slice 57's strict gate rejects the bogus model for this query, making it a
+/// sound `unknown` instead of a KNOWN WRONG SAT (z3: unsat). The gate cannot yet
+/// evaluate the Bool constant `p` (the `eval_bool` audit, spec §9). Flip this
+/// pin to `unsat` when the audit or a narrowed H3 + deep-nf propagate (R11)
+/// lands. Not `#[ignore]`d: the nightly tier runs ignored tests and AGENTS.md
+/// reserves `#[ignore]` for slow tests.
 #[test]
 fn bool_proxy() {
     assert_eq!(
@@ -143,8 +143,8 @@ fn bool_proxy() {
             r#"(declare-fun p () Bool)(assert (= p (= "A" (str.++ y x))))
                (assert (not (= p (= "A" (str.++ x y)))))"#
         ),
-        "sat",
-        "KNOWN WRONG SAT (z3: unsat): flip this pin to unsat when the eval_bool Bool-constant audit or a narrowed H3 + deep-nf propagate lands"
+        "unknown",
+        "slice 57 strict gate rejects bogus model: sound unknown (was wrong sat); flip to unsat when eval_bool Bool-constant audit or narrowed H3 + deep-nf propagate lands"
     );
 }
 

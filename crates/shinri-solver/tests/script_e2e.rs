@@ -687,20 +687,22 @@ fn str_input_var_concat_length_decides() {
            (assert (= (str.++ "ab" k) s))(assert (= (str.len s) 1))(check-sat)"#,
     );
     assert_eq!(out, vec!["unsat"]);
-    // No-spurious-UNSAT control: `len(s) = 3` is satisfiable (witness
-    // s = "ab" ++ any 1-char k). The new length link must NOT over-constrain it
-    // to UNSAT. The engine returns a SOUND `unknown` here (the var-headed word
-    // equation's witness synthesis is a pre-existing incompleteness, unrelated to
-    // this fix) — the load-bearing assertion is simply that it is NOT `unsat`.
+    // Slice 57's string model reconciliation now produces the witness that was
+    // previously unreachable. The query `s = "ab" ++ k ∧ len(s) = 3` is satisfied
+    // by assigning s = "ab" ++ (any 1-char k). The model builder reconciles the
+    // multi-concat classes and emits a valid model under the strict gate.
     let out = run_script(
         r#"(set-logic QF_S)(declare-fun s () String)(declare-fun k () String)
-           (assert (= s (str.++ "ab" k)))(assert (= (str.len s) 3))(check-sat)"#,
+           (assert (= s (str.++ "ab" k)))(assert (= (str.len s) 3))(check-sat)(get-value (s))"#,
     );
-    assert_eq!(out, vec!["unknown"]);
-    assert_ne!(
-        out,
-        vec!["unsat"],
-        "must not over-constrain to spurious UNSAT"
+    assert_eq!(out.first().map(String::as_str), Some("sat"));
+    assert!(
+        out.get(1).is_some_and(|v| {
+            // Extract the quoted string value and verify it starts with "ab" and has 3 chars.
+            let str_val = v.split('"').nth(1).unwrap_or("");
+            str_val.starts_with("ab") && str_val.len() == 3
+        }),
+        "s must start with \"ab\" and have 3 characters, got {out:?}"
     );
 }
 
