@@ -1,4 +1,5 @@
-//! Model construction for the string theory (Task 17 + Task 19 overlay).
+//! Default model construction for the string theory (Task 17 + Task 19
+//! overlay; the slice-57 rebuild is in `model_reconcile`).
 //!
 //! On a SAT result the solver assembles a concrete `ModelVal::String(...)` for
 //! each string-sorted term. The value of a term is assembled from its **deep
@@ -78,21 +79,23 @@ fn class_len_in_model(
     best
 }
 
-/// Assign each string term a concrete `ModelVal::String` value, assembling
-/// compound (concat) terms from their operands and overlaying constant
-/// characters pinned by the equality-engine normal forms.
+/// The default string valuation, without writing it: `(term, value)` for every
+/// term of `str_terms` that `m` does not already hold a string for, in
+/// `str_terms` order. Compound (concat) terms are assembled from their
+/// operands, and constant characters pinned by the equality-engine normal
+/// forms are overlaid.
 ///
 /// `known` must contain every string-sorted term visible to the solver (so that
 /// `deep_normal_form` can reflect merges with terms not syntactically inside
 /// `t`, e.g. `x = "ab"` pins `x`'s value to "ab").
-pub fn assign(
+pub fn string_values(
     terms: &mut Context,
     eq: &mut EqualityEngine,
     known: &[TermId],
     str_terms: &[TermId],
-    m: &mut ModelBuilder,
+    m: &ModelBuilder,
     seed: &FxHashMap<TermId, String>,
-) {
+) -> Vec<(TermId, String)> {
     let mut memo: FxHashMap<TermId, String> = seed.clone();
     let mut in_progress: rustc_hash::FxHashSet<TermId> = rustc_hash::FxHashSet::default();
 
@@ -113,6 +116,7 @@ pub fn assign(
         let _ = value_of(terms, eq, known, t, m, &mut memo, &mut in_progress);
     }
 
+    let mut out = Vec::new();
     for &t in str_terms {
         // Respect an existing *string* assignment, but OVERRIDE non-string
         // placeholders: EUF assigns string-sorted variables an opaque
@@ -122,8 +126,9 @@ pub fn assign(
             continue;
         }
         let v = value_of(terms, eq, known, t, m, &mut memo, &mut in_progress);
-        m.assign(t, ModelVal::String(v));
+        out.push((t, v));
     }
+    out
 }
 
 /// Recursively compute the concrete string value of `t`.
@@ -225,7 +230,7 @@ fn value_of(
 /// while equal variables (same class) get the same word. Falls back to cycling
 /// the printable lowercase/uppercase range; collisions only past 52 distinct free
 /// classes, which the differential corpus does not reach.
-fn free_fill(eq: &mut EqualityEngine, t: TermId, n: usize) -> String {
+pub(crate) fn free_fill(eq: &mut EqualityEngine, t: TermId, n: usize) -> String {
     if n == 0 {
         return String::new();
     }
@@ -355,7 +360,7 @@ fn resolve_pinned(
 /// Find a member of `t`'s EUF equivalence class (drawn from `known`) satisfying
 /// `pred`, or `None`. Used by the model builder to locate a constant or concat
 /// representative for an otherwise-opaque variable.
-fn class_member(
+pub(crate) fn class_member(
     terms: &Context,
     eq: &mut EqualityEngine,
     known: &[TermId],
@@ -380,7 +385,7 @@ fn class_member(
 /// all (recursively) denote fixed words — return that word. Otherwise `None`.
 /// Used by `value_concat` to recognise an unfolded constant concat (e.g.
 /// `"ab"++"cc"`) as a slicing anchor.
-fn const_word_of(terms: &Context, t: TermId) -> Option<String> {
+pub(crate) fn const_word_of(terms: &Context, t: TermId) -> Option<String> {
     if let Some(s) = terms.string_const_value(t) {
         return Some(s.to_owned());
     }
@@ -402,7 +407,7 @@ fn const_word_of(terms: &Context, t: TermId) -> Option<String> {
 }
 
 /// True iff `t` is a `str.++` application.
-fn is_concat(terms: &Context, t: TermId) -> bool {
+pub(crate) fn is_concat(terms: &Context, t: TermId) -> bool {
     matches!(
         terms.term_node(t),
         TermNode::App {
@@ -413,7 +418,7 @@ fn is_concat(terms: &Context, t: TermId) -> bool {
 }
 
 /// Number of direct operands of a concat (0 if not a concat).
-fn concat_arity(terms: &Context, t: TermId) -> usize {
+pub(crate) fn concat_arity(terms: &Context, t: TermId) -> usize {
     match terms.term_node(t) {
         TermNode::App {
             op: Op::Builtin(BuiltinOp::StrConcat),

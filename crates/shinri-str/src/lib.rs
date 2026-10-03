@@ -6,6 +6,7 @@ pub mod int_conv;
 mod length;
 mod memb;
 pub mod model;
+mod model_reconcile;
 pub mod normalize;
 pub mod order;
 mod order_engine;
@@ -19,7 +20,7 @@ pub use fuel::Fuel;
 use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
-use shinri_theory::types::{ENodeId, EqJust, EqLeaf};
+use shinri_theory::types::{ENodeId, EqJust, EqLeaf, ModelVal};
 use shinri_theory::{EqualityEngine, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
 #[derive(Default)]
@@ -109,6 +110,9 @@ pub struct StrSolver {
     /// and the historical unsound-conflict note there). Monotone: recorded at the
     /// moment a split is emitted, before the disjunct can be asserted back.
     minted_eqs: FxHashSet<TermId>,
+    /// Slice 57: candidate-trial budget override for the model reconciliation
+    /// rebuild (`None` = `model_reconcile::trial_budget`). A test hook.
+    rebuild_trial_budget: Option<usize>,
     /// String Eq/Distinct atoms minted by the MEMBERSHIP pass (S1's `x = ""` /
     /// `x = h·z`, Rule E's ε equality, the S-rules' `distinct(x, h·z)`
     /// companions) — a subset of `minted_eqs` that distinguishes the MINTER
@@ -1575,7 +1579,57 @@ impl StrSolver {
         // concat assembly composes REPAIRED values, not default fills.
         let membs: Vec<(TermId, bool)> = self.memb_true.iter().map(|&(a, _, p)| (a, p)).collect();
         let seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
-        model::assign(cx.terms, cx.eq, &known, &str_terms, m, &seeds);
+        // Slice 57: default build, then self-check against the INPUT string
+        // equations (non-minted `eq_true` atoms). Only a violated input
+        // equation triggers the reconciliation rebuild, which is adopted if it
+        // satisfies every input equation and every valued concat equals the
+        // join of its operands, and then requires the strict gate.
+        let vals = model::string_values(cx.terms, cx.eq, &known, &str_terms, m, &seeds);
+        let input_eqs: Vec<TermId> = self
+            .eq_true
+            .iter()
+            .map(|&(a, _)| a)
+            .filter(|a| !self.minted_eqs.contains(a))
+            .collect();
+        let vals = if model_reconcile::input_eqs_hold(cx.terms, &input_eqs, &vals, m) {
+            vals
+        } else {
+            let mut input_sides: FxHashSet<TermId> = FxHashSet::default();
+            let mut minted_sides: FxHashSet<TermId> = FxHashSet::default();
+            for &(atom, _) in &self.eq_true {
+                let (l, r) = crate::wordeq::diseq_sides(cx.terms, atom);
+                let set = if self.minted_eqs.contains(&atom) {
+                    &mut minted_sides
+                } else {
+                    &mut input_sides
+                };
+                set.insert(l);
+                set.insert(r);
+            }
+            let inp = model_reconcile::ReconcileInput {
+                known: &known,
+                str_terms: &str_terms,
+                seeds: &seeds,
+                input_sides: &input_sides,
+                minted_sides: &minted_sides,
+                trial_budget: self.rebuild_trial_budget,
+            };
+            // `None`: the candidate-trial budget ran out; the rebuild is
+            // abandoned like a failed one (default model, flag unset).
+            match model_reconcile::reconciled_values(cx.terms, cx.eq, m, &inp) {
+                Some(rebuilt)
+                    if model_reconcile::input_eqs_hold(cx.terms, &input_eqs, &rebuilt, m)
+                        && model_reconcile::concats_consistent(cx.terms, &rebuilt, m) =>
+                {
+                    m.require_strict_check();
+                    rebuilt
+                }
+                _ => vals,
+            }
+        };
+        for (t, v) in vals {
+            m.assign(t, ModelVal::String(v));
+        }
     }
 
     /// Slice 33 (T5b): walk a propagation tag's antecedent DAG (visited-guarded),
@@ -2017,6 +2071,184 @@ mod tests {
             }
             other => panic!("expected a String model for x, got {other:?}"),
         }
+    }
+
+    /// Slice 57: build a StrSolver whose `eq_true` holds `input` (and
+    /// optionally `minted`), with every term forced into `str_terms`.
+    fn slice57_solver(input: &[TermId], minted: &[TermId], terms: &[TermId]) -> StrSolver {
+        let mut s = StrSolver::default();
+        for (i, &a) in input.iter().chain(minted).enumerate() {
+            s.eq_true.push((
+                a,
+                shinri_core::Lit::new(shinri_core::Var::new(i as u32), true),
+            ));
+            s.eq_levels.push(0);
+        }
+        for &a in minted {
+            s.minted_eqs.insert(a);
+        }
+        for &t in terms {
+            s.test_force_str_term(t);
+        }
+        s
+    }
+
+    fn slice57_var(ctx: &mut Context, name: &str) -> TermId {
+        let s = ctx.string_sort();
+        let f = ctx.declare_fun(name, &[], s);
+        ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+    }
+
+    fn slice57_len(ctx: &mut Context, m: &mut ModelBuilder, t: TermId, n: i64) {
+        let l = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[t]).unwrap();
+        m.assign(l, ModelVal::Num(shinri_core::Rational::from_int(n.into())));
+    }
+
+    fn slice57_merge(eq: &mut EqualityEngine, a: TermId, b: TermId) {
+        let an = eq.intern(a);
+        let bn = eq.intern(b);
+        let _ = eq.merge(an, bn, shinri_theory::types::EqJust::Definitional);
+    }
+
+    /// The char-peel class: the default build violates the input equation,
+    /// the rebuild is adopted and the strict flag is set.
+    #[test]
+    fn slice57_model_with_adopts_rebuild_and_flags_strict() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut m = ModelBuilder::default();
+        let x = slice57_var(&mut ctx, "x");
+        let p = slice57_var(&mut ctx, "p");
+        let k = slice57_var(&mut ctx, "k");
+        let cd = ctx.mk_string_const("cd");
+        let c = ctx.mk_string_const("c");
+        let cdp = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[cd, p])
+            .unwrap();
+        let ck = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[c, k])
+            .unwrap();
+        let input_eq = ctx.mk_eq(x, cdp).unwrap();
+        let minted_eq = ctx.mk_eq(x, ck).unwrap();
+        slice57_merge(&mut eq, x, cdp);
+        slice57_merge(&mut eq, x, ck);
+        slice57_len(&mut ctx, &mut m, x, 3);
+        slice57_len(&mut ctx, &mut m, p, 1);
+        let mut s = slice57_solver(&[input_eq], &[minted_eq], &[ck, x, cd, cdp, k, p, c]);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        s.model_with(&mut cx, &mut m);
+        match m.get(x) {
+            Some(ModelVal::String(v)) => {
+                assert!(v.starts_with("cd") && v.chars().count() == 3, "x = {v:?}")
+            }
+            other => panic!("expected a String for x, got {other:?}"),
+        }
+        assert!(m.strict_check_required());
+    }
+
+    /// Two conflicting input concats: no rebuild satisfies both, so the
+    /// default model is kept and the flag stays unset.
+    #[test]
+    fn slice57_model_with_keeps_default_when_rebuild_fails() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut m = ModelBuilder::default();
+        let x = slice57_var(&mut ctx, "x");
+        let p = slice57_var(&mut ctx, "p");
+        let q = slice57_var(&mut ctx, "q");
+        let ab = ctx.mk_string_const("ab");
+        let cd = ctx.mk_string_const("cd");
+        let abp = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[ab, p])
+            .unwrap();
+        let cdq = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[cd, q])
+            .unwrap();
+        let e1 = ctx.mk_eq(x, abp).unwrap();
+        let e2 = ctx.mk_eq(x, cdq).unwrap();
+        slice57_merge(&mut eq, x, abp);
+        slice57_merge(&mut eq, x, cdq);
+        slice57_len(&mut ctx, &mut m, x, 3);
+        slice57_len(&mut ctx, &mut m, p, 1);
+        slice57_len(&mut ctx, &mut m, q, 1);
+        let mut s = slice57_solver(&[e1, e2], &[], &[x, abp, cdq, p, q, ab, cd]);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        s.model_with(&mut cx, &mut m);
+        assert!(!m.strict_check_required());
+        assert!(matches!(m.get(x), Some(ModelVal::String(_))));
+    }
+
+    /// An exhausted candidate-trial budget abandons the rebuild: the default
+    /// model is kept and the strict flag stays unset.
+    #[test]
+    fn slice57_model_with_budget_exhausted_keeps_default() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut m = ModelBuilder::default();
+        let x = slice57_var(&mut ctx, "x");
+        let p = slice57_var(&mut ctx, "p");
+        let k = slice57_var(&mut ctx, "k");
+        let cd = ctx.mk_string_const("cd");
+        let c = ctx.mk_string_const("c");
+        let cdp = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[cd, p])
+            .unwrap();
+        let ck = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[c, k])
+            .unwrap();
+        let input_eq = ctx.mk_eq(x, cdp).unwrap();
+        let minted_eq = ctx.mk_eq(x, ck).unwrap();
+        slice57_merge(&mut eq, x, cdp);
+        slice57_merge(&mut eq, x, ck);
+        slice57_len(&mut ctx, &mut m, x, 3);
+        slice57_len(&mut ctx, &mut m, p, 1);
+        let mut s = slice57_solver(&[input_eq], &[minted_eq], &[ck, x, cd, cdp, k, p, c]);
+        s.rebuild_trial_budget = Some(0);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        s.model_with(&mut cx, &mut m);
+        match m.get(x) {
+            Some(ModelVal::String(v)) => assert!(!v.starts_with("cd"), "default kept: x = {v:?}"),
+            other => panic!("expected a String for x, got {other:?}"),
+        }
+        assert!(!m.strict_check_required());
+    }
+
+    /// The default path: a model that already satisfies its input equations
+    /// is unchanged and the flag stays unset.
+    #[test]
+    fn slice57_model_with_default_path_unflagged() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut m = ModelBuilder::default();
+        let x = slice57_var(&mut ctx, "x");
+        let ab = ctx.mk_string_const("ab");
+        let e = ctx.mk_eq(x, ab).unwrap();
+        slice57_merge(&mut eq, x, ab);
+        let mut s = slice57_solver(&[e], &[], &[x, ab]);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        s.model_with(&mut cx, &mut m);
+        assert_eq!(m.get(x), Some(&ModelVal::String("ab".into())));
+        assert!(!m.strict_check_required());
     }
 
     // ── Task 2 (slice 21): membership intake + retraction bookkeeping ───────

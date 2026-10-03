@@ -10,6 +10,9 @@ use shinri_core::{Integer, Rational};
 #[derive(Default)]
 pub struct ModelBuilder {
     values: FxHashMap<TermId, ModelVal>,
+    /// Slice 57: set by a theory whose values the solver must confirm with
+    /// the strict model gate (every assertion definitely true).
+    strict_check: bool,
 }
 
 impl ModelBuilder {
@@ -30,6 +33,17 @@ impl ModelBuilder {
         self.values.is_empty()
     }
 
+    /// Slice 57: ask the solver to confirm this model with the strict gate.
+    #[inline]
+    pub fn require_strict_check(&mut self) {
+        self.strict_check = true;
+    }
+    /// Slice 57: whether some theory asked for the strict gate.
+    #[inline]
+    pub fn strict_check_required(&self) -> bool {
+        self.strict_check
+    }
+
     /// First term that `self` and `other` assign different values to, if any.
     pub fn merge_check(&self, other: &ModelBuilder) -> Option<TermId> {
         for (t, v) in self.values.iter() {
@@ -43,11 +57,17 @@ impl ModelBuilder {
     }
 
     /// Fold another builder's assignments into this one (other wins ties; the
-    /// caller has already verified agreement via `merge_check`).
+    /// caller has already verified agreement via `merge_check`). The strict
+    /// flag is kept if either builder set it.
     pub fn absorb(&mut self, other: ModelBuilder) {
-        for (t, v) in other.values {
+        let ModelBuilder {
+            values,
+            strict_check,
+        } = other;
+        for (t, v) in values {
             self.values.insert(t, v);
         }
+        self.strict_check |= strict_check;
     }
 
     /// Iterate all assigned `(TermId, ModelVal)` pairs.
@@ -241,5 +261,21 @@ mod format_tests {
             format_rational(&Rational::from_int((-3i128).into())),
             "(- 3)"
         );
+    }
+}
+
+#[cfg(test)]
+mod strict_check_tests {
+    use super::*;
+
+    #[test]
+    fn strict_check_defaults_off_and_survives_absorb() {
+        let mut a = ModelBuilder::default();
+        assert!(!a.strict_check_required());
+        let mut b = ModelBuilder::default();
+        b.require_strict_check();
+        assert!(b.strict_check_required());
+        a.absorb(b);
+        assert!(a.strict_check_required(), "absorb must keep the flag");
     }
 }

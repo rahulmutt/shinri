@@ -2661,6 +2661,140 @@ fn qfs_str_order_const_word_matches_z3() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Model-reconciliation differential oracle (slice 57): prefixof / suffixof /
+// concat equations with constants, a length pin written as `=`, as `<=`+`>=`,
+// or absent, and an optional membership. These reach string classes holding
+// several concats, where the default model builder failed
+// (`str-model-rejected`). Verdicts must agree with z3; Sat models are
+// z3-verified. Fresh seed — never perturb existing families' seeds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MR_N_ITERS: usize = 300;
+/// `unknown`-where-z3-`sat` count at `46d5fd9` (slice-57 plan, Task 1 Step 4).
+const MR_BEFORE_UNKNOWN_Z3_SAT: usize = 48;
+
+fn gen_model_reconcile_body(seed: u64) -> (String, usize) {
+    let mut rng = Lcg(seed);
+    let nv = 1 + rng.below(2) as usize;
+    let mut b = String::from("(set-logic QF_SLIA)\n");
+    for k in 0..nv {
+        b.push_str(&format!("(declare-fun s{k} () String)\n"));
+    }
+    let var = |rng: &mut Lcg| format!("s{}", rng.below(nv as u64));
+    const LITS: [&str; 6] = ["a", "b", "ab", "ba", "cd", "c"];
+    let lit = |rng: &mut Lcg| format!("\"{}\"", LITS[rng.below(LITS.len() as u64) as usize]);
+    for _ in 0..1 + rng.below(3) {
+        let x = var(&mut rng);
+        let l = lit(&mut rng);
+        let a = match rng.below(4) {
+            0 => format!("(str.prefixof {l} {x})"),
+            1 => format!("(str.suffixof {l} {x})"),
+            2 => {
+                let y = var(&mut rng);
+                format!("(= {x} (str.++ {l} {y}))")
+            }
+            _ => {
+                let y = var(&mut rng);
+                format!("(= {x} (str.++ {y} {l}))")
+            }
+        };
+        b.push_str(&format!("(assert {a})\n"));
+    }
+    let x = var(&mut rng);
+    let n = rng.below(5);
+    match rng.below(3) {
+        0 => b.push_str(&format!("(assert (= (str.len {x}) {n}))\n")),
+        1 => b.push_str(&format!(
+            "(assert (>= (str.len {x}) {n}))\n(assert (<= (str.len {x}) {n}))\n"
+        )),
+        _ => {}
+    }
+    if rng.below(3) == 0 {
+        let x = var(&mut rng);
+        b.push_str(&format!(
+            "(assert (str.in_re {x} (re.+ (re.range \"a\" \"d\"))))\n"
+        ));
+    }
+    (b, nv)
+}
+
+#[test]
+fn differential_qfs_model_reconcile() {
+    let mut rng = Lcg(0x57_0000_0001u64);
+    let (mut n_sat, mut n_unsat, mut n_unknown, mut n_unknown_z3_sat, mut n_z3skip, mut n_witness) =
+        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..MR_N_ITERS {
+        let seed = rng.next();
+        let (body, nv) = gen_model_reconcile_body(seed);
+        let script = format!("{body}(check-sat)\n");
+        let ours = shinri_verdict(&script);
+        let theirs = z3_verdict(&script);
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            if theirs == Verdict::Sat {
+                n_unknown_z3_sat += 1;
+            }
+            continue;
+        }
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "MODEL-RECONCILE SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{script}"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let names: Vec<String> = (0..nv).map(|k| format!("s{k}")).collect();
+                let get = format!("{script}(get-value ({}))\n", names.join(" "));
+                let lines = shinri_lines(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "differential_qfs_model_reconcile: {MR_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown ({n_unknown_z3_sat} with z3 sat) / {n_z3skip} z3-unknown; \
+         {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(
+        n_sat > 0,
+        "model-reconcile family produced zero SAT instances"
+    );
+    assert!(
+        n_unsat > 0,
+        "model-reconcile family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_unknown_z3_sat < MR_BEFORE_UNKNOWN_Z3_SAT,
+        "unknown-where-z3-sat {n_unknown_z3_sat} not below the slice-57 base \
+         {MR_BEFORE_UNKNOWN_Z3_SAT}"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Targeted explicit cases
 // ─────────────────────────────────────────────────────────────────────────────
 
