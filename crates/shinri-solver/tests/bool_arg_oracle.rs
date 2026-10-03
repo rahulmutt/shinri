@@ -5,6 +5,10 @@
 //! see through the argument's truth value, which is exactly what the slice-54
 //! wrong `sat` broke (a compound Bool argument was an opaque e-graph node).
 //!
+//! Slice 56: every family also passes `s`, a Bool constant that occurs only
+//! as an argument, and an abstract `@…` value is a failure (the slice-55
+//! Ruling-8 exclusion is gone).
+//!
 //! Run with:
 //!   cargo nextest run -p shinri-solver --features oracle -E 'binary(bool_arg_oracle)'
 #![cfg(feature = "oracle")]
@@ -44,18 +48,18 @@ impl Family {
     fn decls(self) -> &'static str {
         match self {
             Family::UfLia => {
-                "(declare-const p Bool)\n(declare-const q Bool)\n\
+                "(declare-const p Bool)\n(declare-const q Bool)\n(declare-const s Bool)\n\
                  (declare-const x Int)\n(declare-const y Int)\n\
                  (declare-fun P (Bool) Bool)\n(declare-fun f (Bool Int) Int)\n"
             }
             Family::UfLra => {
-                "(declare-const p Bool)\n(declare-const q Bool)\n\
+                "(declare-const p Bool)\n(declare-const q Bool)\n(declare-const s Bool)\n\
                  (declare-const x Real)\n(declare-const y Real)\n\
                  (declare-fun P (Bool) Bool)\n(declare-fun f (Bool Real) Real)\n"
             }
             Family::Dt => {
                 "(declare-datatypes ((B 0)) (((mk (fa Bool) (fb Bool)) (nil))))\n\
-                 (declare-const p Bool)\n(declare-const q Bool)\n\
+                 (declare-const p Bool)\n(declare-const q Bool)\n(declare-const s Bool)\n\
                  (declare-const u B)\n(declare-const v B)\n"
             }
         }
@@ -96,13 +100,15 @@ fn formula(rng: &mut Lcg, fam: Family, depth: u32) -> String {
     }
 }
 
-/// A Bool argument: `true`/`false` (so congruence with a constant matters)
-/// or a depth-≤1 formula (a leaf or one connective over leaves). Compound
-/// ones are recorded in `sink` for the slice-55 get-value check.
+/// A Bool argument: `true`/`false` (so congruence with a constant matters),
+/// the argument-only constant `s` (slice 56: never an atom elsewhere), or a
+/// depth-≤1 formula (a leaf or one connective over leaves). Everything but
+/// `true`/`false` is recorded in `sink` for the get-value check.
 fn arg(rng: &mut Lcg, fam: Family, sink: &mut Vec<String>) -> String {
-    let a = match rng.below(5) {
+    let a = match rng.below(6) {
         0 => "true".to_string(),
         1 => "false".to_string(),
+        2 => "s".to_string(),
         _ => formula(rng, fam, 1),
     };
     if a != "true" && a != "false" && !sink.contains(&a) {
@@ -271,15 +277,11 @@ fn get_value_pairs(logic: &str, src: &str, queries: &[String]) -> Vec<(String, S
 }
 
 fn is_unvalued(v: &str) -> bool {
-    v == "?" || v.starts_with('@')
+    v == "?"
 }
 
 fn z3_accepts_values(logic: &str, src: &str, pairs: &[(String, String)]) -> easy_smt::Response {
     let mut extra = String::new();
-    // `@elemN` for a Bool term is a pre-existing defect (a Bool constant used
-    // only as a UF argument is not tied to true/false; queued after slice
-    // 55), not a get-value echo issue; excluded from the z3 re-check and
-    // counted as n_abstract.
     for (term, val) in pairs.iter().filter(|(_, v)| !is_unvalued(v)) {
         extra.push_str(&format!("(assert (= {term} {val}))\n"));
     }
@@ -292,7 +294,6 @@ fn run_family(fam: Family, seed: u64) {
     let mut disagreements: Vec<String> = Vec::new();
     let mut value_disagreements: Vec<String> = Vec::new();
     let mut n_valued = 0usize;
-    let mut n_abstract = 0usize;
     for iter in 0..N_ITERS {
         let (src, queries) = gen_script(&mut rng, fam);
         let ours = shinri_outcome(fam.logic(), &src);
@@ -313,6 +314,13 @@ fn run_family(fam: Family, seed: u64) {
         }
         if ours == SolveOutcome::Sat && theirs == easy_smt::Response::Sat {
             let pairs = get_value_pairs(fam.logic(), &src, &queries);
+            // Slice 56: an abstract `@…` value for a Bool term is the
+            // closed wrong-`sat` trace; report it rather than let z3 reject
+            // the line.
+            if let Some((t, v)) = pairs.iter().find(|(_, v)| v.starts_with('@')) {
+                value_disagreements.push(format!("iter {iter}: abstract value {v} for {t}\n{src}"));
+                continue;
+            }
             match z3_accepts_values(fam.logic(), &src, &pairs) {
                 easy_smt::Response::Sat | easy_smt::Response::Unknown => {}
                 easy_smt::Response::Unsat => value_disagreements.push(format!(
@@ -320,12 +328,11 @@ fn run_family(fam: Family, seed: u64) {
                 )),
             }
             n_valued += pairs.iter().filter(|(_, v)| !is_unvalued(v)).count();
-            n_abstract += pairs.iter().filter(|(_, v)| v.starts_with('@')).count();
         }
     }
     println!(
         "{}: sat={n_sat} unsat={n_unsat} unknown={n_unknown} disagreements={} \
-         value_disagreements={} n_valued={n_valued} n_abstract={n_abstract}",
+         value_disagreements={} n_valued={n_valued}",
         fam.logic(),
         disagreements.len(),
         value_disagreements.len()

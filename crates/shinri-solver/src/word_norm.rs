@@ -21,7 +21,10 @@
 //!    `(P (= x 1))`, `(not (P true))`, `(= x 1)` was a wrong `sat`. `b` takes
 //!    the same path as a user Bool constant (an EUF atom merged with ⊤/⊥), and
 //!    the definition puts `t` in a Boolean position (so slice 53's arithmetic
-//!    `=` axioms reach it).
+//!    `=` axioms reach it). A bare nullary user Bool constant `k` in the same
+//!    position (slice 56) is not proxied; it gets one appended definition
+//!    `(or k (not k))`, which makes it a SAT atom — without it a `k` that
+//!    occurs nowhere else was never merged with ⊤/⊥ (wrong `sat`).
 //!
 //! INVARIANTS (load-bearing; see design doc §4):
 //! - A term with no rewritten subterm is returned with its ORIGINAL TermId —
@@ -120,9 +123,11 @@ fn is_bool_connective(op: Op) -> bool {
     )
 }
 
-/// Slice 54: a Bool-sorted argument needs a proxy unless it is already a
-/// single atom EUF links to ⊤/⊥: a Bool constant (`true`/`false`) or a
-/// nullary symbol (a user Bool constant, or an earlier proxy).
+/// Slice 54: a Bool-sorted argument needs a proxy unless it is a Bool
+/// constant (`true`/`false`) or a nullary symbol (a user Bool constant, or an
+/// earlier proxy). A nullary user constant is NOT automatically linked to
+/// ⊤/⊥: it is only when it is also a SAT atom, which slice 56 guarantees via
+/// `WordNorm::needs_excluded_middle`.
 fn needs_bool_proxy(ctx: &Context, t: TermId) -> bool {
     if ctx.sort_of(t) != ctx.bool_sort() {
         return false;
@@ -198,6 +203,42 @@ impl WordNorm {
         b
     }
 
+    /// Slice 56: a nullary user Bool constant in argument position is tied to
+    /// ⊤/⊥ only if it is also a SAT atom; when it occurs nowhere else it was
+    /// an opaque e-graph node (`(P q)`, `(not (P true))`, `(not (P false))`
+    /// was a wrong `sat`). Proxies are excluded: `(= b t)` already makes them
+    /// atoms. `true`/`false` are `TermNode::Const` and fail the match.
+    fn needs_excluded_middle(&self, ctx: &Context, t: TermId) -> bool {
+        ctx.sort_of(t) == ctx.bool_sort()
+            && !self.internal.contains(&t)
+            && matches!(
+                ctx.term_node(t),
+                TermNode::App { op: Op::Uninterpreted(_), args, .. }
+                    if ctx.children(*args).is_empty()
+            )
+    }
+
+    /// Slice 56: append `(or k (not k))` once per call. The tautology changes
+    /// no verdict; it only makes Tseitin encode `k` as an atom, so SAT decides
+    /// it and EUF merges it with ⊤/⊥. `k` itself stays in place.
+    fn excluded_middle(
+        &self,
+        ctx: &mut Context,
+        k: TermId,
+        defs: &mut Vec<TermId>,
+        seen_defs: &mut FxHashSet<TermId>,
+    ) {
+        let not_k = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Not), &[k])
+            .expect("(not k) over Bool is well-sorted");
+        let def = ctx
+            .mk_app(Op::Builtin(BuiltinOp::Or), &[k, not_k])
+            .expect("(or k (not k)) over Bool is well-sorted");
+        if seen_defs.insert(def) {
+            defs.push(def);
+        }
+    }
+
     fn walk(
         &mut self,
         ctx: &mut Context,
@@ -218,11 +259,14 @@ impl WordNorm {
             .iter()
             .map(|&k| self.walk(ctx, k, memo, defs, seen_defs))
             .collect();
-        // Slice 54 (item 3): purify compound Bool arguments of non-connectives.
+        // Slice 54 (item 3): purify compound Bool arguments of non-connectives;
+        // slice 56: give a bare user Bool constant its excluded-middle definition.
         if !is_bool_connective(op) {
             for k in new_kids.iter_mut() {
                 if needs_bool_proxy(ctx, *k) {
                     *k = self.bool_proxy(ctx, *k, defs, seen_defs);
+                } else if self.needs_excluded_middle(ctx, *k) {
+                    self.excluded_middle(ctx, *k, defs, seen_defs);
                 }
             }
         }
@@ -815,12 +859,67 @@ mod tests {
         let iff = ctx.mk_app(Op::Builtin(BuiltinOp::Eq), &[q, eq]).unwrap();
         let mut wn = WordNorm::default();
         let out = wn.normalize(&mut ctx, &[pq, pt, conj, iff]);
+        // Slice 56: `q` as P's argument is not proxied, but gets its
+        // excluded-middle definition; nothing else is appended.
+        let not_q = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[q]).unwrap();
+        let em_q = ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[q, not_q]).unwrap();
         assert_eq!(
             out,
-            vec![pq, pt, conj, iff],
-            "same TermIds, nothing appended"
+            vec![pq, pt, conj, iff, em_q],
+            "same TermIds, only q's definition appended"
         );
         assert!(wn.internal.is_empty());
+    }
+
+    #[test]
+    fn bare_bool_constant_argument_gets_excluded_middle_definition() {
+        let mut ctx = Context::new();
+        let bs = ctx.bool_sort();
+        // A user symbol named like a proxy, declared before any mint: it is a
+        // user constant (not in `internal`), so it gets the definition too.
+        let ub_sym = ctx.declare_fun("bool!0", &[], bs);
+        let ub = ctx.mk_app(Op::Uninterpreted(ub_sym), &[]).unwrap();
+        let q = bool_var(&mut ctx, "q");
+        let r = bool_var(&mut ctx, "r");
+        let p = bool_pred(&mut ctx, "P");
+        let f = bool_pred(&mut ctx, "F");
+        let pq = ctx.mk_app(Op::Uninterpreted(p), &[q]).unwrap();
+        let fq = ctx.mk_app(Op::Uninterpreted(f), &[q]).unwrap();
+        let qr = ctx.mk_app(Op::Builtin(BuiltinOp::And), &[q, r]).unwrap();
+        let pqr = ctx.mk_app(Op::Uninterpreted(p), &[qr]).unwrap();
+        let fls = ctx.mk_const_bool(false);
+        let pf = ctx.mk_app(Op::Uninterpreted(p), &[fls]).unwrap();
+        let pub_ = ctx.mk_app(Op::Uninterpreted(p), &[ub]).unwrap();
+        let mut wn = WordNorm::default();
+        let out = wn.normalize(&mut ctx, &[pq, fq, pqr, pf, pub_]);
+
+        let em = |ctx: &mut Context, k| {
+            let n = ctx.mk_app(Op::Builtin(BuiltinOp::Not), &[k]).unwrap();
+            ctx.mk_app(Op::Builtin(BuiltinOp::Or), &[k, n]).unwrap()
+        };
+        let em_q = em(&mut ctx, q);
+        let em_r = em(&mut ctx, r);
+        let em_ub = em(&mut ctx, ub);
+        // No rewrite of the bare-argument parents: identical TermIds.
+        assert_eq!(&out[..2], &[pq, fq]);
+        assert_eq!(out[3], pf);
+        assert_eq!(out[4], pub_);
+        // Exactly one definition for q although it sits under P and F.
+        assert_eq!(out.iter().filter(|&&t| t == em_q).count(), 1);
+        // None for r (only under the connective `and`), none for `false`.
+        assert!(!out.contains(&em_r));
+        let em_f = em(&mut ctx, fls);
+        assert!(!out.contains(&em_f));
+        // The user `bool!0` gets one.
+        assert_eq!(out.iter().filter(|&&t| t == em_ub).count(), 1);
+        // Exactly one proxy (for `(and q r)`), and the proxy gets no
+        // excluded-middle definition.
+        assert_eq!(wn.internal.len(), 1);
+        let b = *wn.internal.iter().next().unwrap();
+        let em_b = em(&mut ctx, b);
+        assert!(!out.contains(&em_b));
+        // 5 rewritten assertions + (= b (and q r)) + em_q + em_ub.
+        assert_eq!(out.len(), 8, "{out:?}");
     }
 
     #[test]
