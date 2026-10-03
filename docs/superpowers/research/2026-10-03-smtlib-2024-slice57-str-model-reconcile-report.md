@@ -28,8 +28,10 @@ and similar trivially satisfiable inputs answered
   `unknown fence=str-model-rejected` on both of them (3/3 in triage, plus a
   `--stats` check). Counting those two rows as `str-model-rejected` in the
   base too, the count falls by 1 (QF_SLIA 3,123 → 3,122, QF_S 967 → 967).
-  **Spec criterion 3 ("decreases") fails on raw counts and passes only on
-  credited counts.** That needs a ruling (see *Success criteria*).
+  **Spec criterion 3 ("decreases") is judged on the credited counts
+  (controller ruling): PASS**, combined 4,090 → 4,089 (−1). The slice's
+  measured bench gain is a single row (`multiply-reverse-fuzz`), so the
+  decrease is correspondingly tiny.
 - Net `correct` per logic, raw: QF_S +5, QF_SLIA +115, QF_LIA +84. Credited
   to the slice: QF_S 0, QF_SLIA +1, QF_LIA 0. No reproducible `correct → *`
   loss: on all 12 `correct → *` rows (all QF_LIA) both binaries gave the
@@ -151,7 +153,7 @@ slice-56 head. Runs are git-ignored.
 | --- | --- | --- | --- |
 | 1 | 0 rows `* → wrong`; 0 wrong answers in triage | PASS | 0 `wrong` in either run; 0 `* → wrong`. 1,440 triage runs: every answer from the after binary matches the row's status or z3 answer. The 5 changed `unverified` rows: z3 (60 s) `sat` for the 3 QF_LIA rows (shinri `sat`). On the 2 QF_SLIA denghang rows (shinri `unsat`, z3 no answer in 60 s) cvc5 1.4.1 gives `unsat`. **z3 `unsat` count: 0** |
 | 2 | the three §1.1 shapes and `multiply-reverse-fuzz` answer `sat` | PASS | `target/slice57-probes-before.log`: 15 run, 10 pass, 5 fail (`p1_len_eq_prefix_cd`, `p2_len_eq_prefix_backslashes`, `p3_len_eq_suffix_c`, `p4_stringfuzz_multiply_reverse`, `rf2_…`). `target/slice57-probes-after.log` and a re-run at `57743db` (`target/slice57-probes-head.log`): 16 run, 16 pass. Bench: `multiply-reverse-fuzz` is `correct` (`sat`), 3/3 in triage |
-| 3 | `unknown:str-model-rejected` decreases in QF_S + QF_SLIA; every `→ correct` group triaged | **FAIL raw / PASS credited — needs a ruling** | Raw: QF_S 966 → 967, QF_SLIA 3,122 → 3,122 (combined +1). The +1 per logic comes from two `timeout → str-model-rejected` rows. On both, the base binary gives the same `unknown fence=str-model-rejected` 3/3: the base run timed out on them under load (base wall 20.1 s and 20.5 s, isolated runs 18.3–18.7 s and 4.6–5.0 s). Credited: QF_S 967 → 967, QF_SLIA 3,123 → 3,122 (−1, `multiply-reverse-fuzz`). Every `→ correct` group was triaged in full (215 rows) |
+| 3 | `unknown:str-model-rejected` decreases in QF_S + QF_SLIA; every `→ correct` group triaged | **PASS (credited; controller ruling)** | Credited: QF_S 967 → 967, QF_SLIA 3,123 → 3,122 (combined 4,090 → 4,089, −1, `multiply-reverse-fuzz`). Raw: QF_S 966 → 967, QF_SLIA 3,122 → 3,122 (combined 4,088 → 4,089, +1). Reason for the credit: two base-run timeouts (`timeout → str-model-rejected`) that the base binary rejects 3/3 in isolation, with the same `unknown fence=str-model-rejected` (base-run wall 20.1 s and 20.5 s; isolated runs 18.3–18.7 s and 4.6–5.0 s). The slice's measured bench gain is a single row (`multiply-reverse-fuzz`), so the decrease is correspondingly tiny. Every `→ correct` group was triaged in full (215 rows) |
 | 4 | every `correct → *` row triaged; net `correct` ≥ 0 per logic | PASS | 12 `correct → *` rows (QF_LIA: 9 `→ timeout`, 3 `→ unverified`) re-run 3× per binary: both give the correct `sat` 3/3, so none is reproducible. Net correct, raw: QF_S +5, QF_SLIA +115, QF_LIA +84. Credited: 0 / +1 / 0 |
 | 5 | §7.4 before/after, 0 disagreements, 0 witness failures; discovered non-zero; `mise run ci` green | PASS | Before (`46d5fd9` engine, Task 1): `300 iters — 48 sat / 179 unsat / 73 shinri-unknown (48 with z3 sat) / 0 z3-unknown; 48 witnesses; 0 disagreements`. After (re-run at `57743db`, 1 test discovered, 1 passed, 8.9 s): `61 sat / 179 unsat / 60 shinri-unknown (35 with z3 sat) / 0 z3-unknown; 61 witnesses; 0 disagreements`. `mise run ci` at `57743db`: 1,719 run, 1,719 passed (11 slow), 7 skipped |
 | 6 | median/p90 ms per logic against `slice57-base` | reported (neutral) | See *Timing* |
@@ -269,11 +271,23 @@ Base-run load. The base run was slower throughout its 5 h 45 min. Its
 median `wall_ms` on `correct` rows was above the after run's in every
 twentieth of the row order: 1.3–1.4× on the QF_LIA twentieths and 2–8× on
 the string ones (for example 19 vs 4 ms, 30 vs 5 ms). So the slowdown was
-not confined to the hours when Tasks 1–4 used cores 0–11. The base run's z3
-oracle also timed out more often, which accounts for the 117
-`unverified → correct` rows. In isolation the two binaries run at the same
-speed (see *Timing*). This report does not identify the cause of the
-slowdown beyond bench-time environment.
+not confined to the hours when Tasks 1–4 used cores 0–11.
+
+Known extra work during the base run (controller), all on cores 0–11:
+
+- Tasks 1–4 builds and tests, from about 07:00Z to 09:30Z.
+- In a separate worktree, a full nightly-tier
+  `cargo nextest run --all --run-ignored all`, from about 12:00Z to 12:27Z.
+- Then two `cargo mutants` single-mutant reproductions, each a full
+  workspace build plus test, from about 12:27Z to 12:41Z.
+
+The host is also shared with other sessions. This explains part of the
+load, not all of it: string rows from about 10:41Z to 12:00Z were also slow,
+and no slice workload was running then. The cause is not fully identified.
+
+The base run's z3 oracle also timed out more often, which accounts for
+the 117 `unverified → correct` rows. In isolation the two binaries run at
+the same speed (see *Timing*).
 
 ## Timing
 
@@ -359,10 +373,10 @@ are within run-to-run variation (for example `n40-sat-b8` 11.7–12.1 s vs
     assumes new `unverified` rows are shinri `sat`. Two of the five are
     shinri `unsat` (denghang, `timeout → unverified`). z3 gives no answer
     within 60 s, so cvc5 (`unsat`) was used as the cross-check.
-11. **Criterion 3 direction.** It is met only on credited counts (see
-    *Success criteria*). The raw +1 is two load-driven timeouts in the base
-    run that become the same `str-model-rejected` the base binary produces
-    in isolation.
+11. **Criterion 3 judged on credited counts (controller ruling).** The
+    raw +1 is two load-driven timeouts in the base run that become the same
+    `str-model-rejected` the base binary produces in isolation. Credited, the
+    count falls by 1 (see *Success criteria*).
 
 ## Gates
 

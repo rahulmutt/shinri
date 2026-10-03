@@ -346,7 +346,7 @@ Full evidence:
 | --- | --- | --- |
 | 1 | 0 `* → wrong`; 0 wrong answers in triage | PASS. 0 `wrong` and 0 `* → wrong` in 116,641 rows, 0 wrong answers in 1,440 triage runs (240 rows × 3 × 2 binaries). Unverified-z3 check: 5 changed `unverified` rows, 0 z3 `unsat`. 3 are z3 `sat`. The other 2 are shinri `unsat` with no z3 answer in 60 s, and cvc5 gives `unsat` |
 | 2 | §1.1 shapes and `multiply-reverse-fuzz` answer `sat` | PASS. `slice57_probes` 16/16 at `57743db` (before: 5 of 15 failing). The bench row `multiply-reverse-fuzz` is `correct`, `sat` 3/3 in triage |
-| 3 | `str-model-rejected` decreases in QF_S + QF_SLIA | FAIL on raw counts, PASS credited (needs a ruling). Raw: QF_S 966 → 967, QF_SLIA 3,122 → 3,122 (combined +1). The +1 is two `timeout → str-model-rejected` rows. The base binary also rejects them 3/3 in isolation: it timed out on them only under bench load. Credited: QF_S 967 → 967, QF_SLIA 3,123 → 3,122 (−1, `multiply-reverse-fuzz`) |
+| 3 | `str-model-rejected` decreases in QF_S + QF_SLIA | PASS (credited; controller ruling). Credited: QF_S 967 → 967, QF_SLIA 3,123 → 3,122 (combined 4,090 → 4,089, −1, `multiply-reverse-fuzz`). Raw: QF_S 966 → 967, QF_SLIA 3,122 → 3,122 (combined 4,088 → 4,089). Reason for the credit: two base-run timeouts (`timeout → str-model-rejected`) that the base binary rejects 3/3 in isolation. The slice's measured bench gain is a single row (`multiply-reverse-fuzz`), so the decrease is correspondingly tiny |
 | 4 | `correct → *` triaged; net `correct` ≥ 0 per logic | PASS. The 12 `correct → *` rows (QF_LIA) give the correct `sat` 3/3 on both binaries, so none is reproducible. Net `correct`, raw: QF_S +5, QF_SLIA +115, QF_LIA +84. Credited: QF_S 0, QF_SLIA +1, QF_LIA 0. The rest is noise: load timeouts, and z3-oracle timeouts in the base run |
 | 5 | oracle before/after, 0 disagreements; `ci` green | PASS. `differential_qfs_model_reconcile`: before 48 sat / 179 unsat / 73 unknown (48 with z3 `sat`); after 61 / 179 / 60 (35 with z3 `sat`); 0 disagreements, 61 witnesses, 1 test discovered. `mise run ci` at `57743db`: 1,719/1,719 passed, 7 skipped |
 | 6 | median/p90 ms per logic | Neutral. Bench, rows `correct` in both runs, base vs after (ms): QF_S median 19 vs 5, p90 49 vs 13; QF_SLIA 29 vs 5, p90 79 vs 15; QF_LIA 86 vs 63, p90 1,986 vs 1,618. The base run was slower throughout its run. A serial interleaved sample of 100 rows per logic is equal: QF_S median 4/4 ms, p90 8/9 ms; QF_SLIA 4/4, p90 17/16; QF_LIA 45/49, p90 622/635; summed times within 0.5% |
@@ -372,7 +372,7 @@ Full evidence:
 - The final whole-branch review ran before Task 5, while the base bench ran.
 - The §7.4 generator is unchanged (before count 48). No `known` reordering
   was needed.
-- Criterion 3 is met only on credited counts (above).
+- Criterion 3 is judged on credited counts (controller ruling, above).
 - Queued: the solver gate's `eval_str_val` reads a concat's stored value
   before composing its operands. Making the gate compose first is its own
   measured slice, because it changes default-path verdicts (§5).
