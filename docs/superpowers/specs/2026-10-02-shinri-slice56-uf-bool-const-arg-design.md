@@ -234,3 +234,27 @@ only reproducible differences count.
 - Slice-54 spec: `docs/superpowers/specs/2026-10-02-shinri-slice54-uf-bool-arg-purify-design.md`
   (§1.1, §3.1; r6).
 - Slice-55 spec: `docs/superpowers/specs/2026-10-02-shinri-slice55-get-value-echo-remap-design.md`.
+
+## 11. Measured outcomes
+
+Full evidence:
+`docs/superpowers/research/2026-10-03-smtlib-2024-slice56-uf-bool-const-report.md`.
+
+| # | Criterion | Result |
+| --- | --- | --- |
+| 1 | a1–a8 pass; all eight fail on `main` | PASS: RED 13 probes, 10 fail (a1–a8, rf1, rf2_without_bv) and 3 pass as expected; GREEN 15/15 (probes plus 2 unit tests) |
+| 2 | Bench: 0 `wrong`, 0 panic, no reproducible `correct → *` loss | PASS: 0 wrong, 0 panic; 89 of 18,146 rows changed (63 `correct → timeout`, 18 `timeout → correct`, 4 `oom → timeout`, 3 `timeout → oom`, 1 `unknown:theory-refused → timeout`); all re-run 3× on both binaries, no reproducible loss |
+| 3 | Oracle: non-zero count, 0 disagreements, no `@` values | PASS: 22 discovered, 22 passed; QF_DT 0 disagreements / n_valued 393, QF_UFLIA 0 / 424, QF_UFLRA 0 / 432, 0 value disagreements |
+| 4 | `mise run ci` green, fmt clean | PASS: 1,691 run, 1,691 passed (12 slow), 7 skipped; `cargo fmt --all --check` clean |
+
+### Deviations from this spec
+
+- One existing unit test expectation was updated
+  (`bare_constants_and_connective_children_are_not_purified`) and a new unit
+  test added; `(or k (not k))` is not folded (probe a7 passes).
+- The bench transitions are one-sided (63 `correct → timeout` vs 18
+  `timeout → correct`); every row reproduces the base answer in the 3×
+  re-runs and a serial timing of 8 of them shows equal speed on both
+  binaries, so it is classed as bench-time load.
+- QF_SLIA and QF_UFBV header cases (Review Focus 1–2) are probe-covered
+  only, not benched.
