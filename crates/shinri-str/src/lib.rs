@@ -1579,7 +1579,8 @@ impl StrSolver {
         // Slice 57: default build, then self-check against the INPUT string
         // equations (non-minted `eq_true` atoms). Only a violated input
         // equation triggers the reconciliation rebuild, which is adopted if it
-        // satisfies every input equation and then requires the strict gate.
+        // satisfies every input equation and every valued concat equals the
+        // join of its operands, and then requires the strict gate.
         let vals = model::string_values(cx.terms, cx.eq, &known, &str_terms, m, &seeds);
         let input_eqs: Vec<TermId> = self
             .eq_true
@@ -1610,7 +1611,9 @@ impl StrSolver {
                 minted_sides: &minted_sides,
             };
             let rebuilt = model_reconcile::reconciled_values(cx.terms, cx.eq, m, &inp);
-            if model_reconcile::input_eqs_hold(cx.terms, &input_eqs, &rebuilt, m) {
+            if model_reconcile::input_eqs_hold(cx.terms, &input_eqs, &rebuilt, m)
+                && model_reconcile::concats_consistent(cx.terms, &rebuilt, m)
+            {
                 m.require_strict_check();
                 rebuilt
             } else {

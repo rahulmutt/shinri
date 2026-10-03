@@ -196,11 +196,15 @@ impl Reconciler<'_, '_> {
     }
 
     /// Record each operand's slice of `word` (constants and already-valued
-    /// operands keep their own length; the last operand takes the remainder;
-    /// others take their arith length) and return `word`.
+    /// operands keep their own value and length; the last operand takes the
+    /// remainder; others take their arith length) and return the JOIN of the
+    /// operands' values, as `model::value_concat` does, so a concat's value
+    /// always equals its operands' (an already-valued operand that disagrees
+    /// with `word` shows up as a violated equation, not a hidden mismatch).
     fn slice_word(&mut self, kids: &[TermId], word: &str) -> String {
         let chars: Vec<char> = word.chars().collect();
         let mut off = 0usize;
+        let mut out = String::new();
         for (i, &k) in kids.iter().enumerate() {
             let len = if let Some(c) = self.terms.string_const_value(k) {
                 c.chars().count()
@@ -213,14 +217,18 @@ impl Reconciler<'_, '_> {
             };
             let start = off.min(chars.len());
             let end = (off + len).min(chars.len());
-            if self.terms.string_const_value(k).is_none() {
-                self.memo
+            let piece = match self.terms.string_const_value(k) {
+                Some(c) => c.to_owned(),
+                None => self
+                    .memo
                     .entry(k)
-                    .or_insert_with(|| chars[start..end].iter().collect());
-            }
+                    .or_insert_with(|| chars[start..end].iter().collect())
+                    .clone(),
+            };
+            out.push_str(&piece);
             off = end;
         }
-        word.to_owned()
+        out
     }
 
     /// `str.len k` in the arith model, if arith assigned it.
@@ -290,12 +298,31 @@ fn eval_word(
     if let Some(s) = terms.string_const_value(t) {
         return Some(s.to_owned());
     }
+    // A concat is composed from its operands, never read from its stored
+    // value (which could disagree with them). Only when an operand cannot be
+    // evaluated does the stored value stand in.
+    if is_concat(terms, t) {
+        if let Some(w) = compose_concat(terms, view, m, t) {
+            return Some(w);
+        }
+    }
     if let Some(s) = view.get(&t) {
         return Some((*s).to_owned());
     }
     if let Some(ModelVal::String(s)) = m.get(t) {
         return Some(s.clone());
     }
+    None
+}
+
+/// The join of a concat's operands' words, or `None` if `t` is not a concat or
+/// an operand cannot be evaluated.
+fn compose_concat(
+    terms: &Context,
+    view: &FxHashMap<TermId, &str>,
+    m: &ModelBuilder,
+    t: TermId,
+) -> Option<String> {
     match terms.term_node(t) {
         TermNode::App {
             op: Op::Builtin(BuiltinOp::StrConcat),
@@ -310,6 +337,24 @@ fn eval_word(
         }
         _ => None,
     }
+}
+
+/// True iff every valued concat in `vals` equals the join of its operands'
+/// words (under `vals`, falling back to `m`). A concat with an unevaluable
+/// operand is not checked. Guards adoption of a rebuilt model: the solver gate
+/// reads a stored concat value as-is, so a concat that disagrees with its
+/// operands must never reach it.
+pub(crate) fn concats_consistent(
+    terms: &Context,
+    vals: &[(TermId, String)],
+    m: &ModelBuilder,
+) -> bool {
+    let view: FxHashMap<TermId, &str> = vals.iter().map(|(t, v)| (*t, v.as_str())).collect();
+    vals.iter()
+        .all(|(t, v)| match compose_concat(terms, &view, m, *t) {
+            Some(w) => w == *v,
+            None => true,
+        })
 }
 
 #[cfg(test)]
@@ -425,6 +470,57 @@ mod tests {
         assert_eq!(sv.chars().count(), 2, "s = {sv:?}");
         assert_eq!(xv, format!("{sv}c"));
         assert!(input_eqs_hold(&ctx, &[input_eq], &rebuilt, &m));
+    }
+
+    /// Review fix (round 1): `ab = a ++ b` merged with "abc", `len a = 1`,
+    /// membership seed `a ↦ "Z"`. The rebuild must value `ab` as the join of
+    /// its operands ("Zbc"), not the anchor word, so the input equation
+    /// `a ++ b = "abc"` is seen violated and the rebuild is not adopted. The
+    /// adoption check must also compose a stored concat from its operands.
+    #[test]
+    fn seeded_operand_concat_value_is_operand_join() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let mut m = ModelBuilder::default();
+        let (a, b) = (var(&mut ctx, "a"), var(&mut ctx, "b"));
+        let abc = ctx.mk_string_const("abc");
+        let ab = cat(&mut ctx, a, b);
+        merge(&mut eq, ab, abc);
+        set_len(&mut ctx, &mut m, a, 1);
+        let known = vec![ab, a, b, abc];
+        let input_eq = ctx.mk_eq(ab, abc).unwrap();
+        let mut seeds = FxHashMap::default();
+        seeds.insert(a, "Z".to_owned());
+
+        let default = crate::model::string_values(&mut ctx, &mut eq, &known, &known, &m, &seeds);
+        assert_eq!(value_in(&default, ab), "Zbc");
+        assert!(!input_eqs_hold(&ctx, &[input_eq], &default, &m));
+
+        let inp = ReconcileInput {
+            known: &known,
+            str_terms: &known,
+            seeds: &seeds,
+            input_sides: &sides(&[ab, abc]),
+            minted_sides: &sides(&[]),
+        };
+        let rebuilt = reconciled_values(&mut ctx, &mut eq, &m, &inp);
+        let (av, bv, abv) = (
+            value_in(&rebuilt, a),
+            value_in(&rebuilt, b),
+            value_in(&rebuilt, ab),
+        );
+        assert_eq!(abv, format!("{av}{bv}"), "ab must be the join of a, b");
+        assert!(concats_consistent(&ctx, &rebuilt, &m));
+        assert!(!input_eqs_hold(&ctx, &[input_eq], &rebuilt, &m));
+
+        // The adoption check never trusts a stored concat value.
+        let forged = vec![
+            (a, "Z".to_owned()),
+            (b, "bc".to_owned()),
+            (ab, "abc".to_owned()),
+        ];
+        assert!(!input_eqs_hold(&ctx, &[input_eq], &forged, &m));
+        assert!(!concats_consistent(&ctx, &forged, &m));
     }
 
     /// A side that cannot be evaluated counts as holding.
