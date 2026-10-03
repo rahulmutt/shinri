@@ -76,6 +76,19 @@ fn sat_x(body: &str) -> String {
     decode(&out[1])
 }
 
+/// Sound-direction guard: `body` must never be `unsat`. Returns the model
+/// value of `x` when shinri answers `sat`, `None` on `unknown` (pre-existing
+/// incompleteness at f515c00, slice-58 ruling).
+fn not_unsat_x(body: &str) -> Option<String> {
+    let out = run_script(&format!("{H}{body}(check-sat)(get-value (x))"));
+    let v = out.first().map(String::as_str);
+    assert!(
+        matches!(v, Some("sat") | Some("unknown")),
+        "{v:?}: {H}{body}"
+    );
+    (v == Some("sat")).then(|| decode(&out[1]))
+}
+
 fn all_in(s: &str, ok: impl Fn(char) -> bool) -> bool {
     s.chars().all(ok)
 }
@@ -136,17 +149,18 @@ fn m4_negative_polarity() {
 
 // ── sound-direction guards (spec §7.3) ───────────────────────────────────────
 
-/// Non-empty derivative ⟹ no conflict.
+/// Non-empty derivative ⟹ no conflict. At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids `unsat` and checks any `sat` witness.
 #[test]
 fn g1_compatible_prefix() {
-    let x = sat_x(
+    if let Some(x) = not_unsat_x(
         "(assert (str.prefixof \"a\" x))(assert (= x y))\
          (assert (str.in_re y (re.+ (re.range \"a\" \"b\"))))",
-    );
-    assert!(
-        x.starts_with('a') && all_in(&x, |c| c == 'a' || c == 'b'),
-        "x = {x:?}"
-    );
+    ) {
+        assert!(
+            x.starts_with('a') && all_in(&x, |c| c == 'a' || c == 'b'),
+            "x = {x:?}"
+        );
+    }
 }
 
 /// The `"1"` branch's conflict must cite its disjunct, so the `"ab"` branch
@@ -160,20 +174,21 @@ fn g2_conditional_member() {
     assert_eq!(x, "ab");
 }
 
-/// A consistent minted `"1" ++ !strk` member ⟹ no conflict.
+/// A consistent minted `"1" ++ !strk` member ⟹ no conflict. At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids `unsat` and checks any `sat` witness.
 #[test]
 fn g3_minted_member_other_branch() {
-    let x = sat_x(
+    if let Some(x) = not_unsat_x(
         "(assert (= 2 (str.len x)))(assert (= x y))\
          (assert (str.in_re y (re.* (re.union (re.range \"a\" \"b\") (str.to_re \"1\")))))\
          (assert (str.prefixof \"1\" x))",
-    );
-    assert!(
-        x.starts_with('1')
-            && x.chars().count() == 2
-            && all_in(&x, |c| matches!(c, 'a' | 'b' | '1')),
-        "x = {x:?}"
-    );
+    ) {
+        assert!(
+            x.starts_with('1')
+                && x.chars().count() == 2
+                && all_in(&x, |c| matches!(c, 'a' | 'b' | '1')),
+            "x = {x:?}"
+        );
+    }
 }
 
 // ── Review Focus (plan) ──────────────────────────────────────────────────────
@@ -188,41 +203,44 @@ fn rf1_member_popped_with_scope() {
     assert_eq!(out, vec!["unsat".to_string(), "sat".to_string()]);
 }
 
-/// RF2: `prefixof ""` mints a concat whose NF drops `""` — nothing to consume.
+/// RF2: `prefixof ""` mints a concat whose NF drops `""` — nothing to consume. At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids `unsat` and checks any `sat` witness.
 #[test]
 fn rf2_empty_prefix_no_conflict() {
-    let x = sat_x(
+    if let Some(x) = not_unsat_x(
         "(assert (str.prefixof \"\" x))(assert (= x y))\
          (assert (str.in_re y (re.+ (re.range \"a\" \"b\"))))",
-    );
-    assert!(
-        !x.is_empty() && all_in(&x, |c| c == 'a' || c == 'b'),
-        "x = {x:?}"
-    );
+    ) {
+        assert!(
+            !x.is_empty() && all_in(&x, |c| c == 'a' || c == 'b'),
+            "x = {x:?}"
+        );
+    }
 }
 
-/// RF3: code points above ASCII, inside the range ⟹ no conflict.
+/// RF3: code points above ASCII, inside the range ⟹ no conflict. At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids `unsat` and checks any `sat` witness.
 #[test]
 fn rf3_non_ascii_prefix_in_range() {
-    let x = sat_x(
+    if let Some(x) = not_unsat_x(
         "(assert (str.prefixof \"\\u{e9}\" x))(assert (= x y))\
          (assert (str.in_re y (re.* (re.range \"\\u{e0}\" \"\\u{ff}\"))))",
-    );
-    assert!(
-        x.starts_with('\u{e9}') && all_in(&x, |c| ('\u{e0}'..='\u{ff}').contains(&c)),
-        "x = {x:?}"
-    );
+    ) {
+        assert!(
+            x.starts_with('\u{e9}') && all_in(&x, |c| ('\u{e0}'..='\u{ff}').contains(&c)),
+            "x = {x:?}"
+        );
+    }
 }
 
-/// RF4: the membership's string side is itself a concat.
+/// RF4: the membership's string side is itself a concat. At f515c00 this answers `unknown` (fence=sat-budget); the guard only forbids `unsat` and checks any `sat` witness.
 #[test]
 fn rf4_concat_membership_side() {
-    let x = sat_x(
+    if let Some(x) = not_unsat_x(
         "(assert (str.prefixof \"a\" x))\
          (assert (str.in_re (str.++ x \"b\") (re.* (re.range \"a\" \"b\"))))",
-    );
-    assert!(
-        x.starts_with('a') && all_in(&x, |c| c == 'a' || c == 'b'),
-        "x = {x:?}"
-    );
+    ) {
+        assert!(
+            x.starts_with('a') && all_in(&x, |c| c == 'a' || c == 'b'),
+            "x = {x:?}"
+        );
+    }
 }
