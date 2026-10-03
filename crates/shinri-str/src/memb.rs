@@ -6,7 +6,7 @@ use crate::{collect, model, normalize, side_clean, wordeq, StrSolver};
 use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
 use shinri_theory::types::{ENodeId, EqLeaf};
-use shinri_theory::{TCheck, TheoryCtx};
+use shinri_theory::{EqualityEngine, TCheck, TheoryCtx};
 
 const RULE_E: u8 = 0;
 const RULE_S1: u8 = 1;
@@ -143,6 +143,86 @@ fn len_link_split(s: &mut StrSolver, terms: &mut Context, eq_atom: TermId) -> Op
 /// this round; `None` = nothing to do (all memberships discharged, deduped,
 /// or skipped as unclean — the caller falls through to Sat, backstopped by
 /// the post-solve self-check).
+/// Rule G′ (slice 58): concat members of `t`'s class examined per atom.
+/// Past the cap the rest are skipped — decisiveness only, never a verdict.
+pub(crate) const MEMBER_CAP: usize = 64;
+
+/// Rule G′ (slice 58): a membership `t ∈ rex` against the concat MEMBERS of
+/// `t`'s EUF class. `normalize::rep_rank` never makes a concat the class
+/// representative, so when `t`'s class is `{x, y, "1"·z}` Rule G reads
+/// `nf(t) = [t]` and never consumes the `"1"`. Here every concat member `k`
+/// (`k ≠ t`, at most `MEMBER_CAP`, in `known` order) is read through its
+/// cited deep NF; its leading constants are consumed through the derivative,
+/// and `∂_w rex = ∅` yields the conflict justification
+/// `[Asserted(lit)] ++ explain(t, k) ++ deep-NF antecedents`.
+///
+/// Sound at any decision level: under the cited merges `t = w·u`, and
+/// `∂_w rex = ∅` means no word with prefix `w` is in `rex` (for a negative
+/// atom `rex = comp(R)`: every such word is in `R`), contradicting `lit`.
+/// Every substituted merge is cited, so — like Rule G's ground conflict —
+/// it needs no `side_clean` gate. A member whose deep NF does not converge,
+/// or whose derivative exceeds `FUEL_NODE_CAP`, is skipped: G′ is additive,
+/// so it never fences to `Unknown`.
+pub(crate) fn member_prefix_conflict(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    t: TermId,
+    rex: &Rex,
+    lit: shinri_core::Lit,
+) -> Option<Vec<EqLeaf>> {
+    let tn = eq.intern(t);
+    let root = eq.find(tn);
+    let mut seen: FxHashSet<TermId> = FxHashSet::default();
+    let mut examined = 0usize;
+    for &k in known {
+        let is_concat = matches!(
+            terms.term_node(k),
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::StrConcat),
+                ..
+            }
+        );
+        if k == t || !is_concat || !seen.insert(k) {
+            continue;
+        }
+        let kn = eq.intern(k);
+        if eq.find(kn) != root {
+            continue;
+        }
+        if examined == MEMBER_CAP {
+            break;
+        }
+        examined += 1;
+        let mut just = vec![EqLeaf::Asserted(lit)];
+        eq.explain(tn, kn, &mut just);
+        let Some(nf) = normalize::deep_normal_form_cited(terms, eq, known, k, &mut just) else {
+            continue;
+        };
+        let mut cur = rex.clone();
+        let mut fenced = false;
+        'atoms: for &a in &nf {
+            let Some(w) = terms.string_const_value(a).map(str::to_owned) else {
+                break;
+            };
+            for c in w.chars() {
+                cur = regex::deriv(c as u32, &cur);
+                if regex::node_count(&cur) > regex::FUEL_NODE_CAP {
+                    fenced = true;
+                    break 'atoms;
+                }
+                if matches!(cur, Rex::Empty) {
+                    break 'atoms;
+                }
+            }
+        }
+        if !fenced && matches!(cur, Rex::Empty) {
+            return Some(just);
+        }
+    }
+    None
+}
+
 pub(crate) fn memb_check(
     s: &mut StrSolver,
     cx: &mut TheoryCtx,
@@ -191,7 +271,7 @@ pub(crate) fn memb_check(
         else {
             return Some(TCheck::Unknown); // non-convergent merge — sound bail
         };
-        let mut cur = rex;
+        let mut cur = rex.clone();
         let mut i = 0usize;
         let mut fenced = false;
         while i < nf.len() {
@@ -220,6 +300,15 @@ pub(crate) fn memb_check(
             }
             let mut just = vec![EqLeaf::Asserted(lit)];
             just.extend(expand_ante.iter().copied());
+            return Some(TCheck::Conflict(just));
+        }
+
+        // ── Rule G′ (slice 58): the class's concat members ──────────────
+        // Rule G read `t`'s own NF, whose head is the class rep; a concat
+        // member is never the rep, so its constant prefix was unseen. Runs
+        // before the leaf arms (they `continue` past the atom). Conflict
+        // only: no split, no mint, no fuel; nothing found ⟹ fall through.
+        if let Some(just) = member_prefix_conflict(cx.terms, cx.eq, known, t, &rex, lit) {
             return Some(TCheck::Conflict(just));
         }
 
@@ -587,6 +676,7 @@ mod tests {
     use crate::StrSolver;
     use shinri_core::{BuiltinOp, Context, Op, TermId};
     use shinri_sat::Effort;
+    use shinri_theory::types::{EqJust, EqLeaf};
     use shinri_theory::{AtomRegistry, EqualityEngine, TCheck, TheoryCtx, TheorySolver};
 
     fn var(ctx: &mut Context, n: &str) -> TermId {
@@ -1422,5 +1512,187 @@ mod tests {
             !matches!(terminal, TCheck::Conflict(_)),
             "non-empty intersection must NOT conflict"
         );
+    }
+
+    fn cat(ctx: &mut Context, parts: &[TermId]) -> TermId {
+        ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), parts)
+            .unwrap()
+    }
+
+    fn lit_of(v: u32) -> shinri_core::Lit {
+        shinri_core::Lit::new(shinri_core::Var::new(v), true)
+    }
+
+    /// Merge `a ≈ b`, justified by the input literal `l`.
+    fn merge_by(eq: &mut EqualityEngine, a: TermId, b: TermId, l: shinri_core::Lit) {
+        let (an, bn) = (eq.intern(a), eq.intern(b));
+        eq.merge(an, bn, EqJust::Asserted(l))
+            .expect("no EUF conflict");
+    }
+
+    fn sigma_star() -> Rex {
+        regex::star(Rex::Range(0, regex::MAX_CODE))
+    }
+
+    #[test]
+    fn g_prime_conflict_cites_lit_and_member_merges() {
+        // x ≈ y (lit 1), x ≈ "1"·z (lit 2, e.g. a decided disjunct),
+        // y ∈ [a-b]*: ∂_1 = ∅ ⟹ conflict citing lit 9 (the membership) and
+        // BOTH merges, so it is valid on any branch.
+        let mut ctx = Context::new();
+        let (x, y, z) = (var(&mut ctx, "x"), var(&mut ctx, "y"), var(&mut ctx, "z"));
+        let one = ctx.mk_string_const("1");
+        let c = cat(&mut ctx, &[one, z]);
+        let mut eq = EqualityEngine::default();
+        merge_by(&mut eq, x, y, lit_of(1));
+        merge_by(&mut eq, x, c, lit_of(2));
+        let known = vec![y, x, c, z, one];
+        let just = super::member_prefix_conflict(
+            &mut ctx,
+            &mut eq,
+            &known,
+            y,
+            &regex::star_range_test('a', 'b'),
+            lit_of(9),
+        )
+        .expect("∂_1([a-b]*) = ∅ must conflict");
+        assert_eq!(
+            just[0],
+            EqLeaf::Asserted(lit_of(9)),
+            "membership literal first"
+        );
+        for l in [lit_of(1), lit_of(2)] {
+            assert!(
+                just.contains(&EqLeaf::Asserted(l)),
+                "missing {l:?} in {just:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn g_prime_compatible_member_is_none() {
+        let mut ctx = Context::new();
+        let (y, z) = (var(&mut ctx, "y"), var(&mut ctx, "z"));
+        let a = ctx.mk_string_const("a");
+        let c = cat(&mut ctx, &[a, z]);
+        let mut eq = EqualityEngine::default();
+        merge_by(&mut eq, y, c, lit_of(1));
+        let known = vec![y, c, z, a];
+        assert!(super::member_prefix_conflict(
+            &mut ctx,
+            &mut eq,
+            &known,
+            y,
+            &regex::star_range_test('a', 'b'),
+            lit_of(9),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn g_prime_reads_member_deep_nf() {
+        // y ≈ "a"·z (lit 1), z ≈ "b"·w (lit 2), y ∈ "ac"·Σ*: only the deep NF
+        // "ab"·w exposes the clash; the z-merge must be cited.
+        let mut ctx = Context::new();
+        let (y, z, w) = (var(&mut ctx, "y"), var(&mut ctx, "z"), var(&mut ctx, "w"));
+        let a = ctx.mk_string_const("a");
+        let b = ctx.mk_string_const("b");
+        let ca = cat(&mut ctx, &[a, z]);
+        let cb = cat(&mut ctx, &[b, w]);
+        let mut eq = EqualityEngine::default();
+        merge_by(&mut eq, y, ca, lit_of(1));
+        merge_by(&mut eq, z, cb, lit_of(2));
+        // `cb` precedes `z` so `rep(z)` is the concat (rep = first non-const in
+        // `known`; it is never promoted by rank) and the deep NF expands it.
+        let known = vec![y, ca, cb, z, w, a, b];
+        let rex = regex::concat(vec![regex::lit_test("ac"), sigma_star()]);
+        let just = super::member_prefix_conflict(&mut ctx, &mut eq, &known, y, &rex, lit_of(9))
+            .expect("∂_ab(\"ac\"·Σ*) = ∅ must conflict");
+        assert!(
+            just.contains(&EqLeaf::Asserted(lit_of(2))),
+            "deep-NF merge cited: {just:?}"
+        );
+    }
+
+    #[test]
+    fn g_prime_negative_polarity() {
+        // ¬(y ∈ "a"·Σ*) is checked as y ∈ comp("a"·Σ*); ∂_a = comp(Σ*) = ∅.
+        let mut ctx = Context::new();
+        let (y, z) = (var(&mut ctx, "y"), var(&mut ctx, "z"));
+        let a = ctx.mk_string_const("a");
+        let c = cat(&mut ctx, &[a, z]);
+        let mut eq = EqualityEngine::default();
+        merge_by(&mut eq, y, c, lit_of(1));
+        let known = vec![y, c, z, a];
+        let rex = regex::comp(regex::concat(vec![regex::lit_test("a"), sigma_star()]));
+        assert!(
+            super::member_prefix_conflict(&mut ctx, &mut eq, &known, y, &rex, lit_of(9)).is_some()
+        );
+    }
+
+    #[test]
+    fn g_prime_member_cap() {
+        // MEMBER_CAP compatible members ("a"·z_i), then one clashing ("1"·z):
+        // past the cap ⟹ None. Clashing member first ⟹ Some.
+        let mut ctx = Context::new();
+        let y = var(&mut ctx, "y");
+        let a = ctx.mk_string_const("a");
+        let one = ctx.mk_string_const("1");
+        let mut eq = EqualityEngine::default();
+        let mut compatible = Vec::new();
+        for i in 0..super::MEMBER_CAP {
+            let zi = var(&mut ctx, &format!("z{i}"));
+            let ci = cat(&mut ctx, &[a, zi]);
+            merge_by(&mut eq, y, ci, lit_of(1));
+            compatible.push(ci);
+        }
+        let z = var(&mut ctx, "z");
+        let clash = cat(&mut ctx, &[one, z]);
+        merge_by(&mut eq, y, clash, lit_of(2));
+        let rex = regex::star_range_test('a', 'b');
+
+        let mut late = vec![y];
+        late.extend(&compatible);
+        late.push(clash);
+        assert!(
+            super::member_prefix_conflict(&mut ctx, &mut eq, &late, y, &rex, lit_of(9)).is_none(),
+            "the 65th member is past MEMBER_CAP"
+        );
+
+        let mut early = vec![y, clash];
+        early.extend(&compatible);
+        assert!(
+            super::member_prefix_conflict(&mut ctx, &mut eq, &early, y, &rex, lit_of(9)).is_some()
+        );
+    }
+
+    #[test]
+    fn g_prime_skips_unexpandable_member() {
+        // Review Focus 5: y ≈ s·s·u (self-referential through s ≈ y) may not
+        // converge; it is skipped, and the "1"·z member still decides.
+        let mut ctx = Context::new();
+        let (y, s, u, z) = (
+            var(&mut ctx, "y"),
+            var(&mut ctx, "s"),
+            var(&mut ctx, "u"),
+            var(&mut ctx, "z"),
+        );
+        let one = ctx.mk_string_const("1");
+        let ssu = cat(&mut ctx, &[s, s, u]);
+        let c = cat(&mut ctx, &[one, z]);
+        let mut eq = EqualityEngine::default();
+        merge_by(&mut eq, y, s, lit_of(1));
+        merge_by(&mut eq, y, ssu, lit_of(2));
+        merge_by(&mut eq, y, c, lit_of(3));
+        let known = vec![y, s, ssu, u, c, z, one];
+        assert!(super::member_prefix_conflict(
+            &mut ctx,
+            &mut eq,
+            &known,
+            y,
+            &regex::star_range_test('a', 'b'),
+            lit_of(9),
+        )
+        .is_some());
     }
 }

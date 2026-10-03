@@ -2803,6 +2803,8 @@ fn differential_qfs_model_reconcile() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MP_N_ITERS: usize = 300;
+/// `unknown`-where-z3-`unsat` count at `f515c00` (slice-58 plan, Task 1 Step 5).
+const MP_BEFORE_UNKNOWN_Z3_UNSAT: usize = 69;
 
 fn gen_member_prefix_body(seed: u64) -> (String, usize) {
     let mut rng = Lcg(seed);
@@ -2930,6 +2932,11 @@ fn differential_qfs_member_prefix() {
     assert!(
         n_witness > 0,
         "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_unknown_z3_unsat < MP_BEFORE_UNKNOWN_Z3_UNSAT,
+        "unknown-where-z3-unsat {n_unknown_z3_unsat} not below the slice-58 base \
+         {MP_BEFORE_UNKNOWN_Z3_UNSAT}"
     );
 }
 
