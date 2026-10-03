@@ -110,6 +110,9 @@ pub struct StrSolver {
     /// and the historical unsound-conflict note there). Monotone: recorded at the
     /// moment a split is emitted, before the disjunct can be asserted back.
     minted_eqs: FxHashSet<TermId>,
+    /// Slice 57: candidate-trial budget override for the model reconciliation
+    /// rebuild (`None` = `model_reconcile::trial_budget`). A test hook.
+    rebuild_trial_budget: Option<usize>,
     /// String Eq/Distinct atoms minted by the MEMBERSHIP pass (S1's `x = ""` /
     /// `x = h·z`, Rule E's ε equality, the S-rules' `distinct(x, h·z)`
     /// companions) — a subset of `minted_eqs` that distinguishes the MINTER
@@ -1609,15 +1612,19 @@ impl StrSolver {
                 seeds: &seeds,
                 input_sides: &input_sides,
                 minted_sides: &minted_sides,
+                trial_budget: self.rebuild_trial_budget,
             };
-            let rebuilt = model_reconcile::reconciled_values(cx.terms, cx.eq, m, &inp);
-            if model_reconcile::input_eqs_hold(cx.terms, &input_eqs, &rebuilt, m)
-                && model_reconcile::concats_consistent(cx.terms, &rebuilt, m)
-            {
-                m.require_strict_check();
-                rebuilt
-            } else {
-                vals
+            // `None`: the candidate-trial budget ran out; the rebuild is
+            // abandoned like a failed one (default model, flag unset).
+            match model_reconcile::reconciled_values(cx.terms, cx.eq, m, &inp) {
+                Some(rebuilt)
+                    if model_reconcile::input_eqs_hold(cx.terms, &input_eqs, &rebuilt, m)
+                        && model_reconcile::concats_consistent(cx.terms, &rebuilt, m) =>
+                {
+                    m.require_strict_check();
+                    rebuilt
+                }
+                _ => vals,
             }
         };
         for (t, v) in vals {
@@ -2179,6 +2186,46 @@ mod tests {
         s.model_with(&mut cx, &mut m);
         assert!(!m.strict_check_required());
         assert!(matches!(m.get(x), Some(ModelVal::String(_))));
+    }
+
+    /// An exhausted candidate-trial budget abandons the rebuild: the default
+    /// model is kept and the strict flag stays unset.
+    #[test]
+    fn slice57_model_with_budget_exhausted_keeps_default() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut m = ModelBuilder::default();
+        let x = slice57_var(&mut ctx, "x");
+        let p = slice57_var(&mut ctx, "p");
+        let k = slice57_var(&mut ctx, "k");
+        let cd = ctx.mk_string_const("cd");
+        let c = ctx.mk_string_const("c");
+        let cdp = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[cd, p])
+            .unwrap();
+        let ck = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[c, k])
+            .unwrap();
+        let input_eq = ctx.mk_eq(x, cdp).unwrap();
+        let minted_eq = ctx.mk_eq(x, ck).unwrap();
+        slice57_merge(&mut eq, x, cdp);
+        slice57_merge(&mut eq, x, ck);
+        slice57_len(&mut ctx, &mut m, x, 3);
+        slice57_len(&mut ctx, &mut m, p, 1);
+        let mut s = slice57_solver(&[input_eq], &[minted_eq], &[ck, x, cd, cdp, k, p, c]);
+        s.rebuild_trial_budget = Some(0);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        s.model_with(&mut cx, &mut m);
+        match m.get(x) {
+            Some(ModelVal::String(v)) => assert!(!v.starts_with("cd"), "default kept: x = {v:?}"),
+            other => panic!("expected a String for x, got {other:?}"),
+        }
+        assert!(!m.strict_check_required());
     }
 
     /// The default path: a model that already satisfies its input equations

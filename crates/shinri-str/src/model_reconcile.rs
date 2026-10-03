@@ -29,24 +29,46 @@ pub(crate) struct ReconcileInput<'a> {
     pub input_sides: &'a FxHashSet<TermId>,
     /// Both sides of every asserted minted string equality.
     pub minted_sides: &'a FxHashSet<TermId>,
+    /// Candidate-trial budget override; `None` uses [`trial_budget`].
+    pub trial_budget: Option<usize>,
+}
+
+/// Floor of the rebuild's candidate-trial budget.
+const REBUILD_TRIAL_FLOOR: usize = 64;
+/// Candidate trials allowed per known term (on top of the floor).
+const REBUILD_TRIALS_PER_TERM: usize = 4;
+
+/// The default candidate-trial budget for a rebuild over `known_len` terms.
+/// Each candidate concat tried in `value_var` costs one trial; a rejected
+/// candidate discards its sub-work, so without a bound the rebuild can blow
+/// up exponentially in the nesting depth of multi-concat classes.
+pub(crate) fn trial_budget(known_len: usize) -> usize {
+    REBUILD_TRIALS_PER_TERM * known_len + REBUILD_TRIAL_FLOOR
 }
 
 /// Rebuild the string valuation (spec §4.2): `(term, value)` for every term of
 /// `str_terms` that `m` does not already hold a string for, in `str_terms`
 /// order. Starts from a fresh memo seeded only with the membership seeds.
+/// `None` when the candidate-trial budget runs out: the rebuild is abandoned
+/// and the caller keeps the default model (as for a failed rebuild).
 pub(crate) fn reconciled_values(
     terms: &mut Context,
     eq: &mut EqualityEngine,
     m: &ModelBuilder,
     inp: &ReconcileInput<'_>,
-) -> Vec<(TermId, String)> {
+) -> Option<Vec<(TermId, String)>> {
     let mut r = Reconciler {
         terms,
         eq,
         m,
         inp,
         memo: inp.seeds.clone(),
+        undo: Vec::new(),
         in_progress: FxHashSet::default(),
+        trials_left: inp
+            .trial_budget
+            .unwrap_or_else(|| trial_budget(inp.known.len())),
+        exhausted: false,
     };
     // Input-equation concats first, longest first, so a top-level concat sets
     // its operands' values before they are valued on their own.
@@ -59,6 +81,9 @@ pub(crate) fn reconciled_values(
     firsts.sort_by_key(|&t| (std::cmp::Reverse(concat_arity(r.terms, t)), t.index()));
     for t in firsts {
         let _ = r.value(t);
+        if r.exhausted {
+            return None;
+        }
     }
     let mut out = Vec::new();
     for &t in inp.str_terms {
@@ -66,9 +91,12 @@ pub(crate) fn reconciled_values(
             continue;
         }
         let v = r.value(t);
+        if r.exhausted {
+            return None;
+        }
         out.push((t, v));
     }
-    out
+    Some(out)
 }
 
 struct Reconciler<'a, 'b> {
@@ -77,23 +105,51 @@ struct Reconciler<'a, 'b> {
     m: &'a ModelBuilder,
     inp: &'a ReconcileInput<'b>,
     memo: FxHashMap<TermId, String>,
+    /// Undo log of memo writes: `(key, previous value)`, newest last. A
+    /// rejected candidate is rolled back to the log length before its trial.
+    undo: Vec<(TermId, Option<String>)>,
     in_progress: FxHashSet<TermId>,
+    /// Candidate trials left before the rebuild is abandoned.
+    trials_left: usize,
+    /// Set when `trials_left` ran out; the result is then discarded.
+    exhausted: bool,
 }
 
 impl Reconciler<'_, '_> {
+    /// Write `memo[k] = v`, logging the previous entry for rollback.
+    fn memo_set(&mut self, k: TermId, v: String) {
+        let prev = self.memo.insert(k, v);
+        self.undo.push((k, prev));
+    }
+
+    /// Undo every memo write logged after `mark`.
+    fn rollback(&mut self, mark: usize) {
+        while self.undo.len() > mark {
+            let (k, prev) = self.undo.pop().expect("undo entry");
+            match prev {
+                Some(v) => self.memo.insert(k, v),
+                None => self.memo.remove(&k),
+            };
+        }
+    }
+
     fn value(&mut self, t: TermId) -> String {
         if let Some(v) = self.memo.get(&t) {
             return v.clone();
         }
         if let Some(v) = self.terms.string_const_value(t) {
             let v = v.to_owned();
-            self.memo.insert(t, v.clone());
+            self.memo_set(t, v.clone());
             return v;
         }
         if !self.in_progress.insert(t) {
             // Re-entry: a cycle such as `x ≈ s ++ "c"`, `s ≈ x ++ k` (minted).
             // A free fill of the class length, NOT memoised, so the enclosing
             // candidate is judged on its own length and rolled back if wrong.
+            // Spec §4.2 rule 3 names minted cycles, but this applies to ANY
+            // cycle. That is safe: the fill is only a candidate value, and a
+            // rebuilt model is adopted only if `concats_consistent` and
+            // `input_eqs_hold` pass, and then must pass the strict gate.
             let n = self.class_len(t).unwrap_or(0);
             return free_fill(self.eq, t, n);
         }
@@ -103,7 +159,7 @@ impl Reconciler<'_, '_> {
             self.value_var(t)
         };
         self.in_progress.remove(&t);
-        self.memo.insert(t, out.clone());
+        self.memo_set(t, out.clone());
         out
     }
 
@@ -123,12 +179,17 @@ impl Reconciler<'_, '_> {
         }
         let n = self.class_len(t);
         for k in self.candidates(t) {
-            let saved = self.memo.clone();
+            if self.trials_left == 0 {
+                self.exhausted = true;
+                break;
+            }
+            self.trials_left -= 1;
+            let mark = self.undo.len();
             let v = self.value(k);
             if n.is_none_or(|n| v.chars().count() == n) {
                 return v;
             }
-            self.memo = saved;
+            self.rollback(mark);
         }
         free_fill(self.eq, t, n.unwrap_or(0))
     }
@@ -219,11 +280,14 @@ impl Reconciler<'_, '_> {
             let end = (off + len).min(chars.len());
             let piece = match self.terms.string_const_value(k) {
                 Some(c) => c.to_owned(),
-                None => self
-                    .memo
-                    .entry(k)
-                    .or_insert_with(|| chars[start..end].iter().collect())
-                    .clone(),
+                None => match self.memo.get(&k) {
+                    Some(v) => v.clone(),
+                    None => {
+                        let v: String = chars[start..end].iter().collect();
+                        self.memo_set(k, v.clone());
+                        v
+                    }
+                },
             };
             out.push_str(&piece);
             off = end;
@@ -429,8 +493,9 @@ mod tests {
             seeds: &seeds,
             input_sides: &sides(&[x, input]),
             minted_sides: &sides(&[x, minted]),
+            trial_budget: None,
         };
-        let rebuilt = reconciled_values(&mut ctx, &mut eq, &m, &inp);
+        let rebuilt = reconciled_values(&mut ctx, &mut eq, &m, &inp).expect("within budget");
         let xv = value_in(&rebuilt, x);
         assert!(
             xv.starts_with("cd") && xv.chars().count() == 3,
@@ -464,8 +529,9 @@ mod tests {
             seeds: &seeds,
             input_sides: &sides(&[x, input]),
             minted_sides: &sides(&[s, minted]),
+            trial_budget: None,
         };
-        let rebuilt = reconciled_values(&mut ctx, &mut eq, &m, &inp);
+        let rebuilt = reconciled_values(&mut ctx, &mut eq, &m, &inp).expect("within budget");
         let (xv, sv) = (value_in(&rebuilt, x), value_in(&rebuilt, s));
         assert_eq!(sv.chars().count(), 2, "s = {sv:?}");
         assert_eq!(xv, format!("{sv}c"));
@@ -502,8 +568,9 @@ mod tests {
             seeds: &seeds,
             input_sides: &sides(&[ab, abc]),
             minted_sides: &sides(&[]),
+            trial_budget: None,
         };
-        let rebuilt = reconciled_values(&mut ctx, &mut eq, &m, &inp);
+        let rebuilt = reconciled_values(&mut ctx, &mut eq, &m, &inp).expect("within budget");
         let (av, bv, abv) = (
             value_in(&rebuilt, a),
             value_in(&rebuilt, b),
@@ -521,6 +588,36 @@ mod tests {
         ];
         assert!(!input_eqs_hold(&ctx, &[input_eq], &forged, &m));
         assert!(!concats_consistent(&ctx, &forged, &m));
+    }
+
+    /// A zero candidate-trial budget abandons the char-peel rebuild.
+    #[test]
+    fn exhausted_trial_budget_abandons_rebuild() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let mut m = ModelBuilder::default();
+        let (x, p, k) = (var(&mut ctx, "x"), var(&mut ctx, "p"), var(&mut ctx, "k"));
+        let cd = ctx.mk_string_const("cd");
+        let c = ctx.mk_string_const("c");
+        let input = cat(&mut ctx, cd, p);
+        let minted = cat(&mut ctx, c, k);
+        merge(&mut eq, x, input);
+        merge(&mut eq, x, minted);
+        set_len(&mut ctx, &mut m, x, 3);
+        set_len(&mut ctx, &mut m, p, 1);
+        let known = vec![minted, x, cd, input, k, p, c];
+        let seeds = FxHashMap::default();
+        let mut inp = ReconcileInput {
+            known: &known,
+            str_terms: &known,
+            seeds: &seeds,
+            input_sides: &sides(&[x, input]),
+            minted_sides: &sides(&[x, minted]),
+            trial_budget: Some(0),
+        };
+        assert!(reconciled_values(&mut ctx, &mut eq, &m, &inp).is_none());
+        inp.trial_budget = None;
+        assert!(reconciled_values(&mut ctx, &mut eq, &m, &inp).is_some());
     }
 
     /// A side that cannot be evaluated counts as holding.

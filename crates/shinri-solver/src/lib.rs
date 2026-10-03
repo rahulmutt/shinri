@@ -1490,6 +1490,8 @@ impl Solver {
                 // the model is not a genuine witness, so downgrade to a SOUND `Unknown`
                 // rather than report a wrong SAT. Only runs on the string path and
                 // only over fully string-valued atoms (no overhead elsewhere).
+                // Only the string theory sets the strict flag, so it implies the string path.
+                debug_assert!(!strict_gate || on_string_path);
                 if on_string_path && !self.string_model_satisfies(&lowered, &model, strict_gate) {
                     self.last_fence = Some("str-model-rejected");
                     return SolveOutcome::Unknown;

@@ -1,4 +1,5 @@
-//! Default model construction for the string theory (Task 17 + Task 19 overlay; the slice-57 rebuild is in `model_reconcile`).
+//! Default model construction for the string theory (Task 17 + Task 19
+//! overlay; the slice-57 rebuild is in `model_reconcile`).
 //!
 //! On a SAT result the solver assembles a concrete `ModelVal::String(...)` for
 //! each string-sorted term. The value of a term is assembled from its **deep
