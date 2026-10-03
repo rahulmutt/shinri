@@ -2,10 +2,13 @@
 //! string class holding several concats (an input equation's side and a
 //! minted char-peel/F-split side) or a cycle through a minted concat, the
 //! default model builder picked the wrong concat and the gate rejected the
-//! model (`unknown fence=str-model-rejected`). At `46d5fd9` every `sat` case
-//! below answered `unknown`; the slice-53 base binary answered the `len`
+//! model (`unknown fence=str-model-rejected`). At `46d5fd9` the `len =`
+//! cases below answered `unknown`; the slice-53 base binary answered the `len`
 //! cases `sat`. A model produced by the reconciliation rebuild must pass the
-//! strict gate, so `strict_gate_keeps_unevaluable_unknown` stays `unknown`.
+//! strict gate: `strict_gate_confirms_lowered_str_lt` is confirmed (lowering
+//! makes `str.<` against a constant gate-evaluable), while
+//! `strict_gate_keeps_unevaluable_unknown` (compound arithmetic the gate
+//! cannot evaluate) stays `unknown`.
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
 
@@ -184,14 +187,29 @@ fn k2_stringfuzz_translate_graft_stays_unknown() {
 
 // ── strict gate (spec §4.3, Review Focus 5) ─────────────────────────────────
 
-/// At `46d5fd9` this answers `unknown fence=str-model-rejected` (default
-/// build rejected), so the rebuild runs. The gate cannot evaluate `str.<`,
-/// so the strict gate must keep it `unknown` (z3: sat).
+/// The default build is rejected, so the rebuild runs and the strict gate
+/// applies. Lowering turns `str.<` against a constant into atoms the gate can
+/// evaluate, so the strict gate confirms the rebuilt model (z3: sat).
+#[test]
+fn strict_gate_confirms_lowered_str_lt() {
+    let x = sat_x(
+        "(assert (= (str.len x) 3))(assert (str.prefixof \"cd\" x))(assert (str.< x \"zzz\"))",
+    );
+    assert!(x.starts_with("cd") && x.chars().count() == 3, "x = {x:?}");
+    assert!(x.as_str() < "zzz", "x = {x:?}");
+}
+
+/// The rebuild runs (as above), but the gate cannot evaluate the compound
+/// arithmetic `(- (str.len x) (str.len y))`. Under the strict gate the
+/// rebuilt model is not confirmed, so the answer stays `unknown` (z3: sat).
+/// With the gate forced non-strict this script answers `sat`, so the strict
+/// gate is what keeps it `unknown`.
 #[test]
 fn strict_gate_keeps_unevaluable_unknown() {
     assert_eq!(
         verdict(
-            "(assert (= (str.len x) 3))(assert (str.prefixof \"cd\" x))(assert (str.< x \"zzz\"))"
+            "(assert (= (str.len x) 3))(assert (str.prefixof \"cd\" x))\
+             (assert (<= (- (str.len x) (str.len y)) 1))"
         ),
         "unknown"
     );
