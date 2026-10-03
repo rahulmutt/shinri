@@ -2795,6 +2795,145 @@ fn differential_qfs_model_reconcile() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Member-prefix differential oracle (slice 58): a membership on a variable
+// whose EUF class holds a constant-headed concat (from prefixof / suffixof /
+// a concat equation, possibly behind an `or`). Verdicts must agree with z3;
+// Sat models are z3-verified. Fresh seed — never perturb existing families'
+// seeds.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MP_N_ITERS: usize = 300;
+
+fn gen_member_prefix_body(seed: u64) -> (String, usize) {
+    let mut rng = Lcg(seed);
+    let nv = 3;
+    let mut b = String::from("(set-logic QF_SLIA)\n");
+    for k in 0..nv {
+        b.push_str(&format!("(declare-fun s{k} () String)\n"));
+    }
+    const LITS: [&str; 6] = ["a", "b", "ab", "c", "1", "cd"];
+    const RES: [&str; 6] = [
+        "(re.* (re.range \"a\" \"b\"))",
+        "(re.+ (re.range \"a\" \"b\"))",
+        "(re.* (re.range \"a\" \"d\"))",
+        "(re.++ (str.to_re \"ab\") (re.* (re.range \"a\" \"d\")))",
+        "(re.++ (str.to_re \"c\") re.all)",
+        "(re.comp (re.++ (str.to_re \"a\") re.all))",
+    ];
+    let lit = |rng: &mut Lcg| format!("\"{}\"", LITS[rng.below(LITS.len() as u64) as usize]);
+    if rng.below(3) != 0 {
+        b.push_str("(assert (= s0 s1))\n");
+    }
+    for _ in 0..1 + rng.below(2) {
+        let x = format!("s{}", rng.below(2));
+        let l = lit(&mut rng);
+        let c = match rng.below(4) {
+            0 => format!("(str.prefixof {l} {x})"),
+            1 => format!("(str.suffixof {l} {x})"),
+            2 => format!("(= {x} (str.++ {l} s2))"),
+            _ => format!("(= {x} (str.++ s2 {l}))"),
+        };
+        if rng.below(3) == 0 {
+            let alt = lit(&mut rng);
+            b.push_str(&format!("(assert (or {c} (= {x} {alt})))\n"));
+        } else {
+            b.push_str(&format!("(assert {c})\n"));
+        }
+    }
+    let m = format!(
+        "(str.in_re s{} {})",
+        rng.below(2),
+        RES[rng.below(RES.len() as u64) as usize]
+    );
+    if rng.below(3) == 0 {
+        b.push_str(&format!("(assert (not {m}))\n"));
+    } else {
+        b.push_str(&format!("(assert {m})\n"));
+    }
+    if rng.below(2) == 0 {
+        b.push_str(&format!("(assert (= (str.len s0) {}))\n", rng.below(5)));
+    }
+    (b, nv)
+}
+
+#[test]
+fn differential_qfs_member_prefix() {
+    let mut rng = Lcg(0x58_0000_0001u64);
+    let (
+        mut n_sat,
+        mut n_unsat,
+        mut n_unknown,
+        mut n_unknown_z3_unsat,
+        mut n_z3skip,
+        mut n_witness,
+    ) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
+
+    for it in 0..MP_N_ITERS {
+        let seed = rng.next();
+        let (body, nv) = gen_member_prefix_body(seed);
+        let script = format!("{body}(check-sat)\n");
+        let ours = shinri_verdict(&script);
+        let theirs = z3_verdict(&script);
+        if ours == Verdict::Unknown {
+            n_unknown += 1;
+            if theirs == Verdict::Unsat {
+                n_unknown_z3_unsat += 1;
+            }
+            continue;
+        }
+        if theirs == Verdict::Unknown {
+            n_z3skip += 1;
+            continue;
+        }
+        assert_eq!(
+            ours, theirs,
+            "MEMBER-PREFIX SOUNDNESS DISAGREEMENT (iter {it}, seed {seed}): \
+             shinri={ours:?} z3={theirs:?}\nReproduce:\n{script}"
+        );
+        match ours {
+            Verdict::Sat => {
+                n_sat += 1;
+                let names: Vec<String> = (0..nv).map(|k| format!("s{k}")).collect();
+                let get = format!("{script}(get-value ({}))\n", names.join(" "));
+                let lines = shinri_lines(&get);
+                if let Some(resp) = lines.get(1) {
+                    let model = parse_string_values(resp);
+                    if !model.is_empty() {
+                        let w = z3_with_model(&body, &model);
+                        assert_eq!(
+                            w,
+                            Verdict::Sat,
+                            "WITNESS FAILURE (iter {it}, seed {seed}): model {model:?}\n{body}"
+                        );
+                        n_witness += 1;
+                    }
+                }
+            }
+            Verdict::Unsat => n_unsat += 1,
+            Verdict::Unknown => unreachable!(),
+        }
+    }
+
+    println!(
+        "differential_qfs_member_prefix: {MP_N_ITERS} iters — {n_sat} sat / {n_unsat} unsat / \
+         {n_unknown} shinri-unknown ({n_unknown_z3_unsat} with z3 unsat) / {n_z3skip} z3-unknown; \
+         {n_witness} witnesses; 0 disagreements"
+    );
+    assert!(
+        n_sat > 0,
+        "member-prefix family produced zero SAT instances"
+    );
+    assert!(
+        n_unsat > 0,
+        "member-prefix family produced zero UNSAT instances"
+    );
+    assert!(
+        n_witness > 0,
+        "no witnesses checked — model path not exercised"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Targeted explicit cases
 // ─────────────────────────────────────────────────────────────────────────────
 
