@@ -2670,6 +2670,8 @@ fn qfs_str_order_const_word_matches_z3() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MR_N_ITERS: usize = 300;
+/// `unknown`-where-z3-`sat` count at `46d5fd9` (slice-57 plan, Task 1 Step 4).
+const MR_BEFORE_UNKNOWN_Z3_SAT: usize = 48;
 
 fn gen_model_reconcile_body(seed: u64) -> (String, usize) {
     let mut rng = Lcg(seed);
@@ -2784,6 +2786,11 @@ fn differential_qfs_model_reconcile() {
     assert!(
         n_witness > 0,
         "no witnesses checked — model path not exercised"
+    );
+    assert!(
+        n_unknown_z3_sat < MR_BEFORE_UNKNOWN_Z3_SAT,
+        "unknown-where-z3-sat {n_unknown_z3_sat} not below the slice-57 base \
+         {MR_BEFORE_UNKNOWN_Z3_SAT}"
     );
 }
 
