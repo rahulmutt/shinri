@@ -30,7 +30,7 @@ forced into `{true, false}`. On the bench (QF_UF, QF_DT, QF_UFLIA, QF_UFLRA,
   within 0.2 s per row). On the 691 rows that are `correct` on both runs
   and took over 5 s on the base, the after run's summed wall time is 7.2 Ks
   vs 6.7 Ks (+7%), consistent with a slower machine during the second run.
-- No changed row can trigger the new code path: a grep of the 88 files listed in
+- No changed row can trigger the new code path: a grep of the 89 files listed in
   `target/slice56-after/changed.txt` found 0 `declare-fun` with a Bool argument and
   0 `(<field> Bool)` datatype fields (regexes: `\(declare-fun[^)]*\([^)]*\bBool\b[^)]*\)` (declare-fun with a Bool argument) and `\([A-Za-z0-9_|!$@.-]+ Bool\)` (datatype field)). Across the corpus only 105
   QF_UF files declare a Bool-argument function (single-line-regex heuristic; 0 in
@@ -187,7 +187,7 @@ Raw re-run lines are kept in the session scratchpad, not committed.
    The slice-54→55 flips skewed 42/19 the other way (`timeout → correct`
    versus `correct → timeout`), so the slice-55 base was itself a fast run. No
    changed row can trigger the new code path (0 Bool-argument `declare-fun`, 0
-   `(<field> Bool)` fields in the 88 changed files; 105 QF_UF files corpus-wide
+   `(<field> Bool)` fields in the 89 changed files; 105 QF_UF files corpus-wide
    declare one, single-line-regex heuristic), which supports load, not the fix.
 6. **Probe-only coverage.** Review Focus 1–2 (QF_SLIA, QF_UFBV headers) are
    probe-covered only, not benched.
@@ -246,7 +246,7 @@ Ordered. Items 2–3 are from slice 55; the rest are carried.
   they were already `correct`. The slice's evidence is the probes and the
   oracle. A wider corpus (e.g. QF_AUFLIA / UFDT logics) would be needed for
   a bench-level signal. The same holds for slice 56: no changed row declares a
-  Bool-argument function (0 of 88; 105 QF_UF files corpus-wide, 0 in QF_DT,
+  Bool-argument function (0 of 89; 105 QF_UF files corpus-wide, 0 in QF_DT,
   QF_UFLIA, QF_UFLRA, single-line-regex heuristic).
 
 From spec §9:

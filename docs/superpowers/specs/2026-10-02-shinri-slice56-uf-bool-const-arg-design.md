@@ -256,7 +256,7 @@ Full evidence:
   `timeout → correct`); every row reproduces the base answer in the 3×
   re-runs and a serial timing of 8 of them shows equal speed on both
   binaries, so it is classed as bench-time load. No changed row can trigger
-  the new code path (0 of 88 declare a Bool-argument function or `(<field> Bool)`
+  the new code path (0 of 89 declare a Bool-argument function or `(<field> Bool)`
   field; 105 QF_UF files corpus-wide, single-line-regex heuristic).
 - QF_SLIA and QF_UFBV header cases (Review Focus 1–2) are probe-covered
   only, not benched.
