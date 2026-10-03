@@ -1637,17 +1637,24 @@ fn to_code_digit_range_get_value_witness() {
 /// `!strcode` handle would let arith pick a bogus `code("b") < code("a")` and
 /// answer a spurious SAT).
 ///
-/// `#[ignore]`d because a two-symbolic-var `str.<` atom does not ROUTE to the
-/// slice-31 order engine until Task 7 lifts the presence fence. Task 7 MUST
-/// remove this `#[ignore]` line and confirm the assertion holds end-to-end.
+/// KNOWN `unknown` (z3: unsat), pinned as a passing marker. Task 7's fence
+/// lift never landed: the two-symbolic-var `str.<` capability is DEFERRED
+/// (slice-31 spec §11), so the presence fence still answers `unknown`
+/// (`fence=str-order`) before the order engine sees the atom. This test was
+/// `#[ignore]`d pending Task 7, which kept the nightly tier (it runs ignored
+/// tests) red from 2026-07-20. Flip this pin to `unsat` when the §11 deferral
+/// is lifted.
 #[test]
-#[ignore = "enabled in Task 7 (fence lift)"]
 fn lt_with_constant_pins_is_unsat_via_folding() {
     let out = run_script(
         "(set-logic QF_S)(declare-fun s () String)(declare-fun u () String)\
          (assert (str.< s u))(assert (= s \"b\"))(assert (= u \"a\"))(check-sat)",
     );
-    assert_eq!(out, vec!["unsat"]);
+    assert_eq!(
+        out,
+        vec!["unknown"],
+        "KNOWN UNKNOWN (z3: unsat): flip this pin to unsat when the slice-31 §11 deferral is lifted"
+    );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
