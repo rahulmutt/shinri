@@ -242,7 +242,7 @@ Full evidence:
 
 | # | Criterion | Result |
 | --- | --- | --- |
-| 1 | a1–a8 pass; all eight fail on `main` | PASS: RED 13 probes, 10 fail (a1–a8, rf1, rf2_without_bv) and 3 pass as expected; GREEN 15/15 (probes plus 2 unit tests) |
+| 1 | a1–a8 pass; all eight fail on `main` | PASS: RED 13 probes, 10 fail (a1–a8, rf1, rf2_ufbv_header_without_bv_term) and 3 pass as expected; GREEN 15/15 (probes plus 2 unit tests) |
 | 2 | Bench: 0 `wrong`, 0 panic, no reproducible `correct → *` loss | PASS: 0 wrong, 0 panic; 89 of 18,146 rows changed (63 `correct → timeout`, 18 `timeout → correct`, 4 `oom → timeout`, 3 `timeout → oom`, 1 `unknown:theory-refused → timeout`); all re-run 3× on both binaries, no reproducible loss |
 | 3 | Oracle: non-zero count, 0 disagreements, no `@` values | PASS: 22 discovered, 22 passed; QF_DT 0 disagreements / n_valued 393, QF_UFLIA 0 / 424, QF_UFLRA 0 / 432, 0 value disagreements |
 | 4 | `mise run ci` green, fmt clean | PASS: 1,691 run, 1,691 passed (12 slow), 7 skipped; `cargo fmt --all --check` clean |
@@ -255,6 +255,8 @@ Full evidence:
 - The bench transitions are one-sided (63 `correct → timeout` vs 18
   `timeout → correct`); every row reproduces the base answer in the 3×
   re-runs and a serial timing of 8 of them shows equal speed on both
-  binaries, so it is classed as bench-time load.
+  binaries, so it is classed as bench-time load. No changed row can trigger
+  the new code path (0 of 88 declare a Bool-argument function or `(<field> Bool)`
+  field; 105 QF_UF files corpus-wide, single-line-regex heuristic).
 - QF_SLIA and QF_UFBV header cases (Review Focus 1–2) are probe-covered
   only, not benched.

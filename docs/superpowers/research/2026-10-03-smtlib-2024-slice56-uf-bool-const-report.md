@@ -30,6 +30,11 @@ forced into `{true, false}`. On the bench (QF_UF, QF_DT, QF_UFLIA, QF_UFLRA,
   within 0.2 s per row). On the 691 rows that are `correct` on both runs
   and took over 5 s on the base, the after run's summed wall time is 7.2 Ks
   vs 6.7 Ks (+7%), consistent with a slower machine during the second run.
+- No changed row can trigger the new code path: a grep of the 88 files listed in
+  `target/slice56-after/changed.txt` found 0 `declare-fun` with a Bool argument and
+  0 `(<field> Bool)` datatype fields (regexes: `\(declare-fun[^)]*\([^)]*\bBool\b[^)]*\)` (declare-fun with a Bool argument) and `\([A-Za-z0-9_|!$@.-]+ Bool\)` (datatype field)). Across the corpus only 105
+  QF_UF files declare a Bool-argument function (single-line-regex heuristic; 0 in
+  QF_DT, QF_UFLIA and QF_UFLRA), and none of them is among the changed rows.
 
 ## Commands
 
@@ -73,7 +78,7 @@ QF_UFLIA, QF_UFLRA. (Runs are git-ignored.)
 
 | # | Criterion | Result | Evidence |
 | --- | --- | --- | --- |
-| 1 | a1–a8 pass; all eight fail on `main` | PASS | Task 1 report: RED run of `binary(slice56_probes)`: 13 discovered, 3 pass (`rf2_with_bv`, `rf3`, `rf4`), 10 fail (a1–a8, `rf1`, `rf2_without_bv`: wrong `sat`); GREEN: probes plus 2 unit tests 15/15; re-run by the controller 15/15 |
+| 1 | a1–a8 pass; all eight fail on `main` | PASS | Task 1 report: RED run of `binary(slice56_probes)`: 13 discovered, 3 pass (`rf2_ufbv_header_with_bv_term`, `rf3`, `rf4`), 10 fail (a1–a8, `rf1`, `rf2_ufbv_header_without_bv_term`: wrong `sat`); GREEN: probes plus 2 unit tests 15/15; re-run by the controller 15/15 |
 | 2 | Bench: 0 `wrong`, 0 panic, no reproducible `correct → *` loss | PASS | 0 wrong, 0 panic; 89 changed rows, 63 `correct → timeout`, none reproducible (re-run 3× on both binaries; *Verdict comparison*) |
 | 3 | Oracle: non-zero count, 0 disagreements, no `@` values | PASS | 22 tests discovered, 22 passed; QF_DT 0 disagreements / 0 value disagreements / n_valued 393; QF_UFLIA 0/0/424; QF_UFLRA 0/0/432 (no `n_abstract` any more; an `@` value is now a disagreement) |
 | 4 | `mise run ci` green, fmt clean | PASS | 1,691 tests run, 1,691 passed (12 slow), 7 skipped; `cargo fmt --all --check` clean |
@@ -179,6 +184,11 @@ Raw re-run lines are kept in the session scratchpad, not committed.
    the Ruling 3 re-run. The flips here are more one-sided (63 to 18) than
    slice 55's; the serial timing in the *Headline* shows equal speed per
    row on the two binaries.
+   The slice-54→55 flips skewed 42/19 the other way (`timeout → correct`
+   versus `correct → timeout`), so the slice-55 base was itself a fast run. No
+   changed row can trigger the new code path (0 Bool-argument `declare-fun`, 0
+   `(<field> Bool)` fields in the 88 changed files; 105 QF_UF files corpus-wide
+   declare one, single-line-regex heuristic), which supports load, not the fix.
 6. **Probe-only coverage.** Review Focus 1–2 (QF_SLIA, QF_UFBV headers) are
    probe-covered only, not benched.
 
@@ -232,10 +242,12 @@ Ordered. Items 2–3 are from slice 55; the rest are carried.
   Either record the binary's md5 as the identity for `--solver` runs, or
   launch long runs detached (as slice 53's ruling R1 did) so the 2 h tool
   limit never applies.
-- **No corpus row exercises the fix.** Only 5 local files mint a proxy, and
+- **No corpus row exercises the fix (slice 54).** Only 5 local files mint a proxy, and
   they were already `correct`. The slice's evidence is the probes and the
   oracle. A wider corpus (e.g. QF_AUFLIA / UFDT logics) would be needed for
-  a bench-level signal.
+  a bench-level signal. The same holds for slice 56: no changed row declares a
+  Bool-argument function (0 of 88; 105 QF_UF files corpus-wide, 0 in QF_DT,
+  QF_UFLIA, QF_UFLRA, single-line-regex heuristic).
 
 From spec §9:
 
@@ -376,12 +388,6 @@ From spec §10 (slice 52):
 Test-tier note (carried): the unfiltered oracle suite is dominated by
 `fp_oracle differential_qf_fp_rem` (~25–33 min), over the 5 min rule; it is an
 existing test, not part of this slice.
-
-
-Review Focus 1-2 of the spec (QF_SLIA and QF_UFBV headers) are probe-covered
-only (`tests/slice56_probes.rs`: `rf1`, `rf2_with_bv`, `rf2_without_bv`); they
-were not benched, because the bench covers only QF_UF, QF_DT, QF_UFLIA and
-QF_UFLRA.
 
 ## References
 

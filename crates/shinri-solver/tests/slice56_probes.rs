@@ -155,14 +155,15 @@ fn rf1_string_logic_header() {
     assert_ne!(v, "sat");
 }
 
-/// Review Focus 2a. HEAD: sat; z3: unsat. No BV term, so no fence.
+/// Review Focus 2a. HEAD: sat; z3: unsat. No BV term, so no fence applies and
+/// the answer must be exactly `unsat`.
 #[test]
 fn rf2_ufbv_header_without_bv_term() {
     let v = verdict(
         "(set-logic QF_UFBV)(declare-fun q () Bool)(declare-fun P (Bool) Bool)",
         A1,
     );
-    assert_ne!(v, "sat");
+    assert_eq!(v, "unsat");
 }
 
 /// Review Focus 2b. HEAD: unknown (fenced); z3: unsat. Must not become sat.
