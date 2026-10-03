@@ -1354,6 +1354,9 @@ impl Solver {
             SolveResult::Unsat { .. } => SolveOutcome::Unsat,
             SolveResult::Sat => {
                 let mb = sat.theory_mut().build_model();
+                // Slice 57: a string model from the reconciliation rebuild must
+                // pass the strict gate (every assertion definitely true).
+                let strict_gate = mb.strict_check_required();
                 let mut model = Model::default();
                 // Values of word_norm-internal symbols, keyed by the internal
                 // term — surfaced to users only through the eliminated-ite
@@ -1487,7 +1490,9 @@ impl Solver {
                 // the model is not a genuine witness, so downgrade to a SOUND `Unknown`
                 // rather than report a wrong SAT. Only runs on the string path and
                 // only over fully string-valued atoms (no overhead elsewhere).
-                if on_string_path && !self.string_model_satisfies(&lowered, &model) {
+                // Only the string theory sets the strict flag, so it implies the string path.
+                debug_assert!(!strict_gate || on_string_path);
+                if on_string_path && !self.string_model_satisfies(&lowered, &model, strict_gate) {
                     self.last_fence = Some("str-model-rejected");
                     return SolveOutcome::Unknown;
                 }
@@ -1517,10 +1522,20 @@ impl Solver {
     /// `None` (a term the model cannot fully evaluate — a missing string value, an
     /// opaque predicate) is treated as satisfied. This can only MISS a violation,
     /// never fabricate one, so a genuine SAT is never turned into a spurious Unknown.
-    fn string_model_satisfies(&self, assertions: &[TermId], model: &Model) -> bool {
+    ///
+    /// Slice 57: with `strict` set (the string theory adopted its
+    /// reconciliation rebuild, `ModelBuilder::strict_check_required`), `None`
+    /// also rejects. The rebuild changes string contents the engine did not
+    /// derive, so an assertion the gate cannot evaluate (`str.<`, compound
+    /// arithmetic, a UF application) could be violated unseen; a rebuilt model
+    /// yields `sat` only when every assertion is positively confirmed.
+    fn string_model_satisfies(&self, assertions: &[TermId], model: &Model, strict: bool) -> bool {
         for &a in assertions {
-            if self.eval_bool(a, model) == Some(false) {
-                return false;
+            match self.eval_bool(a, model) {
+                Some(true) => {}
+                Some(false) => return false,
+                None if strict => return false,
+                None => {}
             }
         }
         true
@@ -3731,7 +3746,7 @@ mod slice52_gate_tests {
         let iff = s.eq(e1, e2);
         let assertion = s.app(Op::Builtin(BuiltinOp::Not), &[iff]);
         let m = model(&[(x, ""), (y, "E")]);
-        assert!(!s.string_model_satisfies(&[assertion], &m));
+        assert!(!s.string_model_satisfies(&[assertion], &m, false));
     }
 
     #[test]
@@ -3752,5 +3767,30 @@ mod slice52_gate_tests {
         let m = model(&[(x, "")]); // y un-valued
         let iff = s.eq(e1, e2);
         assert_eq!(s.eval_bool(iff, &m), None);
+    }
+
+    /// Slice 57: an assertion the gate cannot evaluate (`str.<`) passes the
+    /// 3-valued gate but fails the strict one.
+    #[test]
+    fn strict_gate_rejects_unevaluable_assertion() {
+        let mut s = Solver::new();
+        let (x, y, _e1, _e2) = noetzli_atoms(&mut s);
+        let lt = s.app(Op::Builtin(BuiltinOp::StrLt), &[x, y]);
+        let m = model(&[(x, "a"), (y, "b")]);
+        assert_eq!(s.eval_bool(lt, &m), None);
+        assert!(s.string_model_satisfies(&[lt], &m, false));
+        assert!(!s.string_model_satisfies(&[lt], &m, true));
+    }
+
+    /// Slice 57: the strict gate accepts a set that evaluates to all-true.
+    #[test]
+    fn strict_gate_accepts_all_true() {
+        let mut s = Solver::new();
+        let (x, y, e1, e2) = noetzli_atoms(&mut s);
+        // e1 = ("A" = y ++ x), e2 = ("A" = x ++ y): both true for x="", y="A".
+        let m = model(&[(x, ""), (y, "A")]);
+        assert!(s.string_model_satisfies(&[e1, e2], &m, true));
+        let not_e1 = s.app(Op::Builtin(BuiltinOp::Not), &[e1]);
+        assert!(!s.string_model_satisfies(&[not_e1], &m, true));
     }
 }
