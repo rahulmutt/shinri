@@ -172,35 +172,9 @@ fn u2_suffix_with_zero_len_unsat() {
     );
 }
 
-// ── known-unknown pins (queued engine-side reconciliation, spec §9 item 1) ──
-
-/// `regex-050-translate-rotate-fuzz.smt2`; z3: unsat. Needs the engine to
-/// derive the conflict between `x`'s constant prefix and the membership
-/// (spec §9 item 1); the model-side rebuild cannot produce `unsat`.
-#[test]
-fn k1_stringfuzz_translate_rotate_stays_unknown() {
-    assert_eq!(
-        verdict(
-            "(assert (= (str.len x) 3))(assert (= x y))\
-             (assert (str.in_re y (re.+ (re.range \"a\" \"b\"))))(assert (str.prefixof \"\\\\\" x))"
-        ),
-        "unknown",
-        "queued: engine-side reconciliation (slice-57 spec §9 item 1)"
-    );
-}
-
-/// `regex-050-translate-graft-translate.smt2`; z3: unsat. Same queue item.
-#[test]
-fn k2_stringfuzz_translate_graft_stays_unknown() {
-    assert_eq!(
-        verdict(
-            "(assert (= 2 (str.len x)))(assert (= x y))\
-             (assert (str.in_re y (re.* (re.range \"a\" \"b\"))))(assert (str.prefixof \"1\" x))"
-        ),
-        "unknown",
-        "queued: engine-side reconciliation (slice-57 spec §9 item 1)"
-    );
-}
+// `k1`/`k2` (translate-rotate / translate-graft, z3 unsat) moved to
+// `slice58_probes::m1_translate_rotate` / `m2_translate_graft`, which assert
+// `unsat` (slice-58 spec §7.3).
 
 // ── strict gate (spec §4.3, Review Focus 5) ─────────────────────────────────
 
