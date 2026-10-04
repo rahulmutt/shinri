@@ -129,6 +129,10 @@ pub struct Row {
     /// the field existed and on rows that saw no stdout error.
     pub first_error: Option<String>,
     pub fence: Option<String>,
+    /// Slice 59: the solver's `detail=` tag behind a `str-model-rejected`
+    /// (`<mode>:<kind>@<rebuild>`); `None` on other rows and on rows written
+    /// before the field existed.
+    pub fence_detail: Option<String>,
     pub stderr_head: String,
     pub verdict: Verdict,
     pub oracle: Option<OracleAnswers>,
@@ -159,6 +163,10 @@ impl Row {
             Some(f) => json::escape(f),
             None => "null".to_string(),
         };
+        let fence_detail = match &self.fence_detail {
+            Some(d) => json::escape(d),
+            None => "null".to_string(),
+        };
         let first_error = match &self.first_error {
             Some(e) => json::escape(e),
             None => "null".to_string(),
@@ -172,7 +180,7 @@ impl Row {
             None => "null".to_string(),
         };
         format!(
-            "{{\"path\":{},\"logic\":{},\"bytes\":{},\"status\":{},\"rc\":{},\"wall_ms\":{},\"answers\":{},\"stdout_errors\":{},\"first_error\":{},\"fence\":{},\"stderr_head\":{},\"verdict\":{},\"oracle\":{}}}",
+            "{{\"path\":{},\"logic\":{},\"bytes\":{},\"status\":{},\"rc\":{},\"wall_ms\":{},\"answers\":{},\"stdout_errors\":{},\"first_error\":{},\"fence\":{},\"fence_detail\":{},\"stderr_head\":{},\"verdict\":{},\"oracle\":{}}}",
             json::escape(&self.path),
             json::escape(&self.logic),
             self.bytes,
@@ -183,6 +191,7 @@ impl Row {
             self.stdout_errors,
             first_error,
             fence,
+            fence_detail,
             json::escape(&self.stderr_head),
             json::escape(&self.verdict.key()),
             oracle,
@@ -246,6 +255,11 @@ impl Row {
             Some(JsonVal::Str(s)) => Some(s),
             _ => None,
         };
+        // Absent in files written before the field existed (slice 59).
+        let fence_detail = match get("fence_detail") {
+            Some(JsonVal::Str(s)) => Some(s),
+            _ => None,
+        };
         let stderr_head = match get("stderr_head") {
             Some(JsonVal::Str(s)) => s,
             _ => String::new(),
@@ -286,6 +300,7 @@ impl Row {
             stdout_errors,
             first_error,
             fence,
+            fence_detail,
             stderr_head,
             verdict,
             oracle,
@@ -424,6 +439,7 @@ mod tests {
             stdout_errors: 3,
             first_error: Some("(error \"sort error: Arity { expected: 2, found: 64 }\")".into()),
             fence: None,
+            fence_detail: Some("violated:word-eq@adopted".into()),
             stderr_head: "line1\nline2\\".into(),
             verdict: Verdict::Unverified,
             oracle: Some(OracleAnswers {
@@ -444,6 +460,26 @@ mod tests {
         assert_eq!(back.answers, r.answers);
         assert_eq!(back.stdout_errors, r.stdout_errors);
         assert_eq!(back.first_error, r.first_error);
+        assert_eq!(back.fence_detail, r.fence_detail);
+    }
+
+    #[test]
+    fn older_rows_have_no_fence_detail() {
+        // Review Focus 5: a line written before slice 59 still parses.
+        let older = r#"{"path":"a.smt2","logic":"QF_S","bytes":7,"status":null,"rc":0,"wall_ms":12,"answers":["unknown"],"fence":"str-model-rejected","stderr_head":"","verdict":"unknown:str-model-rejected","oracle":null}"#;
+        let back = Row::from_json(older).expect("older rows stay readable");
+        assert_eq!(back.fence.as_deref(), Some("str-model-rejected"));
+        assert_eq!(back.fence_detail, None);
+    }
+
+    #[test]
+    fn fence_detail_is_written_after_fence() {
+        let json = row().to_json();
+        let f = json.find("\"fence\":").unwrap();
+        let d = json
+            .find("\"fence_detail\":\"violated:word-eq@adopted\"")
+            .unwrap();
+        assert!(f < d);
     }
 
     #[test]

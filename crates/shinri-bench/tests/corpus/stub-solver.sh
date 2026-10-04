@@ -11,8 +11,9 @@ while [ $# -gt 1 ]; do
 done
 f="$1"
 case "$(basename "$f")" in
-  sat.smt2)   echo sat;   echo "stats: cmd=check-sat wall_ms=1 outcome=sat fence=-" >&2 ;;
-  unsat.smt2) echo unsat; echo "stats: cmd=check-sat wall_ms=1 outcome=unsat fence=-" >&2 ;;
+  sat.smt2)   echo sat;   echo "stats: cmd=check-sat wall_ms=1 outcome=sat fence=- detail=-" >&2 ;;
+  unsat.smt2) echo unsat; echo "stats: cmd=check-sat wall_ms=1 outcome=unsat fence=- detail=-" >&2 ;;
+  rejected.smt2) echo unknown; echo "stats: cmd=check-sat wall_ms=1 outcome=unknown fence=str-model-rejected detail=violated:word-eq@not-needed" >&2 ;;
   lies.smt2)  echo sat ;;
   slow.smt2)  sleep 30; echo sat ;;
   hog.smt2)   echo "memory allocation of 4000000000 bytes failed" >&2; kill -ABRT $$ ;;

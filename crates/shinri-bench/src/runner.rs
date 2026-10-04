@@ -51,6 +51,7 @@ pub fn run_one(inst: &Instance, cfg: &RunConfig) -> Row {
 
     let (answers, stdout_errors, first_error) = parse_answers(&exec.stdout);
     let fence = parse_stats_fence(&exec.stderr);
+    let fence_detail = parse_stats_detail(&exec.stderr);
     let mut stderr_head = strip_stats(&exec.stderr, STDERR_HEAD_BYTES);
 
     let observe = |oracle: Option<&OracleAnswers>| -> Verdict {
@@ -107,6 +108,7 @@ pub fn run_one(inst: &Instance, cfg: &RunConfig) -> Row {
         stdout_errors,
         first_error,
         fence,
+        fence_detail,
         stderr_head,
         verdict,
         oracle,
@@ -126,6 +128,7 @@ fn bare_row(inst: &Instance, verdict: Verdict) -> Row {
         stdout_errors: 0,
         first_error: None,
         fence: None,
+        fence_detail: None,
         stderr_head: String::new(),
         verdict,
         oracle: None,
@@ -195,13 +198,24 @@ pub fn run_all(
 
 /// The `fence=` tag of the last `stats:` line, or `None` for `-` / absent.
 pub fn parse_stats_fence(stderr: &str) -> Option<String> {
+    stats_field(stderr, "fence=")
+}
+
+/// The `detail=` tag of the last `stats:` line (slice 59), or `None` for `-`
+/// / absent (a solver older than slice 59 prints no `detail=` field).
+pub fn parse_stats_detail(stderr: &str) -> Option<String> {
+    stats_field(stderr, "detail=")
+}
+
+/// The value of `key` on the last `stats:` line, or `None` for `-` / absent.
+fn stats_field(stderr: &str, key: &str) -> Option<String> {
     let last = stderr
         .lines()
         .rev()
         .find(|line| line.trim_start().starts_with("stats:"))?;
     let tag = last
         .split_whitespace()
-        .find_map(|field| field.strip_prefix("fence="))?;
+        .find_map(|field| field.strip_prefix(key))?;
     if tag == "-" {
         None
     } else {
@@ -332,6 +346,28 @@ mod tests {
             "unexpected verdict: {:?}",
             row.verdict
         );
+    }
+
+    #[test]
+    fn detail_from_last_stats_line() {
+        let two = "stats: cmd=check-sat wall_ms=3 outcome=unknown fence=str-model-rejected detail=violated:word-eq@adopted\n\
+                   stats: cmd=check-sat wall_ms=1 outcome=unknown fence=str-model-rejected detail=unevaluable:str-pred@not-needed\n";
+        assert_eq!(
+            parse_stats_detail(two),
+            Some("unevaluable:str-pred@not-needed".into())
+        );
+        assert_eq!(
+            parse_stats_detail("stats: cmd=check-sat wall_ms=3 outcome=sat fence=- detail=-\n"),
+            None
+        );
+        // Review Focus 4: an older solver prints no detail field.
+        assert_eq!(
+            parse_stats_detail(
+                "stats: cmd=check-sat wall_ms=3 outcome=unknown fence=str-model-rejected\n"
+            ),
+            None
+        );
+        assert_eq!(parse_stats_detail("junk\n"), None);
     }
 
     #[test]

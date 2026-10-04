@@ -1,4 +1,4 @@
-//! The runner end-to-end over a six-file mini-corpus and a stub solver.
+//! The runner end-to-end over a seven-file mini-corpus and a stub solver.
 use shinri_bench::instance::walk;
 use shinri_bench::oracle::Oracle;
 use shinri_bench::process::{tools_available, Limits};
@@ -8,7 +8,7 @@ use shinri_bench::verdict::Verdict;
 use std::path::Path;
 
 #[test]
-fn six_verdicts_from_the_stub_solver() {
+fn seven_verdicts_from_the_stub_solver() {
     if let Err(e) = tools_available() {
         eprintln!("skipping: {e}");
         return;
@@ -16,7 +16,7 @@ fn six_verdicts_from_the_stub_solver() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/corpus");
     let stub = corpus.join("stub-solver.sh");
     let insts = walk(&corpus, &["QF_T".into()]).unwrap();
-    assert_eq!(insts.len(), 6);
+    assert_eq!(insts.len(), 7);
     let out = std::env::temp_dir().join(format!("shinri-bench-e2e-{}.jsonl", std::process::id()));
     let _ = std::fs::remove_file(&out);
     let fx = Fixture {
@@ -59,9 +59,9 @@ fn six_verdicts_from_the_stub_solver() {
         "pool did not overlap or kill: {:?}",
         t0.elapsed()
     );
-    assert_eq!(seen_progress.len(), 6);
-    assert_eq!(seen_progress[5].0, 6);
-    assert!(seen_progress.iter().all(|(_, total, _)| *total == 6));
+    assert_eq!(seen_progress.len(), 7);
+    assert_eq!(seen_progress[6].0, 7);
+    assert!(seen_progress.iter().all(|(_, total, _)| *total == 7));
     let (_, rows) = read_all(&out).unwrap();
     let by: std::collections::HashMap<_, _> = rows
         .iter()
@@ -73,13 +73,29 @@ fn six_verdicts_from_the_stub_solver() {
     assert_eq!(by["QF_T/slow.smt2"], Verdict::Timeout);
     assert_eq!(by["QF_T/hog.smt2"], Verdict::Oom);
     assert_eq!(by["QF_T/crash.smt2"], Verdict::Panic);
+    assert_eq!(
+        by["QF_T/rejected.smt2"],
+        Verdict::Unknown("str-model-rejected".into())
+    );
+    let detail = |p: &str| {
+        rows.iter()
+            .find(|r| r.path == p)
+            .unwrap()
+            .fence_detail
+            .clone()
+    };
+    assert_eq!(
+        detail("QF_T/rejected.smt2").as_deref(),
+        Some("violated:word-eq@not-needed")
+    );
+    assert_eq!(detail("QF_T/sat.smt2"), None);
     let lies = rows.iter().find(|r| r.path == "QF_T/lies.smt2").unwrap();
     assert_eq!(
         lies.oracle.as_ref().unwrap().z3,
         Some(shinri_bench::verdict::Answer::Sat)
     );
-    // Resume: a second open reports all six as done.
+    // Resume: a second open reports all seven as done.
     let (_, seen) = ResultsFile::open(&out, &fx).unwrap();
-    assert_eq!(seen.len(), 6);
+    assert_eq!(seen.len(), 7);
     std::fs::remove_file(out).unwrap();
 }
