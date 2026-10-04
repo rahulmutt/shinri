@@ -139,18 +139,14 @@ fn len_link_split(s: &mut StrSolver, terms: &mut Context, eq_atom: TermId) -> Op
     None
 }
 
-/// The slice-21 membership pass. `Some(tcheck)` = a verdict or an emission
-/// this round; `None` = nothing to do (all memberships discharged, deduped,
-/// or skipped as unclean — the caller falls through to Sat, backstopped by
-/// the post-solve self-check).
 /// Rule G′ (slice 58): concat members of `t`'s class examined per atom.
 /// Past the cap the rest are skipped — decisiveness only, never a verdict.
 pub(crate) const MEMBER_CAP: usize = 64;
 
 /// Rule G′ (slice 58): a membership `t ∈ rex` against the concat MEMBERS of
-/// `t`'s EUF class. `normalize::rep_rank` never makes a concat the class
-/// representative, so when `t`'s class is `{x, y, "1"·z}` Rule G reads
-/// `nf(t) = [t]` and never consumes the `"1"`. Here every concat member `k`
+/// `t`'s EUF class. `normalize::rep_rank` never prefers a concat as the class
+/// representative (in practice it is usually a variable), so when `t`'s class
+/// is `{x, y, "1"·z}` Rule G reads `nf(t) = [t]` and never consumes the `"1"`. Here every concat member `k`
 /// (`k ≠ t`, at most `MEMBER_CAP`, in `known` order) is read through its
 /// cited deep NF; its leading constants are consumed through the derivative,
 /// and `∂_w rex = ∅` yields the conflict justification
@@ -223,6 +219,10 @@ pub(crate) fn member_prefix_conflict(
     None
 }
 
+/// The slice-21 membership pass. `Some(tcheck)` = a verdict or an emission
+/// this round; `None` = nothing to do (all memberships discharged, deduped,
+/// or skipped as unclean — the caller falls through to Sat, backstopped by
+/// the post-solve self-check).
 pub(crate) fn memb_check(
     s: &mut StrSolver,
     cx: &mut TheoryCtx,
@@ -304,8 +304,8 @@ pub(crate) fn memb_check(
         }
 
         // ── Rule G′ (slice 58): the class's concat members ──────────────
-        // Rule G read `t`'s own NF, whose head is the class rep; a concat
-        // member is never the rep, so its constant prefix was unseen. Runs
+        // Rule G read `t`'s own NF, whose head is the class rep (usually a
+        // variable, rarely a concat), so a member's constant prefix was unseen. Runs
         // before the leaf arms (they `continue` past the atom). Conflict
         // only: no split, no mint, no fuel; nothing found ⟹ fall through.
         if let Some(just) = member_prefix_conflict(cx.terms, cx.eq, known, t, &rex, lit) {
@@ -1668,8 +1668,12 @@ mod tests {
 
     #[test]
     fn g_prime_skips_unexpandable_member() {
-        // Review Focus 5: y ≈ s·s·u (self-referential through s ≈ y) may not
-        // converge; it is skipped, and the "1"·z member still decides.
+        // q = s·u is first in `known`, so it is the class rep and `s` reads
+        // as `q`. The candidate ssu = s·s·u then expands to q·q·u and q's own
+        // expansion resurfaces: a merge cycle, so `deep_normal_form_cited` is
+        // `None` and G′ must skip it. ssu has no constant prefix, so it could
+        // never decide anyway; the conflict can only come from the later
+        // "1"·z member. Covers the non-convergent skip, nothing else.
         let mut ctx = Context::new();
         let (y, s, u, z) = (
             var(&mut ctx, "y"),
@@ -1678,14 +1682,22 @@ mod tests {
             var(&mut ctx, "z"),
         );
         let one = ctx.mk_string_const("1");
+        let q = cat(&mut ctx, &[s, u]);
         let ssu = cat(&mut ctx, &[s, s, u]);
         let c = cat(&mut ctx, &[one, z]);
         let mut eq = EqualityEngine::default();
-        merge_by(&mut eq, y, s, lit_of(1));
-        merge_by(&mut eq, y, ssu, lit_of(2));
+        merge_by(&mut eq, s, q, lit_of(1));
+        merge_by(&mut eq, y, s, lit_of(2));
+        merge_by(&mut eq, y, ssu, lit_of(4));
         merge_by(&mut eq, y, c, lit_of(3));
-        let known = vec![y, s, ssu, u, c, z, one];
-        assert!(super::member_prefix_conflict(
+        let known = vec![q, y, s, ssu, u, c, z, one];
+        let mut ante = Vec::new();
+        assert!(
+            crate::normalize::deep_normal_form_cited(&mut ctx, &mut eq, &known, ssu, &mut ante)
+                .is_none(),
+            "the skip path needs a non-convergent candidate"
+        );
+        let just = super::member_prefix_conflict(
             &mut ctx,
             &mut eq,
             &known,
@@ -1693,6 +1705,7 @@ mod tests {
             &regex::star_range_test('a', 'b'),
             lit_of(9),
         )
-        .is_some());
+        .expect("the later \"1\"·z member decides");
+        assert!(just.contains(&EqLeaf::Asserted(lit_of(3))));
     }
 }

@@ -331,6 +331,11 @@ Rows decided by G′: 8, all QF_SLIA stringfuzz `transformed/z3str2/regex-050-*`
   criterion is on the combined count, which fell by 4.
 - 31 `unverified → correct` rows are base-run z3 oracle timeouts with
   identical shinri answers; not credited to the slice.
+- Spec §7.1 bullet 2 (Rule E emits the same split as without G′) is covered
+  only by the helper returning `None` (`g_prime_compatible_member_is_none`);
+  bullet 3 (a level > 0 conflict cites the decision literal) is covered only
+  end-to-end by `g2` plus the unit test citing a non-level-0 merge literal.
+  No `memb_check`-level test was added.
 - Ruling: criterion 3 was ruled on the combined QF_S + QF_SLIA count (PASS,
   −4). If the owner meant it per logic, it fails on QF_S (+4) and the 12-row
   `sat-budget` / `str-model-rejected` relabel needs investigation.

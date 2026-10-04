@@ -188,7 +188,7 @@ and after each reproduce their bench verdict 3/3, *noise* otherwise.
 | QF_SLIA `unverified → correct` (stringfuzz regexbig / regexlengths / regexpair / regexsmall) | 28 | noise: `sat` on both binaries 3/3; same oracle effect |
 | QF_S `sat-budget → str-model-rejected` (Jiang slog_stranger) | 8 | reproduces 3/3 (base `sat-budget`, after `str-model-rejected`); no `correct` change, informational |
 | QF_S `str-model-rejected → sat-budget` (Jiang slog_stranger 2950, 3686, 4068, 5414) | 4 | reproduces 3/3 (base `str-model-rejected`, after `sat-budget`); informational |
-| QF_SLIA `timeout → sat-budget` | 9 | not triaged (neither side is `correct`; timeout flips are bench-time resource noise) |
+| QF_SLIA `timeout → sat-budget` | 9 | not triaged (neither side `correct`) |
 
 **Rows G′ decided: 8** (the attributable group above): in each, the base
 binary answered `unknown` 3/3 and the after binary answers `unsat` 3/3. All
@@ -227,7 +227,9 @@ all both-`correct` rows (QF_S 16,057, QF_SLIA 24,873):
 | QF_SLIA | 16 / 45 ms | 5 / 15 ms |
 
 The bench medians fall for the same reason as in slice 57: the base run was
-slower throughout. The serial isolated measurement above is the evidence.
+slower throughout. The serial isolated measurement above is the evidence. Both-`correct` rows
+average about 7–10 ms each, so the serial sums are dominated by process
+start-up.
 
 ## What changed versus the spec
 
@@ -288,6 +290,11 @@ slower throughout. The serial isolated measurement above is the evidence.
     (controller), which falls 4,088 → 4,084, so it is PASS. If the owner
     meant it per logic, it fails on QF_S (966 → 970), and the 12-row
     `sat-budget` / `str-model-rejected` relabel needs investigation.
+11. **Test coverage gap against spec §7.1.** Bullet 2 (Rule E emits the same
+    split as without G′) is covered only by the helper returning `None`
+    (`g_prime_compatible_member_is_none`); bullet 3 (a level > 0 conflict
+    cites the decision literal) only end-to-end by `g2` plus the unit test
+    citing a non-level-0 merge literal. No `memb_check`-level test was added.
 
 ## Gates
 

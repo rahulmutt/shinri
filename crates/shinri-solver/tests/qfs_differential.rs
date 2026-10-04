@@ -2933,6 +2933,10 @@ fn differential_qfs_member_prefix() {
         n_witness > 0,
         "no witnesses checked — model path not exercised"
     );
+    assert_eq!(
+        n_witness, n_sat,
+        "every sat model must be z3-verified (spec §7.4)"
+    );
     assert!(
         n_unknown_z3_unsat < MP_BEFORE_UNKNOWN_Z3_UNSAT,
         "unknown-where-z3-unsat {n_unknown_z3_unsat} not below the slice-58 base \

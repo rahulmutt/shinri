@@ -1,10 +1,13 @@
 //! Slice 58 probes (spec §7.3). A membership `t ∈ R` whose EUF class holds
 //! a constant-headed concat that is not the class's normal-form
-//! representative: `normal_form` never picks a concat as rep, so Rule G saw
-//! `nf = [t]` and never consumed the constant. At `f515c00` the `m*` targets
-//! answered `unknown fence=str-model-rejected` (`m1`/`m2` measured; see the
-//! slice-58 report for `m3`/`m4`). The `g*` and `rf*` cases must stay `sat`;
-//! their witnesses are checked against every assertion.
+//! representative: `rep_rank` never prefers a concat, so the rep is usually
+//! a variable (`build_node_of` keeps the first non-constant term in `known`,
+//! which could be a concat), and Rule G saw `nf = [t]` and never consumed the
+//! constant. At `f515c00` the `m*` targets answered
+//! `unknown fence=str-model-rejected` (`m1`/`m2` measured; see the slice-58
+//! report for `m3`/`m4`). `g2` and `rf1`'s post-pop answer must be `sat`;
+//! `g1`/`g3`/`rf2`/`rf3`/`rf4` answered `unknown` at `f515c00` and only
+//! forbid `unsat`, witness-checking any `sat`.
 use shinri_parser::Parser;
 use shinri_solver::{CommandResponse, Solver};
 
@@ -149,7 +152,10 @@ fn m4_negative_polarity() {
 
 // ── sound-direction guards (spec §7.3) ───────────────────────────────────────
 
-/// Non-empty derivative ⟹ no conflict. At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids `unsat` and checks any `sat` witness.
+/// Non-empty derivative ⟹ no conflict.
+///
+/// At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids
+/// `unsat` and checks any `sat` witness.
 #[test]
 fn g1_compatible_prefix() {
     if let Some(x) = not_unsat_x(
@@ -174,7 +180,10 @@ fn g2_conditional_member() {
     assert_eq!(x, "ab");
 }
 
-/// A consistent minted `"1" ++ !strk` member ⟹ no conflict. At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids `unsat` and checks any `sat` witness.
+/// A consistent minted `"1" ++ !strk` member ⟹ no conflict.
+///
+/// At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids
+/// `unsat` and checks any `sat` witness.
 #[test]
 fn g3_minted_member_other_branch() {
     if let Some(x) = not_unsat_x(
@@ -203,7 +212,10 @@ fn rf1_member_popped_with_scope() {
     assert_eq!(out, vec!["unsat".to_string(), "sat".to_string()]);
 }
 
-/// RF2: `prefixof ""` mints a concat whose NF drops `""` — nothing to consume. At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids `unsat` and checks any `sat` witness.
+/// RF2: `prefixof ""` mints a concat whose NF drops `""` — nothing to consume.
+///
+/// At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids
+/// `unsat` and checks any `sat` witness.
 #[test]
 fn rf2_empty_prefix_no_conflict() {
     if let Some(x) = not_unsat_x(
@@ -217,7 +229,10 @@ fn rf2_empty_prefix_no_conflict() {
     }
 }
 
-/// RF3: code points above ASCII, inside the range ⟹ no conflict. At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids `unsat` and checks any `sat` witness.
+/// RF3: code points above ASCII, inside the range ⟹ no conflict.
+///
+/// At f515c00 this answers `unknown` (fence=str-model-rejected); the guard only forbids
+/// `unsat` and checks any `sat` witness.
 #[test]
 fn rf3_non_ascii_prefix_in_range() {
     if let Some(x) = not_unsat_x(
@@ -231,7 +246,10 @@ fn rf3_non_ascii_prefix_in_range() {
     }
 }
 
-/// RF4: the membership's string side is itself a concat. At f515c00 this answers `unknown` (fence=sat-budget); the guard only forbids `unsat` and checks any `sat` witness.
+/// RF4: the membership's string side is itself a concat.
+///
+/// At f515c00 this answers `unknown` (fence=sat-budget); the guard only forbids
+/// `unsat` and checks any `sat` witness.
 #[test]
 fn rf4_concat_membership_side() {
     if let Some(x) = not_unsat_x(
