@@ -304,7 +304,7 @@ Full evidence:
 | --- | --- | --- |
 | 1 | 0 `* → wrong`; 0 wrong answers in triage | PASS: 0 `wrong` rows in either run (103,335 rows each), 0 wrong answers in 306 triage runs; no changed row ends `unverified`, so the z3 check has 0 rows and 0 disagreements |
 | 2 | `translate-rotate-fuzz`, `translate-graft-translate` answer `unsat` | PASS: both `str-model-rejected → correct`, base `unknown` 3/3, after `unsat` 3/3 |
-| 3 | credited `str-model-rejected` does not increase | PASS on the combined count: QF_S 966 → 970 (+4), QF_SLIA 3,122 → 3,114 (−8), combined 4,088 → 4,084 (−4); raw = credited (no row credited) |
+| 3 | credited `str-model-rejected` does not increase | PASS (combined 4,088 → 4,084, −4), read as the combined count (controller ruling); per logic QF_S 966 → 970 (+4: 8 `sat-budget → str-model-rejected` and 4 reverse, all 3/3 reproducible, all stay `unknown`), QF_SLIA 3,122 → 3,114 (−8); raw = credited (no row credited) |
 | 4 | no reproducible `correct → *` loss | PASS: 0 `correct → *` rows; net `correct` QF_S +3, QF_SLIA +36 |
 | 5 | serial timing within ±5% | PASS: QF_S 0.974 (1.07 s vs 1.04 s), QF_SLIA 1.017 (1.59 s vs 1.62 s), 150 rows each |
 | 6 | `ci` green; oracle suite non-zero, passing; §7.4 count falls | PASS: `ci` exit 0, 1735/1735 passed (6 skipped); oracle suite 808/808 passed (2 skipped); §7.4 count 69 → 47, 0 disagreements |
@@ -331,3 +331,6 @@ Rows decided by G′: 8, all QF_SLIA stringfuzz `transformed/z3str2/regex-050-*`
   criterion is on the combined count, which fell by 4.
 - 31 `unverified → correct` rows are base-run z3 oracle timeouts with
   identical shinri answers; not credited to the slice.
+- Ruling: criterion 3 was ruled on the combined QF_S + QF_SLIA count (PASS,
+  −4). If the owner meant it per logic, it fails on QF_S (+4) and the 12-row
+  `sat-budget` / `str-model-rejected` relabel needs investigation.

@@ -101,7 +101,7 @@ git-ignored.
 | --- | --- | --- | --- |
 | 1 | 0 `* → wrong`; 0 wrong answers in triage | **PASS** | 0 `wrong` rows in either run; 0 `* → wrong`; 0 wrong answers in 306 triage runs. No changed row ends `unverified`, so the z3 cross-check (§Triage) has 0 rows and 0 disagreements |
 | 2 | `translate-rotate-fuzz`, `translate-graft-translate` answer `unsat` | **PASS** | both `unknown:str-model-rejected → correct`; triage: base `unknown` 3/3, after `unsat` 3/3 |
-| 3 | credited `str-model-rejected` (QF_S + QF_SLIA) does not increase | **PASS (combined)** | raw = credited: QF_S 966 → 970 (+4), QF_SLIA 3,122 → 3,114 (−8), combined 4,088 → 4,084 (−4). The 4 `str-model-rejected → sat-budget` rows are fenced by the base 3/3, so nothing needs crediting in the base's favour; no after row gets credit either (the 8 QF_S `sat-budget → str-model-rejected` rows give `sat-budget` in the base 3/3). QF_S alone rises by 4, see *What changed versus the spec* |
+| 3 | credited `str-model-rejected` (QF_S + QF_SLIA) does not increase | **PASS (combined 4,088 → 4,084, −4), read as the combined count (controller ruling)** | Per logic: QF_S 966 → 970 (+4: 8 `sat-budget → str-model-rejected` and 4 reverse, all 3/3 reproducible, all stay `unknown`), QF_SLIA 3,122 → 3,114 (−8). Raw = credited: no row is credited, because the 8 QF_S `sat-budget → str-model-rejected` rows give `sat-budget` in the base 3/3. Read per logic, this criterion fails on QF_S, see ruling 10 in *What changed versus the spec* |
 | 4 | no reproducible `correct → *` loss | **PASS** | 0 `correct → *` rows (net `correct`: QF_S +3, QF_SLIA +36) |
 | 5 | serial timing within ±5% | **PASS** | QF_S 0.974 (1.07 s vs 1.04 s), QF_SLIA 1.017 (1.59 s vs 1.62 s), 150 rows each |
 | 6 | `ci` green; oracle suite non-zero and passing; §7.4 count strictly falls | **PASS** | `mise run ci` exit 0, nextest 1735 run / 1735 passed / 6 skipped; oracle suite (`--features oracle`) 808 run / 808 passed / 2 skipped; §7.4 count 69 → 47 with 0 disagreements |
@@ -284,6 +284,11 @@ slower throughout. The serial isolated measurement above is the evidence.
    skip and the node-cap skip is untested; `g_prime_negative_polarity` checks
    only `is_some()`.
 
+10. **Ruling: criterion 3 was ruled on the combined QF_S + QF_SLIA count**
+    (controller), which falls 4,088 → 4,084, so it is PASS. If the owner
+    meant it per logic, it fails on QF_S (966 → 970), and the 12-row
+    `sat-budget` / `str-model-rejected` relabel needs investigation.
+
 ## Gates
 
 - `mise run ci` (lint, deny, secrets, test): exit 0; nextest 1735 run /
@@ -297,29 +302,34 @@ slower throughout. The serial isolated measurement above is the evidence.
 
 ## Queued for the next slice
 
-Ordered. Items 1–3 are spec §9's; item 4 carries the rest. Slice-57's items 1
+Ordered. Items 1–3 are spec §9's, copied verbatim; the rest carries over. Slice-57's items 1
 and 6 merge into §9 item 1 (classify the `str-model-rejected` population and
 the remaining approach-2 parts), and its item 2 is §9 item 2. Its items 3–5
 and carried lists follow verbatim.
 
 1. **Classify the `str-model-rejected` population** (4,089 rows at slice 57,
-   4,084 after this slice), for example by the first violated assertion and
-   the class shape. Seeds: the five guards `g1`, `g3`, `rf2`, `rf3` (`unknown
-   fence=str-model-rejected`) and `rf4` (`unknown fence=sat-budget`), all z3
-   `sat`. This absorbs slice-57 queue items 1 and 6: the remaining
-   approach-2 parts (constant-head strip, cited deep NF on the word-equation
-   path, minted length links) have no current reproducer and wait for one
-   from the classification.
+   minus this slice's movement), for example by the first violated
+   assertion and the class shape. This absorbs slice-57 queue items 1 and 6:
+   the remaining approach-2 parts (constant-head strip, cited deep NF on the
+   word-equation path, minted length links) have no current reproducer and
+   wait for one from the classification.
 2. **Bare-E and `Not(Eq)` arm removal — possibly unblocked.**
    `translate-rotate-fuzz` was the smallest reproducer of the order
-   sensitivity that blocked it, and now answers `unsat`. Re-run the R6 probes
+   sensitivity that blocked it. Re-run the R6 probes
    (`slice33_probes::probe_c_len_zero_var`,
    `script_e2e::user_pfx_name_declared_before_any_mint_still_works`) with
    bare-E applied, in that slice.
 3. **Suffix analogue of G′** (reverse derivative over a member's constant
    tail), only if the classification shows suffix shapes.
 
-From the slice-57 report's queue, items 3–5 verbatim:
+Slice-58 annotations to items 1–2 (not part of the copied text):
+
+- Item 1: the `str-model-rejected` population is 4,084 rows after this slice
+  (4,088 in the slice-58 base run; the "4,089" above is the slice-57 figure).
+  Classification seeds: the five guards `g1`, `g3`, `rf2`, `rf3` (`unknown
+  fence=str-model-rejected`) and `rf4` (`unknown fence=sat-budget`), all z3
+  `sat`.
+- Item 2: `translate-rotate-fuzz` now answers `unsat` (G′).
 
 3. **Axiom memory measurement** (slice-53 carry).
 4. **Solver gate composes concats before reading stored values (slice 57
