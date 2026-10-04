@@ -313,4 +313,60 @@ classification re-ranks them.
 
 ## 11. Measured outcomes
 
-Filled in after the bench runs.
+Full evidence:
+`docs/superpowers/research/2026-10-04-smtlib-2024-slice59-model-rejected-classes-report.md`.
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | 0 `* → wrong`; 0 wrong answers in triage | PASS: 0 `wrong` rows in all four runs (103,335 + 2,000 rows per binary); 0 wrong answers in 582 triage runs (418 decided runs, all agree with corpus status / z3 / bench answers) |
+| 2 | verdict-neutral (every changed row a non-reproducible flip) | PASS: 74 string rows + 23 sample rows changed, all 97 triaged, 0 attributable. 59 are `unverified ↔ correct` with identical shinri answers (z3 oracle timeouts only); the rest are timeout/oom/budget flips that both binaries reproduce alike |
+| 3 | every `str-model-rejected` row has a `fence_detail`; no other row has one | PASS: 4,085 rejected rows, 0 missing, 0 stray (string run and sample) |
+| 4 | serial timing within ±5% (150 rows each: QF_S, QF_SLIA both-`correct`; `str-model-rejected`) | PASS on the pooled 3 passes: QF_S 0.964, QF_SLIA 0.973, rejected 1.018. Pass 1 QF_S was 0.932, outside the band on the *faster* side; passes 2–3 were 0.977 / 0.984 |
+| 5 | `mise run ci` green; oracle suite passes | PASS: ci exit 0, 1759 passed / 6 skipped; oracle 825 passed / 2 skipped (= slice 58's 808 + this slice's 17 new tests; ledger ruling) |
+| 6 | named classes cover ≥80%, each with a reproducer | PASS: top 3 tags cover 3,326 / 4,085 = 81.4% |
+
+Population 4,085 (QF_S 971, QF_SLIA 3,114). Mode: violated 3,974,
+unevaluable 111. Rebuild: not-needed 3,460, rejected 496, adopted 129,
+budget 0. Top classes:
+
+1. `violated:memb@not-needed`: 2,253 rows. Mostly (35/36 sampled
+   variable subjects) the membership witness search in `memb_seeds` stops at
+   `CLASS_SPLIT_CAP` and the variable keeps a default fill. Smallest
+   reproducer `regex-035-reverse-fuzz.smt2` (concat subject, unseeded
+   operand); representative `regex-010-reverse-multiply-fuzz.smt2`.
+2. `violated:bool@not-needed`: 594 rows. The failing assertion is a lowered
+   `len x = k` (40/40 sampled) where `x ∈ R` has no word of length `k`; z3
+   `unsat` 39/40. Reproducer `regex-017-graft-reverse-graft.smt2`.
+3. `violated:word-eq@rejected`: 479 rows. The word-equation rebuild was
+   rejected: constant head/tail equations that are never split (woorpje
+   `track01`), and minted members whose model lengths disagree with their
+   class. Reproducers `parikh.smt2` (smallest, `unsat`), `01_track_86`,
+   `01_track_154`.
+
+Guards: `g1` → `violated:memb@adopted` (rank 9); `rf2`, `rf3` →
+`violated:memb@not-needed` (rank 1); `g3` and `rf4` → `sat-budget` (outside
+the population; `g3` is `sat-budget` on the base binary too). Parked items:
+constant-head strip and minted length links now have reproducers. Cited deep
+NF on the word-equation path and suffix G′ stay parked. Recommended next
+slice: membership witness search past `CLASS_SPLIT_CAP` (class 1).
+
+### Deviations from this spec
+
+- §7.3's end-to-end checks live in `shinri-cli` `tests/cli.rs`
+  (`stats_line_shape_on_sat`, `stats_detail_clears_on_the_next_check_sat`),
+  not `script_e2e` (ruling R4).
+- Criterion 5's count is 825, not 808: the 17 extra tests are this slice's
+  own (ledger ruling).
+- `g3` lands at `sat-budget`, not `str-model-rejected`. It moved before
+  this slice's base, between slice-58 `e784454` and the merge `de96d28`
+  (not bisected).
+- Criterion 4's pass-1 QF_S ratio of 0.932 is outside the band on the fast
+  side; the pooled three-pass ratio is inside it.
+- Plan test expectation corrected: `tag_safe("(_ extract 7 0)")` is
+  `(__extract_7_0)`.
+- Triage ran rows 6 in parallel (each row's runs interleaved), not
+  serially. Bench paths are absolute in the main checkout (ruling R2), and
+  reports were rendered with `shinri-bench report` (ruling R8).
+- The class-shape traces also instrumented `memb_seeds` and
+  `language_empty`. That debug output was throwaway and was reverted with
+  `git checkout -- crates`.
