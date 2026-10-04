@@ -84,9 +84,17 @@ fn shinri_run(body: &str, vars: &[&str]) -> (SolveOutcome, Vec<String>) {
     (outcome, values)
 }
 
-fn z3_outcome(body: &str) -> easy_smt::Response {
+/// `timeout_s` is z3's wall-clock limit; a timeout comes back as `Unknown`.
+fn z3_outcome(body: &str, timeout_s: u32) -> easy_smt::Response {
     let mut ctx = easy_smt::ContextBuilder::new()
-        .solver("z3", ["-smt2", "-in", "-T:3"])
+        .solver(
+            "z3",
+            [
+                "-smt2".to_string(),
+                "-in".to_string(),
+                format!("-T:{timeout_s}"),
+            ],
+        )
         .build()
         .expect("failed to launch z3 — run `mise install`");
     ctx.set_logic("QF_S").expect("z3 set-logic failed");
@@ -103,7 +111,7 @@ fn z3_outcome(body: &str) -> easy_smt::Response {
             );
         }
     }
-    // z3 can time out (-T:3) on long unrelated words; that is inconclusive,
+    // z3 can time out (-T) on long unrelated words; that is inconclusive,
     // not a disagreement.
     match ctx.check() {
         Ok(r) => r,
@@ -112,13 +120,21 @@ fn z3_outcome(body: &str) -> easy_smt::Response {
     }
 }
 
-/// Checks one script. Returns shinri's verdict for the caller's tally.
-fn check(body: &str, vars: &[&str]) -> SolveOutcome {
+/// Checks one script against z3 with a `timeout_s` verdict query. Returns
+/// shinri's verdict; a z3 timeout bumps `z3_timeouts`. A shinri `unsat` that
+/// z3 cannot confirm fails, a `sat` is still covered by the witness re-check.
+fn check(body: &str, vars: &[&str], timeout_s: u32, z3_timeouts: &mut usize) -> SolveOutcome {
     let (ours, values) = shinri_run(body, vars);
-    let theirs = z3_outcome(body);
+    let theirs = z3_outcome(body, timeout_s);
+    if matches!(theirs, easy_smt::Response::Unknown) {
+        *z3_timeouts += 1;
+    }
     match (ours, theirs) {
         (SolveOutcome::Sat, easy_smt::Response::Unsat) => panic!("shinri sat, z3 unsat:\n{body}"),
         (SolveOutcome::Unsat, easy_smt::Response::Sat) => panic!("shinri unsat, z3 sat:\n{body}"),
+        (SolveOutcome::Unsat, easy_smt::Response::Unknown) => {
+            panic!("shinri unsat, z3 timed out (-T:{timeout_s}), unconfirmed:\n{body}")
+        }
         _ => {}
     }
     if ours == SolveOutcome::Sat {
@@ -128,7 +144,7 @@ fn check(body: &str, vars: &[&str]) -> SolveOutcome {
             pinned.push_str(&format!("(assert (= {v} \"{val}\"))\n"));
         }
         assert!(
-            matches!(z3_outcome(&pinned), easy_smt::Response::Sat),
+            matches!(z3_outcome(&pinned, 20), easy_smt::Response::Sat),
             "z3 rejects shinri's witness {values:?}:\n{body}"
         );
     }
@@ -196,25 +212,35 @@ fn gen(rng: &mut Lcg) -> (String, Vec<&'static str>) {
 
 #[test]
 fn head_classes_probes_agree_with_z3() {
-    assert_eq!(check(REGEX_010, &["x"]), SolveOutcome::Unsat);
-    assert_eq!(check(&shared_member_body(), &["x"]), SolveOutcome::Sat);
-    assert_eq!(check(&len_pin_body(), &["x"]), SolveOutcome::Sat);
+    let mut timeouts = 0;
+    assert_eq!(
+        check(REGEX_010, &["x"], 20, &mut timeouts),
+        SolveOutcome::Unsat
+    );
+    assert_eq!(
+        check(&shared_member_body(), &["x"], 20, &mut timeouts),
+        SolveOutcome::Sat
+    );
+    assert_eq!(
+        check(&len_pin_body(), &["x"], 20, &mut timeouts),
+        SolveOutcome::Sat
+    );
 }
 
 #[test]
 fn head_classes_generated_agree_with_z3() {
     let mut rng = Lcg(60);
-    let (mut sat, mut unsat) = (0usize, 0usize);
+    let (mut sat, mut unsat, mut z3_timeouts) = (0usize, 0usize, 0usize);
     for _ in 0..N_ITERS {
         let (body, vars) = gen(&mut rng);
-        match check(&body, &vars) {
+        match check(&body, &vars, 3, &mut z3_timeouts) {
             SolveOutcome::Sat => sat += 1,
             SolveOutcome::Unsat => unsat += 1,
             _ => {}
         }
     }
     eprintln!(
-        "head_classes_oracle: {sat} sat, {unsat} unsat, {} unknown",
+        "head_classes_oracle: {sat} sat, {unsat} unsat, {} unknown, {z3_timeouts} z3 timeouts",
         N_ITERS - sat - unsat
     );
     assert!(
