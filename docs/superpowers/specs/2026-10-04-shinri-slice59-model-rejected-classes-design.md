@@ -149,8 +149,9 @@ diagnostic only: no code reads it to choose a verdict or a model.
 
 ### 4.3 Classifier (`shinri-solver`)
 
-A reject-path function `model_reject_detail(&lowered, &model, strict) ->
-String` re-walks the assertions with the existing `eval_bool` and builds the
+A reject-path function `model_reject_detail(&lowered, &model, strict,
+rebuild) -> String` (with `rebuild = mb.rebuild_outcome()` read beside
+`strict_check_required`) re-walks the assertions with the existing `eval_bool` and builds the
 tag. It runs only after `string_model_satisfies` returned `false`, so the
 accept path is unchanged. A small `kind_of(atom)` maps a term head to §4.1's
 vocabulary; the `unevaluable` leaf search is a separate descent that stops at
