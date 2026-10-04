@@ -32,7 +32,7 @@ verdicts, and the bench shows none it caused.
   3. Class 3 is a failed word-equation model rebuild. Sub-buckets: constant
      head/tail equations that are never split (woorpje `track01`, 10/40),
      which a constant-head strip would solve; and leaf classes whose member
-     values disagree (26/40). In the traced example (`01_track_154`) the
+     values disagree (24/40). In the traced example (`01_track_154`) the
      minted concat member and the variable also disagree in length, which is
      the shape of missing minted length links. z3 says `sat` on 33 of the 40.
 - **Recommended next slice:** class 1. Make the membership witness search
@@ -282,15 +282,15 @@ Ranked tags (`target/slice59-after/classes.txt`, `classes-table.md`):
 
 | # | tag | QF_S sat / unsat / unknown | QF_SLIA sat / unsat / unknown | total | cum % | top families |
 | ---: | --- | --- | --- | ---: | ---: | --- |
-| 1 | `violated:memb@not-needed` | 290 / 310 / 93 | 0 / 0 / 1,560 | 2,253 | 55.2 | stringfuzz `generated` 1,138, Norn `HammingDistance` 326, stringfuzz `transformed` 57 |
-| 2 | `violated:bool@not-needed` | 0 / 0 / 0 | 0 / 0 / 594 | 594 | 69.7 | stringfuzz `transformed` 594 |
-| 3 | `violated:word-eq@rejected` | 157 / 4 / 86 | 0 / 0 / 232 | 479 | 81.4 | stringfuzz `transformed` 192, woorpje `track01` 157, woorpje `track03` 67 |
-| 4 | `violated:not-word-eq@not-needed` | 0 / 0 / 0 | 0 / 0 / 352 | 352 | 90.0 | stringfuzz `transformed` 352 |
-| 5 | `violated:len-arith@not-needed` | 0 / 0 / 0 | 0 / 0 / 242 | 242 | 96.0 | stringfuzz `transformed` 130, stringfuzz `generated` 74, denghang 1 |
+| 1 | `violated:memb@not-needed` | 290 / 310 / 93 | 0 / 0 / 1,560 | 2,253 | 55.2 | automatark-lu 649, stringfuzz `generated/regexbig` 493, stringfuzz `generated/regexpair` 394 |
+| 2 | `violated:bool@not-needed` | 0 / 0 / 0 | 0 / 0 / 594 | 594 | 69.7 | stringfuzz `transformed/z3str2` 594 |
+| 3 | `violated:word-eq@rejected` | 157 / 4 / 86 | 0 / 0 / 232 | 479 | 81.4 | stringfuzz `transformed/z3str2` 192, woorpje `track01` 157, woorpje `track03` 67 |
+| 4 | `violated:not-word-eq@not-needed` | 0 / 0 / 0 | 0 / 0 / 352 | 352 | 90.0 | stringfuzz `transformed/z3str2` 352 |
+| 5 | `violated:len-arith@not-needed` | 0 / 0 / 0 | 0 / 0 / 242 | 242 | 96.0 | stringfuzz `transformed/z3str2` 130, stringfuzz `generated/regexdeep` 74, denghang 38 |
 | 6 | `unevaluable:other:uf@adopted` | 0 / 0 / 0 | 0 / 0 / 111 | 111 | 98.7 | Jiang `slent` 111 |
 | 7 | `violated:not-memb@not-needed` | 0 / 0 / 0 | 0 / 0 / 19 | 19 | 99.1 | Norn `StringReplace` 12, Norn `HammingDistance` 7 |
 | 8 | `violated:bool@rejected` | 0 / 0 / 17 | 0 / 0 / 0 | 17 | 99.6 | Jiang `slog` 17 |
-| 9 | `violated:memb@adopted` | 0 / 0 / 14 | 0 / 0 / 2 | 16 | 100.0 | Jiang `slog` 14, stringfuzz `transformed` 2 |
+| 9 | `violated:memb@adopted` | 0 / 0 / 14 | 0 / 0 / 2 | 16 | 100.0 | Jiang `slog` 14, stringfuzz `transformed/z3str2` 2 |
 | 10 | `violated:not-bool@adopted` | 0 / 0 / 0 | 0 / 0 / 2 | 2 | 100.0 | Noetzli `str-pred-small-rw` 2 |
 
 Smallest reproducer per tag (bytes):
@@ -449,15 +449,16 @@ no model fix can help this reproducer. It is the smallest row, not a typical
 one.
 
 40-row sample (`class3-groups.txt`): in all 40 rows the equation's sides sit
-in one class with 2 concats. 31 have a leaf variable whose class holds a
-minted concat, 26 have leaf classes whose member values disagree, 21/19 have
-a constant head/tail on the sides, and 4 have a leaf concat cycle. z3: 33
+in one class with 2 concats. 26 have a leaf variable whose class holds a
+minted concat, 24 have leaf classes whose member values disagree, 19/21 have
+a constant head/tail on the sides, and 2 have a leaf concat cycle (rows
+counted once per feature). z3: 33
 `sat`, 3 `unsat`, 4 `timeout`. Groups:
 
 | group | rows | example |
 | --- | ---: | --- |
 | woorpje `track01`, constant head and tail, equation **never split** (0 minted equations), z3 `sat` | 10 | `01_track_86` |
-| split; a leaf's class holds a minted concat whose value (and length) disagrees with the variable | ~20 (stringfuzz `x++y = m++n`, woorpje `track01`–`04`, Kepler `quad`) | `01_track_154` |
+| split; a leaf's class holds a minted concat whose value (and length) disagrees with the variable | 22 (stringfuzz `x++y = m++n`, woorpje `track01`–`04`, Kepler `quad`; the 2 cycle rows below also disagree) | `01_track_154` |
 | stringfuzz `x++y = m++n`, unsplit | 4 | `regex-032-rotate-translate-rotate` |
 | leaf concat cycle | 2 | `noodles-unsat-8` |
 
@@ -571,6 +572,13 @@ should be seeded from the regex's derivative by the constant head.
 12. **Push and PR not done by the analysing agent** (ruling R7): the
     report and the spec section are committed locally, and the controller
     opens the PR.
+13. **Family key replaced (review fix, controller ruling).** The plan's
+    Step 6 script grouped families by `"/".join(path.split("/")[1:3])`.
+    In a flat directory that key makes every file its own family, which hid
+    automatark (649 rows, class 1's largest family) and Kepler (40 rows in
+    class 3). The ranked table's "top families" column is now keyed on the
+    containing directory, `"/".join(path.split("/")[1:-1])`
+    (`target/slice59-after/fix1_recount.py`). No counts changed.
 
 ## Gates
 
