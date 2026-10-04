@@ -140,3 +140,68 @@ fn qfabv_gate_fences_store_chain_equality_spurious_sat() {
         other => panic!("QF_ABV store-chain equality must not be sat: {other:?}"),
     }
 }
+
+/// The §4.1 grammar: `<mode>:<kind>@<rebuild>`, no whitespace.
+fn well_formed_detail(tag: &str) -> bool {
+    let Some((head, rebuild)) = tag.rsplit_once('@') else {
+        return false;
+    };
+    let Some((mode, kind)) = head.split_once(':') else {
+        return false;
+    };
+    matches!(mode, "violated" | "unevaluable")
+        && !kind.is_empty()
+        && matches!(rebuild, "not-needed" | "adopted" | "rejected" | "budget")
+        && !tag.contains(char::is_whitespace)
+}
+
+/// Slice 59: a `str-model-rejected` carries a well-formed detail, and the
+/// next `check-sat` clears it (Review Focus 1). The first query is the
+/// slice-58 `g1` guard shape, `unknown fence=str-model-rejected` at `de96d28`.
+#[test]
+fn str_model_rejected_detail_clears_on_next_check() {
+    let src = "(set-logic QF_SLIA)(declare-fun x () String)(declare-fun y () String)\
+        (assert (str.prefixof \"a\" x))(assert (= x y))\
+        (assert (str.in_re y (re.+ (re.range \"a\" \"b\"))))(check-sat)\
+        (assert false)(check-sat)";
+    let mut solver = Solver::new();
+    let mut parser = Parser::new(src);
+    let mut seen = Vec::new();
+    while let Some(r) = parser.next_command(solver.ctx_mut()) {
+        let resp = solver.execute(r.expect("fixture parses"));
+        if matches!(
+            resp,
+            CommandResponse::Sat | CommandResponse::Unsat | CommandResponse::Unknown
+        ) {
+            seen.push((
+                resp,
+                solver.last_fence(),
+                solver.last_fence_detail().map(str::to_owned),
+            ));
+        }
+    }
+    assert_eq!(seen.len(), 2);
+    assert!(matches!(seen[0].0, CommandResponse::Unknown));
+    assert_eq!(seen[0].1, Some("str-model-rejected"));
+    let detail = seen[0]
+        .2
+        .as_deref()
+        .expect("a detail on str-model-rejected");
+    assert!(well_formed_detail(detail), "{detail:?}");
+    assert!(matches!(seen[1].0, CommandResponse::Unsat));
+    assert_eq!((seen[1].1, seen[1].2.as_deref()), (None, None));
+}
+
+#[test]
+fn other_fences_carry_no_detail() {
+    let mut solver = Solver::new();
+    let mut parser = Parser::new(
+        "(set-logic QF_S)(declare-fun a () String)(declare-fun b () String)\
+         (assert (str.< a b))(check-sat)",
+    );
+    while let Some(r) = parser.next_command(solver.ctx_mut()) {
+        solver.execute(r.expect("fixture parses"));
+    }
+    assert_eq!(solver.last_fence(), Some("str-order"));
+    assert_eq!(solver.last_fence_detail(), None);
+}

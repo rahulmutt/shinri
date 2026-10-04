@@ -6,6 +6,7 @@ mod abv_stage;
 mod bv_stage;
 mod fp_stage;
 mod model;
+mod model_reject;
 mod string_stage;
 mod tseitin;
 mod word_norm;
@@ -133,6 +134,10 @@ pub struct Solver {
     /// `shinri-cli --stats` so a benchmark run can attribute every `unknown`
     /// to the guard that raised it.
     last_fence: Option<&'static str>,
+    /// Slice 59: the `str-model-rejected` detail tag (`<mode>:<kind>@<rebuild>`,
+    /// spec §4.1) of the most recent `check_sat`; `None` whenever `last_fence`
+    /// is anything else. Read by `shinri-cli --stats`.
+    last_fence_detail: Option<String>,
 }
 
 /// One user-declared function. `arity == 0` entries are the ones `get-model`
@@ -252,6 +257,7 @@ impl Solver {
             theory_guard_bailouts: 0,
             last_outcome: None,
             last_fence: None,
+            last_fence_detail: None,
         }
     }
 
@@ -408,6 +414,11 @@ impl Solver {
     /// The fence tag behind the most recent `Unknown` (slice 46), or `None`.
     pub fn last_fence(&self) -> Option<&'static str> {
         self.last_fence
+    }
+
+    /// The detail tag behind a `str-model-rejected` `Unknown` (slice 59), or `None`.
+    pub fn last_fence_detail(&self) -> Option<&str> {
+        self.last_fence_detail.as_deref()
     }
 
     /// Execute one IR command and return the response.
@@ -766,6 +777,7 @@ impl Solver {
     /// return site.
     pub fn check_sat(&mut self) -> SolveOutcome {
         self.last_fence = None;
+        self.last_fence_detail = None;
         let outcome = self.check_sat_inner();
         self.last_outcome = Some(outcome);
         outcome
@@ -1357,6 +1369,8 @@ impl Solver {
                 // Slice 57: a string model from the reconciliation rebuild must
                 // pass the strict gate (every assertion definitely true).
                 let strict_gate = mb.strict_check_required();
+                // Slice 59: diagnostic only, for the str-model-rejected detail.
+                let rebuild = mb.rebuild_outcome();
                 let mut model = Model::default();
                 // Values of word_norm-internal symbols, keyed by the internal
                 // term — surfaced to users only through the eliminated-ite
@@ -1494,6 +1508,8 @@ impl Solver {
                 debug_assert!(!strict_gate || on_string_path);
                 if on_string_path && !self.string_model_satisfies(&lowered, &model, strict_gate) {
                     self.last_fence = Some("str-model-rejected");
+                    self.last_fence_detail =
+                        Some(self.model_reject_detail(&lowered, &model, strict_gate, rebuild));
                     return SolveOutcome::Unknown;
                 }
                 self.last_model = Some(model);

@@ -243,7 +243,7 @@ fn cell(s: &str) -> Cow<'_, str> {
 }
 
 /// Render the full Markdown report: fixture header, per-logic matrix, ranked
-/// gaps, wrong answers, perf tail.
+/// gaps, fence detail (only when some row has one), wrong answers, perf tail.
 pub fn render(fixture: Option<&Fixture>, rows: &[Row]) -> String {
     let logics = collect(rows);
     let mut out = String::with_capacity(4096);
@@ -251,6 +251,7 @@ pub fn render(fixture: Option<&Fixture>, rows: &[Row]) -> String {
     render_fixture(&mut out, fixture, rows, &logics);
     render_matrix(&mut out, &logics);
     render_gaps(&mut out, rows);
+    render_fence_detail(&mut out, rows);
     render_wrong(&mut out, rows);
     render_perf(&mut out, rows, &logics);
     out
@@ -424,6 +425,50 @@ fn render_gaps(out: &mut String, rows: &[Row]) {
     }
 }
 
+/// Slice 59: each fence's `fence_detail` tags, ranked by count. Omitted when
+/// no row carries a detail, so runs from before slice 59 render unchanged.
+fn render_fence_detail(out: &mut String, rows: &[Row]) {
+    let mut by_fence: BTreeMap<&str, BTreeMap<&str, Bucket>> = BTreeMap::new();
+    for row in rows {
+        let (Some(fence), Some(tag)) = (row.fence.as_deref(), row.fence_detail.as_deref()) else {
+            continue;
+        };
+        by_fence
+            .entry(fence)
+            .or_default()
+            .entry(tag)
+            .or_default()
+            .add(row);
+    }
+    if by_fence.is_empty() {
+        return;
+    }
+    out.push_str("## Fence detail\n\n");
+    for (fence, tags) in &by_fence {
+        let total: usize = tags.values().map(|b| b.count).sum();
+        let _ = writeln!(out, "### {} — {}\n", cell(fence), total);
+        out.push_str("| detail | QF_S | QF_SLIA | total | example |\n");
+        out.push_str("| --- | ---: | ---: | ---: | --- |\n");
+        // Count descending, then tag ascending.
+        let mut ranked: Vec<(&&str, &Bucket)> = tags.iter().collect();
+        ranked.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+        for (tag, b) in ranked {
+            let n = |logic: &str| b.per_logic.get(logic).copied().unwrap_or(0);
+            let example = b.examples.first().map_or("", |(_, p)| *p);
+            let _ = writeln!(
+                out,
+                "| {} | {} | {} | {} | `{}` |",
+                cell(tag),
+                n("QF_S"),
+                n("QF_SLIA"),
+                b.count,
+                example
+            );
+        }
+        out.push('\n');
+    }
+}
+
 fn render_wrong(out: &mut String, rows: &[Row]) {
     out.push_str("## Wrong answers\n\n");
     let mut wrong: Vec<&Row> = Vec::new();
@@ -575,6 +620,7 @@ mod tests {
             stdout_errors: 0,
             first_error: None,
             fence: None,
+            fence_detail: None,
             stderr_head: String::new(),
             verdict,
             oracle: None,
@@ -666,5 +712,56 @@ mod tests {
         let a = render(None, &rows);
         rows.reverse();
         assert_eq!(a, render(None, &rows));
+    }
+
+    #[test]
+    fn fence_detail_section_ranks_tags_per_fence() {
+        let mk = |logic: &str, path: &str, bytes: u64, tag: &str| {
+            let mut r = bare(Verdict::Unknown("str-model-rejected".into()));
+            r.logic = logic.into();
+            r.path = path.into();
+            r.bytes = bytes;
+            r.fence = Some("str-model-rejected".into());
+            r.fence_detail = Some(tag.into());
+            r
+        };
+        let rows = vec![
+            mk(
+                "QF_SLIA",
+                "QF_SLIA/b.smt2",
+                50,
+                "violated:word-eq@not-needed",
+            ),
+            mk("QF_S", "QF_S/a.smt2", 10, "violated:word-eq@not-needed"),
+            mk(
+                "QF_SLIA",
+                "QF_SLIA/c.smt2",
+                5,
+                "unevaluable:str-pred@adopted",
+            ),
+        ];
+        let md = render(None, &rows);
+        let at = md.find("## Fence detail").expect("section present");
+        let sec = &md[at..];
+        assert!(
+            sec.starts_with("## Fence detail\n\n### str-model-rejected — 3\n\n"),
+            "{sec}"
+        );
+        let first = sec
+            .find("| violated:word-eq@not-needed | 1 | 1 | 2 | `QF_S/a.smt2` |")
+            .expect("word-eq row");
+        let second = sec
+            .find("| unevaluable:str-pred@adopted | 0 | 1 | 1 | `QF_SLIA/c.smt2` |")
+            .expect("str-pred row");
+        assert!(first < second, "ranked by count");
+        assert!(md.find("## Ranked gaps").unwrap() < at);
+        assert!(at < md.find("## Wrong answers").unwrap());
+    }
+
+    #[test]
+    fn fence_detail_section_absent_without_details() {
+        let mut r = bare(Verdict::Unknown("str-order".into()));
+        r.fence = Some("str-order".into());
+        assert!(!render(None, &[r]).contains("## Fence detail"));
     }
 }

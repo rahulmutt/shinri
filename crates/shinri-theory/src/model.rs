@@ -6,6 +6,35 @@ use rustc_hash::FxHashMap;
 use shinri_core::TermId;
 use shinri_core::{Integer, Rational};
 
+/// Slice 59: what the string theory's slice-57 reconciliation rebuild did
+/// for this model. Diagnostic only (the `str-model-rejected` detail tag);
+/// nothing reads it to choose a model or a verdict. Ordered by how much it
+/// says, so `absorb` keeps the more informative value.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub enum RebuildOutcome {
+    /// The default model held every input equation (or no rebuild applies).
+    #[default]
+    NotNeeded,
+    /// The rebuild held every input equation and was adopted.
+    Adopted,
+    /// The rebuild completed but failed its checks; the default was kept.
+    Rejected,
+    /// The candidate-trial budget ran out; the default was kept.
+    Budget,
+}
+
+impl RebuildOutcome {
+    /// The tag spelling (spec §4.1).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RebuildOutcome::NotNeeded => "not-needed",
+            RebuildOutcome::Adopted => "adopted",
+            RebuildOutcome::Rejected => "rejected",
+            RebuildOutcome::Budget => "budget",
+        }
+    }
+}
+
 /// Each theory writes its term values here; the Combiner reconciles them.
 #[derive(Default)]
 pub struct ModelBuilder {
@@ -13,6 +42,8 @@ pub struct ModelBuilder {
     /// Slice 57: set by a theory whose values the solver must confirm with
     /// the strict model gate (every assertion definitely true).
     strict_check: bool,
+    /// Slice 59: the string rebuild's outcome (diagnostic only).
+    rebuild: RebuildOutcome,
 }
 
 impl ModelBuilder {
@@ -44,6 +75,17 @@ impl ModelBuilder {
         self.strict_check
     }
 
+    /// Slice 59: record what the string rebuild did (diagnostic only).
+    #[inline]
+    pub fn set_rebuild_outcome(&mut self, o: RebuildOutcome) {
+        self.rebuild = o;
+    }
+    /// Slice 59: what the string rebuild did for this model.
+    #[inline]
+    pub fn rebuild_outcome(&self) -> RebuildOutcome {
+        self.rebuild
+    }
+
     /// First term that `self` and `other` assign different values to, if any.
     pub fn merge_check(&self, other: &ModelBuilder) -> Option<TermId> {
         for (t, v) in self.values.iter() {
@@ -58,16 +100,19 @@ impl ModelBuilder {
 
     /// Fold another builder's assignments into this one (other wins ties; the
     /// caller has already verified agreement via `merge_check`). The strict
-    /// flag is kept if either builder set it.
+    /// flag is kept if either builder set it; the rebuild outcome keeps the
+    /// more informative of the two.
     pub fn absorb(&mut self, other: ModelBuilder) {
         let ModelBuilder {
             values,
             strict_check,
+            rebuild,
         } = other;
         for (t, v) in values {
             self.values.insert(t, v);
         }
         self.strict_check |= strict_check;
+        self.rebuild = self.rebuild.max(rebuild);
     }
 
     /// Iterate all assigned `(TermId, ModelVal)` pairs.
@@ -277,5 +322,46 @@ mod strict_check_tests {
         assert!(b.strict_check_required());
         a.absorb(b);
         assert!(a.strict_check_required(), "absorb must keep the flag");
+    }
+
+    #[test]
+    fn rebuild_outcome_defaults_and_absorb_keeps_the_more_informative() {
+        assert_eq!(
+            ModelBuilder::default().rebuild_outcome(),
+            RebuildOutcome::NotNeeded
+        );
+        for (a, b, want) in [
+            (
+                RebuildOutcome::NotNeeded,
+                RebuildOutcome::Adopted,
+                RebuildOutcome::Adopted,
+            ),
+            (
+                RebuildOutcome::Budget,
+                RebuildOutcome::Adopted,
+                RebuildOutcome::Budget,
+            ),
+            (
+                RebuildOutcome::Adopted,
+                RebuildOutcome::Rejected,
+                RebuildOutcome::Rejected,
+            ),
+            (
+                RebuildOutcome::Rejected,
+                RebuildOutcome::NotNeeded,
+                RebuildOutcome::Rejected,
+            ),
+        ] {
+            let mut x = ModelBuilder::default();
+            x.set_rebuild_outcome(a);
+            let mut y = ModelBuilder::default();
+            y.set_rebuild_outcome(b);
+            x.absorb(y);
+            assert_eq!(x.rebuild_outcome(), want, "{a:?} absorb {b:?}");
+        }
+        assert_eq!(RebuildOutcome::NotNeeded.as_str(), "not-needed");
+        assert_eq!(RebuildOutcome::Adopted.as_str(), "adopted");
+        assert_eq!(RebuildOutcome::Rejected.as_str(), "rejected");
+        assert_eq!(RebuildOutcome::Budget.as_str(), "budget");
     }
 }

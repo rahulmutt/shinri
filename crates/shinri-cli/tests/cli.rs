@@ -188,7 +188,8 @@ fn stats_line_shape_on_sat() {
     fields[2]["wall_ms=".len()..].parse::<u64>().unwrap();
     assert_eq!(fields[3], "outcome=sat");
     assert_eq!(fields[4], "fence=-");
-    assert_eq!(fields.len(), 5);
+    assert_eq!(fields[5], "detail=-");
+    assert_eq!(fields.len(), 6);
 }
 
 #[test]
@@ -199,6 +200,30 @@ fn stats_line_names_the_fence_on_unknown() {
         stderr.contains("outcome=unknown fence=str-order"),
         "stderr: {stderr:?}"
     );
+}
+
+const REJECTED_THEN_UNSAT: &str = "(set-option :print-success false)\
+(set-logic QF_SLIA)(declare-fun x () String)(declare-fun y () String)\
+(assert (str.prefixof \"a\" x))(assert (= x y))\
+(assert (str.in_re y (re.+ (re.range \"a\" \"b\"))))(check-sat)\
+(assert false)(check-sat)";
+
+/// Slice 59: a `str-model-rejected` names its detail; the next `check-sat`
+/// prints `detail=-` (Review Focus 1).
+#[test]
+fn stats_detail_clears_on_the_next_check_sat() {
+    let (stdout, stderr, _) = run_with(&["--stats"], REJECTED_THEN_UNSAT);
+    assert_eq!(stdout, "unknown\nunsat\n");
+    let lines: Vec<&str> = stderr.lines().filter(|l| l.starts_with("stats:")).collect();
+    assert_eq!(lines.len(), 2, "stderr: {stderr:?}");
+    let first: Vec<&str> = lines[0].split(' ').collect();
+    assert_eq!(first[4], "fence=str-model-rejected");
+    let detail = first[5].strip_prefix("detail=").expect("a detail field");
+    assert!(
+        detail != "-" && detail.contains(':') && detail.contains('@'),
+        "{detail:?}"
+    );
+    assert!(lines[1].ends_with("fence=- detail=-"), "{:?}", lines[1]);
 }
 
 #[test]

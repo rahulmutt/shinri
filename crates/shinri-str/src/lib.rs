@@ -21,7 +21,9 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use shinri_core::{BuiltinOp, Context, Lit, Op, TermId, TermNode, TheoryJust, Var};
 use shinri_sat::Effort;
 use shinri_theory::types::{ENodeId, EqJust, EqLeaf, ModelVal};
-use shinri_theory::{EqualityEngine, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
+use shinri_theory::{
+    EqualityEngine, Explainer, ModelBuilder, RebuildOutcome, TCheck, TheoryCtx, TheorySolver,
+};
 
 #[derive(Default)]
 pub struct StrSolver {
@@ -1616,15 +1618,24 @@ impl StrSolver {
             };
             // `None`: the candidate-trial budget ran out; the rebuild is
             // abandoned like a failed one (default model, flag unset).
+            // Slice 59: each branch records its outcome for the detail tag.
             match model_reconcile::reconciled_values(cx.terms, cx.eq, m, &inp) {
                 Some(rebuilt)
                     if model_reconcile::input_eqs_hold(cx.terms, &input_eqs, &rebuilt, m)
                         && model_reconcile::concats_consistent(cx.terms, &rebuilt, m) =>
                 {
                     m.require_strict_check();
+                    m.set_rebuild_outcome(RebuildOutcome::Adopted);
                     rebuilt
                 }
-                _ => vals,
+                Some(_) => {
+                    m.set_rebuild_outcome(RebuildOutcome::Rejected);
+                    vals
+                }
+                None => {
+                    m.set_rebuild_outcome(RebuildOutcome::Budget);
+                    vals
+                }
             }
         };
         for (t, v) in vals {
@@ -1857,7 +1868,8 @@ mod tests {
     use shinri_sat::Effort;
     use shinri_theory::types::ModelVal;
     use shinri_theory::{
-        AtomRegistry, EqualityEngine, ModelBuilder, Owner, TCheck, TheoryCtx, TheorySolver,
+        AtomRegistry, EqualityEngine, ModelBuilder, Owner, RebuildOutcome, TCheck, TheoryCtx,
+        TheorySolver,
     };
 
     #[test]
@@ -2149,6 +2161,7 @@ mod tests {
             other => panic!("expected a String for x, got {other:?}"),
         }
         assert!(m.strict_check_required());
+        assert_eq!(m.rebuild_outcome(), RebuildOutcome::Adopted);
     }
 
     /// Two conflicting input concats: no rebuild satisfies both, so the
@@ -2186,6 +2199,7 @@ mod tests {
         s.model_with(&mut cx, &mut m);
         assert!(!m.strict_check_required());
         assert!(matches!(m.get(x), Some(ModelVal::String(_))));
+        assert_eq!(m.rebuild_outcome(), RebuildOutcome::Rejected);
     }
 
     /// An exhausted candidate-trial budget abandons the rebuild: the default
@@ -2226,6 +2240,7 @@ mod tests {
             other => panic!("expected a String for x, got {other:?}"),
         }
         assert!(!m.strict_check_required());
+        assert_eq!(m.rebuild_outcome(), RebuildOutcome::Budget);
     }
 
     /// The default path: a model that already satisfies its input equations
@@ -2249,6 +2264,7 @@ mod tests {
         s.model_with(&mut cx, &mut m);
         assert_eq!(m.get(x), Some(&ModelVal::String("ab".into())));
         assert!(!m.strict_check_required());
+        assert_eq!(m.rebuild_outcome(), RebuildOutcome::NotNeeded);
     }
 
     // ── Task 2 (slice 21): membership intake + retraction bookkeeping ───────

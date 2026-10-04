@@ -28,7 +28,7 @@ Options:
   -h, --help       Print this help and exit
   -V, --version    Print version and exit
       --stats      After each check-sat, print a `stats:` line on stderr
-                   (wall_ms, outcome, and the fence tag behind an unknown)
+                   (wall_ms, outcome, the fence tag behind an unknown, and its detail)
 ";
 
 /// Parse arguments (excluding the program name).

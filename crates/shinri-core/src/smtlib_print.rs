@@ -267,7 +267,8 @@ fn format_fp_triple(eb: u32, sb: u32, bits: &shinri_num::Integer) -> String {
     )
 }
 
-fn builtin_name(b: BuiltinOp) -> String {
+/// The SMT-LIB spelling of a builtin operator (indexed ops in `(_ op …)` form).
+pub fn builtin_name(b: BuiltinOp) -> String {
     use BuiltinOp::*;
     match b {
         Not => "not".to_owned(),
