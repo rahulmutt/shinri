@@ -160,10 +160,11 @@ impl Driver {
                 _ => "unknown",
             };
             eprintln!(
-                "stats: cmd=check-sat wall_ms={} outcome={} fence={}",
+                "stats: cmd=check-sat wall_ms={} outcome={} fence={} detail={}",
                 started.elapsed().as_millis(),
                 outcome,
-                self.solver.last_fence().unwrap_or("-")
+                self.solver.last_fence().unwrap_or("-"),
+                self.solver.last_fence_detail().unwrap_or("-")
             );
         }
         match resp {
