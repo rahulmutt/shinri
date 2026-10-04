@@ -294,3 +294,40 @@ group), which sizes the population beyond the two reproducers.
   - `crates/shinri-str/src/normalize.rs:46` (`rep_rank`), `:97`
     (`normal_form_cited`), `:211` (`deep_normal_form_cited`)
   - `crates/shinri-solver/tests/slice57_probes.rs:181`, `:194` (`k1`, `k2`)
+
+## 11. Measured outcomes
+
+Full evidence:
+`docs/superpowers/research/2026-10-04-smtlib-2024-slice58-member-prefix-report.md`.
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | 0 `* → wrong`; 0 wrong answers in triage | PASS: 0 `wrong` rows in either run (103,335 rows each), 0 wrong answers in 306 triage runs; no changed row ends `unverified`, so the z3 check has 0 rows and 0 disagreements |
+| 2 | `translate-rotate-fuzz`, `translate-graft-translate` answer `unsat` | PASS: both `str-model-rejected → correct`, base `unknown` 3/3, after `unsat` 3/3 |
+| 3 | credited `str-model-rejected` does not increase | PASS on the combined count: QF_S 966 → 970 (+4), QF_SLIA 3,122 → 3,114 (−8), combined 4,088 → 4,084 (−4); raw = credited (no row credited) |
+| 4 | no reproducible `correct → *` loss | PASS: 0 `correct → *` rows; net `correct` QF_S +3, QF_SLIA +36 |
+| 5 | serial timing within ±5% | PASS: QF_S 0.974 (1.07 s vs 1.04 s), QF_SLIA 1.017 (1.59 s vs 1.62 s), 150 rows each |
+| 6 | `ci` green; oracle suite non-zero, passing; §7.4 count falls | PASS: `ci` exit 0, 1735/1735 passed (6 skipped); oracle suite 808/808 passed (2 skipped); §7.4 count 69 → 47, 0 disagreements |
+
+Rows decided by G′: 8, all QF_SLIA stringfuzz `transformed/z3str2/regex-050-*`
+(`unknown:str-model-rejected → correct`; base `unknown` 3/3, after `unsat` 3/3).
+
+### Deviations from this spec
+
+- Guards `g1`, `g3`, `rf2`, `rf3` (`unknown fence=str-model-rejected` at
+  HEAD) and `rf4` (`unknown fence=sat-budget`) only forbid `unsat` and
+  witness-check any `sat`; z3 answers `sat` for all five, and conflict-only
+  G′ cannot change them. The shapes are queued (§9 item 1).
+- `m4` already passed at HEAD (regression guard); before-count 7 PASS / 4 FAIL.
+- `differential_qfs_member_prefix` takes about 669 s and is not `#[ignore]`d:
+  it runs only in the nightly-only `oracle` CI job.
+- Unit test `g_prime_reads_member_deep_nf` reorders `known` (`cb` before `z`)
+  because `build_node_of` picks the first non-constant term as the
+  representative.
+- Oracle `sat` fell 73 → 71 (two `sat → unknown`, decisiveness only, 0
+  disagreements).
+- QF_S `str-model-rejected` rose by 4 (8 rows from `sat-budget`, 4
+  rows back to `sat-budget`, all reproducible 3/3 and none `correct`); the
+  criterion is on the combined count, which fell by 4.
+- 31 `unverified → correct` rows are base-run z3 oracle timeouts with
+  identical shinri answers; not credited to the slice.
