@@ -3058,6 +3058,7 @@ mod tests {
                 }
             }
         }
+        // Must cover every `arb_range` POOL edge +/- 1 (each is probed).
         let probes: Vec<u32> = (0..=0x90u32)
             .chain([
                 0xD7FE,

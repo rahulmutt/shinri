@@ -3,7 +3,11 @@
 //! `CLASS_SPLIT_CAP` under the old all-ranges `next_classes`. Every decided
 //! shinri answer must match z3, and every shinri `sat` witness, re-asserted
 //! into z3, must be `sat`. Subjects are a bare variable (witness search,
-//! emptiness conflict) or `(str.++ x y)` (Rule-E unfolding).
+//! emptiness conflict) or `(str.++ x y)`. The concat subjects are not known
+//! to reach a decided answer through Rule-E, so this file does not claim
+//! Rule-E coverage: that is pinned by the unit test
+//! `rule_e_long_literal_head_splits_not_fenced` (shinri-str, memb.rs) and its
+//! effect on real workloads is measured only by the bench.
 //!
 //! Run with:
 //!   cargo nextest run -p shinri-solver --features oracle -E 'binary(head_classes_oracle)'
@@ -233,6 +237,8 @@ fn head_classes_generated_agree_with_z3() {
     let (mut sat, mut unsat, mut z3_timeouts) = (0usize, 0usize, 0usize);
     for _ in 0..N_ITERS {
         let (body, vars) = gen(&mut rng);
+        // The -T limit is wall-clock time: under heavy load a shinri-unsat /
+        // z3-timeout failure is a possible flake (it fails closed).
         match check(&body, &vars, 3, &mut z3_timeouts) {
             SolveOutcome::Sat => sat += 1,
             SolveOutcome::Unsat => unsat += 1,
@@ -240,7 +246,7 @@ fn head_classes_generated_agree_with_z3() {
         }
     }
     eprintln!(
-        "head_classes_oracle: {sat} sat, {unsat} unsat, {} unknown, {z3_timeouts} z3 timeouts",
+        "head_classes_oracle: {sat} sat, {unsat} unsat, {} unknown, {z3_timeouts} z3 unknown/timeouts",
         N_ITERS - sat - unsat
     );
     assert!(
