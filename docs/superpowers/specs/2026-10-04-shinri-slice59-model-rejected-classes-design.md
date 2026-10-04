@@ -239,9 +239,20 @@ Every existing solver, str, bench and oracle suite passes unchanged.
 
 ## 8. Measurement
 
-Two `mise run bench-run` runs at default limits (20 s, 3072 MB, 6 jobs)
-over the full corpus (all logics; the change touches shared solver and CLI
-code): `slice59-base` at `de96d28` and `slice59` at the slice head.
+Two runs per binary at default limits (20 s, 3072 MB, 6 jobs),
+`slice59-base` at the branch point (crates identical to `de96d28`) and
+`slice59` at the slice head (scope ruling, owner, in chat 2026-10-04):
+
+- **Strings:** the full QF_S and QF_SLIA corpus (103,335 rows), where every
+  row the classifier can touch lives (it runs only behind `on_string_path`).
+- **Neutrality sample:** a seeded (seed 59) 2,000-row sample over the other
+  seven logics (QF_BVFP, QF_DT, QF_LIA, QF_LRA, QF_UF, QF_UFLIA, QF_UFLRA),
+  allocated in proportion to logic size with a floor of 100 rows per logic,
+  run from a hard-linked corpus tree so row paths match the main corpus.
+  Outside the string path the change is an unread `ModelBuilder` field and
+  `detail=-` on the stats line; the sample checks that nothing else moved.
+  A full all-logic run (~153,800 rows, ~7–8 h per binary) was considered and
+  not chosen.
 
 Every changed verdict is re-run 3× per binary, interleaved, with the bench's
 command line (slice-53 triage method).
@@ -269,9 +280,9 @@ contains:
 | # | criterion | kind |
 | --- | --- | --- |
 | 1 | 0 rows `* → wrong`; 0 wrong answers in triage re-runs | hard; any hit stops the slice for a ruling |
-| 2 | verdict-neutral: every changed row is a non-reproducible timing flip (3/3 triage re-runs agree with base) | hard |
+| 2 | verdict-neutral on the string runs and the neutrality sample: every changed row is a non-reproducible timing flip (3/3 triage re-runs agree with base) | hard |
 | 3 | every `unknown:str-model-rejected` row has a non-null `fence_detail`; no other row has one | hard |
-| 4 | serial, interleaved timing on sampled both-`correct` QF_S and QF_SLIA rows: summed wall time within ±5% of base | hard |
+| 4 | serial, interleaved timing on 150 sampled both-`correct` rows per string logic, and on 150 sampled `str-model-rejected` rows (the path the classifier runs on): summed wall time within ±5% of base | hard |
 | 5 | `mise run ci` green; oracle suite (`--features oracle`) passes with the slice-58 discovered count (808 passed, 2 skipped) | hard |
 | 6 | the report's named classes cover ≥80% of the population, each with a reproducer | hard |
 
