@@ -410,6 +410,23 @@ mod tests {
         assert_eq!(tag(&s, &[p], &m, true), "unevaluable:other:uf@not-needed");
     }
 
+    /// A Boolean builtin outside the §4.1 list is tagged `other:<op>` through
+    /// `builtin_name` + `tag_safe`. No indexed Boolean builtin exists (every
+    /// `(_ …)` op is BV-, regex- or FP-valued), so `bvult` stands in.
+    #[test]
+    fn unlisted_builtin_is_other_op() {
+        let (mut s, x, _) = fx();
+        let c1 = s.ctx_mut().mk_bv_const(8, shinri_core::Integer::from(1u64));
+        let c2 = s.ctx_mut().mk_bv_const(8, shinri_core::Integer::from(2u64));
+        let a = b(&mut s, BuiltinOp::BvUlt, &[c1, c2]);
+        let m = strs(&[(x, "a")]);
+        assert_eq!(s.eval_bool(a, &m), None);
+        assert_eq!(
+            tag(&s, &[a], &m, true),
+            "unevaluable:other:bvult@not-needed"
+        );
+    }
+
     #[test]
     fn rebuild_suffix_and_unclassified_fallback() {
         let (s, x, _) = fx();

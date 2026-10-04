@@ -336,17 +336,20 @@ budget 0. Top classes:
    operand); representative `regex-010-reverse-multiply-fuzz.smt2`.
 2. `violated:bool@not-needed`: 594 rows. The failing assertion is a lowered
    `len x = k` (40/40 sampled) where `x ∈ R` has no word of length `k`; z3
-   `unsat` 39/40. Reproducer `regex-017-graft-reverse-graft.smt2`.
+   `unsat` 39/40. Reproducer `regex-017-graft-reverse-graft.smt2`. The
+   `bool` kind is a mislabel (the lowered Int-equality `and`); the report
+   queues a tag fix as a deliberate rename against this baseline.
 3. `violated:word-eq@rejected`: 479 rows. The word-equation rebuild was
    rejected: constant head/tail equations that are never split (woorpje
-   `track01`), and minted members whose model lengths disagree with their
-   class. Reproducers `parikh.smt2` (smallest, `unsat`), `01_track_86`,
+   `track01`), and leaf classes whose member values disagree (22/40 sampled;
+   a minted-length mismatch is confirmed on `01_track_154` only). Reproducers `parikh.smt2` (smallest, `unsat`), `01_track_86`,
    `01_track_154`.
 
 Guards: `g1` → `violated:memb@adopted` (rank 9); `rf2`, `rf3` →
 `violated:memb@not-needed` (rank 1); `g3` and `rf4` → `sat-budget` (outside
 the population; `g3` is `sat-budget` on the base binary too). Parked items:
-constant-head strip and minted length links now have reproducers. Cited deep
+constant-head strip and minted length links now have reproducers and are
+absorbed into the class-3 fix. Cited deep
 NF on the word-equation path and suffix G′ stay parked. Recommended next
 slice: membership witness search past `CLASS_SPLIT_CAP` (class 1).
 
@@ -370,3 +373,12 @@ slice: membership witness search past `CLASS_SPLIT_CAP` (class 1).
 - The class-shape traces also instrumented `memb_seeds` and
   `language_empty`. That debug output was throwaway and was reverted with
   `git checkout -- crates`.
+- §7.2 asks for one `violated`-mode test per kind. `str-pred` and
+  `str-order` cannot be `violated` today: `eval_bool` returns `None` for
+  `str.prefixof`, `str.contains`, `str.suffixof`, `str.<` and `str.<=`
+  (no arm), so they are tested in `unevaluable` mode only. `int-conv` is
+  likewise tested in `unevaluable` mode only: `eval_num_val` /
+  `eval_str_val` have no conversion arm and decide such a term only when
+  the model holds a value for the conversion term itself. An unlisted
+  builtin (`other:<op>`) is tested with `bvult`, because no indexed Boolean
+  builtin exists.

@@ -430,6 +430,12 @@ length `k` exists. **Parked-item match:** none of the four. This is a
 length-abstraction gap: the exact-length emptiness of `R` is not turned into
 a conflict.
 
+**The tag is mislabelled.** These rows are `len-arith` failures. Lowering
+turns every Int `=` into `(and (= a b) (<= a b) (>= a b))`, and `violated`
+mode names the top-level lowered assertion, so the kind comes out `bool`.
+Queue item 2 fixes the tag (controller ruling: no code change in this
+slice).
+
 ### 3. `violated:word-eq@rejected` (479 rows, 11.7%)
 
 **Smallest reproducer** (435 B, z3 `unsat`): `QF_S/20240318-omark/parikh.smt2`
@@ -458,8 +464,9 @@ counted once per feature). z3: 33
 | group | rows | example |
 | --- | ---: | --- |
 | woorpje `track01`, constant head and tail, equation **never split** (0 minted equations), z3 `sat` | 10 | `01_track_86` |
-| split; a leaf's class holds a minted concat whose value (and length) disagrees with the variable | 22 (stringfuzz `x++y = m++n`, woorpje `track01`–`04`, Kepler `quad`; the 2 cycle rows below also disagree) | `01_track_154` |
+| split; leaf class member values disagree (value disagreement only; a length mismatch is confirmed on `01_track_154` only) | 22 (stringfuzz `x++y = m++n`, woorpje `track01`–`04`, Kepler `quad`; the 2 cycle rows below also disagree) | `01_track_154` |
 | stringfuzz `x++y = m++n`, unsplit | 4 | `regex-032-rotate-translate-rotate` |
+| split, no value disagreement (stringfuzz `transformed`, z3 `sat`) | 2 | (see `class3-groups.txt`) |
 | leaf concat cycle | 2 | `noodles-unsat-8` |
 
 `QF_S/20230329-woorpje-lu/track01/01_track_86.smt2` (935 B, corpus `sat`):
@@ -517,9 +524,9 @@ should be seeded from the regex's derivative by the constant head.
 
 | item | ruling | reproducer |
 | --- | --- | --- |
-| Constant-head strip | **Has reproducers; leave parked as a fix item in its own right** and fold it into the class-3 fix (queue item 3). It appears on both paths: on word equations (class 3: woorpje `track01`, never split, constant head and tail) and on memberships (pinned subject; the guards `rf2`, `rf3`, `g1`) | `QF_S/20230329-woorpje-lu/track01/01_track_86.smt2` (935 B); guards `rf2`/`rf3` |
+| Constant-head strip | **Has reproducers; absorbed into the class-3 fix (queue item 4).** It appears on both paths: on word equations (class 3: woorpje `track01`, never split, constant head and tail) and on memberships (pinned subject; the guards `rf2`, `rf3`, `g1`) | `QF_S/20230329-woorpje-lu/track01/01_track_86.smt2` (935 B); guards `rf2`/`rf3` |
 | Cited deep NF on the word-equation path | **Stays parked.** No sampled row isolates it. The class-3 value disagreements trace to minted members whose lengths differ, not to a stale normal form | none |
-| Minted length links | **Has a reproducer** (class 3, about half of the sample). The minted equation's sides take different model lengths | `QF_S/20230329-woorpje-lu/track01/01_track_154.smt2` (946 B) |
+| Minted length links | **Has a reproducer; absorbed into the class-3 fix (queue item 4).** Class 3 shows value disagreement in a leaf class on 22/40 sampled rows. A length mismatch between the minted equation's sides is confirmed on `01_track_154` only | `QF_S/20230329-woorpje-lu/track01/01_track_154.smt2` (946 B) |
 | Suffix G′ (constant tail on a membership member) | **Stays parked.** No sampled class-1 row has a constant-tail member in a membership subject's class (the 4 concat subjects have free operands, and the pinned case has a constant *head*). Constant tails in class 3 are on word equations, which the constant-head strip covers | none |
 
 ## What changed versus the spec
@@ -579,6 +586,15 @@ should be seeded from the regex's derivative by the constant head.
     class 3). The ranked table's "top families" column is now keyed on the
     containing directory, `"/".join(path.split("/")[1:-1])`
     (`target/slice59-after/fix1_recount.py`). No counts changed.
+14. **§7.2 coverage.** §7.2 asks for one `violated`-mode test per kind.
+    `str-pred` and `str-order` cannot be `violated` today: `eval_bool` has
+    no arm for `str.prefixof`, `str.contains`, `str.suffixof`, `str.<` or
+    `str.<=` and returns `None`, so they are tested in `unevaluable` mode
+    only. `int-conv` is likewise tested in `unevaluable` mode only:
+    `eval_num_val` / `eval_str_val` have no conversion arm and decide such a
+    term only when the model holds a value for the conversion term itself.
+    `other:<op>` is tested with `bvult` (`unlisted_builtin_is_other_op`,
+    final-review fix), because no indexed Boolean builtin exists.
 
 ## Gates
 
@@ -593,10 +609,11 @@ base string run):
 
 ## Queued for the next slice
 
-Ordered. Items 1–3 are new, from the classification. They are ranked by
-population, and each item says what it needs. After them come slice-58 queue
+Ordered. Items 1–4 are new, from the classification. Items 1, 3 and 4 are
+fix slices ranked by population; item 2 is a tag fix (controller ruling,
+final review). Each item says what it needs. After them come slice-58 queue
 items 2 onward and its carried lists, verbatim. **Re-rank:** the
-classification puts the three new items ahead of everything carried. Suffix
+classification puts the four new items ahead of everything carried. Suffix
 G′ (slice-58 item 3) stays where it was but is marked *no reproducer*,
 because the classification found no suffix shapes on the membership path.
 
@@ -619,18 +636,30 @@ because the classification found no suffix shapes on the membership path.
    Expected bench signal: `str-model-rejected → correct` on stringfuzz
    `generated` and automatark rows, measured per tag with the new
    `fence_detail`.
-2. **Length/membership conflict (class 2, 594 rows).** When the arith model
+2. **Fix the class-2 tag: `bool` is a mislabelled Int equality (594 rows).**
+   Lowering turns every Int `=` into `(and (= a b) (<= a b) (>= a b))`, and
+   `violated` mode names the top-level lowered assertion, so a violated
+   `len x = k` is tagged `violated:bool`. Either descend, in `violated`
+   mode, to the first `Some(false)` conjunct of a top-level `and` (as the
+   `unevaluable` leaf search already does), or recognise the lowered
+   Int-equality triple as `len-arith`. **This is a deliberate tag rename
+   against the slice-59 baseline**: the 594 class-2 rows (and any other
+   lowered-`and` rows) will move to another tag, so the next run's per-tag
+   comparison has to account for the rename and not count it as movement. No
+   code changed in slice 59 (ruling).
+3. **Length/membership conflict (class 2, 594 rows).** When the arith model
    fixes `len(x) = k` and `x ∈ R` has no word of length `k` (an exact,
    uncapped search), emit a conflict (or a length lemma) instead of
    reaching SAT. z3 says `unsat` on 39/40 sampled rows. Reproducer:
    `QF_SLIA/20230327-stringfuzz-lu/transformed/z3str2/regex-017-graft-reverse-graft.smt2`
    (`x ∈ (BA)*`, `len x = 5`). Note: the tag reads `bool` because the
-   lowering wraps the Int equality in an `and`.
-3. **Word-equation model rebuild: constant-head/tail strip and minted length
+   lowering wraps the Int equality in an `and` (item 2).
+4. **Word-equation model rebuild: constant-head/tail strip and minted length
    links (class 3, 479 rows).** Constant head and tail on both sides of an
    input equation that is never split (woorpje `track01`):
    `QF_S/20230329-woorpje-lu/track01/01_track_86.smt2`. Minted members whose
-   model lengths disagree with their class:
+   values disagree with their class (22/40 sampled; a length mismatch is
+   confirmed on this row only):
    `QF_S/20230329-woorpje-lu/track01/01_track_154.smt2`. On the membership
    path, the guards `rf2`/`rf3`/`g1` need the tail of a pinned prefix concat
    seeded from the regex's derivative by the head. These absorb the parked
@@ -639,9 +668,16 @@ because the classification found no suffix shapes on the membership path.
 
 Not ranked above, for reference: `violated:not-word-eq@not-needed` (352,
 stringfuzz `transformed`), `violated:len-arith@not-needed` (242), and
-`unevaluable:other:uf@adopted` (111, Jiang `slent`: an uninterpreted
-function application the strict gate cannot evaluate after an adopted
-rebuild; this is evaluator coverage).
+`unevaluable:other:uf@adopted` (111, Jiang `slent`). In the reproducer
+`slent_kaluza_575_sink.smt2`, the undecided leaf is the declared 0-ary Bool
+constant `T_SELECT_2`, inside `(= T_SELECT_2 (not (= PCTEMP_LHS_2 (- 1))))`
+(the other side evaluates to `true`), and again in `(assert T_SELECT_2)`.
+`eval_bool` returns `None` for any non-builtin application, so it never
+reads a Bool constant's value. The `other:uf` kind covers declared Bool
+constants as well as UF applications. Reading a 0-ary Bool constant from
+the model (`ModelVal::Bool`; I did not check that the gate's model holds
+it) may be a narrow, cheap evaluator fix behind this class's rows. Only the
+reproducer was checked.
 
 From the slice-58 report's queue, item 2 onward, verbatim (its item 1 is
 this slice):
