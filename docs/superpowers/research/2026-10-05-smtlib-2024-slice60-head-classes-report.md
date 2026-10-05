@@ -16,14 +16,15 @@ that ships.
 - **Rows moved to `correct`: 917** (QF_S 609, QF_SLIA 308). All 917 were
   `unknown:str-model-rejected` with tag `violated:memb@not-needed` in base.
   - With a corpus status: 310 `unsat`, 289 `sat`.
-  - With corpus status unknown and z3 agreeing: 318 (291 `sat`, 27 `unsat`).
+  - With corpus status unknown and z3 agreeing: 318 (294 `sat`, 24 `unsat`).
   - Adding 10 Norn `sat-budget → correct` rows, string `correct` rises by
     **+897** in net: QF_S 16,057 → 16,666 and QF_SLIA 24,856 → 25,144.
 - **Criterion 2:** `violated:memb@not-needed` falls **2,252 → 525**. Of the
   base-tagged rows, **917 (40.7%)** are now `correct` (bar: ≥ 450 and ≥ 20%).
   - Another **897** base-tagged rows are now decided but `unverified`,
-    because the z3 oracle timed out at 20 s: 855 `sat` (stringfuzz
-    `generated`) and 42 `unsat` (automatark 38, denghang 4).
+    because the z3 oracle timed out at 20 s: 855 `sat` (853 stringfuzz
+    `generated`, 2 stringfuzz `transformed/amazon`) and 42 `unsat`
+    (automatark 38, denghang 4).
   - `unknown:str-model-rejected` as a whole falls 4,084 → 2,360.
 - **Criteria:**
 
@@ -45,17 +46,26 @@ Task 0 (controller): base binary from the branch point `aab0dfd`, then the
 base runs, detached.
 
 ```bash
+# Step 3: build and freeze the base binary
 cargo build --release -p shinri-cli -p shinri-bench
-mkdir -p target/slice60-base && cp target/release/shinri target/release/shinri-bench target/slice60-base/
+mkdir -p target/slice60-base && cp target/release/shinri target/slice60-base/shinri
+cp target/release/shinri-bench target/slice60-base/shinri-bench
 md5sum target/slice60-base/shinri | tee target/slice60-base/md5.txt
+git rev-parse --short HEAD | tee target/slice60-base/commit.txt
+# Step 4: probes on the base binary (plan Task 0 Step 4) -> target/slice60-base/probes.txt
+# Step 5: launch both base runs detached
+date -u +%FT%TZ > target/slice60-base/started.txt
 setsid nohup sh -c 'taskset -c 12-23 target/slice60-base/shinri-bench run \
   --logics QF_S,QF_SLIA --timeout 20 --mem-mb 3072 --jobs 6 \
-  --solver target/slice60-base/shinri --run-id slice60-base ...; \
+  --solver target/slice60-base/shinri --run-id slice60-base \
+  > target/slice60-base/run.log 2>&1; \
   taskset -c 12-23 target/slice60-base/shinri-bench run \
   --logics QF_BVFP,QF_DT,QF_LIA,QF_LRA,QF_UF,QF_UFLIA,QF_UFLRA \
   --corpus target/slice59-sample-corpus --timeout 20 --mem-mb 3072 --jobs 6 \
-  --solver target/slice60-base/shinri --run-id slice60-base-sample ...' &
-# probes on the base binary -> target/slice60-base/probes.txt
+  --solver target/slice60-base/shinri --run-id slice60-base-sample \
+  > target/slice60-base/run-sample.log 2>&1; \
+  date -u +%FT%TZ > target/slice60-base/finished.txt' \
+  > /dev/null 2>&1 &
 ```
 
 Task 4 (controller): `mise run ci`, `cargo nextest run -p shinri-solver
@@ -67,14 +77,21 @@ Task 5:
 ```bash
 # Step 2 (controller), at 4a9e656
 cargo build --release -p shinri-cli -p shinri-bench
-cp target/release/shinri target/slice60-after/shinri
+mkdir -p target/slice60-after && cp target/release/shinri target/slice60-after/shinri
+md5sum target/slice60-after/shinri | tee target/slice60-after/md5.txt
+git rev-parse --short HEAD | tee target/slice60-after/commit.txt
+date -u +%FT%TZ > target/slice60-after/started.txt
 setsid nohup sh -c 'taskset -c 12-23 target/release/shinri-bench run \
   --logics QF_S,QF_SLIA --timeout 20 --mem-mb 3072 --jobs 6 \
-  --solver target/slice60-after/shinri --run-id slice60 ...; \
+  --solver target/slice60-after/shinri --run-id slice60 \
+  > target/slice60-after/run.log 2>&1; \
   taskset -c 12-23 target/release/shinri-bench run \
   --logics QF_BVFP,QF_DT,QF_LIA,QF_LRA,QF_UF,QF_UFLIA,QF_UFLRA \
   --corpus target/slice59-sample-corpus --timeout 20 --mem-mb 3072 --jobs 6 \
-  --solver target/slice60-after/shinri --run-id slice60-sample ...' &
+  --solver target/slice60-after/shinri --run-id slice60-sample \
+  > target/slice60-after/run-sample.log 2>&1; \
+  date -u +%FT%TZ > target/slice60-after/finished.txt' \
+  > /dev/null 2>&1 &
 # Step 3: reports and join (brief script) -> target/slice60-after/{join.txt,changed.tsv}
 for id in slice60-base slice60 slice60-base-sample slice60-sample; do BENCH_RUN_ID=$id mise run bench-report; done
 # Step 4: triage-in.tsv (brief gain selection + stratified non-gain sample), 6 rows in parallel
@@ -114,6 +131,7 @@ commit the binary was built from:
 | --- | --- |
 | `slice60-base` | `aab0dfd-dirty` |
 | `slice60-base-sample` | `4a9e656` |
+| `slice60` | `4a9e656` |
 | `slice60-sample` | `0e39c39` |
 
 The md5 is the authoritative identity.
@@ -155,7 +173,8 @@ cores 12–23. Results are in `target/slice60-after/unsat-crosscheck.tsv`.
   `13032`, `15041`, `15868`.
 - All 4 denghang rows are cvc5-confirmed, and 1 of them is z3-confirmed too.
 
-The 855 new `unverified` `sat` rows are model-checked by shinri's own gate,
+The 855 new `unverified` `sat` rows (853 stringfuzz `generated`, 2
+`transformed/amazon`) are model-checked by shinri's own gate,
 which is the fence they used to fail. The 32 sampled ones reproduce 3/3.
 
 ### Criterion 3: the four regressions
@@ -241,8 +260,8 @@ byte-identical shinri answers in both runs. Only the z3 oracle changed: it
 timed out in after on 57 rows and in base on 30. The real increase in
 `unverified` comes from the 897 rows that are newly decided but on which z3
 times out:
-- 855 stringfuzz `generated` `sat` rows: regexbig 413, regexpair 362,
-  regexsmall 78, and 2 amazon;
+- 855 `sat` rows: 853 stringfuzz `generated` (regexbig 413, regexpair 362,
+  regexsmall 78) and 2 stringfuzz `transformed/amazon`;
 - 42 `unsat` rows (cross-checked above).
 
 **Unknown ↔ unknown churn.** 133 rows go `sat-budget → str-model-rejected`:
@@ -378,7 +397,7 @@ By family:
 
 | family | rows | callers |
 | --- | ---: | --- |
-| automatark | 23 | 11 `sat` via witness, 12 `unsat` via emptiness |
+| automatark | 23 | 9 `sat` via witness, 14 `unsat` via emptiness |
 | stringfuzz `generated` | 13 | all witness |
 | z3str2 | 2 | both emptiness, including the slice-59 representative `regex-010-reverse-multiply-fuzz` |
 | amazon | 1 | witness |
@@ -562,8 +581,8 @@ slice-59 queue items 2 onward and their carried lists follow verbatim
      concat subject: the key normalisation, or the shape never reaching the
      block.
 5. **Oracle coverage for decided-but-unverified rows.** 897 rows are newly
-   decided while the z3 oracle times out at 20 s: 855 stringfuzz
-   `generated` `sat` and 42 `unsat`. Of the 42 `unsat`, 6 automatark rows
+   decided while the z3 oracle times out at 20 s: 855 `sat` (853
+   stringfuzz `generated`, 2 `transformed/amazon`) and 42 `unsat`. Of the 42 `unsat`, 6 automatark rows
    stay unconfirmed after z3 `-T:120` and cvc5 `--tlimit=120000`
    (`instance06362`, `10317`, `10696`, `13032`, `15041`, `15868`). Options:
    enable the bench's `cvc5` oracle column (cvc5 confirmed 36 of the 42),
