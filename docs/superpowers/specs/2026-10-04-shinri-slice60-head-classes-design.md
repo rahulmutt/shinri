@@ -316,9 +316,9 @@ Criteria, base → variant:
 | 1 | 0 `* → wrong`; 0 wrong answers in triage | PASS. 0 `wrong` rows in both runs. 0 `sat` ↔ `unsat` flips against base or approach 1. 0 wrong answers in 984 triage runs (164 rows). Unsat cross-check of the 371 newly checked variant `unverified` `unsat` rows (369 pre-existing in base) at 120 s: 0 `sat`, 212 confirmed (z3 8, cvc5 212), 159 unconfirmed, all pre-existing |
 | 2 | `violated:memb@not-needed` shrinks ≥ 20% (≥ 450 rows) to `correct` | PASS. 936 of 2,252 base-tagged rows (41.6%) are now `correct`, against 917 for approach 1. The tag goes 2,252 → 432 |
 | 3 | no `correct → non-correct` reproducing 3/3 | PASS. The 4 `correct → unverified` rows are noise: same answer 3/3, only the bench z3 timed out. Norn `312`, `322`, `362` and `454` are `correct` again, 3/3 on both binaries |
-| 4 | serial timing within ±5% | **FAIL, on the faster side** (as approach 1). Pooled over 3 passes: QF_S 0.809 (4.76 → 3.85 s), QF_SLIA 0.845 (7.30 → 6.17 s). Newly-`correct` rows: 9.36×, reported. The passes ran once the 1-min load fell to ≤ 24 (15–18), after about 4 h of waiting |
+| 4 | serial timing within ±5% | **FAIL, on the faster side** (as approach 1). Pooled over 3 passes: QF_S 0.809 (4.76 → 3.85 s), QF_SLIA 0.845 (7.30 → 6.17 s). Newly-`correct` rows: 9.36×, reported. The passes ran once the 1-min load fell to ≤ 24, after about 4 h of waiting; during the passes the 1-min load was 14–18 and the 5-min load 23.5–29.3 |
 | 5 | `mise run ci` green; oracle count | PASS. ci 1773 / 1773 (6 skipped); oracle 831 / 831 (2 skipped) |
-| 6 | neutrality sample: only non-reproducible flips | PASS. 37 sample rows changed, all noise: both binaries give identical results, mostly killed under external host load |
+| 6 | neutrality sample: only non-reproducible flips | PASS. 37 sample rows changed, all noise: both binaries give identical results, mostly killed under external host load. The variant changes only string regex code (`shinri-str` Rule-E), and all 37 changed sample rows are in non-string logics that never reach it |
 
 - **Approach 1 → variant.** The 4 Norn regressions are restored. Approach
   1's 10 Norn HammingDistance gains are given back (`correct → sat-budget`,
@@ -335,7 +335,11 @@ Deviations (variant):
 - Rule-E no longer takes the head-only partition. That contradicts §3
   approach 1, §4.3, and the header's "`range_bounds` deleted":
   `range_bounds` is back, and Rule-E uses it.
-- Triage and the cross-check ran under heavy external host load (load
-  average 67–127 on 24 cores).
-- Cross-check scope: 371 rows, which is all the variant's unchecked `unverified` `unsat` rows. 369 of them predate the slice
-- Criterion 4: out of band on the faster side, as with approach 1, and measured on a loaded host (1-min load 15–18) rather than an idle one
+- Triage and the cross-check ran under heavy external host load (1-min
+  load average 32.78–132.67 on 24 cores, from the triage and cross-check
+  start/end readings and `timing-load.log`).
+- Cross-check scope: 371 rows, which is all the variant's unchecked
+  `unverified` `unsat` rows. 369 of them predate the slice.
+- Criterion 4: out of band on the faster side, as with approach 1, and
+  measured on a loaded host (1-min load 14–18, 5-min load 23.5–29.3)
+  rather than an idle one.

@@ -919,8 +919,9 @@ Gates at `56997aa` (`target/slice60b-gates.txt`): ci exit 0, 1773 run /
 - Base is unchanged: `slice60-base{,-sample}` (`aab0dfd`, md5
   `cf6f6b2f…`).
 - **Host load.** Processes outside this container loaded the host heavily
-  during the variant run and during this analysis. At 09:34 UTC the load
-  average was about 83 on 24 cores. `uptime` readings are in
+  during the variant run and during this analysis. At the start of triage
+  (09:35:59Z) the 1-min load average was 70.81 on 24 cores. `uptime`
+  readings are in
   `target/slice60b-after/{triage-uptime-before,triage-uptime-after,crosscheck-uptime-before,crosscheck-uptime-after}.txt`
   and `timing-load.log`.
 
@@ -936,6 +937,8 @@ tr '\t' ' ' < target/slice60b-after/triage-in.tsv | xargs -P6 -L1 target/slice60
 python3 target/slice60b-after/triage_disp.py   # -> triage-disp.txt, triage-summary.txt
 # unsat cross-check, 5 rows in parallel on cores 13-23 (core 12 kept for timing)
 xargs -P5 -L1 target/slice60b-after/crosscheck-row.sh < target/slice60b-after/unsat-crosscheck-in.txt > target/slice60b-after/unsat-crosscheck.tsv
+# after 135 rows: stopped, the 236 unchecked rows -> unsat-crosscheck-in-rest.txt, relaunched 10 in parallel
+xargs -P10 -L1 target/slice60b-after/crosscheck-row.sh < target/slice60b-after/unsat-crosscheck-in-rest.txt >> target/slice60b-after/unsat-crosscheck.tsv
 # timing: Task 5 Step 6's script with target/slice60b-after/shinri and runs slice60b,
 # gated on the 1-min load being <= 24 (timing-watch.sh)
 ```
@@ -949,7 +952,7 @@ xargs -P5 -L1 target/slice60b-after/crosscheck-row.sh < target/slice60b-after/un
 | 3 | no `correct → non-correct` change that reproduces 3/3 | **PASS** | base → variant has 4 `correct → *` rows, all `correct → unverified`. In each one the variant gives base's answer 3/3 and only the bench's z3 oracle timed out, so all 4 are noise. The 4 Norn rows are `correct` again in the bench and reproduce 3/3 on both binaries (`sat`, `unsat`, `sat`, `sat`) |
 | 4 | serial interleaved timing on 150 both-`correct` rows per string logic, within ±5% | **FAIL on the faster side** (as with approach 1) | Pooled over 3 passes: QF_S **0.809** (4.76 → 3.85 s) and QF_SLIA **0.845** (7.30 → 6.17 s). Each pass is in 0.787–0.864. Newly-`correct` rows: 9.36 (10.79 → 100.99 s), reported. See *Timing (variant)* |
 | 5 | `mise run ci` green; oracle count ≥ slice 59 + this slice's oracle tests | **PASS** | `target/slice60b-gates.txt` at `56997aa`: ci 1773 / 1773 / 6 skipped; oracle 831 / 831 / 2 skipped |
-| 6 | neutrality sample: only non-reproducible timing flips | **PASS** | 37 sample rows changed. All 37 are noise in triage: both binaries got identical results, mostly `killed` 3/3 on both under the host load (table below) |
+| 6 | neutrality sample: only non-reproducible timing flips | **PASS** | 37 sample rows changed. All 37 are noise in triage: both binaries got identical results, mostly `killed` 3/3 on both under the host load (table below). The variant changes only string regex code (`shinri-str` Rule-E), and all 37 changed sample rows are in non-string logics (QF_UF, QF_UFLIA, QF_LIA, QF_BVFP, QF_UFLRA) that never reach it |
 
 ### Verdict changes, base → variant
 
@@ -1041,8 +1044,9 @@ as above.
 Files: `target/slice60b-after/{triage-in.tsv,triage.tsv,triage-disp.txt,triage-summary.txt}`.
 Method: Task 5 Step 4's command and noise rule, base binary vs variant
 binary, 3 interleaved runs each, on cores 12–23, 6 rows in parallel. Ran
-09:35:59Z–09:51:12Z. Load: `70.81, 77.17, 66.99` before and
-`87.30, 96.07, 89.68` after; that load came from outside this container.
+09:35:59Z–09:51:12Z. Load averages (1-, 5-, 15-min): `70.81, 77.17, 66.99`
+before and `87.30, 96.07, 89.68` after; that load came from outside this
+container.
 
 Selection: 164 rows.
 - 981 non-gain rows (944 string + 37 sample), which is more than 200. Every
@@ -1107,8 +1111,10 @@ Method: z3 4.16 `-T:120` and cvc5 1.4.1 `--tlimit=120000` per row
 (`crosscheck-row.sh`), on cores 13–23.
 - The first 135 rows ran 5 in parallel. The rest ran 10 in parallel to
   finish sooner.
-- Times: 09:52:17Z–12:19:12Z. Load: `81.43, 92.64, 88.93` before and
-  `127.21, 118.80, 110.97` after.
+- Times: 09:52:17Z–12:19:12Z. Load averages (1-, 5-, 15-min):
+  `81.43, 92.64, 88.93` before and `127.21, 118.80, 110.97` after. The
+  1-min load in `timing-load.log`'s 5-min samples over the same span was
+  32.78–132.67.
 - Results: `target/slice60b-after/{unsat-crosscheck.tsv,crosscheck-summary.txt,crosscheck-unconfirmed.txt}`.
 
 | z3 | cvc5 | rows |
@@ -1145,8 +1151,9 @@ after run: serial, interleaved, pinned to core 12, sampled with
 - The host load stayed far above 24 (the 1-min load peaked at 142) until
   13:47Z. `timing-watch.sh` checked every 5 min (`timing-load.log`) and
   started the passes once the 1-min load was ≤ 24.
-- The passes ran 13:47:33Z–13:49:54Z, with 1-min load 17.72 → 15.09. That
-  host was below its core count but not idle.
+- The passes ran 13:47:33Z–13:49:54Z. Readings at pass starts and ends:
+  1-min load 14.24–17.72, 5-min load 23.53–29.29. The host was below its
+  core count but not idle.
 
 | group | pass 1 | pass 2 | pass 3 | pooled base → variant | pooled ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -1176,7 +1183,12 @@ after run: serial, interleaved, pinned to core 12, sampled with
 - **Item 2 (class-1 remainder, Norn concat subjects):** the count is now
   about 356 rows (Norn's share of the 432 still tagged), not about 465.
 - **Item 5 (oracle coverage):** with the variant, 885 base-tagged rows are
-  decided but `unverified` (843 `sat`, 42 `unsat`). The variant's 371 additional `unverified` `unsat` rows have 0 `sat`, and 212 are confirmed by z3 or cvc5 at 120 s. The 159 unconfirmed rows (manyregexes 73, variants 59, automatark 23, Norn 3, regexpair 1) were already `unverified` `unsat` in base, so the slice did not create them. They belong in this item's oracle-coverage work.
+  decided but `unverified` (843 `sat`, 42 `unsat`). The variant's 371
+  additional `unverified` `unsat` rows have 0 `sat`, and 212 are confirmed
+  by z3 or cvc5 at 120 s. The 159 unconfirmed rows (manyregexes 73, variants
+  59, automatark 23, Norn 3, regexpair 1) were already `unverified` `unsat`
+  in base, so the slice did not create them. They belong in this item's
+  oracle-coverage work.
 - **New candidate:** recover the 10 HammingDistance gains without the 4
   losses. Candidate (c), a disjunct order independent of partition
   granularity, is still open. Lower priority than items 2–4.
@@ -1191,9 +1203,15 @@ after run: serial, interleaved, pinned to core 12, sampled with
    the owner-approved follow-up to the criterion-3 FAIL.
 2. **Benchmarked commit:** `56997aa`, which is branch HEAD before this docs
    commit.
-3. **Triage under external load.** Load average was 67–96 on 24 cores
-   during triage. Sample rows near the 20 s limit were killed on both
-   binaries, so their noise classification rests on the two binaries
-   agreeing, not on reproducing the base answer.
-4. **Unsat cross-check scope.** The brief asked for every variant `unverified` `unsat` row not already checked. That is 371 rows, of which 369 predate this slice (they were already `unverified` `unsat` in base). All were run. Parallelism went from 5 to 10 partway through, to finish sooner under the load.
-5. **Timing.** Timing waited about 4 h for the host load to drop. It ran at a 1-min load of 15–18 rather than on an idle host. Criterion 4 is out of band on the faster side, as with approach 1.
+3. **Triage under external load.** The 1-min load average was 70.81 at the
+   start of triage and 87.30 at its end, on 24 cores. Sample rows near the
+   20 s limit were killed on both binaries, so their noise classification
+   rests on the two binaries agreeing, not on reproducing the base answer.
+4. **Unsat cross-check scope.** The brief asked for every variant
+   `unverified` `unsat` row not already checked. That is 371 rows, of
+   which 369 predate this slice (they were already `unverified` `unsat` in
+   base). All were run. Parallelism went from 5 to 10 partway through, to
+   finish sooner under the load.
+5. **Timing.** Timing waited about 4 h for the host load to drop. It ran
+   at a 1-min load of 14–18 (5-min load 23.5–29.3) rather than on an idle
+   host. Criterion 4 is out of band on the faster side, as with approach 1.
