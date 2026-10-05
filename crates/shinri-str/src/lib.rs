@@ -128,6 +128,13 @@ pub struct StrSolver {
     /// ground/conflict handling stay fully intact; ONLY the Split emission
     /// is suppressed. Monotone, like `minted_eqs`.
     memb_minted_eqs: FxHashSet<TermId>,
+    /// `str.in_re` atoms MINTED by the S3/S4/E membership rules (the head,
+    /// tail and class-shape disjuncts), as opposed to memberships present in
+    /// the reduced INPUT assertions. The SAT state can hold jointly
+    /// unsatisfiable combinations of these derivative atoms, and the model
+    /// gate checks only input assertions, so `joint_seeds` ignores them.
+    /// Monotone, like `minted_eqs`.
+    minted_membs: FxHashSet<TermId>,
     /// Counter for fresh string skolem variables minted by F-split.
     fresh_ctr: u32,
     /// Set once an H1 propagation merged a var into `""`: arith then needs the
@@ -1581,10 +1588,21 @@ impl StrSolver {
         // Slice 21: seed free membership variables with searched words so
         // concat assembly composes REPAIRED values, not default fills.
         let membs: Vec<(TermId, bool)> = self.memb_true.iter().map(|&(a, _, p)| (a, p)).collect();
+        let input_membs: Vec<(TermId, bool)> = membs
+            .iter()
+            .copied()
+            .filter(|(a, _)| !self.minted_membs.contains(a))
+            .collect();
         let mut seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
         // Slice 61: joint words for the free leaves of concat-subject
         // memberships override those leaves' per-leaf seeds.
-        seeds.extend(joint_seed::joint_seeds(cx.terms, cx.eq, &known, &membs, m));
+        seeds.extend(joint_seed::joint_seeds(
+            cx.terms,
+            cx.eq,
+            &known,
+            &input_membs,
+            m,
+        ));
         // Slice 57: default build, then self-check against the INPUT string
         // equations (non-minted `eq_true` atoms). Only a violated input
         // equation triggers the reconciliation rebuild, which is adopted if it

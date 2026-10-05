@@ -562,6 +562,7 @@ pub(crate) fn memb_check(
                     .terms
                     .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[h, c_t])
                     .expect("str.in_re well-sorted");
+                s.minted_membs.insert(m_h);
                 return Some(emit_split(s, cx.terms, vec![dist, m_h], guard));
             }
             // S4: lit ∧ x=h·z → z·γ ∈ R''.
@@ -575,6 +576,7 @@ pub(crate) fn memb_check(
                     .terms
                     .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[tail_t, tail_re])
                     .expect("str.in_re well-sorted");
+                s.minted_membs.insert(m_tail);
                 return Some(emit_split(s, cx.terms, vec![dist, m_tail], guard));
             }
             continue; // fully unfolded at this level — wait for SAT/merges
@@ -604,11 +606,12 @@ pub(crate) fn memb_check(
                 }
                 let shape = regex::concat(vec![Rex::Range(lo, hi), d]);
                 let shape_t = regex::rex_to_term(cx.terms, &shape);
-                disj.push(
-                    cx.terms
-                        .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[residual, shape_t])
-                        .expect("str.in_re well-sorted"),
-                );
+                let m_shape = cx
+                    .terms
+                    .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[residual, shape_t])
+                    .expect("str.in_re well-sorted");
+                s.minted_membs.insert(m_shape);
+                disj.push(m_shape);
             }
             if disj.is_empty() {
                 // No ε, no live class: L(cur) = ∅ — the membership is

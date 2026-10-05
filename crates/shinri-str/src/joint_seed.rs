@@ -8,7 +8,8 @@
 //! concat-subject memberships by shared free leaves; `solve_group` runs one
 //! DFS that assigns the leaves a character at a time while advancing every
 //! constraint's derivative. The words are CANDIDATES: they override the
-//! per-leaf seeds and the gate re-checks every assertion, so a miss or a bug
+//! per-leaf seeds (input memberships only: derivative atoms minted by the
+//! S/E rules can be jointly unsatisfiable) and the gate re-checks every assertion, so a miss or a bug
 //! can only leave the prior sound `unknown`.
 
 use crate::model;
@@ -469,6 +470,11 @@ fn groups(raw: &[(Vec<RawOp>, Rex)]) -> Vec<Vec<usize>> {
 /// lengths (pass 1), then at free lengths (pass 2). A group yields a word
 /// for every leaf or nothing. The caller merges the result over
 /// `memb_seeds`.
+///
+/// `membs` must hold INPUT memberships only (the caller filters out
+/// `StrSolver::minted_membs`): the SAT state can contain jointly
+/// unsatisfiable Rule-S/E derivative atoms, which would make a solvable
+/// group unsolvable, and the model gate checks only the input assertions.
 pub(crate) fn joint_seeds(
     terms: &mut Context,
     eq: &mut EqualityEngine,
@@ -1196,6 +1202,36 @@ mod front_tests {
         let s = joint_seeds(&mut ctx, &mut eq, &[x, y, xy, hz, h, z], &[(a, true)], &m);
         assert_eq!(s.get(&x).map(String::as_str), Some("bb"), "{s:?}");
         assert_eq!(s.get(&y).map(String::as_str), Some("b"), "{s:?}");
+    }
+
+    #[test]
+    fn contradicting_derivative_atom_is_why_callers_filter_minted() {
+        // Input x·y ∈ a·b*; a minted derivative x·y ∈ z·Σ* contradicts it.
+        // Given both, the group is unsolvable; the filtered (input-only)
+        // slice that `model_with` passes is solvable.
+        let mut ctx = Context::new();
+        let (x, y) = (var(&mut ctx, "x"), var(&mut ctx, "y"));
+        let xy = cat(&mut ctx, &[x, y]);
+        let input_re = regex::concat(vec![regex::lit_test("a"), regex::star_lit_test("b")]);
+        let a_in = memb(&mut ctx, xy, &input_re);
+        let z_first = regex::concat(vec![regex::lit_test("z"), regex::star_lit_test("z")]);
+        let a_min = memb(&mut ctx, xy, &z_first);
+        let mut m = ModelBuilder::default();
+        pin_len(&mut ctx, &mut m, x, 1);
+        pin_len(&mut ctx, &mut m, y, 1);
+        let mut eq = EqualityEngine::default();
+        let known = [x, y, xy];
+        let both = joint_seeds(
+            &mut ctx,
+            &mut eq,
+            &known,
+            &[(a_in, true), (a_min, true)],
+            &m,
+        );
+        assert!(both.is_empty(), "{both:?}");
+        let s = joint_seeds(&mut ctx, &mut eq, &known, &[(a_in, true)], &m);
+        assert_eq!(s.get(&x).map(String::as_str), Some("a"));
+        assert_eq!(s.get(&y).map(String::as_str), Some("b"));
     }
 
     #[test]
