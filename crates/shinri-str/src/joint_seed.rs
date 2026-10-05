@@ -541,4 +541,229 @@ mod tests {
             Outcome::Aborted
         );
     }
+
+    #[test]
+    fn free_lengths_find_when_fixed_cannot() {
+        // x·y ∈ (ab)+ with model lengths |x| = 1, |y| = 0: "a" is not in
+        // (ab)+, so pass 1 is exhausted; pass 2 finds a short pair.
+        let own = vec![sigma_star(), sigma_star()];
+        let ab = regex::concat(vec![ch('a'), ch('b')]);
+        let cons = vec![JConstraint {
+            ops: vec![JOp::Leaf(0), JOp::Leaf(1)],
+            rex: regex::concat(vec![ab.clone(), regex::star(ab)]),
+        }];
+        assert_eq!(
+            solve_group(&own, &cons, Lengths::Fixed(&[1, 0])),
+            Outcome::Exhausted
+        );
+        let w = found(solve_group(&own, &cons, Lengths::Free(JOINT_FREE_LEN_CAP)));
+        assert!(satisfies(&own, &cons, &w), "{w:?}");
+    }
+
+    #[test]
+    fn free_lengths_prefer_short_words() {
+        // x·"z"·y ∈ a*za*: End is tried first, so both leaves come back empty.
+        let own = vec![sigma_star(), sigma_star()];
+        let cons = vec![JConstraint {
+            ops: vec![JOp::Leaf(0), lit("z"), JOp::Leaf(1)],
+            rex: regex::concat(vec![regex::star(ch('a')), ch('z'), regex::star(ch('a'))]),
+        }];
+        let w = found(solve_group(&own, &cons, Lengths::Free(JOINT_FREE_LEN_CAP)));
+        assert_eq!(w, vec![String::new(), String::new()]);
+    }
+
+    #[test]
+    fn free_budget_bounds_total_length() {
+        // x ∈ a{70}: needs 70 leaf characters, more than JOINT_FREE_LEN_CAP.
+        let own = vec![sigma_star()];
+        let cons = vec![JConstraint {
+            ops: vec![JOp::Leaf(0), lit("z")],
+            rex: regex::concat(vec![regex::loop_(ch('a'), 70, 70), ch('z')]),
+        }];
+        assert_eq!(
+            solve_group(&own, &cons, Lengths::Free(JOINT_FREE_LEN_CAP)),
+            Outcome::Exhausted
+        );
+    }
+
+    #[test]
+    fn norn_531_free() {
+        let (own, cons) = norn_531();
+        let w = found(solve_group(&own, &cons, Lengths::Free(JOINT_FREE_LEN_CAP)));
+        assert!(satisfies(&own, &cons, &w), "{w:?}");
+    }
+
+    /// Deterministic LCG (no new dependency), as in the oracle files.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            self.0 >> 16
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A small regex over {a, b}. Every char other than a/b behaves alike,
+    /// so 'c' stands for all of them in the brute force.
+    fn gen_rex(rng: &mut Lcg, depth: u32) -> Rex {
+        let leafy = depth == 0 || rng.below(3) == 0;
+        if leafy {
+            return match rng.below(4) {
+                0 => ch('a'),
+                1 => ch('b'),
+                2 => Rex::Range('a' as u32, 'b' as u32),
+                _ => regex::star(ch('a')),
+            };
+        }
+        let a = gen_rex(rng, depth - 1);
+        match rng.below(5) {
+            0 => regex::concat(vec![a, gen_rex(rng, depth - 1)]),
+            1 => regex::union(vec![a, gen_rex(rng, depth - 1)]),
+            2 => regex::star(a),
+            3 => regex::comp(a),
+            _ => regex::inter(vec![a, gen_rex(rng, depth - 1)]),
+        }
+    }
+
+    /// 1–2 leaves, 1–2 constraints of 1–3 operands each (≥ 1 leaf), leaves
+    /// renumbered by first occurrence so later constraints may see them out
+    /// of order (waiting constraints).
+    fn gen_group(rng: &mut Lcg) -> (Vec<Rex>, Vec<JConstraint>) {
+        let k = 1 + rng.below(2) as usize;
+        let mut cons: Vec<JConstraint> = (0..1 + rng.below(2))
+            .map(|_| {
+                let mut ops: Vec<JOp> = (0..1 + rng.below(3))
+                    .map(|_| match rng.below(4) {
+                        0 => lit(["a", "b", "ab"][rng.below(3) as usize]),
+                        _ => JOp::Leaf(rng.below(k as u64) as usize),
+                    })
+                    .collect();
+                if !ops.iter().any(|o| matches!(o, JOp::Leaf(_))) {
+                    ops[0] = JOp::Leaf(0);
+                }
+                JConstraint {
+                    ops,
+                    rex: gen_rex(rng, 3),
+                }
+            })
+            .collect();
+        let mut order: Vec<usize> = Vec::new();
+        for c in &cons {
+            for op in &c.ops {
+                if let JOp::Leaf(l) = op {
+                    if !order.contains(l) {
+                        order.push(*l);
+                    }
+                }
+            }
+        }
+        for c in &mut cons {
+            for op in &mut c.ops {
+                if let JOp::Leaf(l) = op {
+                    *l = order.iter().position(|x| x == l).unwrap();
+                }
+            }
+        }
+        let own = (0..order.len())
+            .map(|_| {
+                if rng.below(2) == 0 {
+                    sigma_star()
+                } else {
+                    gen_rex(rng, 2)
+                }
+            })
+            .collect();
+        (own, cons)
+    }
+
+    fn words_over(n: usize) -> Vec<String> {
+        let mut out = vec![String::new()];
+        for _ in 0..n {
+            out = out
+                .into_iter()
+                .flat_map(|w| ['a', 'b', 'c'].map(|c| format!("{w}{c}")))
+                .collect();
+        }
+        out
+    }
+
+    /// Brute force: some assignment with the given per-leaf lengths
+    /// satisfies the group.
+    fn brute(own: &[Rex], cons: &[JConstraint], lens: &[usize]) -> bool {
+        fn go(own: &[Rex], cons: &[JConstraint], lens: &[usize], acc: &mut Vec<String>) -> bool {
+            if acc.len() == lens.len() {
+                return satisfies(own, cons, acc);
+            }
+            for w in words_over(lens[acc.len()]) {
+                acc.push(w);
+                if go(own, cons, lens, acc) {
+                    return true;
+                }
+                acc.pop();
+            }
+            false
+        }
+        go(own, cons, lens, &mut Vec::new())
+    }
+
+    #[test]
+    fn sweep_sound_and_complete() {
+        let mut rng = Lcg(61);
+        let (mut found_n, mut exhausted_n, mut aborted_n) = (0, 0, 0);
+        for _ in 0..1500 {
+            let (own, cons) = gen_group(&mut rng);
+            // Pass 1 at random fixed lengths (total ≤ 4).
+            let lens: Vec<usize> = (0..own.len()).map(|_| rng.below(3) as usize).collect();
+            let expect = brute(&own, &cons, &lens);
+            match solve_group(&own, &cons, Lengths::Fixed(&lens)) {
+                Outcome::Found(w) => {
+                    found_n += 1;
+                    assert!(
+                        satisfies(&own, &cons, &w),
+                        "unsound {w:?}: {own:?} {cons:?}"
+                    );
+                    assert!(w.iter().zip(&lens).all(|(w, &n)| w.chars().count() == n));
+                }
+                Outcome::Exhausted => {
+                    exhausted_n += 1;
+                    assert!(!expect, "incomplete at {lens:?}: {own:?} {cons:?}");
+                }
+                Outcome::Aborted => aborted_n += 1,
+            }
+            // Pass 2 with a budget of 4 vs every length split with total ≤ 4.
+            let any = (0..=4usize).any(|t| {
+                let mut splits = vec![vec![]];
+                for _ in 0..own.len() {
+                    splits = splits
+                        .into_iter()
+                        .flat_map(|s: Vec<usize>| {
+                            (0..=t).map(move |n| [s.clone(), vec![n]].concat())
+                        })
+                        .collect();
+                }
+                splits
+                    .into_iter()
+                    .filter(|s| s.iter().sum::<usize>() == t)
+                    .any(|s| brute(&own, &cons, &s))
+            });
+            match solve_group(&own, &cons, Lengths::Free(4)) {
+                Outcome::Found(w) => {
+                    assert!(
+                        satisfies(&own, &cons, &w),
+                        "unsound free {w:?}: {own:?} {cons:?}"
+                    );
+                    assert!(w.iter().map(|w| w.chars().count()).sum::<usize>() <= 4);
+                }
+                Outcome::Exhausted => assert!(!any, "incomplete free: {own:?} {cons:?}"),
+                Outcome::Aborted => aborted_n += 1,
+            }
+        }
+        eprintln!("sweep: {found_n} found, {exhausted_n} exhausted, {aborted_n} aborted");
+        assert!(
+            found_n > 100 && exhausted_n > 100,
+            "generator must exercise both outcomes"
+        );
+    }
 }
