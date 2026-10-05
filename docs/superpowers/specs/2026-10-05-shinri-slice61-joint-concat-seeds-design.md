@@ -8,7 +8,8 @@ mechanism and ship together; item 4 (concat-subject emptiness → `unsat`)
 stays queued; this slice is model-side only.
 
 **Area:** `shinri-str` (new `joint_seed.rs`; `model::class_len_in_model`
-becomes `pub(crate)`; one call added in `lib.rs`
+becomes `pub(crate)`; `regex.rs` gains `class_witness` and `joint_classes`;
+one call added in `lib.rs`
 `model_with`). Tests in `shinri-str` and `shinri-solver`. No parser, SAT,
 Combiner, word-equation, Rule-E, emptiness, lowering, model-gate or
 bench-tool change.
@@ -148,15 +149,21 @@ consumes operands while its next operand is a `Const` or an assigned
 `FUEL_NODE_CAP` kills the branch.
 
 **Character step for leaf `x`.** Active constraints are those whose next
-operand is `x`. Classes are `next_classes(&inter([own, d_active…]))`, which
-is the common refinement because `head_bounds` collects every `Inter`
-member's head bounds. `None` (past `CLASS_SPLIT_CAP`) is a dead end, not a
-verdict. Per class the witness is the smallest non-surrogate code point;
-pure-surrogate classes are skipped (as in `search_word`). The character
-advances `own` and every active `d_j`. A constraint waiting on a different
-unassigned leaf is not advanced and consumes `x`'s whole word later in
-*Advance*; it does not prune `x`'s characters, which costs search time
-only.
+operand is `x`; *later* constraints are those that will consume `x`'s
+characters afterwards (one waiting on a different unassigned leaf, or any
+constraint with a further occurrence of `x`). Classes are
+`regex::joint_classes(&inter([own, d_active…]), &[d_later…])`: the head
+bounds of the `Inter` (every member's, so the common refinement), refined
+by every range of each later `d_j`. `deriv` never creates a `Range`, so a
+later constraint's future tests are among its present ranges and each class
+is uniform for it too; without this refinement one witness per class could
+miss the word a later constraint needs (completeness, not soundness).
+`None` (past `CLASS_SPLIT_CAP`) is a dead end, not a verdict. Per class the
+witness is the smallest non-surrogate code point; pure-surrogate classes
+are skipped (as in `search_word`). The character advances `own` and every
+active `d_j`. A later constraint is not advanced: it consumes `x`'s whole
+word in *Advance*, and does not prune `x`'s characters, which costs search
+time only.
 
 **Leaf end.** When the leaf ends (§4.5), require `nullable(own)`, step each
 active constraint past the `x` operand, run *Advance*, move to the next
@@ -208,8 +215,8 @@ today's per-leaf `search_word`. Measured per §8.
 ## 5. What this does not change
 
 `memb_seeds`, `search_word`, `search_shortest`, `next_classes`,
-`rule_e_classes`, Rule-E, the slice-28 emptiness conflict, the gate and the
-reconcile acceptance rules. A group that is ineligible, pinned or not
+`rule_e_classes` (`regex.rs` only gains two helpers), Rule-E, the slice-28
+emptiness conflict, the gate and the reconcile acceptance rules. A group that is ineligible, pinned or not
 solved within the caps leaves the seed map exactly as `memb_seeds` built it.
 
 ## 6. Tasks
@@ -243,12 +250,13 @@ Ordered; the implementation plan details them.
   - Waiting constraint: `x·y ∈ R1` with `y·x ∈ R2`.
   - Pass-2 fallback: model lengths infeasible, free lengths feasible.
   - Cap hit: empty result.
-- **Sweep.** A seeded deterministic generator (no new dependency) of a few
-  thousand small groups over a 2–3 letter alphabet:
+- **Sweep.** A seeded deterministic generator (no new dependency) of 1,500
+  small groups over a 2–3 letter alphabet:
   - soundness: every returned word set satisfies every constraint and own
     language under `eval_membership`;
   - completeness: when no cap is hit, the search finds a solution iff
-    brute-force enumeration up to total length 6 does.
+    brute-force enumeration up to total length 4 does (a 3-letter alphabet keeps
+    this inside the blocking-tier budget).
 
 ### 7.2 Probes (`shinri-solver/tests/slice61_probes.rs`, blocking tier)
 
