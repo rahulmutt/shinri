@@ -395,6 +395,7 @@ fn is_minted_concat(terms: &Context, t: TermId) -> bool {
     // `flatten` also rejects above-alphabet constants; those are not minted
     // splits either, so treating them as "not minted" is the safe side.
     flatten(terms, t, &mut ops)
+        && ops.iter().any(|o| matches!(o, RawOp::Leaf(_)))
         && ops.iter().all(|o| match o {
             RawOp::Lit(_) => true,
             RawOp::Leaf(l) => match terms.term_node(*l) {
@@ -475,13 +476,21 @@ fn groups(raw: &[(Vec<RawOp>, Rex)]) -> Vec<Vec<usize>> {
 /// `StrSolver::minted_membs`): the SAT state can contain jointly
 /// unsatisfiable Rule-S/E derivative atoms, which would make a solvable
 /// group unsolvable, and the model gate checks only the input assertions.
-pub(crate) fn joint_seeds(
+///
+/// The flag is true iff an adopted word's length differs from its leaf's
+/// model length (a pass-2 result). Spec §4.5's gate argument — the gate
+/// re-reads `str.len` from the string value — holds only for atomic
+/// `str.len` comparisons; a compound arithmetic constraint (`len x + len y
+/// = 3`) is satisfied by the arith value, not the word. The caller must then
+/// require the strict gate (R9).
+pub(crate) fn joint_seeds_flagged(
     terms: &mut Context,
     eq: &mut EqualityEngine,
     known: &[TermId],
     membs: &[(TermId, bool)],
     m: &ModelBuilder,
-) -> FxHashMap<TermId, String> {
+) -> (FxHashMap<TermId, String>, bool) {
+    let mut length_changed = false;
     let mut bare: FxHashMap<TermId, Vec<Rex>> = FxHashMap::default();
     let mut raw: Vec<(Vec<RawOp>, Rex)> = Vec::new();
     for &(atom, pos) in membs {
@@ -559,10 +568,26 @@ pub(crate) fn joint_seeds(
             },
         };
         if let Some(words) = words {
+            length_changed |= words
+                .iter()
+                .zip(&lens)
+                .any(|(w, &n)| w.chars().count() != n);
             out.extend(leaves.into_iter().zip(words));
         }
     }
-    out
+    (out, length_changed)
+}
+
+/// Words only (tests that do not care about the R9 flag).
+#[cfg(test)]
+fn joint_seeds(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    membs: &[(TermId, bool)],
+    m: &ModelBuilder,
+) -> FxHashMap<TermId, String> {
+    joint_seeds_flagged(terms, eq, known, membs, m).0
 }
 
 #[cfg(test)]
@@ -1232,6 +1257,39 @@ mod front_tests {
         let s = joint_seeds(&mut ctx, &mut eq, &known, &[(a_in, true)], &m);
         assert_eq!(s.get(&x).map(String::as_str), Some("a"));
         assert_eq!(s.get(&y).map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn length_change_flag_marks_pass_two_only() {
+        let mut ctx = Context::new();
+        let (x, y) = (var(&mut ctx, "x"), var(&mut ctx, "y"));
+        let xy = cat(&mut ctx, &[x, y]);
+        let r = regex::star(regex::lit_test("ab"));
+        let a = memb(&mut ctx, xy, &r);
+        let known = [x, y, xy];
+        let mut eq = EqualityEngine::default();
+        // Lengths 1+1 fit (ab): pass 1, flag clear.
+        let mut m = ModelBuilder::default();
+        pin_len(&mut ctx, &mut m, x, 1);
+        pin_len(&mut ctx, &mut m, y, 1);
+        let (s, flag) = joint_seeds_flagged(&mut ctx, &mut eq, &known, &[(a, true)], &m);
+        assert_eq!(s.len(), 2);
+        assert!(!flag);
+        // Lengths 1+2 cannot (odd): pass 2, flag set.
+        let mut m = ModelBuilder::default();
+        pin_len(&mut ctx, &mut m, x, 1);
+        pin_len(&mut ctx, &mut m, y, 2);
+        let (s, flag) = joint_seeds_flagged(&mut ctx, &mut eq, &known, &[(a, true)], &m);
+        assert_eq!(s.len(), 2);
+        assert!(flag);
+    }
+
+    #[test]
+    fn constant_only_concat_is_not_minted() {
+        let mut ctx = Context::new();
+        let (a, b) = (ctx.mk_string_const("a"), ctx.mk_string_const("b"));
+        let t = cat(&mut ctx, &[a, b]);
+        assert!(!is_minted_concat(&ctx, t));
     }
 
     #[test]

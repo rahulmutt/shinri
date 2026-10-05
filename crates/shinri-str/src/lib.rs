@@ -1596,13 +1596,15 @@ impl StrSolver {
         let mut seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
         // Slice 61: joint words for the free leaves of concat-subject
         // memberships override those leaves' per-leaf seeds.
-        seeds.extend(joint_seed::joint_seeds(
-            cx.terms,
-            cx.eq,
-            &known,
-            &input_membs,
-            m,
-        ));
+        let (joint, joint_len_changed) =
+            joint_seed::joint_seeds_flagged(cx.terms, cx.eq, &known, &input_membs, m);
+        seeds.extend(joint);
+        if joint_len_changed {
+            // A joint word whose length differs from the arith model's: only
+            // atomic `str.len` comparisons are re-read from the string, so
+            // require the strict gate (every assertion definitely true).
+            m.require_strict_check();
+        }
         // Slice 57: default build, then self-check against the INPUT string
         // equations (non-minted `eq_true` atoms). Only a violated input
         // equation triggers the reconciliation rebuild, which is adopted if it
