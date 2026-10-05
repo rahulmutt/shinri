@@ -197,7 +197,7 @@ neutrality sample for QF_BVFP, QF_DT, QF_LIA, QF_LRA, QF_UF, QF_UFLIA,
 QF_UFLRA; base binary from the branch point; `--timeout 20 --mem-mb 3072
 --jobs 6`.
 
-The report (`docs/superpowers/research/YYYY-MM-DD-smtlib-2024-slice60-head-classes-report.md`)
+The report (`docs/superpowers/research/2026-10-05-smtlib-2024-slice60-head-classes-report.md`)
 gives:
 
 1. Verdict changes by `fence_detail` tag and by family (automatark,
@@ -239,3 +239,58 @@ Written by the measurement report (§8 item 5). Carries slice-59 queue items
   - `crates/shinri-str/src/memb.rs:587` (Rule-E), `:662` (emptiness conflict)
   - `crates/shinri-str/src/model.rs:467` (`memb_seeds`)
   - `crates/shinri-solver/tests/script_e2e.rs` (`in_re_unfold_unknown_class_cap`)
+
+## 11. Measured outcomes
+
+Full evidence:
+`docs/superpowers/research/2026-10-05-smtlib-2024-slice60-head-classes-report.md`.
+Benchmarked binary: `4a9e656`. HEAD `0e39c39` differs only in tests and
+comments.
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | 0 `* → wrong`; 0 wrong answers in triage | PASS. 0 `wrong` rows in all four runs (103,335 + 2,000 rows per binary). 0 `sat` ↔ `unsat` flips. 0 wrong answers in 1,434 triage runs (239 rows). The 42 new unverified `unsat` rows were cross-checked with z3 `-T:120` and cvc5 `--tlimit=120000`: 0 `sat`; 5 confirmed by z3 and 36 by cvc5 (36 by either); 6 automatark rows unconfirmed |
+| 2 | `violated:memb@not-needed` shrinks ≥ 20% (≥ 450 rows) to `correct` | PASS. 917 of 2,252 base-tagged rows (40.7%) are now `correct`. A further 897 are decided but `unverified` (z3 oracle timeout) |
+| 3 | no `correct → non-correct` reproducing 3/3 | **FAIL — accepted by controller ruling, pending owner decision.** 4 Norn HammingDistance rows (`norn-benchmark-312`, `322`, `362`, `454`): `sat`/`unsat` → `unknown` (3 `sat-budget`, 1 `str-model-rejected`), 3/3 on each side. Only Rule-E runs the changed partition on these rows (a search-order effect). There is no `sat` ↔ `unsat` flip, and the family nets +6 (+10 / −4). The PR does not merge without the owner's decision |
+| 4 | serial timing within ±5% (150 both-`correct` rows per string logic) | **FAIL, outside the band on the faster side.** Pooled over 3 passes: QF_S 0.794 (5.49 → 4.36 s), QF_SLIA 0.740 (5.80 → 4.29 s). Every pass is in 0.709–0.828, and an after-first diagnostic pass gives 0.868 / 0.746. Newly-`correct` rows: 11.10× (8.13 → 90.28 s), reported. Their median is 9 ms; the cost is concentrated in stringfuzz `generated` witness searches (up to 2.7 s) |
+| 5 | `mise run ci` green; oracle count ≥ slice 59 + this slice's oracle tests | PASS. ci exit 0, 1768 passed / 6 skipped (HEAD 1769). Oracle 831 passed / 2 skipped. Wide-head pins 3/3 |
+| 6 | neutrality sample: only non-reproducible flips | PASS. 4 sample rows changed, all noise in triage |
+
+**`violated:memb@not-needed`: 2,252 → 525.** `unknown:str-model-rejected`
+overall: 4,084 → 2,360. String `correct`: QF_S 16,057 → 16,666, QF_SLIA
+24,856 → 25,144.
+
+Caller attribution (40 sampled gain rows): witness search 24 (1 of them
+also has Rule-E splits), emptiness conflict 16, Rule-E only 0.
+
+What remains of class 1 is a concat-subject shape: Norn operands seeded but
+jointly inconsistent, about 465 rows, plus `regex-035-*` (28 rows,
+unchanged). The report's queue now starts with the Norn Rule-E regressions,
+then the class-1 remainder.
+
+### Deviations from this spec
+
+- Criterion 3 is a FAIL, accepted by controller ruling and pending owner
+  decision (4 Norn HammingDistance rows, from Rule-E search order).
+- Criterion 4 is a FAIL on the faster side (pooled 0.794 / 0.740). By intent
+  this is a speed-up; by the letter it is outside ±5%.
+- §7.2: the shared-member `sat` sibling in `slice60_probes` has two `re.+`
+  memberships and one `re.*`, not three `re.+`.
+- §7.3: the oracle uses z3 `-T:3` for generated scripts and `-T:20` for
+  probes and witness re-checks. A shinri `unsat` whose z3 check times out
+  fails the test, which is stricter than the spec. Last tally: 65 `sat`,
+  77 `unsat`, 58 `unknown`, 37 z3 timeouts (the timeout count includes
+  genuine z3 `unknown`).
+- Rule-E coverage comes from the unit test
+  `memb::tests::rule_e_long_literal_head_splits_not_fenced`, not from the
+  oracle. The oracle's `(str.++ x y)` scripts never reached a decided answer
+  through Rule-E.
+- The bench measured `4a9e656`. HEAD `0e39c39` adds only tests and comments.
+- Triage covered 239 rows: every small stratum and every `correct → *` and
+  sample row in full; seeded samples of 32 from the two large strata (897
+  and 133 rows); and 32 gain rows. Rows ran 6 in parallel.
+- Extra gate (controller ruling): the cross-check of the 42 unverified
+  `unsat` rows.
+- Queue candidate from the final review: concat-subject memberships with a
+  provably empty intersection (e.g. `(str.++ x y) ∈ L40+ ∩ (bba)+`) stay
+  `unknown` in both base and after. Queued as item 4.
