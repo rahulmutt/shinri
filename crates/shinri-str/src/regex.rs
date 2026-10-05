@@ -455,8 +455,35 @@ fn head_bounds(r: &Rex, out: &mut BTreeSet<u32>) {
 /// `CLASS_SPLIT_CAP` (→ caller fences).
 pub(crate) fn next_classes(r: &Rex) -> Option<Vec<(u32, u32)>> {
     let mut bounds = BTreeSet::new();
-    bounds.insert(0u32);
     head_bounds(r, &mut bounds);
+    classes_from_bounds(bounds)
+}
+
+/// Collect the class boundaries contributed by every `Range` node in `r`
+/// (head-reachable or not): each range [lo, hi] cuts Σ at lo and hi+1. This
+/// is Rule-E's preferred partition (see `rule_e_classes`).
+fn range_bounds(r: &Rex, out: &mut BTreeSet<u32>) {
+    match r {
+        Rex::Empty | Rex::Eps => {}
+        Rex::Range(lo, hi) => {
+            out.insert(*lo);
+            if *hi < MAX_CODE {
+                out.insert(hi + 1);
+            }
+        }
+        Rex::Concat(ps) | Rex::Union(ps) | Rex::Inter(ps) => {
+            for p in ps {
+                range_bounds(p, out);
+            }
+        }
+        Rex::Star(i) | Rex::Comp(i) | Rex::Loop(i, ..) => range_bounds(i, out),
+    }
+}
+
+/// Turn a set of cut points into the partition of Σ they induce (0 is always
+/// a cut). `None` iff that exceeds `CLASS_SPLIT_CAP`.
+fn classes_from_bounds(mut bounds: BTreeSet<u32>) -> Option<Vec<(u32, u32)>> {
+    bounds.insert(0u32);
     let cuts: Vec<u32> = bounds.into_iter().collect();
     if cuts.len() > CLASS_SPLIT_CAP {
         return None;
@@ -471,6 +498,18 @@ pub(crate) fn next_classes(r: &Rex) -> Option<Vec<(u32, u32)>> {
         classes.push((lo, hi));
     }
     Some(classes)
+}
+
+/// Rule-E's partition: the all-ranges one when it is within
+/// `CLASS_SPLIT_CAP`, otherwise the head-only `next_classes`; `None` iff both
+/// exceed the cap. Both partitions are exact (`deriv` is uniform per class);
+/// the full one is preferred because it reproduces the pre-slice-60 Rule-E
+/// disjunct structure (and so the SAT search order) wherever that fit, while
+/// the head-only one keeps Rule-E from fencing on long literals.
+pub(crate) fn rule_e_classes(r: &Rex) -> Option<Vec<(u32, u32)>> {
+    let mut bounds = BTreeSet::new();
+    range_bounds(r, &mut bounds);
+    classes_from_bounds(bounds).or_else(|| next_classes(r))
 }
 
 /// The syntactic shape `Range · R''` (Rule-E disjunct shape): a bare `Range`
@@ -3026,40 +3065,37 @@ mod tests {
         );
     }
 
-    #[test]
-    fn next_classes_head_only_uniform_sweep() {
-        // Soundness guard (spec §4.4): for thousands of random regexes, every
-        // probed code point has the same derivative as its class's
-        // representative. A head_bounds that missed a range `deriv` tests
-        // would split a class's behaviour and fail here.
-        fn gen(g: &mut Lcg, depth: u32) -> Rex {
-            if depth == 0 || g.next().is_multiple_of(3) {
-                return match g.next() % 6 {
-                    0 => Rex::Eps,
-                    1 => arb_range(g),
-                    _ => {
-                        let lo = 'a' as u32 + (g.next() % 8) as u32;
-                        Rex::Range(lo, lo + (g.next() % 3) as u32)
-                    }
-                };
-            }
-            let kids = |g: &mut Lcg| -> Vec<Rex> {
-                (0..2 + g.next() % 2).map(|_| gen(g, depth - 1)).collect()
-            };
-            match g.next() % 6 {
-                0 => concat(kids(g)),
-                1 => union(kids(g)),
-                2 => inter(kids(g)),
-                3 => star(gen(g, depth - 1)),
-                4 => comp(gen(g, depth - 1)),
+    /// Random-regex generator shared by the uniformity sweeps.
+    fn gen(g: &mut Lcg, depth: u32) -> Rex {
+        if depth == 0 || g.next().is_multiple_of(3) {
+            return match g.next() % 6 {
+                0 => Rex::Eps,
+                1 => arb_range(g),
                 _ => {
-                    let lo = (g.next() % 2) as u32;
-                    loop_(gen(g, depth - 1), lo, lo + 1 + (g.next() % 3) as u32)
+                    let lo = 'a' as u32 + (g.next() % 8) as u32;
+                    Rex::Range(lo, lo + (g.next() % 3) as u32)
                 }
+            };
+        }
+        let kids = |g: &mut Lcg| -> Vec<Rex> {
+            (0..2 + g.next() % 2).map(|_| gen(g, depth - 1)).collect()
+        };
+        match g.next() % 6 {
+            0 => concat(kids(g)),
+            1 => union(kids(g)),
+            2 => inter(kids(g)),
+            3 => star(gen(g, depth - 1)),
+            4 => comp(gen(g, depth - 1)),
+            _ => {
+                let lo = (g.next() % 2) as u32;
+                loop_(gen(g, depth - 1), lo, lo + 1 + (g.next() % 3) as u32)
             }
         }
-        // Must cover every `arb_range` POOL edge +/- 1 (each is probed).
-        let probes: Vec<u32> = (0..=0x90u32)
+    }
+
+    /// Must cover every `arb_range` POOL edge +/- 1 (each is probed).
+    fn sweep_probes() -> Vec<u32> {
+        (0..=0x90u32)
             .chain([
                 0xD7FE,
                 0xD7FF,
@@ -3072,12 +3108,19 @@ mod tests {
                 MAX_CODE - 1,
                 MAX_CODE,
             ])
-            .collect();
+            .collect()
+    }
+
+    type Classes = Option<Vec<(u32, u32)>>;
+
+    /// Uniformity sweep over `partition` (seed 60, 3000 regexes).
+    fn uniform_sweep(partition: fn(&Rex) -> Classes) {
+        let probes = sweep_probes();
         let mut g = Lcg(60);
         let mut checked = 0usize;
         for _ in 0..3000 {
             let r = gen(&mut g, 4);
-            let Some(classes) = next_classes(&r) else {
+            let Some(classes) = partition(&r) else {
                 continue; // over the cap — a fence, not a partition to check
             };
             // A partition of Σ: contiguous, starts at 0, ends at MAX_CODE.
@@ -3100,6 +3143,15 @@ mod tests {
             checked += 1;
         }
         assert!(checked > 2500, "too many regexes over the cap: {checked}");
+    }
+
+    #[test]
+    fn next_classes_head_only_uniform_sweep() {
+        // Soundness guard (spec §4.4): for thousands of random regexes, every
+        // probed code point has the same derivative as its class's
+        // representative. A head_bounds that missed a range `deriv` tests
+        // would split a class's behaviour and fail here.
+        uniform_sweep(next_classes);
     }
 
     #[test]
@@ -3134,5 +3186,41 @@ mod tests {
         for a in &arms {
             assert_eq!(eval_membership(&found, a), Some(true));
         }
+    }
+
+    // ── Slice 60 task 6: Rule-E partition ────────────────────────────────
+
+    #[test]
+    fn rule_e_classes_prefers_full_partition() {
+        let r = concat(vec![chr('a'), chr('m')]);
+        let lows: Vec<u32> = rule_e_classes(&r)
+            .expect("under the cap")
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        let c = |ch: char| ch as u32;
+        assert_eq!(lows, vec![0, c('a'), c('b'), c('m'), c('n')]);
+        assert_eq!(los(&r), vec![0, c('a'), c('b')]);
+    }
+
+    #[test]
+    fn rule_e_classes_falls_back_to_head_only() {
+        let r = plus_rex(lit(&isolated40()));
+        assert_eq!(rule_e_classes(&r), next_classes(&r));
+        assert_eq!(
+            rule_e_classes(&r),
+            Some(vec![(0, 0x20), (0x21, 0x21), (0x22, MAX_CODE)])
+        );
+    }
+
+    #[test]
+    fn rule_e_classes_none_when_head_wide() {
+        let many = union((0u32..70).map(|i| Rex::Range(2 * i, 2 * i)).collect());
+        assert_eq!(rule_e_classes(&many), None);
+    }
+
+    #[test]
+    fn rule_e_classes_uniform_sweep() {
+        uniform_sweep(rule_e_classes);
     }
 }

@@ -584,7 +584,7 @@ pub(crate) fn memb_check(
         //    L(cur) = [ε if ν] ∪ ⋃_C C·L(∂_C cur) — single-atom disjuncts. ──
         if !s.emitted_memb.contains(&(residual, cur_t, RULE_E)) {
             s.emitted_memb.insert((residual, cur_t, RULE_E));
-            let Some(classes) = regex::next_classes(&cur) else {
+            let Some(classes) = regex::rule_e_classes(&cur) else {
                 return Some(TCheck::Unknown); // CLASS_SPLIT_CAP — fence
             };
             let mut disj: Vec<TermId> = Vec::new();
