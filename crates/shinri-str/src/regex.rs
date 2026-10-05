@@ -412,8 +412,56 @@ pub(crate) const MEMB_SEARCH_STEP_CAP: usize = 10_000;
 const SURR_LO: u32 = 0xD800;
 const SURR_HI: u32 = 0xDFFF;
 
-/// Collect the class boundaries contributed by every `Range` node in `r`:
-/// each range [lo, hi] cuts Σ at lo and hi+1.
+/// Collect the class boundaries of every `Range` that `deriv` can test on
+/// the NEXT character — exactly the nodes `deriv` descends into: a concat's
+/// first element, and each following element while every element before it
+/// is nullable (`deriv`'s `ε ∈ r1` branch); every member of a union or
+/// intersection; the body of a star, complement or loop. Each range
+/// [lo, hi] cuts Σ at lo and hi+1. Ranges past a non-nullable concat
+/// element are never tested and contribute no cut.
+fn head_bounds(r: &Rex, out: &mut BTreeSet<u32>) {
+    match r {
+        Rex::Empty | Rex::Eps => {}
+        Rex::Range(lo, hi) => {
+            out.insert(*lo);
+            if *hi < MAX_CODE {
+                out.insert(hi + 1);
+            }
+        }
+        Rex::Concat(ps) => {
+            for p in ps {
+                head_bounds(p, out);
+                if !nullable(p) {
+                    break;
+                }
+            }
+        }
+        Rex::Union(ps) | Rex::Inter(ps) => {
+            for p in ps {
+                head_bounds(p, out);
+            }
+        }
+        Rex::Star(i) | Rex::Comp(i) | Rex::Loop(i, ..) => head_bounds(i, out),
+    }
+}
+
+/// Next-character classes: a partition of Σ = [0, MAX_CODE] into maximal
+/// ranges on which `deriv` is uniform. `deriv` branches only on membership
+/// tests against the head-reachable `Range` nodes that `head_bounds`
+/// collects, and no such boundary falls strictly inside a class, so every
+/// test answers identically across the class. Ranges deeper in the regex
+/// (past a non-nullable concat element) are not cut on: a long literal
+/// contributes only its first character. `None` iff the partition exceeds
+/// `CLASS_SPLIT_CAP` (→ caller fences).
+pub(crate) fn next_classes(r: &Rex) -> Option<Vec<(u32, u32)>> {
+    let mut bounds = BTreeSet::new();
+    head_bounds(r, &mut bounds);
+    classes_from_bounds(bounds)
+}
+
+/// Collect the class boundaries contributed by every `Range` node in `r`
+/// (head-reachable or not): each range [lo, hi] cuts Σ at lo and hi+1. This
+/// is Rule-E's preferred partition (see `rule_e_classes`).
 fn range_bounds(r: &Rex, out: &mut BTreeSet<u32>) {
     match r {
         Rex::Empty | Rex::Eps => {}
@@ -432,17 +480,10 @@ fn range_bounds(r: &Rex, out: &mut BTreeSet<u32>) {
     }
 }
 
-/// Next-character classes: a partition of Σ = [0, MAX_CODE] into maximal
-/// ranges on which `deriv` is uniform. `deriv` branches only on `Range`
-/// membership tests, and no `Range` boundary of `r` falls strictly inside a
-/// class, so every test answers identically across the class. Using ALL
-/// ranges in `r` (not just head-reachable ones) yields a finer-than-needed
-/// partition — still correct. `None` iff the partition exceeds
-/// `CLASS_SPLIT_CAP` (→ caller fences).
-pub(crate) fn next_classes(r: &Rex) -> Option<Vec<(u32, u32)>> {
-    let mut bounds = BTreeSet::new();
+/// Turn a set of cut points into the partition of Σ they induce (0 is always
+/// a cut). `None` iff that exceeds `CLASS_SPLIT_CAP`.
+fn classes_from_bounds(mut bounds: BTreeSet<u32>) -> Option<Vec<(u32, u32)>> {
     bounds.insert(0u32);
-    range_bounds(r, &mut bounds);
     let cuts: Vec<u32> = bounds.into_iter().collect();
     if cuts.len() > CLASS_SPLIT_CAP {
         return None;
@@ -457,6 +498,18 @@ pub(crate) fn next_classes(r: &Rex) -> Option<Vec<(u32, u32)>> {
         classes.push((lo, hi));
     }
     Some(classes)
+}
+
+/// Rule-E's partition: the all-ranges one when it is within
+/// `CLASS_SPLIT_CAP`, otherwise the head-only `next_classes`; `None` iff both
+/// exceed the cap. Both partitions are exact (`deriv` is uniform per class);
+/// the full one is preferred because it reproduces the pre-slice-60 Rule-E
+/// disjunct structure (and so the SAT search order) wherever that fit, while
+/// the head-only one keeps Rule-E from fencing on long literals.
+pub(crate) fn rule_e_classes(r: &Rex) -> Option<Vec<(u32, u32)>> {
+    let mut bounds = BTreeSet::new();
+    range_bounds(r, &mut bounds);
+    classes_from_bounds(bounds).or_else(|| next_classes(r))
 }
 
 /// The syntactic shape `Range · R''` (Rule-E disjunct shape): a bare `Range`
@@ -2915,5 +2968,259 @@ mod tests {
         let ranges: Vec<Rex> = (0u32..70).map(|i| Rex::Range(2 * i, 2 * i)).collect();
         let many = union(ranges);
         assert!(matches!(language_empty(&many), Emptiness::Unknown));
+    }
+
+    // ── Slice 60: head-only next-character classes ───────────────────────
+
+    /// `r+` as `extract_const_regex` builds it: `r · r*`.
+    fn plus_rex(r: Rex) -> Rex {
+        concat(vec![r.clone(), star(r)])
+    }
+
+    /// 40 pairwise NON-adjacent printable chars ('!' + 2i). Each is an
+    /// isolated range, so the pre-slice-60 all-ranges partition of any regex
+    /// containing this word has 1 + 2·40 = 81 cuts > CLASS_SPLIT_CAP.
+    fn isolated40() -> String {
+        (0..40u32)
+            .map(|i| char::from_u32(0x21 + 2 * i).unwrap())
+            .collect()
+    }
+
+    /// The class lower bounds (= the cut points) of `next_classes(r)`.
+    fn los(r: &Rex) -> Vec<u32> {
+        next_classes(r)
+            .expect("under the cap")
+            .iter()
+            .map(|c| c.0)
+            .collect()
+    }
+
+    #[test]
+    fn next_classes_head_only_long_literal() {
+        // Only the literal's FIRST char can be consumed next: 3 classes,
+        // where the all-ranges partition overflowed the cap.
+        let w = isolated40();
+        let r = plus_rex(lit(&w));
+        assert_eq!(
+            next_classes(&r),
+            Some(vec![(0, 0x20), (0x21, 0x21), (0x22, MAX_CODE)])
+        );
+    }
+
+    #[test]
+    fn next_classes_head_only_concat_shapes() {
+        let c = |ch: char| ch as u32;
+        let (a, m, x) = (chr('a'), chr('m'), chr('x'));
+        // Non-nullable head: the tail is never tested.
+        assert_eq!(
+            los(&concat(vec![a.clone(), m.clone()])),
+            vec![0, c('a'), c('b')]
+        );
+        // Nullable head: the next element joins.
+        assert_eq!(
+            los(&concat(vec![star(a.clone()), m.clone()])),
+            vec![0, c('a'), c('b'), c('m'), c('n')]
+        );
+        // Two nullable heads: the third element joins.
+        assert_eq!(
+            los(&concat(vec![star(a.clone()), star(m.clone()), x.clone()])),
+            vec![0, c('a'), c('b'), c('m'), c('n'), c('x'), c('y')]
+        );
+        // The walk stops at the first non-nullable element.
+        assert_eq!(
+            los(&concat(vec![star(a.clone()), m.clone(), x.clone()])),
+            vec![0, c('a'), c('b'), c('m'), c('n')]
+        );
+        // comp(a*) is NOT nullable (ε ∈ a*), so `m` is unreachable.
+        assert_eq!(
+            los(&concat(vec![comp(star(a.clone())), m.clone()])),
+            vec![0, c('a'), c('b')]
+        );
+        // Comp / Inter pass the inner heads through.
+        assert_eq!(
+            los(&comp(concat(vec![a.clone(), m.clone()]))),
+            vec![0, c('a'), c('b')]
+        );
+        assert_eq!(
+            los(&inter(vec![
+                concat(vec![a.clone(), m.clone()]),
+                concat(vec![x.clone(), a.clone()]),
+            ])),
+            vec![0, c('a'), c('b'), c('x'), c('y')]
+        );
+        // Loop: lo = 0 is nullable (next element joins); lo = 1 is not.
+        let am = concat(vec![a.clone(), m.clone()]);
+        assert_eq!(
+            los(&concat(vec![loop_(am.clone(), 0, 3), x.clone()])),
+            vec![0, c('a'), c('b'), c('x'), c('y')]
+        );
+        assert_eq!(
+            los(&concat(vec![loop_(am, 1, 3), x.clone()])),
+            vec![0, c('a'), c('b')]
+        );
+        // Surrogate-block head: cuts exactly at the block edges.
+        assert_eq!(
+            los(&concat(vec![Rex::Range(0xD800, 0xDFFF), a])),
+            vec![0, 0xD800, 0xE000]
+        );
+    }
+
+    /// Random-regex generator shared by the uniformity sweeps.
+    fn gen(g: &mut Lcg, depth: u32) -> Rex {
+        if depth == 0 || g.next().is_multiple_of(3) {
+            return match g.next() % 6 {
+                0 => Rex::Eps,
+                1 => arb_range(g),
+                _ => {
+                    let lo = 'a' as u32 + (g.next() % 8) as u32;
+                    Rex::Range(lo, lo + (g.next() % 3) as u32)
+                }
+            };
+        }
+        let kids = |g: &mut Lcg| -> Vec<Rex> {
+            (0..2 + g.next() % 2).map(|_| gen(g, depth - 1)).collect()
+        };
+        match g.next() % 6 {
+            0 => concat(kids(g)),
+            1 => union(kids(g)),
+            2 => inter(kids(g)),
+            3 => star(gen(g, depth - 1)),
+            4 => comp(gen(g, depth - 1)),
+            _ => {
+                let lo = (g.next() % 2) as u32;
+                loop_(gen(g, depth - 1), lo, lo + 1 + (g.next() % 3) as u32)
+            }
+        }
+    }
+
+    /// Must cover every `arb_range` POOL edge +/- 1 (each is probed).
+    fn sweep_probes() -> Vec<u32> {
+        (0..=0x90u32)
+            .chain([
+                0xD7FE,
+                0xD7FF,
+                0xD800,
+                0xD801,
+                0xDFFE,
+                0xDFFF,
+                0xE000,
+                0xE001,
+                MAX_CODE - 1,
+                MAX_CODE,
+            ])
+            .collect()
+    }
+
+    type Classes = Option<Vec<(u32, u32)>>;
+
+    /// Uniformity sweep over `partition` (seed 60, 3000 regexes).
+    fn uniform_sweep(partition: fn(&Rex) -> Classes) {
+        let probes = sweep_probes();
+        let mut g = Lcg(60);
+        let mut checked = 0usize;
+        for _ in 0..3000 {
+            let r = gen(&mut g, 4);
+            let Some(classes) = partition(&r) else {
+                continue; // over the cap — a fence, not a partition to check
+            };
+            // A partition of Σ: contiguous, starts at 0, ends at MAX_CODE.
+            assert_eq!(classes[0].0, 0, "{r:?}");
+            assert_eq!(classes.last().unwrap().1, MAX_CODE, "{r:?}");
+            for w in classes.windows(2) {
+                assert_eq!(w[0].1 + 1, w[1].0, "{r:?}");
+            }
+            for &c in &probes {
+                let &(lo, _) = classes
+                    .iter()
+                    .find(|(lo, hi)| *lo <= c && c <= *hi)
+                    .unwrap();
+                assert_eq!(
+                    deriv(c, &r),
+                    deriv(lo, &r),
+                    "class of {c:#x} not uniform in {r:?}"
+                );
+            }
+            checked += 1;
+        }
+        assert!(checked > 2500, "too many regexes over the cap: {checked}");
+    }
+
+    #[test]
+    fn next_classes_head_only_uniform_sweep() {
+        // Soundness guard (spec §4.4): for thousands of random regexes, every
+        // probed code point has the same derivative as its class's
+        // representative. A head_bounds that missed a range `deriv` tests
+        // would split a class's behaviour and fail here.
+        uniform_sweep(next_classes);
+    }
+
+    #[test]
+    fn language_empty_distinct_heads_past_old_cap() {
+        // The slice-59 representative reproducer's shape: three r+ literals
+        // whose FIRST chars differ ('b', 'a', '!'). One derivative step on
+        // any class empties the intersection; pre-slice-60 the 40-char word
+        // overflowed the partition and this was Unknown.
+        let goal = inter(vec![
+            plus_rex(lit("bba")),
+            plus_rex(lit("aaps]0e4_b{a")),
+            plus_rex(lit(&isolated40())),
+        ]);
+        assert!(matches!(language_empty(&goal), Emptiness::Empty));
+    }
+
+    #[test]
+    fn search_finds_long_literal_witness() {
+        // Shared member w·w of w+ and (w·w)+ over a printable alphabet;
+        // pre-slice-60 both searches gave up on the first step.
+        let w = isolated40();
+        let ww = format!("{w}{w}");
+        let arms = vec![
+            plus_rex(lit(&w)),
+            plus_rex(lit(&ww)),
+            star(Rex::Range('!' as u32, '~' as u32)),
+        ];
+        let goal = inter(arms.clone());
+        let found = search_word(&goal, 80).expect("a word of length 80");
+        assert_eq!(found, ww);
+        assert_eq!(search_shortest(&goal).as_deref(), Some(ww.as_str()));
+        for a in &arms {
+            assert_eq!(eval_membership(&found, a), Some(true));
+        }
+    }
+
+    // ── Slice 60 task 6: Rule-E partition ────────────────────────────────
+
+    #[test]
+    fn rule_e_classes_prefers_full_partition() {
+        let r = concat(vec![chr('a'), chr('m')]);
+        let lows: Vec<u32> = rule_e_classes(&r)
+            .expect("under the cap")
+            .iter()
+            .map(|c| c.0)
+            .collect();
+        let c = |ch: char| ch as u32;
+        assert_eq!(lows, vec![0, c('a'), c('b'), c('m'), c('n')]);
+        assert_eq!(los(&r), vec![0, c('a'), c('b')]);
+    }
+
+    #[test]
+    fn rule_e_classes_falls_back_to_head_only() {
+        let r = plus_rex(lit(&isolated40()));
+        assert_eq!(rule_e_classes(&r), next_classes(&r));
+        assert_eq!(
+            rule_e_classes(&r),
+            Some(vec![(0, 0x20), (0x21, 0x21), (0x22, MAX_CODE)])
+        );
+    }
+
+    #[test]
+    fn rule_e_classes_none_when_head_wide() {
+        let many = union((0u32..70).map(|i| Rex::Range(2 * i, 2 * i)).collect());
+        assert_eq!(rule_e_classes(&many), None);
+    }
+
+    #[test]
+    fn rule_e_classes_uniform_sweep() {
+        uniform_sweep(rule_e_classes);
     }
 }

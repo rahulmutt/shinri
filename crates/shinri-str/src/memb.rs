@@ -584,7 +584,7 @@ pub(crate) fn memb_check(
         //    L(cur) = [ε if ν] ∪ ⋃_C C·L(∂_C cur) — single-atom disjuncts. ──
         if !s.emitted_memb.contains(&(residual, cur_t, RULE_E)) {
             s.emitted_memb.insert((residual, cur_t, RULE_E));
-            let Some(classes) = regex::next_classes(&cur) else {
+            let Some(classes) = regex::rule_e_classes(&cur) else {
                 return Some(TCheck::Unknown); // CLASS_SPLIT_CAP — fence
             };
             let mut disj: Vec<TermId> = Vec::new();
@@ -869,6 +869,62 @@ mod tests {
             cx.terms.string_const_value(l) == Some("")
                 || cx.terms.string_const_value(rr) == Some("")
         );
+    }
+
+    #[test]
+    fn rule_e_long_literal_head_splits_not_fenced() {
+        // Slice 60 (§4.3): Rule E partitions by head-reachable ranges only.
+        // x·y ∈ (A | B)+ where A, B are 40-char literals over pairwise
+        // non-adjacent printable chars ('!' + 2i; B is A reversed), so the
+        // two heads differ (not head-forced: Rule S declines) while the
+        // regex holds 40 distinct non-adjacent Ranges (~80 all-range
+        // classes, over CLASS_SPLIT_CAP = 64). Head-only: exactly two class
+        // disjuncts (A's and B's first char), no ε (not nullable). The
+        // pre-slice-60 all-ranges `next_classes` fenced this to Unknown.
+        let chars: Vec<char> = (0..40u8).map(|i| (b'!' + 2 * i) as char).collect();
+        let a: String = chars.iter().collect();
+        let b: String = chars.iter().rev().collect();
+        let lit = regex::union(vec![regex::lit_test(&a), regex::lit_test(&b)]);
+        let r = regex::concat(vec![lit.clone(), regex::star(lit)]);
+
+        let mut ctx = Context::new();
+        let x = var(&mut ctx, "x");
+        let y = var(&mut ctx, "y");
+        let xy = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrConcat), &[x, y])
+            .unwrap();
+        let m = memb_atom(&mut ctx, xy, &r);
+        let (mut s, mut eq_e, atoms) = harness(&mut ctx);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq_e,
+            atoms: &atoms,
+        };
+        s.new_var(&mut cx, shinri_core::Var::new(0), m);
+        s.test_force_memb_true(m, true);
+        let (splits, terminal) = run_rounds(&mut s, &mut cx, 16);
+        assert!(
+            !matches!(terminal, TCheck::Unknown),
+            "Rule E must not fence a long-literal head at the class cap"
+        );
+        let is_memb = |t: &TermId| {
+            matches!(
+                cx.terms.term_node(*t),
+                shinri_core::TermNode::App {
+                    op: Op::Builtin(BuiltinOp::StrInRe),
+                    ..
+                }
+            )
+        };
+        let expansions: Vec<_> = splits
+            .iter()
+            .filter(|(atoms, _)| atoms.iter().any(is_memb))
+            .collect();
+        assert_eq!(expansions.len(), 1, "exactly one Rule-E expansion");
+        let (disj, guarded) = expansions[0];
+        assert!(*guarded, "expansion must be guarded by ¬lit");
+        assert_eq!(disj.len(), 2, "two head-class disjuncts, no ε");
+        assert!(disj.iter().all(is_memb));
     }
 
     #[test]
