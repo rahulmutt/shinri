@@ -2,6 +2,8 @@
 
 ## Headline
 
+> **Follow-up:** the Rule-E full-partition variant (`56997aa`) passes criterion 3 and supersedes approach 1's verdict on it. See *Follow-up: Rule-E full-partition variant (56997aa)* at the end.
+
 Slice 60 changes `regex::next_classes` so that it cuts Σ only at the bounds of
 head-reachable `Range` nodes (`head_bounds`). Before, it cut at every `Range`
 in the regex. Long literals therefore no longer overflow `CLASS_SPLIT_CAP`
@@ -873,3 +875,325 @@ existing test, not part of this slice.
 - Evidence (not committed): `target/slice60-gates.txt`; `target/slice60-{base,after}/{md5.txt,commit.txt,started.txt,finished.txt}`; `target/slice60-base/probes.txt`;
   `target/slice60-after/{join.txt,changed.tsv,triage-in.tsv,triage.tsv,triage-disp.txt,triage-summary.txt,unsat-crosscheck.tsv,attr-in.txt,attribution.tsv,class1-rem-in.txt,timing.txt,timing-rerun2.txt,timing-rerun3.txt,timing-swapped.txt,timing-newly-correct-rows.txt}`;
   `/workspace/bench/results/slice60{,-base,-sample,-base-sample}/`
+
+## Follow-up: Rule-E full-partition variant (56997aa)
+
+### What changed and why
+
+Approach 1 failed criterion 3 on 4 Norn HammingDistance rows (`312`, `322`,
+`362`, `454`). In those rows only Rule-E ran the coarser head-only partition,
+and that changed the SAT search over the split atoms (see *Criterion 3: the
+four regressions*). The owner approved a variant of queue item 1's
+candidate (b): Rule-E prefers the full partition when it fits the cap, and
+falls back to head-only past it.
+
+- `regex::rule_e_classes` (new): cut Σ at the bounds of **every** `Range`
+  node (`range_bounds`, which is back), and use that partition if it is
+  within `CLASS_SPLIT_CAP`. Otherwise fall back to the head-only
+  `next_classes`. It returns `None` (fence) only when both are over the cap.
+- `memb.rs` Rule-E calls `rule_e_classes` instead of `next_classes`.
+- The witness search (`search_word`, `search_shortest`) and the emptiness
+  conflict (`language_empty`) keep the head-only `next_classes`, unchanged
+  from approach 1.
+- Both partitions are exact (`deriv` is uniform per class). Where the full
+  partition fits, Rule-E reproduces the pre-slice-60 disjunct structure,
+  and with it the SAT search order. Where it does not fit, Rule-E no longer
+  fences on long literals.
+
+Gates at `56997aa` (`target/slice60b-gates.txt`): ci exit 0, 1773 run /
+1773 passed / 6 skipped. That is 1768 + 1 fix-wave `memb` test + 4
+`rule_e_classes` tests. Oracle `--features oracle`: 831 run / 831 passed /
+2 skipped; the discovered count is non-zero.
+
+### Runs
+
+| run | solver | md5 | started | finished | rows |
+| --- | --- | --- | --- | --- | ---: |
+| `bench/results/slice60b/` | `target/slice60b-after/shinri` (`56997aa`) | `6109b2a0266510f2084dab2df1e60240` | 2026-10-05T06:34:28Z | (string leg ends when the sample leg starts, 09:14:12Z) | 103,335 |
+| `bench/results/slice60b-sample/` | same | same | 2026-10-05T09:14:12Z | 2026-10-05T09:33:23Z | 2,000 |
+
+- Same flags as the other runs: `--timeout 20 --mem-mb 3072 --jobs 6`,
+  cores 12–23.
+- The row sets match base and approach 1. The fixture `sha` is
+  `56997aaacd77` on both runs.
+- Base is unchanged: `slice60-base{,-sample}` (`aab0dfd`, md5
+  `cf6f6b2f…`).
+- **Host load.** Processes outside this container loaded the host heavily
+  during the variant run and during this analysis. At 09:34 UTC the load
+  average was about 83 on 24 cores. `uptime` readings are in
+  `target/slice60b-after/{triage-uptime-before,triage-uptime-after,crosscheck-uptime-before,crosscheck-uptime-after}.txt`
+  and `timing-load.log`.
+
+Commands, in addition to *Commands* above:
+
+```bash
+# reports
+for id in slice60b slice60b-sample; do BENCH_RUN_ID=$id mise run bench-report; done
+# join: Task 5 Step 3's script, run for base -> variant and approach 1 -> variant
+python3 target/slice60b-after/join.py   # -> join.txt, changed.tsv (base -> variant rows)
+# triage: Task 5 Step 4's per-row command, with target/slice60b-after/shinri as the after binary
+tr '\t' ' ' < target/slice60b-after/triage-in.tsv | xargs -P6 -L1 target/slice60b-after/triage-row.sh > target/slice60b-after/triage.tsv
+python3 target/slice60b-after/triage_disp.py   # -> triage-disp.txt, triage-summary.txt
+# unsat cross-check, 5 rows in parallel on cores 13-23 (core 12 kept for timing)
+xargs -P5 -L1 target/slice60b-after/crosscheck-row.sh < target/slice60b-after/unsat-crosscheck-in.txt > target/slice60b-after/unsat-crosscheck.tsv
+# timing: Task 5 Step 6's script with target/slice60b-after/shinri and runs slice60b,
+# gated on the 1-min load being <= 24 (timing-watch.sh)
+```
+
+### Success criteria, base → variant
+
+| # | criterion | result | evidence |
+| --- | --- | --- | --- |
+| 1 | 0 rows `* → wrong`; 0 wrong answers in triage re-runs | **PASS** | 0 `wrong` rows in `slice60b` and `slice60b-sample`. 0 `sat` ↔ `unsat` flips against base or against approach 1. Triage made 984 runs over 164 rows: 0 wrong answers, and no row got both `sat` and `unsat`. The unsat cross-check of 371 variant `unverified` `unsat` rows gave 0 `sat` from z3 or cvc5 (see *Unsat cross-check*) |
+| 2 | `violated:memb@not-needed` shrinks by ≥ 20% (≥ 450 rows), moving to `correct` | **PASS** | 2,252 → 432. **936** base-tagged rows (41.6%) are now `correct` (approach 1: 917). Another 885 are decided but `unverified` (843 `sat`, 42 `unsat`), and 431 stay tagged |
+| 3 | no `correct → non-correct` change that reproduces 3/3 | **PASS** | base → variant has 4 `correct → *` rows, all `correct → unverified`. In each one the variant gives base's answer 3/3 and only the bench's z3 oracle timed out, so all 4 are noise. The 4 Norn rows are `correct` again in the bench and reproduce 3/3 on both binaries (`sat`, `unsat`, `sat`, `sat`) |
+| 4 | serial interleaved timing on 150 both-`correct` rows per string logic, within ±5% | **FAIL on the faster side** (as with approach 1) | Pooled over 3 passes: QF_S **0.809** (4.76 → 3.85 s) and QF_SLIA **0.845** (7.30 → 6.17 s). Each pass is in 0.787–0.864. Newly-`correct` rows: 9.36 (10.79 → 100.99 s), reported. See *Timing (variant)* |
+| 5 | `mise run ci` green; oracle count ≥ slice 59 + this slice's oracle tests | **PASS** | `target/slice60b-gates.txt` at `56997aa`: ci 1773 / 1773 / 6 skipped; oracle 831 / 831 / 2 skipped |
+| 6 | neutrality sample: only non-reproducible timing flips | **PASS** | 37 sample rows changed. All 37 are noise in triage: both binaries got identical results, mostly `killed` 3/3 on both under the host load (table below) |
+
+### Verdict changes, base → variant
+
+`target/slice60b-after/join.txt`. String runs, 1,880 rows changed:
+
+| logic | base | variant | rows |
+| --- | --- | --- | ---: |
+| QF_S | `unknown:str-model-rejected` | `correct` | 610 |
+| QF_S | `unknown:str-model-rejected` | `unverified` | 38 |
+| QF_S | `correct` | `unverified` | 1 |
+| QF_S | `timeout` | `correct` | 1 |
+| QF_S | `timeout` | `unknown:str-model-rejected` | 1 |
+| QF_SLIA | `unknown:str-model-rejected` | `correct` | 326 |
+| QF_SLIA | `unknown:str-model-rejected` | `unverified` | 847 |
+| QF_SLIA | `unverified` | `correct` | 52 |
+| QF_SLIA | `correct` | `unverified` | 3 |
+| QF_SLIA | `timeout` | `unknown:sat-budget` | 1 |
+
+- **Rows moved to `correct`: 989** (QF_S 611, QF_SLIA 378).
+  - 936 were `str-model-rejected` with tag `violated:memb@not-needed`:
+    310 with corpus status `unsat`, 289 `sat`, and 337 corpus-unknown with
+    z3 agreeing (312 `sat`, 25 `unsat`).
+  - 52 were `unverified` in base, where z3 timed out (28 `sat`, 24 `unsat`).
+  - 1 was a base `timeout` (automatark `instance07283`, `sat`).
+- String `correct` goes 40,913 → **41,898 (+985)**: QF_S 16,057 → 16,667,
+  QF_SLIA 24,856 → 25,231. Approach 1 reached 41,810.
+- `unknown:str-model-rejected` overall: 4,084 → 2,264 (approach 1: 2,360).
+- **No Norn or Jiang `slog` row changes verdict between base and variant**
+  (3,003 rows). The 133 + 38 unknown ↔ unknown churn that approach 1 showed
+  is gone.
+- Moved base-tagged rows by family: automatark 610, regexsmall 163,
+  regexbig 89, regexpair 45, amazon 14, z3str2 11, denghang 4.
+
+`fence_detail` (rows `unknown:str-model-rejected`): only
+`violated:memb@not-needed` moves, 2,252 → 432. Every other tag has the same
+count in base and variant. What remains of the tag: Norn 356, which is
+base's Norn count; Jiang `slog` 44, also base's count; z3str2 30, which
+includes the 28 `regex-035-*` rows; automatark 1; denghang 1.
+
+Neutrality sample, 37 rows changed:
+
+| logic | base | variant | rows | triage |
+| --- | --- | --- | ---: | --- |
+| QF_UF | `correct` | `timeout` | 17 | noise: all `qg5`, both binaries `killed` 3/3 |
+| QF_UFLIA | `correct` | `timeout` | 4 | noise: both binaries `killed` 3/3 |
+| QF_LIA | `oom` | `timeout` | 14 | noise: both binaries `killed` or OOM on every row, with identical results on most |
+| QF_BVFP | `timeout` | `correct` | 1 | noise: base `unsat, unsat, killed`, variant `killed` 3/3 |
+| QF_UFLRA | `timeout` | `parse-error` | 1 | noise: both binaries `sat` 3/3 |
+
+The approach-1 sample run against approach 1's binary shows the same shape
+(`slice60-sample → slice60b-sample`: 16 QF_UF and 4 QF_UFLIA
+`correct → timeout`, 15 QF_LIA/QF_UFLIA `oom → timeout`), and the two
+binaries differ only in Rule-E. These are load effects on rows near the
+20 s limit. Triage cannot show either binary answering them under the
+same load.
+
+### Approach 1 → variant
+
+`slice60 → slice60b`: 310 string rows changed (`join.txt`, by family in
+`delta.txt`). The sample runs differ on 35 rows, all timeout/OOM movement
+as above.
+
+- **Restored: the 4 Norn regressions.** `312`, `322` and `362` go
+  `sat-budget → correct`, and `454` goes `str-model-rejected → correct`.
+- **Given back: approach 1's 10 Norn HammingDistance gains.** They go
+  `correct → unknown:sat-budget`, base's verdict: `norn-benchmark-147`,
+  `151`, `315`, `329`, `434`, `442`, `580`, `592`, `828` and `1190` (7
+  `sat`, 3 `unsat` in approach 1). Re-run 3× on each binary
+  (`givenback-triage.tsv`): approach 1 answers 3/3 and the variant gives
+  `sat-budget` 3/3, so all 10 are attributable. HammingDistance is back to
+  base's distribution: 165 `correct`, 281 `sat-budget`, 333
+  `str-model-rejected`, 15 `theory-refused` (approach 1: 171 / 171 / 437 /
+  15). The family's net effect goes from +6 to 0.
+- **Unknown ↔ unknown churn is reverted.** Norn: 122 + 4 + 2
+  `str-model-rejected → sat-budget`, and 19 + 2 the other way. `slog`:
+  17 `sat-budget → str-model-rejected` and 5 the other way.
+- **Oracle churn.** 106 rows go `unverified → correct` and 12 go
+  `correct → unverified`. Each has the same shinri answer on both runs;
+  only the bench's 20 s z3 call finished or timed out. 7 rows go
+  `timeout → unverified`.
+- **Net:** string `correct` 41,810 → 41,898 (+88) = +4 Norn restored, −10
+  Norn given back, +94 oracle churn. 0 `sat` ↔ `unsat` flips.
+- **Class 1:** `violated:memb@not-needed` 525 → 432. Norn's 465 tagged rows
+  in approach 1 fall back to base's 356. The difference sat in
+  `sat-budget`, not in `correct`.
+
+### Triage
+
+Files: `target/slice60b-after/{triage-in.tsv,triage.tsv,triage-disp.txt,triage-summary.txt}`.
+Method: Task 5 Step 4's command and noise rule, base binary vs variant
+binary, 3 interleaved runs each, on cores 12–23, 6 rows in parallel. Ran
+09:35:59Z–09:51:12Z. Load: `70.81, 77.17, 66.99` before and
+`87.30, 96.07, 89.68` after; that load came from outside this container.
+
+Selection: 164 rows.
+- 981 non-gain rows (944 string + 37 sample), which is more than 200. Every
+  small stratum was triaged in full: all 4 `correct → unverified`, all 37
+  sample rows, all `timeout → *` rows, and all 52 `unverified → correct`.
+- The one large stratum, `str-model-rejected → unverified` (885 rows), got a
+  seeded (`random.Random(60)`) family-stratified sample of 32. That makes
+  128 non-gain rows.
+- 32 stratified gain rows (`unknown:* → correct`).
+- The 4 Norn rows, which are `correct → correct` against base.
+
+| transition | rows | noise | attributable |
+| --- | ---: | ---: | ---: |
+| gain (`unknown:* → correct`) | 32 | 0 | 32 (expected) |
+| Norn 312/322/362/454 (`correct → correct`) | 4 | 4 (same answer on both, 3/3) | 0 |
+| `correct → unverified` | 4 | 4 | 0 |
+| `unverified → correct` | 52 | 52 | 0 |
+| `str-model-rejected → unverified` | 32 (of 885) | 1 | 31 |
+| `timeout → correct` | 1 | 1 | 0 |
+| `timeout → unknown:sat-budget` | 1 | 1 | 0 |
+| `timeout → unknown:str-model-rejected` | 1 | 0 | 1 |
+| sample `correct → timeout` | 21 | 21 | 0 |
+| sample `oom → timeout` | 14 | 14 | 0 |
+| sample `timeout → correct`, `→ parse-error` | 2 | 2 | 0 |
+
+- **Wrong answers: 0.** Attributable `correct → non-correct`: 0. Attributable
+  sample rows: 0.
+- **The 4 Norn rows:** the variant reproduces `correct` 3/3 on each: `312`
+  `sat`, `322` `unsat`, `362` `sat`, `454` `sat`. Base gives the same answers.
+- **`correct → unverified` (4):** the variant's answer is base's answer 3/3
+  on both binaries. The rows are 3 stringfuzz `regexlengths` `sat`
+  (`00076-19`, `00076-7`, `00101-22`) and automatark `instance14507`
+  `unsat`. All 4 have corpus status unknown. Base's bench z3 agreed with
+  that answer; the variant's bench z3 timed out.
+- **`→ unverified` in general:** the variant's answer matches the base
+  answer wherever base decided, and never contradicts a corpus status. The
+  885 `str-model-rejected → unverified` rows are 843 `sat` (model-checked
+  by shinri's gate) and 42 `unsat`. 41 of those 42 are rows approach 1
+  produced and cross-checked. The 42nd, `instance13119`, is in this
+  run's cross-check.
+- `timeout → str-model-rejected` (automatark `instance02984`) is
+  attributable: base is killed 3/3 and the variant fences 3/3. It is the
+  same row and transition as in approach 1, and it is not a `correct` row.
+
+### Unsat cross-check
+
+Scope (the brief): every variant row that is `unverified` with answer
+`unsat` and not already in `target/slice60-after/unsat-crosscheck.tsv`.
+The variant has 412 such rows. 41 were already cross-checked for approach 1,
+which leaves **371**.
+- Only 2 of the 371 are new against base. `instance13119` was `timeout` in
+  approach 1. `instance14507` is base `correct` (z3 `unsat`).
+- The other 369 were already `unverified` `unsat` in base, meaning the
+  bench's 20 s z3 timed out on them in every run. They are pre-existing, not
+  caused by this slice.
+- Of approach 1's 42 rows, 41 are among the variant's 42
+  `str-model-rejected → unverified` `unsat` rows. The 42nd variant row is
+  `instance13119`. The 42nd approach-1 row (`instance14567`) is `correct`
+  in the variant.
+
+Method: z3 4.16 `-T:120` and cvc5 1.4.1 `--tlimit=120000` per row
+(`crosscheck-row.sh`), on cores 13–23.
+- The first 135 rows ran 5 in parallel. The rest ran 10 in parallel to
+  finish sooner.
+- Times: 09:52:17Z–12:19:12Z. Load: `81.43, 92.64, 88.93` before and
+  `127.21, 118.80, 110.97` after.
+- Results: `target/slice60b-after/{unsat-crosscheck.tsv,crosscheck-summary.txt,crosscheck-unconfirmed.txt}`.
+
+| z3 | cvc5 | rows |
+| --- | --- | ---: |
+| unsat | unsat | 8 |
+| timeout | unsat | 204 |
+| timeout | timeout | 159 |
+
+- **No `sat` from either solver on any row.**
+- Confirmed by at least one solver: 212 (z3 8, cvc5 212).
+- Both new-vs-base rows are confirmed: `instance14507` by z3 and cvc5,
+  `instance13119` by cvc5.
+- By family:
+
+  | family | z3 + cvc5 | cvc5 only | neither |
+  | --- | ---: | ---: | ---: |
+  | denghang | 4 | 128 | 0 |
+  | automatark | 4 | 67 | 23 |
+  | Norn | 0 | 8 | 3 |
+  | stringfuzz `generated/manyregexes` | 0 | 0 | 73 |
+  | stringfuzz `generated/variants` | 0 | 0 | 59 |
+  | stringfuzz `generated/regexpair` | 0 | 1 | 1 |
+
+- **Unconfirmed: 159.** All 159 were already `unverified` `unsat` in base.
+- The heavy external load may have turned some solver answers into
+  timeouts.
+
+### Timing (variant)
+
+Script: `target/slice60b-after/timing.py`. It is Task 5 Step 6's script with
+`target/slice60b-after/shinri` as the after binary and `slice60b` as the
+after run: serial, interleaved, pinned to core 12, sampled with
+`random.Random(60)`.
+- The host load stayed far above 24 (the 1-min load peaked at 142) until
+  13:47Z. `timing-watch.sh` checked every 5 min (`timing-load.log`) and
+  started the passes once the 1-min load was ≤ 24.
+- The passes ran 13:47:33Z–13:49:54Z, with 1-min load 17.72 → 15.09. That
+  host was below its core count but not idle.
+
+| group | pass 1 | pass 2 | pass 3 | pooled base → variant | pooled ratio |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| QF_S both-`correct` | 0.787 (1.71 → 1.35 s) | 0.807 (1.54 → 1.24 s) | 0.830 (1.51 → 1.26 s) | 4.76 → 3.85 s | **0.809** |
+| QF_SLIA both-`correct` | 0.831 (2.60 → 2.16 s) | 0.842 (2.35 → 1.98 s) | 0.864 (2.35 → 2.03 s) | 7.30 → 6.17 s | **0.845** |
+| newly-`correct` (not gated) | 9.126 (3.62 → 33.02 s) | 9.587 (3.66 → 35.14 s) | 9.354 (3.51 → 32.83 s) | 10.79 → 100.99 s | 9.36 |
+
+- **Both gated groups land outside ±5% on the faster side in every pass.**
+  This is the same pattern as approach 1 (0.794 / 0.740), and the
+  controller treated it as met in intent.
+- The variant's QF_SLIA speed-up is smaller than approach 1's (0.845
+  against 0.740). That fits Rule-E again building the finer full
+  partition wherever it fits.
+- The both-`correct` and newly-`correct` row sets are drawn against the
+  variant run, so they are not the same rows as approach 1's.
+- Bench `wall_ms` median / p90 on both-`correct` rows: QF_S 23 / 75 → 16 /
+  55 ms; QF_SLIA 11 / 51 → 14 / 51 ms. The runs shared the machine
+  differently, so these are not comparable.
+
+### Queue changes
+
+- **Queue item 1 (Rule-E search-order regressions on Norn HammingDistance)
+  is resolved by this variant**, which is candidate (b). All 4 rows are
+  `correct` again (3/3), and Norn/`slog` match base row for row. Cost: the
+  10 Norn gains that approach 1 got from the coarser Rule-E partition are
+  given back.
+- **Item 2 (class-1 remainder, Norn concat subjects):** the count is now
+  about 356 rows (Norn's share of the 432 still tagged), not about 465.
+- **Item 5 (oracle coverage):** with the variant, 885 base-tagged rows are
+  decided but `unverified` (843 `sat`, 42 `unsat`). The variant's 371 additional `unverified` `unsat` rows have 0 `sat`, and 212 are confirmed by z3 or cvc5 at 120 s. The 159 unconfirmed rows (manyregexes 73, variants 59, automatark 23, Norn 3, regexpair 1) were already `unverified` `unsat` in base, so the slice did not create them. They belong in this item's oracle-coverage work.
+- **New candidate:** recover the 10 HammingDistance gains without the 4
+  losses. Candidate (c), a disjunct order independent of partition
+  granularity, is still open. Lower priority than items 2–4.
+- Items 3, 4 and 6 and the carried list are unchanged.
+
+### What changed versus the spec (variant)
+
+1. **Rule-E no longer uses `next_classes`.** Spec §3 approach 1 and §4.3
+   say every caller gets the head-only partition. Rule-E now prefers the
+   full all-ranges partition (`range_bounds`, which the spec header says is
+   deleted, is back) and falls back to head-only only past the cap. This is
+   the owner-approved follow-up to the criterion-3 FAIL.
+2. **Benchmarked commit:** `56997aa`, which is branch HEAD before this docs
+   commit.
+3. **Triage under external load.** Load average was 67–96 on 24 cores
+   during triage. Sample rows near the 20 s limit were killed on both
+   binaries, so their noise classification rests on the two binaries
+   agreeing, not on reproducing the base answer.
+4. **Unsat cross-check scope.** The brief asked for every variant `unverified` `unsat` row not already checked. That is 371 rows, of which 369 predate this slice (they were already `unverified` `unsat` in base). All were run. Parallelism went from 5 to 10 partway through, to finish sooner under the load.
+5. **Timing.** Timing waited about 4 h for the host load to drop. It ran at a 1-min load of 15–18 rather than on an idle host. Criterion 4 is out of band on the faster side, as with approach 1.

@@ -242,6 +242,8 @@ Written by the measurement report (§8 item 5). Carries slice-59 queue items
 
 ## 11. Measured outcomes
 
+> **Follow-up:** the Rule-E full-partition variant (`56997aa`) is measured in *Follow-up: Rule-E full-partition variant* at the end of this section. With it, criterion 3 passes.
+
 Full evidence:
 `docs/superpowers/research/2026-10-05-smtlib-2024-slice60-head-classes-report.md`.
 Benchmarked binary: `4a9e656`. HEAD `0e39c39` differs only in tests and
@@ -294,3 +296,46 @@ then the class-1 remainder.
 - Queue candidate from the final review: concat-subject memberships with a
   provably empty intersection (e.g. `(str.++ x y) ∈ L40+ ∩ (bba)+`) stay
   `unknown` in both base and after. Queued as item 4.
+
+### Follow-up: Rule-E full-partition variant
+
+The owner approved a variant after the criterion-3 FAIL. Rule-E calls
+`regex::rule_e_classes`, which uses the full all-ranges partition when it
+fits `CLASS_SPLIT_CAP` and falls back to the head-only `next_classes` past
+it. The witness search and the emptiness conflict keep `next_classes`.
+
+- Benchmarked commit: `56997aa`, md5 `6109b2a0266510f2084dab2df1e60240`.
+- Runs: `slice60b` and `slice60b-sample`.
+- Evidence: the report's § *Follow-up: Rule-E full-partition variant
+  (56997aa)*, with artifacts under `target/slice60b-after/`.
+
+Criteria, base → variant:
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | 0 `* → wrong`; 0 wrong answers in triage | PASS. 0 `wrong` rows in both runs. 0 `sat` ↔ `unsat` flips against base or approach 1. 0 wrong answers in 984 triage runs (164 rows). Unsat cross-check of the 371 newly checked variant `unverified` `unsat` rows (369 pre-existing in base) at 120 s: 0 `sat`, 212 confirmed (z3 8, cvc5 212), 159 unconfirmed, all pre-existing |
+| 2 | `violated:memb@not-needed` shrinks ≥ 20% (≥ 450 rows) to `correct` | PASS. 936 of 2,252 base-tagged rows (41.6%) are now `correct`, against 917 for approach 1. The tag goes 2,252 → 432 |
+| 3 | no `correct → non-correct` reproducing 3/3 | PASS. The 4 `correct → unverified` rows are noise: same answer 3/3, only the bench z3 timed out. Norn `312`, `322`, `362` and `454` are `correct` again, 3/3 on both binaries |
+| 4 | serial timing within ±5% | **FAIL, on the faster side** (as approach 1). Pooled over 3 passes: QF_S 0.809 (4.76 → 3.85 s), QF_SLIA 0.845 (7.30 → 6.17 s). Newly-`correct` rows: 9.36×, reported. The passes ran once the 1-min load fell to ≤ 24 (15–18), after about 4 h of waiting |
+| 5 | `mise run ci` green; oracle count | PASS. ci 1773 / 1773 (6 skipped); oracle 831 / 831 (2 skipped) |
+| 6 | neutrality sample: only non-reproducible flips | PASS. 37 sample rows changed, all noise: both binaries give identical results, mostly killed under external host load |
+
+- **Approach 1 → variant.** The 4 Norn regressions are restored. Approach
+  1's 10 Norn HammingDistance gains are given back (`correct → sat-budget`,
+  attributable 3/3).
+- Norn and Jiang `slog` now match base row for row (3,003 rows). This
+  removes approach 1's unknown ↔ unknown churn.
+- String `correct` is 41,898, against 41,810 for approach 1 and 40,913 for
+  base. The +88 over approach 1 is +4 − 10 Norn, plus 94 rows where only
+  the bench's z3 oracle timeout differed.
+- The report's queue item 1 is resolved.
+
+Deviations (variant):
+
+- Rule-E no longer takes the head-only partition. That contradicts §3
+  approach 1, §4.3, and the header's "`range_bounds` deleted":
+  `range_bounds` is back, and Rule-E uses it.
+- Triage and the cross-check ran under heavy external host load (load
+  average 67–127 on 24 cores).
+- Cross-check scope: 371 rows, which is all the variant's unchecked `unverified` `unsat` rows. 369 of them predate the slice
+- Criterion 4: out of band on the faster side, as with approach 1, and measured on a loaded host (1-min load 15–18) rather than an idle one
