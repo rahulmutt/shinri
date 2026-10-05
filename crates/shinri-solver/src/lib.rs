@@ -1593,7 +1593,6 @@ impl Solver {
     /// evaluable string is the shape the string fragment actually needs.
     fn eval_num_val(&self, model: &Model, t: TermId) -> Option<shinri_core::Rational> {
         use shinri_core::{BuiltinOp, Op, TermNode};
-        use shinri_theory::types::ModelVal;
         if let Some(r) = self.ctx.numeral_value(t) {
             return Some(r.clone());
         }
@@ -1608,13 +1607,64 @@ impl Solver {
                     (s.chars().count() as i128).into(),
                 ))
             }
-            _ => {
-                if let Some(ModelVal::Num(r)) = model.values.get(&t) {
-                    Some(r.clone())
+            // Length arithmetic is re-evaluated structurally, but ONLY when the
+            // arith model valued the compound term: that value can be stale
+            // (disagree with the string-derived `str.len` values) once a
+            // model-side seed changes a leaf's length, so the term's true
+            // value under the FINAL model is computed from its operands. If an
+            // operand is unevaluable the arith value is returned as before;
+            // with no arith value the term stays unevaluable (`None`).
+            TermNode::App {
+                op:
+                    Op::Builtin(
+                        op @ (BuiltinOp::Add | BuiltinOp::Sub | BuiltinOp::Mul | BuiltinOp::Neg),
+                    ),
+                args,
+                ..
+            } => {
+                let arith = self.model_num(model, t)?;
+                let vals: Option<Vec<shinri_core::Rational>> = self
+                    .ctx
+                    .children(*args)
+                    .iter()
+                    .map(|&k| self.eval_num_val(model, k))
+                    .collect();
+                Some(vals.and_then(|v| Self::fold_arith(*op, v)).unwrap_or(arith))
+            }
+            _ => self.model_num(model, t),
+        }
+    }
+
+    fn model_num(&self, model: &Model, t: TermId) -> Option<shinri_core::Rational> {
+        use shinri_theory::types::ModelVal;
+        match model.values.get(&t) {
+            Some(ModelVal::Num(r)) => Some(r.clone()),
+            _ => None,
+        }
+    }
+
+    /// Fold evaluated operands of `+`, `-` (n-ary left fold), `*` and unary
+    /// negation; `None` for a wrong operand count.
+    fn fold_arith(
+        op: shinri_core::BuiltinOp,
+        v: Vec<shinri_core::Rational>,
+    ) -> Option<shinri_core::Rational> {
+        use shinri_core::BuiltinOp;
+        let mut it = v.into_iter();
+        let first = it.next()?;
+        match op {
+            BuiltinOp::Neg => it.next().is_none().then(|| -first),
+            BuiltinOp::Add => Some(it.fold(first, |a, b| a + b)),
+            BuiltinOp::Sub => {
+                let mut rest = it.peekable();
+                if rest.peek().is_none() {
+                    Some(-first)
                 } else {
-                    None
+                    Some(rest.fold(first, |a, b| a - b))
                 }
             }
+            BuiltinOp::Mul => Some(it.fold(first, |a, b| a * b)),
+            _ => None,
         }
     }
 
