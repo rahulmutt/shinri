@@ -53,7 +53,7 @@ pub fn len_of_in_model(terms: &mut Context, m: &ModelBuilder, t: TermId) -> usiz
 /// are EUF-equal to `t`. A derived concat term's own `(str.len …)` may be absent
 /// from the arith model while an EUF-equal variable's is pinned, so the class read
 /// recovers the true length (needed by the cycle-guard fallback).
-fn class_len_in_model(
+pub(crate) fn class_len_in_model(
     terms: &mut Context,
     eq: &mut EqualityEngine,
     known: &[TermId],

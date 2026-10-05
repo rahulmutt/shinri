@@ -1581,7 +1581,10 @@ impl StrSolver {
         // Slice 21: seed free membership variables with searched words so
         // concat assembly composes REPAIRED values, not default fills.
         let membs: Vec<(TermId, bool)> = self.memb_true.iter().map(|&(a, _, p)| (a, p)).collect();
-        let seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
+        let mut seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
+        // Slice 61: joint words for the free leaves of concat-subject
+        // memberships override those leaves' per-leaf seeds.
+        seeds.extend(joint_seed::joint_seeds(cx.terms, cx.eq, &known, &membs, m));
         // Slice 57: default build, then self-check against the INPUT string
         // equations (non-minted `eq_true` atoms). Only a violated input
         // equation triggers the reconciliation rebuild, which is adopted if it

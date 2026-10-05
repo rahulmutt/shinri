@@ -11,10 +11,11 @@
 //! per-leaf seeds and the gate re-checks every assertion, so a miss or a bug
 //! can only leave the prior sound `unknown`.
 
-#![allow(dead_code)] // TEMP: removed in Task 3 (first non-test caller)
-
+use crate::model;
 use crate::regex::{self, Rex};
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
+use shinri_core::{BuiltinOp, Context, Op, TermId, TermNode};
+use shinri_theory::{EqualityEngine, ModelBuilder};
 
 /// Per-pass DFS step cap (spec §4.4): the witness search's own cap.
 pub(crate) const JOINT_SEARCH_STEP_CAP: usize = regex::MEMB_SEARCH_STEP_CAP;
@@ -338,6 +339,224 @@ pub(crate) fn solve_group(own: &[Rex], cons: &[JConstraint], lens: Lengths<'_>) 
         dead.insert(f.key);
     }
     Outcome::Exhausted
+}
+
+/// An operand before leaves are numbered within their group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RawOp {
+    Lit(Vec<u32>),
+    Leaf(TermId),
+}
+
+fn is_leaf(terms: &Context, t: TermId) -> bool {
+    matches!(
+        terms.term_node(t),
+        TermNode::App { op: Op::Uninterpreted(_), args, .. } if terms.children(*args).is_empty()
+    )
+}
+
+/// Flatten `t` into constants and nullary leaves (nested concats inlined).
+/// False if an operand is anything else, or a constant holds a character
+/// above the SMT-LIB alphabet (spec §4.2).
+fn flatten(terms: &Context, t: TermId, out: &mut Vec<RawOp>) -> bool {
+    if let Some(s) = terms.string_const_value(t) {
+        let cs: Vec<u32> = s.chars().map(|c| c as u32).collect();
+        if cs.iter().any(|&c| c > regex::MAX_CODE) {
+            return false;
+        }
+        out.push(RawOp::Lit(cs));
+        return true;
+    }
+    if is_leaf(terms, t) {
+        out.push(RawOp::Leaf(t));
+        return true;
+    }
+    match terms.term_node(t) {
+        TermNode::App {
+            op: Op::Builtin(BuiltinOp::StrConcat),
+            args,
+            ..
+        } => terms
+            .children(*args)
+            .to_vec()
+            .into_iter()
+            .all(|k| flatten(terms, k, out)),
+        _ => false,
+    }
+}
+
+/// A concat is *minted* iff every leaf among its (recursively flattened)
+/// operands is a nullary uninterpreted app with a reserved symbol; constant
+/// operands do not matter. Any other operand makes it not minted
+/// (conservative).
+fn is_minted_concat(terms: &Context, t: TermId) -> bool {
+    let mut ops = Vec::new();
+    // `flatten` also rejects above-alphabet constants; those are not minted
+    // splits either, so treating them as "not minted" is the safe side.
+    flatten(terms, t, &mut ops)
+        && ops.iter().all(|o| match o {
+            RawOp::Lit(_) => true,
+            RawOp::Leaf(l) => match terms.term_node(*l) {
+                TermNode::App {
+                    op: Op::Uninterpreted(f),
+                    ..
+                } => terms.is_reserved(*f),
+                _ => false,
+            },
+        })
+}
+
+/// True iff `l`'s value is dictated elsewhere: its EUF class (within
+/// `known`) holds another member that is a string constant or a concat that
+/// is NOT minted. Unlike `model::is_repair_pinned`, solver-minted Rule-S1
+/// splits (`l ≈ !strk0·!strk1`) do not count (R5): they are not gate-checked
+/// (`input_eqs_hold` filters minted equalities) and a seed takes precedence
+/// over the class concat in `value_of`, whereas constants and input concats
+/// are checked and a seed would fight them.
+fn value_dictated(terms: &Context, eq: &mut EqualityEngine, known: &[TermId], l: TermId) -> bool {
+    model::class_member(terms, eq, known, l, |tm, mm| {
+        mm != l
+            && (tm.string_const_value(mm).is_some()
+                || (model::is_concat(tm, mm) && !is_minted_concat(tm, mm)))
+    })
+    .is_some()
+}
+
+/// Connected components of `raw`'s constraints, linked by shared leaves:
+/// each component's constraints in input order, components ordered by
+/// their first constraint.
+fn groups(raw: &[(Vec<RawOp>, Rex)]) -> Vec<Vec<usize>> {
+    fn find(p: &mut [usize], mut i: usize) -> usize {
+        while p[i] != i {
+            p[i] = p[p[i]];
+            i = p[i];
+        }
+        i
+    }
+    let mut parent: Vec<usize> = (0..raw.len()).collect();
+    let mut first: FxHashMap<TermId, usize> = FxHashMap::default();
+    for (ci, (ops, _)) in raw.iter().enumerate() {
+        for op in ops {
+            if let RawOp::Leaf(l) = op {
+                match first.get(l) {
+                    Some(&cj) => {
+                        let (a, b) = (find(&mut parent, ci), find(&mut parent, cj));
+                        parent[a.max(b)] = a.min(b);
+                    }
+                    None => {
+                        first.insert(*l, ci);
+                    }
+                }
+            }
+        }
+    }
+    let mut out: Vec<Vec<usize>> = Vec::new();
+    let mut slot: FxHashMap<usize, usize> = FxHashMap::default();
+    for ci in 0..raw.len() {
+        let r = find(&mut parent, ci);
+        let g = *slot.entry(r).or_insert_with(|| {
+            out.push(Vec::new());
+            out.len() - 1
+        });
+        out[g].push(ci);
+    }
+    out
+}
+
+/// Slice 61: joint words for the free leaves of concat-subject memberships
+/// (spec §4). Groups eligible constraints by shared leaves; a group whose
+/// leaves are all free of dictated values is solved at the leaves' model
+/// lengths (pass 1), then at free lengths (pass 2). A group yields a word
+/// for every leaf or nothing. The caller merges the result over
+/// `memb_seeds`.
+pub(crate) fn joint_seeds(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    membs: &[(TermId, bool)],
+    m: &ModelBuilder,
+) -> FxHashMap<TermId, String> {
+    let mut bare: FxHashMap<TermId, Vec<Rex>> = FxHashMap::default();
+    let mut raw: Vec<(Vec<RawOp>, Rex)> = Vec::new();
+    for &(atom, pos) in membs {
+        let (t, re_t) = crate::memb::memb_sides(terms, atom);
+        let Some(mut rex) = regex::extract_const_regex(terms, re_t) else {
+            continue;
+        };
+        if !pos {
+            rex = regex::comp(rex);
+        }
+        if is_leaf(terms, t) {
+            bare.entry(t).or_default().push(rex);
+            continue;
+        }
+        let mut ops = Vec::new();
+        if !model::is_concat(terms, t)
+            || !flatten(terms, t, &mut ops)
+            || !ops.iter().any(|o| matches!(o, RawOp::Leaf(_)))
+        {
+            continue;
+        }
+        // A class constant dictates the subject's value (spec §4.2).
+        let pinned = model::class_member(terms, eq, known, t, |tm, mm| {
+            tm.string_const_value(mm).is_some()
+        });
+        if pinned.is_none() {
+            raw.push((ops, rex));
+        }
+    }
+    let mut out = FxHashMap::default();
+    for group in groups(&raw) {
+        // Leaves in first-occurrence order: `solve_group`'s leaf order.
+        let mut leaves: Vec<TermId> = Vec::new();
+        for &ci in &group {
+            for op in &raw[ci].0 {
+                if let RawOp::Leaf(l) = op {
+                    if !leaves.contains(l) {
+                        leaves.push(*l);
+                    }
+                }
+            }
+        }
+        if leaves.iter().any(|&l| value_dictated(terms, eq, known, l)) {
+            continue;
+        }
+        let cons: Vec<JConstraint> = group
+            .iter()
+            .map(|&ci| JConstraint {
+                ops: raw[ci]
+                    .0
+                    .iter()
+                    .map(|op| match op {
+                        RawOp::Lit(cs) => JOp::Lit(cs.clone()),
+                        RawOp::Leaf(l) => {
+                            JOp::Leaf(leaves.iter().position(|x| x == l).expect("collected above"))
+                        }
+                    })
+                    .collect(),
+                rex: raw[ci].1.clone(),
+            })
+            .collect();
+        let own: Vec<Rex> = leaves
+            .iter()
+            .map(|l| regex::inter(bare.get(l).cloned().unwrap_or_default()))
+            .collect();
+        let lens: Vec<usize> = leaves
+            .iter()
+            .map(|&l| model::class_len_in_model(terms, eq, known, m, l))
+            .collect();
+        let words = match solve_group(&own, &cons, Lengths::Fixed(&lens)) {
+            Outcome::Found(w) => Some(w),
+            _ => match solve_group(&own, &cons, Lengths::Free(JOINT_FREE_LEN_CAP)) {
+                Outcome::Found(w) => Some(w),
+                _ => None,
+            },
+        };
+        if let Some(words) = words {
+            out.extend(leaves.into_iter().zip(words));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -765,5 +984,235 @@ mod tests {
             found_n > 100 && exhausted_n > 100,
             "generator must exercise both outcomes"
         );
+    }
+}
+
+#[cfg(test)]
+mod front_tests {
+    use super::*;
+    use crate::regex::{self, Rex};
+    use shinri_core::{BuiltinOp, Context, Op, TermId};
+    use shinri_theory::types::{EqJust, ModelVal};
+    use shinri_theory::{EqualityEngine, ModelBuilder};
+
+    fn var(ctx: &mut Context, n: &str) -> TermId {
+        let s = ctx.string_sort();
+        let f = ctx.declare_fun(n, &[], s);
+        ctx.mk_app(Op::Uninterpreted(f), &[]).unwrap()
+    }
+
+    fn cat(ctx: &mut Context, parts: &[TermId]) -> TermId {
+        ctx.mk_app(Op::Builtin(BuiltinOp::StrConcat), parts)
+            .unwrap()
+    }
+
+    fn memb(ctx: &mut Context, t: TermId, r: &Rex) -> TermId {
+        let re_t = regex::rex_to_term_test(ctx, r);
+        ctx.mk_app(Op::Builtin(BuiltinOp::StrInRe), &[t, re_t])
+            .unwrap()
+    }
+
+    fn pin_len(ctx: &mut Context, m: &mut ModelBuilder, t: TermId, n: i128) {
+        let l = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[t]).unwrap();
+        m.assign(l, ModelVal::Num(shinri_core::Rational::from_int(n.into())));
+    }
+
+    fn merge(eq: &mut EqualityEngine, a: TermId, b: TermId) {
+        let (ia, ib) = (eq.intern(a), eq.intern(b));
+        let _ = eq.merge(ia, ib, EqJust::Definitional);
+    }
+
+    #[test]
+    fn regex_035_shape_seeds_both_leaves() {
+        let mut ctx = Context::new();
+        let (x, y) = (var(&mut ctx, "x"), var(&mut ctx, "y"));
+        let yx = cat(&mut ctx, &[y, x]);
+        let a = memb(&mut ctx, yx, &regex::star_lit_test("b"));
+        let mut m = ModelBuilder::default();
+        pin_len(&mut ctx, &mut m, y, 1);
+        pin_len(&mut ctx, &mut m, x, 2);
+        let mut eq = EqualityEngine::default();
+        let s = joint_seeds(&mut ctx, &mut eq, &[x, y, yx], &[(a, true)], &m);
+        assert_eq!(s.get(&y).map(String::as_str), Some("b"));
+        assert_eq!(s.get(&x).map(String::as_str), Some("bb"));
+    }
+
+    #[test]
+    fn bare_membership_is_the_own_language() {
+        // x·y ∈ (a|b)*, x ∈ b+ (bare), negative bare y ∉ a* ⇒ y has a b.
+        let mut ctx = Context::new();
+        let (x, y) = (var(&mut ctx, "x"), var(&mut ctx, "y"));
+        let xy = cat(&mut ctx, &[x, y]);
+        let ab = regex::star(regex::union(vec![
+            Rex::Range('a' as u32, 'a' as u32),
+            Rex::Range('b' as u32, 'b' as u32),
+        ]));
+        let a1 = memb(&mut ctx, xy, &ab);
+        let bplus = regex::concat(vec![regex::lit_test("b"), regex::star_lit_test("b")]);
+        let a2 = memb(&mut ctx, x, &bplus);
+        let a3 = memb(&mut ctx, y, &regex::star_lit_test("a"));
+        let mut m = ModelBuilder::default();
+        pin_len(&mut ctx, &mut m, x, 1);
+        pin_len(&mut ctx, &mut m, y, 1);
+        let mut eq = EqualityEngine::default();
+        let s = joint_seeds(
+            &mut ctx,
+            &mut eq,
+            &[x, y, xy],
+            &[(a1, true), (a2, true), (a3, false)],
+            &m,
+        );
+        assert_eq!(s.get(&x).map(String::as_str), Some("b"));
+        assert_eq!(s.get(&y).map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn pinned_leaf_skips_its_group_only() {
+        // Group 1: x·y ∈ b*, x pinned to "ab" ⇒ skipped. Group 2: z·w ∈ a*.
+        let mut ctx = Context::new();
+        let (x, y, z, w) = (
+            var(&mut ctx, "x"),
+            var(&mut ctx, "y"),
+            var(&mut ctx, "z"),
+            var(&mut ctx, "w"),
+        );
+        let (xy, zw) = (cat(&mut ctx, &[x, y]), cat(&mut ctx, &[z, w]));
+        let a1 = memb(&mut ctx, xy, &regex::star_lit_test("b"));
+        let a2 = memb(&mut ctx, zw, &regex::star_lit_test("a"));
+        let ab = ctx.mk_string_const("ab");
+        let mut eq = EqualityEngine::default();
+        merge(&mut eq, x, ab);
+        let mut m = ModelBuilder::default();
+        for t in [x, y, z, w] {
+            pin_len(&mut ctx, &mut m, t, 1);
+        }
+        let s = joint_seeds(
+            &mut ctx,
+            &mut eq,
+            &[x, y, z, w, xy, zw, ab],
+            &[(a1, true), (a2, true)],
+            &m,
+        );
+        assert!(!s.contains_key(&x) && !s.contains_key(&y), "{s:?}");
+        assert_eq!(s.get(&z).map(String::as_str), Some("a"));
+        assert_eq!(s.get(&w).map(String::as_str), Some("a"));
+    }
+
+    #[test]
+    fn constant_pinned_subject_is_skipped() {
+        let mut ctx = Context::new();
+        let (x, y) = (var(&mut ctx, "x"), var(&mut ctx, "y"));
+        let xy = cat(&mut ctx, &[x, y]);
+        let a = memb(&mut ctx, xy, &regex::star_lit_test("b"));
+        let bb = ctx.mk_string_const("bb");
+        let mut eq = EqualityEngine::default();
+        merge(&mut eq, xy, bb);
+        let m = ModelBuilder::default();
+        let s = joint_seeds(&mut ctx, &mut eq, &[x, y, xy, bb], &[(a, true)], &m);
+        assert!(s.is_empty(), "{s:?}");
+    }
+
+    #[test]
+    fn non_leaf_operand_is_ineligible() {
+        // f(x)·y ∈ b*: f(x) is not a nullary leaf.
+        let mut ctx = Context::new();
+        let (x, y) = (var(&mut ctx, "x"), var(&mut ctx, "y"));
+        let s_sort = ctx.string_sort();
+        let f = ctx.declare_fun("f", &[s_sort], s_sort);
+        let fx = ctx.mk_app(Op::Uninterpreted(f), &[x]).unwrap();
+        let t = cat(&mut ctx, &[fx, y]);
+        let a = memb(&mut ctx, t, &regex::star_lit_test("b"));
+        let mut eq = EqualityEngine::default();
+        let m = ModelBuilder::default();
+        assert!(joint_seeds(&mut ctx, &mut eq, &[x, y, fx, t], &[(a, true)], &m).is_empty());
+    }
+
+    #[test]
+    fn nested_concat_is_flattened() {
+        // x·("z"·y) ∈ a*za*
+        let mut ctx = Context::new();
+        let (x, y) = (var(&mut ctx, "x"), var(&mut ctx, "y"));
+        let z = ctx.mk_string_const("z");
+        let zy = cat(&mut ctx, &[z, y]);
+        let t = cat(&mut ctx, &[x, zy]);
+        let r = regex::concat(vec![
+            regex::star_lit_test("a"),
+            regex::lit_test("z"),
+            regex::star_lit_test("a"),
+        ]);
+        let a = memb(&mut ctx, t, &r);
+        let mut m = ModelBuilder::default();
+        pin_len(&mut ctx, &mut m, x, 2);
+        pin_len(&mut ctx, &mut m, y, 1);
+        let mut eq = EqualityEngine::default();
+        let s = joint_seeds(&mut ctx, &mut eq, &[x, y, z, zy, t], &[(a, true)], &m);
+        assert_eq!(s.get(&x).map(String::as_str), Some("aa"));
+        assert_eq!(s.get(&y).map(String::as_str), Some("a"));
+    }
+
+    #[test]
+    fn flatten_rejects_above_alphabet_constant() {
+        let mut ctx = Context::new();
+        let x = var(&mut ctx, "x");
+        let hi = ctx.mk_string_const(&char::from_u32(0x30000).unwrap().to_string());
+        let ok = ctx.mk_string_const("\u{10000}");
+        let bad = cat(&mut ctx, &[x, hi]);
+        let good = cat(&mut ctx, &[x, ok]);
+        let mut out = Vec::new();
+        assert!(!flatten(&ctx, bad, &mut out));
+        out.clear();
+        assert!(flatten(&ctx, good, &mut out));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn groups_link_constraints_by_shared_leaves() {
+        let mut ctx = Context::new();
+        let (x, y, z) = (var(&mut ctx, "x"), var(&mut ctx, "y"), var(&mut ctx, "z"));
+        let raw = vec![
+            (vec![RawOp::Leaf(x), RawOp::Lit(vec![97])], Rex::Eps),
+            (vec![RawOp::Leaf(z)], Rex::Eps),
+            (vec![RawOp::Leaf(y), RawOp::Leaf(x)], Rex::Eps),
+        ];
+        assert_eq!(groups(&raw), vec![vec![0, 2], vec![1]]);
+    }
+
+    #[test]
+    fn minted_split_does_not_skip_group() {
+        let mut ctx = Context::new();
+        let (x, y) = (var(&mut ctx, "x"), var(&mut ctx, "y"));
+        let xy = cat(&mut ctx, &[x, y]);
+        let a = memb(&mut ctx, xy, &regex::star_lit_test("b"));
+        let mut ctr = 0u32;
+        let h = crate::wordeq::fresh_str(&mut ctx, &mut ctr);
+        let z = crate::wordeq::fresh_str(&mut ctx, &mut ctr);
+        let hz = cat(&mut ctx, &[h, z]);
+        let mut eq = EqualityEngine::default();
+        merge(&mut eq, x, hz);
+        let mut m = ModelBuilder::default();
+        for (t, n) in [(x, 2), (y, 1), (h, 1), (z, 1)] {
+            pin_len(&mut ctx, &mut m, t, n);
+        }
+        let s = joint_seeds(&mut ctx, &mut eq, &[x, y, xy, hz, h, z], &[(a, true)], &m);
+        assert_eq!(s.get(&x).map(String::as_str), Some("bb"), "{s:?}");
+        assert_eq!(s.get(&y).map(String::as_str), Some("b"), "{s:?}");
+    }
+
+    #[test]
+    fn input_concat_class_skips_group() {
+        let mut ctx = Context::new();
+        let (x, y) = (var(&mut ctx, "x"), var(&mut ctx, "y"));
+        let (u, v) = (var(&mut ctx, "u"), var(&mut ctx, "v"));
+        let xy = cat(&mut ctx, &[x, y]);
+        let a = memb(&mut ctx, xy, &regex::star_lit_test("b"));
+        let uv = cat(&mut ctx, &[u, v]);
+        let mut eq = EqualityEngine::default();
+        merge(&mut eq, x, uv);
+        let mut m = ModelBuilder::default();
+        for (t, n) in [(x, 2), (y, 1), (u, 1), (v, 1)] {
+            pin_len(&mut ctx, &mut m, t, n);
+        }
+        let s = joint_seeds(&mut ctx, &mut eq, &[x, y, xy, uv, u, v], &[(a, true)], &m);
+        assert!(!s.contains_key(&x) && !s.contains_key(&y), "{s:?}");
     }
 }
