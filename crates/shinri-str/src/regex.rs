@@ -800,6 +800,35 @@ pub(crate) fn search_shortest(r: &Rex) -> Option<String> {
     None
 }
 
+/// The witness character of a next-character class: its smallest
+/// NON-SURROGATE code point, or `None` for a pure-surrogate class (no Rust
+/// `char`; skipping it loses completeness only). The same choice
+/// `search_word` makes inline; slice 61's joint search shares it.
+pub(crate) fn class_witness(lo: u32, hi: u32) -> Option<u32> {
+    if (SURR_LO..=SURR_HI).contains(&lo) {
+        (hi > SURR_HI).then_some(SURR_HI + 1)
+    } else {
+        Some(lo)
+    }
+}
+
+/// Slice 61: next-character classes for the joint search — the head
+/// partition of `head`, refined by EVERY range of each regex in `later`.
+/// A regex in `later` consumes the current characters only afterwards (a
+/// constraint waiting on another leaf, or a later occurrence of the same
+/// leaf). `deriv` never creates a `Range`, so the ranges it will ever test
+/// are among its present ones, and each class is uniform for it too —
+/// without this refinement one witness per class could miss the word it
+/// needs. `None` iff the partition exceeds `CLASS_SPLIT_CAP`.
+pub(crate) fn joint_classes(head: &Rex, later: &[&Rex]) -> Option<Vec<(u32, u32)>> {
+    let mut bounds = BTreeSet::new();
+    head_bounds(head, &mut bounds);
+    for r in later {
+        range_bounds(r, &mut bounds);
+    }
+    classes_from_bounds(bounds)
+}
+
 /// Three-valued emptiness of `L(r)`. `Empty` / `NonEmpty` are DECISIONS;
 /// `Unknown` means a fuel/partition cap prevented a complete traversal (an
 /// abort, NOT a verdict — the caller keeps its prior sound Unknown). `Empty`
@@ -3222,5 +3251,38 @@ mod tests {
     #[test]
     fn rule_e_classes_uniform_sweep() {
         uniform_sweep(rule_e_classes);
+    }
+
+    #[test]
+    fn class_witness_skips_surrogates() {
+        assert_eq!(class_witness(0x61, 0x7A), Some(0x61));
+        assert_eq!(class_witness(0xD800, 0xDFFF), None);
+        assert_eq!(class_witness(0xD800, 0xE005), Some(0xE000));
+        assert_eq!(class_witness(0xE000, MAX_CODE), Some(0xE000));
+    }
+
+    #[test]
+    fn joint_classes_refine_by_later_ranges() {
+        // head [a-b]* cuts at a and c; the later "bab" adds a, b and c.
+        let head = star(Rex::Range(0x61, 0x62));
+        let later = concat(vec![
+            Rex::Range(0x62, 0x62),
+            Rex::Range(0x61, 0x61),
+            Rex::Range(0x62, 0x62),
+        ]);
+        assert_eq!(
+            next_classes(&head),
+            Some(vec![(0, 0x60), (0x61, 0x62), (0x63, MAX_CODE)])
+        );
+        assert_eq!(
+            joint_classes(&head, &[&later]),
+            Some(vec![
+                (0, 0x60),
+                (0x61, 0x61),
+                (0x62, 0x62),
+                (0x63, MAX_CODE)
+            ])
+        );
+        assert_eq!(joint_classes(&head, &[]), next_classes(&head));
     }
 }

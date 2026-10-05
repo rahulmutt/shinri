@@ -3,6 +3,7 @@ mod collect;
 mod fuel;
 pub mod indexof_replace;
 pub mod int_conv;
+mod joint_seed;
 mod length;
 mod memb;
 pub mod model;
