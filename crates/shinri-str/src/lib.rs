@@ -4,6 +4,7 @@ mod fuel;
 pub mod indexof_replace;
 pub mod int_conv;
 mod joint_seed;
+mod leaf_bounds;
 mod length;
 mod memb;
 pub mod model;
@@ -78,6 +79,15 @@ pub struct StrSolver {
     code_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
     emitted_len_axioms: FxHashSet<TermId>,
+    /// Slice 62: dedup for per-leaf intersection length bounds, keyed by
+    /// `(bound atom, sorted guard lits)` — the same bound under a different
+    /// membership set is a different lemma. Monotone, like
+    /// `emitted_len_axioms`.
+    emitted_group_len_axioms: FxHashSet<(TermId, Vec<Lit>)>,
+    /// Slice 62: `regex::len_bounds` of a leaf group's intersection, keyed by
+    /// its sorted guard lits (lits <-> atoms, so the key fixes the goal).
+    /// Monotone.
+    len_bounds_cache: FxHashMap<Vec<Lit>, Option<(u32, Option<u32>)>>,
     /// Dedup set for F-splits: keyed on the canonical (unordered) head pair.
     /// Monotone (never cleared on backtrack); prevents re-emitting the same
     /// split after dedup (termination guarantee).
@@ -1883,6 +1893,13 @@ impl StrSolver {
     pub fn test_force_memb_true(&mut self, atom: TermId, positive: bool) {
         self.memb_true
             .push((atom, Lit::new(Var::new(0), true), positive));
+        self.memb_levels.push(0);
+    }
+
+    /// Like `test_force_memb_true`, with an explicit SAT literal (slice 62:
+    /// group lemmas need distinct guard lits).
+    pub fn test_force_memb_true_lit(&mut self, atom: TermId, lit: Lit, positive: bool) {
+        self.memb_true.push((atom, lit, positive));
         self.memb_levels.push(0);
     }
 }

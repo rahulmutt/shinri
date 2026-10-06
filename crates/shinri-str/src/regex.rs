@@ -885,7 +885,6 @@ pub(crate) fn language_empty(r: &Rex) -> Emptiness {
 
 /// Slice 62: layers the exact-bounds walk explores before giving up on a
 /// finite maximum (spec §4.3).
-#[allow(dead_code)] // used by Task 3
 pub(crate) const LEN_BOUND_DEPTH_CAP: u32 = 64;
 
 /// Exact length bounds of `L(r)`: `Some((min, max))`, where `min` is the
@@ -901,7 +900,6 @@ pub(crate) const LEN_BOUND_DEPTH_CAP: u32 = 64;
 /// `language_empty`, every `next_classes` interval is explored, pure-surrogate
 /// ones included (its `lo` represents the class), so `min` is a sound lower
 /// bound — `search_shortest` skips surrogate classes and is not.
-#[allow(dead_code)] // used by Task 3
 pub(crate) fn len_bounds(r: &Rex) -> Option<(u32, Option<u32>)> {
     let mut steps = 0usize;
     let mut layer: Vec<Rex> = vec![r.clone()];

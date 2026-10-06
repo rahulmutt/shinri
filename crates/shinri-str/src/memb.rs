@@ -681,7 +681,11 @@ pub(crate) fn memb_check(
             return Some(TCheck::Conflict(just));
         }
     }
-    None
+    // -- Slice 62: per-leaf intersection length bounds ---------------------
+    // Reached only when nothing above emitted this round. A leaf whose
+    // memberships jointly bound its length more tightly than any single
+    // atom does gets `!m1 | ... | !mk | bound` (leaf_bounds.rs).
+    crate::leaf_bounds::bound_split(s, cx, known, input_cond_roots)
 }
 
 #[cfg(test)]
