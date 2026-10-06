@@ -112,7 +112,9 @@ from the model).
 
 ### 4.2 Backstop: strict gate on a seed/model length mismatch
 
-`memb_seeds` returns `(FxHashMap<TermId, String>, bool)`. The flag is set
+A new `memb_seeds_flagged` returns `(FxHashMap<TermId, String>, bool)`;
+`memb_seeds` becomes its `.0` wrapper, so existing callers and tests are
+untouched (the slice-61 `joint_seeds` pattern). The flag is set
 when it inserts a seed whose char count differs from the
 `class_len_in_model` value it searched at (the `search_shortest` fallback
 path). `model_with` calls `m.require_strict_check()` when the flag is set,
@@ -122,6 +124,10 @@ Purpose: a re-lengthed leaf whose length reaches an assertion the gate
 cannot evaluate (a UF argument, `str.to_int` of a length-dependent term)
 could otherwise be violated unseen. With the flag, such a model yields
 `sat` only when every assertion is positively confirmed.
+
+This is live on `main` (found during planning, `cdb5630`): `x ∈ (ab)*`,
+`f(len x) = 1`, `f(0) = 0`, `f(2) = 0`, `len x ≤ 3` (logic `ALL`) answers
+`sat ((x ""))`; z3 answers `unsat`.
 
 Known costs, measured not tuned: the item-4 pattern (the strict gate
 rejecting on an unrelated unevaluable assertion); and a model length that
@@ -203,8 +209,15 @@ The SAT split arm (`crates/shinri-sat/src/solver.rs`, the `SplitAtoms`
 case) pushes every guard as-is before the atom literals, exactly as it
 pushes the single guard today. The unit-split path (`lits.len() == 1`) is
 reached only with no guards, as now. Every guard is the negation of an
-asserted literal and so false at emission, so the clause shape and the
-learn-and-backtrack-one-level protocol are unchanged.
+asserted literal and so false at emission, and the
+learn-and-backtrack-one-level protocol is unchanged.
+
+Watch order (added during planning): `add_learnt` watches `lits[0]` and
+`lits[1]` as given. With two or more already-false guards in front, both
+watches would be false guards and the atoms would never be watched, so a
+violated lemma would go unnoticed. A clause with two or more guards is
+therefore ordered atoms first, then guards by descending decision level.
+With 0 or 1 guard the original guard-first order is kept byte-for-byte.
 
 Migration is mechanical and compiler-driven: `guard: None` becomes
 `guards: vec![]`, `guard: Some(g)` becomes `guards: vec![g]`, readers move
