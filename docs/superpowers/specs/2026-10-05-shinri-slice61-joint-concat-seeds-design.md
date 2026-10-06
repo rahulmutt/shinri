@@ -289,7 +289,7 @@ Same harness and flags as slice 60: full QF_S and QF_SLIA, plus the seeded
 neutrality sample for QF_BVFP, QF_DT, QF_LIA, QF_LRA, QF_UF, QF_UFLIA,
 QF_UFLRA; base binary `5aa164a`; `--timeout 20 --mem-mb 3072 --jobs 6`.
 
-The report (`docs/superpowers/research/YYYY-MM-DD-smtlib-2024-slice61-joint-concat-seeds-report.md`)
+The report (`docs/superpowers/research/2026-10-06-smtlib-2024-slice61-joint-concat-seeds-report.md`)
 gives:
 
 1. Verdict changes by `fence_detail` tag and by family (Norn, `slog`,
@@ -338,3 +338,46 @@ counts.
     (`eval_membership`)
   - `crates/shinri-str/src/memb.rs` ~636 (slice-28 emptiness grouping)
   - `crates/shinri-solver/src/lib.rs` `eval_num_val` (gate `str.len`)
+
+## 11. Measured outcomes
+
+Report: `docs/superpowers/research/2026-10-06-smtlib-2024-slice61-joint-concat-seeds-report.md`
+(after runs at `f9fa4f9` against the slice-60b base runs, `56997aa`, whose
+crates equal `main`'s).
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | 0 rows `* → wrong`; 0 wrong answers in triage | **PASS**: 0 `wrong` rows in both after runs; 0 wrong answers in 828 triage runs over 138 rows; no new `unverified` `unsat` row |
+| 2 | `violated:memb@not-needed` −20% (≥ 87) moving to `correct` | **PASS**: 432 → 314; 108 base-tagged rows (25.0%) now `correct`, 0 `unverified`. 110 rows moved to `correct` in all (all `sat`, z3-confirmed) |
+| 3 | no reproducible `correct → non-correct` | **FAIL (by the letter)**: 2 rows, Norn `ab` `norn-benchmark-135`/`138`, `sat` → `unknown:str-model-rejected`, 3/3. Caused by the R11a gate change, not joint seeds: base's `sat` carried an invalid model (`var_0 = "ab"`, `str.len var_0 = 4`, `v = 3`), which the gate now rejects |
+| 4 | timing within ±5% | **FAIL (faster side)**: pass 1 QF_S 0.914 / QF_SLIA 0.919; pooled over 3 passes 0.969 / 0.931; per-row min-of-3 QF_SLIA 0.987. No slowdown; newly-`correct` rows 0.933 |
+| 5 | ci green; oracle ≥ 831 + slice tests | **PASS**: ci 1808 / 1808 / 6 skipped; oracle 841 / 841 / 2 skipped |
+| 6 | neutrality sample | **PASS**: 51 changed rows, all base timeouts; all noise (identical results from both binaries 3/3) |
+
+`violated:memb@not-needed`: **432 → 314** (string `correct` +126 net).
+
+### Deviations from this spec
+
+- **R5:** the group skip is `value_dictated` (a class constant, or a
+  non-minted concat), not `model::is_repair_pinned`. Minted Rule-S1 concats
+  pinned both reproducers' leaves (§4.3).
+- **R8:** constraints and own languages come from **input** memberships
+  only (`minted_membs` on `StrSolver`, filled at the `memb.rs` `StrInRe`
+  mint sites), not all of `memb_true` (§4.2). `norn-benchmark-531`'s
+  `memb_true` was jointly unsat (z3). The set inserts touch Rule-S/E code
+  as bookkeeping only (§5).
+- **R9:** when an adopted joint word's length differs from the leaf's model
+  length, `model_with` requires the strict gate. §4.5's gate argument fails
+  for compound length arithmetic.
+- **R10/R11/R11a:** the solver gate's `eval_num_val` evaluates `+ - *` and
+  unary `-` structurally when the arith model valued the compound term
+  (§2/§5 said no gate change). This closes the pre-existing wrong `sat` on
+  main (bare `x, y ∈ (ab)*`, `len x + len y = 3`: base `sat`, after
+  `unknown`). It also causes criterion 3's 2 rows.
+- The entry point is `joint_seeds_flagged(...) -> (map, length_changed)`
+  (§4.1).
+- Plan task order: the search core (Tasks 1–2) came before the front end
+  and wiring (Task 3), unlike §6.
+- Process rulings R1–R4, R6, R7, R12 (in-place branch, count slip, RED
+  worktree path, no push/PR in Task 7, R5's tests, no reviewer for no-diff
+  tasks) are listed in the report's *What changed versus the spec*.
