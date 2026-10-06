@@ -1605,16 +1605,19 @@ impl StrSolver {
             .copied()
             .filter(|(a, _)| !self.minted_membs.contains(a))
             .collect();
-        let mut seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
+        let (mut seeds, seed_len_changed) =
+            model::memb_seeds_flagged(cx.terms, cx.eq, &known, &membs, m);
         // Slice 61: joint words for the free leaves of concat-subject
         // memberships override those leaves' per-leaf seeds.
         let (joint, joint_len_changed) =
             joint_seed::joint_seeds_flagged(cx.terms, cx.eq, &known, &input_membs, m);
         seeds.extend(joint);
-        if joint_len_changed {
-            // A joint word whose length differs from the arith model's: only
-            // atomic `str.len` comparisons are re-read from the string, so
-            // require the strict gate (every assertion definitely true).
+        if joint_len_changed || seed_len_changed {
+            // A seed (joint, or a per-leaf shortest-word fallback) whose
+            // length differs from the arith model's: length facts outside
+            // what the gate re-reads from strings may be stale (a UF
+            // argument, `str.to_int`), so require the strict gate (R9;
+            // slice 62 adds the per-leaf case).
             m.require_strict_check();
         }
         // Slice 57: default build, then self-check against the INPUT string
@@ -2284,6 +2287,32 @@ mod tests {
         }
         assert!(!m.strict_check_required());
         assert_eq!(m.rebuild_outcome(), RebuildOutcome::Budget);
+    }
+
+    /// Slice 62: a fallback seed whose length differs from the arith model's
+    /// requires the strict gate.
+    #[test]
+    fn slice62_model_with_flags_strict_on_seed_length_mismatch() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut m = ModelBuilder::default();
+        let x = slice57_var(&mut ctx, "x");
+        let re_t = crate::regex::rex_to_term_test(&mut ctx, &crate::regex::star_lit_test("ab"));
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        slice57_len(&mut ctx, &mut m, x, 3);
+        let mut s = slice57_solver(&[], &[], &[x]);
+        s.test_force_memb_true(atom, true);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        s.model_with(&mut cx, &mut m);
+        assert!(matches!(m.get(x), Some(ModelVal::String(v)) if v.is_empty()));
+        assert!(m.strict_check_required());
     }
 
     /// The default path: a model that already satisfies its input equations

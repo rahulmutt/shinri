@@ -464,13 +464,15 @@ pub(crate) fn is_repair_pinned(
 /// The word: `search_word` over the intersection of all its (polarity-
 /// adjusted) Rex constraints at the class's model length. No word / cap hit
 /// / extraction failure ⇒ no seed (the post-solve self-check backstops).
-pub(crate) fn memb_seeds(
+/// Also returns whether some seed's length differs from the model length it
+/// was searched at (slice 62).
+pub(crate) fn memb_seeds_flagged(
     terms: &mut Context,
     eq: &mut EqualityEngine,
     known: &[TermId],
     membs: &[(TermId, bool)],
     m: &ModelBuilder,
-) -> FxHashMap<TermId, String> {
+) -> (FxHashMap<TermId, String>, bool) {
     use crate::regex;
     let mut per_var: FxHashMap<TermId, Vec<regex::Rex>> = FxHashMap::default();
     for &(atom, pos) in membs {
@@ -492,6 +494,7 @@ pub(crate) fn memb_seeds(
         per_var.entry(t).or_default().push(rex);
     }
     let mut out = FxHashMap::default();
+    let mut len_changed = false;
     for (v, rexes) in per_var {
         // Free check: no constant and no concat in v's class.
         if is_repair_pinned(terms, eq, known, v) {
@@ -513,10 +516,28 @@ pub(crate) fn memb_seeds(
         // only fall back to the prior sound Unknown, never fabricate a
         // wrong Sat.
         if let Some(w) = regex::search_word(&goal, n).or_else(|| regex::search_shortest(&goal)) {
+            // Slice 62: a fallback word whose length disagrees with the arith
+            // model's leaves stale length facts behind; the caller requires
+            // the strict gate (spec §4.2).
+            if w.chars().count() != n {
+                len_changed = true;
+            }
             out.insert(v, w);
         }
     }
-    out
+    (out, len_changed)
+}
+
+/// `memb_seeds_flagged` without the length-mismatch flag.
+#[cfg(test)]
+pub(crate) fn memb_seeds(
+    terms: &mut Context,
+    eq: &mut EqualityEngine,
+    known: &[TermId],
+    membs: &[(TermId, bool)],
+    m: &ModelBuilder,
+) -> FxHashMap<TermId, String> {
+    memb_seeds_flagged(terms, eq, known, membs, m).0
 }
 
 #[cfg(test)]
@@ -559,6 +580,50 @@ mod tests {
         let _ = eq.merge(xa, ca, shinri_theory::types::EqJust::Definitional);
         let seeds2 = memb_seeds(&mut ctx, &mut eq, &[x, ab], &[(atom, true)], &m);
         assert!(seeds2.is_empty(), "constant-pinned var is not repaired");
+    }
+
+    // ── Slice 62: the seed/model length mismatch flag ────────────────────
+
+    fn ab_star_leaf(ctx: &mut Context) -> (TermId, TermId) {
+        let str_s = ctx.string_sort();
+        let x = {
+            let s = ctx.declare_fun("x", &[], str_s);
+            ctx.mk_app(Op::Uninterpreted(s), &[]).unwrap()
+        };
+        let re_t = crate::regex::rex_to_term_test(ctx, &crate::regex::star_lit_test("ab"));
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        (x, atom)
+    }
+
+    fn pin_len(ctx: &mut Context, m: &mut ModelBuilder, x: TermId, n: i128) {
+        let l = ctx.mk_app(Op::Builtin(BuiltinOp::StrLen), &[x]).unwrap();
+        m.assign(l, ModelVal::Num(shinri_core::Rational::from_int(n.into())));
+    }
+
+    #[test]
+    fn memb_seed_flag_unset_at_model_length() {
+        let mut ctx = Context::new();
+        let (x, atom) = ab_star_leaf(&mut ctx);
+        let mut m = ModelBuilder::default();
+        pin_len(&mut ctx, &mut m, x, 4);
+        let mut eq = EqualityEngine::default();
+        let (seeds, flag) = memb_seeds_flagged(&mut ctx, &mut eq, &[x], &[(atom, true)], &m);
+        assert_eq!(seeds.get(&x).map(String::as_str), Some("abab"));
+        assert!(!flag);
+    }
+
+    #[test]
+    fn memb_seed_flag_set_on_shortest_fallback() {
+        let mut ctx = Context::new();
+        let (x, atom) = ab_star_leaf(&mut ctx);
+        let mut m = ModelBuilder::default();
+        pin_len(&mut ctx, &mut m, x, 3); // no word of (ab)* has length 3
+        let mut eq = EqualityEngine::default();
+        let (seeds, flag) = memb_seeds_flagged(&mut ctx, &mut eq, &[x], &[(atom, true)], &m);
+        assert_eq!(seeds.get(&x).map(String::as_str), Some(""));
+        assert!(flag);
     }
 
     // ── Task 4b (slice 25): witness search at length 1 for non-nullable
