@@ -554,7 +554,7 @@ impl TheorySolver for StrSolver {
                     );
                     return TCheck::Split {
                         atoms: vec![comp],
-                        guard: Some(lit.negate()),
+                        guards: vec![lit.negate()],
                         phases: Vec::new(),
                     };
                 }
@@ -599,7 +599,7 @@ impl TheorySolver for StrSolver {
                 self.emitted_len_axioms.insert(axiom);
                 return TCheck::Split {
                     atoms: vec![axiom],
-                    guard: None,
+                    guards: Vec::new(),
                     phases: Vec::new(),
                 };
             }
@@ -758,7 +758,7 @@ impl TheorySolver for StrSolver {
                             );
                             return TCheck::Split {
                                 atoms: vec![le_atom],
-                                guard: Some(lit.negate()),
+                                guards: vec![lit.negate()],
                                 phases: Vec::new(),
                             };
                         }
@@ -893,7 +893,7 @@ impl TheorySolver for StrSolver {
                         // implication (Nielsen lemma) — NOT the unsound bare disjunction.
                         return TCheck::Split {
                             atoms,
-                            guard: Some(guard),
+                            guards: vec![guard],
                             phases: Vec::new(),
                         };
                     }
@@ -1290,7 +1290,7 @@ impl TheorySolver for StrSolver {
                         );
                         return TCheck::Split {
                             atoms: vec![ge_l, ge_r],
-                            guard: Some(lit.negate()),
+                            guards: vec![lit.negate()],
                             phases: Vec::new(),
                         };
                     }
@@ -1999,16 +1999,16 @@ mod tests {
         let (mut saw_ge, mut saw_le) = (false, false);
         for _ in 0..64 {
             match solver.check(&mut cx, Effort::Full) {
-                TCheck::Split { atoms, guard, .. } => {
+                TCheck::Split { atoms, guards, .. } => {
                     for a in atoms {
                         if a == expected_ge {
                             saw_ge = true;
                             // Non-tautological len link must be guarded by ¬eqn.
-                            assert!(guard.is_some(), "length link must be guarded (¬eqn)");
+                            assert!(!guards.is_empty(), "length link must be guarded (¬eqn)");
                         }
                         if a == expected_le {
                             saw_le = true;
-                            assert!(guard.is_some(), "length link must be guarded (¬eqn)");
+                            assert!(!guards.is_empty(), "length link must be guarded (¬eqn)");
                         }
                     }
                 }

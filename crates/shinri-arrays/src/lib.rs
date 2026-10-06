@@ -97,7 +97,7 @@ impl TheorySolver for Arrays {
                         // ROW-1 is a McCarthy-axiom T-tautology — no guard.
                         return TCheck::Split {
                             atoms: vec![lemma],
-                            guard: None,
+                            guards: Vec::new(),
                             phases: Vec::new(),
                         };
                     }
@@ -113,7 +113,7 @@ impl TheorySolver for Arrays {
                         // ROW-2 is a McCarthy-axiom T-tautology — no guard.
                         return TCheck::Split {
                             atoms: vec![eqij, eqsel],
-                            guard: None,
+                            guards: Vec::new(),
                             phases: Vec::new(),
                         };
                     }

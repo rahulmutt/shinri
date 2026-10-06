@@ -702,7 +702,7 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                 }
                                 TheoryResult::SplitAtoms {
                                     atoms,
-                                    guard,
+                                    guards,
                                     phases,
                                 } => {
                                     debug_assert!(
@@ -714,8 +714,9 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // bind+encode it BEFORE the clause exists. new_var() updates
                                     // assignment/heuristic/watches/analyzer, so the fresh vars
                                     // are immediately usable in a learnt clause.
-                                    let mut lits: Vec<Lit> = Vec::with_capacity(atoms.len() + 1);
-                                    // GUARD (optional): a literal over an ALREADY-allocated SAT var
+                                    let mut lits: Vec<Lit> =
+                                        Vec::with_capacity(atoms.len() + guards.len());
+                                    // GUARDS (optional): literals over an ALREADY-allocated SAT var
                                     // (e.g. the negation of an asserted equality). It is pushed
                                     // AS-IS — no fresh var, no bind_fresh — because it must refer to
                                     // the existing boolean variable so the clause expresses a real
@@ -723,9 +724,16 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // guard=None; the string F-split passes guard=Some(¬eqn) so the
                                     // disjunction is only enforced on branches where the triggering
                                     // word equation is asserted true (sound Nielsen lemma).
-                                    let guard_was_present = guard.is_some();
-                                    if let Some(g) = guard {
-                                        lits.push(g);
+                                    let guard_was_present = !guards.is_empty();
+                                    // Slice 62: with two or more guards (all false at emission),
+                                    // guards-first ordering could make BOTH watched literals
+                                    // (`add_learnt` watches lits[0], lits[1]) already-false
+                                    // guards, and the atoms would never be watched. Put the atoms
+                                    // first and the guards after, highest level first. 0 or 1
+                                    // guard keeps the original guard-first order byte-for-byte.
+                                    let multi_guard = guards.len() >= 2;
+                                    if !multi_guard {
+                                        lits.extend(guards.iter().copied());
                                     }
                                     for (i, atom) in atoms.iter().copied().enumerate() {
                                         // Reuse the existing SAT var if the theory already
@@ -753,6 +761,13 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                             }
                                         };
                                         lits.push(Lit::new(v, true));
+                                    }
+                                    if multi_guard {
+                                        let mut gs = guards;
+                                        gs.sort_by_key(|g| {
+                                            std::cmp::Reverse(self.assign.level(g.var()))
+                                        });
+                                        lits.extend(gs);
                                     }
                                     // Phase 2: learn the split clause and backtrack one level so
                                     // the solver must case-split on it (mirrors the Lemma path).
@@ -1600,7 +1615,7 @@ mod tests {
                     // Two split atoms named by sentinel TermIds; solver mints vars.
                     TheoryResult::SplitAtoms {
                         atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
-                        guard: None,
+                        guards: Vec::new(),
                         phases: Vec::new(),
                     }
                 } else {
@@ -1695,7 +1710,7 @@ mod tests {
                     // existing eqn var (negated) — NOT a fresh var.
                     TheoryResult::SplitAtoms {
                         atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
-                        guard: Some(Lit::new(eqn, false)),
+                        guards: vec![Lit::new(eqn, false)],
                         phases: Vec::new(),
                     }
                 } else {
@@ -1728,6 +1743,73 @@ mod tests {
              wrong-UNSAT soundness bug — it means the split clause was learnt as a \
              bare disjunction, forbidding the model on every branch. got {:?}",
             res
+        );
+    }
+
+    // ── Slice 62: a split guarded by TWO already-false literals ────────────
+    //
+    // Clause `¬e1 ∨ ¬e2 ∨ a` with e1, e2 true at level 0 and the theory then
+    // propagating `a` false: the clause is violated, so the answer is UNSAT.
+    // `add_learnt` watches lits[0] and lits[1] as given; ordered guards-first
+    // both watches would be the already-false guards and `a := false` would
+    // go unnoticed (a wrong SAT). Atoms-first ordering keeps `a` watched.
+    #[test]
+    fn two_guard_split_detects_violation() {
+        use shinri_core::TermId;
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        #[derive(Default)]
+        struct TwoGuardSplitter {
+            fired: bool,
+            eqns: Vec<Var>,
+            fresh: Rc<RefCell<Vec<Var>>>,
+            forced: Rc<RefCell<bool>>,
+        }
+        impl Theory for TwoGuardSplitter {
+            fn new_var(&mut self, v: Var) {
+                if self.eqns.len() < 2 {
+                    self.eqns.push(v);
+                }
+            }
+            fn assert(&mut self, _l: Lit) {}
+            fn propagate(&mut self, out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+                let fresh = self.fresh.borrow();
+                if self.fired && fresh.len() == 1 && !*self.forced.borrow() {
+                    *self.forced.borrow_mut() = true;
+                    out.push((Lit::new(fresh[0], false), TheoryJust { theory: 99, tag: 0 }));
+                }
+                None
+            }
+            fn check(&mut self, _e: Effort) -> TheoryResult {
+                if !self.fired {
+                    self.fired = true;
+                    TheoryResult::SplitAtoms {
+                        atoms: vec![TermId::new(100).unwrap()],
+                        guards: vec![Lit::new(self.eqns[0], false), Lit::new(self.eqns[1], false)],
+                        phases: Vec::new(),
+                    }
+                } else {
+                    TheoryResult::Sat
+                }
+            }
+            fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+            fn push(&mut self) {}
+            fn pop(&mut self, _n: usize) {}
+            fn bind_fresh(&mut self, v: Var, _atom: TermId) {
+                self.fresh.borrow_mut().push(v);
+            }
+        }
+
+        let mut s: Solver<TwoGuardSplitter, NoProof, Vmtf> = Solver::new(SolverConfig::default());
+        let e1 = s.new_var();
+        let e2 = s.new_var();
+        s.add_clause(&[Lit::new(e1, true)]);
+        s.add_clause(&[Lit::new(e2, true)]);
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Unsat { .. }),
+            "e1 ∧ e2 → a with a forced false must be UNSAT; got {res:?}"
         );
     }
 
@@ -1769,7 +1851,7 @@ mod tests {
                     self.fired = true;
                     TheoryResult::SplitAtoms {
                         atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
-                        guard: None,
+                        guards: Vec::new(),
                         phases: Vec::new(),
                     }
                 } else {
@@ -1841,7 +1923,7 @@ mod tests {
                             TermId::new(101).unwrap(), // is-green → existing v1 (false)
                             TermId::new(102).unwrap(), // is-blue  → fresh, unassigned
                         ],
-                        guard: None,
+                        guards: Vec::new(),
                         // Seed the fresh survivor's saved phase FALSE: pre-fix the
                         // solver DECIDES it false (no propagation); post-fix the
                         // unit rule forces it true regardless of phase. This makes
@@ -1963,7 +2045,7 @@ mod tests {
                             TermId::new(101).unwrap(),
                             TermId::new(102).unwrap(),
                         ],
-                        guard: None,
+                        guards: Vec::new(),
                         phases: Vec::new(),
                     }
                 } else {
@@ -2065,7 +2147,7 @@ mod tests {
                     let eqn = self.eqn.expect("eqn var must exist before check");
                     TheoryResult::SplitAtoms {
                         atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
-                        guard: Some(Lit::new(eqn, true)),
+                        guards: vec![Lit::new(eqn, true)],
                         phases: Vec::new(),
                     }
                 } else {
@@ -2162,7 +2244,7 @@ mod tests {
                     // genuinely all-false including the guard.
                     TheoryResult::SplitAtoms {
                         atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
-                        guard: Some(Lit::new(eqn, true)),
+                        guards: vec![Lit::new(eqn, true)],
                         phases: Vec::new(),
                     }
                 } else {
@@ -2272,7 +2354,7 @@ mod tests {
                             TermId::new(100).unwrap(), // a1 -> existing, false
                             TermId::new(101).unwrap(), // a2 -> fresh, unassigned
                         ],
-                        guard: Some(Lit::new(eqn, true)), // eqn false -> guard false
+                        guards: vec![Lit::new(eqn, true)], // eqn false -> guard false
                         // Seed the survivor's saved phase TRUE so the branch path
                         // DECIDES it true (satisfying the clause honestly → a real
                         // SAT model, a2 = true). The eager arm would force it true
@@ -2378,7 +2460,7 @@ mod tests {
                         // one false, one unassigned -> arm 2, Reason::Binary.
                         TheoryResult::SplitAtoms {
                             atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
-                            guard: None,
+                            guards: Vec::new(),
                             phases: Vec::new(),
                         }
                     }

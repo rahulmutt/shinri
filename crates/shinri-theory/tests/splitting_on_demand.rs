@@ -87,7 +87,7 @@ impl TheorySolver for OneShotSplitter {
             self.fired = true;
             TCheck::Split {
                 atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
-                guard: None,
+                guards: Vec::new(),
                 phases: Vec::new(),
             }
         } else {
@@ -151,7 +151,7 @@ impl TheorySolver for PhaseSeededSplitter {
             self.fired = true;
             TCheck::Split {
                 atoms: vec![TermId::new(100).unwrap(), TermId::new(101).unwrap()],
-                guard: None,
+                guards: Vec::new(),
                 phases: self.phases.clone(),
             }
         } else {

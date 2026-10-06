@@ -20,7 +20,8 @@ enum FinalCheck {
     Conflict(Vec<crate::types::EqLeaf>),
     Split {
         atoms: Vec<TermId>,
-        guard: Option<Lit>,
+        /// See shinri_sat::TheoryResult::SplitAtoms::guards.
+        guards: Vec<Lit>,
         phases: Vec<Option<bool>>,
     },
     /// A sub-theory exhausted its fuel budget; the overall result is unknown.
@@ -371,11 +372,11 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
             FinalCheck::Conflict(leaves) => TheoryResult::Conflict(self.expand_conflict(leaves)),
             FinalCheck::Split {
                 atoms,
-                guard,
+                guards,
                 phases,
             } => TheoryResult::SplitAtoms {
                 atoms,
-                guard,
+                guards,
                 phases,
             },
             FinalCheck::Unknown => TheoryResult::Unknown,
@@ -632,12 +633,12 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
                     TCheck::Split {
                         atoms,
-                        guard,
+                        guards,
                         phases,
                     } => {
                         return FinalCheck::Split {
                             atoms,
-                            guard,
+                            guards,
                             phases,
                         }
                     }
@@ -651,12 +652,12 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
                     TCheck::Split {
                         atoms,
-                        guard,
+                        guards,
                         phases,
                     } => {
                         return FinalCheck::Split {
                             atoms,
-                            guard,
+                            guards,
                             phases,
                         }
                     }
@@ -667,12 +668,12 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
                     TCheck::Split {
                         atoms,
-                        guard,
+                        guards,
                         phases,
                     } => {
                         return FinalCheck::Split {
                             atoms,
-                            guard,
+                            guards,
                             phases,
                         }
                     }
@@ -688,12 +689,12 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                     TCheck::Conflict(cf) => return FinalCheck::Conflict(cf),
                     TCheck::Split {
                         atoms,
-                        guard,
+                        guards,
                         phases,
                     } => {
                         return FinalCheck::Split {
                             atoms,
-                            guard,
+                            guards,
                             phases,
                         }
                     }
@@ -848,7 +849,7 @@ impl<E: TheorySolver, A: TheorySolver, R: TheorySolver, S: TheorySolver, D: Theo
                     // over a totally-ordered arith domain — no guard needed.
                     return FinalCheck::Split {
                         atoms: vec![eq, lt, gt],
-                        guard: None,
+                        guards: Vec::new(),
                         phases: Vec::new(),
                     };
                 }
@@ -1584,7 +1585,7 @@ mod tests {
                     .expect("split_atom must be set before check");
                 TCheck::Split {
                     atoms: vec![atom],
-                    guard: None,
+                    guards: Vec::new(),
                     phases: Vec::new(),
                 }
             } else {
@@ -1615,9 +1616,9 @@ mod tests {
 
         // First Full check lifts the arith Split into SplitAtoms.
         match Theory::check(&mut comb, Effort::Full) {
-            TheoryResult::SplitAtoms { atoms, guard, .. } => {
+            TheoryResult::SplitAtoms { atoms, guards, .. } => {
                 assert_eq!(atoms, vec![le]);
-                assert_eq!(guard, None);
+                assert!(guards.is_empty());
             }
             other => panic!("expected SplitAtoms, got {other:?}"),
         }
@@ -1741,8 +1742,11 @@ mod tests {
         c.arith.t1 = Some(u);
         c.arith.t2 = Some(v);
         match Theory::check(&mut c, Effort::Full) {
-            TheoryResult::SplitAtoms { atoms, guard, .. } => {
-                assert_eq!(guard, None, "MBTC trichotomy is a tautology, no guard");
+            TheoryResult::SplitAtoms { atoms, guards, .. } => {
+                assert!(
+                    guards.is_empty(),
+                    "MBTC trichotomy is a tautology, no guard"
+                );
                 assert_eq!(atoms.len(), 3, "integer trichotomy = 3 atoms");
                 assert_eq!(classify(&c.terms, atoms[0]), Ok(Owner::Euf)); // (= u v)
                 assert_eq!(classify(&c.terms, atoms[1]), Ok(Owner::Arith)); // (< u v)
@@ -1781,7 +1785,7 @@ mod tests {
                 self.fired = true;
                 TCheck::Split {
                     atoms: vec![self.atom.unwrap()],
-                    guard: None,
+                    guards: Vec::new(),
                     phases: Vec::new(),
                 }
             } else {
@@ -1842,9 +1846,9 @@ mod tests {
 
         // First Full check: arrays.check returns Split — must be lifted to SplitAtoms.
         match Theory::check(&mut comb, Effort::Full) {
-            TheoryResult::SplitAtoms { atoms, guard, .. } => {
+            TheoryResult::SplitAtoms { atoms, guards, .. } => {
                 assert_eq!(atoms, vec![sel_atom], "split atom must round-trip");
-                assert_eq!(guard, None);
+                assert!(guards.is_empty());
             }
             other => panic!("expected SplitAtoms from arrays slot, got {other:?}"),
         }

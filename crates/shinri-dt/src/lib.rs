@@ -220,7 +220,7 @@ impl DtSolver {
                 }
                 return Some(TCheck::Split {
                     atoms: vec![lemma],
-                    guard: None,
+                    guards: Vec::new(),
                     phases: Vec::new(),
                 });
             }
@@ -429,7 +429,7 @@ impl DtSolver {
                 }
                 return Some(TCheck::Split {
                     atoms: vec![is_c_on_ctor],
-                    guard: None,
+                    guards: Vec::new(),
                     phases: Vec::new(),
                 });
             }
@@ -476,7 +476,7 @@ impl DtSolver {
             }
             return Some(TCheck::Split {
                 atoms,
-                guard: None,
+                guards: Vec::new(),
                 phases,
             });
         }
@@ -575,7 +575,7 @@ impl DtSolver {
             }
             return Some(TCheck::Split {
                 atoms: vec![lemma],
-                guard: Some(Lit::new(var, true).negate()),
+                guards: vec![Lit::new(var, true).negate()],
                 phases: Vec::new(),
             });
         }
@@ -1281,8 +1281,8 @@ mod tests {
         let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
 
         match dt.check(&mut cx, Effort::Full) {
-            TCheck::Split { atoms, guard, .. } => {
-                assert_eq!(guard, None, "collapse is an unconditional tautology");
+            TCheck::Split { atoms, guards, .. } => {
+                assert!(guards.is_empty(), "collapse is an unconditional tautology");
                 assert_eq!(atoms.len(), 1, "collapse emits a unit lemma");
                 // The lemma is `head(cons(1,nil)) = 1`.
                 let expected_sel = cx.terms.mk_app(Op::Uninterpreted(head), &[cons_t]).unwrap();
@@ -1489,8 +1489,8 @@ mod tests {
         dt.new_var(&mut cx, Var::new(0), is_cons_c);
 
         match dt.check(&mut cx, Effort::Full) {
-            TCheck::Split { atoms, guard, .. } => {
-                assert_eq!(guard, None);
+            TCheck::Split { atoms, guards, .. } => {
+                assert!(guards.is_empty());
                 assert_eq!(atoms, vec![is_cons_c]);
             }
             other => panic!("expected Split, got {}", tcheck_name(&other)),
@@ -1534,8 +1534,8 @@ mod tests {
         let _ = cx.eq.merge(xn, cn, EqJust::Definitional);
 
         match dt.check(&mut cx, Effort::Full) {
-            TCheck::Split { atoms, guard, .. } => {
-                assert_eq!(guard, None, "the rewritten lemma is unconditional");
+            TCheck::Split { atoms, guards, .. } => {
+                assert!(guards.is_empty(), "the rewritten lemma is unconditional");
                 let expected = cx
                     .terms
                     .mk_app(Op::Uninterpreted(is_cons), &[cons_t])
@@ -1786,10 +1786,10 @@ mod tests {
         match dt.check(&mut cx, Effort::Full) {
             TCheck::Split {
                 atoms,
-                guard,
+                guards,
                 phases,
             } => {
-                assert_eq!(guard, None, "exhaustiveness is a tautology");
+                assert!(guards.is_empty(), "exhaustiveness is a tautology");
                 let is_nil_x = cx.terms.mk_app(Op::Uninterpreted(is_nil), &[x]).unwrap();
                 let is_cons_x = cx.terms.mk_app(Op::Uninterpreted(is_cons), &[x]).unwrap();
                 assert!(atoms.contains(&is_nil_x) && atoms.contains(&is_cons_x));
@@ -1865,7 +1865,7 @@ mod tests {
         match dt.check(&mut cx, Effort::Full) {
             TCheck::Split {
                 atoms: lemma,
-                guard,
+                guards,
                 ..
             } => {
                 assert_eq!(lemma.len(), 1, "instantiation emits a unit equality");
@@ -1878,8 +1878,8 @@ mod tests {
                 let expected = cx.terms.mk_eq(x, capp).unwrap();
                 assert_eq!(lemma[0], expected, "x = cons(head(x), tail(x))");
                 assert_eq!(
-                    guard,
-                    Some(Lit::new(v, true).negate()),
+                    guards,
+                    vec![Lit::new(v, true).negate()],
                     "guarded by ¬is-cons(x)"
                 );
                 assert!(
@@ -2359,7 +2359,7 @@ mod tests {
         match dt.check(&mut cx, Effort::Full) {
             TCheck::Split {
                 atoms: lemma,
-                guard,
+                guards,
                 ..
             } => {
                 let head_x = cx.terms.mk_app(Op::Uninterpreted(head), &[x]).unwrap();
@@ -2375,8 +2375,8 @@ mod tests {
                     "the guarded instantiation must survive the pop"
                 );
                 assert_eq!(
-                    guard,
-                    Some(Lit::new(v, true).negate()),
+                    guards,
+                    vec![Lit::new(v, true).negate()],
                     "and stay guarded by ¬is-cons(x), which is what makes \
                      keeping it sound"
                 );

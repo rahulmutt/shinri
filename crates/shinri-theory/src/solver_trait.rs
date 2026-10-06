@@ -30,7 +30,8 @@ pub enum TCheck {
     Conflict(Vec<EqLeaf>),
     Split {
         atoms: Vec<TermId>,
-        guard: Option<Lit>,
+        /// See shinri_sat::TheoryResult::SplitAtoms::guards.
+        guards: Vec<Lit>,
         /// Optional per-atom preferred decision phase (empty = none).
         phases: Vec<Option<bool>>,
     },
@@ -212,13 +213,13 @@ mod tests {
         let t = shinri_core::TermId::new(5).unwrap();
         let c = TCheck::Split {
             atoms: vec![t],
-            guard: None,
+            guards: Vec::new(),
             phases: Vec::new(),
         };
         match c {
-            TCheck::Split { atoms, guard, .. } => {
+            TCheck::Split { atoms, guards, .. } => {
                 assert_eq!(atoms, vec![t]);
-                assert_eq!(guard, None);
+                assert!(guards.is_empty());
             }
             TCheck::Sat | TCheck::Conflict(_) | TCheck::Unknown => panic!("expected Split"),
         }

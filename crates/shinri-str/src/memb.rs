@@ -78,6 +78,17 @@ fn emit_split(
     atoms: Vec<TermId>,
     guard: Option<shinri_core::Lit>,
 ) -> TCheck {
+    emit_split_guards(s, terms, atoms, guard.into_iter().collect())
+}
+
+/// [`emit_split`] with any number of guard literals (slice 62: the per-leaf
+/// length lemma is guarded by every membership literal it depends on).
+pub(crate) fn emit_split_guards(
+    s: &mut StrSolver,
+    terms: &mut Context,
+    atoms: Vec<TermId>,
+    guards: Vec<shinri_core::Lit>,
+) -> TCheck {
     for &a in &atoms {
         register_atom(s, terms, a);
     }
@@ -88,7 +99,7 @@ fn emit_split(
     );
     TCheck::Split {
         atoms,
-        guard,
+        guards,
         phases: Vec::new(),
     }
 }
@@ -714,7 +725,7 @@ mod tests {
         let mut splits = Vec::new();
         for _ in 0..max {
             match s.check(cx, Effort::Full) {
-                TCheck::Split { atoms, guard, .. } => splits.push((atoms, guard.is_some())),
+                TCheck::Split { atoms, guards, .. } => splits.push((atoms, !guards.is_empty())),
                 other => return (splits, other),
             }
         }

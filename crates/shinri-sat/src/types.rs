@@ -59,7 +59,11 @@ pub enum TheoryResult {
     Lemma(Vec<Lit>),
     SplitAtoms {
         atoms: Vec<TermId>,
-        guard: Option<Lit>,
+        /// Literals over ALREADY-allocated vars, pushed as-is: the clause is
+        /// `g₁ ∨ … ∨ gₖ ∨ atom₁ ∨ …`, i.e. `¬g₁ ∧ … ∧ ¬gₖ → (atom₁ ∨ …)`.
+        /// Empty = an unconditional split. Slice 62 widened this from
+        /// `Option<Lit>` for the per-leaf length-bound lemma.
+        guards: Vec<Lit>,
         /// Optional per-atom preferred decision phase. Empty = no preference.
         /// Otherwise `phases.len() == atoms.len()`; `Some(p)` seeds that atom's
         /// var phase to `p` when the var is freshly minted.
@@ -125,13 +129,13 @@ mod tests {
         let t = shinri_core::TermId::new(7).unwrap();
         let r = TheoryResult::SplitAtoms {
             atoms: vec![t],
-            guard: None,
+            guards: Vec::new(),
             phases: Vec::new(),
         };
         match r {
-            TheoryResult::SplitAtoms { atoms, guard, .. } => {
+            TheoryResult::SplitAtoms { atoms, guards, .. } => {
                 assert_eq!(atoms, vec![t]);
-                assert_eq!(guard, None);
+                assert!(guards.is_empty());
             }
             _ => panic!("expected SplitAtoms"),
         }
