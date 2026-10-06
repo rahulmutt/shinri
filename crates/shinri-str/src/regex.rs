@@ -883,6 +883,68 @@ pub(crate) fn language_empty(r: &Rex) -> Emptiness {
     Emptiness::Empty
 }
 
+/// Slice 62: layers the exact-bounds walk explores before giving up on a
+/// finite maximum (spec §4.3).
+#[allow(dead_code)] // used by Task 3
+pub(crate) const LEN_BOUND_DEPTH_CAP: u32 = 64;
+
+/// Exact length bounds of `L(r)`: `Some((min, max))`, where `min` is the
+/// shortest word length and `max` the longest (`None` when the language is
+/// infinite or no finite bound was reached within `LEN_BOUND_DEPTH_CAP`).
+/// `None` overall when `L(r)` is empty (slice 28 owns that case) or on any
+/// taint (class-split cap, node cap, step cap) — "no lemma", never a verdict.
+///
+/// Layered walk: layer `d` is the set of distinct derivative states reached
+/// by words of length exactly `d`. States are deduplicated WITHIN a layer
+/// only: one state can sit at two depths without a cycle (`(a|bb)c` reaches
+/// `c` at 1 and 2), and cross-layer dedup would under-state the max. Like
+/// `language_empty`, every `next_classes` interval is explored, pure-surrogate
+/// ones included (its `lo` represents the class), so `min` is a sound lower
+/// bound — `search_shortest` skips surrogate classes and is not.
+#[allow(dead_code)] // used by Task 3
+pub(crate) fn len_bounds(r: &Rex) -> Option<(u32, Option<u32>)> {
+    let mut steps = 0usize;
+    let mut layer: Vec<Rex> = vec![r.clone()];
+    let mut min: Option<u32> = None;
+    let mut last: Option<u32> = None;
+    for d in 0..=LEN_BOUND_DEPTH_CAP {
+        layer.retain(|s| !matches!(s, Rex::Empty));
+        if layer.is_empty() {
+            // Every path died: the language is finite (or empty).
+            return min.map(|m| (m, last));
+        }
+        if layer.iter().any(nullable) {
+            min.get_or_insert(d);
+            last = Some(d);
+        }
+        if d == LEN_BOUND_DEPTH_CAP {
+            break;
+        }
+        let mut seen: FxHashSet<Rex> = FxHashSet::default();
+        let mut next: Vec<Rex> = Vec::new();
+        for state in &layer {
+            steps += 1;
+            if steps > MEMB_SEARCH_STEP_CAP {
+                return None;
+            }
+            let classes = next_classes(state)?;
+            for (lo, _hi) in classes {
+                let dd = deriv(lo, state);
+                if node_count(&dd) > FUEL_NODE_CAP {
+                    return None;
+                }
+                if !matches!(dd, Rex::Empty) && seen.insert(dd.clone()) {
+                    next.push(dd);
+                }
+            }
+        }
+        layer = next;
+    }
+    // Depth cap with live states: the minimum (if found) is exact, the
+    // maximum unknown.
+    min.map(|m| (m, None))
+}
+
 /// Ground membership of a CONCRETE string in the regex TERM `re_t`.
 /// 3-valued for the post-solve witness self-check: `Some(verdict)` iff `s`
 /// is in-alphabet, `re_t` extracts as a constant regex, and evaluation stays
@@ -3284,5 +3346,59 @@ mod tests {
             ])
         );
         assert_eq!(joint_classes(&head, &[]), next_classes(&head));
+    }
+
+    // ── Slice 62: exact length bounds ───────────────────────────────────
+
+    #[test]
+    fn len_bounds_norn135_singleton() {
+        // a*b ∩ a*b+ ∩ ab* ∩ [a-u]* = {ab}.
+        let a_star = star_lit_test("a");
+        let goal = inter(vec![
+            concat(vec![a_star.clone(), lit_test("b")]),
+            concat(vec![a_star, lit_test("b"), star_lit_test("b")]),
+            concat(vec![lit_test("a"), star_lit_test("b")]),
+            star_range_test('a', 'u'),
+        ]);
+        assert_eq!(len_bounds(&goal), Some((2, Some(2))));
+    }
+
+    #[test]
+    fn len_bounds_cross_depth_state() {
+        // (a|bb)c reaches the state `c` at depths 1 and 2: max must be 3.
+        let r = concat(vec![
+            union(vec![lit_test("a"), lit_test("bb")]),
+            lit_test("c"),
+        ]);
+        assert_eq!(len_bounds(&r), Some((2, Some(3))));
+    }
+
+    #[test]
+    fn len_bounds_unbounded() {
+        assert_eq!(len_bounds(&star_lit_test("ab")), Some((0, None)));
+    }
+
+    #[test]
+    fn len_bounds_counts_surrogate_shortest_path() {
+        // The only length-2 word starts with a surrogate code point;
+        // `search_shortest` skips that class and finds "bbb" (3).
+        let r = union(vec![
+            concat(vec![Rex::Range(0xD800, 0xDFFF), lit_test("a")]),
+            lit_test("bbb"),
+        ]);
+        assert_eq!(search_shortest(&r).map(|w| w.chars().count()), Some(3));
+        assert_eq!(len_bounds(&r), Some((2, Some(3))));
+    }
+
+    #[test]
+    fn len_bounds_empty_language_is_none() {
+        assert_eq!(len_bounds(&inter(vec![lit_test("a"), lit_test("b")])), None);
+    }
+
+    #[test]
+    fn len_bounds_depth_cap_drops_max_only() {
+        let long = "a".repeat(LEN_BOUND_DEPTH_CAP as usize + 6);
+        let r = union(vec![lit_test("a"), lit_test(&long)]);
+        assert_eq!(len_bounds(&r), Some((1, None)));
     }
 }
