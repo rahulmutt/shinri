@@ -1588,12 +1588,11 @@ impl Solver {
     /// Evaluate an Int/Real-sorted term to a rational under `model`.
     /// Handles numerals, `str.len` (= char count of the string value), and a bare
     /// numeric variable via the model. Compound arithmetic (`+`/`-`/`*`, unary
-    /// `-`) is evaluated structurally from its operands only when the arith model
-    /// holds a value for the compound term AND every operand evaluates (R11a):
-    /// the structural value is then the term's true value under the final model,
-    /// so it can only reject models that are actually wrong. A compound term with
-    /// no arith value stays unevaluable (`None`), conservatively skipped, so the
-    /// gate never fabricates a violation from a sum it cannot compute.
+    /// `-`) is evaluated structurally whenever every operand evaluates (slice
+    /// 62): the structural value is the term's true value under the final
+    /// model, so it can only reject models that are actually wrong. Otherwise
+    /// the arith model's value of the compound term is used, and with none the
+    /// term is unevaluable (`None`), conservatively skipped.
     fn eval_num_val(&self, model: &Model, t: TermId) -> Option<shinri_core::Rational> {
         use shinri_core::{BuiltinOp, Op, TermNode};
         if let Some(r) = self.ctx.numeral_value(t) {
@@ -1610,13 +1609,14 @@ impl Solver {
                     (s.chars().count() as i128).into(),
                 ))
             }
-            // Length arithmetic is re-evaluated structurally, but ONLY when the
-            // arith model valued the compound term: that value can be stale
-            // (disagree with the string-derived `str.len` values) once a
-            // model-side seed changes a leaf's length, so the term's true
-            // value under the FINAL model is computed from its operands. If an
-            // operand is unevaluable the arith value is returned as before;
-            // with no arith value the term stays unevaluable (`None`).
+            // Length arithmetic is evaluated structurally whenever every
+            // operand evaluates (slice 62; R11a required an arith value for
+            // the compound term too). The fold is the term's true value under
+            // the FINAL model — string lengths read from string values — so it
+            // can only reject models that are actually wrong; an arith value
+            // can be stale once a model-side seed changes a leaf's length.
+            // With an unevaluable operand the arith value is used as before;
+            // with neither the term stays unevaluable (`None`).
             TermNode::App {
                 op:
                     Op::Builtin(
@@ -1625,14 +1625,16 @@ impl Solver {
                 args,
                 ..
             } => {
-                let arith = self.model_num(model, t)?;
                 let vals: Option<Vec<shinri_core::Rational>> = self
                     .ctx
                     .children(*args)
                     .iter()
                     .map(|&k| self.eval_num_val(model, k))
                     .collect();
-                Some(vals.and_then(|v| Self::fold_arith(*op, v)).unwrap_or(arith))
+                match vals.and_then(|v| Self::fold_arith(*op, v)) {
+                    Some(r) => Some(r),
+                    None => self.model_num(model, t),
+                }
             }
             _ => self.model_num(model, t),
         }

@@ -348,17 +348,52 @@ mod tests {
         assert_eq!(tag(&s, &[a], &m, true), "unevaluable:int-conv@not-needed");
     }
 
+    /// Slice 62: compound length arithmetic is folded from its operands even
+    /// when the arith model never valued the compound term.
     #[test]
-    fn unevaluable_compound_len_arith() {
+    fn compound_len_arith_evaluates_from_operands() {
         let (mut s, x, _) = fx();
         let len = b(&mut s, BuiltinOp::StrLen, &[x]);
         let one = int(&mut s, 1);
         let sum = b(&mut s, BuiltinOp::Add, &[len, one]);
         let two = int(&mut s, 2);
+        let three = int(&mut s, 3);
+        let holds = s.eq(sum, two);
+        let fails = s.eq(sum, three);
+        let m = strs(&[(x, "a")]);
+        assert_eq!(s.eval_bool(holds, &m), Some(true));
+        assert_eq!(s.eval_bool(fails, &m), Some(false));
+    }
+
+    /// An operand with no value keeps the term unevaluable.
+    #[test]
+    fn unevaluable_compound_len_arith() {
+        let (mut s, x, _) = fx();
+        let len = b(&mut s, BuiltinOp::StrLen, &[x]);
+        let is = s.ctx_mut().int_sort();
+        let nf = s.declare_fun("n", &[], is);
+        let n = s.app(Op::Uninterpreted(nf), &[]);
+        let sum = b(&mut s, BuiltinOp::Add, &[len, n]);
+        let two = int(&mut s, 2);
         let a = s.eq(sum, two);
         let m = strs(&[(x, "a")]);
         assert_eq!(s.eval_bool(a, &m), None);
         assert_eq!(tag(&s, &[a], &m, true), "unevaluable:len-arith@not-needed");
+    }
+
+    /// Slice 62 (item 5): `len x + len y = 3` under `x = y = ""`, with no
+    /// arith value for the sum, is a violation the non-strict gate sees.
+    #[test]
+    fn unvalued_sum_of_lengths_is_violated() {
+        let (mut s, x, y) = fx();
+        let lx = b(&mut s, BuiltinOp::StrLen, &[x]);
+        let ly = b(&mut s, BuiltinOp::StrLen, &[y]);
+        let sum = b(&mut s, BuiltinOp::Add, &[lx, ly]);
+        let three = int(&mut s, 3);
+        let a = s.eq(sum, three);
+        let m = strs(&[(x, ""), (y, "")]);
+        assert_eq!(s.eval_bool(a, &m), Some(false));
+        assert!(!s.string_model_satisfies(&[a], &m, false));
     }
 
     #[test]
