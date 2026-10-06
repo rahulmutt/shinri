@@ -1636,8 +1636,36 @@ impl Solver {
                     None => self.model_num(model, t),
                 }
             }
+            _ if self.uf_args_stale(model, t) => None,
             _ => self.model_num(model, t),
         }
+    }
+
+    /// Whether `t` is a UF application with an argument whose model value
+    /// (the point the function's value for `t` was built at) differs from
+    /// the argument's evaluated value under the final model (slice 62): a
+    /// seed that changed a leaf's length leaves `f(len x)` valued at the old
+    /// length, so that value says nothing about `f` at the new one and the
+    /// application is unevaluable. Arguments without a numeric model value
+    /// are left as before.
+    fn uf_args_stale(&self, model: &Model, t: TermId) -> bool {
+        use shinri_core::{Op, TermNode};
+        use shinri_theory::types::ModelVal;
+        let TermNode::App {
+            op: Op::Uninterpreted(_),
+            args,
+            ..
+        } = self.ctx.term_node(t)
+        else {
+            return false;
+        };
+        self.ctx
+            .children(*args)
+            .iter()
+            .any(|&k| match model.values.get(&k) {
+                Some(ModelVal::Num(r)) => self.eval_num_val(model, k).as_ref() != Some(r),
+                _ => false,
+            })
     }
 
     fn model_num(&self, model: &Model, t: TermId) -> Option<shinri_core::Rational> {

@@ -396,6 +396,43 @@ mod tests {
         assert!(!s.string_model_satisfies(&[a], &m, false));
     }
 
+    /// `(= (f (str.len x)) 1)` with the model's `f(len x) = 1` built at a
+    /// stale `len x = 3`, while `x = ""`.
+    fn stale_uf_arg(len_val: i128, x_val: &str) -> (Solver, TermId, Model) {
+        let (mut s, x, _) = fx();
+        let len = b(&mut s, BuiltinOp::StrLen, &[x]);
+        let is = s.ctx_mut().int_sort();
+        let ff = s.declare_fun("f", &[is], is);
+        let fl = s.app(Op::Uninterpreted(ff), &[len]);
+        let one = int(&mut s, 1);
+        let a = s.eq(fl, one);
+        let mut m = strs(&[(x, x_val)]);
+        m.values
+            .insert(len, ModelVal::Num(Rational::from_int(len_val.into())));
+        m.values
+            .insert(fl, ModelVal::Num(Rational::from_int(1i128.into())));
+        (s, a, m)
+    }
+
+    /// Slice 62 backstop: a UF application whose argument now evaluates to a
+    /// different value than the model's interpretation was built at is
+    /// unevaluable, so the strict gate cannot confirm it from the stale value.
+    #[test]
+    fn uf_app_with_stale_argument_is_unevaluable() {
+        let (s, a, m) = stale_uf_arg(3, "");
+        assert_eq!(s.eval_bool(a, &m), None);
+        assert!(!s.string_model_satisfies(&[a], &m, true));
+        assert_eq!(tag(&s, &[a], &m, true), "unevaluable:len-arith@not-needed");
+    }
+
+    /// An argument consistent with the model keeps the model's value.
+    #[test]
+    fn uf_app_with_consistent_argument_keeps_model_value() {
+        let (s, a, m) = stale_uf_arg(0, "");
+        assert_eq!(s.eval_bool(a, &m), Some(true));
+        assert!(s.string_model_satisfies(&[a], &m, true));
+    }
+
     #[test]
     fn unevaluable_descends_to_the_first_undecided_leaf() {
         let (mut s, x, _) = fx();
