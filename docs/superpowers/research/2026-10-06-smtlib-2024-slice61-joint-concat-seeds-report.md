@@ -51,9 +51,12 @@ are this report's, and they are docs-only.
 - **Pass attribution** (40 seeded gain rows): pass 1 (model lengths) 15,
   pass 2 (free lengths) 25. Every pass-2 gain also raised the R9 strict-gate
   flag and still passed the gate.
-- **R10 is closed incidentally.** The bare-variable variant
-  (`x, y ∈ (ab)*`, `len x + len y = 3`, z3 `unsat`) is a wrong `sat` on
-  the base binary (`x = "ab"`, `y = ""`) and `unknown` on the after binary.
+- **R10's exact script is closed by R11a; the mechanism remains.** The
+  bare-variable script (`x, y ∈ (ab)*`, `len x + len y = 3`, z3 `unsat`) is a
+  wrong `sat` on the base binary (`x = "ab"`, `y = ""`) and `unknown` on the
+  after binary. A sibling variant (the sum pinned with `<=` and `>=`) is
+  still a wrong `sat` on both base and HEAD (queue item 5, the top soundness
+  item).
 
 ## Commands
 
@@ -186,7 +189,9 @@ to 2. After binary: `unknown` (`str-model-rejected`,
 `violated:bool@not-needed`); the trace build prints `gate-arith-diff`. The
 cause is `memb_seeds`' shortest-word fallback combined with a gate that read
 the stale arith value of `(+ (str.len x) (str.len y))`. R11a closes it, so
-R10 moves from "queued" to "fixed incidentally". Norn `ab` 135 and 138 are
+R10's exact script is closed by R11a; the mechanism remains (a compound
+term the arith model never valued still passes the gate, see queue item 5
+and its variant reproducer). Norn `ab` 135 and 138 are
 the same mechanism in the corpus, but there the answer happened to be
 right (`target/slice61-after/r10/`).
 
@@ -537,7 +542,7 @@ SDD ledger):
     `len x + len y = 3` is a wrong `sat` on `main` (`x = "ab"`, `y = ""`),
     via `memb_seeds`' shortest-word fallback plus compound length
     arithmetic. It was first ruled out of scope (`memb_seeds` is frozen),
-    then amended: R11a closes it incidentally. **Verified:** base `sat`
+    then amended: R11a closes R10's exact script (the mechanism remains, R15). **Verified:** base `sat`
     (wrong), after `unknown` (*R10 check* above). The corpus has two
     instances where the wrong model happened to give the right answer (Norn
     `ab` 135, 138); they are criterion 3's two rows.
@@ -555,7 +560,7 @@ SDD ledger):
     wrong: unexpected verdict churn in other string rows. Measured: 2 rows
     (`correct → unknown`, both invalid base models) and 1 tag move; 0 in
     the neutrality sample. Residual hole: a compound term with no arith
-    value stays unevaluable and passes the non-strict gate (queue item 4).
+    value stays unevaluable and passes the non-strict gate (queue item 5).
 12. **R12: Task 6 had no review.** Task 6 has no repo diff; the controller
     checked `target/slice61-gates.txt`. Cost if wrong: none.
 13. **R13: criterion 3 treated as met in substance.** The criterion is
@@ -570,6 +575,10 @@ SDD ledger):
     pattern as slices 60 and 60b, and the per-row min-of-3 gives 0.987.
     Cost if wrong: an unexplained timing effect goes unnoticed; no
     correctness risk.
+15. **R15: the R10 variant stays unfixed in slice 61.** It is pre-existing
+    on `main`; the candidate fix needs its own measurement run; queued as
+    the top soundness item (queue item 5). Cost if wrong: a known wrong
+    `sat` on main persists one more slice.
 15. **Plan task reordering.** Spec §6 orders the work as trace, extraction
     and grouping, search pass 1, pass 2, wiring with probes, oracle, bench.
     The plan builds the pure search core first: Task 1 is pass 1, Task 2
@@ -619,7 +628,7 @@ Report: docs/superpowers/research/2026-10-06-smtlib-2024-slice61-joint-concat-se
 The free leaves of concat-subject memberships now get jointly chosen witness words at
 model-build time (`joint_seed::joint_seeds_flagged`, merged over `memb_seeds`), so the gate
 stops rejecting the composed concat. The gate also evaluates valued compound length
-arithmetic structurally (R11a), which closes a pre-existing wrong `sat` on main (R10).
+arithmetic structurally (R11a), which closes R10's exact script (a pre-existing wrong `sat` on main; a variant remains, queue item 5).
 
 | # | criterion | result |
 | 1 | 0 wrong | PASS: 0 wrong rows, 0 wrong answers in 828 triage runs |
@@ -712,10 +721,27 @@ lists follow verbatim.
    The flag also fires when `class_len_in_model` is 0 because the model
    has no length for the leaf (Task 3 minor). No triaged gain was lost to
    it, but these 14 rows are where it would show.
-5. **R11a residual: a compound arithmetic term the arith model never
-   valued stays unevaluable** and passes the non-strict gate, as on main.
-   With joint or shortest seeds changing lengths, such a term could hide a
-   violated sum. Pinned as unevaluable by
+5. **TOP SOUNDNESS ITEM. R11a residual: a compound arithmetic term the
+   arith model never valued stays unevaluable** and passes the non-strict
+   gate, as on main. This is a live wrong `sat` on both base and HEAD, not a
+   hypothetical. Variant reproducer (z3 `unsat`; base
+   `target/slice60b-after/shinri` and HEAD both print
+   `sat ((x "") (y ""))`, verified in the final-review fix pass):
+
+   ```smt2
+   (set-logic QF_SLIA)(declare-fun x () String)(declare-fun y () String)
+   (assert (str.in_re x (re.* (str.to_re "ab"))))
+   (assert (str.in_re y (re.* (str.to_re "ab"))))
+   (assert (and (<= (+ (str.len x) (str.len y)) 3)
+                (>= (+ (str.len x) (str.len y)) 3)))
+   (check-sat)
+   ```
+
+   Candidate fix (reviewer's, unmeasured): raise the R9 strict flag when a
+   `memb_seeds` seed's length differs from the model length, at the
+   `model_with` call site (no `memb_seeds` body change). It needs its own
+   measurement run. The concat-subject form of the same script is already
+   caught by R9 at HEAD. Pinned as unevaluable by
    `model_reject::tests::unevaluable_compound_len_arith`. A fix evaluates
    it structurally whenever every operand evaluates. It changes that
    test's premise, so it needs its own measured slice.

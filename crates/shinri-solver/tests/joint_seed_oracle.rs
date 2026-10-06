@@ -167,7 +167,8 @@ const LITS: [&str; 3] = ["a", "b", "z"];
 const NAMES: [&str; 3] = ["x", "y", "z"];
 
 /// One generated script over leaves x, y, z (only the first 1–3 are used
-/// in subjects; all three are declared and queried).
+/// in subjects; all three are declared, and the test queries only those some
+/// assertion mentions).
 fn gen(rng: &mut Lcg) -> String {
     let mut body = String::from(
         "(declare-fun x () String)\n(declare-fun y () String)\n(declare-fun z () String)\n",
@@ -238,10 +239,11 @@ fn joint_seed_generated_agree_with_z3() {
     let (mut sat, mut unsat, mut z3_timeouts) = (0usize, 0usize, 0usize);
     for _ in 0..N_ITERS {
         let body = gen(&mut rng);
-        // -T is wall-clock: under heavy load a shinri-unsat / z3-timeout
-        // failure is a possible flake (it fails closed).
         // shinri prints a never-constrained String as `?`, which has no
         // quoted value; query only the leaves some assertion mentions.
+        // (Separately: z3's -T is wall-clock, so under heavy load a
+        // shinri-unsat / z3-timeout failure is a possible flake; it fails
+        // closed.)
         let used: Vec<&str> = NAMES
             .iter()
             .copied()

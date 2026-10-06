@@ -1587,10 +1587,13 @@ impl Solver {
 
     /// Evaluate an Int/Real-sorted term to a rational under `model`.
     /// Handles numerals, `str.len` (= char count of the string value), and a bare
-    /// numeric variable via the model. Compound arithmetic (`+`/`-`/`*`) is left
-    /// unevaluated (`None`) — conservatively skipped, so the gate never fabricates
-    /// a violation from an arith sum it cannot compute. `str.len` over a fully
-    /// evaluable string is the shape the string fragment actually needs.
+    /// numeric variable via the model. Compound arithmetic (`+`/`-`/`*`, unary
+    /// `-`) is evaluated structurally from its operands only when the arith model
+    /// holds a value for the compound term AND every operand evaluates (R11a):
+    /// the structural value is then the term's true value under the final model,
+    /// so it can only reject models that are actually wrong. A compound term with
+    /// no arith value stays unevaluable (`None`), conservatively skipped, so the
+    /// gate never fabricates a violation from a sum it cannot compute.
     fn eval_num_val(&self, model: &Model, t: TermId) -> Option<shinri_core::Rational> {
         use shinri_core::{BuiltinOp, Op, TermNode};
         if let Some(r) = self.ctx.numeral_value(t) {

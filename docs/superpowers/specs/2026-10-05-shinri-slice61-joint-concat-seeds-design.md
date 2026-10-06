@@ -371,9 +371,10 @@ crates equal `main`'s).
   for compound length arithmetic.
 - **R10/R11/R11a:** the solver gate's `eval_num_val` evaluates `+ - *` and
   unary `-` structurally when the arith model valued the compound term
-  (§2/§5 said no gate change). This closes the pre-existing wrong `sat` on
-  main (bare `x, y ∈ (ab)*`, `len x + len y = 3`: base `sat`, after
-  `unknown`). It also causes criterion 3's 2 rows.
+  (§2/§5 said no gate change). R10's exact script is closed by R11a; the
+  mechanism remains (bare `x, y ∈ (ab)*`, `len x + len y = 3`: base `sat`,
+  after `unknown`; but the `<= 3` / `>= 3` variant is still a wrong `sat`
+  on base and HEAD, see the report's queue item 5). It also causes criterion 3's 2 rows.
 - The entry point is `joint_seeds_flagged(...) -> (map, length_changed)`
   (§4.1).
 - Plan task order: the search core (Tasks 1–2) came before the front end
@@ -384,6 +385,11 @@ crates equal `main`'s).
   rejects them (the corpus form of R10, a soundness fix). Cost if wrong:
   −2 `correct` rows until seeds for bare memberships that respect model
   lengths bring them back soundly.
+- **R15:** the R10 variant stays unfixed in slice 61: pre-existing on
+  main; the candidate fix (raise the R9 strict flag when a `memb_seeds`
+  seed's length differs from the model length) needs its own measurement
+  run; queued as the top soundness item. Cost if wrong: a known wrong `sat`
+  on main persists one more slice.
 - **R14:** criterion 4 is a FAIL by the letter, treated as met in
   substance. The deviation is a speed-up (same pattern as slices 60/60b),
   and the per-row min-of-3 gives 0.987. Cost if wrong: an unexplained

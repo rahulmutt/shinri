@@ -133,6 +133,8 @@ pub struct StrSolver {
     /// the reduced INPUT assertions. The SAT state can hold jointly
     /// unsatisfiable combinations of these derivative atoms, and the model
     /// gate checks only input assertions, so `joint_seeds` ignores them.
+    /// Caveat: atoms are hash-consed, so a Rule-E atom equal to an input atom
+    /// marks that input atom minted (completeness only).
     /// Monotone, like `minted_eqs`.
     minted_membs: FxHashSet<TermId>,
     /// Counter for fresh string skolem variables minted by F-split.

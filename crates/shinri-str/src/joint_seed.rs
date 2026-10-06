@@ -9,8 +9,8 @@
 //! DFS that assigns the leaves a character at a time while advancing every
 //! constraint's derivative. The words are CANDIDATES: they override the
 //! per-leaf seeds (input memberships only: derivative atoms minted by the
-//! S/E rules can be jointly unsatisfiable) and the gate re-checks every assertion, so a miss or a bug
-//! can only leave the prior sound `unknown`.
+//! S/E rules can be jointly unsatisfiable) and the gate re-checks every
+//! assertion, so a miss or a bug can only leave the prior sound `unknown`.
 
 use crate::model;
 use crate::regex::{self, Rex};
@@ -389,7 +389,11 @@ fn flatten(terms: &Context, t: TermId, out: &mut Vec<RawOp>) -> bool {
 /// A concat is *minted* iff every leaf among its (recursively flattened)
 /// operands is a nullary uninterpreted app with a reserved symbol; constant
 /// operands do not matter. Any other operand makes it not minted
-/// (conservative).
+/// (conservative). The reserved-symbol test also admits predicate-rewrite
+/// skolem concats (`!pfx`, `!sfx`, `!ctnl`/`!ctnr`, `predicates.rs`), which
+/// ARE input equations and ARE gate-checked; soundness is unaffected because
+/// the gate re-checks. Taking provenance from `minted_eqs` instead of symbol
+/// reservation is the later refinement.
 fn is_minted_concat(terms: &Context, t: TermId) -> bool {
     let mut ops = Vec::new();
     // `flatten` also rejects above-alphabet constants; those are not minted
@@ -412,7 +416,8 @@ fn is_minted_concat(terms: &Context, t: TermId) -> bool {
 /// `known`) holds another member that is a string constant or a concat that
 /// is NOT minted. Unlike `model::is_repair_pinned`, solver-minted Rule-S1
 /// splits (`l ≈ !strk0·!strk1`) do not count (R5): they are not gate-checked
-/// (`input_eqs_hold` filters minted equalities) and a seed takes precedence
+/// (`input_eqs_hold` filters minted equalities; predicate-rewrite skolem
+/// concats are exempted too though gate-checked, see `is_minted_concat`) and a seed takes precedence
 /// over the class concat in `value_of`, whereas constants and input concats
 /// are checked and a seed would fight them.
 fn value_dictated(terms: &Context, eq: &mut EqualityEngine, known: &[TermId], l: TermId) -> bool {
