@@ -349,8 +349,8 @@ crates equal `main`'s).
 | --- | --- | --- |
 | 1 | 0 rows `* → wrong`; 0 wrong answers in triage | **PASS**: 0 `wrong` rows in both after runs; 0 wrong answers in 828 triage runs over 138 rows; no new `unverified` `unsat` row |
 | 2 | `violated:memb@not-needed` −20% (≥ 87) moving to `correct` | **PASS**: 432 → 314; 108 base-tagged rows (25.0%) now `correct`, 0 `unverified`. 110 rows moved to `correct` in all (all `sat`, z3-confirmed) |
-| 3 | no reproducible `correct → non-correct` | **FAIL (by the letter)**: 2 rows, Norn `ab` `norn-benchmark-135`/`138`, `sat` → `unknown:str-model-rejected`, 3/3. Caused by the R11a gate change, not joint seeds: base's `sat` carried an invalid model (`var_0 = "ab"`, `str.len var_0 = 4`, `v = 3`), which the gate now rejects |
-| 4 | timing within ±5% | **FAIL (faster side)**: pass 1 QF_S 0.914 / QF_SLIA 0.919; pooled over 3 passes 0.969 / 0.931; per-row min-of-3 QF_SLIA 0.987. No slowdown; newly-`correct` rows 0.933 |
+| 3 | no reproducible `correct → non-correct` | **FAIL (by the letter)**: 2 rows, Norn `ab` `norn-benchmark-135`/`138`, `sat` → `unknown:str-model-rejected`, 3/3. Caused by the R11a gate change, not joint seeds: base's `sat` carried an invalid model (`var_0 = "ab"`, `str.len var_0 = 4`, `v = 3`), which the gate now rejects. Ruling R13: met in substance |
+| 4 | timing within ±5% | **FAIL (faster side)**: pass 1 QF_S 0.982 (in band) / QF_SLIA 0.901; pooled over 3 passes 0.969 / 0.931; per-row min-of-3 QF_SLIA 0.987. No slowdown; newly-`correct` rows 0.933. Ruling R14: met in substance |
 | 5 | ci green; oracle ≥ 831 + slice tests | **PASS**: ci 1808 / 1808 / 6 skipped; oracle 841 / 841 / 2 skipped |
 | 6 | neutrality sample | **PASS**: 51 changed rows, all base timeouts; all noise (identical results from both binaries 3/3) |
 
@@ -378,6 +378,21 @@ crates equal `main`'s).
   (§4.1).
 - Plan task order: the search core (Tasks 1–2) came before the front end
   and wiring (Task 3), unlike §6.
-- Process rulings R1–R4, R6, R7, R12 (in-place branch, count slip, RED
-  worktree path, no push/PR in Task 7, R5's tests, no reviewer for no-diff
-  tasks) are listed in the report's *What changed versus the spec*.
+- **R13:** criterion 3 is a FAIL by the letter, treated as met in
+  substance. The two `correct → unknown` rows (`norn-benchmark-135`, `138`)
+  had invalid base witnesses and were correct by luck; the R11a gate now
+  rejects them (the corpus form of R10, a soundness fix). Cost if wrong:
+  −2 `correct` rows until seeds for bare memberships that respect model
+  lengths bring them back soundly.
+- **R14:** criterion 4 is a FAIL by the letter, treated as met in
+  substance. The deviation is a speed-up (same pattern as slices 60/60b),
+  and the per-row min-of-3 gives 0.987. Cost if wrong: an unexplained
+  timing effect goes unnoticed; no correctness risk.
+- **R2:** Task 3's expected test count is 12 `joint_seed` core + 2
+  `regex` tests; the plan's "13" was an arithmetic slip.
+- **R3:** Task 4's RED-check worktree went to `target/slice61-red-wt`
+  instead of `../slice61-red` (the parent of `/workspace` may be
+  unwritable).
+- Process rulings R1, R4, R6, R7, R12 (in-place branch, no push/PR in Task
+  7, R5's tests, no reviewer for no-diff tasks) are listed in the report's
+  *What changed versus the spec*.

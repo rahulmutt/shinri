@@ -13,8 +13,8 @@ gate when a joint seed changes a leaf's length) and R11a (the solver gate
 evaluates `+ - *` length arithmetic structurally when the arith model
 valued the term). See *What changed versus the spec*.
 
-The benchmarked binary is branch HEAD `f9fa4f9`. This report is the only
-commit after it, and it is docs-only.
+The benchmarked binary is branch HEAD `f9fa4f9`. The only commits after it
+are this report's, and they are docs-only.
 
 - **Rows moved to `correct`: 110**, all QF_SLIA and all `sat`, all with
   corpus status `unknown` and z3 agreeing. All 110 were
@@ -43,8 +43,8 @@ commit after it, and it is docs-only.
   | --- | --- |
   | 1 | PASS: 0 `wrong` rows in both after runs; 0 wrong answers in 828 triage runs; no new `unverified` `unsat` row |
   | 2 | PASS: 432 → 314; 108 base-tagged rows (25.0%) now `correct` |
-  | 3 | **FAIL by the letter**: 2 attributable `correct → unknown:str-model-rejected` rows (Norn `ab` 135, 138). Both come from the R11a gate rejecting base's invalid model, so this is a soundness fix, not a regression in the answers shinri can justify |
-  | 4 | **FAIL on the faster side**: pass 1 QF_S 0.914, QF_SLIA 0.919. Pooled over 3 passes: QF_S 0.969 (inside ±5%), QF_SLIA 0.931 (outside). A min-of-3 per-row diagnostic gives QF_SLIA 0.987. No slowdown anywhere; newly-`correct` rows 0.93 |
+  | 3 | **FAIL by the letter**: 2 attributable `correct → unknown:str-model-rejected` rows (Norn `ab` 135, 138). Both come from the R11a gate rejecting base's invalid model, so this is a soundness fix, not a regression in the answers shinri can justify. Controller ruling R13: met in substance |
+  | 4 | **FAIL on the faster side**: pass 1 QF_S 0.982 (inside ±5%), QF_SLIA 0.901 (outside). Pooled over 3 passes: QF_S 0.969 (inside), QF_SLIA 0.931 (outside). A min-of-3 per-row diagnostic gives QF_SLIA 0.987. No slowdown anywhere; newly-`correct` rows 0.93. Controller ruling R14: met in substance |
   | 5 | PASS: ci 1808 / 1808 / 6 skipped; oracle 841 / 841 / 2 skipped |
   | 6 | PASS: 51 sample rows changed, all noise (base-run timeouts under host load; both binaries identical 3/3) |
 
@@ -152,8 +152,8 @@ git checkout -- crates && git status --short crates     # printed nothing
 | --- | --- | --- | --- |
 | 1 | 0 rows `* → wrong`; 0 wrong answers in triage re-runs | **PASS** | 0 `wrong` rows in `slice61` and `slice61-sample`. 0 `sat` ↔ `unsat` flips. Triage made 828 runs over 138 rows: no row got both `sat` and `unsat`, and no decided run contradicts a known corpus status. No row became `unverified` with an `unsat` answer, so the brief's unsat cross-check had no input (the only `unsat` row that moved, automatark `instance14507`, went `unverified → correct`; slice 60b's cross-check already confirmed it with z3 and cvc5) |
 | 2 | `violated:memb@not-needed` shrinks by ≥ 20% (≥ 87 rows) of 432, moving to `correct` | **PASS** | 432 → 314. 108 base-tagged rows (25.0%) are now `correct`; 0 `unverified` |
-| 3 | no `correct → non-correct` change that reproduces 3/3 | **FAIL (by the letter)** | 2 rows reproduce 3/3: `QF_SLIA/2015-Norn/ab/norn-benchmark-135.smt2` and `-138.smt2`, base `sat` → after `unknown:str-model-rejected` (`violated:bool@not-needed`). The trace build shows `gate-arith-diff` and no joint-seed group, so the R11a gate change is the cause. Base's `sat` came with an invalid model (see *The two `correct → unknown` rows*). Reported, not tuned |
-| 4 | serial interleaved timing on 150 both-`correct` rows per string logic, within ±5% | **FAIL (outside the band on the faster side)** | Pass 1: QF_S 0.914, QF_SLIA 0.919. Pooled over 3 passes: QF_S **0.969** (in band), QF_SLIA **0.931** (out). Swapped order: 0.987 / 0.947. Min-of-3 per row on the QF_SLIA sample: 0.987. Newly-`correct` rows: 0.93 pooled, no slowdown. See *Timing* |
+| 3 | no `correct → non-correct` change that reproduces 3/3 | **FAIL (by the letter)** | 2 rows reproduce 3/3: `QF_SLIA/2015-Norn/ab/norn-benchmark-135.smt2` and `-138.smt2`, base `sat` → after `unknown:str-model-rejected` (`violated:bool@not-needed`). The trace build shows `gate-arith-diff` and no joint-seed group, so the R11a gate change is the cause. Base's `sat` came with an invalid model (see *The two `correct → unknown` rows*). Reported, not tuned. Controller ruling R13: met in substance |
+| 4 | serial interleaved timing on 150 both-`correct` rows per string logic, within ±5% | **FAIL (outside the band on the faster side)** | Pass 1: QF_S 0.982 (in band), QF_SLIA 0.901 (out). Pooled over 3 passes: QF_S **0.969** (in band), QF_SLIA **0.931** (out). Swapped order: 0.987 / 0.947. Min-of-3 per row on the QF_SLIA sample: 0.987. Newly-`correct` rows: 0.93 pooled, no slowdown. See *Timing*. Controller ruling R14: met in substance |
 | 5 | `mise run ci` green; oracle discovered count ≥ 831 + this slice's oracle tests | **PASS** | `target/slice61-gates.txt` at `f9fa4f9`: ci 1808 run / 1808 passed / 6 skipped (1773 + 35 new: 2 `regex`, 12 `joint_seed` core, 13 `joint_seed` front, 5 probes, 3 gate-arith). Oracle `--features oracle`: 841 run / 841 passed / 2 skipped; ≥ 831 + 2 `joint_seed_oracle` tests, non-zero discovered count |
 | 6 | neutrality sample: only non-reproducible timing flips | **PASS** | 51 sample rows changed, every one from a base `timeout`. Triage: all 51 are noise, with identical results from both binaries 3/3 (24 `unsat`, 7 `sat`, 20 OOM) |
 
@@ -435,29 +435,34 @@ nothing else of ours was running.
 
 | group | pass 1 | pass 2 | pass 3 | pooled base → after | pooled ratio |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| QF_S both-`correct` | 0.914 (1.18 → 1.08 s) | 1.001 (1.15 → 1.16 s) | 0.982 (1.20 → 1.18 s) | 3.53 → 3.42 s | **0.969** |
-| QF_SLIA both-`correct` | 0.919 (2.14 → 1.97 s) | 0.973 (2.05 → 2.00 s) | 0.901 (2.17 → 1.95 s) | 6.36 → 5.92 s | **0.931** |
-| newly-`correct` (144 rows, not gated) | 0.933 (28.45 → 26.55 s) | 0.934 (28.43 → 26.57 s) | 0.931 (28.49 → 26.53 s) | 85.37 → 79.65 s | 0.933 |
+| QF_S both-`correct` | 0.982 (1.20 → 1.18 s) | 0.914 (1.18 → 1.08 s) | 1.001 (1.15 → 1.16 s) | 3.53 → 3.42 s | **0.969** |
+| QF_SLIA both-`correct` | 0.901 (2.17 → 1.95 s) | 0.919 (2.14 → 1.97 s) | 0.973 (2.05 → 2.00 s) | 6.36 → 5.92 s | **0.931** |
+| newly-`correct` (144 rows, not gated) | 0.931 (28.49 → 26.53 s) | 0.933 (28.45 → 26.55 s) | 0.934 (28.43 → 26.57 s) | 85.37 → 79.65 s | 0.933 |
 
-- **By the letter, a FAIL on the faster side.** Pass 1 lies outside ±5%
-  for both logics. Per the brief, two more passes were pooled: QF_S comes
-  back in band (0.969), QF_SLIA does not (0.931).
+- Pass order is from `timing-load.log` and the file mtimes: pass 1 =
+  `timing.txt` (ended 00:37:16Z), pass 2 = `timing-rerun2.txt`, pass 3 =
+  `timing-rerun3.txt`.
+- **By the letter, a FAIL on the faster side.** In pass 1, QF_S is inside
+  ±5% (0.982) and QF_SLIA is outside (0.901). Per the brief, two more
+  passes were pooled: QF_S stays in band (0.969), QF_SLIA does not
+  (0.931). Pass 2 has both logics outside (0.914 / 0.919).
 - **Diagnostics.** A pass with after run first (`timing-swapped.txt`)
   gives 0.987 / 0.947. A per-row min-of-3 on the same 150 QF_SLIA rows
   (`timing-slia-rows.txt`) gives **0.987** (1.931 → 1.905 s). The
   summed-ratio gap comes from a few rows of about 5–30 ms whose single runs
   jitter by up to 2×. The largest, `regex-small-00021-10`, reports an
   internal `wall_ms` of 14–17 on base and 12–13 on after over 5 runs.
-  Total sample time is about 2 s, so process start-up noise is a large
-  share of it.
+  Total sample time is about 2 s over 300 process launches, so per-launch
+  overhead may be a sizeable share of it; I did not measure that
+  separately.
 - **No slowdown.** The slice adds work only in `model_with`, after SAT, and
   only when an eligible group exists, so no real speed-up is expected
   either. I read the result as "no slowdown, within noise", as slices 60
   and 60b did for their out-of-band speed-ups.
 - **Newly-`correct` rows (144 = 110 gains + 34 oracle churn):** 0.933, so
-  there is no reproducible slowdown. Most of that group's time is in the
-  oracle-churn stringfuzz `generated` rows, which do the same work on both
-  binaries.
+  there is no reproducible slowdown. I did not break that group's time
+  down by row, so which rows dominate it is not measured. The 34
+  oracle-churn rows give the same answer on both binaries.
 - Bench `wall_ms` median / p90 on both-`correct` rows: QF_S 17 / 56 →
   11 / 23 ms; QF_SLIA 14 / 54 → 6 / 19 ms. The runs shared the machine
   differently (base under 70+ load), so these are not comparable.
@@ -553,32 +558,44 @@ SDD ledger):
     value stays unevaluable and passes the non-strict gate (queue item 4).
 12. **R12: Task 6 had no review.** Task 6 has no repo diff; the controller
     checked `target/slice61-gates.txt`. Cost if wrong: none.
-13. **Plan task reordering.** Spec §6 orders the work as trace, extraction
+13. **R13: criterion 3 treated as met in substance.** The criterion is
+    still a FAIL by the letter. The two `correct → unknown` rows
+    (`norn-benchmark-135`, `138`) had **invalid** base witnesses and were
+    correct by luck. The R11a gate now rejects them; this is the corpus form
+    of R10, a soundness fix. Cost if wrong: −2 `correct` rows until seeds
+    for bare memberships that respect model lengths bring them back soundly
+    (queue item 3).
+14. **R14: criterion 4 treated as met in substance.** The criterion is
+    still a FAIL by the letter. The deviation is a speed-up, the same
+    pattern as slices 60 and 60b, and the per-row min-of-3 gives 0.987.
+    Cost if wrong: an unexplained timing effect goes unnoticed; no
+    correctness risk.
+15. **Plan task reordering.** Spec §6 orders the work as trace, extraction
     and grouping, search pass 1, pass 2, wiring with probes, oracle, bench.
     The plan builds the pure search core first: Task 1 is pass 1, Task 2
     is pass 2 plus the sweep, and both are testable without a `Context`.
     The front end (extraction, grouping, `joint_seeds`) and the wiring
     follow in Task 3, then probes (4), oracle (5), gates (6) and bench (7).
-14. **Entry point name.** The spec's `joint_seeds(...) -> FxHashMap` ships
+16. **Entry point name.** The spec's `joint_seeds(...) -> FxHashMap` ships
     as `joint_seeds_flagged(...) -> (FxHashMap, bool)`. The flag drives R9.
     It is called with the input-membership slice (R8), not `memb_true`.
 
 Task 7 process deviations:
 
-15. **Triage ran 6 rows in parallel** (`xargs -P6`, as in slice 60), not
+17. **Triage ran 6 rows in parallel** (`xargs -P6`, as in slice 60), not
     the brief's serial loop. The per-run command and the noise rule are the
     brief's. All 106 non-gain rows were triaged (< 200).
-16. **The trace build carries two extra diagnostics**, `strict` and
+18. **The trace build carries two extra diagnostics**, `strict` and
     `gate-arith-diff`, to separate gate-caused from joint-seed-caused
     changes as the addendum asks. The build was made from HEAD before the
     after runs finished, and reverted at once (`git status --short crates`
     printed nothing). Attribution ran on cores 0–11 while triage held
     12–23.
-17. **Timing:** the three passes ran back to back without waiting to see
-    pass 1. Pass 1 was out of band, so the brief's pooling applies in any
-    case. A swapped-order pass and a per-row min-of-3 pass were added as
+19. **Timing:** the three passes ran back to back without waiting to see
+    pass 1. Pass 1's QF_SLIA ratio (0.901) was out of band, so the brief's
+    pooling applies in any case. A swapped-order pass and a per-row min-of-3 pass were added as
     diagnostics.
-18. **No new base run.** The base is slice 60b's runs (see *Runs*), as the
+20. **No new base run.** The base is slice 60b's runs (see *Runs*), as the
     plan specifies.
 
 ## Gates
@@ -607,8 +624,8 @@ arithmetic structurally (R11a), which closes a pre-existing wrong `sat` on main 
 | # | criterion | result |
 | 1 | 0 wrong | PASS: 0 wrong rows, 0 wrong answers in 828 triage runs |
 | 2 | memb@not-needed -20% (>= 87) to correct | PASS: 432 -> 314; 108 (25.0%) now correct |
-| 3 | no reproducible correct -> non-correct | FAIL (letter): 2 Norn ab rows; base sat had an invalid model, R11a gate rejects it |
-| 4 | timing within +-5% | FAIL (faster side): pooled QF_S 0.969, QF_SLIA 0.931; min-of-3 0.987 |
+| 3 | no reproducible correct -> non-correct | FAIL (letter): 2 Norn ab rows; base sat had an invalid model, R11a gate rejects it; ruling R13: met in substance |
+| 4 | timing within +-5% | FAIL (faster side): pass 1 QF_S 0.982, QF_SLIA 0.901; pooled 0.969 / 0.931; min-of-3 0.987; ruling R14: met in substance |
 | 5 | ci + oracle | PASS: 1808/1808; oracle 841/841 |
 | 6 | neutrality sample | PASS: 51 changes, all noise |
 
