@@ -922,46 +922,86 @@ pub(crate) fn len_bounds(r: &Rex) -> Option<(u32, Option<u32>)> {
 }
 
 /// `len_bounds` with an explicit derivative-work budget (`work_cap`).
+///
+/// States are interned (`Walk`): each distinct state's `nullable`,
+/// `next_classes` and per-class derivatives are computed once and replayed
+/// whenever the state recurs at a later depth (an infinite language keeps
+/// the same states alive layer after layer). The replay performs the same
+/// cap checks, in the same order, on the same `node_count`s as a fresh
+/// expansion, so results — including where a cap trips — are those of the
+/// plain walk (`len_bounds_plain` in the tests).
 fn len_bounds_budgeted(r: &Rex, work_cap: usize) -> Option<(u32, Option<u32>)> {
     let mut steps = 0usize;
     let mut work = 0usize;
-    let mut layer: Vec<Rex> = vec![r.clone()];
+    let mut w = Walk::default();
+    // `Empty` never enters a layer (it is filtered when a successor is
+    // recorded), so no per-layer `retain` is needed. Keep it that way: a
+    // `Vec<Rex>::retain` here changed how LLVM shapes `Rex`'s drop glue
+    // crate-wide and cost ~10% on derivative-heavy rows (slice 62 perf).
+    let mut layer: Vec<usize> = if matches!(r, Rex::Empty) {
+        Vec::new()
+    } else {
+        vec![w.intern(r.clone())]
+    };
     let mut min: Option<u32> = None;
     let mut last: Option<u32> = None;
+    // Per-layer dedup: `stamp[id] == d + 1` iff `id` is already in `next`.
+    let mut stamp: Vec<u32> = Vec::new();
     for d in 0..=LEN_BOUND_DEPTH_CAP {
-        layer.retain(|s| !matches!(s, Rex::Empty));
         if layer.is_empty() {
             // Every path died: the language is finite (or empty).
             return min.map(|m| (m, last));
         }
-        if layer.iter().any(nullable) {
+        if layer.iter().any(|&id| w.nullable[id]) {
             min.get_or_insert(d);
             last = Some(d);
         }
         if d == LEN_BOUND_DEPTH_CAP {
             break;
         }
-        let mut seen: FxHashSet<Rex> = FxHashSet::default();
-        let mut next: Vec<Rex> = Vec::new();
-        for state in &layer {
+        let mut next: Vec<usize> = Vec::new();
+        for &id in &layer {
             steps += 1;
             if steps > MEMB_SEARCH_STEP_CAP {
                 return None;
             }
-            let classes = next_classes(state)?;
-            for (lo, _hi) in classes {
-                let dd = deriv(lo, state);
-                let n = node_count(&dd);
-                if n > FUEL_NODE_CAP {
-                    return None;
+            if w.succ[id].is_none() {
+                // First expansion: compute and check as we go; a cap that
+                // trips returns before anything is recorded.
+                let classes = next_classes(&w.states[id])?;
+                let mut out: Vec<Succ> = Vec::with_capacity(classes.len());
+                for (lo, _hi) in classes {
+                    let dd = deriv(lo, &w.states[id]);
+                    let n = node_count(&dd);
+                    if n > FUEL_NODE_CAP {
+                        return None;
+                    }
+                    work += n;
+                    if work > work_cap {
+                        // Slice-62 deviation: see LEN_BOUND_WORK_CAP.
+                        return min.map(|m| (m, None));
+                    }
+                    let child = if matches!(dd, Rex::Empty) {
+                        None
+                    } else {
+                        Some(w.intern(dd))
+                    };
+                    if let Some(c) = child {
+                        push_once(&mut next, &mut stamp, c, d);
+                    }
+                    out.push((n, child));
                 }
-                work += n;
-                if work > work_cap {
-                    // Slice-62 deviation: see LEN_BOUND_WORK_CAP.
-                    return min.map(|m| (m, None));
-                }
-                if !matches!(dd, Rex::Empty) && seen.insert(dd.clone()) {
-                    next.push(dd);
+                w.succ[id] = Some(out);
+            } else {
+                // Replay: the same checks on the recorded counts.
+                for &(n, child) in w.succ[id].as_deref().unwrap_or_default() {
+                    work += n;
+                    if work > work_cap {
+                        return min.map(|m| (m, None));
+                    }
+                    if let Some(c) = child {
+                        push_once(&mut next, &mut stamp, c, d);
+                    }
                 }
             }
         }
@@ -970,6 +1010,49 @@ fn len_bounds_budgeted(r: &Rex, work_cap: usize) -> Option<(u32, Option<u32>)> {
     // Depth cap with live states: the minimum (if found) is exact, the
     // maximum unknown.
     min.map(|m| (m, None))
+}
+
+/// `len_bounds_budgeted`'s interned states: `states[id]`, its `nullable`,
+/// and (once expanded) its successors as `(node_count, child)` per
+/// `next_classes` interval, `child == None` for an `Empty` derivative.
+/// Recorded counts are within `FUEL_NODE_CAP` (a larger one returns before
+/// the state is recorded).
+#[derive(Default)]
+struct Walk {
+    ids: FxHashMap<Rex, usize>,
+    states: Vec<Rex>,
+    nullable: Vec<bool>,
+    succ: Vec<Option<Vec<Succ>>>,
+}
+
+/// One recorded successor: the derivative's `node_count` and its state id
+/// (`None` for `Empty`).
+type Succ = (usize, Option<usize>);
+
+impl Walk {
+    fn intern(&mut self, r: Rex) -> usize {
+        if let Some(&id) = self.ids.get(&r) {
+            return id;
+        }
+        let id = self.states.len();
+        self.nullable.push(nullable(&r));
+        self.succ.push(None);
+        self.ids.insert(r.clone(), id);
+        self.states.push(r);
+        id
+    }
+}
+
+/// Append `id` to layer `d + 1` unless it is already there (first-seen
+/// order, like the plain walk's `seen` set).
+fn push_once(next: &mut Vec<usize>, stamp: &mut Vec<u32>, id: usize, d: u32) {
+    if stamp.len() <= id {
+        stamp.resize(id + 1, 0);
+    }
+    if stamp[id] != d + 1 {
+        stamp[id] = d + 1;
+        next.push(id);
+    }
 }
 
 /// Ground membership of a CONCRETE string in the regex TERM `re_t`.
@@ -3423,10 +3506,114 @@ mod tests {
     }
 
     #[test]
+    fn len_bounds_empty_root_is_none() {
+        assert_eq!(len_bounds(&Rex::Empty), None);
+        assert_eq!(len_bounds(&Rex::Eps), Some((0, Some(0))));
+    }
+
+    #[test]
     fn len_bounds_depth_cap_drops_max_only() {
         let long = "a".repeat(LEN_BOUND_DEPTH_CAP as usize + 6);
         let r = union(vec![lit_test("a"), lit_test(&long)]);
         assert_eq!(len_bounds(&r), Some((1, None)));
+    }
+
+    /// The pre-memo walk (slice 62 as first written): every layer re-derives
+    /// every state. Reference for `len_bounds_memo_matches_plain_walk`.
+    fn len_bounds_plain(r: &Rex, work_cap: usize) -> Option<(u32, Option<u32>)> {
+        let (mut steps, mut work) = (0usize, 0usize);
+        let mut layer: Vec<Rex> = vec![r.clone()];
+        let (mut min, mut last) = (None, None);
+        for d in 0..=LEN_BOUND_DEPTH_CAP {
+            layer.retain(|s| !matches!(s, Rex::Empty));
+            if layer.is_empty() {
+                return min.map(|m| (m, last));
+            }
+            if layer.iter().any(nullable) {
+                min.get_or_insert(d);
+                last = Some(d);
+            }
+            if d == LEN_BOUND_DEPTH_CAP {
+                break;
+            }
+            let mut seen: FxHashSet<Rex> = FxHashSet::default();
+            let mut next: Vec<Rex> = Vec::new();
+            for state in &layer {
+                steps += 1;
+                if steps > MEMB_SEARCH_STEP_CAP {
+                    return None;
+                }
+                for (lo, _hi) in next_classes(state)? {
+                    let dd = deriv(lo, state);
+                    let n = node_count(&dd);
+                    if n > FUEL_NODE_CAP {
+                        return None;
+                    }
+                    work += n;
+                    if work > work_cap {
+                        return min.map(|m| (m, None));
+                    }
+                    if !matches!(dd, Rex::Empty) && seen.insert(dd.clone()) {
+                        next.push(dd);
+                    }
+                }
+            }
+            layer = next;
+        }
+        min.map(|m| (m, None))
+    }
+
+    /// Deterministic pseudo-random regex over `{a, b, c}`.
+    fn rand_rex(seed: &mut u64, depth: u32) -> Rex {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        let k = *seed % if depth == 0 { 3 } else { 9 };
+        match k {
+            0 => lit_test(["a", "b", "c", "ab", "ba"][(*seed >> 8) as usize % 5]),
+            1 => Rex::Range('a' as u32, 'b' as u32),
+            2 => Rex::Eps,
+            3 => concat(vec![rand_rex(seed, depth - 1), rand_rex(seed, depth - 1)]),
+            4 => union(vec![rand_rex(seed, depth - 1), rand_rex(seed, depth - 1)]),
+            5 => inter(vec![rand_rex(seed, depth - 1), rand_rex(seed, depth - 1)]),
+            6 => star(rand_rex(seed, depth - 1)),
+            7 => comp(rand_rex(seed, depth - 1)),
+            _ => loop_(rand_rex(seed, depth - 1), 1, 3),
+        }
+    }
+
+    /// Slice-62 perf: the interned walk replays recurring states instead of
+    /// re-deriving them; every result, including where each cap trips,
+    /// must equal the plain walk's.
+    #[test]
+    fn len_bounds_memo_matches_plain_walk() {
+        let mut seed = 0x5eed_6262_u64;
+        let mut fixed = vec![
+            Rex::Empty,
+            Rex::Eps,
+            star_lit_test("ab"),
+            union(vec![lit_test("0"), loop_(wide_pairs(), 20, 20)]),
+            loop_(wide_pairs(), 3, 3),
+        ];
+        fixed.extend((0..400).map(|_| rand_rex(&mut seed, 4)));
+        let mut kinds = [0usize; 4]; // finite max, (min, None), None, cap-tripped
+        for r in &fixed {
+            let full = len_bounds_plain(r, usize::MAX);
+            for cap in [0, 7, 50, 300, 2_000, LEN_BOUND_WORK_CAP, usize::MAX] {
+                let got = len_bounds_budgeted(r, cap);
+                assert_eq!(got, len_bounds_plain(r, cap), "cap {cap}: {r:?}");
+                kinds[3] += usize::from(got != full);
+            }
+            match full {
+                Some((_, Some(_))) => kinds[0] += 1,
+                Some((_, None)) => kinds[1] += 1,
+                None => kinds[2] += 1,
+            }
+        }
+        assert!(
+            kinds.iter().all(|&k| k > 0),
+            "corpus covers every outcome: {kinds:?}"
+        );
     }
 
     /// 26 two-letter words with distinct heads (`aA|bB|...`): 27 classes
