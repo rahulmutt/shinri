@@ -119,9 +119,6 @@ pub struct Parser<'a> {
     stopped: bool,
 }
 
-/// The semantic text of an attribute-value token: the inner string for
-/// symbols/numerals/decimals/keywords/hex/bin, and the quote-stripped,
-/// `""`-unescaped contents for string literals.
 /// Slice 64 §3.1: true iff logic `name`'s arithmetic is Reals-only, i.e. it
 /// ends in `LRA`, `NRA` or `RDL` (`QF_LRA`, `QF_UFLRA`, `QF_RDL`,
 /// `QF_FPLRA`, ...). Mixed logics end in `IRA` (`QF_LIRA`, `AUFLIRA`) and so
@@ -130,6 +127,9 @@ fn reals_only_arith(name: &str) -> bool {
     ["LRA", "NRA", "RDL"].iter().any(|suf| name.ends_with(suf))
 }
 
+/// The semantic text of an attribute-value token: the inner string for
+/// symbols/numerals/decimals/keywords/hex/bin, and the quote-stripped,
+/// `""`-unescaped contents for string literals.
 fn token_value_text(tok: &Token) -> String {
     match tok {
         Token::Symbol(s)
@@ -431,7 +431,8 @@ impl<'a> Parser<'a> {
         if any_real {
             for a in args.iter_mut() {
                 if ctx.sort_of(*a) == int {
-                    if let Some(v) = ctx.numeral_value(*a).cloned() {
+                    // A numeral or `(- c)` of one (slice 64): re-mint as Real.
+                    if let Some(v) = ctx.const_real_value(*a) {
                         *a = ctx.mk_numeral(v, real);
                     }
                 }
@@ -824,8 +825,16 @@ impl<'a> Parser<'a> {
         // Left-fold pairwise.
         let mut acc = args[0];
         for &divisor in &args[1..] {
-            let dv = ctx.numeral_value(divisor).cloned();
-            match (ctx.numeral_value(acc).cloned(), dv) {
+            // Constants are numerals or `(- c)` of one (slice 64).
+            let dv = ctx.const_real_value(divisor);
+            match (ctx.const_real_value(acc), dv) {
+                (_, Some(d)) if d.is_zero() => {
+                    // Threat model: never panic on input (`recip` asserts).
+                    return Err(Diagnostic::new(
+                        sp,
+                        "division by a zero constant unsupported",
+                    ));
+                }
                 (Some(n), Some(d)) => {
                     // constant / constant -> fold
                     // Borrow fix: bind real_sort first to avoid nested &ctx/&mut ctx borrow.
@@ -3260,6 +3269,58 @@ mod tests {
             let src = format!("(set-logic {logic})(declare-fun n () Int)(assert (= n 1))");
             let (_ctx, cmds) = parse_all_ok(&src);
             assert_eq!(cmds.len(), 3, "{logic}");
+        }
+    }
+
+    fn bind_real_x(ctx: &mut Context, p: &mut Parser) {
+        let r = ctx.real_sort();
+        let sym = ctx.declare_fun("x", &[], r);
+        p.bind_fun("x", sym);
+    }
+
+    /// Slice 64 §3.1 (ALL/LIRA path): `(- 1)` next to a Real operand is
+    /// re-minted as a Real constant.
+    #[test]
+    fn coerces_negated_int_literal_in_real_context() {
+        let (ctx, t) = parse_one("(+ x (- 1))", bind_real_x);
+        assert_eq!(ctx.sort_of(t), ctx.real_sort());
+    }
+
+    /// `(/ x (- 2))` folds to `(* -1/2 x)` instead of "non-linear division".
+    #[test]
+    fn division_by_negated_constant_folds() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let (ctx, t) = parse_one("(/ x (- 2))", bind_real_x);
+        assert_eq!(ctx.sort_of(t), ctx.real_sort());
+        match ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Mul),
+                args,
+                ..
+            } => {
+                let kids = ctx.children(*args);
+                assert_eq!(
+                    ctx.numeral_value(kids[0]).cloned(),
+                    Some(Rational::new(Integer::from(-1i128), Integer::from(2i128)))
+                );
+            }
+            other => panic!("expected Mul, got {other:?}"),
+        }
+    }
+
+    /// Threat model: a zero constant divisor is a Diagnostic, never a panic
+    /// (`main` aborts with "recip of zero").
+    #[test]
+    fn division_by_zero_constant_is_a_diagnostic_not_a_panic() {
+        for src in ["(/ x 0)", "(/ x (- 0))", "(/ 1 0)", "(/ x 0.0)"] {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            bind_real_x(&mut ctx, &mut p);
+            let err = p.parse_term(&mut ctx).expect_err(src);
+            assert!(
+                err.message.contains("division by a zero constant"),
+                "{src}: {err:?}"
+            );
         }
     }
 }
