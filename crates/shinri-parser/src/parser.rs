@@ -122,6 +122,14 @@ pub struct Parser<'a> {
 /// The semantic text of an attribute-value token: the inner string for
 /// symbols/numerals/decimals/keywords/hex/bin, and the quote-stripped,
 /// `""`-unescaped contents for string literals.
+/// Slice 64 §3.1: true iff logic `name`'s arithmetic is Reals-only, i.e. it
+/// ends in `LRA`, `NRA` or `RDL` (`QF_LRA`, `QF_UFLRA`, `QF_RDL`,
+/// `QF_FPLRA`, ...). Mixed logics end in `IRA` (`QF_LIRA`, `AUFLIRA`) and so
+/// never match; `ALL` and logics without arithmetic don't either.
+fn reals_only_arith(name: &str) -> bool {
+    ["LRA", "NRA", "RDL"].iter().any(|suf| name.ends_with(suf))
+}
+
 fn token_value_text(tok: &Token) -> String {
     match tok {
         Token::Symbol(s)
@@ -1117,6 +1125,7 @@ impl<'a> Parser<'a> {
         let cmd = match head.as_str() {
             "set-logic" => {
                 let (l, _) = self.expect_symbol()?;
+                self.env.set_numerals_are_real(reals_only_arith(&l));
                 Command::SetLogic(l)
             }
             "declare-sort" => {
@@ -1591,7 +1600,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Build a numeral term from literal text. `is_decimal` selects Real;
-    /// integer literals default to Int (caller may re-coerce to Real later).
+    /// integer literals default to Int (caller may re-coerce to Real later);
+    /// Real under a Reals-only `set-logic` (slice 64).
     #[allow(dead_code)]
     fn parse_atom_numeral(
         &mut self,
@@ -1619,7 +1629,12 @@ impl<'a> Parser<'a> {
             let n = Integer::from_str_radix(text, 10)
                 .map_err(|_| Diagnostic::new(sp, "bad numeral"))?;
             let val = Rational::from_int(n);
-            let sort = ctx.int_sort();
+            // Slice 64: in a Reals-only logic a numeral denotes a real.
+            let sort = if self.env.numerals_are_real() {
+                ctx.real_sort()
+            } else {
+                ctx.int_sort()
+            };
             Ok(ctx.mk_numeral(val, sort))
         }
     }
@@ -3190,6 +3205,62 @@ mod tests {
             "check-sat should be the second result, got {:?}",
             cs[1]
         );
+    }
+    /// Slice 64 §3.1: which logics read integer literals as Real.
+    #[test]
+    fn reals_only_arith_classifies_logic_names() {
+        for l in [
+            "QF_LRA",
+            "QF_UFLRA",
+            "LRA",
+            "UFLRA",
+            "QF_NRA",
+            "QF_UFNRA",
+            "QF_RDL",
+            "QF_FPLRA",
+            "QF_ABVFPLRA",
+        ] {
+            assert!(reals_only_arith(l), "{l} should be Reals-only");
+        }
+        for l in [
+            "QF_LIRA", "AUFLIRA", "QF_NIRA", "QF_LIA", "QF_UFLIA", "ALL", "QF_BV", "QF_FP", "QF_S",
+            "QF_SLIA", "QF_IDL",
+        ] {
+            assert!(!reals_only_arith(l), "{l} should not be Reals-only");
+        }
+    }
+
+    #[test]
+    fn numeral_sort_follows_env_flag() {
+        let (ctx, t) = parse_one("1", |_, p| p.env.set_numerals_are_real(true));
+        assert_eq!(ctx.sort_of(t), ctx.real_sort());
+        let (ctx, t) = parse_one("(- 1)", |_, p| p.env.set_numerals_are_real(true));
+        assert_eq!(ctx.sort_of(t), ctx.real_sort());
+        let (ctx, t) = parse_one("1", |_, _| {});
+        assert_eq!(ctx.sort_of(t), ctx.int_sort());
+    }
+
+    /// The FFT reproducer (QF_UFLRA/FFT/smtlib.624882) plus let-bound and
+    /// comparison shapes all parse once QF_UFLRA numerals are Real.
+    #[test]
+    fn reals_logic_parses_int_literals_in_real_contexts() {
+        let src = "(set-logic QF_UFLRA)(declare-fun f3 (Real) Real)(declare-fun f5 () Real)\
+                   (assert (= (f3 f5) (- 1)))\
+                   (assert (let ((?v (- 1))) (= f5 ?v)))\
+                   (assert (< f5 1))";
+        let (_ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 6);
+    }
+
+    /// Int logics keep Int literals: `(= n 1)` with `n : Int` only parses
+    /// if `1` is Int.
+    #[test]
+    fn int_and_all_logics_keep_int_numerals() {
+        for logic in ["QF_LIA", "ALL"] {
+            let src = format!("(set-logic {logic})(declare-fun n () Int)(assert (= n 1))");
+            let (_ctx, cmds) = parse_all_ok(&src);
+            assert_eq!(cmds.len(), 3, "{logic}");
+        }
     }
 }
 

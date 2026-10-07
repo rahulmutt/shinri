@@ -240,6 +240,28 @@ mod streaming_tests {
         let _ = sp.next_command(&mut ctx);
         assert!(matches!(sp.finish(&mut ctx), StreamItem::Done));
     }
+    /// Slice 64: `set-logic` and a later numeral are separate commands on
+    /// the streaming path; the Real-numeral mode lives in the persisted env.
+    #[test]
+    fn set_logic_numeral_mode_persists_across_commands() {
+        let mut ctx = Context::new();
+        let mut sp = StreamingParser::new();
+        sp.push_str("(set-logic QF_LRA)");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::SetLogic(_)
+        )));
+        sp.push_str("(declare-fun x () Real)");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::DeclareFun { .. }
+        )));
+        sp.push_str("(assert (let ((?v (- 1))) (= x ?v)))");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::Assert(_)
+        )));
+    }
 }
 
 #[cfg(test)]

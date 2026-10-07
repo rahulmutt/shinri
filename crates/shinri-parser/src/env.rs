@@ -17,11 +17,22 @@ pub struct Env {
     funs: FxHashMap<String, SymbolId>,
     macros: FxHashMap<String, Macro>,
     let_frames: Vec<FxHashMap<String, TermId>>,
+    /// Slice 64: set by `set-logic`. True for Reals-only logics, where an
+    /// integer literal denotes a real (SMT-LIB 2.6 Reals theory). Lives here
+    /// because `Env` is the state that persists across commands, on both the
+    /// batch and the streaming path.
+    numerals_are_real: bool,
 }
 
 impl Env {
     pub fn new() -> Self {
         Env::default()
+    }
+    pub fn set_numerals_are_real(&mut self, on: bool) {
+        self.numerals_are_real = on;
+    }
+    pub fn numerals_are_real(&self) -> bool {
+        self.numerals_are_real
     }
 
     pub fn add_sort(&mut self, name: &str, s: SortId) {
