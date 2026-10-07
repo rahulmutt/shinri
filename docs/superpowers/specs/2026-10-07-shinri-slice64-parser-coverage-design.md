@@ -9,11 +9,17 @@ logics). Scope rulings (owner, in chat):
 - `define-sort` is nullary only (§3.3);
 - a sort error that drops an assertion while the script still answers
   `sat` stays out of scope and is queued (§9);
-- new timeouts are reported, not gated.
+- new timeouts are reported, not gated;
+- **amendment A (owner, in chat, 2026-10-07):** the after run exposed
+  pre-existing `shinri-fp` wrong answers that `define-sort` made reachable.
+  They are fixed in this slice (§3.5), so one PR lands both and `main` never
+  answers QF_FP wrongly.
 
-**Area:** `shinri-parser` only (`parser.rs`, plus `env.rs` if a lookup
-helper is needed). Tests in `shinri-parser` and `shinri-solver/tests/`. No
-core, solver, theory, printer or bench-tool change.
+**Area:** `shinri-parser` (`parser.rs`, plus `env.rs` if a lookup helper is
+needed); since amendment A also `shinri-fp` (`blast/minmax.rs`,
+`blast/fma.rs`, and the blasting context that owns shared tie bits). Tests
+in `shinri-parser`, `shinri-fp` and `shinri-solver/tests/`. No core,
+theory, printer or bench-tool change.
 
 ## 1. Summary
 
@@ -134,6 +140,64 @@ nesting. Attribute skipping is iterative, and sort aliases are resolved
 once. Each error is a `Diagnostic`, never a panic. A local `parse_script`
 fuzz run is a gate (§7.4).
 
+### 3.5 FP soundness (amendment A)
+
+The first after run (`slice64-fp`, at 30,650 of 40,407 rows) had **3 wrong
+answers**, and no other run has any. The base `main` binary gives the same
+wrong answers once the `define-sort` aliases are inlined by hand, so the
+parser didn't cause them. They are `shinri-fp` bugs that were unreachable
+while every QF_FP file failed to parse:
+
+| row | `:status` | shinri | cause |
+| --- | --- | --- | --- |
+| `wintersteiger/min/min-has-solution-13472` | sat | unsat | ±0 tie (§3.5.1) |
+| `wintersteiger/fma/fma-has-solution-4663` | sat | unsat | fma zero addend (§3.5.2) |
+| `wintersteiger/fma/fma-has-no-other-solution-4663` | unsat | sat | fma zero addend (§3.5.2) |
+
+Any further wrong row found when the run finishes joins this table, and it
+is either fixed under §3.5 or fenced to `unknown` with a stated cause.
+Shipping a known wrong answer is never an option.
+
+#### 3.5.1 `fp.min` / `fp.max` on a ±0 tie
+
+`blast/minmax.rs` hard-codes the `(+0, -0)` tie to `-0` for `fp.min` and
+`+0` for `fp.max`. SMT-LIB 2.6 (FloatingPoint theory) leaves this result
+unspecified: either zero may be returned. So `fp.min` is *some fixed
+function* whose value on the two tie inputs is unknown. A solver must
+therefore admit both choices, but consistently.
+
+The encoding:
+- There are four **shared** tie bits per format `(eb, sb)`: one for each
+  of `fp.min(+0,-0)`, `fp.min(-0,+0)`, `fp.max(+0,-0)` and `fp.max(-0,+0)`.
+  Each is minted once with `Blaster::fresh()` and cached for the whole
+  query, keyed by `(op, eb, sb, order)`.
+- On a tie, the result is `+0` if the bit is set and `-0` otherwise.
+  Non-tie behaviour is unchanged, including NaN passthrough.
+- The bits are not free *per occurrence*. That would let
+  `fp.min(a,b) ≠ fp.min(c,d)` with `a=c, b=d` be satisfiable, which no
+  interpretation of the function allows: a wrong `sat`. Sharing per format
+  and order is exactly the freedom the standard leaves.
+
+#### 3.5.2 `fp.fma` with a zero addend and a deeply underflowed product
+
+`blast/fma.rs` normalises the addend's significand. A zero addend therefore
+gets exponent `emin − pw` (−1,128 for Float64), which the code comment
+assumed always loses the hi/lo magnitude election to the product. A product
+that underflows further (exponent about −1,576 in the reproducer) loses
+instead. The zero addend becomes `hi`, `res_sign` takes its sign, and an
+exact result that is nonzero and negative rounds to **+0** where IEEE 754
+requires **−0**.
+
+The fix: a zero addend never wins the election against a nonzero product,
+i.e. elect `hi = product` whenever `z` is zero and the product is not. The
+election is unchanged otherwise. Both-zero and exact-cancellation sign
+rules are unchanged, because they are decided by `cancel_zero` and the
+rounding-mode zero-sign rule, not by `res_sign`.
+
+This hypothesis must be pinned by a failing test before the fix (§7.5).
+If the test shows a different cause, the fix follows the evidence, and the
+report records the difference.
+
 ## 4. What this does not change
 
 Term interning, the IR command set, solver behaviour, numeral printing,
@@ -148,6 +212,9 @@ QF_LIA/ALL numeral sorts (still Int), and decimal handling.
 3. §3.3 `define-sort`, with unit tests.
 4. E2E reproducers and the oracle generator extension.
 5. Gates (ci, oracle, fuzz); after runs; report; PR.
+6. (Amendment A) §3.5.1 shared ±0 tie bits, and §3.5.2 the fma zero-addend
+   election, each test-first; then a targeted QF_FP re-run (§8, set
+   **fp-ops**). These come before task 5's report and PR.
 
 ## 6. Cross-track coordination
 
@@ -203,6 +270,24 @@ discovered test count.
 (`cd crates/shinri-parser && mise x rust@nightly -- cargo fuzz run parse_script -- -max_total_time=600`),
 which must produce no crash.
 
+### 7.5 FP soundness (amendment A, `shinri-fp` + `shinri-solver/tests/`)
+
+- `fp.min` and `fp.max` ties, Float64 and a tiny format:
+  - with `x = -0`, `y = +0`, both `fp.min(x,y) = +0` and
+    `fp.min(x,y) = -0` are `sat` (and likewise for `fp.max`);
+  - **functional consistency:** `a = -0, b = +0, c = -0, d = +0` with
+    `fp.min(a,b) ≠ fp.min(c,d)` is `unsat`;
+  - non-tie and NaN cases keep their existing results (the existing
+    exhaustive and sampled tests stay green).
+- `fp.fma`:
+  - the `fma-has-solution-4663` reproducer is `sat` with `r = -0`;
+  - the `fma-has-no-other-solution-4663` reproducer is `unsat`;
+  - an underflowed product with `z = -0` and `z = +0`, in each rounding
+    mode, matches the IEEE result, checked against a z3 oracle for the
+    sampled cases.
+- The three corpus rows are inlined as e2e tests and answer their
+  `:status`.
+
 ## 8. Measurement
 
 Base: a `main` binary. After: the PR head. Both run the same row sets:
@@ -210,11 +295,17 @@ Base: a `main` binary. After: the PR head. Both run the same row sets:
 - **fp**: all of QF_FP (40,407);
 - **lra**: all of QF_LRA and QF_UFLRA (3,037);
 - **uf-rodin**: the 34 QF_UF `parse-error` rows (hard-link corpus);
-- **neutrality sample**: the 2,000-row slice-59 seeded recipe.
+- **neutrality sample**: the 2,000-row slice-59 seeded recipe;
+- **fp-ops** (amendment A): the 8,570 QF_FP files that contain `fp.min`,
+  `fp.max` or `fp.fma` (5,706 min/max, 2,864 fma). They are re-run with the
+  post-fix binary and compared with the pre-fix after run. Rows without
+  these operators cannot change under §3.5, so the pre-fix after run stands
+  for them.
 
 ### Success criteria
 
-1. `wrong = 0` in every after run.
+1. `wrong = 0` in every after run. For QF_FP that is the pre-fix after run
+   with the fp-ops rows replaced by the post-fix re-run.
 2. QF_FP `parse-error` drops by ≥ 39,900.
 3. QF_LRA plus QF_UFLRA `parse-error` drops by ≥ 2,000. Every remaining
    parse error is classified in the report.
