@@ -1,4 +1,4 @@
-# SMT-LIB 2024 re-run — slice 62 (length-consistent seeds and the compound-arithmetic gate) — shinri @ 1261bc9 (benchmarked), fd445aa (PR head)
+# SMT-LIB 2024 re-run — slice 62 (length-consistent seeds and the compound-arithmetic gate) — shinri @ 1261bc9 (benchmarked), 5b0f399 (PR head code, final review fixes)
 
 ## Headline
 
@@ -25,8 +25,12 @@ second, behaviour-neutral perf fix (interned `len_bounds` walk states, no
 repeated at `fd445aa` (R13): the evidence that it is behaviour-neutral is
 a unit test against the old walk and identical final-check traces, and the
 full oracle suite was re-run at `fd445aa` instead. Timing (criterion 4) was
-re-measured at `fd445aa`. Any commits after it are this report's, and they
-are docs-only.
+re-measured at `fd445aa`. The final whole-branch review then found a SAT
+install bug in the multi-guard path (lost `unsat`s only); its fixes are at
+`fe35046`, `a7418f3` and `5b0f399` and were re-verified by ci, the oracle
+suite, a targeted bench (every gain row plus the 2,000-row neutrality
+sample) and the Step-5 timing script — see **Final review fixes** below.
+The commit after `5b0f399` is this report's, and it is docs-only.
 
 - **Rows moved to `correct`: 167**, all QF_SLIA, all corpus status
   `unknown`, and all confirmed by the bench's z3 oracle. **165 `unsat`, 2
@@ -704,6 +708,84 @@ Task 9 process deviations:
   **pre-existing on `main` `9ac5105`** (Task 8 compared both). The new
   `len_bounds_oracle.rs` has 0 findings. It stays queued (slice-54 carry).
 
+## Final review fixes
+
+Ruling R14: one fix round after the final whole-branch review (at
+`38965b8`). R13's behaviour-neutral basis does not cover it (it changes
+the SAT split path), so it was measured on its own. Code head `5b0f399`,
+release binary `target/slice62-final/shinri`, md5
+`cc09e01641fae6bcd40586dbdd19446f` (fast `Rex` drop-glue shape: 8 × 0xf8
++ 1 × 0x37e).
+
+**Critical — all-false multi-guard lemma never noticed** (`fe35046`,
+`crates/shinri-sat/src/solver.rs`, `SplitAtoms` arm). The group lemma
+`¬m₁ ∨ … ∨ ¬mₖ ∨ bound` can name a bound atom that already exists as a SAT
+var: an input atom such as `(not (<= (str.len x) 0))`, or the same bound
+emitted earlier under a different guard set. If that atom is false at
+final check the clause is born all-false. The guarded install
+(`add_learnt`, backtrack one level) skips the all-false/unit arms on
+purpose; with every literal below the current level both watches stay
+false, nothing revisits the clause, and the emitter's dedup never
+re-emits it. Impact: lost `unsat`s (`unknown`), no wrong answer observed
+end to end (the gate rejected the model); at the SAT layer alone a unit
+theory got a wrong `Sat`. Reproducers (z3 `unsat`; `unknown` at `38965b8`,
+`unsat` now): the R4 pin with `(>= (str.len x) 1)` written
+`(not (<= (str.len x) 0))`; `x ∈ a*b ∧ x ∈ ab*` with
+`(not (>= (str.len x) 2))` or `(not (<= (str.len x) 2))`;
+`x ∈ a*(b|cc) ∧ x ∈ [b-c]*` with `(not (<= (str.len x) 2))`.
+
+Fix: when a clause with **≥ 2 guards** is all-false under the trail, learn
+it watched on its two highest-level literals and route it through the
+split arm's existing all-false conflict path (level 0 ⇒ `unsat`, else
+1-UIP and backjump). This is the reviewer's tested condition
+(`guard_was_present && !(multi_guard && all false)`), plus storing the
+lemma so the dedup cannot lose it after the backjump. Alternatives
+considered: full status routing (conflict / unit / branch) for
+multi-guard clauses was rejected because the *normal* group lemma (fresh
+unassigned bound atom, all guards false) is exactly the unit case, so it
+would change every lemma's install; that case stays on learn-and-backtrack
+and is safe because the atom is watched at `lits[0]`, so deciding it false
+later makes BCP report the conflict. A true bound atom is a satisfied
+clause (unchanged). 0/1-guard installs are byte-for-byte unchanged.
+Tests: `two_guard_split_over_false_existing_atom_is_conflict` (RED before
+the fix: `Sat`), `two_guard_split_over_true_existing_atom_stays_sat`;
+blocking probes `r4_sibling_negated_bound_atom_unsat`,
+`group_bound_atom_false_{upper,lower,union_leaf}_unsat`.
+
+**Important 1 — oracle never produced an input atom equal to a bound
+atom.** New `len_bounds_bound_atoms_agree_with_z3` (seed 6262, 200
+scripts): each `gen` script plus, per leaf, a negated bound atom
+(`not (<= len k)` / `not (>= len k)`), a disjunction of two, a membership
+∨ bound, or a `p`-split pair, so the search branches and bounds are
+re-emitted under a second guard set. The existing generated test is
+byte-identical and keeps its tally. Tally: **24 sat, 155 unsat, 21
+unknown, 9 z3 timeouts, 9 bounded-confirmed** (154 unsat with the SAT fix
+reverted: the new generator reaches the bug once).
+
+**Important 2 — `uf_args_stale`** (`a7418f3`,
+`crates/shinri-solver/src/lib.rs`). An argument whose re-evaluation is
+`None` no longer counts as stale; only `Some(v) != r` does. `uf1`–`uf5`
+and `toint` stay `unknown`; `uf_len_backstop_not_sat` passes.
+
+**Minors.** The `guard = None` / `Some(¬eqn)` doc comments in
+`types.rs`, `solver_trait.rs` and the `solver.rs` split arm now describe
+`guards`. `len_bounds_non_folding_empty_intersection_is_none` adds
+`a*b ∩ a*c` (asserted not to fold to `Empty`) beside the existing test.
+
+**Post-fix evidence.**
+
+| check | result |
+| --- | --- |
+| `taskset -c 0-23 mise run ci` | exit 0, **1845/1845** (6 skipped) = 1838 + 2 SAT + 4 probes + 1 regex |
+| oracle (`--features oracle`) | **859/859** (2 skipped) = 854 + 4 probes + 1 oracle test; generated tally 33/123/44 (unchanged), bound-atom tally 24/155/21 |
+| 169 slice-62 gain rows (167 `str-model-rejected → correct`, 1 `unverified → correct`, 1 `timeout → correct`) | **169/169 same answer** as the slice-62 run, 0 wrong |
+| neutrality sample (2,000 rows, `slice62-final-sample`) | **0 wrong**; vs slice 61: 26 changes (11 `correct → timeout`, 15 `oom → timeout`), vs slice 62: 15; triage 3× base vs final: **26/26 noise** (base reproduces the same timeouts; host load ~50 during the run). No multi-guard emitter exists outside strings |
+| timing (Step-5 script, 3 passes, load 21–25) | pooled **QF_S 0.987, QF_SLIA 0.982** (passes 0.965/1.056/0.953 and 0.986/0.960/0.995); newly-correct 0.961; CPU min-of-5 **QF_S 1.001, QF_SLIA 0.955** (wall 0.991 / 0.936) |
+| `cargo fmt --all`, `mise run lint` | clean |
+
+Files: `target/slice62-final/{ci.log, oracle.log, gains-run.tsv,
+sample-join.txt, triage.tsv, triage-summary.txt, timing.txt}`.
+
 ## Queued for the next slice
 
 Ordered. **Re-ranks** (each stated):
@@ -785,9 +867,8 @@ Ordered. **Re-ranks** (each stated):
    - this slice's per-leaf seed flag fires on ~1% of string rows (4/400:
      2 `correct`, 2 already-rejected);
    - the flag also fires at model length 0 (no `str.len` entry);
-   - **`uf_args_stale`'s non-strict widening**: an argument with a numeric
-     model value but `eval_num_val` `None` counts as stale, which can turn
-     a definite `Some(false)` into `None`. Tighten it to `Some(v) != r`.
+   - (`uf_args_stale`'s non-strict widening was tightened to
+     `Some(v) != r` in the final review fixes.)
 
    Scoping strictness to the assertions that mention a re-lengthed leaf
    would address all of these.
@@ -817,13 +898,12 @@ Deferred minors from this slice's reviews (not ranked):
   `len_bounds_memo_matches_plain_walk`.
 - `len_bounds`: the taint paths (`next_classes` overflow, `FUEL_NODE_CAP`,
   step cap) are untested, and there is no boundary test for a finite
-  language whose max is exactly `LEN_BOUND_DEPTH_CAP` (64).
-  `len_bounds_empty_language_is_none` may be satisfied by `inter()`
-  constructor folding. (The `layer.retain` minor is gone: `fd445aa` removed the `retain`.)
-- Stale doc comments still describe an `Option` guard: the `types.rs`
-  `TheoryResult` doc, the `solver_trait.rs` `TCheck` doc, and the
-  `solver.rs` comment above `guard_was_present`. A Task 2 test comment
-  writes the clause guards-first.
+  language whose max is exactly `LEN_BOUND_DEPTH_CAP` (64). (The
+  constructor-folding gap is closed by
+  `len_bounds_non_folding_empty_intersection_is_none`; the `layer.retain`
+  minor is gone: `fd445aa` removed the `retain`.)
+- A Task 2 test comment writes the clause guards-first. (The stale
+  `Option`-guard doc comments were fixed in the final review fixes.)
 - `pinned_leaf_emits_no_group_lemma` lacks a positive control. No test
   separates R3 (positive-only `lo₀`/`hi₀`) from the all-members version.
   `lib.rs:88` doc uses `<->`.
@@ -838,6 +918,24 @@ Deferred minors from this slice's reviews (not ranked):
   (44/200) is unbounded. Bounded confirmation is weaker than proof, and its
   `12` / 20 s values are not named constants. The probe test discards its
   counters.
+
+Deferred minors from the final whole-branch review (not ranked):
+- A poisoned membership (non-constant regex) drops the whole leaf group:
+  no bound lemma for the leaf's other memberships.
+- The Norn 135/138 probes re-check the witness with shinri itself
+  (`norn_witness_holds` re-solves the pinned script); the z3 re-check lives
+  only in the oracle binary.
+- Untested `len_bounds` taint paths and the 64-boundary test (above) stay
+  open; `pinned_leaf_emits_no_group_lemma` still lacks a positive control;
+  no mixed-leaf seed-flag test; the R5 "strict-off ⇒ `sat`" claim is not
+  machine-pinned.
+- `eval_str_val` String-UF staleness (item 11) is unchanged.
+- `bound_split` re-extracts every leaf's regexes on each final-check round
+  (memoised only on the guard set's bounds).
+- A multi-guard lemma over a fresh atom with all guards below the current
+  level is learnt unit but not propagated (deferred to BCP when the atom is
+  decided false); standard asserting-level placement would propagate it
+  earlier, but changes every lemma's install, so it needs its own bench.
 
 Carried from slice 61, not re-ranked:
 - Its deferred minors: `joint_seed.rs` `key()` clones per node; the sweep

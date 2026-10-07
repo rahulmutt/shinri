@@ -209,8 +209,23 @@ The SAT split arm (`crates/shinri-sat/src/solver.rs`, the `SplitAtoms`
 case) pushes every guard as-is before the atom literals, exactly as it
 pushes the single guard today. The unit-split path (`lits.len() == 1`) is
 reached only with no guards, as now. Every guard is the negation of an
-asserted literal and so false at emission, and the
-learn-and-backtrack-one-level protocol is unchanged.
+asserted literal and so false at emission. A guarded clause is installed by
+the existing learn-and-backtrack-one-level protocol (the clause is learnt,
+not eagerly propagated), with one exception added in the final review: a
+clause with **two or more guards** whose literals are **all false** under
+the current trail — its bound atom pre-exists as a SAT var (an input atom
+such as `(not (<= (str.len x) 0))`, or the same bound emitted earlier under
+another guard set) and is already false — is learnt watched on its two
+highest-level literals and then routed through the split arm's existing
+all-false conflict path (level 0 ⇒ `unsat`; otherwise 1-UIP analysis and
+backjump). Installed by learn-and-backtrack, such a clause could have every
+literal below the current level, leave both watches false forever, and
+(the emitter deduplicates) never be re-emitted — a lost `unsat`. A
+multi-guard clause over a fresh, unassigned atom is unit but keeps the
+learn-and-backtrack install: the atom is watched at `lits[0]`, so deciding
+it false later makes BCP report the conflict (a deferred propagation, never
+a missed violation). 0- and 1-guard clauses keep their install
+byte-for-byte.
 
 Watch order (added during planning): `add_learnt` watches `lits[0]` and
 `lits[1]` as given. With two or more already-false guards in front, both
@@ -382,6 +397,41 @@ QF_S 1.037 and QF_SLIA 1.036; per-row min-of-5 by CPU time 1.014 / 1.028
 (QF_S) and 0.996 / 0.990 (QF_SLIA), against 1.097 / 1.112 at `1261bc9`.
 Set 1 alone (the R10 three-pass set) is QF_S 1.076; the A/A control swings
 0.92–1.08 on identical binaries.
+
+### Final review fixes (R14)
+
+PR head after the fixes: code at `5b0f399` (release binary md5
+`cc09e01641fae6bcd40586dbdd19446f`); the docs commit on top changes no code.
+
+- **Critical (SAT, `fe35046`).** A multi-guard lemma whose bound atom
+  already existed as a SAT var and was false at final check (input atom
+  `(not (<= (str.len x) 0))`, or the same bound emitted earlier under
+  another guard set) was born all-false, installed by learn-and-backtrack
+  with every literal below the current level, and never revisited; the
+  emitter's dedup never re-emitted it. Impact: lost `unsat`s only
+  (`unknown`), no wrong answer end to end (the solver-level model check
+  rejected the resulting model; at the SAT layer alone the unit test saw a
+  wrong `Sat`). Fix: an all-false clause with ≥ 2 guards is learnt
+  watched on its two highest-level literals and routed through the split
+  arm's existing all-false conflict path; 0/1-guard installs are
+  byte-for-byte unchanged (§4.5 updated). The four reviewer scripts and
+  the R4 sibling now answer `unsat` (z3 `unsat`).
+- **Important 1 (oracle).** New `len_bounds_bound_atoms_agree_with_z3`
+  (seed 6262, 200 scripts): each `gen` script plus negated bound atoms,
+  disjunctions over bound atoms and memberships. The existing generated
+  test is untouched (same tally 33/123/44).
+- **Important 2 (`uf_args_stale`, `a7418f3`).** Only a definite
+  disagreement (`Some(v) != r`) is stale; the uf/to_int backstop scripts
+  stay `unknown`.
+- **Minors.** `guard`/`Option` doc comments updated to `guards`; a
+  non-folding empty intersection test (`a*b ∩ a*c`) for `len_bounds`.
+- **Evidence.** ci 1845/1845 (6 skipped); oracle 859/859 (2 skipped),
+  bound-atom tally 24 sat / 155 unsat / 21 unknown, generated tally
+  unchanged; all 169 slice-62 gain rows (the 167
+  `str-model-rejected → correct` plus 2) give the same answer; the 2,000-row
+  neutrality sample has 0 wrong and 26 changes against slice 61, all
+  timeout/oom-edge noise 3/3 under host load ~50; timing 3 passes pooled
+  QF_S 0.987 / QF_SLIA 0.982, CPU min-of-5 1.001 / 0.955.
 
 ### Deviations from this spec
 
