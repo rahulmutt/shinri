@@ -716,14 +716,15 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                     // are immediately usable in a learnt clause.
                                     let mut lits: Vec<Lit> =
                                         Vec::with_capacity(atoms.len() + guards.len());
-                                    // GUARDS (optional): literals over an ALREADY-allocated SAT var
-                                    // (e.g. the negation of an asserted equality). It is pushed
-                                    // AS-IS — no fresh var, no bind_fresh — because it must refer to
-                                    // the existing boolean variable so the clause expresses a real
-                                    // implication `¬guard → (atom1 ∨ …)`. A tautology split passes
-                                    // guard=None; the string F-split passes guard=Some(¬eqn) so the
+                                    // GUARDS (possibly empty): literals over ALREADY-allocated SAT
+                                    // vars (e.g. the negation of an asserted equality). They are
+                                    // pushed AS-IS — no fresh var, no bind_fresh — because they must
+                                    // refer to the existing boolean variables so the clause expresses
+                                    // a real implication `(¬g₁ ∧ …) → (atom1 ∨ …)`. A tautology split
+                                    // passes `guards = []`; the string F-split passes `[¬eqn]` so the
                                     // disjunction is only enforced on branches where the triggering
-                                    // word equation is asserted true (sound Nielsen lemma).
+                                    // word equation is asserted true (sound Nielsen lemma); the
+                                    // slice-62 leaf length-bound group lemma passes `[¬m₁, …, ¬mₖ]`.
                                     let guard_was_present = !guards.is_empty();
                                     // Slice 62: with two or more guards (all false at emission),
                                     // guards-first ordering could make BOTH watched literals
@@ -847,9 +848,32 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                                 }
                                             }
                                         }
-                                        if guard_was_present {
+                                        // Slice 62 final review: a MULTI-guard
+                                        // clause can be born ALL-FALSE when its
+                                        // atom pre-exists as a SAT var that is
+                                        // already false (an input atom, or the same
+                                        // bound emitted earlier under another guard
+                                        // set). Installed by the guarded branch
+                                        // path below, every literal can sit below
+                                        // the current level: backtracking one level
+                                        // leaves both watches false, nothing ever
+                                        // revisits the clause, and the emitter's
+                                        // dedup never re-emits it (a lost UNSAT).
+                                        // Store the lemma (watched on its two
+                                        // highest-level literals) and route it
+                                        // through the conflict arm. 0/1-guard
+                                        // clauses are untouched (spec §4.5).
+                                        let all_false_multi =
+                                            multi_guard && false_count == lits.len();
+                                        if all_false_multi {
+                                            lits.sort_by_key(|l| {
+                                                std::cmp::Reverse(self.assign.level(l.var()))
+                                            });
+                                            self.add_learnt(&lits);
+                                        }
+                                        if guard_was_present && !all_false_multi {
                                             // GUARDED split (a conditional lemma
-                                            // `¬guard → atoms`, e.g. the string
+                                            // `guards → atoms`, e.g. the string
                                             // Nielsen F-split `¬eqn ∨ a₁ ∨ …`): the
                                             // emitting theory relies on the
                                             // branch-and-backtrack structure and
@@ -857,19 +881,31 @@ impl<T: Theory, P: ProofSink + Default, H: BranchHeuristic> Solver<T, P, H> {
                                             // its guard fires through normal BCP.
                                             // Eager conflict/propagate resolution
                                             // (arms 1 & 2 below) is only correct for
-                                            // UNCONDITIONAL (`guard: None`) split
+                                            // UNCONDITIONAL (`guards = []`) split
                                             // clauses — the datatype exhaustiveness
-                                            // split over parsed testers. Force a
-                                            // guarded clause down the pre-16efa9fb
-                                            // branch path regardless of its current
-                                            // trail status; it is logically sound to
-                                            // add_learnt it (it is a valid lemma) and
-                                            // let normal BCP unit-propagate the guard
-                                            // when the case-split reaches it. Eagerly
+                                            // split over parsed testers — and for an
+                                            // all-false multi-guard clause (above).
+                                            // Force any other guarded clause down
+                                            // the pre-16efa9fb branch path regardless
+                                            // of its current trail status; it is
+                                            // logically sound to add_learnt it (it is
+                                            // a valid lemma) and let normal BCP
+                                            // unit-propagate the guard when the
+                                            // case-split reaches it. Eagerly
                                             // propagating the survivor at the wrong
                                             // level perturbs the theory's case-split
                                             // and regresses satisfiable branches to
                                             // Unknown (slice40 string regression).
+                                            //
+                                            // Multi-guard (slice 62) with a fresh,
+                                            // unassigned atom and all guards false
+                                            // is UNIT here but deliberately not
+                                            // propagated: the atom is watched at
+                                            // lits[0], so if it is later decided
+                                            // false, BCP visits the clause, finds no
+                                            // non-false replacement and reports the
+                                            // conflict — a deferred propagation,
+                                            // never a missed violation.
                                             self.add_learnt(&lits);
                                             let dl = self.trail.decision_level();
                                             if dl > 0 {
@@ -1810,6 +1846,89 @@ mod tests {
         assert!(
             matches!(res, SolveResult::Unsat { .. }),
             "e1 ∧ e2 → a with a forced false must be UNSAT; got {res:?}"
+        );
+    }
+
+    // ── Slice 62 final review: a two-guard split whose atom PRE-EXISTS false ──
+    //
+    // The leaf length-bound lemma `¬m₁ ∨ ¬m₂ ∨ bound` can name a bound atom
+    // that is already a SAT var (an input atom such as
+    // `(not (<= (str.len x) 0))`, or the same bound emitted earlier under a
+    // different guard set) and already FALSE at final check. With both guards
+    // false too the clause is born all-false. Pre-fix the multi-guard path
+    // `add_learnt`ed it and backtracked one level: with every literal below
+    // the current level both watches stayed false, nothing noticed, and the
+    // theory's dedup never re-emitted it (Sat here; `unknown` end-to-end).
+    #[derive(Default)]
+    struct PreExistingBoundSplitter {
+        fired: bool,
+        vars: std::rc::Rc<std::cell::RefCell<Vec<Var>>>,
+    }
+    impl Theory for PreExistingBoundSplitter {
+        fn new_var(&mut self, v: Var) {
+            self.vars.borrow_mut().push(v);
+        }
+        fn assert(&mut self, _l: Lit) {}
+        fn propagate(&mut self, _out: &mut Vec<(Lit, TheoryJust)>) -> Option<Vec<Lit>> {
+            None
+        }
+        fn check(&mut self, _e: Effort) -> TheoryResult {
+            if !self.fired {
+                self.fired = true;
+                let vars = self.vars.borrow();
+                TheoryResult::SplitAtoms {
+                    // TermId(100) is the pre-existing bound var (vars[2]).
+                    atoms: vec![shinri_core::TermId::new(100).unwrap()],
+                    guards: vec![Lit::new(vars[0], false), Lit::new(vars[1], false)],
+                    phases: Vec::new(),
+                }
+            } else {
+                TheoryResult::Sat
+            }
+        }
+        fn explain(&mut self, _j: TheoryJust, _out: &mut Vec<Lit>) {}
+        fn push(&mut self) {}
+        fn pop(&mut self, _n: usize) {}
+        fn var_for_atom(&self, atom: shinri_core::TermId) -> Option<Var> {
+            // TermId::new(100).index() == 99
+            (atom.index() == 99)
+                .then(|| self.vars.borrow().get(2).copied())
+                .flatten()
+        }
+    }
+
+    #[test]
+    fn two_guard_split_over_false_existing_atom_is_conflict() {
+        let mut s: Solver<PreExistingBoundSplitter, NoProof, Vmtf> =
+            Solver::new(SolverConfig::default());
+        let m1 = s.new_var();
+        let m2 = s.new_var();
+        let bound = s.new_var();
+        s.add_clause(&[Lit::new(m1, true)]);
+        s.add_clause(&[Lit::new(m2, true)]);
+        // The bound atom is an input atom asserted FALSE.
+        s.add_clause(&[Lit::new(bound, false)]);
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Unsat { .. }),
+            "m1 ∧ m2 ∧ ¬bound with lemma ¬m1 ∨ ¬m2 ∨ bound is UNSAT; got {res:?}"
+        );
+    }
+
+    #[test]
+    fn two_guard_split_over_true_existing_atom_stays_sat() {
+        let mut s: Solver<PreExistingBoundSplitter, NoProof, Vmtf> =
+            Solver::new(SolverConfig::default());
+        let m1 = s.new_var();
+        let m2 = s.new_var();
+        let bound = s.new_var();
+        s.add_clause(&[Lit::new(m1, true)]);
+        s.add_clause(&[Lit::new(m2, true)]);
+        s.add_clause(&[Lit::new(bound, true)]);
+        let res = s.solve();
+        assert!(
+            matches!(res, SolveResult::Sat),
+            "an already-satisfied group lemma must leave SAT; got {res:?}"
         );
     }
 

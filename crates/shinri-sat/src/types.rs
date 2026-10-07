@@ -44,14 +44,16 @@ pub enum Effort {
 /// fresh vars for, bind into the theory, then learn + case-split (splitting on
 /// demand — QF_LIA Plan A).
 ///
-/// `SplitAtoms.guard` carries an OPTIONAL pre-existing literal (referencing an
-/// already-allocated SAT var, e.g. an asserted equality) that is added to the
-/// learnt clause AS-IS (no fresh var minted). It is the mechanism for emitting a
-/// GUARDED split — a clause `guard ∨ atom1 ∨ … ∨ atomN` that encodes an
-/// implication `¬guard → (atom1 ∨ …)`. A tautology split (arrays ROW-2, arith
-/// branch/cut) passes `guard = None`; the string F-split passes
-/// `guard = Some(¬eqn)` so the disjunction is only forced when the triggering
-/// word equation is true (sound Nielsen lemma). See `shinri-str`.
+/// `SplitAtoms.guards` carries zero or more pre-existing literals (each over
+/// an already-allocated SAT var, e.g. an asserted equality) that are added to
+/// the learnt clause AS-IS (no fresh var minted). They are the mechanism for
+/// emitting a GUARDED split — a clause `g₁ ∨ … ∨ gₖ ∨ atom1 ∨ … ∨ atomN` that
+/// encodes `¬g₁ ∧ … ∧ ¬gₖ → (atom1 ∨ …)`. A tautology split (arrays ROW-2,
+/// arith branch/cut, datatype exhaustiveness) passes `guards = []`; the string
+/// F-split passes `[¬eqn]` so the disjunction is only forced when the
+/// triggering word equation is true (sound Nielsen lemma); the slice-62 leaf
+/// length-bound lemma passes `[¬m₁, …, ¬mₖ]` (one per membership). See
+/// `shinri-str`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum TheoryResult {
     Sat,
