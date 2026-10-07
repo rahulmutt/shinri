@@ -171,3 +171,74 @@ fn mixed_int_real_query_is_unknown() {
     s.assert(ger);
     assert_eq!(s.check_sat(), SolveOutcome::Unknown);
 }
+
+/// Run an SMT-LIB script; the outcome of its last `check-sat`.
+fn script_outcome(src: &str) -> SolveOutcome {
+    use shinri_parser::Parser;
+    use shinri_solver::CommandResponse;
+    let mut solver = Solver::new();
+    let mut parser = Parser::new(src);
+    let mut outcome = None;
+    while let Some(result) = parser.next_command(solver.ctx_mut()) {
+        let cmd = result.expect("parse error");
+        match solver.execute(cmd) {
+            CommandResponse::Sat => outcome = Some(SolveOutcome::Sat),
+            CommandResponse::Unsat => outcome = Some(SolveOutcome::Unsat),
+            CommandResponse::Unknown => outcome = Some(SolveOutcome::Unknown),
+            _ => {}
+        }
+    }
+    outcome.expect("script has a check-sat")
+}
+
+/// Slice 63 spec §1 reproducer, pinned to x = 0: −4x ≤ 3 ⇒ x ≥ 0 over Int.
+#[test]
+fn slice63_neg_coeff_left_sat() {
+    let src = "(set-logic QF_LIA)(declare-fun x () Int)\
+               (assert (<= (* (- 4) x) 3))(assert (<= x 0))(check-sat)";
+    assert_eq!(script_outcome(src), SolveOutcome::Sat);
+}
+
+/// Sign check: −4x ≤ 3 ∧ x ≤ −1 is unsat (a dropped sign gives 4x ≤ 3, sat).
+#[test]
+fn slice63_neg_coeff_left_sign_unsat() {
+    let src = "(set-logic QF_LIA)(declare-fun x () Int)\
+               (assert (<= (* (- 4) x) 3))(assert (<= x (- 1)))(check-sat)";
+    assert_eq!(script_outcome(src), SolveOutcome::Unsat);
+}
+
+/// Mirrored position: x·(−2) ≥ 1 ∧ x ≥ 0 is unsat.
+#[test]
+fn slice63_neg_coeff_right_unsat() {
+    let src = "(set-logic QF_LIA)(declare-fun x () Int)\
+               (assert (>= (* x (- 2)) 1))(assert (>= x 0))(check-sat)";
+    assert_eq!(script_outcome(src), SolveOutcome::Unsat);
+}
+
+/// Real decimal coefficient, mirrored: −2.5r > 5 ⇒ r < −2.
+#[test]
+fn slice63_real_neg_decimal_coeff() {
+    let unsat = "(set-logic QF_LRA)(declare-fun r () Real)\
+                 (assert (> (* r (- 2.5)) 5.0))(assert (> r (- 2.0)))(check-sat)";
+    assert_eq!(script_outcome(unsat), SolveOutcome::Unsat);
+    let sat = "(set-logic QF_LRA)(declare-fun r () Real)\
+               (assert (> (* r (- 2.5)) 5.0))(check-sat)";
+    assert_eq!(script_outcome(sat), SolveOutcome::Sat);
+}
+
+/// Guard (Global Constraints): a shared `(- 4)` under a UF stays pinned to −4.
+#[test]
+fn slice63_shared_neg_numeral_stays_pinned() {
+    let src = "(set-logic QF_UFLIA)(declare-fun f (Int) Int)(declare-fun y () Int)\
+               (assert (= y (- 4)))(assert (= (f y) 0))(assert (= (f (- 4)) 1))(check-sat)";
+    assert_eq!(script_outcome(src), SolveOutcome::Unsat);
+}
+
+/// A shared compound with a `(- 1)` coefficient is linear and pinned
+/// (slice 50's `define_shared_compound`): (* (- 1) y) = 4 when y = −4.
+#[test]
+fn slice63_shared_neg_coeff_compound_is_pinned() {
+    let src = "(set-logic QF_UFLIA)(declare-fun f (Int) Int)(declare-fun y () Int)\
+               (assert (= y (- 4)))(assert (= (f 4) 0))(assert (= (f (* (- 1) y)) 1))(check-sat)";
+    assert_eq!(script_outcome(src), SolveOutcome::Unsat);
+}
