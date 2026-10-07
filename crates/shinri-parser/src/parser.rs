@@ -678,6 +678,7 @@ impl<'a> Parser<'a> {
         };
 
         match head.as_str() {
+            "!" => return self.parse_annotated(ctx),
             "let" => return self.parse_let(ctx),
             "forall" | "exists" | "as" | "match" => {
                 return Err(Diagnostic::new(
@@ -784,6 +785,77 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(args)
+    }
+
+    /// `(! t attr*)` (slice 64 §3.2), with `(` and `!` already consumed. The
+    /// value is `t`; an annotation never changes a term's meaning. `:named n`
+    /// binds `n` as a nullary alias of `t` (SMT-LIB 2.6 §3.6.5); any other
+    /// attribute is skipped.
+    fn parse_annotated(&mut self, ctx: &mut Context) -> Result<TermId, Diagnostic> {
+        let t = self.parse_term(ctx)?;
+        loop {
+            match self.bump() {
+                Some((Ok(Token::RParen), _)) => return Ok(t),
+                Some((Ok(Token::Keyword(k)), _)) => {
+                    if k == ":named" {
+                        let (name, nsp) = self.expect_symbol()?;
+                        if self.name_in_use(&name) {
+                            return Err(Diagnostic::new(
+                                nsp,
+                                format!("named term: name already in use: {name}"),
+                            ));
+                        }
+                        self.env.add_macro(&name, Vec::new(), t);
+                    } else {
+                        self.skip_attribute_value();
+                    }
+                }
+                Some((_, sp)) => {
+                    return Err(Diagnostic::new(
+                        sp,
+                        "expected an attribute keyword or ')' in (! ...)",
+                    ))
+                }
+                None => {
+                    return Err(Diagnostic::new(
+                        self.eof..self.eof,
+                        "unexpected EOF in (! ...)",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Consume one attribute value if present: nothing when the next token is
+    /// `)` or a keyword, else one s-expression. Iterative (a depth counter),
+    /// so hostile nesting cannot overflow the stack (threat model).
+    fn skip_attribute_value(&mut self) {
+        match self.peek() {
+            None | Some((Ok(Token::RParen), _)) | Some((Ok(Token::Keyword(_)), _)) => {}
+            Some((Ok(Token::LParen), _)) => {
+                self.bump();
+                let mut depth = 1usize;
+                while depth > 0 {
+                    match self.bump() {
+                        None => break,
+                        Some((Ok(Token::LParen), _)) => depth += 1,
+                        Some((Ok(Token::RParen), _)) => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            Some(_) => {
+                self.bump();
+            }
+        }
+    }
+
+    /// A `:named` name collides with a let-bound name, a macro (`define-fun`
+    /// or an earlier `:named`), or a declared function/constant.
+    fn name_in_use(&self, name: &str) -> bool {
+        self.env.lookup_let(name).is_some()
+            || self.env.lookup_macro(name).is_some()
+            || self.env.lookup_fun(name).is_some()
     }
 
     fn parse_let(&mut self, ctx: &mut Context) -> Result<TermId, Diagnostic> {
@@ -3322,6 +3394,83 @@ mod tests {
                 "{src}: {err:?}"
             );
         }
+    }
+    fn assert_terms(cmds: &[Command]) -> Vec<TermId> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                Command::Assert(t) => Some(*t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Slice 64 §3.2: `!` is transparent and `:named h` makes `h` an alias.
+    #[test]
+    fn named_annotation_is_transparent_and_binds_name() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = "(declare-fun a () Bool)(declare-fun b () Bool)\
+                   (assert (! (= a b) :named h))(assert (not h))(assert (= a b))";
+        let (ctx, cmds) = parse_all_ok(src);
+        let ts = assert_terms(&cmds);
+        assert_eq!(ts[0], ts[2], "annotation must not change the term");
+        match ctx.term_node(ts[1]) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Not),
+                args,
+                ..
+            } => assert_eq!(ctx.children(*args)[0], ts[0]),
+            other => panic!("expected (not h), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_annotation_rejects_names_in_use() {
+        for src in [
+            "(declare-fun a () Bool)(assert (! a :named h))(assert (! a :named h))",
+            "(declare-fun a () Bool)(assert (! a :named a))",
+            "(declare-fun a () Bool)(define-fun k () Bool a)(assert (! a :named k))",
+            "(declare-fun a () Bool)(assert (let ((h a)) (! a :named h)))",
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(msg.contains("name already in use"), "{src}: {msg}");
+        }
+    }
+
+    #[test]
+    fn unknown_attributes_are_skipped_including_nested_values() {
+        let src = "(declare-fun a () Bool)\
+                   (assert (! a :pattern ((f (g x)) y) :weight 3 :flag :named h2))(assert h2)";
+        let (_ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 3);
+    }
+
+    /// Threat model: attribute-value skipping is iterative.
+    #[test]
+    fn deeply_nested_attribute_value_does_not_overflow() {
+        let depth = 200_000;
+        let src = format!(
+            "(declare-fun a () Bool)(assert (! a :x {}{}))",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let (_ctx, cmds) = parse_all_ok(&src);
+        assert_eq!(cmds.len(), 2);
+    }
+
+    #[test]
+    fn command_after_failed_named_still_parses() {
+        let src = "(declare-fun a () Bool)(assert (! a :named a))(declare-fun b () Bool)";
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        assert!(matches!(
+            p.next_command(&mut ctx),
+            Some(Ok(Command::DeclareFun { .. }))
+        ));
+        assert!(matches!(p.next_command(&mut ctx), Some(Err(_))));
+        assert!(matches!(
+            p.next_command(&mut ctx),
+            Some(Ok(Command::DeclareFun { .. }))
+        ));
     }
 }
 
