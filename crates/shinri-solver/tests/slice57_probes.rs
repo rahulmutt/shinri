@@ -32,7 +32,8 @@ fn run_script(src: &str) -> Vec<String> {
     out
 }
 
-const H: &str = "(set-logic QF_SLIA)(declare-fun x () String)(declare-fun y () String)";
+const H: &str =
+    "(set-logic QF_SLIA)(declare-fun x () String)(declare-fun y () String)(declare-fun b () Bool)";
 
 /// The `check-sat` verdict of `body` and the solver's fence tag after it.
 fn verdict_and_fence(body: &str) -> (String, Option<&'static str>) {
@@ -190,8 +191,20 @@ fn strict_gate_confirms_lowered_str_lt() {
     assert!(x.as_str() < "zzz", "x = {x:?}");
 }
 
-/// The rebuild runs (as above), but the gate cannot evaluate the compound
-/// arithmetic `(- (str.len x) (str.len y))`. Under the strict gate the
+/// Slice 62: the rebuild runs (as above) and the compound length arithmetic
+/// `(- (str.len x) (str.len y))` is now evaluable by the gate's structural
+/// fold, so the strict gate confirms the rebuilt model (z3: sat).
+#[test]
+fn strict_gate_confirms_folded_len_arith() {
+    let x = sat_x(
+        "(assert (= (str.len x) 3))(assert (str.prefixof \"cd\" x))\
+         (assert (<= (- (str.len x) (str.len y)) 1))",
+    );
+    assert!(x.starts_with("cd") && x.chars().count() == 3, "x = {x:?}");
+}
+
+/// The rebuild runs (as above), but the gate cannot evaluate the numeric
+/// `ite` operand in `(<= (- (str.len x) (ite b (str.len y) 0)) 1)`. Under the strict gate the
 /// rebuilt model is not confirmed, so the answer stays `unknown` (z3: sat).
 /// With the gate forced non-strict this script answers `sat`, so the strict
 /// gate is what keeps it `unknown`.
@@ -199,7 +212,7 @@ fn strict_gate_confirms_lowered_str_lt() {
 fn strict_gate_keeps_unevaluable_unknown() {
     let (v, fence) = verdict_and_fence(
         "(assert (= (str.len x) 3))(assert (str.prefixof \"cd\" x))\
-         (assert (<= (- (str.len x) (str.len y)) 1))",
+         (assert (<= (- (str.len x) (ite b (str.len y) 0)) 1))",
     );
     assert_eq!(v, "unknown");
     assert_eq!(fence, Some("str-model-rejected"));
@@ -220,12 +233,12 @@ fn rf1_input_disjunction_stays_sat() {
 /// Review Focus 2: the strict flag belongs to one model build only.
 #[test]
 fn rf2_strict_flag_does_not_leak_across_checks() {
-    // The second query's compound arithmetic is gate-unevaluable, and its
+    // The second query's numeric `ite` operand is gate-unevaluable, and its
     // default model passes the 3-valued gate: a leaked strict flag would
     // reject it (`unknown`).
     let out = run_script(&format!(
         "{H}(push 1)(assert (= (str.len x) 3))(assert (str.prefixof \"cd\" x))(check-sat)(pop 1)\
-         (push 1)(assert (= (str.len x) 1))(assert (<= (- (str.len x) (str.len y)) 1))\
+         (push 1)(assert (= (str.len x) 1))(assert (<= (- (str.len x) (ite b (str.len y) 0)) 1))\
          (check-sat)(pop 1)"
     ));
     assert_eq!(out, vec!["sat".to_string(), "sat".to_string()]);

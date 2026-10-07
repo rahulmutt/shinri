@@ -21,16 +21,18 @@ pub struct TheoryCtx<'a> {
 /// never free-standing lemmas. `Split` is the SINGLE sanctioned exception (QF_LIA
 /// Plan A): a clause of theory-valid positive atoms (`TermId`s) the Combiner
 /// lifts to `TheoryResult::SplitAtoms`. Arithmetic and arrays emit TAUTOLOGY
-/// splits (`guard = None`); the String theory emits a GUARDED split
-/// (`guard = Some(¬eqn)`) whose disjunction is only valid given the triggering
-/// word equation (sound Nielsen lemma). The optional `guard` is a literal over an
-/// already-allocated SAT var, threaded verbatim into the learnt clause.
+/// splits (`guards = []`); the String theory emits GUARDED splits — the
+/// Nielsen F-split (`guards = [¬eqn]`), valid only given the triggering word
+/// equation, and the slice-62 leaf length-bound lemma (`guards = [¬m₁, …,
+/// ¬mₖ]`). Each guard is a literal over an already-allocated SAT var, threaded
+/// verbatim into the learnt clause.
 pub enum TCheck {
     Sat,
     Conflict(Vec<EqLeaf>),
     Split {
         atoms: Vec<TermId>,
-        guard: Option<Lit>,
+        /// See shinri_sat::TheoryResult::SplitAtoms::guards.
+        guards: Vec<Lit>,
         /// Optional per-atom preferred decision phase (empty = none).
         phases: Vec<Option<bool>>,
     },
@@ -212,13 +214,13 @@ mod tests {
         let t = shinri_core::TermId::new(5).unwrap();
         let c = TCheck::Split {
             atoms: vec![t],
-            guard: None,
+            guards: Vec::new(),
             phases: Vec::new(),
         };
         match c {
-            TCheck::Split { atoms, guard, .. } => {
+            TCheck::Split { atoms, guards, .. } => {
                 assert_eq!(atoms, vec![t]);
-                assert_eq!(guard, None);
+                assert!(guards.is_empty());
             }
             TCheck::Sat | TCheck::Conflict(_) | TCheck::Unknown => panic!("expected Split"),
         }

@@ -348,17 +348,89 @@ mod tests {
         assert_eq!(tag(&s, &[a], &m, true), "unevaluable:int-conv@not-needed");
     }
 
+    /// Slice 62: compound length arithmetic is folded from its operands even
+    /// when the arith model never valued the compound term.
     #[test]
-    fn unevaluable_compound_len_arith() {
+    fn compound_len_arith_evaluates_from_operands() {
         let (mut s, x, _) = fx();
         let len = b(&mut s, BuiltinOp::StrLen, &[x]);
         let one = int(&mut s, 1);
         let sum = b(&mut s, BuiltinOp::Add, &[len, one]);
         let two = int(&mut s, 2);
+        let three = int(&mut s, 3);
+        let holds = s.eq(sum, two);
+        let fails = s.eq(sum, three);
+        let m = strs(&[(x, "a")]);
+        assert_eq!(s.eval_bool(holds, &m), Some(true));
+        assert_eq!(s.eval_bool(fails, &m), Some(false));
+    }
+
+    /// An operand with no value keeps the term unevaluable.
+    #[test]
+    fn unevaluable_compound_len_arith() {
+        let (mut s, x, _) = fx();
+        let len = b(&mut s, BuiltinOp::StrLen, &[x]);
+        let is = s.ctx_mut().int_sort();
+        let nf = s.declare_fun("n", &[], is);
+        let n = s.app(Op::Uninterpreted(nf), &[]);
+        let sum = b(&mut s, BuiltinOp::Add, &[len, n]);
+        let two = int(&mut s, 2);
         let a = s.eq(sum, two);
         let m = strs(&[(x, "a")]);
         assert_eq!(s.eval_bool(a, &m), None);
         assert_eq!(tag(&s, &[a], &m, true), "unevaluable:len-arith@not-needed");
+    }
+
+    /// Slice 62 (item 5): `len x + len y = 3` under `x = y = ""`, with no
+    /// arith value for the sum, is a violation the non-strict gate sees.
+    #[test]
+    fn unvalued_sum_of_lengths_is_violated() {
+        let (mut s, x, y) = fx();
+        let lx = b(&mut s, BuiltinOp::StrLen, &[x]);
+        let ly = b(&mut s, BuiltinOp::StrLen, &[y]);
+        let sum = b(&mut s, BuiltinOp::Add, &[lx, ly]);
+        let three = int(&mut s, 3);
+        let a = s.eq(sum, three);
+        let m = strs(&[(x, ""), (y, "")]);
+        assert_eq!(s.eval_bool(a, &m), Some(false));
+        assert!(!s.string_model_satisfies(&[a], &m, false));
+    }
+
+    /// `(= (f (str.len x)) 1)` with the model's `f(len x) = 1` built at a
+    /// stale `len x = 3`, while `x = ""`.
+    fn stale_uf_arg(len_val: i128, x_val: &str) -> (Solver, TermId, Model) {
+        let (mut s, x, _) = fx();
+        let len = b(&mut s, BuiltinOp::StrLen, &[x]);
+        let is = s.ctx_mut().int_sort();
+        let ff = s.declare_fun("f", &[is], is);
+        let fl = s.app(Op::Uninterpreted(ff), &[len]);
+        let one = int(&mut s, 1);
+        let a = s.eq(fl, one);
+        let mut m = strs(&[(x, x_val)]);
+        m.values
+            .insert(len, ModelVal::Num(Rational::from_int(len_val.into())));
+        m.values
+            .insert(fl, ModelVal::Num(Rational::from_int(1i128.into())));
+        (s, a, m)
+    }
+
+    /// Slice 62 backstop: a UF application whose argument now evaluates to a
+    /// different value than the model's interpretation was built at is
+    /// unevaluable, so the strict gate cannot confirm it from the stale value.
+    #[test]
+    fn uf_app_with_stale_argument_is_unevaluable() {
+        let (s, a, m) = stale_uf_arg(3, "");
+        assert_eq!(s.eval_bool(a, &m), None);
+        assert!(!s.string_model_satisfies(&[a], &m, true));
+        assert_eq!(tag(&s, &[a], &m, true), "unevaluable:len-arith@not-needed");
+    }
+
+    /// An argument consistent with the model keeps the model's value.
+    #[test]
+    fn uf_app_with_consistent_argument_keeps_model_value() {
+        let (s, a, m) = stale_uf_arg(0, "");
+        assert_eq!(s.eval_bool(a, &m), Some(true));
+        assert!(s.string_model_satisfies(&[a], &m, true));
     }
 
     #[test]

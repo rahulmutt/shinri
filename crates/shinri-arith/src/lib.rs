@@ -1243,7 +1243,7 @@ impl Arith {
                 // split, no guard.
                 return TCheck::Split {
                     atoms: vec![cut_atom],
-                    guard: None,
+                    guards: Vec::new(),
                     phases: Vec::new(),
                 };
             }
@@ -1267,7 +1267,7 @@ impl Arith {
         // Branch `(x ≤ ⌊v⌋) ∨ (x ≥ ⌈v⌉)` is a tautology over the integers — no guard.
         TCheck::Split {
             atoms: vec![le, ge],
-            guard: None,
+            guards: Vec::new(),
             phases: Vec::new(),
         }
     }

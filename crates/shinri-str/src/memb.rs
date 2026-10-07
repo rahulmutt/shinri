@@ -78,6 +78,17 @@ fn emit_split(
     atoms: Vec<TermId>,
     guard: Option<shinri_core::Lit>,
 ) -> TCheck {
+    emit_split_guards(s, terms, atoms, guard.into_iter().collect())
+}
+
+/// [`emit_split`] with any number of guard literals (slice 62: the per-leaf
+/// length lemma is guarded by every membership literal it depends on).
+pub(crate) fn emit_split_guards(
+    s: &mut StrSolver,
+    terms: &mut Context,
+    atoms: Vec<TermId>,
+    guards: Vec<shinri_core::Lit>,
+) -> TCheck {
     for &a in &atoms {
         register_atom(s, terms, a);
     }
@@ -88,7 +99,7 @@ fn emit_split(
     );
     TCheck::Split {
         atoms,
-        guard,
+        guards,
         phases: Vec::new(),
     }
 }
@@ -670,7 +681,11 @@ pub(crate) fn memb_check(
             return Some(TCheck::Conflict(just));
         }
     }
-    None
+    // -- Slice 62: per-leaf intersection length bounds ---------------------
+    // Reached only when nothing above emitted this round. A leaf whose
+    // memberships jointly bound its length more tightly than any single
+    // atom does gets `!m1 | ... | !mk | bound` (leaf_bounds.rs).
+    crate::leaf_bounds::bound_split(s, cx, known, input_cond_roots)
 }
 
 #[cfg(test)]
@@ -714,7 +729,7 @@ mod tests {
         let mut splits = Vec::new();
         for _ in 0..max {
             match s.check(cx, Effort::Full) {
-                TCheck::Split { atoms, guard, .. } => splits.push((atoms, guard.is_some())),
+                TCheck::Split { atoms, guards, .. } => splits.push((atoms, !guards.is_empty())),
                 other => return (splits, other),
             }
         }

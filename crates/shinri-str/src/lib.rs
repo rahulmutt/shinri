@@ -4,6 +4,7 @@ mod fuel;
 pub mod indexof_replace;
 pub mod int_conv;
 mod joint_seed;
+mod leaf_bounds;
 mod length;
 mod memb;
 pub mod model;
@@ -78,6 +79,15 @@ pub struct StrSolver {
     code_terms: FxHashSet<TermId>,
     str_terms: FxHashSet<TermId>,
     emitted_len_axioms: FxHashSet<TermId>,
+    /// Slice 62: dedup for per-leaf intersection length bounds, keyed by
+    /// `(bound atom, sorted guard lits)` — the same bound under a different
+    /// membership set is a different lemma. Monotone, like
+    /// `emitted_len_axioms`.
+    emitted_group_len_axioms: FxHashSet<(TermId, Vec<Lit>)>,
+    /// Slice 62: `regex::len_bounds` of a leaf group's intersection, keyed by
+    /// its sorted guard lits (lits <-> atoms, so the key fixes the goal).
+    /// Monotone.
+    len_bounds_cache: FxHashMap<Vec<Lit>, Option<(u32, Option<u32>)>>,
     /// Dedup set for F-splits: keyed on the canonical (unordered) head pair.
     /// Monotone (never cleared on backtrack); prevents re-emitting the same
     /// split after dedup (termination guarantee).
@@ -554,7 +564,7 @@ impl TheorySolver for StrSolver {
                     );
                     return TCheck::Split {
                         atoms: vec![comp],
-                        guard: Some(lit.negate()),
+                        guards: vec![lit.negate()],
                         phases: Vec::new(),
                     };
                 }
@@ -599,7 +609,7 @@ impl TheorySolver for StrSolver {
                 self.emitted_len_axioms.insert(axiom);
                 return TCheck::Split {
                     atoms: vec![axiom],
-                    guard: None,
+                    guards: Vec::new(),
                     phases: Vec::new(),
                 };
             }
@@ -758,7 +768,7 @@ impl TheorySolver for StrSolver {
                             );
                             return TCheck::Split {
                                 atoms: vec![le_atom],
-                                guard: Some(lit.negate()),
+                                guards: vec![lit.negate()],
                                 phases: Vec::new(),
                             };
                         }
@@ -893,7 +903,7 @@ impl TheorySolver for StrSolver {
                         // implication (Nielsen lemma) — NOT the unsound bare disjunction.
                         return TCheck::Split {
                             atoms,
-                            guard: Some(guard),
+                            guards: vec![guard],
                             phases: Vec::new(),
                         };
                     }
@@ -1290,7 +1300,7 @@ impl TheorySolver for StrSolver {
                         );
                         return TCheck::Split {
                             atoms: vec![ge_l, ge_r],
-                            guard: Some(lit.negate()),
+                            guards: vec![lit.negate()],
                             phases: Vec::new(),
                         };
                     }
@@ -1595,16 +1605,19 @@ impl StrSolver {
             .copied()
             .filter(|(a, _)| !self.minted_membs.contains(a))
             .collect();
-        let mut seeds = model::memb_seeds(cx.terms, cx.eq, &known, &membs, m);
+        let (mut seeds, seed_len_changed) =
+            model::memb_seeds_flagged(cx.terms, cx.eq, &known, &membs, m);
         // Slice 61: joint words for the free leaves of concat-subject
         // memberships override those leaves' per-leaf seeds.
         let (joint, joint_len_changed) =
             joint_seed::joint_seeds_flagged(cx.terms, cx.eq, &known, &input_membs, m);
         seeds.extend(joint);
-        if joint_len_changed {
-            // A joint word whose length differs from the arith model's: only
-            // atomic `str.len` comparisons are re-read from the string, so
-            // require the strict gate (every assertion definitely true).
+        if joint_len_changed || seed_len_changed {
+            // A seed (joint, or a per-leaf shortest-word fallback) whose
+            // length differs from the arith model's: length facts outside
+            // what the gate re-reads from strings may be stale (a UF
+            // argument, `str.to_int`), so require the strict gate (R9;
+            // slice 62 adds the per-leaf case).
             m.require_strict_check();
         }
         // Slice 57: default build, then self-check against the INPUT string
@@ -1885,6 +1898,13 @@ impl StrSolver {
             .push((atom, Lit::new(Var::new(0), true), positive));
         self.memb_levels.push(0);
     }
+
+    /// Like `test_force_memb_true`, with an explicit SAT literal (slice 62:
+    /// group lemmas need distinct guard lits).
+    pub fn test_force_memb_true_lit(&mut self, atom: TermId, lit: Lit, positive: bool) {
+        self.memb_true.push((atom, lit, positive));
+        self.memb_levels.push(0);
+    }
 }
 
 #[cfg(test)]
@@ -1999,16 +2019,16 @@ mod tests {
         let (mut saw_ge, mut saw_le) = (false, false);
         for _ in 0..64 {
             match solver.check(&mut cx, Effort::Full) {
-                TCheck::Split { atoms, guard, .. } => {
+                TCheck::Split { atoms, guards, .. } => {
                     for a in atoms {
                         if a == expected_ge {
                             saw_ge = true;
                             // Non-tautological len link must be guarded by ¬eqn.
-                            assert!(guard.is_some(), "length link must be guarded (¬eqn)");
+                            assert!(!guards.is_empty(), "length link must be guarded (¬eqn)");
                         }
                         if a == expected_le {
                             saw_le = true;
-                            assert!(guard.is_some(), "length link must be guarded (¬eqn)");
+                            assert!(!guards.is_empty(), "length link must be guarded (¬eqn)");
                         }
                     }
                 }
@@ -2267,6 +2287,32 @@ mod tests {
         }
         assert!(!m.strict_check_required());
         assert_eq!(m.rebuild_outcome(), RebuildOutcome::Budget);
+    }
+
+    /// Slice 62: a fallback seed whose length differs from the arith model's
+    /// requires the strict gate.
+    #[test]
+    fn slice62_model_with_flags_strict_on_seed_length_mismatch() {
+        let mut ctx = Context::new();
+        let mut eq = EqualityEngine::default();
+        let areg = AtomRegistry::default();
+        let mut m = ModelBuilder::default();
+        let x = slice57_var(&mut ctx, "x");
+        let re_t = crate::regex::rex_to_term_test(&mut ctx, &crate::regex::star_lit_test("ab"));
+        let atom = ctx
+            .mk_app(Op::Builtin(BuiltinOp::StrInRe), &[x, re_t])
+            .unwrap();
+        slice57_len(&mut ctx, &mut m, x, 3);
+        let mut s = slice57_solver(&[], &[], &[x]);
+        s.test_force_memb_true(atom, true);
+        let mut cx = TheoryCtx {
+            terms: &mut ctx,
+            eq: &mut eq,
+            atoms: &areg,
+        };
+        s.model_with(&mut cx, &mut m);
+        assert!(matches!(m.get(x), Some(ModelVal::String(v)) if v.is_empty()));
+        assert!(m.strict_check_required());
     }
 
     /// The default path: a model that already satisfies its input equations

@@ -883,6 +883,178 @@ pub(crate) fn language_empty(r: &Rex) -> Emptiness {
     Emptiness::Empty
 }
 
+/// Slice 62: layers the exact-bounds walk explores before giving up on a
+/// finite maximum (spec §4.3).
+pub(crate) const LEN_BOUND_DEPTH_CAP: u32 = 64;
+
+/// Slice-62 deviation (perf fix, not in spec §4.3): a separate, tighter
+/// budget on the walk's total derivative work, counted as the summed
+/// `node_count` of every derivative it computes. `MEMB_SEARCH_STEP_CAP`
+/// alone bounds the number of expanded states, not their cost: on
+/// automatark-sized regexes (~500-1000 nodes, dozens of classes) one state
+/// costs ~5 ms, so a walk that runs to the step cap took 25-50 s, inside a
+/// single `memb_check` round (automatark-lu instance00134: 7 ms -> timeout).
+/// A sweep of 2.5k QF_S/QF_SLIA rows found every finite-max result within
+/// ~5.2k work; the costly walks were infinite languages walked to the depth
+/// cap for a max of `None`. Past this budget the walk stops: with `min`
+/// found it returns `(min, None)` exactly as at the depth cap (`min` is the
+/// first nullable layer, every shorter layer fully explored), else `None`
+/// ("no lemma"). ~10k node-units is a few ms.
+pub(crate) const LEN_BOUND_WORK_CAP: usize = 10_000;
+
+/// Exact length bounds of `L(r)`: `Some((min, max))`, where `min` is the
+/// shortest word length and `max` the longest (`None` when the language is
+/// infinite or no finite bound was reached within `LEN_BOUND_DEPTH_CAP`).
+/// `None` overall when `L(r)` is empty (slice 28 owns that case) or on any
+/// taint (class-split cap, node cap, step cap) — "no lemma", never a verdict.
+/// Exhausting `LEN_BOUND_WORK_CAP` acts like the depth cap once `min` is
+/// known (`(min, None)`) and like a taint before (`None`).
+///
+/// Layered walk: layer `d` is the set of distinct derivative states reached
+/// by words of length exactly `d`. States are deduplicated WITHIN a layer
+/// only: one state can sit at two depths without a cycle (`(a|bb)c` reaches
+/// `c` at 1 and 2), and cross-layer dedup would under-state the max. Like
+/// `language_empty`, every `next_classes` interval is explored, pure-surrogate
+/// ones included (its `lo` represents the class), so `min` is a sound lower
+/// bound — `search_shortest` skips surrogate classes and is not.
+pub(crate) fn len_bounds(r: &Rex) -> Option<(u32, Option<u32>)> {
+    len_bounds_budgeted(r, LEN_BOUND_WORK_CAP)
+}
+
+/// `len_bounds` with an explicit derivative-work budget (`work_cap`).
+///
+/// States are interned (`Walk`): each distinct state's `nullable`,
+/// `next_classes` and per-class derivatives are computed once and replayed
+/// whenever the state recurs at a later depth (an infinite language keeps
+/// the same states alive layer after layer). The replay performs the same
+/// cap checks, in the same order, on the same `node_count`s as a fresh
+/// expansion, so results — including where a cap trips — are those of the
+/// plain walk (`len_bounds_plain` in the tests).
+fn len_bounds_budgeted(r: &Rex, work_cap: usize) -> Option<(u32, Option<u32>)> {
+    let mut steps = 0usize;
+    let mut work = 0usize;
+    let mut w = Walk::default();
+    // `Empty` never enters a layer (it is filtered when a successor is
+    // recorded), so no per-layer `retain` is needed. Keep it that way: a
+    // `Vec<Rex>::retain` here changed how LLVM shapes `Rex`'s drop glue
+    // crate-wide and cost ~10% on derivative-heavy rows (slice 62 perf).
+    let mut layer: Vec<usize> = if matches!(r, Rex::Empty) {
+        Vec::new()
+    } else {
+        vec![w.intern(r.clone())]
+    };
+    let mut min: Option<u32> = None;
+    let mut last: Option<u32> = None;
+    // Per-layer dedup: `stamp[id] == d + 1` iff `id` is already in `next`.
+    let mut stamp: Vec<u32> = Vec::new();
+    for d in 0..=LEN_BOUND_DEPTH_CAP {
+        if layer.is_empty() {
+            // Every path died: the language is finite (or empty).
+            return min.map(|m| (m, last));
+        }
+        if layer.iter().any(|&id| w.nullable[id]) {
+            min.get_or_insert(d);
+            last = Some(d);
+        }
+        if d == LEN_BOUND_DEPTH_CAP {
+            break;
+        }
+        let mut next: Vec<usize> = Vec::new();
+        for &id in &layer {
+            steps += 1;
+            if steps > MEMB_SEARCH_STEP_CAP {
+                return None;
+            }
+            if w.succ[id].is_none() {
+                // First expansion: compute and check as we go; a cap that
+                // trips returns before anything is recorded.
+                let classes = next_classes(&w.states[id])?;
+                let mut out: Vec<Succ> = Vec::with_capacity(classes.len());
+                for (lo, _hi) in classes {
+                    let dd = deriv(lo, &w.states[id]);
+                    let n = node_count(&dd);
+                    if n > FUEL_NODE_CAP {
+                        return None;
+                    }
+                    work += n;
+                    if work > work_cap {
+                        // Slice-62 deviation: see LEN_BOUND_WORK_CAP.
+                        return min.map(|m| (m, None));
+                    }
+                    let child = if matches!(dd, Rex::Empty) {
+                        None
+                    } else {
+                        Some(w.intern(dd))
+                    };
+                    if let Some(c) = child {
+                        push_once(&mut next, &mut stamp, c, d);
+                    }
+                    out.push((n, child));
+                }
+                w.succ[id] = Some(out);
+            } else {
+                // Replay: the same checks on the recorded counts.
+                for &(n, child) in w.succ[id].as_deref().unwrap_or_default() {
+                    work += n;
+                    if work > work_cap {
+                        return min.map(|m| (m, None));
+                    }
+                    if let Some(c) = child {
+                        push_once(&mut next, &mut stamp, c, d);
+                    }
+                }
+            }
+        }
+        layer = next;
+    }
+    // Depth cap with live states: the minimum (if found) is exact, the
+    // maximum unknown.
+    min.map(|m| (m, None))
+}
+
+/// `len_bounds_budgeted`'s interned states: `states[id]`, its `nullable`,
+/// and (once expanded) its successors as `(node_count, child)` per
+/// `next_classes` interval, `child == None` for an `Empty` derivative.
+/// Recorded counts are within `FUEL_NODE_CAP` (a larger one returns before
+/// the state is recorded).
+#[derive(Default)]
+struct Walk {
+    ids: FxHashMap<Rex, usize>,
+    states: Vec<Rex>,
+    nullable: Vec<bool>,
+    succ: Vec<Option<Vec<Succ>>>,
+}
+
+/// One recorded successor: the derivative's `node_count` and its state id
+/// (`None` for `Empty`).
+type Succ = (usize, Option<usize>);
+
+impl Walk {
+    fn intern(&mut self, r: Rex) -> usize {
+        if let Some(&id) = self.ids.get(&r) {
+            return id;
+        }
+        let id = self.states.len();
+        self.nullable.push(nullable(&r));
+        self.succ.push(None);
+        self.ids.insert(r.clone(), id);
+        self.states.push(r);
+        id
+    }
+}
+
+/// Append `id` to layer `d + 1` unless it is already there (first-seen
+/// order, like the plain walk's `seen` set).
+fn push_once(next: &mut Vec<usize>, stamp: &mut Vec<u32>, id: usize, d: u32) {
+    if stamp.len() <= id {
+        stamp.resize(id + 1, 0);
+    }
+    if stamp[id] != d + 1 {
+        stamp[id] = d + 1;
+        next.push(id);
+    }
+}
+
 /// Ground membership of a CONCRETE string in the regex TERM `re_t`.
 /// 3-valued for the post-solve witness self-check: `Some(verdict)` iff `s`
 /// is in-alphabet, `re_t` extracts as a constant regex, and evaluation stays
@@ -3284,5 +3456,204 @@ mod tests {
             ])
         );
         assert_eq!(joint_classes(&head, &[]), next_classes(&head));
+    }
+
+    // ── Slice 62: exact length bounds ───────────────────────────────────
+
+    #[test]
+    fn len_bounds_norn135_singleton() {
+        // a*b ∩ a*b+ ∩ ab* ∩ [a-u]* = {ab}.
+        let a_star = star_lit_test("a");
+        let goal = inter(vec![
+            concat(vec![a_star.clone(), lit_test("b")]),
+            concat(vec![a_star, lit_test("b"), star_lit_test("b")]),
+            concat(vec![lit_test("a"), star_lit_test("b")]),
+            star_range_test('a', 'u'),
+        ]);
+        assert_eq!(len_bounds(&goal), Some((2, Some(2))));
+    }
+
+    #[test]
+    fn len_bounds_cross_depth_state() {
+        // (a|bb)c reaches the state `c` at depths 1 and 2: max must be 3.
+        let r = concat(vec![
+            union(vec![lit_test("a"), lit_test("bb")]),
+            lit_test("c"),
+        ]);
+        assert_eq!(len_bounds(&r), Some((2, Some(3))));
+    }
+
+    #[test]
+    fn len_bounds_unbounded() {
+        assert_eq!(len_bounds(&star_lit_test("ab")), Some((0, None)));
+    }
+
+    #[test]
+    fn len_bounds_counts_surrogate_shortest_path() {
+        // The only length-2 word starts with a surrogate code point;
+        // `search_shortest` skips that class and finds "bbb" (3).
+        let r = union(vec![
+            concat(vec![Rex::Range(0xD800, 0xDFFF), lit_test("a")]),
+            lit_test("bbb"),
+        ]);
+        assert_eq!(search_shortest(&r).map(|w| w.chars().count()), Some(3));
+        assert_eq!(len_bounds(&r), Some((2, Some(3))));
+    }
+
+    #[test]
+    fn len_bounds_empty_language_is_none() {
+        assert_eq!(len_bounds(&inter(vec![lit_test("a"), lit_test("b")])), None);
+    }
+
+    /// `a*b ∩ a*c` is empty but does NOT fold to `Empty` at construction
+    /// (unlike `a ∩ b`), so `None` must come from the walk itself.
+    #[test]
+    fn len_bounds_non_folding_empty_intersection_is_none() {
+        let a_star = star_lit_test("a");
+        let r = inter(vec![
+            concat(vec![a_star.clone(), lit_test("b")]),
+            concat(vec![a_star, lit_test("c")]),
+        ]);
+        assert_ne!(r, Rex::Empty, "the intersection must not fold");
+        assert_eq!(len_bounds(&r), None);
+    }
+
+    #[test]
+    fn len_bounds_empty_root_is_none() {
+        assert_eq!(len_bounds(&Rex::Empty), None);
+        assert_eq!(len_bounds(&Rex::Eps), Some((0, Some(0))));
+    }
+
+    #[test]
+    fn len_bounds_depth_cap_drops_max_only() {
+        let long = "a".repeat(LEN_BOUND_DEPTH_CAP as usize + 6);
+        let r = union(vec![lit_test("a"), lit_test(&long)]);
+        assert_eq!(len_bounds(&r), Some((1, None)));
+    }
+
+    /// The pre-memo walk (slice 62 as first written): every layer re-derives
+    /// every state. Reference for `len_bounds_memo_matches_plain_walk`.
+    fn len_bounds_plain(r: &Rex, work_cap: usize) -> Option<(u32, Option<u32>)> {
+        let (mut steps, mut work) = (0usize, 0usize);
+        let mut layer: Vec<Rex> = vec![r.clone()];
+        let (mut min, mut last) = (None, None);
+        for d in 0..=LEN_BOUND_DEPTH_CAP {
+            layer.retain(|s| !matches!(s, Rex::Empty));
+            if layer.is_empty() {
+                return min.map(|m| (m, last));
+            }
+            if layer.iter().any(nullable) {
+                min.get_or_insert(d);
+                last = Some(d);
+            }
+            if d == LEN_BOUND_DEPTH_CAP {
+                break;
+            }
+            let mut seen: FxHashSet<Rex> = FxHashSet::default();
+            let mut next: Vec<Rex> = Vec::new();
+            for state in &layer {
+                steps += 1;
+                if steps > MEMB_SEARCH_STEP_CAP {
+                    return None;
+                }
+                for (lo, _hi) in next_classes(state)? {
+                    let dd = deriv(lo, state);
+                    let n = node_count(&dd);
+                    if n > FUEL_NODE_CAP {
+                        return None;
+                    }
+                    work += n;
+                    if work > work_cap {
+                        return min.map(|m| (m, None));
+                    }
+                    if !matches!(dd, Rex::Empty) && seen.insert(dd.clone()) {
+                        next.push(dd);
+                    }
+                }
+            }
+            layer = next;
+        }
+        min.map(|m| (m, None))
+    }
+
+    /// Deterministic pseudo-random regex over `{a, b, c}`.
+    fn rand_rex(seed: &mut u64, depth: u32) -> Rex {
+        *seed ^= *seed << 13;
+        *seed ^= *seed >> 7;
+        *seed ^= *seed << 17;
+        let k = *seed % if depth == 0 { 3 } else { 9 };
+        match k {
+            0 => lit_test(["a", "b", "c", "ab", "ba"][(*seed >> 8) as usize % 5]),
+            1 => Rex::Range('a' as u32, 'b' as u32),
+            2 => Rex::Eps,
+            3 => concat(vec![rand_rex(seed, depth - 1), rand_rex(seed, depth - 1)]),
+            4 => union(vec![rand_rex(seed, depth - 1), rand_rex(seed, depth - 1)]),
+            5 => inter(vec![rand_rex(seed, depth - 1), rand_rex(seed, depth - 1)]),
+            6 => star(rand_rex(seed, depth - 1)),
+            7 => comp(rand_rex(seed, depth - 1)),
+            _ => loop_(rand_rex(seed, depth - 1), 1, 3),
+        }
+    }
+
+    /// Slice-62 perf: the interned walk replays recurring states instead of
+    /// re-deriving them; every result, including where each cap trips,
+    /// must equal the plain walk's.
+    #[test]
+    fn len_bounds_memo_matches_plain_walk() {
+        let mut seed = 0x5eed_6262_u64;
+        let mut fixed = vec![
+            Rex::Empty,
+            Rex::Eps,
+            star_lit_test("ab"),
+            union(vec![lit_test("0"), loop_(wide_pairs(), 20, 20)]),
+            loop_(wide_pairs(), 3, 3),
+        ];
+        fixed.extend((0..400).map(|_| rand_rex(&mut seed, 4)));
+        let mut kinds = [0usize; 4]; // finite max, (min, None), None, cap-tripped
+        for r in &fixed {
+            let full = len_bounds_plain(r, usize::MAX);
+            for cap in [0, 7, 50, 300, 2_000, LEN_BOUND_WORK_CAP, usize::MAX] {
+                let got = len_bounds_budgeted(r, cap);
+                assert_eq!(got, len_bounds_plain(r, cap), "cap {cap}: {r:?}");
+                kinds[3] += usize::from(got != full);
+            }
+            match full {
+                Some((_, Some(_))) => kinds[0] += 1,
+                Some((_, None)) => kinds[1] += 1,
+                None => kinds[2] += 1,
+            }
+        }
+        assert!(
+            kinds.iter().all(|&k| k > 0),
+            "corpus covers every outcome: {kinds:?}"
+        );
+    }
+
+    /// 26 two-letter words with distinct heads (`aA|bB|...`): 27 classes
+    /// per state, so each layer costs thousands of node-units.
+    fn wide_pairs() -> Rex {
+        union(
+            ('a'..='z')
+                .map(|c| lit_test(&format!("{c}{}", c.to_ascii_uppercase())))
+                .collect(),
+        )
+    }
+
+    /// Slice-62 perf fix: a wide-alphabet finite language whose walk costs
+    /// more than `LEN_BOUND_WORK_CAP` keeps its exact `min` and drops only
+    /// the max (like the depth cap); with no budget the max is exact.
+    #[test]
+    fn len_bounds_work_cap_drops_max_only() {
+        let r = union(vec![lit_test("0"), loop_(wide_pairs(), 20, 20)]);
+        assert_eq!(len_bounds_budgeted(&r, usize::MAX), Some((1, Some(40))));
+        assert_eq!(len_bounds(&r), Some((1, None)));
+    }
+
+    /// ... and before any nullable layer is reached the budget is a taint.
+    #[test]
+    fn len_bounds_work_cap_before_min_is_none() {
+        let r = loop_(wide_pairs(), 20, 20);
+        assert_eq!(len_bounds_budgeted(&r, usize::MAX), Some((40, Some(40))));
+        assert_eq!(len_bounds(&r), None);
     }
 }

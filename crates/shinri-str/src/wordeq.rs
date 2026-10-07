@@ -1293,12 +1293,12 @@ mod tests {
         let mut saw_split = false;
         for _ in 0..32 {
             match s.check(&mut cx, Effort::Full) {
-                TCheck::Split { atoms, guard, .. } => {
+                TCheck::Split { atoms, guards, .. } => {
                     if atoms.len() >= 2 {
                         // The F-split MUST be guarded by the negated word equation
                         // (sound Nielsen lemma), never a bare disjunction.
                         assert!(
-                            guard.is_some(),
+                            !guards.is_empty(),
                             "variable-head F-split must carry a guard (¬eqn)"
                         );
                         saw_split = true;

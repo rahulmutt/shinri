@@ -1249,17 +1249,17 @@ fn in_re_symbolic_regex_side_still_fenced() {
 #[test]
 fn in_re_unfold_unsat_disjoint_stars() {
     // x ∈ a* ∧ x ∈ b* ∧ len(x) ≥ 1 — the intersection above length 0 is empty.
-    // slice 21 KNOWN GAP: spec claims unsat, but deciding a* ∩ b* above ε
-    // needs an intersection-aware rule (the single-guard Split channel cannot
-    // cite two membership lits); the G/E/S unfolding saturates → sound
-    // Unknown. See spec Deviations.
+    // Slice 21 left this at Unknown (the single-guard Split channel could not
+    // cite two membership lits). Slice 62's per-leaf intersection bound
+    // (`not m1 or not m2 or len x <= 0`) closes that gap: a* and b* meet only
+    // in the empty word, so the solver now decides unsat.
     let out = run_script(
         "(set-logic QF_S)(declare-fun x () String)\
          (assert (str.in_re x (re.* (str.to_re \"a\"))))\
          (assert (str.in_re x (re.* (str.to_re \"b\"))))\
          (assert (>= (str.len x) 1))(check-sat)",
     );
-    assert_eq!(out, vec!["unknown"]);
+    assert_eq!(out, vec!["unsat"]);
 }
 
 #[test]
