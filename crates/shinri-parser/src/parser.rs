@@ -127,6 +127,21 @@ fn reals_only_arith(name: &str) -> bool {
     ["LRA", "NRA", "RDL"].iter().any(|suf| name.ends_with(suf))
 }
 
+/// Sort names `parse_sort` resolves before the environment; `define-sort`
+/// may not shadow them (slice 64 §3.3). Keep in sync with `parse_sort`.
+const BUILTIN_SORT_NAMES: &[&str] = &[
+    "Bool",
+    "Int",
+    "Real",
+    "String",
+    "RegLan",
+    "Float16",
+    "Float32",
+    "Float64",
+    "Float128",
+    "RoundingMode",
+];
+
 /// The semantic text of an attribute-value token: the inner string for
 /// symbols/numerals/decimals/keywords/hex/bin, and the quote-stripped,
 /// `""`-unescaped contents for string literals.
@@ -1158,7 +1173,7 @@ impl<'a> Parser<'a> {
     /// command so the next call resumes cleanly (design §8 recovery).
     ///
     /// Recovery runs exactly once per command: `parse_command_body` returns
-    /// `Ok(None)` for `define-fun` (no IR command emitted), and this loop
+    /// `Ok(None)` for `define-fun` and `define-sort` (no IR command emitted), and this loop
     /// simply continues — no recursion, no double-recovery.
     pub fn next_command(&mut self, ctx: &mut Context) -> Option<Result<Command, Diagnostic>> {
         loop {
@@ -1179,7 +1194,7 @@ impl<'a> Parser<'a> {
                 }
             }
             match self.parse_command_body(ctx) {
-                Ok(None) => continue, // define-fun: no IR command, fetch next
+                Ok(None) => continue, // define-fun / define-sort: no IR command, fetch next
                 Ok(Some(cmd)) => {
                     if matches!(cmd, Command::Exit) {
                         self.stopped = true;
@@ -1197,7 +1212,7 @@ impl<'a> Parser<'a> {
     /// After the opening '(' is consumed, parse the command head + body,
     /// including the closing ')'.
     ///
-    /// Returns `Ok(None)` for `define-fun` (no IR command emitted); the caller
+    /// Returns `Ok(None)` for `define-fun` and `define-sort` (no IR command emitted); the caller
     /// loops to fetch the next real command. Returns `Ok(Some(cmd))` for every
     /// other command. Returns `Err` on parse/sort errors — the caller is
     /// responsible for calling `recover_to_command_end` exactly once.
@@ -1260,6 +1275,41 @@ impl<'a> Parser<'a> {
             "define-fun" => {
                 // parse_define_fun already consumes the define-fun's own closing ')'.
                 self.parse_define_fun(ctx)?;
+                return Ok(None); // no IR command emitted; caller loops
+            }
+            "define-sort" => {
+                // Slice 64 §3.3: nullary aliases only. The alias stores the
+                // resolved SortId, so it is never re-expanded.
+                let (name, nsp) = self.expect_symbol()?;
+                self.expect_token(&Token::LParen)?;
+                if !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+                    // Consume the parameter list (iteratively) first, so the
+                    // caller's `recover_to_command_end` resumes at this
+                    // command's own ')' instead of treating the sort body as
+                    // a stray next command.
+                    let mut depth = 1usize;
+                    while depth > 0 {
+                        match self.bump() {
+                            None => break,
+                            Some((Ok(Token::LParen), _)) => depth += 1,
+                            Some((Ok(Token::RParen), _)) => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    return Err(Diagnostic::new(hsp, "parametric define-sort unsupported"));
+                }
+                self.bump(); // ')' of the empty parameter list
+                if BUILTIN_SORT_NAMES.contains(&name.as_str())
+                    || self.env.lookup_sort(&name).is_some()
+                {
+                    return Err(Diagnostic::new(
+                        nsp,
+                        format!("define-sort: sort already defined: {name}"),
+                    ));
+                }
+                let s = self.parse_sort(ctx)?;
+                self.expect_token(&Token::RParen)?; // close (define-sort …)
+                self.env.add_sort(&name, s);
                 return Ok(None); // no IR command emitted; caller loops
             }
             "assert" => {
@@ -2423,6 +2473,59 @@ mod tests {
         let cs = commands("(bad-command foo bar)\n(check-sat)");
         assert!(cs[0].is_err());
         assert!(matches!(cs[1], Ok(Command::CheckSat)));
+    }
+
+    /// Slice 64 §3.3: aliases resolve to the stored SortId, including an
+    /// alias of an alias.
+    #[test]
+    fn nullary_define_sort_aliases_resolve() {
+        let src = "(define-sort FPN () (_ FloatingPoint 11 53))(define-sort F2 () FPN)\
+                   (declare-fun x () FPN)(declare-fun y () F2)";
+        let (mut ctx, cmds) = parse_all_ok(src);
+        let fpn = ctx.fp_sort(11, 53);
+        let sorts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::DeclareFun { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sorts, vec![fpn, fpn]);
+        assert_eq!(cmds.len(), 2, "define-sort emits no IR command");
+    }
+
+    #[test]
+    fn define_sort_rejects_parameters_and_redefinition() {
+        for (src, needle) in [
+            (
+                "(define-sort Arr (X) (Array X X))",
+                "parametric define-sort unsupported",
+            ),
+            ("(define-sort Real () Int)", "sort already defined: Real"),
+            (
+                "(define-sort S () Int)(define-sort S () Bool)",
+                "sort already defined: S",
+            ),
+            (
+                "(declare-sort U 0)(define-sort U () Int)",
+                "sort already defined: U",
+            ),
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(msg.contains(needle), "{src}: {msg}");
+        }
+    }
+
+    #[test]
+    fn command_after_failed_define_sort_still_parses() {
+        let src = "(define-sort Arr (X) (Array X X))(declare-fun a () Bool)";
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        assert!(matches!(p.next_command(&mut ctx), Some(Err(_))));
+        assert!(matches!(
+            p.next_command(&mut ctx),
+            Some(Ok(Command::DeclareFun { .. }))
+        ));
     }
 
     /// Helper: parse all commands from `src`, asserting no diagnostic errors.

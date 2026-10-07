@@ -183,6 +183,19 @@ mod streaming_tests {
         assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::CheckSat));
     }
 
+    /// Slice 64: a define-sort alias persists into later commands.
+    #[test]
+    fn define_sort_alias_persists_across_commands() {
+        let mut ctx = Context::new();
+        let mut sp = StreamingParser::new();
+        sp.push_str("(define-sort FPN () (_ FloatingPoint 11 53))(declare-fun x () FPN)");
+        let fpn = ctx.fp_sort(11, 53);
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::DeclareFun { result, .. } if *result == fpn
+        )));
+    }
+
     #[test]
     fn env_persists_across_commands() {
         let mut ctx = Context::new();
