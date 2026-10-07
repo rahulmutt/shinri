@@ -171,11 +171,22 @@ discovered count ≥ the `main` count + this slice's new tests.
 
 ## 8. Measurement
 
-Base: a fresh `mise run bench-run` of `main` over QF_LIA, QF_LRA, QF_UFLIA,
-QF_UFLRA (the latest per-row arith verdicts are from slice 53, older than
-`main`). After: the same logics at the PR head, plus the 2,000-row
-neutrality sample (slice 59's seeded recipe) and a 2,000-row seeded QF_SLIA
-sample (string length arithmetic goes through `linearize`).
+Four row sets, each run by both a fresh `main` base binary and the PR-head
+binary:
+
+- **refused**: the 4,874 `unknown:theory-refused` rows of
+  `bench/results/slice53/`, the rows this slice can change;
+- **arith-sample**: 2,000 rows drawn with `random.Random(63)` from the other
+  QF_LIA/QF_LRA/QF_UFLIA/QF_UFLRA rows. These rows can't contain the shape,
+  because an atom containing it is refused, so this set checks neutrality;
+- **neutrality sample**: the 2,000-row slice-59 seeded recipe;
+- **slia-sample**: 2,000 QF_SLIA rows drawn with `random.Random(63)`
+  (string length arithmetic goes through `linearize`).
+
+Amended while planning (2026-10-07): full four-logic base and after runs
+were the original plan. They would cost about 18 h of bench time at
+`--jobs 3`, because roughly 3,700 arith rows already time out at 20 s. The
+narrowed sets measure every row the change can reach and sample the rest.
 
 Host sharing (cross-track rule): `--jobs 3` on cores 12–23 while other
 tracks may be benching; no timing criterion in this slice, so no
