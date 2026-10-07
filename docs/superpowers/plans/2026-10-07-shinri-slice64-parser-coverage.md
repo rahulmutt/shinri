@@ -1291,3 +1291,495 @@ git push origin --delete slice64-parser-coverage
 git worktree remove .claude/worktrees/slice64
 git branch -d slice64-parser-coverage
 ```
+
+---
+
+## Amendment A — FP soundness (spec §3.5, §7.5; added 2026-10-07)
+
+The pre-fix after run (`slice64-fp`) found 3 wrong QF_FP rows, all caused by pre-existing `shinri-fp` bugs (spec §3.5). The owner ruled to fix them in this slice. **Execution order:** Task 6's Steps 1–3 already ran pre-fix (gates passed; after runs launched at `a7dd0cf`). Run Tasks 7 → 8 → 9, then resume Task 6 at Step 4, where the QF_FP set is the **combined** run defined in Task 9.
+
+Additional global constraints:
+- **Scope widens** to `crates/shinri-bv/src/blast/mod.rs` (one new `WordSink` method with an `unreachable!` default, like `rm_cache`), `crates/shinri-fp/src/{lib.rs,lower.rs,blast/minmax.rs,blast/fma.rs}`, and the new test file `crates/shinri-solver/tests/fp_soundness_e2e.rs`.
+- **Tie bits are shared, never per occurrence** (spec §3.5.1): one bit per key `(is_max, eb, sb, x_is_pos_zero)` per query.
+- **Allowed existing-test edit:** the two `fp_min`/`fp_max` calls in `minmax.rs`'s `min_max_words_match_reference` gain the new tie-bit arguments. They pass the bits that reproduce the reference's old choice (`fp_min`: `b.zero(), b.zero()` for −0; `fp_max`: `b.one(), b.one()` for +0). The assertions stay unchanged.
+- The fma fix asserts the IEEE result literally. It does not rely on `reference::ref_fma`, which may share the bug.
+
+### Task 7: Shared ±0 tie bits for `fp.min` / `fp.max`
+
+**Files:**
+- Modify: `crates/shinri-bv/src/blast/mod.rs`: add the `WordSink::fp_tie_bits` method next to `rm_cache`
+- Modify: `crates/shinri-fp/src/lib.rs`: a `tie_bits` field and override on `FpBlaster`, a new `fn tie_bit`, and the `FpMin`/`FpMax` arms (~210–219)
+- Modify: `crates/shinri-fp/src/lower.rs`: a `tie_bits` field and override on `Lowerer`
+- Modify: `crates/shinri-fp/src/blast/minmax.rs`: `fp_min`, `fp_max`, a new `tie_word`, and tests
+- Create: `crates/shinri-solver/tests/fp_soundness_e2e.rs`
+
+**Interfaces:**
+- Produces: `WordSink::fp_tie_bits(&mut self) -> &mut FxHashMap<(bool, u32, u32, bool), BitLit>`; `fn tie_bit<S: WordSink>(sink: &mut S, key: (bool, u32, u32, bool)) -> BitLit` (private, `shinri-fp/src/lib.rs`); `pub fn fp_min(b, x, y, eb, sb, tie_pn: BitLit, tie_np: BitLit) -> Vec<BitLit>`, and the same signature for `fp_max`. Here `tie_pn` is the choice when `x = +0, y = −0`, `tie_np` the choice when `x = −0, y = +0`, and a bit value of true means the result is `+0`.
+- `fp_soundness_e2e.rs` defines `fn script_outcome(src: &str) -> SolveOutcome`, which Task 8 reuses.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `mod tests` in `crates/shinri-fp/src/blast/minmax.rs`:
+
+```rust
+    /// Amendment A (spec §3.5.1): a ±0 tie returns the choice bit for its
+    /// argument order — true ⇒ +0, false ⇒ −0 — for both fp.min and fp.max.
+    #[test]
+    fn zero_tie_follows_choice_bit() {
+        let (eb, sb) = (8, 24);
+        let (pz, nz) = (0x0000_0000u64, 0x8000_0000u64);
+        for (x, y, is_pn) in [(pz, nz, true), (nz, pz, false)] {
+            for choose_pos in [false, true] {
+                for is_max in [false, true] {
+                    let mut b = Blaster::new();
+                    let xb = const_bits(&b, eb, sb, x);
+                    let yb = const_bits(&b, eb, sb, y);
+                    let (c, other) = if choose_pos {
+                        (b.one(), b.zero())
+                    } else {
+                        (b.zero(), b.one())
+                    };
+                    let (pn, np) = if is_pn { (c, other) } else { (other, c) };
+                    let w = if is_max {
+                        fp_max(&mut b, &xb, &yb, eb, sb, pn, np)
+                    } else {
+                        fp_min(&mut b, &xb, &yb, eb, sb, pn, np)
+                    };
+                    let want = if choose_pos { pz } else { nz };
+                    assert_eq!(
+                        eval_word(b, &w),
+                        want,
+                        "max={is_max} x={x:#x} y={y:#x} choose_pos={choose_pos}"
+                    );
+                }
+            }
+        }
+    }
+```
+
+In the same module's `min_max_words_match_reference`, change only the two calls:
+`fp_min(&mut b, &xb, &yb, eb, sb)` becomes `{ let z = b.zero(); fp_min(&mut b, &xb, &yb, eb, sb, z, z) }`, and
+`fp_max(&mut b2, &xb2, &yb2, eb, sb)` becomes `{ let o = b2.one(); fp_max(&mut b2, &xb2, &yb2, eb, sb, o, o) }`.
+
+Create `crates/shinri-solver/tests/fp_soundness_e2e.rs`:
+
+```rust
+//! Slice 64 amendment A (spec §3.5, §7.5): FP soundness fixes exposed once
+//! `define-sort` let QF_FP files parse.
+
+use shinri_parser::Parser;
+use shinri_solver::{CommandResponse, SolveOutcome, Solver};
+
+/// Run an SMT-LIB script; the outcome of its last `check-sat`. Any parse
+/// error fails the test.
+fn script_outcome(src: &str) -> SolveOutcome {
+    let mut solver = Solver::new();
+    let mut parser = Parser::new(src);
+    let mut outcome = None;
+    while let Some(result) = parser.next_command(solver.ctx_mut()) {
+        let cmd = result.unwrap_or_else(|e| panic!("parse error: {e:?}"));
+        match solver.execute(cmd) {
+            CommandResponse::Sat => outcome = Some(SolveOutcome::Sat),
+            CommandResponse::Unsat => outcome = Some(SolveOutcome::Unsat),
+            CommandResponse::Unknown => outcome = Some(SolveOutcome::Unknown),
+            _ => {}
+        }
+    }
+    outcome.expect("script has a check-sat")
+}
+
+const F64: &str = "(_ FloatingPoint 11 53)";
+
+/// §3.5.1: both zeros are admissible results of a ±0 tie, for both orders
+/// and both operators.
+#[test]
+fn slice64a_zero_tie_admits_both_results() {
+    for op in ["fp.min", "fp.max"] {
+        for (xv, yv) in [("-zero", "+zero"), ("+zero", "-zero")] {
+            for r in ["+zero", "-zero"] {
+                let src = format!(
+                    "(set-logic QF_FP)(declare-fun x () {F64})(declare-fun y () {F64})\
+                     (assert (= x (_ {xv} 11 53)))(assert (= y (_ {yv} 11 53)))\
+                     (assert (= ({op} x y) (_ {r} 11 53)))(check-sat)"
+                );
+                assert_eq!(script_outcome(&src), SolveOutcome::Sat, "{op} {xv} {yv} -> {r}");
+            }
+        }
+    }
+}
+
+/// §3.5.1: fp.min/fp.max are functions — two applications to equal
+/// arguments must agree, so per-occurrence free choice would be unsound.
+#[test]
+fn slice64a_zero_tie_is_functionally_consistent() {
+    for op in ["fp.min", "fp.max"] {
+        let src = format!(
+            "(set-logic QF_FP)(declare-fun a () {F64})(declare-fun b () {F64})\
+             (declare-fun c () {F64})(declare-fun d () {F64})\
+             (assert (= a (_ -zero 11 53)))(assert (= b (_ +zero 11 53)))\
+             (assert (= c (_ -zero 11 53)))(assert (= d (_ +zero 11 53)))\
+             (assert (not (= ({op} a b) ({op} c d))))(check-sat)"
+        );
+        assert_eq!(script_outcome(&src), SolveOutcome::Unsat, "{op}");
+    }
+}
+
+/// QF_FP/wintersteiger/min/min-has-solution-13472 (`:status sat`).
+#[test]
+fn slice64a_min_has_solution_13472() {
+    let src = "(set-logic QF_FP)(define-sort FPN () (_ FloatingPoint 11 53))\
+        (declare-fun x () FPN)(declare-fun y () FPN)(declare-fun r () FPN)\
+        (assert (= x (fp #b1 #b00000000000 #b0000000000000000000000000000000000000000000000000000)))\
+        (assert (= y (fp #b0 #b00000000000 #b0000000000000000000000000000000000000000000000000000)))\
+        (assert (= r (fp #b0 #b00000000000 #b0000000000000000000000000000000000000000000000000000)))\
+        (assert (= (fp.min x y) r))(check-sat)";
+    assert_eq!(script_outcome(src), SolveOutcome::Sat);
+}
+```
+
+- [ ] **Step 2: Run them and verify they fail**
+
+```bash
+cd /workspace/.claude/worktrees/slice64
+taskset -c 0-11 cargo nextest run -p shinri-fp -E 'test(zero_tie_follows_choice_bit)'
+taskset -c 0-11 cargo nextest run -p shinri-solver -E 'binary(fp_soundness_e2e)'
+```
+
+Expected:
+- shinri-fp does not compile, because `fp_min` takes 5 arguments, not 7. Record that as the RED.
+- In `fp_soundness_e2e`, 3 tests are discovered. `slice64a_zero_tie_admits_both_results` FAILS (some combination is `unsat`), and `slice64a_min_has_solution_13472` FAILS (`unsat`).
+- `slice64a_zero_tie_is_functionally_consistent` PASSES already. It is the guard that the fix must not break.
+
+- [ ] **Step 3: Implement**
+
+In `crates/shinri-bv/src/blast/mod.rs`, add to `trait WordSink`, directly after `rm_cache`:
+
+```rust
+    /// Shared `fp.min`/`fp.max` ±0 tie bits (slice 64 amendment A), keyed by
+    /// `(is_max, eb, sb, x_is_pos_zero)`. SMT-LIB leaves a ±0 tie's result
+    /// unspecified, but `fp.min` is still a function, so every occurrence must
+    /// share one choice per key for the whole query. Only meaningful for FP
+    /// sinks; pure-BV lowering never calls this.
+    fn fp_tie_bits(&mut self) -> &mut FxHashMap<(bool, u32, u32, bool), BitLit> {
+        unreachable!("pure BV lowering has no fp.min/fp.max")
+    }
+```
+
+In `crates/shinri-fp/src/lib.rs`:
+- Add the field `tie_bits: FxHashMap<(bool, u32, u32, bool), BitLit>,` to `FpBlaster`, with the doc `/// Shared fp.min/fp.max ±0 tie bits (amendment A; see WordSink::fp_tie_bits).`, and initialise it with `FxHashMap::default()` in `FpBlaster::new`.
+- Add the override to `impl WordSink for FpBlaster`:
+
+```rust
+    fn fp_tie_bits(&mut self) -> &mut FxHashMap<(bool, u32, u32, bool), BitLit> {
+        &mut self.tie_bits
+    }
+```
+
+Add the same field, initialiser and override to `Lowerer` in `crates/shinri-fp/src/lower.rs`.
+
+Add next to `blast_fp_word` in `lib.rs`:
+
+```rust
+/// The shared ±0 tie bit for `key`, minted once per query (amendment A).
+fn tie_bit<S: WordSink>(sink: &mut S, key: (bool, u32, u32, bool)) -> BitLit {
+    if let Some(&l) = sink.fp_tie_bits().get(&key) {
+        return l;
+    }
+    let l = sink.blaster().fresh();
+    sink.fp_tie_bits().insert(key, l);
+    l
+}
+```
+
+The `FpMin` / `FpMax` arms become:
+
+```rust
+                FpMin => {
+                    let xw = sink.word(ctx, kids[0]);
+                    let yw = sink.word(ctx, kids[1]);
+                    let pn = tie_bit(sink, (false, eb, sb, true));
+                    let np = tie_bit(sink, (false, eb, sb, false));
+                    crate::blast::minmax::fp_min(sink.blaster(), &xw, &yw, eb, sb, pn, np)
+                }
+                FpMax => {
+                    let xw = sink.word(ctx, kids[0]);
+                    let yw = sink.word(ctx, kids[1]);
+                    let pn = tie_bit(sink, (true, eb, sb, true));
+                    let np = tie_bit(sink, (true, eb, sb, false));
+                    crate::blast::minmax::fp_max(sink.blaster(), &xw, &yw, eb, sb, pn, np)
+                }
+```
+
+In `crates/shinri-fp/src/blast/minmax.rs`:
+- Update the module doc's "sign-canonical ±0 rule" to "a ±0 tie resolved by a shared choice bit (amendment A)".
+- Add:
+
+```rust
+/// The ±0 tie result: `+0` when the order's choice bit is true, else `−0`.
+/// `x_sign` selects the order: `x = +0` uses `tie_pn`, `x = −0` uses `tie_np`.
+/// SMT-LIB leaves the tie unspecified; the bits are shared per format and
+/// order by the caller, so the operator stays a function (amendment A).
+fn tie_word(
+    b: &mut Blaster,
+    x_sign: BitLit,
+    tie_pn: BitLit,
+    tie_np: BitLit,
+    eb: u32,
+    sb: u32,
+) -> Vec<BitLit> {
+    let choose_pos = b.mux2(x_sign, tie_np, tie_pn);
+    let mut w = zero_word(b, eb, sb, false);
+    let last = w.len() - 1;
+    w[last] = b.not1(choose_pos);
+    w
+}
+```
+
+`fp_min` gains the parameters `tie_pn: BitLit, tie_np: BitLit`. Its doc's "resolves to -0 (sign-canonical, order-independent)" becomes "resolves to the shared choice bit for its argument order". Replace its two lines
+
+```rust
+    let neg_zero = zero_word(b, eb, sb, true);
+    let pick = mux_word(b, zero_tie, &neg_zero, &pick);
+```
+
+with
+
+```rust
+    let tie = tie_word(b, ux.sign, tie_pn, tie_np, eb, sb);
+    let pick = mux_word(b, zero_tie, &tie, &pick);
+```
+
+`fp_max` gets the same two new parameters, the same doc change ("the (+0,-0) tie resolves to +0" becomes "… to the shared choice bit"), and the same replacement of its `pos_zero` lines. `zero_word` keeps its signature; if it ends up called only with `false`, leave it as it is.
+
+- [ ] **Step 4: Run the tests and the affected suites**
+
+```bash
+taskset -c 0-11 cargo nextest run -p shinri-bv -p shinri-fp -E 'not test(_tiny_exhaustive_all_modes)'
+taskset -c 0-11 cargo nextest run -p shinri-solver -E 'binary(fp_soundness_e2e) | binary(fp_e2e)'
+```
+
+Expected: everything passes. That includes `min_max_words_match_reference` (unchanged assertions), `zero_tie_follows_choice_bit`, and the 3 `fp_soundness_e2e` tests. The exhaustive `#[ignore]`d suites stay ignored (AGENTS.md); don't un-ignore them.
+
+- [ ] **Step 5: Format, lint, commit**
+
+```bash
+cargo fmt --all && taskset -c 0-11 mise run lint
+git add crates/shinri-bv/src/blast/mod.rs crates/shinri-fp/src/lib.rs crates/shinri-fp/src/lower.rs crates/shinri-fp/src/blast/minmax.rs crates/shinri-solver/tests/fp_soundness_e2e.rs
+git commit -m "fix(fp): slice64 - fp.min/fp.max ±0 tie is a shared free choice"
+```
+
+---
+
+### Task 8: `fp.fma` zero addend never wins the magnitude election
+
+**Files:**
+- Modify: `crates/shinri-fp/src/blast/fma.rs`: the hi/lo election (~70–80), the zero-z comment (~48), tests
+- Modify: `crates/shinri-solver/tests/fp_soundness_e2e.rs` (append)
+
+**Interfaces:**
+- Consumes: `script_outcome` from Task 7; the `fma.rs` test helpers `const_bits`, `eval_word`, `rmode`, `rm::literal`, and `RoundMode`.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `mod tests` in `crates/shinri-fp/src/blast/fma.rs`:
+
+```rust
+    /// Amendment A (spec §3.5.2): x·y ≈ −2^-1576 underflows far below a zero
+    /// addend's normalized exponent (emin − pw). The exact result is a tiny
+    /// negative, so the IEEE result keeps the negative sign. Expected values
+    /// are literal IEEE results, not `ref_fma`.
+    /// Operands from QF_FP/wintersteiger/fma/fma-has-solution-4663.
+    #[test]
+    fn fma_zero_addend_loses_to_underflowed_product() {
+        let (eb, sb) = (11, 53);
+        let (x, y) = (0x0c35_20cc_566c_800fu64, 0x913c_e340_a93e_e431u64);
+        let neg_zero = 0x8000_0000_0000_0000u64;
+        let neg_min_sub = 0x8000_0000_0000_0001u64;
+        for (z, m, want) in [
+            (0u64, RoundMode::Rtz, neg_zero),
+            (neg_zero, RoundMode::Rtz, neg_zero),
+            (0, RoundMode::Rne, neg_zero),
+            (0, RoundMode::Rna, neg_zero),
+            (0, RoundMode::Rtp, neg_zero),
+            (0, RoundMode::Rtn, neg_min_sub),
+        ] {
+            let mut bl = Blaster::new();
+            let xv = const_bits(&bl, eb, sb, x);
+            let yv = const_bits(&bl, eb, sb, y);
+            let zv = const_bits(&bl, eb, sb, z);
+            let sel = rm::literal(&bl, rmode(m));
+            let word = fp_fma(&mut bl, &xv, &yv, &zv, &sel, eb, sb);
+            assert_eq!(
+                eval_word(bl, &word),
+                want,
+                "fp.fma z={z:#x} m={m:?}"
+            );
+        }
+    }
+```
+
+Append to `crates/shinri-solver/tests/fp_soundness_e2e.rs`:
+
+```rust
+const FMA_4663: &str = "(set-logic QF_FP)(define-sort FPN () (_ FloatingPoint 11 53))\
+    (declare-fun x () FPN)(declare-fun y () FPN)(declare-fun z () FPN)(declare-fun r () FPN)\
+    (assert (= x (fp #b0 #b00011000011 #b0101001000001100110001010110011011001000000000001111)))\
+    (assert (= y (fp #b1 #b00100010011 #b1100111000110100000010101001001111101110010000110001)))\
+    (assert (= z (fp #b0 #b00000000000 #b0000000000000000000000000000000000000000000000000000)))\
+    (assert (= r (fp #b1 #b00000000000 #b0000000000000000000000000000000000000000000000000000)))";
+
+/// QF_FP/wintersteiger/fma/fma-has-solution-4663 (`:status sat`).
+#[test]
+fn slice64a_fma_has_solution_4663() {
+    let src = format!("{FMA_4663}(assert (= (fp.fma roundTowardZero x y z) r))(check-sat)");
+    assert_eq!(script_outcome(&src), SolveOutcome::Sat);
+}
+
+/// QF_FP/wintersteiger/fma/fma-has-no-other-solution-4663 (`:status unsat`).
+#[test]
+fn slice64a_fma_has_no_other_solution_4663() {
+    let src = format!("{FMA_4663}(assert (not (= (fp.fma roundTowardZero x y z) r)))(check-sat)");
+    assert_eq!(script_outcome(&src), SolveOutcome::Unsat);
+}
+```
+
+Before writing the e2e constant, confirm the `no-other-solution` file's assertion shape with `grep -v '^;' /workspace/bench/corpus/QF_FP/wintersteiger/fma/fma-has-no-other-solution-4663.smt2`. If it differs from `(not (= (fp.fma …) r))`, mirror the file exactly.
+
+- [ ] **Step 2: Run them and verify they fail**
+
+```bash
+cd /workspace/.claude/worktrees/slice64
+taskset -c 0-11 cargo nextest run -p shinri-fp -E 'test(fma_zero_addend_loses_to_underflowed_product)'
+taskset -c 0-11 cargo nextest run -p shinri-solver -E 'binary(fp_soundness_e2e) & test(fma)'
+```
+
+Expected: the unit test FAILS on the first case, getting `0x0` where `0x8000000000000000` was expected. Both e2e tests FAIL (`unsat` and `sat`, respectively). If the unit test fails differently, or passes, **stop**: the spec §3.5.2 hypothesis is wrong. Record the evidence in the report, find the actual cause, and fix that instead (spec §3.5.2 allows this).
+
+- [ ] **Step 3: Implement**
+
+In `fma.rs`, replace
+
+```rust
+    let tie = b.and2(exp_eq, sig_ge);
+    let p_ge_z = b.or2(exp_gt, tie);
+```
+
+with
+
+```rust
+    let tie = b.and2(exp_eq, sig_ge);
+    // Amendment A: a zero addend's normalized exponent (emin − pw) is not low
+    // enough to lose to a product that underflows further, so a zero z must
+    // never be elected over a nonzero product (else res_sign takes z's sign).
+    let z_zero_p_nonzero = {
+        let p_nonzero = b.not1(prod_zero);
+        b.and2(oz.is_zero, p_nonzero)
+    };
+    let p_ge_z = {
+        let g = b.or2(exp_gt, tie);
+        b.or2(g, z_zero_p_nonzero)
+    };
+```
+
+Then correct the stale comment line `// For zero z: lzc=pw, z_sig_norm=0, z_exp goes very negative (product wins tie).` to read `// For zero z: lzc=pw, z_sig_norm=0, z_exp = emin − pw; the election below forces the product to win (amendment A).`.
+
+- [ ] **Step 4: Run the tests and the fma suites**
+
+```bash
+taskset -c 0-11 cargo nextest run -p shinri-fp -E 'not test(_tiny_exhaustive_all_modes)'
+taskset -c 0-11 cargo nextest run -p shinri-solver -E 'binary(fp_soundness_e2e) | binary(fp_e2e)'
+```
+
+Expected: everything passes. That includes `fp_fma_tiny_sampled_all_modes` (sampled against `ref_fma`), the new unit test, and all 5 `fp_soundness_e2e` tests.
+
+- [ ] **Step 5: Format, lint, commit**
+
+```bash
+cargo fmt --all && taskset -c 0-11 mise run lint
+git add crates/shinri-fp/src/blast/fma.rs crates/shinri-solver/tests/fp_soundness_e2e.rs
+git commit -m "fix(fp): slice64 - fma zero addend never out-elects an underflowed product"
+```
+
+---
+
+### Task 9: Gates again; fp-ops re-run; combined QF_FP set
+
+**Files:** none in the repo. Artifacts go under `/workspace/target/slice64-fpfix/` and `/workspace/target/slice64-fp-ops-corpus/`.
+
+**Interfaces:**
+- Consumes: branch HEAD after Tasks 7–8; the finished pre-fix after runs (`/workspace/target/slice64-after/finished.txt`); `bench/results/slice64-{base-fp,fp}`.
+- Produces: `bench/results/slice64-fp-ops` (the post-fix re-run); `bench/results/slice64-fp-combined/results.jsonl`, which is `slice64-fp` with the fp-ops rows replaced. Task 6 Step 4 onward uses `slice64-fp-combined` in place of `slice64-fp`.
+
+- [ ] **Step 1: Re-run the gates on the fixed branch**
+
+Run Task 6 Step 1's three commands again (ci, the oracle suite, fuzz 600 s). Expected: `ci` exit 0, and the oracle count equal to base 859 + 5 + 5 (the e2e binary `fp_soundness_e2e` adds 5 tests that are not feature-gated). For fuzz, also record a rerun with `ASAN_OPTIONS=detect_leaks=0` if LeakSanitizer fails at exit again, as in the pre-fix gates. Append the results to `/workspace/target/slice64-gates.txt`.
+
+- [ ] **Step 2: Build the fp-ops corpus**
+
+```bash
+cd /workspace && python3 - <<'EOF'
+import os, pathlib, re
+corpus = pathlib.Path("bench/corpus")
+ps = sorted(str(p.relative_to(corpus)) for p in (corpus / "QF_FP").rglob("*.smt2")
+            if re.search(r"fp\.(min|max|fma)\b", p.read_text(errors="replace")))
+out = pathlib.Path("target/slice64-fp-ops-corpus")
+for rel in ps:
+    dst = out / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if not dst.exists():
+        os.link(corpus / rel, dst)
+pathlib.Path("target/slice64-fp-ops.txt").write_text("\n".join(ps) + "\n")
+print(len(ps))
+EOF
+```
+
+Expected: `8570`, matching the spec §8 count. A different number is recorded in the report; it doesn't stop the run.
+
+- [ ] **Step 3: Wait for the pre-fix after runs, then launch the fp-ops re-run**
+
+Wait (with a background until-loop) for `/workspace/target/slice64-after/finished.txt`. Then:
+
+```bash
+cd /workspace/.claude/worktrees/slice64
+taskset -c 0-11 cargo build --release -p shinri-cli -p shinri-bench
+F=/workspace/target/slice64-fpfix && mkdir -p $F
+cp target/release/shinri target/release/shinri-bench $F/
+md5sum $F/shinri | tee $F/md5.txt; git rev-parse --short HEAD | tee $F/commit.txt
+for p in QF_FP/wintersteiger/fma/fma-has-no-other-solution-4663.smt2 QF_FP/wintersteiger/fma/fma-has-solution-4663.smt2 QF_FP/wintersteiger/min/min-has-solution-13472.smt2; do
+  echo "$p $($F/shinri /workspace/bench/corpus/$p | grep -E '^(sat|unsat|unknown)$')"; done
+uptime | tee $F/uptime-start.txt
+cd /workspace && setsid nohup sh -c "
+  taskset -c 12-23 $F/shinri-bench run --logics QF_FP --corpus /workspace/target/slice64-fp-ops-corpus --results /workspace/bench/results \
+    --timeout 20 --mem-mb 3072 --jobs 3 --solver $F/shinri --run-id slice64-fp-ops > $F/run-fp-ops.log 2>&1;
+  date -u +%FT%TZ > $F/finished.txt" > /dev/null 2>&1 &
+```
+
+Expected: the three corpus rows print `unsat`, `sat` and `sat`, matching their `:status`. Wait for `$F/finished.txt`.
+
+- [ ] **Step 4: Build the combined QF_FP result**
+
+```bash
+cd /workspace && python3 - <<'EOF'
+import json, pathlib
+lines = open("bench/results/slice64-fp/results.jsonl").read().splitlines()
+fixture, rows = lines[0], [json.loads(l) for l in lines[1:] if l.strip()]
+ops = {r["path"]: r for r in map(json.loads, open("bench/results/slice64-fp-ops/results.jsonl")) if "path" in r}
+assert set(ops) <= {r["path"] for r in rows}, "fp-ops rows must be a subset of slice64-fp"
+out = pathlib.Path("bench/results/slice64-fp-combined"); out.mkdir(exist_ok=True)
+with open(out / "results.jsonl", "w") as f:
+    f.write(fixture + "\n")
+    for r in rows:
+        f.write(json.dumps(ops.get(r["path"], r)) + "\n")
+print("replaced", len(ops), "of", len(rows), "; wrong in combined:",
+      sum((ops.get(r["path"], r))["verdict"] == "wrong" for r in rows))
+EOF
+```
+
+Expected: `replaced 8570 of 40407 ; wrong in combined: 0`. Any `wrong` stops the slice for a ruling under spec §3.5: fix it, or fence it to `unknown` with a stated cause.
+
+- [ ] **Step 5: Resume Task 6 at Step 4**
+
+Run Task 6 Steps 4–9 with `slice64-fp-combined` in place of `slice64-fp` in the join's `(base, after)` pairs. Task 6 Step 6's re-runs use the `$F` (post-fix) binary as "after" for rows in the fp-ops set. The report adds:
+- a § *FP soundness (amendment A)* with the three rows, the two root causes, the tie-bit design and the fp-ops re-run (moves, counts, wrong = 0);
+- the gates from both rounds;
+- a row in *What changed versus the spec* for amendment A.
