@@ -3505,6 +3505,19 @@ mod tests {
         assert_eq!(len_bounds(&inter(vec![lit_test("a"), lit_test("b")])), None);
     }
 
+    /// `a*b ∩ a*c` is empty but does NOT fold to `Empty` at construction
+    /// (unlike `a ∩ b`), so `None` must come from the walk itself.
+    #[test]
+    fn len_bounds_non_folding_empty_intersection_is_none() {
+        let a_star = star_lit_test("a");
+        let r = inter(vec![
+            concat(vec![a_star.clone(), lit_test("b")]),
+            concat(vec![a_star, lit_test("c")]),
+        ]);
+        assert_ne!(r, Rex::Empty, "the intersection must not fold");
+        assert_eq!(len_bounds(&r), None);
+    }
+
     #[test]
     fn len_bounds_empty_root_is_none() {
         assert_eq!(len_bounds(&Rex::Empty), None);

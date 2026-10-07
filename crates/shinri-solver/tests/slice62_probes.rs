@@ -161,3 +161,57 @@ fn uf_len_backstop_sat_sibling() {
         "the only even length ≤ 3 with f ≠ 0 is 2: {vals}"
     );
 }
+
+// Final review (Critical): the group lemma's bound atom can PRE-EXIST as a
+// SAT var — here as an input atom — already false at final check, so the
+// lemma `¬m₁ ∨ ¬m₂ ∨ bound` is born all-false. Pre-fix the multi-guard
+// install never noticed it (`unknown`); z3 answers `unsat` on all four.
+
+/// The R4 pin (`script_e2e::in_re_unfold_unsat_disjoint_stars`) with
+/// `(>= (str.len x) 1)` spelled as the negated bound atom itself.
+const R4_SIBLING: &str = r#"(set-logic QF_S)(declare-fun x () String)
+(assert (str.in_re x (re.* (str.to_re "a"))))
+(assert (str.in_re x (re.* (str.to_re "b"))))
+(assert (not (<= (str.len x) 0)))
+"#;
+
+/// `a*b ∩ ab* = {ab}`: upper bound atom `(<= (str.len x) 2)` asserted false.
+const AB_NOT_LE2: &str = r#"(set-logic QF_SLIA)(declare-fun x () String)
+(assert (str.in_re x (re.++ (re.* (str.to_re "a")) (str.to_re "b"))))
+(assert (str.in_re x (re.++ (str.to_re "a") (re.* (str.to_re "b")))))
+(assert (not (<= (str.len x) 2)))
+"#;
+
+/// Same group, lower bound atom `(>= (str.len x) 2)` asserted false.
+const AB_NOT_GE2: &str = r#"(set-logic QF_SLIA)(declare-fun x () String)
+(assert (str.in_re x (re.++ (re.* (str.to_re "a")) (str.to_re "b"))))
+(assert (str.in_re x (re.++ (str.to_re "a") (re.* (str.to_re "b")))))
+(assert (not (>= (str.len x) 2)))
+"#;
+
+/// `a*(b|cc) ∩ [b-c]* = {b, cc}`: upper bound atom asserted false.
+const BCC_NOT_LE2: &str = r#"(set-logic QF_S)(declare-fun x () String)
+(assert (str.in_re x (re.++ (re.* (str.to_re "a")) (re.union (str.to_re "b") (str.to_re "cc")))))
+(assert (str.in_re x (re.* (re.range "b" "c"))))
+(assert (not (<= (str.len x) 2)))
+"#;
+
+#[test]
+fn r4_sibling_negated_bound_atom_unsat() {
+    assert_eq!(verdict(R4_SIBLING), "unsat");
+}
+
+#[test]
+fn group_bound_atom_false_upper_unsat() {
+    assert_eq!(verdict(AB_NOT_LE2), "unsat");
+}
+
+#[test]
+fn group_bound_atom_false_lower_unsat() {
+    assert_eq!(verdict(AB_NOT_GE2), "unsat");
+}
+
+#[test]
+fn group_bound_atom_false_union_leaf_unsat() {
+    assert_eq!(verdict(BCC_NOT_LE2), "unsat");
+}

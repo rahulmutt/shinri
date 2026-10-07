@@ -276,3 +276,55 @@ fn len_bounds_generated_agree_with_z3() {
         "generator must reach sat: {sat} sat, {unsat} unsat"
     );
 }
+
+/// Final review (Important 1): constraints over the group lemma's own bound
+/// atoms. Appended to a `gen` script: per leaf, a negated bound atom
+/// (`(not (<= (str.len n) k))` / `(not (>= (str.len n) k))`) — an INPUT atom
+/// equal to a bound atom, false at final check — or a disjunction over bound
+/// atoms / memberships, so the search branches and the same bound is
+/// re-emitted under a second guard set while it is false.
+fn gen_bound_atoms(rng: &mut Lcg, body: &mut String, strs: &[&str]) {
+    body.push_str("(declare-fun p () Bool)\n");
+    for n in strs {
+        let len = format!("(str.len {n})");
+        let (k1, k2) = (rng.below(5), rng.below(5));
+        let re = REGEXES[rng.below(REGEXES.len() as u64) as usize];
+        match rng.below(6) {
+            0 => body.push_str(&format!("(assert (not (<= {len} {k1})))\n")),
+            1 => body.push_str(&format!("(assert (not (>= {len} {k1})))\n")),
+            2 => body.push_str(&format!(
+                "(assert (or (not (<= {len} {k1})) (not (>= {len} {k2}))))\n"
+            )),
+            3 => body.push_str(&format!(
+                "(assert (or (str.in_re {n} {re}) (not (<= {len} {k1}))))\n"
+            )),
+            4 => body.push_str(&format!(
+                "(assert (or p (not (>= {len} {k1}))))\n(assert (or (not p) (not (<= {len} {k2}))))\n"
+            )),
+            _ => {}
+        }
+    }
+}
+
+#[test]
+fn len_bounds_bound_atoms_agree_with_z3() {
+    let mut rng = Lcg(6262);
+    let (mut sat, mut unsat, mut z3_timeouts, mut bounded) = (0usize, 0usize, 0usize, 0usize);
+    for _ in 0..N_ITERS {
+        let (mut body, strs, with_v) = gen(&mut rng);
+        gen_bound_atoms(&mut rng, &mut body, &strs);
+        match check(&body, &strs, with_v, 3, &mut z3_timeouts, &mut bounded) {
+            SolveOutcome::Sat => sat += 1,
+            SolveOutcome::Unsat => unsat += 1,
+            _ => {}
+        }
+    }
+    eprintln!(
+        "len_bounds_oracle (bound atoms): {sat} sat, {unsat} unsat, {} unknown, {z3_timeouts} z3 unknown/timeouts, {bounded} bounded-confirmed unsat",
+        N_ITERS - sat - unsat
+    );
+    assert!(
+        sat > 0 && unsat > 0,
+        "generator must reach both verdicts: {sat} sat, {unsat} unsat"
+    );
+}
