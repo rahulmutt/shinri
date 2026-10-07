@@ -103,7 +103,8 @@ In `parse_term`, an application whose head symbol is `!` parses the
 inner term `t`, then zero or more attributes until `)`:
 
 - `:named n`: `n` must be a symbol. If `n` is already bound as a
-  function, macro or sort-free symbol in scope, the parse fails with
+  declared function or constant, a macro (`define-fun` or an earlier
+  `:named`), or a let-bound name in scope, the parse fails with
   `named term: name already in use: n`, per SMT-LIB 2.6 §3.6.5. Otherwise
   `env.add_macro(n, vec![], t)` binds it, so later uses of `n` resolve to
   `t`. That is the same mechanism a nullary `define-fun` uses.
