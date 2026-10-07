@@ -887,11 +887,28 @@ pub(crate) fn language_empty(r: &Rex) -> Emptiness {
 /// finite maximum (spec §4.3).
 pub(crate) const LEN_BOUND_DEPTH_CAP: u32 = 64;
 
+/// Slice-62 deviation (perf fix, not in spec §4.3): a separate, tighter
+/// budget on the walk's total derivative work, counted as the summed
+/// `node_count` of every derivative it computes. `MEMB_SEARCH_STEP_CAP`
+/// alone bounds the number of expanded states, not their cost: on
+/// automatark-sized regexes (~500-1000 nodes, dozens of classes) one state
+/// costs ~5 ms, so a walk that runs to the step cap took 25-50 s, inside a
+/// single `memb_check` round (automatark-lu instance00134: 7 ms -> timeout).
+/// A sweep of 2.5k QF_S/QF_SLIA rows found every finite-max result within
+/// ~5.2k work; the costly walks were infinite languages walked to the depth
+/// cap for a max of `None`. Past this budget the walk stops: with `min`
+/// found it returns `(min, None)` exactly as at the depth cap (`min` is the
+/// first nullable layer, every shorter layer fully explored), else `None`
+/// ("no lemma"). ~10k node-units is a few ms.
+pub(crate) const LEN_BOUND_WORK_CAP: usize = 10_000;
+
 /// Exact length bounds of `L(r)`: `Some((min, max))`, where `min` is the
 /// shortest word length and `max` the longest (`None` when the language is
 /// infinite or no finite bound was reached within `LEN_BOUND_DEPTH_CAP`).
 /// `None` overall when `L(r)` is empty (slice 28 owns that case) or on any
 /// taint (class-split cap, node cap, step cap) — "no lemma", never a verdict.
+/// Exhausting `LEN_BOUND_WORK_CAP` acts like the depth cap once `min` is
+/// known (`(min, None)`) and like a taint before (`None`).
 ///
 /// Layered walk: layer `d` is the set of distinct derivative states reached
 /// by words of length exactly `d`. States are deduplicated WITHIN a layer
@@ -901,7 +918,13 @@ pub(crate) const LEN_BOUND_DEPTH_CAP: u32 = 64;
 /// ones included (its `lo` represents the class), so `min` is a sound lower
 /// bound — `search_shortest` skips surrogate classes and is not.
 pub(crate) fn len_bounds(r: &Rex) -> Option<(u32, Option<u32>)> {
+    len_bounds_budgeted(r, LEN_BOUND_WORK_CAP)
+}
+
+/// `len_bounds` with an explicit derivative-work budget (`work_cap`).
+fn len_bounds_budgeted(r: &Rex, work_cap: usize) -> Option<(u32, Option<u32>)> {
     let mut steps = 0usize;
+    let mut work = 0usize;
     let mut layer: Vec<Rex> = vec![r.clone()];
     let mut min: Option<u32> = None;
     let mut last: Option<u32> = None;
@@ -928,8 +951,14 @@ pub(crate) fn len_bounds(r: &Rex) -> Option<(u32, Option<u32>)> {
             let classes = next_classes(state)?;
             for (lo, _hi) in classes {
                 let dd = deriv(lo, state);
-                if node_count(&dd) > FUEL_NODE_CAP {
+                let n = node_count(&dd);
+                if n > FUEL_NODE_CAP {
                     return None;
+                }
+                work += n;
+                if work > work_cap {
+                    // Slice-62 deviation: see LEN_BOUND_WORK_CAP.
+                    return min.map(|m| (m, None));
                 }
                 if !matches!(dd, Rex::Empty) && seen.insert(dd.clone()) {
                     next.push(dd);
@@ -3398,5 +3427,33 @@ mod tests {
         let long = "a".repeat(LEN_BOUND_DEPTH_CAP as usize + 6);
         let r = union(vec![lit_test("a"), lit_test(&long)]);
         assert_eq!(len_bounds(&r), Some((1, None)));
+    }
+
+    /// 26 two-letter words with distinct heads (`aA|bB|...`): 27 classes
+    /// per state, so each layer costs thousands of node-units.
+    fn wide_pairs() -> Rex {
+        union(
+            ('a'..='z')
+                .map(|c| lit_test(&format!("{c}{}", c.to_ascii_uppercase())))
+                .collect(),
+        )
+    }
+
+    /// Slice-62 perf fix: a wide-alphabet finite language whose walk costs
+    /// more than `LEN_BOUND_WORK_CAP` keeps its exact `min` and drops only
+    /// the max (like the depth cap); with no budget the max is exact.
+    #[test]
+    fn len_bounds_work_cap_drops_max_only() {
+        let r = union(vec![lit_test("0"), loop_(wide_pairs(), 20, 20)]);
+        assert_eq!(len_bounds_budgeted(&r, usize::MAX), Some((1, Some(40))));
+        assert_eq!(len_bounds(&r), Some((1, None)));
+    }
+
+    /// ... and before any nullable layer is reached the budget is a taint.
+    #[test]
+    fn len_bounds_work_cap_before_min_is_none() {
+        let r = loop_(wide_pairs(), 20, 20);
+        assert_eq!(len_bounds_budgeted(&r, usize::MAX), Some((40, Some(40))));
+        assert_eq!(len_bounds(&r), None);
     }
 }
