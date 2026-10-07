@@ -353,3 +353,100 @@ and 6–9 and its deferred minors, re-ranked on the new counts, and adds
     `crates/shinri-theory/src/combiner.rs` `FinalCheck`;
     `crates/shinri-sat/src/types.rs` `TheoryResult`;
     `crates/shinri-sat/src/solver.rs` `SplitAtoms` arm
+
+## 11. Measured outcomes
+
+Report: `docs/superpowers/research/2026-10-07-smtlib-2024-slice62-length-consistent-seeds-report.md`
+(verdict runs at `1261bc9`, 2026-10-07; base: slice 61's runs at `f9fa4f9`;
+PR head `fd445aa`, a behaviour-neutral perf fix that was timed and
+oracle-tested but not re-benched, see R13 below).
+
+167 rows moved to `correct`, all QF_SLIA and all z3-confirmed: 165 `unsat`
+and 2 `sat` (Norn `ab` 135, 138). Every one of them is attributed to the
+§4.4 bound lemma. The §1.1 item-5 reproducer and the §4.2 UF case go from
+a wrong `sat` to `unknown`.
+
+| # | criterion | result |
+| --- | --- | --- |
+| 1 | 0 `* → wrong`; 0 wrong in triage | **PASS**: 0 `wrong` rows in both after runs; 0 wrong answers in 546 triage runs; the one new `unverified` `unsat` (denghang `instance46328`) is confirmed by z3 `-T:120` and cvc5 |
+| 2 | Norn `ab` 135/138 `correct` with valid models | **PASS**: both `sat` with `v = 2`, `var_0`/`var_4 = "ab"`; z3 accepts the pinned models |
+| 3 | reproducible `correct → non-correct` only with invalid base models | **PASS**: none reproduce (39 oracle-churn `correct → unverified`, 10 sample timeouts; all noise 3/3) |
+| 4 | timing within ±5% | **PASS per R12.** At `1261bc9` it was a FAIL (pooled QF_S 1.060, QF_SLIA 1.094). After `fd445aa`: 6 passes pooled QF_S 1.037 / QF_SLIA 1.036; set 1 (R10 three-pass, load 21–26) 1.076 / 1.033; set 2 (load 13–15) 0.996 / 1.040; CPU min-of-5 per row QF_S 1.014 / 1.028, QF_SLIA 0.996 / 0.990; A/A base-vs-base swing 0.92–1.08. Set 1 alone fails QF_S by the letter and is accepted under R12 (noise floor, controlled measurements) |
+| 5 | ci green; oracle ≥ 841 + this slice's | **PASS**: ci 1838/1838 (6 skipped) at `fd445aa` (1836 at `1261bc9`, 1834 at `01e3fa8`); oracle 854/854 (2 skipped) at `fd445aa` |
+| 6 | neutrality sample: timing flips only | **PASS**: 15 changes, all at the 20 s / 3 GB edge, noise 3/3 |
+| 7 | backstop and bound-lemma counts (report-only) | bound lemma on 167/167 gains and 1/400 random string rows. The seed backstop moved 0 verdicts (4/400 rows fire it, none changed). Unvalued fold and `uf-stale` fired on 0 changed rows and 0/400 |
+
+Key timing numbers (after `fd445aa`, `target/slice62-after/timing-perf2.txt`):
+pooled over 6 passes (150 rows per string logic, core 12, interleaved)
+QF_S 1.037 and QF_SLIA 1.036; per-row min-of-5 by CPU time 1.014 / 1.028
+(QF_S) and 0.996 / 0.990 (QF_SLIA), against 1.097 / 1.112 at `1261bc9`.
+Set 1 alone (the R10 three-pass set) is QF_S 1.076; the A/A control swings
+0.92–1.08 on identical binaries.
+
+### Deviations from this spec
+
+- **R2 (§4.5):** `emit_split` keeps its signature and wraps a new
+  `memb::emit_split_guards(s, terms, atoms, guards)`. Behaviour is
+  identical.
+- **R3 (§4.4 step 4, plan conflict):** `lo₀`/`hi₀` are computed over
+  positive atoms only, as this spec states; the plan's code used all
+  members.
+- **R4 (§7.4 "unchanged suites"):**
+  `script_e2e::in_re_unfold_unsat_disjoint_stars` (slice-21 KNOWN GAP,
+  pinned `unknown`) now answers `unsat`. Its pin was updated. The
+  multi-guard lemma closes exactly this gap.
+- **R5 (§4.1, §7.4):** two slice-57 probes
+  (`strict_gate_keeps_unevaluable_unknown`,
+  `rf2_strict_flag_does_not_leak_across_checks`) lost their "unevaluable"
+  premise to §4.1. The old script is kept as a renamed `sat` pin. Both
+  tests get a new assertion that the gate cannot evaluate.
+- **Task 5 fix round (§4.2):** the strict flag alone did not reject the
+  §4.2 UF case, because the gate read `f(len x)` at the stale arith
+  argument. `eval_num_val` now treats a UF application as unevaluable when
+  an argument's numeric model value differs from its evaluated value
+  (`uf_args_stale`). That is a solver-gate rule beyond §4.1–4.2.
+- **R7 (§7.3):** on (shinri `unsat`, z3 unknown) the oracle re-asks z3 with
+  every string leaf bounded `len ≤ 12` (and `v ≤ 12`). Bounded `unsat`
+  counts as confirmed; bounded `sat` or unknown fails. Neither z3 nor cvc5
+  decides `z ∈ (ab)* ∧ z ∉ [a-u]*`.
+- **R9 (§4.3):** `len_bounds` has a new budget, `LEN_BOUND_WORK_CAP` =
+  10,000 derivative node-units, beside the unchanged caps. When it runs
+  out, the walk returns `(min, None)` if a nullable layer was reached, and
+  `None` otherwise. It was added after the first after run (`01e3fa8`)
+  hit 238 timeouts. That run was abandoned at 89,050 rows and redone at
+  `1261bc9`.
+- **R10 (§8 criterion 4 procedure):** the timing load gate (≤ 24) waits at
+  most 30 min, with a three-pass pooled fallback. In the event, load was
+  21.67, so pass 1 ran gated. Passes 2 and 3 follow the out-of-band
+  pooling rule.
+- **R11 / second perf fix (§4.3, implementation only):** after criterion 4
+  failed at `1261bc9`, one behaviour-neutral perf round produced `fd445aa`
+  (`regex.rs` only). Root cause: a lone `Vec<Rex>::retain` in the
+  `len_bounds` walk perturbed `Rex` drop-glue codegen crate-wide (about
+  +11% even with `bound_split` returning early), plus a QF_S re-derivation
+  of the same walk states at every depth. The walk now **interns its
+  states** (each state's `nullable`, `next_classes` and per-class
+  `(node_count, child)` are computed once and replayed with the same cap
+  checks in the same order) and drops the `retain` (`Empty` never enters a
+  layer). No cap, constant or lemma changed; §4.3's `len_bounds` results
+  are identical, including where a cap trips (unit test
+  `len_bounds_memo_matches_plain_walk`: 405 regexes × 7 work caps against
+  the old walk; final-check traces identical on 946 bench rows). The fix
+  partly rests on a codegen artifact, so the report queues a build-profile
+  change (`codegen-units = 1` or LTO) as item 1.
+- **R12 (§8 criterion 4 verdict):** criterion 4 is accepted as PASS on the
+  6-pass pool (QF_S 1.037, QF_SLIA 1.036) backed by CPU min-of-5 (≤ 1.028).
+  By the R10 three-pass letter, set 1 alone fails QF_S at 1.076; this is
+  disclosed beside the A/A base-vs-base swing (0.92–1.08), which shows it is
+  noise. Cost if wrong: a real ~+4–7% QF_S slowdown ships.
+- **R13 (§8 measurement basis):** the after runs were at `1261bc9`, and no
+  third full bench was run at the PR head `fd445aa`. `fd445aa` is verified
+  behaviour-neutral (above), and the full oracle suite was re-run at
+  `fd445aa` instead. Cost if wrong: a verdict change at `fd445aa` outside
+  the traced rows goes unmeasured (about 3 h of bench to close).
+- **`memb_seeds` is `#[cfg(test)]` (§4.2):** its only production caller,
+  `model_with`, uses `memb_seeds_flagged`. The wrapper is kept for tests
+  only.
+- The §4.5 watch-order rule (atoms first, then guards by descending level,
+  for ≥ 2 guards) was already in this spec (added during planning). It is
+  pinned by `two_guard_split_detects_violation`.
