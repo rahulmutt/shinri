@@ -1646,8 +1646,10 @@ impl Solver {
     /// the argument's evaluated value under the final model (slice 62): a
     /// seed that changed a leaf's length leaves `f(len x)` valued at the old
     /// length, so that value says nothing about `f` at the new one and the
-    /// application is unevaluable. Arguments without a numeric model value
-    /// are left as before.
+    /// application is unevaluable. Only a DEFINITE disagreement counts: an
+    /// argument without a numeric model value, or whose re-evaluation is
+    /// itself `None`, is left as before (treating "unknown" as stale would
+    /// turn a definite `Some(false)` into a skip under the non-strict gate).
     fn uf_args_stale(&self, model: &Model, t: TermId) -> bool {
         use shinri_core::{Op, TermNode};
         use shinri_theory::types::ModelVal;
@@ -1663,7 +1665,7 @@ impl Solver {
             .children(*args)
             .iter()
             .any(|&k| match model.values.get(&k) {
-                Some(ModelVal::Num(r)) => self.eval_num_val(model, k).as_ref() != Some(r),
+                Some(ModelVal::Num(r)) => self.eval_num_val(model, k).is_some_and(|v| &v != r),
                 _ => false,
             })
     }
