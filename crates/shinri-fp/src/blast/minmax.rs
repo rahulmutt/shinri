@@ -1,4 +1,4 @@
-//! fp.min / fp.max: NaN-passthrough selectors with a sign-canonical ±0 rule.
+//! fp.min / fp.max: NaN-passthrough selectors with a ±0 tie resolved by a shared choice bit (amendment A).
 
 use crate::blast::compare::fp_lt;
 use crate::unpack::unpack;
@@ -18,9 +18,36 @@ fn zero_word(b: &Blaster, eb: u32, sb: u32, neg: bool) -> Vec<BitLit> {
         .collect()
 }
 
+/// The ±0 tie result: `+0` when the order's choice bit is true, else `−0`.
+/// `x_sign` selects the order: `x = +0` uses `tie_pn`, `x = −0` uses `tie_np`.
+/// SMT-LIB leaves the tie unspecified; the bits are shared per format and
+/// order by the caller, so the operator stays a function (amendment A).
+fn tie_word(
+    b: &mut Blaster,
+    x_sign: BitLit,
+    tie_pn: BitLit,
+    tie_np: BitLit,
+    eb: u32,
+    sb: u32,
+) -> Vec<BitLit> {
+    let choose_pos = b.mux2(x_sign, tie_np, tie_pn);
+    let mut w = zero_word(b, eb, sb, false);
+    let last = w.len() - 1;
+    w[last] = b.not1(choose_pos);
+    w
+}
+
 /// `fp.min`: `minNum` semantics. NaN passes through to the other operand;
-/// the (+0,-0) tie resolves to -0 (sign-canonical, order-independent).
-pub fn fp_min(b: &mut Blaster, x: &[BitLit], y: &[BitLit], eb: u32, sb: u32) -> Vec<BitLit> {
+/// the (+0,-0) tie resolves to the shared choice bit for its argument order.
+pub fn fp_min(
+    b: &mut Blaster,
+    x: &[BitLit],
+    y: &[BitLit],
+    eb: u32,
+    sb: u32,
+    tie_pn: BitLit,
+    tie_np: BitLit,
+) -> Vec<BitLit> {
     let ux = unpack(b, x, eb, sb);
     let uy = unpack(b, y, eb, sb);
     let lt = fp_lt(b, x, y, eb, sb);
@@ -29,15 +56,23 @@ pub fn fp_min(b: &mut Blaster, x: &[BitLit], y: &[BitLit], eb: u32, sb: u32) -> 
     let opp = b.xor2(ux.sign, uy.sign);
     let both_zero = b.and2(ux.is_zero, uy.is_zero);
     let zero_tie = b.and2(both_zero, opp);
-    let neg_zero = zero_word(b, eb, sb, true);
-    let pick = mux_word(b, zero_tie, &neg_zero, &pick);
+    let tie = tie_word(b, ux.sign, tie_pn, tie_np, eb, sb);
+    let pick = mux_word(b, zero_tie, &tie, &pick);
 
     let r = mux_word(b, uy.is_nan, x, &pick); // y NaN -> x
     mux_word(b, ux.is_nan, y, &r) // x NaN -> y (outermost)
 }
 
-/// `fp.max`: symmetric to `fp_min`; the (+0,-0) tie resolves to +0.
-pub fn fp_max(b: &mut Blaster, x: &[BitLit], y: &[BitLit], eb: u32, sb: u32) -> Vec<BitLit> {
+/// `fp.max`: symmetric to `fp_min`; the (+0,-0) tie resolves to the shared choice bit.
+pub fn fp_max(
+    b: &mut Blaster,
+    x: &[BitLit],
+    y: &[BitLit],
+    eb: u32,
+    sb: u32,
+    tie_pn: BitLit,
+    tie_np: BitLit,
+) -> Vec<BitLit> {
     let ux = unpack(b, x, eb, sb);
     let uy = unpack(b, y, eb, sb);
     let lt = fp_lt(b, x, y, eb, sb);
@@ -46,8 +81,8 @@ pub fn fp_max(b: &mut Blaster, x: &[BitLit], y: &[BitLit], eb: u32, sb: u32) -> 
     let opp = b.xor2(ux.sign, uy.sign);
     let both_zero = b.and2(ux.is_zero, uy.is_zero);
     let zero_tie = b.and2(both_zero, opp);
-    let pos_zero = zero_word(b, eb, sb, false);
-    let pick = mux_word(b, zero_tie, &pos_zero, &pick);
+    let tie = tie_word(b, ux.sign, tie_pn, tie_np, eb, sb);
+    let pick = mux_word(b, zero_tie, &tie, &pick);
 
     let r = mux_word(b, uy.is_nan, x, &pick);
     mux_word(b, ux.is_nan, y, &r)
@@ -116,7 +151,10 @@ mod tests {
                 let mut b = Blaster::new();
                 let xb = const_bits(&b, eb, sb, x);
                 let yb = const_bits(&b, eb, sb, y);
-                let w = fp_min(&mut b, &xb, &yb, eb, sb);
+                let w = {
+                    let z = b.zero();
+                    fp_min(&mut b, &xb, &yb, eb, sb, z, z)
+                };
                 let got = eval_word(b, &w);
                 let want = ref_min(eb, sb, &Integer::from(x), &Integer::from(y))
                     .to_i128()
@@ -126,12 +164,49 @@ mod tests {
                 let mut b2 = Blaster::new();
                 let xb2 = const_bits(&b2, eb, sb, x);
                 let yb2 = const_bits(&b2, eb, sb, y);
-                let w2 = fp_max(&mut b2, &xb2, &yb2, eb, sb);
+                let w2 = {
+                    let o = b2.one();
+                    fp_max(&mut b2, &xb2, &yb2, eb, sb, o, o)
+                };
                 let got2 = eval_word(b2, &w2);
                 let want2 = ref_max(eb, sb, &Integer::from(x), &Integer::from(y))
                     .to_i128()
                     .unwrap() as u64;
                 assert_eq!(got2, want2, "fp.max({x:#x},{y:#x})");
+            }
+        }
+    }
+
+    /// Amendment A (spec §3.5.1): a ±0 tie returns the choice bit for its
+    /// argument order — true ⇒ +0, false ⇒ −0 — for both fp.min and fp.max.
+    #[test]
+    fn zero_tie_follows_choice_bit() {
+        let (eb, sb) = (8, 24);
+        let (pz, nz) = (0x0000_0000u64, 0x8000_0000u64);
+        for (x, y, is_pn) in [(pz, nz, true), (nz, pz, false)] {
+            for choose_pos in [false, true] {
+                for is_max in [false, true] {
+                    let mut b = Blaster::new();
+                    let xb = const_bits(&b, eb, sb, x);
+                    let yb = const_bits(&b, eb, sb, y);
+                    let (c, other) = if choose_pos {
+                        (b.one(), b.zero())
+                    } else {
+                        (b.zero(), b.one())
+                    };
+                    let (pn, np) = if is_pn { (c, other) } else { (other, c) };
+                    let w = if is_max {
+                        fp_max(&mut b, &xb, &yb, eb, sb, pn, np)
+                    } else {
+                        fp_min(&mut b, &xb, &yb, eb, sb, pn, np)
+                    };
+                    let want = if choose_pos { pz } else { nz };
+                    assert_eq!(
+                        eval_word(b, &w),
+                        want,
+                        "max={is_max} x={x:#x} y={y:#x} choose_pos={choose_pos}"
+                    );
+                }
             }
         }
     }

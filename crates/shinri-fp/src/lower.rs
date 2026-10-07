@@ -16,6 +16,8 @@ pub struct Lowerer {
     // roundToIntegral/fma/to_fp) that carry RM operands, so it must override
     // `rm_cache` with a real backing store rather than inherit the default.
     rm_cache: FxHashMap<TermId, [BitLit; 5]>,
+    /// Shared fp.min/fp.max ±0 tie bits (amendment A; see WordSink::fp_tie_bits).
+    tie_bits: FxHashMap<(bool, u32, u32, bool), BitLit>,
     // FP→BV application registry for unspecified-value congruence (slice 4e).
     fp2bv_apps: Vec<FpToBvApp>,
     // Uninterpreted-application registry for Ackermann congruence (slice 44).
@@ -30,6 +32,7 @@ impl Lowerer {
             b: Blaster::new(),
             cache: FxHashMap::default(),
             rm_cache: FxHashMap::default(),
+            tie_bits: FxHashMap::default(),
             fp2bv_apps: Vec::new(),
             uf_apps: Vec::new(),
         }
@@ -80,6 +83,9 @@ impl WordSink for Lowerer {
     }
     fn rm_cache(&mut self) -> &mut FxHashMap<TermId, [BitLit; 5]> {
         &mut self.rm_cache
+    }
+    fn fp_tie_bits(&mut self) -> &mut FxHashMap<(bool, u32, u32, bool), BitLit> {
+        &mut self.tie_bits
     }
     fn fp2bv_apps(&mut self) -> &mut Vec<FpToBvApp> {
         &mut self.fp2bv_apps
