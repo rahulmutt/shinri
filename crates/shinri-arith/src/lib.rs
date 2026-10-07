@@ -28,6 +28,9 @@ use shinri_num::{DeltaRational, Integer, Rational};
 use shinri_theory::types::EqLeaf;
 use shinri_theory::{Effort, Explainer, ModelBuilder, TCheck, TheoryCtx, TheorySolver};
 
+#[cfg(test)]
+mod linearity_lockstep_tests;
+
 /// SAT variables are dense from 0; the SAT solver never mints variables in the
 /// top half of the `u32` space. We reserve that region for the synthetic
 /// "sentinel" literals injected by Nelson-Oppen entailment probes so they can
@@ -205,12 +208,14 @@ fn is_compound_arith(ctx: &Context, t: TermId) -> bool {
 }
 
 /// Slice 50: `t` is linear all the way down: every `*` has at most one
-/// non-numeral factor, which is itself linear. This is exactly the input
+/// non-constant factor, which is itself linear. A factor is constant iff
+/// `Context::const_arith_value` folds it (slice 63; must agree with
+/// classify's `contains_nonlinear_mul`). This is exactly the input
 /// `normalize::linearize` accepts without its "nonlinear reached normalize"
 /// debug assertion. Opaque leaves are linear.
 fn is_linear_arith(ctx: &Context, t: TermId) -> bool {
     use shinri_core::TermNode;
-    if ctx.numeral_value(t).is_some() {
+    if ctx.const_arith_value(t).is_some() {
         return true;
     }
     match ctx.term_node(t) {
@@ -228,7 +233,7 @@ fn is_linear_arith(ctx: &Context, t: TermId) -> bool {
                 .children(*args)
                 .iter()
                 .copied()
-                .filter(|&k| ctx.numeral_value(k).is_none());
+                .filter(|&k| ctx.const_arith_value(k).is_none());
             match (nonconst.next(), nonconst.next()) {
                 (None, _) => true,
                 (Some(k), None) => is_linear_arith(ctx, k),

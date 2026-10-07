@@ -1015,12 +1015,17 @@ impl Context {
         }
     }
 
-    /// The exact `Rational` of a **constant** Real term — a numeral (literals and
-    /// parser-folded `(/ lit lit)` both intern as numerals) or a unary `(- c)` of a
-    /// constant Real — or `None` if `t` is symbolic (a Real variable, `(* recip x)`,
-    /// nested arithmetic). SHARED by the FP `to_fp` fence (shinri-solver) and folder
-    /// (shinri-fp) so they admit exactly the same set — a soundness invariant.
-    pub fn const_real_value(&self, t: TermId) -> Option<Rational> {
+    /// The exact `Rational` of a **constant** arithmetic term, Int or Real — a
+    /// numeral (literals and parser-folded `(/ lit lit)` both intern as
+    /// numerals) or a unary `(- c)` of a constant — or `None` if `t` is
+    /// symbolic (a variable, `(* recip x)`, nested arithmetic).
+    ///
+    /// SHARED admit set, a soundness invariant: every consumer must agree on
+    /// what a constant is. Consumers: the FP `to_fp` fence (shinri-solver
+    /// `fp_stage.rs`, via [`Context::const_real_value`]); classify's
+    /// `contains_nonlinear_mul` (shinri-theory `atom.rs`); `is_linear_arith`
+    /// and `normalize::linearize` (shinri-arith) — slice 63.
+    pub fn const_arith_value(&self, t: TermId) -> Option<Rational> {
         if let Some(r) = self.numeral_value(t) {
             return Some(r.clone());
         }
@@ -1032,11 +1037,17 @@ impl Context {
         {
             let kids = self.children(*args);
             if kids.len() == 1 {
-                let inner = self.const_real_value(kids[0])?;
+                let inner = self.const_arith_value(kids[0])?;
                 return Some(Rational::new(Integer::from(-1i64), Integer::one()) * inner);
             }
         }
         None
+    }
+
+    /// Alias of [`Context::const_arith_value`], kept for the FP fence's callers.
+    #[inline]
+    pub fn const_real_value(&self, t: TermId) -> Option<Rational> {
+        self.const_arith_value(t)
     }
 
     /// Intern a bitvector literal. `value` is reduced mod 2^width into `[0, 2^width)`.
@@ -2024,6 +2035,28 @@ mod tests {
             .mk_app(Op::Builtin(BuiltinOp::Mul), &[recip, rt])
             .unwrap();
         assert_eq!(ctx.const_real_value(prod), None);
+    }
+
+    #[test]
+    fn const_arith_value_folds_int_and_double_neg() {
+        use shinri_num::Rational;
+        let mut ctx = Context::new();
+        let int = ctx.int_sort();
+        let seven = ctx.mk_numeral(Rational::from_int(7i128.into()), int);
+        let neg = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[seven]).unwrap();
+        let negneg = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[neg]).unwrap();
+        assert_eq!(
+            ctx.const_arith_value(seven),
+            Some(Rational::from_int(7i128.into()))
+        );
+        assert_eq!(
+            ctx.const_arith_value(neg),
+            Some(Rational::from_int((-7i128).into()))
+        );
+        assert_eq!(
+            ctx.const_arith_value(negneg),
+            Some(Rational::from_int(7i128.into()))
+        );
     }
 
     // helper local to the test module

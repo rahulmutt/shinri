@@ -139,12 +139,14 @@ pub(crate) fn linearize(
                     (v.into_iter().map(|(x, q)| (x, -q)).collect(), -c)
                 }
                 Op::Builtin(BuiltinOp::Mul) => {
-                    // Linear: exactly one non-constant factor (classify rejected the rest).
+                    // Linear: exactly one non-constant factor (classify rejected
+                    // the rest). Constant factors — numerals and `(- c)` — fold
+                    // via `const_arith_value` (slice 63).
                     let mut coeff = Rational::one();
                     let mut nonconst: Option<TermId> = None;
                     for k in &kids {
-                        match terms.numeral_value(*k) {
-                            Some(r) => coeff = coeff * r.clone(),
+                        match terms.const_arith_value(*k) {
+                            Some(r) => coeff = coeff * r,
                             None => {
                                 debug_assert!(nonconst.is_none(), "nonlinear reached normalize");
                                 nonconst = Some(*k);
@@ -381,5 +383,33 @@ mod tests {
             ]
         );
         assert_eq!(n.rhs, Rational::zero());
+    }
+
+    /// Slice 63: `(- k)` factors fold into the coefficient, with their sign.
+    #[test]
+    fn linearize_folds_negated_numeral_coefficients() {
+        let mut ctx = Context::new();
+        let x = real_var(&mut ctx, "x");
+        let two = num(&mut ctx, 2);
+        let three = num(&mut ctx, 3);
+        let four = num(&mut ctx, 4);
+        let five = num(&mut ctx, 5);
+        let neg =
+            |ctx: &mut Context, t: TermId| ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[t]).unwrap();
+        let mul =
+            |ctx: &mut Context, a: &[TermId]| ctx.mk_app(Op::Builtin(BuiltinOp::Mul), a).unwrap();
+        let n3 = neg(&mut ctx, three);
+        let n4 = neg(&mut ctx, four);
+        let n5 = neg(&mut ctx, five);
+        let mut vs = VarStore::default();
+        let xv = vs.problem_var(x);
+        let q = |n: i128| Rational::from_int(n.into());
+
+        let t = mul(&mut ctx, &[n4, x]);
+        assert_eq!(linearize(&ctx, &mut vs, t), (vec![(xv, q(-4))], q(0)));
+        let t = mul(&mut ctx, &[x, n4, two]);
+        assert_eq!(linearize(&ctx, &mut vs, t), (vec![(xv, q(-8))], q(0)));
+        let t = mul(&mut ctx, &[n3, n5]);
+        assert_eq!(linearize(&ctx, &mut vs, t), (vec![], q(15)));
     }
 }
