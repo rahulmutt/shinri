@@ -50,15 +50,15 @@ QF_SLIA `2015-Norn` 17 correct, 18 other unknown.
 | # | Criterion | Result | Evidence |
 | --- | --- | --- | --- |
 | 1 | `wrong = 0` in every after run | **PASS** | `wrong after: 0` in all four joins |
-| 2 | `theory-refused` drops by ≥ 4,700 | **PASS** | 4,871 → 0 on the refused set (join prints 4,874 → 0; see Discrepancies); 0 still refused, so no classification is needed |
-| 3 | Each leaving row lands in `correct` / `unverified` (confirmed) / `timeout`/`oom` | **PASS** | 983 / 3,100 / 770 / 18 unknown; 0 `unverified`, so the ≥ 20-row confirmation sample is vacuous (nothing to confirm) |
+| 2 | `theory-refused` drops by ≥ 4,700 | **PASS** | 4,871 → 0 on the refused set (join prints 4,874 → 0; see What changed versus the spec, item 4); 0 still refused, so no classification is needed |
+| 3 | Each leaving row lands in `correct` / `unverified` (confirmed) / `timeout`/`oom` | **PASS with deviation** | 983 `correct` / 3,100 `timeout` / 770 `oom` fit. 18 QF_SLIA Norn rows (9 `unknown:sat-budget`, 9 `unknown:str-model-rejected`) land in `unknown`, outside the criterion's destination list. None is wrong; their cause is queued. 0 `unverified`, so the ≥ 20-row confirmation sample is vacuous |
 | 4 | No `correct → non-correct` row reproduces on 3 re-runs of both binaries | **PASS, with one explained timing-edge row** | 84 rows × 6 runs; 1 row reproduces: `QF_UF/QG-classification/qg5/gensys_brn095.smt2`. See Verdict changes |
 | 5 | `mise run ci` and the oracle suite green | **PASS** | ci 1857/1857 (6 skipped); oracle 866/866 vs base 859 |
-| 6 | Neutrality and QF_SLIA samples change only at the timeout edge, 3/3 as noise | **PASS, with a load caveat** | sample changes are `correct`/`oom`/`parse-error` → `timeout`; host load was very high and unequal (below) |
+| 6 | Neutrality and QF_SLIA samples change only at the timeout edge, 3/3 as noise | **PASS, with a load caveat** | sample changes are `correct`/`oom`/`parse-error` → `timeout`; the 3× re-runs and the interleaved re-timing (Verdict changes) are consistent with load noise; host load was very high and unequal (base ~70–80, after ~115–127), so this is not a quiet-host timing measurement |
 
 ## Commands
 
-From the plan, without deviation except as noted. `B=/workspace/target/slice63-base`,
+From the plan; deviations are listed after the block. `B=/workspace/target/slice63-base`,
 `A=/workspace/target/slice63-after`.
 
 ```bash
@@ -124,9 +124,25 @@ All 85 `correct → non-correct` rows (39 + 44 + 2) were re-run 3× per binary
 (510 runs, 84 distinct paths: one path is in two sets).
 
 - 63 rows `timeout` in all 6 runs; 9 `sat` and 3 `unsat` identical in both
-  binaries; the other 8 are mixed (run-to-run flips in at least one
-  binary, e.g. `timeout`/`unsat` both before and after). None are one-sided
-  except the row below.
+  binaries. The other 9 rows (8 mixed plus the reproducing row) are
+  listed with their 3 base / 3 after outcomes. Several lean one way:
+  - against the after binary: `query.14` (base `timeout`/`unsat`/`unsat`,
+    after 3× `timeout`), `xs-05-12-1-4-2-1` (base 2× `unsat`, after 3×
+    `timeout`), `090-incremental_scheduling-15444-0` (base 1× `unsat`,
+    after 3× `timeout`);
+  - one after timeout out of three: `gensys_icl428`;
+  - toward the after binary: `gensys_icl517` (base 1× `unsat`, after 3×
+    `unsat`), `hash_sat_04_13` (base 1× `sat`, after 2× `sat`);
+  - identical in both: `gensys_icl1073`, `hash_sat_05_09`.
+- **Interleaved re-timing of those 9 rows**
+  (`target/slice63-after/lean-retiming.txt`; 3 runs per binary,
+  alternating, 1-min load rising 59 → 99). Every row is solved on both
+  binaries with matching `unsat`/`sat`, and the times overlap run for run
+  (e.g. `query.14` base 8.3/8.3/7.6 s vs after 9.0/8.1/8.0 s;
+  `gensys_icl517` base 13.1/25.5/26.3 s vs after 22.3/25.6/24.9 s). The
+  per-row sums total 477.4 s (base) vs 489.5 s (after), +2.5%, within the
+  visible run-to-run variance. This is consistent with load noise. It is
+  not a quiet-host timing measurement.
 - **One row reproduces:**
   `QF_UF/QG-classification/qg5/gensys_brn095.smt2` is `unsat` 3/3 in the
   base and `timeout` 3/3 after. The change cannot reach it: QF_UF never
@@ -143,11 +159,12 @@ All 85 `correct → non-correct` rows (39 + 44 + 2) were re-run 3× per binary
   both binaries say `sat` 3/3, the `correct → unverified` flip was the
   bench's z3 oracle timing out, and z3 `-T:120` and cvc5 both say `sat`,
   equal to shinri.
-- Neither sample shows any `timeout → correct` or other improvement, only
-  moves toward `timeout`. That one-sidedness matches the load asymmetry
-  above and is why the quiet-host check is queued; it is not evidence of
-  slowdown, because the unchanged-logic rows (29 QF_UF) account for a
-  third of it.
+- Neither sample shows any `timeout → correct` or other improvement,
+  only moves toward `timeout`. The 3× re-runs and the interleaved
+  re-timing above are the basis for calling these timing-edge moves: the
+  re-timed rows are solved on both binaries at matching cost. Load was
+  unequal (base ~70–80, after ~115–127), which alone could produce
+  one-sided edge moves. The queued quiet-host check settles it.
 
 ## Still refused
 
@@ -200,7 +217,7 @@ Ordered.
      sample 630 timeout and 108 oom of 2,000 (about 3,700 across the
      logics, §8).
    - 18 QF_SLIA Norn rows now reach strings and end `unknown`:
-     9 `sat-budget`, 9 `str-model-rejected`.
+     9 `sat-budget`, 9 `str-model-rejected`; investigate the cause (criterion 3 deviation).
 2. **Quiet-host timing check** of `gensys_brn095` and the 29 QF_UF
    `correct → timeout` sample rows, base vs after, interleaved, on an
    otherwise idle host; and re-run the arith/neutrality sample moves
@@ -224,6 +241,6 @@ Ordered.
 - Spec: `docs/superpowers/specs/2026-10-07-shinri-slice63-lia-const-coefficients-design.md`
 - Plan: `docs/superpowers/plans/2026-10-07-shinri-slice63-lia-const-coefficients.md`
 - Raw rows: `bench/results/slice63-{base-,}{refused,arith,sample,slia}/`
-- Evidence: `target/slice63-after/{join.txt,changed.tsv,losses.txt,loss-reruns.txt}`,
+- Evidence: `target/slice63-after/{join.txt,changed.tsv,losses.txt,loss-reruns.txt,rerun1.sh,lean-retiming.txt}`,
   `target/slice63-gates.txt`, `target/slice63-base/oracle-count.txt`
 - Previous report: `docs/superpowers/research/2026-10-07-smtlib-2024-slice62-length-consistent-seeds-report.md`
