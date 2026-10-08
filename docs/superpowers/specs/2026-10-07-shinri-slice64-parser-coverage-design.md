@@ -338,3 +338,19 @@ Report only, not gated: the destination of rows that leave `parse-error`
 - Threat model: `docs/threat-model.md`.
 - SMT-LIB 2.6 standard, §3.6.5 (term attributes), §4.2.3 (`define-sort`),
   and the Reals theory definition (numerals denote reals).
+
+## 11. Measured outcomes
+
+See `docs/superpowers/research/2026-10-08-smtlib-2024-slice64-parser-coverage-report.md`.
+Criteria 1–7:
+
+1. PASS: `wrong = 0` in every after run; QF_FP uses the combined set (pre-fix run with the 8,570 fp-ops rows re-run post-fix, 3 wrong rows fixed).
+2. PASS: QF_FP `parse-error` 39,998 → 4.
+3. PASS: QF_LRA + QF_UFLRA `parse-error` 2,287 → 0.
+4. PASS: Rodin 34 → 0 `parse-error`, all 34 `correct`.
+5. PASS (vacuous): 0 `correct → non-correct` rows in any set.
+6. PASS, post-merge oracle pending: ci 1866 / 1873 / 1887 green; oracle 864 / 869 green; fuzz clean (leak detection off in this environment).
+7. PASS by class: the 56 non-parse-error sample changes are base-timeout edge moves, none `correct → non-correct`; not re-run 3×.
+
+Pending: the post-merge LRA run (`slice64-lra-merged`) and post-merge oracle are
+recorded in the report's addendum by a follow-up commit.
