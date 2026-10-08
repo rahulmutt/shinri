@@ -6,7 +6,8 @@
 //!   cargo nextest run -p shinri-solver --features oracle -E 'binary(neg_coeff_oracle)'
 //!
 //! Variables are bounded to [-3, 3], so every script is small and decidable:
-//! `Unknown` is not tolerated.
+//! shinri's own `Unknown` is not tolerated (it fails the test). A z3 `unknown`
+//! is skipped, and bounded by the 90% z3-confirmation floor.
 #![cfg(feature = "oracle")]
 
 use shinri_parser::Parser;

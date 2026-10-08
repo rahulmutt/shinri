@@ -1022,9 +1022,11 @@ impl Context {
     ///
     /// SHARED admit set, a soundness invariant: every consumer must agree on
     /// what a constant is. Consumers: the FP `to_fp` fence (shinri-solver
-    /// `fp_stage.rs`, via [`Context::const_real_value`]); classify's
-    /// `contains_nonlinear_mul` (shinri-theory `atom.rs`); `is_linear_arith`
-    /// and `normalize::linearize` (shinri-arith) — slice 63.
+    /// `fp_stage.rs`) and the FP folder (shinri-fp `lib.rs`), both via
+    /// [`Context::const_real_value`]; `int_conv.rs` in shinri-str (also via
+    /// `const_real_value`); classify's `contains_nonlinear_mul` (shinri-theory
+    /// `atom.rs`); `is_linear_arith` (shinri-arith
+    /// `lib.rs`) and `normalize::linearize` (shinri-arith) — slice 63.
     pub fn const_arith_value(&self, t: TermId) -> Option<Rational> {
         if let Some(r) = self.numeral_value(t) {
             return Some(r.clone());

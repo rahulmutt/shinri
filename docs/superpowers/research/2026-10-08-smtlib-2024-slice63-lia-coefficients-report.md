@@ -25,14 +25,18 @@ benchmarked binary is `58564ef` (md5 `5fac825f…`); the base is `ea60d55`
 
 | logic | refused → correct | → timeout | → oom | → other unknown |
 | --- | ---: | ---: | ---: | ---: |
-| QF_LIA | 965 | 3,023 | 770 | 0 |
+| QF_LIA | 965 | 3,026 | 770 | 0 |
 | QF_LRA | 0 | 58 | 0 | 0 |
 | QF_SLIA | 17 | 0 | 0 | 18 |
 | QF_UFLIA | 1 | 16 | 0 | 0 |
 | total | 983 | 3,100 | 770 | 18 |
 
-(The join counts QF_LIA `timeout` as 3,026 because it includes the 3
-`miplib2003` rows that were already `timeout`.)
+(Columns sum to the stated totals: 965 + 17 + 1 = 983; 3,026 + 58 + 16 =
+3,100. These are the rows that were `unknown:theory-refused` at base and are
+`timeout` now. The 3 `miplib2003` QF_LIA rows that were already base
+`timeout` and are `timeout` again form a separate timeout → timeout group.
+The join's per-logic line, 3,026, excludes them; its criterion-3 total,
+3,103, includes them.)
 
 By family (refused set; `correct` / `timeout` / `oom`), QF_LIA:
 CAV_2009_benchmarks 420 / 171 / 0; Bromberger 138 / 668 / 0;
@@ -137,7 +141,7 @@ All 85 `correct → non-correct` rows (39 + 44 + 2) were re-run 3× per binary
 - **Interleaved re-timing of those 9 rows**
   (`target/slice63-after/lean-retiming.txt`; 3 runs per binary,
   alternating, 1-min load rising 59 → 99). Every row is solved on both
-  binaries with matching `unsat`/`sat`, and the times overlap run for run
+  binaries with matching `unsat`/`sat`, and the times overlap within the observed run-to-run spread
   (e.g. `query.14` base 8.3/8.3/7.6 s vs after 9.0/8.1/8.0 s;
   `gensys_icl517` base 13.1/25.5/26.3 s vs after 22.3/25.6/24.9 s). The
   per-row sums total 477.4 s (base) vs 489.5 s (after), +2.5%, within the
@@ -148,7 +152,10 @@ All 85 `correct → non-correct` rows (39 + 44 + 2) were re-run 3× per binary
   base and `timeout` 3/3 after. The change cannot reach it: QF_UF never
   enters the arithmetic code that changed. Interleaved re-timing on
   2026-10-08 at load 30–65: base 10.05 / 10.10 / 15.39 s, after
-  10.22 / 12.13 / 12.74 s, all `unsat`. The overnight 3/3 timeouts ran at
+  10.22 / 12.13 / 12.74 s, all `unsat`. The lean re-timing file
+  (`target/slice63-after/lean-retiming.txt`) also carries brn095 timings, in
+  seconds: `base unsat:12.7 unsat:12.7 unsat:11.5 | after unsat:12.7
+  unsat:11.8 unsat:11.1`, which supports the same conclusion. The overnight 3/3 timeouts ran at
   load ~115 against the 20 s cap, on a row that needs 10–15 s even
   quietly. I rule it a timing-edge row and criterion 4 PASS. The residual
   risk is a ~1 s code-layout perf change on QF_UF (compare slice 62's
@@ -159,8 +166,10 @@ All 85 `correct → non-correct` rows (39 + 44 + 2) were re-run 3× per binary
   both binaries say `sat` 3/3, the `correct → unverified` flip was the
   bench's z3 oracle timing out, and z3 `-T:120` and cvc5 both say `sat`,
   equal to shinri.
-- Neither sample shows any `timeout → correct` or other improvement,
-  only moves toward `timeout`. The 3× re-runs and the interleaved
+- Among rows that were not refused, neither sample shows any
+  `timeout → correct` or other improvement, only moves toward `timeout`
+  (the neutrality sample's 33 `theory-refused → correct` rows are the
+  intended gain). The 3× re-runs and the interleaved
   re-timing above are the basis for calling these timing-edge moves: the
   re-timed rows are solved on both binaries at matching cost. Load was
   unequal (base ~70–80, after ~115–127), which alone could produce
