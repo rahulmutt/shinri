@@ -45,7 +45,7 @@ pub fn fp_fma(
     // Without normalization a subnormal z has decoded exp=emin but its significand
     // leading bit is below pw-1, so a subnormal product with a smaller exponent can
     // have larger actual magnitude yet lose the "hi" election — causing wrong results.
-    // For zero z: lzc=pw, z_sig_norm=0, z_exp goes very negative (product wins tie).
+    // For zero z: lzc=pw, z_sig_norm=0, z_exp = emin − pw; the election below forces the product to win (amendment A).
     let mut z_sig_raw: Vec<BitLit> = vec![b.zero(); sbu];
     z_sig_raw.extend_from_slice(&oz.sig);
     let lz_z = lzc(b, &z_sig_raw); // count_width(pw) bits
@@ -73,7 +73,17 @@ pub fn fp_fma(
         b.not1(lt)
     };
     let tie = b.and2(exp_eq, sig_ge);
-    let p_ge_z = b.or2(exp_gt, tie);
+    // Amendment A: a zero addend's normalized exponent (emin − pw) is not low
+    // enough to lose to a product that underflows further, so a zero z must
+    // never be elected over a nonzero product (else res_sign takes z's sign).
+    let z_zero_p_nonzero = {
+        let p_nonzero = b.not1(prod_zero);
+        b.and2(oz.is_zero, p_nonzero)
+    };
+    let p_ge_z = {
+        let g = b.or2(exp_gt, tie);
+        b.or2(g, z_zero_p_nonzero)
+    };
     let (hi_sign, hi_exp, hi_sig) = select3(
         b,
         p_ge_z,
@@ -92,7 +102,12 @@ pub fn fp_fma(
     );
 
     // ---- Align lo to hi: right-shift lo by (hi_exp - lo_exp), collecting sticky. ----
-    let exp_diff = bvsub(b, &hi_exp, &lo_exp); // >= 0 since hi >= lo
+    // Usually >= 0 (hi wins the magnitude election). Not always: when z is
+    // zero, the election forces hi = product even if the product's exponent
+    // is below z's normalised emin - pw, so this can wrap negative. Harmless:
+    // lo is then the zero addend, whose lo_sig is all zero, so any shift
+    // amount yields a zero lo_shifted and a clear sticky bit.
+    let exp_diff = bvsub(b, &hi_exp, &lo_exp);
     let zb = b.zero();
     let mut hi_ext: Vec<BitLit> = vec![zb; 3];
     hi_ext.extend_from_slice(&hi_sig); // mw
@@ -428,6 +443,35 @@ mod tests {
             for &m in MODES {
                 check(eb, sb, a, bb, c, m);
             }
+        }
+    }
+
+    /// Amendment A (spec §3.5.2): x·y ≈ −2^-1576 underflows far below a zero
+    /// addend's normalized exponent (emin − pw). The exact result is a tiny
+    /// negative, so the IEEE result keeps the negative sign. Expected values
+    /// are literal IEEE results, not `ref_fma`.
+    /// Operands from QF_FP/wintersteiger/fma/fma-has-solution-4663.
+    #[test]
+    fn fma_zero_addend_loses_to_underflowed_product() {
+        let (eb, sb) = (11, 53);
+        let (x, y) = (0x0c35_20cc_566c_800fu64, 0x913c_e340_a93e_e431u64);
+        let neg_zero = 0x8000_0000_0000_0000u64;
+        let neg_min_sub = 0x8000_0000_0000_0001u64;
+        for (z, m, want) in [
+            (0u64, RoundMode::Rtz, neg_zero),
+            (neg_zero, RoundMode::Rtz, neg_zero),
+            (0, RoundMode::Rne, neg_zero),
+            (0, RoundMode::Rna, neg_zero),
+            (0, RoundMode::Rtp, neg_zero),
+            (0, RoundMode::Rtn, neg_min_sub),
+        ] {
+            let mut bl = Blaster::new();
+            let xv = const_bits(&bl, eb, sb, x);
+            let yv = const_bits(&bl, eb, sb, y);
+            let zv = const_bits(&bl, eb, sb, z);
+            let sel = rm::literal(&bl, rmode(m));
+            let word = fp_fma(&mut bl, &xv, &yv, &zv, &sel, eb, sb);
+            assert_eq!(eval_word(bl, &word), want, "fp.fma z={z:#x} m={m:?}");
         }
     }
 }

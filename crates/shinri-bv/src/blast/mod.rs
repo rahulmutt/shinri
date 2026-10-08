@@ -155,6 +155,15 @@ pub trait WordSink {
         unreachable!("pure BV lowering has no RoundingMode operands")
     }
 
+    /// Shared `fp.min`/`fp.max` ±0 tie bits (slice 64 amendment A), keyed by
+    /// `(is_max, eb, sb, x_is_pos_zero)`. SMT-LIB leaves a ±0 tie's result
+    /// unspecified, but `fp.min` is still a function, so every occurrence must
+    /// share one choice per key for the whole query. Only meaningful for FP
+    /// sinks; pure-BV lowering never calls this.
+    fn fp_tie_bits(&mut self) -> &mut FxHashMap<(bool, u32, u32, bool), BitLit> {
+        unreachable!("pure BV lowering has no fp.min/fp.max")
+    }
+
     /// Registry of FP→BV applications for unspecified-value congruence. Only
     /// meaningful for sinks that lower FP→BV conversions (shinri-fp's Lowerer);
     /// pure-BV lowering never calls this.

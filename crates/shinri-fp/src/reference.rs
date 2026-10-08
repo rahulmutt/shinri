@@ -202,7 +202,10 @@ pub fn ref_geq(eb: u32, sb: u32, a: &Integer, b: &Integer) -> bool {
 }
 
 /// `fp.min`: NaN passes through to the other operand; both-NaN -> b. The
-/// SMT-LIB-unspecified (+0,-0) case is resolved sign-canonically to -0.
+/// (+0,-0) tie is unspecified by SMT-LIB 2.6: the blasted operator
+/// (`blast/minmax.rs`) leaves it a free choice, shared per format and operand
+/// order (slice 64 spec §3.5.1). This reference fixes ONE choice (-0) so it
+/// can serve as a concrete testing oracle; it is not the operator's semantics.
 pub fn ref_min(eb: u32, sb: u32, a: &Integer, b: &Integer) -> Integer {
     let (ca, cb) = (decode(eb, sb, a), decode(eb, sb, b));
     if matches!(ca, FpClass::Nan) {
@@ -223,7 +226,9 @@ pub fn ref_min(eb: u32, sb: u32, a: &Integer, b: &Integer) -> Integer {
     }
 }
 
-/// `fp.max`: symmetric to `ref_min`; the (+0,-0) tie resolves to +0.
+/// `fp.max`: symmetric to `ref_min`. The (+0,-0) tie is likewise a shared
+/// free choice in the blasted operator (spec §3.5.1); this reference fixes
+/// it to +0 for testing only.
 pub fn ref_max(eb: u32, sb: u32, a: &Integer, b: &Integer) -> Integer {
     let (ca, cb) = (decode(eb, sb, a), decode(eb, sb, b));
     if matches!(ca, FpClass::Nan) {

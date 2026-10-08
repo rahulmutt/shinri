@@ -26,6 +26,8 @@ pub struct FpBlaster {
     cache: FxHashMap<TermId, Vec<BitLit>>,
     var_bits: FxHashMap<TermId, Vec<BitLit>>,
     rm_cache: FxHashMap<TermId, [BitLit; 5]>,
+    /// Shared fp.min/fp.max ±0 tie bits (amendment A; see WordSink::fp_tie_bits).
+    tie_bits: FxHashMap<(bool, u32, u32, bool), BitLit>,
     /// Uninterpreted-application registry for Ackermann congruence (slice 44).
     /// A real store, not a defaulted `unreachable!` — `WordSink::uf_apps` has
     /// no default by design (see the trait docs).
@@ -39,6 +41,7 @@ impl FpBlaster {
             cache: FxHashMap::default(),
             var_bits: FxHashMap::default(),
             rm_cache: FxHashMap::default(),
+            tie_bits: FxHashMap::default(),
             uf_apps: Vec::new(),
         }
     }
@@ -94,6 +97,9 @@ impl WordSink for FpBlaster {
     fn rm_cache(&mut self) -> &mut FxHashMap<TermId, [BitLit; 5]> {
         &mut self.rm_cache
     }
+    fn fp_tie_bits(&mut self) -> &mut FxHashMap<(bool, u32, u32, bool), BitLit> {
+        &mut self.tie_bits
+    }
     fn uf_apps(&mut self) -> &mut Vec<UfApp> {
         &mut self.uf_apps
     }
@@ -114,6 +120,15 @@ fn blast_rm<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> crate::rm::R
     };
     sink.rm_cache().insert(t, sel.sel);
     sel
+}
+/// The shared ±0 tie bit for `key`, minted once per query (amendment A).
+fn tie_bit<S: WordSink>(sink: &mut S, key: (bool, u32, u32, bool)) -> BitLit {
+    if let Some(&l) = sink.fp_tie_bits().get(&key) {
+        return l;
+    }
+    let l = sink.blaster().fresh();
+    sink.fp_tie_bits().insert(key, l);
+    l
 }
 
 /// FP word dispatch, generic over the sink. Assumes `t` is FP-sorted; callers
@@ -210,12 +225,16 @@ pub fn blast_fp_word<S: WordSink>(sink: &mut S, ctx: &Context, t: TermId) -> Vec
                 FpMin => {
                     let xw = sink.word(ctx, kids[0]);
                     let yw = sink.word(ctx, kids[1]);
-                    crate::blast::minmax::fp_min(sink.blaster(), &xw, &yw, eb, sb)
+                    let pn = tie_bit(sink, (false, eb, sb, true));
+                    let np = tie_bit(sink, (false, eb, sb, false));
+                    crate::blast::minmax::fp_min(sink.blaster(), &xw, &yw, eb, sb, pn, np)
                 }
                 FpMax => {
                     let xw = sink.word(ctx, kids[0]);
                     let yw = sink.word(ctx, kids[1]);
-                    crate::blast::minmax::fp_max(sink.blaster(), &xw, &yw, eb, sb)
+                    let pn = tie_bit(sink, (true, eb, sb, true));
+                    let np = tie_bit(sink, (true, eb, sb, false));
+                    crate::blast::minmax::fp_max(sink.blaster(), &xw, &yw, eb, sb, pn, np)
                 }
                 FpFma => {
                     let rm = blast_rm(sink, ctx, kids[0]);

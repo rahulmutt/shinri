@@ -117,7 +117,36 @@ pub struct Parser<'a> {
     /// Set to `true` after `(exit)` is processed; subsequent `next_command`
     /// calls return `None` immediately.
     stopped: bool,
+    /// True while a `define-fun` body with at least one parameter is being
+    /// parsed: a `:named` there would bind an open term over the parameter
+    /// placeholders, so it is rejected.
+    in_define_fun_params: bool,
 }
+
+/// Slice 64 §3.1: true iff logic `name`'s arithmetic is Reals-only: it ends
+/// in `LRA`, `NRA` or `RDL` and the character before that suffix is not `I`
+/// (`QF_LRA`, `QF_UFLRA`, `QF_RDL`, `QF_FPLRA`, ...). The "not preceded by
+/// `I`" condition needs no separate check: a mixed Int/Real logic ends in
+/// `IRA` (`QF_LIRA`, `AUFLIRA`, `QF_NIRA`), so its suffix is `IRA`, never
+/// `LRA`/`NRA`/`RDL`. `ALL` and logics without arithmetic don't match either.
+fn reals_only_arith(name: &str) -> bool {
+    ["LRA", "NRA", "RDL"].iter().any(|suf| name.ends_with(suf))
+}
+
+/// Sort names `parse_sort` resolves before the environment; `define-sort`
+/// may not shadow them (slice 64 §3.3). Keep in sync with `parse_sort`.
+const BUILTIN_SORT_NAMES: &[&str] = &[
+    "Bool",
+    "Int",
+    "Real",
+    "String",
+    "RegLan",
+    "Float16",
+    "Float32",
+    "Float64",
+    "Float128",
+    "RoundingMode",
+];
 
 /// The semantic text of an attribute-value token: the inner string for
 /// symbols/numerals/decimals/keywords/hex/bin, and the quote-stripped,
@@ -144,6 +173,7 @@ impl<'a> Parser<'a> {
             env: Env::new(),
             eof: src.len(),
             stopped: false,
+            in_define_fun_params: false,
         }
     }
 
@@ -157,6 +187,7 @@ impl<'a> Parser<'a> {
             env,
             eof: src.len(),
             stopped: false,
+            in_define_fun_params: false,
         }
     }
 
@@ -423,7 +454,8 @@ impl<'a> Parser<'a> {
         if any_real {
             for a in args.iter_mut() {
                 if ctx.sort_of(*a) == int {
-                    if let Some(v) = ctx.numeral_value(*a).cloned() {
+                    // A numeral or `(- c)` of one (slice 64): re-mint as Real.
+                    if let Some(v) = ctx.const_real_value(*a) {
                         *a = ctx.mk_numeral(v, real);
                     }
                 }
@@ -669,6 +701,7 @@ impl<'a> Parser<'a> {
         };
 
         match head.as_str() {
+            "!" => return self.parse_annotated(ctx),
             "let" => return self.parse_let(ctx),
             "forall" | "exists" | "as" | "match" => {
                 return Err(Diagnostic::new(
@@ -777,6 +810,93 @@ impl<'a> Parser<'a> {
         Ok(args)
     }
 
+    /// `(! t attr*)` (slice 64 §3.2), with `(` and `!` already consumed. The
+    /// value is `t`; an annotation never changes a term's meaning. `:named n`
+    /// binds `n` as a nullary alias of `t` (SMT-LIB 2.6 §3.6.5); any other
+    /// attribute is skipped.
+    fn parse_annotated(&mut self, ctx: &mut Context) -> Result<TermId, Diagnostic> {
+        let t = self.parse_term(ctx)?;
+        loop {
+            match self.bump() {
+                Some((Ok(Token::RParen), _)) => return Ok(t),
+                Some((Ok(Token::Keyword(k)), _)) => {
+                    if k == ":named" {
+                        let (name, nsp) = self.expect_symbol()?;
+                        if self.in_define_fun_params {
+                            return Err(Diagnostic::new(
+                                nsp,
+                                "named term: not allowed inside define-fun",
+                            ));
+                        }
+                        if self.name_in_use(ctx, &name) {
+                            return Err(Diagnostic::new(
+                                nsp,
+                                format!("named term: name already in use: {name}"),
+                            ));
+                        }
+                        self.env.add_macro(&name, Vec::new(), t);
+                    } else {
+                        self.skip_attribute_value();
+                    }
+                }
+                Some((_, sp)) => {
+                    return Err(Diagnostic::new(
+                        sp,
+                        "expected an attribute keyword or ')' in (! ...)",
+                    ))
+                }
+                None => {
+                    return Err(Diagnostic::new(
+                        self.eof..self.eof,
+                        "unexpected EOF in (! ...)",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// Consume one attribute value if present: nothing when the next token is
+    /// `)` or a keyword, else one s-expression. Iterative (a depth counter),
+    /// so hostile nesting cannot overflow the stack (threat model).
+    fn skip_attribute_value(&mut self) {
+        match self.peek() {
+            None | Some((Ok(Token::RParen), _)) | Some((Ok(Token::Keyword(_)), _)) => {}
+            Some((Ok(Token::LParen), _)) => {
+                self.bump();
+                let mut depth = 1usize;
+                while depth > 0 {
+                    match self.bump() {
+                        None => break,
+                        Some((Ok(Token::LParen), _)) => depth += 1,
+                        Some((Ok(Token::RParen), _)) => depth -= 1,
+                        _ => {}
+                    }
+                }
+            }
+            Some(_) => {
+                self.bump();
+            }
+        }
+    }
+
+    /// A `:named` name collides with a let-bound name, a macro (`define-fun`
+    /// or an earlier `:named`), a declared function/constant, a builtin
+    /// operator (a macro would shadow it: `(! a :named and)` would break every
+    /// later `(and …)`), or a solver-reserved symbol.
+    fn name_in_use(&self, ctx: &Context, name: &str) -> bool {
+        self.env.lookup_let(name).is_some()
+            || self.env.lookup_macro(name).is_some()
+            || self.env.lookup_fun(name).is_some()
+            || Self::is_builtin_operator(name)
+            || ctx.lookup_symbol(name).is_some_and(|s| ctx.is_reserved(s))
+    }
+
+    /// Operator heads `parse_compound` resolves after the macro table, which
+    /// a macro of the same name would therefore shadow.
+    fn is_builtin_operator(name: &str) -> bool {
+        name == "/" || Self::builtin_for(name).is_some()
+    }
+
     fn parse_let(&mut self, ctx: &mut Context) -> Result<TermId, Diagnostic> {
         self.expect_token(&Token::LParen)?; // bindings list
         let mut bindings = Vec::new();
@@ -816,8 +936,16 @@ impl<'a> Parser<'a> {
         // Left-fold pairwise.
         let mut acc = args[0];
         for &divisor in &args[1..] {
-            let dv = ctx.numeral_value(divisor).cloned();
-            match (ctx.numeral_value(acc).cloned(), dv) {
+            // Constants are numerals or `(- c)` of one (slice 64).
+            let dv = ctx.const_real_value(divisor);
+            match (ctx.const_real_value(acc), dv) {
+                (_, Some(d)) if d.is_zero() => {
+                    // Threat model: never panic on input (`recip` asserts).
+                    return Err(Diagnostic::new(
+                        sp,
+                        "division by a zero constant unsupported",
+                    ));
+                }
                 (Some(n), Some(d)) => {
                     // constant / constant -> fold
                     // Borrow fix: bind real_sort first to avoid nested &ctx/&mut ctx borrow.
@@ -1069,7 +1197,7 @@ impl<'a> Parser<'a> {
     /// command so the next call resumes cleanly (design §8 recovery).
     ///
     /// Recovery runs exactly once per command: `parse_command_body` returns
-    /// `Ok(None)` for `define-fun` (no IR command emitted), and this loop
+    /// `Ok(None)` for `define-fun` and `define-sort` (no IR command emitted), and this loop
     /// simply continues — no recursion, no double-recovery.
     pub fn next_command(&mut self, ctx: &mut Context) -> Option<Result<Command, Diagnostic>> {
         loop {
@@ -1090,7 +1218,7 @@ impl<'a> Parser<'a> {
                 }
             }
             match self.parse_command_body(ctx) {
-                Ok(None) => continue, // define-fun: no IR command, fetch next
+                Ok(None) => continue, // define-fun / define-sort: no IR command, fetch next
                 Ok(Some(cmd)) => {
                     if matches!(cmd, Command::Exit) {
                         self.stopped = true;
@@ -1108,7 +1236,7 @@ impl<'a> Parser<'a> {
     /// After the opening '(' is consumed, parse the command head + body,
     /// including the closing ')'.
     ///
-    /// Returns `Ok(None)` for `define-fun` (no IR command emitted); the caller
+    /// Returns `Ok(None)` for `define-fun` and `define-sort` (no IR command emitted); the caller
     /// loops to fetch the next real command. Returns `Ok(Some(cmd))` for every
     /// other command. Returns `Err` on parse/sort errors — the caller is
     /// responsible for calling `recover_to_command_end` exactly once.
@@ -1117,6 +1245,7 @@ impl<'a> Parser<'a> {
         let cmd = match head.as_str() {
             "set-logic" => {
                 let (l, _) = self.expect_symbol()?;
+                self.env.set_numerals_are_real(reals_only_arith(&l));
                 Command::SetLogic(l)
             }
             "declare-sort" => {
@@ -1170,6 +1299,41 @@ impl<'a> Parser<'a> {
             "define-fun" => {
                 // parse_define_fun already consumes the define-fun's own closing ')'.
                 self.parse_define_fun(ctx)?;
+                return Ok(None); // no IR command emitted; caller loops
+            }
+            "define-sort" => {
+                // Slice 64 §3.3: nullary aliases only. The alias stores the
+                // resolved SortId, so it is never re-expanded.
+                let (name, nsp) = self.expect_symbol()?;
+                self.expect_token(&Token::LParen)?;
+                if !matches!(self.peek(), Some((Ok(Token::RParen), _))) {
+                    // Consume the parameter list (iteratively) first, so the
+                    // caller's `recover_to_command_end` resumes at this
+                    // command's own ')' instead of treating the sort body as
+                    // a stray next command.
+                    let mut depth = 1usize;
+                    while depth > 0 {
+                        match self.bump() {
+                            None => break,
+                            Some((Ok(Token::LParen), _)) => depth += 1,
+                            Some((Ok(Token::RParen), _)) => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    return Err(Diagnostic::new(hsp, "parametric define-sort unsupported"));
+                }
+                self.bump(); // ')' of the empty parameter list
+                if BUILTIN_SORT_NAMES.contains(&name.as_str())
+                    || self.env.lookup_sort(&name).is_some()
+                {
+                    return Err(Diagnostic::new(
+                        nsp,
+                        format!("define-sort: sort already defined: {name}"),
+                    ));
+                }
+                let s = self.parse_sort(ctx)?;
+                self.expect_token(&Token::RParen)?; // close (define-sort …)
+                self.env.add_sort_alias(&name, s);
                 return Ok(None); // no IR command emitted; caller loops
             }
             "assert" => {
@@ -1232,6 +1396,14 @@ impl<'a> Parser<'a> {
             }
         };
         self.expect_token(&Token::RParen)?; // close the command
+                                            // Scope definitions by push/pop only once the command is complete, so
+                                            // a malformed `(push 1 x)` (reported, no IR command) opens no scope.
+        match cmd {
+            Command::Push(n) => self.env.push_scopes(n),
+            Command::Pop(n) => self.env.pop_scopes(n),
+            Command::Reset => self.env.reset_scopes(),
+            _ => {}
+        }
         Ok(Some(cmd))
     }
 
@@ -1487,7 +1659,14 @@ impl<'a> Parser<'a> {
     /// `(define-fun f ((x S)…) R body)` — intern body against fresh formal
     /// placeholder consts and store as a macro; emits no command.
     fn parse_define_fun(&mut self, ctx: &mut Context) -> Result<(), Diagnostic> {
-        let (name, _) = self.expect_symbol()?;
+        let (name, nsp) = self.expect_symbol()?;
+        if Self::is_builtin_operator(&name) {
+            return Err(Diagnostic::new(
+                nsp,
+                format!("define-fun: cannot redefine builtin operator '{name}'"),
+            ));
+        }
+        reject_reserved(ctx, &name, &nsp)?;
         self.expect_token(&Token::LParen)?;
         let mut formal_names = Vec::new();
         let mut formals = Vec::new();
@@ -1513,7 +1692,9 @@ impl<'a> Parser<'a> {
                 .zip(formals.iter().copied())
                 .collect(),
         );
+        self.in_define_fun_params = !formals.is_empty();
         let body = self.parse_term(ctx);
+        self.in_define_fun_params = false;
         self.env.pop_let();
         let body = body?;
         self.expect_token(&Token::RParen)?; // close (define-fun …)
@@ -1591,7 +1772,8 @@ impl<'a> Parser<'a> {
     }
 
     /// Build a numeral term from literal text. `is_decimal` selects Real;
-    /// integer literals default to Int (caller may re-coerce to Real later).
+    /// integer literals default to Int (caller may re-coerce to Real later);
+    /// Real under a Reals-only `set-logic` (slice 64).
     #[allow(dead_code)]
     fn parse_atom_numeral(
         &mut self,
@@ -1619,7 +1801,12 @@ impl<'a> Parser<'a> {
             let n = Integer::from_str_radix(text, 10)
                 .map_err(|_| Diagnostic::new(sp, "bad numeral"))?;
             let val = Rational::from_int(n);
-            let sort = ctx.int_sort();
+            // Slice 64: in a Reals-only logic a numeral denotes a real.
+            let sort = if self.env.numerals_are_real() {
+                ctx.real_sort()
+            } else {
+                ctx.int_sort()
+            };
             Ok(ctx.mk_numeral(val, sort))
         }
     }
@@ -2327,6 +2514,59 @@ mod tests {
         let cs = commands("(bad-command foo bar)\n(check-sat)");
         assert!(cs[0].is_err());
         assert!(matches!(cs[1], Ok(Command::CheckSat)));
+    }
+
+    /// Slice 64 §3.3: aliases resolve to the stored SortId, including an
+    /// alias of an alias.
+    #[test]
+    fn nullary_define_sort_aliases_resolve() {
+        let src = "(define-sort FPN () (_ FloatingPoint 11 53))(define-sort F2 () FPN)\
+                   (declare-fun x () FPN)(declare-fun y () F2)";
+        let (mut ctx, cmds) = parse_all_ok(src);
+        let fpn = ctx.fp_sort(11, 53);
+        let sorts: Vec<_> = cmds
+            .iter()
+            .filter_map(|c| match c {
+                Command::DeclareFun { result, .. } => Some(*result),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sorts, vec![fpn, fpn]);
+        assert_eq!(cmds.len(), 2, "define-sort emits no IR command");
+    }
+
+    #[test]
+    fn define_sort_rejects_parameters_and_redefinition() {
+        for (src, needle) in [
+            (
+                "(define-sort Arr (X) (Array X X))",
+                "parametric define-sort unsupported",
+            ),
+            ("(define-sort Real () Int)", "sort already defined: Real"),
+            (
+                "(define-sort S () Int)(define-sort S () Bool)",
+                "sort already defined: S",
+            ),
+            (
+                "(declare-sort U 0)(define-sort U () Int)",
+                "sort already defined: U",
+            ),
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(msg.contains(needle), "{src}: {msg}");
+        }
+    }
+
+    #[test]
+    fn command_after_failed_define_sort_still_parses() {
+        let src = "(define-sort Arr (X) (Array X X))(declare-fun a () Bool)";
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        assert!(matches!(p.next_command(&mut ctx), Some(Err(_))));
+        assert!(matches!(
+            p.next_command(&mut ctx),
+            Some(Ok(Command::DeclareFun { .. }))
+        ));
     }
 
     /// Helper: parse all commands from `src`, asserting no diagnostic errors.
@@ -3190,6 +3430,384 @@ mod tests {
             "check-sat should be the second result, got {:?}",
             cs[1]
         );
+    }
+    /// Slice 64 §3.1: which logics read integer literals as Real.
+    #[test]
+    fn reals_only_arith_classifies_logic_names() {
+        for l in [
+            "QF_LRA",
+            "QF_UFLRA",
+            "LRA",
+            "UFLRA",
+            "QF_NRA",
+            "QF_UFNRA",
+            "QF_RDL",
+            "QF_FPLRA",
+            "QF_ABVFPLRA",
+        ] {
+            assert!(reals_only_arith(l), "{l} should be Reals-only");
+        }
+        for l in [
+            "QF_LIRA", "AUFLIRA", "QF_NIRA", "QF_LIA", "QF_UFLIA", "ALL", "QF_BV", "QF_FP", "QF_S",
+            "QF_SLIA", "QF_IDL",
+        ] {
+            assert!(!reals_only_arith(l), "{l} should not be Reals-only");
+        }
+    }
+
+    #[test]
+    fn numeral_sort_follows_env_flag() {
+        let (ctx, t) = parse_one("1", |_, p| p.env.set_numerals_are_real(true));
+        assert_eq!(ctx.sort_of(t), ctx.real_sort());
+        let (ctx, t) = parse_one("(- 1)", |_, p| p.env.set_numerals_are_real(true));
+        assert_eq!(ctx.sort_of(t), ctx.real_sort());
+        let (ctx, t) = parse_one("1", |_, _| {});
+        assert_eq!(ctx.sort_of(t), ctx.int_sort());
+    }
+
+    /// The FFT reproducer (QF_UFLRA/FFT/smtlib.624882) plus let-bound and
+    /// comparison shapes all parse once QF_UFLRA numerals are Real.
+    #[test]
+    fn reals_logic_parses_int_literals_in_real_contexts() {
+        let src = "(set-logic QF_UFLRA)(declare-fun f3 (Real) Real)(declare-fun f5 () Real)\
+                   (assert (= (f3 f5) (- 1)))\
+                   (assert (let ((?v (- 1))) (= f5 ?v)))\
+                   (assert (< f5 1))";
+        let (_ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 6);
+    }
+
+    /// Int logics keep Int literals: `(= n 1)` with `n : Int` only parses
+    /// if `1` is Int.
+    #[test]
+    fn int_and_all_logics_keep_int_numerals() {
+        for logic in ["QF_LIA", "ALL"] {
+            let src = format!("(set-logic {logic})(declare-fun n () Int)(assert (= n 1))");
+            let (_ctx, cmds) = parse_all_ok(&src);
+            assert_eq!(cmds.len(), 3, "{logic}");
+        }
+    }
+
+    fn bind_real_x(ctx: &mut Context, p: &mut Parser) {
+        let r = ctx.real_sort();
+        let sym = ctx.declare_fun("x", &[], r);
+        p.bind_fun("x", sym);
+    }
+
+    /// Slice 64 §3.1 (ALL/LIRA path): `(- 1)` next to a Real operand is
+    /// re-minted as a Real constant.
+    #[test]
+    fn coerces_negated_int_literal_in_real_context() {
+        let (ctx, t) = parse_one("(+ x (- 1))", bind_real_x);
+        assert_eq!(ctx.sort_of(t), ctx.real_sort());
+    }
+
+    /// `(/ x (- 2))` folds to `(* -1/2 x)` instead of "non-linear division".
+    #[test]
+    fn division_by_negated_constant_folds() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let (ctx, t) = parse_one("(/ x (- 2))", bind_real_x);
+        assert_eq!(ctx.sort_of(t), ctx.real_sort());
+        match ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Mul),
+                args,
+                ..
+            } => {
+                let kids = ctx.children(*args);
+                assert_eq!(
+                    ctx.numeral_value(kids[0]).cloned(),
+                    Some(Rational::new(Integer::from(-1i128), Integer::from(2i128)))
+                );
+            }
+            other => panic!("expected Mul, got {other:?}"),
+        }
+    }
+
+    /// Threat model: a zero constant divisor is a Diagnostic, never a panic
+    /// (`main` aborts with "recip of zero").
+    #[test]
+    fn division_by_zero_constant_is_a_diagnostic_not_a_panic() {
+        for src in ["(/ x 0)", "(/ x (- 0))", "(/ 1 0)", "(/ x 0.0)"] {
+            let mut ctx = Context::new();
+            let mut p = Parser::new(src);
+            bind_real_x(&mut ctx, &mut p);
+            let err = p.parse_term(&mut ctx).expect_err(src);
+            assert!(
+                err.message.contains("division by a zero constant"),
+                "{src}: {err:?}"
+            );
+        }
+    }
+    fn assert_terms(cmds: &[Command]) -> Vec<TermId> {
+        cmds.iter()
+            .filter_map(|c| match c {
+                Command::Assert(t) => Some(*t),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Slice 64 §3.2: `!` is transparent and `:named h` makes `h` an alias.
+    #[test]
+    fn named_annotation_is_transparent_and_binds_name() {
+        use shinri_core::{BuiltinOp, Op, TermNode};
+        let src = "(declare-fun a () Bool)(declare-fun b () Bool)\
+                   (assert (! (= a b) :named h))(assert (not h))(assert (= a b))";
+        let (ctx, cmds) = parse_all_ok(src);
+        let ts = assert_terms(&cmds);
+        assert_eq!(ts[0], ts[2], "annotation must not change the term");
+        match ctx.term_node(ts[1]) {
+            TermNode::App {
+                op: Op::Builtin(BuiltinOp::Not),
+                args,
+                ..
+            } => assert_eq!(ctx.children(*args)[0], ts[0]),
+            other => panic!("expected (not h), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn named_annotation_rejects_names_in_use() {
+        for src in [
+            "(declare-fun a () Bool)(assert (! a :named h))(assert (! a :named h))",
+            "(declare-fun a () Bool)(assert (! a :named a))",
+            "(declare-fun a () Bool)(define-fun k () Bool a)(assert (! a :named k))",
+            "(declare-fun a () Bool)(assert (let ((h a)) (! a :named h)))",
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(msg.contains("name already in use"), "{src}: {msg}");
+        }
+    }
+
+    #[test]
+    fn unknown_attributes_are_skipped_including_nested_values() {
+        let src = "(declare-fun a () Bool)\
+                   (assert (! a :pattern ((f (g x)) y) :weight 3 :flag :named h2))(assert h2)";
+        let (_ctx, cmds) = parse_all_ok(src);
+        assert_eq!(cmds.len(), 3);
+    }
+
+    /// Threat model: attribute-value skipping is iterative.
+    #[test]
+    fn deeply_nested_attribute_value_does_not_overflow() {
+        let depth = 200_000;
+        let src = format!(
+            "(declare-fun a () Bool)(assert (! a :x {}{}))",
+            "(".repeat(depth),
+            ")".repeat(depth)
+        );
+        let (_ctx, cmds) = parse_all_ok(&src);
+        assert_eq!(cmds.len(), 2);
+    }
+
+    /// The uninterpreted nullary symbol a term is, if any.
+    fn uf_name(ctx: &Context, t: TermId) -> Option<String> {
+        use shinri_core::{Op, TermNode};
+        match ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Uninterpreted(sym),
+                ..
+            } => Some(ctx.symbol_name(*sym).to_string()),
+            _ => None,
+        }
+    }
+
+    /// Final review (slice 64): a `:named` / `define-fun` binding made inside
+    /// a push scope is removed by the matching pop (SMT-LIB 2.6 §4.1.4), so
+    /// the name may be reused after the pop.
+    #[test]
+    fn named_and_define_fun_bindings_are_reusable_after_pop() {
+        for (def1, def2) in [
+            ("(assert (! a :named h))", "(assert (! (not a) :named h))"),
+            ("(define-fun h () Bool a)", "(define-fun h () Bool (not a))"),
+        ] {
+            let src =
+                format!("(declare-fun a () Bool)(push 1){def1}(pop 1)(push 1){def2}(assert h)");
+            let (ctx, cmds) = parse_all_ok(&src);
+            let ts = assert_terms(&cmds);
+            let h = *ts.last().unwrap();
+            assert!(
+                uf_name(&ctx, h).is_none(),
+                "{src}: h must be (not a), got a symbol"
+            );
+            match ctx.term_node(h) {
+                shinri_core::TermNode::App {
+                    op: shinri_core::Op::Builtin(shinri_core::BuiltinOp::Not),
+                    ..
+                } => {}
+                other => panic!("{src}: expected (not a), got {other:?}"),
+            }
+        }
+    }
+
+    /// After the pop, a fresh `declare-fun h` is what `h` resolves to — not
+    /// the stale alias.
+    #[test]
+    fn declare_fun_after_pop_is_not_shadowed_by_stale_binding() {
+        for def in ["(assert (! a :named h))", "(define-fun h () Bool a)"] {
+            let src = format!(
+                "(declare-fun a () Bool)(push 1){def}(pop 1)(declare-fun h () Bool)(assert h)"
+            );
+            let (ctx, cmds) = parse_all_ok(&src);
+            let h = *assert_terms(&cmds).last().unwrap();
+            assert_eq!(uf_name(&ctx, h).as_deref(), Some("h"), "{src}");
+        }
+    }
+
+    /// Pop restores the definition a scoped redefinition shadowed; nested
+    /// scopes unwind one level at a time; `push n` / `pop n` count levels.
+    #[test]
+    fn pop_restores_outer_definitions_level_by_level() {
+        let src = "(declare-fun a () Bool)(declare-fun b () Bool)\
+                   (define-fun k () Bool a)\
+                   (push 2)(define-fun m () Bool b)(push 1)(assert (! b :named n))\
+                   (pop 1)(assert m)(pop 1)(assert m)(pop 1)(assert k)";
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        let mut results = Vec::new();
+        while let Some(r) = p.next_command(&mut ctx) {
+            results.push(r);
+        }
+        // `m` survives the first pop (it lives one level out from `n`); the
+        // second pop closes the inner of push 2's two levels, where `m`
+        // lives, so the second `(assert m)` is an error; the third pop
+        // closes the last level and `k` (depth 0) survives everything.
+        let asserts: Vec<_> = results
+            .iter()
+            .filter(|r| matches!(r, Ok(Command::Assert(_)) | Err(_)))
+            .collect();
+        assert_eq!(asserts.len(), 4);
+        assert!(matches!(asserts[0], Ok(Command::Assert(_))), "n's assert");
+        assert!(
+            matches!(asserts[1], Ok(Command::Assert(_))),
+            "m after pop 1"
+        );
+        match asserts[2] {
+            Err(d) => assert!(d.message.contains("undeclared symbol m"), "{d:?}"),
+            other => panic!("m must be gone after the second pop, got {other:?}"),
+        }
+        assert!(matches!(asserts[3], Ok(Command::Assert(_))), "k is global");
+        // Shadowed definition restored.
+        let src = "(declare-fun a () Bool)(define-fun k () Bool a)\
+                   (push 1)(define-fun k () Bool (not a))(pop 1)(assert k)";
+        let (ctx, cmds) = parse_all_ok(src);
+        let k = *assert_terms(&cmds).last().unwrap();
+        assert_eq!(uf_name(&ctx, k).as_deref(), Some("a"));
+    }
+
+    /// A nullary `define-sort` is a definition too: scoped by push/pop.
+    #[test]
+    fn define_sort_alias_is_removed_by_pop() {
+        let src = "(push 1)(define-sort S () Bool)(pop 1)(declare-fun x () S)";
+        let msg = first_error(src).expect("S must be gone after pop");
+        assert!(msg.contains("S"), "{msg}");
+        // ...and may be redefined after the pop.
+        let (_ctx, cmds) =
+            parse_all_ok("(push 1)(define-sort S () Bool)(pop 1)(define-sort S () Int)");
+        assert_eq!(cmds.len(), 2);
+    }
+
+    /// Threat model: over-pop is a silent no-op (as in the solver), and huge
+    /// push/pop counts cost O(1) memory per command, never a panic.
+    #[test]
+    fn hostile_push_pop_counts_are_bounded_and_never_panic() {
+        let src = "(declare-fun a () Bool)(pop 1000000)(push 4294967295)\
+                   (define-fun k () Bool a)(push 4294967295)(assert (! a :named h))\
+                   (pop 4294967295)(assert h)(pop 4294967295)(pop 4294967295)(assert k)";
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        let mut results = Vec::new();
+        while let Some(r) = p.next_command(&mut ctx) {
+            results.push(r);
+        }
+        let errs: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs[0].message.contains("undeclared symbol h"));
+        assert!(errs[1].message.contains("undeclared symbol k"));
+        // A deep chain of single pushes, each with a definition.
+        let mut src = String::from("(declare-fun a () Bool)");
+        for i in 0..10_000 {
+            src.push_str(&format!("(push 1)(define-fun d{i} () Bool a)"));
+        }
+        src.push_str("(pop 10000)(assert d0)");
+        assert!(first_error(&src)
+            .expect("d0 must be gone")
+            .contains("undeclared symbol d0"));
+    }
+
+    /// `:named` inside a `define-fun` body would bind an open term over the
+    /// definition's parameter placeholders.
+    #[test]
+    fn named_inside_define_fun_with_params_is_rejected() {
+        let src = "(define-fun f ((x Bool)) Bool (! x :named h))";
+        let msg = first_error(src).expect("must be rejected");
+        assert!(
+            msg.contains("named term: not allowed inside define-fun"),
+            "{msg}"
+        );
+        // The rejection leaves no binding behind, and the next command parses.
+        let src = "(define-fun f ((x Bool)) Bool (! x :named h))(declare-fun h () Bool)(assert h)";
+        let errs = all_errors(src);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+    }
+
+    /// A `:named` / `define-fun` name may not shadow a builtin operator or a
+    /// solver-reserved symbol: `(! a :named and)` would break every later
+    /// `(and …)`.
+    #[test]
+    fn named_and_define_fun_reject_builtin_and_reserved_names() {
+        for src in [
+            "(declare-fun a () Bool)(assert (! a :named and))",
+            "(declare-fun a () Bool)(assert (! a :named =))",
+            "(declare-fun a () Bool)(assert (! a :named /))",
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(msg.contains("name already in use"), "{src}: {msg}");
+        }
+        for src in [
+            "(declare-fun a () Bool)(define-fun and () Bool a)",
+            "(declare-fun a () Bool)(define-fun + ((x Int)) Int x)",
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(msg.contains("builtin"), "{src}: {msg}");
+        }
+        // `and` still works after the rejected binding.
+        let errs = all_errors("(declare-fun a () Bool)(assert (! a :named and))(assert (and a a))");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+    }
+
+    /// A reserved (solver-internal) name is rejected by `:named` and
+    /// `define-fun` alike.
+    #[test]
+    fn named_and_define_fun_reject_reserved_names() {
+        // `is-nil` is the minted (reserved) tester of `nil`.
+        for src in [
+            "(declare-datatype L ((nil)))(declare-fun a () Bool)(assert (! a :named is-nil))",
+            "(declare-datatype L ((nil)))(declare-fun a () Bool)(define-fun is-nil () Bool a)",
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(
+                msg.contains("reserved") || msg.contains("name already in use"),
+                "{src}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_after_failed_named_still_parses() {
+        let src = "(declare-fun a () Bool)(assert (! a :named a))(declare-fun b () Bool)";
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        assert!(matches!(
+            p.next_command(&mut ctx),
+            Some(Ok(Command::DeclareFun { .. }))
+        ));
+        assert!(matches!(p.next_command(&mut ctx), Some(Err(_))));
+        assert!(matches!(
+            p.next_command(&mut ctx),
+            Some(Ok(Command::DeclareFun { .. }))
+        ));
     }
 }
 

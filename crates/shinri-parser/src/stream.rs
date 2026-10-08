@@ -183,6 +183,19 @@ mod streaming_tests {
         assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::CheckSat));
     }
 
+    /// Slice 64: a define-sort alias persists into later commands.
+    #[test]
+    fn define_sort_alias_persists_across_commands() {
+        let mut ctx = Context::new();
+        let mut sp = StreamingParser::new();
+        sp.push_str("(define-sort FPN () (_ FloatingPoint 11 53))(declare-fun x () FPN)");
+        let fpn = ctx.fp_sort(11, 53);
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::DeclareFun { result, .. } if *result == fpn
+        )));
+    }
+
     #[test]
     fn env_persists_across_commands() {
         let mut ctx = Context::new();
@@ -239,6 +252,61 @@ mod streaming_tests {
         sp.push_str("(check-sat)\n");
         let _ = sp.next_command(&mut ctx);
         assert!(matches!(sp.finish(&mut ctx), StreamItem::Done));
+    }
+    /// Slice 64: `set-logic` and a later numeral are separate commands on
+    /// the streaming path; the Real-numeral mode lives in the persisted env.
+    #[test]
+    fn set_logic_numeral_mode_persists_across_commands() {
+        let mut ctx = Context::new();
+        let mut sp = StreamingParser::new();
+        sp.push_str("(set-logic QF_LRA)");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::SetLogic(_)
+        )));
+        sp.push_str("(declare-fun x () Real)");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::DeclareFun { .. }
+        )));
+        sp.push_str("(assert (let ((?v (- 1))) (= x ?v)))");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::Assert(_)
+        )));
+    }
+
+    /// Final review (slice 64): push/pop scoping of `:named` / `define-fun`
+    /// bindings lives in the persisted env, so it holds across commands.
+    #[test]
+    fn named_binding_scoped_by_push_pop_across_commands() {
+        let mut ctx = Context::new();
+        let mut sp = StreamingParser::new();
+        sp.push_str("(declare-fun a () Bool)(push 1)(assert (! a :named h))(pop 1)");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::DeclareFun { .. }
+        )));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::Push(1)));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::Assert(_)
+        )));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::Pop(1)));
+        // `h` was unbound by the pop: reusing it as a name is accepted...
+        sp.push_str("(assert (! (not a) :named h))");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::Assert(_)
+        )));
+        // ...and a define-fun made in a scope is gone after its pop.
+        sp.push_str("(push 1)(define-fun g () Bool a)(pop 1)(assert g)");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::Push(1)));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::Pop(1)));
+        match sp.next_command(&mut ctx) {
+            StreamItem::Command(Err(d)) => assert!(d.message.contains("undeclared symbol g")),
+            other => panic!("g must be unbound after pop, got {other:?}"),
+        }
     }
 }
 
