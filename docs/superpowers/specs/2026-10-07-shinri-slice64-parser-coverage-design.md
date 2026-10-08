@@ -142,8 +142,9 @@ fuzz run is a gate (§7.4).
 
 ### 3.5 FP soundness (amendment A)
 
-The first after run (`slice64-fp`, at 30,650 of 40,407 rows) had **3 wrong
-answers**, and no other run has any. The base `main` binary gives the same
+The first after run (`slice64-fp`) had **3 wrong answers**, and no other
+run has any. They were first seen at 26,850 of 40,407 rows, and the
+snapshot at 30,650 still showed the same 3. The base `main` binary gives the same
 wrong answers once the `define-sort` aliases are inlined by hand, so the
 parser didn't cause them. They are `shinri-fp` bugs that were unreachable
 while every QF_FP file failed to parse:
@@ -349,8 +350,17 @@ Criteria 1–7:
 3. PASS: QF_LRA + QF_UFLRA `parse-error` 2,287 → 0.
 4. PASS: Rodin 34 → 0 `parse-error`, all 34 `correct`.
 5. PASS (vacuous): 0 `correct → non-correct` rows in any set.
-6. PASS, post-merge oracle pending: ci 1866 / 1873 / 1887 green; oracle 864 / 869 green; fuzz clean (leak detection off in this environment).
-7. PASS by class: the 56 non-parse-error sample changes are base-timeout edge moves, none `correct → non-correct`; not re-run 3×.
+6. PASS: ci 1866 / 1873 / 1887 green; oracle 864 / 869 / 878 green; fuzz clean (leak detection off in this environment). Final-review fix wave (a34ddca): ci 1898/1898, oracle 880/880, lint clean, fuzz 1,166,827 runs / 300 s clean.
+7. PASS by class: the 56 non-parse-error sample changes are 55 base-timeout edge moves in logics without the Real-numeral change plus 1 QF_LRA `theory-lira` → `timeout`; none `correct → non-correct`; not re-run 3×.
 
-Pending: the post-merge LRA run (`slice64-lra-merged`) and post-merge oracle are
-recorded in the report's addendum by a follow-up commit.
+Post-merge LRA run (`slice64-lra-merged`, 3,037 rows): `wrong` 0, `correct`
+1,838 (base 432), `theory-refused` 0 (1,083 → `correct`, 703 →
+`timeout`), `panic` 13 (the queued stack overflow), `oom` 8. The 5
+pre-merge-`correct` → `timeout` rows solve on both binaries when re-timed
+(timing-edge noise).
+
+Final-review fix wave (after all bench runs): push/pop now scopes
+`define-fun`, `:named` and `define-sort` bindings (the `define-fun` case was
+wrong before this slice); `:named` is rejected inside a parameterised
+`define-fun` body; `:named`/`define-fun` reject builtin and reserved names.
+No bench row was re-run on it; see the report's fix-wave section.
