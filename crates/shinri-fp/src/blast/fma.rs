@@ -102,7 +102,12 @@ pub fn fp_fma(
     );
 
     // ---- Align lo to hi: right-shift lo by (hi_exp - lo_exp), collecting sticky. ----
-    let exp_diff = bvsub(b, &hi_exp, &lo_exp); // >= 0 since hi >= lo
+    // Usually >= 0 (hi wins the magnitude election). Not always: when z is
+    // zero, the election forces hi = product even if the product's exponent
+    // is below z's normalised emin - pw, so this can wrap negative. Harmless:
+    // lo is then the zero addend, whose lo_sig is all zero, so any shift
+    // amount yields a zero lo_shifted and a clear sticky bit.
+    let exp_diff = bvsub(b, &hi_exp, &lo_exp);
     let zb = b.zero();
     let mut hi_ext: Vec<BitLit> = vec![zb; 3];
     hi_ext.extend_from_slice(&hi_sig); // mw
