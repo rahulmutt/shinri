@@ -467,6 +467,10 @@ Commits on top of `71cb41e` (`7d56d6e`..`a34ddca`, then this docs commit):
     `ref_min`/`ref_max` docs were fixed in the fix wave.)
   - T8: thin coverage of the newly reachable deep-product-`hi` path (add `+x·+y` with
     `z = −0` and a symbolic `z`); a 120-char comment line.
+- **`(push 4294967295)` crashes the solver**: pre-existing, found in final fix-wave re-review. "Memory allocation of 4294967296 bytes failed"; the solver's `Command::Push` loops per level in crates/shinri-solver/src/lib.rs while parser is O(1)—the solver should cap or validate push count.
+- **`(reset)` doesn't clear parser bindings**: pre-existing, found in final fix-wave re-review. The parser's `Env` keeps its macros, function and sort bindings; only the scope stack is cleared.
+- **`:named` bindings persist after failed `assert`**: pre-existing, found in final fix-wave re-review. A `:named` binding made inside an `assert` that fails to parse stays bound even though the assertion is dropped.
+- **Reserved words accepted as `:named` names**: pre-existing, found in final fix-wave re-review. SMT-LIB reserved words (`let`, `_`, `!`, `as`, `forall`, `par`) are still accepted as `:named` names; harmless because those heads resolve before macros, but non-conforming.
 
 ## References
 
