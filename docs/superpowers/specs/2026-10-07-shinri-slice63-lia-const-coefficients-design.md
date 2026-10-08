@@ -210,7 +210,7 @@ serialized timing window is needed.
 
 ## 9. Queued for the next slice
 
-Filled in by the report.
+See the report, § Queued for the next slice.
 
 ## 10. References
 
@@ -220,3 +220,15 @@ Filled in by the report.
   (§ Per-logic matrix, QF_LIA `unknown` 4,764).
 - Shared-constant precedent: `Context::const_real_value` doc comment
   (FP fence/folder soundness invariant).
+
+## 11. Measured outcomes
+
+See `docs/superpowers/research/2026-10-08-smtlib-2024-slice63-lia-coefficients-report.md`.
+Criteria 1–6:
+
+1. PASS: `wrong = 0` in all four after runs.
+2. PASS: `theory-refused` 4,871 → 0 on the refused set (target ≥ 4,700); 0 still refused.
+3. PASS with deviation: 983 `correct` / 3,100 `timeout` / 770 `oom` (all nec-smt) fit; 18 QF_SLIA Norn rows (9 `sat-budget`, 9 `str-model-rejected`) land in `unknown`, outside the criterion's destination list. None is wrong; the cause is queued. 0 `unverified`, so the confirmation sample is vacuous.
+4. PASS: 1 of 84 re-run rows reproduces (QF_UF `gensys_brn095`, a timing-edge row QF_UF code cannot affect); quiet-host timing check queued.
+5. PASS: ci 1857/1857 (6 skipped); oracle 866/866 (base 859, +7).
+6. PASS with a caveat: sample changes are moves toward `timeout`; re-runs and an interleaved re-timing (+2.5% over 9 rows) are consistent with load noise, under unequal, very high host load (base ~70–80, after ~115–127). Not a quiet-host measurement.

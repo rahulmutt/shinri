@@ -219,7 +219,10 @@ fn string_under_uf(terms: &Context, atom: TermId) -> bool {
     walk(terms, atom, &mut seen)
 }
 
-/// True if `t` contains a `Mul` whose operands are not all numeric constants.
+/// True if `t` contains a `Mul` with two or more non-constant factors. A
+/// factor is constant iff `Context::const_arith_value` folds it (a numeral or
+/// `(- c)`); this must agree with `is_linear_arith` and `linearize` in
+/// shinri-arith (slice 63).
 fn contains_nonlinear_mul(terms: &Context, t: TermId) -> bool {
     match terms.term_node(t) {
         TermNode::Const { .. } => false,
@@ -228,7 +231,7 @@ fn contains_nonlinear_mul(terms: &Context, t: TermId) -> bool {
             if let Op::Builtin(BuiltinOp::Mul) = op {
                 let non_const = children
                     .iter()
-                    .filter(|&&c| !matches!(terms.term_node(c), TermNode::Const { .. }))
+                    .filter(|&&c| terms.const_arith_value(c).is_none())
                     .count();
                 if non_const >= 2 {
                     return true;
@@ -598,5 +601,39 @@ mod tests {
         let yrt = ctx.mk_app(Op::Uninterpreted(yr), &[]).unwrap();
         let ler = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[xrt, yrt]).unwrap();
         assert_eq!(classify(&ctx, ler), Ok(Owner::Arith));
+    }
+
+    /// Slice 63: `(- k)` is a constant factor in either position, Int and
+    /// Real, including `(- (- k))`.
+    #[test]
+    fn negated_numeral_coefficient_is_linear() {
+        let mut ctx = Context::new();
+        let sorts = [ctx.int_sort(), ctx.real_sort()];
+        for (i, sort) in sorts.into_iter().enumerate() {
+            let x = uconst(&mut ctx, &format!("x{i}"), sort);
+            let four = ctx.mk_numeral(shinri_core::Rational::from_int(4i128.into()), sort);
+            let three = ctx.mk_numeral(shinri_core::Rational::from_int(3i128.into()), sort);
+            let neg4 = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[four]).unwrap();
+            let negneg4 = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[neg4]).unwrap();
+            for prod in [[neg4, x], [x, neg4], [negneg4, x]] {
+                let m = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &prod).unwrap();
+                let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[m, three]).unwrap();
+                assert_eq!(classify(&ctx, le), Ok(Owner::Arith), "{prod:?}");
+            }
+        }
+    }
+
+    /// Slice 63 boundary: a negated *variable* is not a constant factor.
+    #[test]
+    fn negated_variable_times_variable_stays_refused() {
+        let mut ctx = Context::new();
+        let real = ctx.real_sort();
+        let x = real_var(&mut ctx, "x");
+        let y = real_var(&mut ctx, "y");
+        let zero = ctx.mk_numeral(shinri_core::Rational::from_int(0i128.into()), real);
+        let negx = ctx.mk_app(Op::Builtin(BuiltinOp::Neg), &[x]).unwrap();
+        let m = ctx.mk_app(Op::Builtin(BuiltinOp::Mul), &[negx, y]).unwrap();
+        let le = ctx.mk_app(Op::Builtin(BuiltinOp::Le), &[m, zero]).unwrap();
+        assert_eq!(classify(&ctx, le), Err(Unsupported(le)));
     }
 }
