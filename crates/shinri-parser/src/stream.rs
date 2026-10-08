@@ -275,6 +275,39 @@ mod streaming_tests {
             Command::Assert(_)
         )));
     }
+
+    /// Final review (slice 64): push/pop scoping of `:named` / `define-fun`
+    /// bindings lives in the persisted env, so it holds across commands.
+    #[test]
+    fn named_binding_scoped_by_push_pop_across_commands() {
+        let mut ctx = Context::new();
+        let mut sp = StreamingParser::new();
+        sp.push_str("(declare-fun a () Bool)(push 1)(assert (! a :named h))(pop 1)");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::DeclareFun { .. }
+        )));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::Push(1)));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::Assert(_)
+        )));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::Pop(1)));
+        // `h` was unbound by the pop: reusing it as a name is accepted...
+        sp.push_str("(assert (! (not a) :named h))");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| matches!(
+            c,
+            Command::Assert(_)
+        )));
+        // ...and a define-fun made in a scope is gone after its pop.
+        sp.push_str("(push 1)(define-fun g () Bool a)(pop 1)(assert g)");
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::Push(1)));
+        assert!(is_cmd(&sp.next_command(&mut ctx), |c| *c == Command::Pop(1)));
+        match sp.next_command(&mut ctx) {
+            StreamItem::Command(Err(d)) => assert!(d.message.contains("undeclared symbol g")),
+            other => panic!("g must be unbound after pop, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

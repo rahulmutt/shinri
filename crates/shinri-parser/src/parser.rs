@@ -117,12 +117,18 @@ pub struct Parser<'a> {
     /// Set to `true` after `(exit)` is processed; subsequent `next_command`
     /// calls return `None` immediately.
     stopped: bool,
+    /// True while a `define-fun` body with at least one parameter is being
+    /// parsed: a `:named` there would bind an open term over the parameter
+    /// placeholders, so it is rejected.
+    in_define_fun_params: bool,
 }
 
-/// Slice 64 §3.1: true iff logic `name`'s arithmetic is Reals-only, i.e. it
-/// ends in `LRA`, `NRA` or `RDL` (`QF_LRA`, `QF_UFLRA`, `QF_RDL`,
-/// `QF_FPLRA`, ...). Mixed logics end in `IRA` (`QF_LIRA`, `AUFLIRA`) and so
-/// never match; `ALL` and logics without arithmetic don't either.
+/// Slice 64 §3.1: true iff logic `name`'s arithmetic is Reals-only: it ends
+/// in `LRA`, `NRA` or `RDL` and the character before that suffix is not `I`
+/// (`QF_LRA`, `QF_UFLRA`, `QF_RDL`, `QF_FPLRA`, ...). The "not preceded by
+/// `I`" condition needs no separate check: a mixed Int/Real logic ends in
+/// `IRA` (`QF_LIRA`, `AUFLIRA`, `QF_NIRA`), so its suffix is `IRA`, never
+/// `LRA`/`NRA`/`RDL`. `ALL` and logics without arithmetic don't match either.
 fn reals_only_arith(name: &str) -> bool {
     ["LRA", "NRA", "RDL"].iter().any(|suf| name.ends_with(suf))
 }
@@ -167,6 +173,7 @@ impl<'a> Parser<'a> {
             env: Env::new(),
             eof: src.len(),
             stopped: false,
+            in_define_fun_params: false,
         }
     }
 
@@ -180,6 +187,7 @@ impl<'a> Parser<'a> {
             env,
             eof: src.len(),
             stopped: false,
+            in_define_fun_params: false,
         }
     }
 
@@ -814,7 +822,13 @@ impl<'a> Parser<'a> {
                 Some((Ok(Token::Keyword(k)), _)) => {
                     if k == ":named" {
                         let (name, nsp) = self.expect_symbol()?;
-                        if self.name_in_use(&name) {
+                        if self.in_define_fun_params {
+                            return Err(Diagnostic::new(
+                                nsp,
+                                "named term: not allowed inside define-fun",
+                            ));
+                        }
+                        if self.name_in_use(ctx, &name) {
                             return Err(Diagnostic::new(
                                 nsp,
                                 format!("named term: name already in use: {name}"),
@@ -866,11 +880,21 @@ impl<'a> Parser<'a> {
     }
 
     /// A `:named` name collides with a let-bound name, a macro (`define-fun`
-    /// or an earlier `:named`), or a declared function/constant.
-    fn name_in_use(&self, name: &str) -> bool {
+    /// or an earlier `:named`), a declared function/constant, a builtin
+    /// operator (a macro would shadow it: `(! a :named and)` would break every
+    /// later `(and …)`), or a solver-reserved symbol.
+    fn name_in_use(&self, ctx: &Context, name: &str) -> bool {
         self.env.lookup_let(name).is_some()
             || self.env.lookup_macro(name).is_some()
             || self.env.lookup_fun(name).is_some()
+            || Self::is_builtin_operator(name)
+            || ctx.lookup_symbol(name).is_some_and(|s| ctx.is_reserved(s))
+    }
+
+    /// Operator heads `parse_compound` resolves after the macro table, which
+    /// a macro of the same name would therefore shadow.
+    fn is_builtin_operator(name: &str) -> bool {
+        name == "/" || Self::builtin_for(name).is_some()
     }
 
     fn parse_let(&mut self, ctx: &mut Context) -> Result<TermId, Diagnostic> {
@@ -1309,7 +1333,7 @@ impl<'a> Parser<'a> {
                 }
                 let s = self.parse_sort(ctx)?;
                 self.expect_token(&Token::RParen)?; // close (define-sort …)
-                self.env.add_sort(&name, s);
+                self.env.add_sort_alias(&name, s);
                 return Ok(None); // no IR command emitted; caller loops
             }
             "assert" => {
@@ -1372,6 +1396,14 @@ impl<'a> Parser<'a> {
             }
         };
         self.expect_token(&Token::RParen)?; // close the command
+                                            // Scope definitions by push/pop only once the command is complete, so
+                                            // a malformed `(push 1 x)` (reported, no IR command) opens no scope.
+        match cmd {
+            Command::Push(n) => self.env.push_scopes(n),
+            Command::Pop(n) => self.env.pop_scopes(n),
+            Command::Reset => self.env.reset_scopes(),
+            _ => {}
+        }
         Ok(Some(cmd))
     }
 
@@ -1627,7 +1659,14 @@ impl<'a> Parser<'a> {
     /// `(define-fun f ((x S)…) R body)` — intern body against fresh formal
     /// placeholder consts and store as a macro; emits no command.
     fn parse_define_fun(&mut self, ctx: &mut Context) -> Result<(), Diagnostic> {
-        let (name, _) = self.expect_symbol()?;
+        let (name, nsp) = self.expect_symbol()?;
+        if Self::is_builtin_operator(&name) {
+            return Err(Diagnostic::new(
+                nsp,
+                format!("define-fun: cannot redefine builtin operator '{name}'"),
+            ));
+        }
+        reject_reserved(ctx, &name, &nsp)?;
         self.expect_token(&Token::LParen)?;
         let mut formal_names = Vec::new();
         let mut formals = Vec::new();
@@ -1653,7 +1692,9 @@ impl<'a> Parser<'a> {
                 .zip(formals.iter().copied())
                 .collect(),
         );
+        self.in_define_fun_params = !formals.is_empty();
         let body = self.parse_term(ctx);
+        self.in_define_fun_params = false;
         self.env.pop_let();
         let body = body?;
         self.expect_token(&Token::RParen)?; // close (define-fun …)
@@ -3558,6 +3599,199 @@ mod tests {
         );
         let (_ctx, cmds) = parse_all_ok(&src);
         assert_eq!(cmds.len(), 2);
+    }
+
+    /// The uninterpreted nullary symbol a term is, if any.
+    fn uf_name(ctx: &Context, t: TermId) -> Option<String> {
+        use shinri_core::{Op, TermNode};
+        match ctx.term_node(t) {
+            TermNode::App {
+                op: Op::Uninterpreted(sym),
+                ..
+            } => Some(ctx.symbol_name(*sym).to_string()),
+            _ => None,
+        }
+    }
+
+    /// Final review (slice 64): a `:named` / `define-fun` binding made inside
+    /// a push scope is removed by the matching pop (SMT-LIB 2.6 §4.1.4), so
+    /// the name may be reused after the pop.
+    #[test]
+    fn named_and_define_fun_bindings_are_reusable_after_pop() {
+        for (def1, def2) in [
+            ("(assert (! a :named h))", "(assert (! (not a) :named h))"),
+            ("(define-fun h () Bool a)", "(define-fun h () Bool (not a))"),
+        ] {
+            let src =
+                format!("(declare-fun a () Bool)(push 1){def1}(pop 1)(push 1){def2}(assert h)");
+            let (ctx, cmds) = parse_all_ok(&src);
+            let ts = assert_terms(&cmds);
+            let h = *ts.last().unwrap();
+            assert!(
+                uf_name(&ctx, h).is_none(),
+                "{src}: h must be (not a), got a symbol"
+            );
+            match ctx.term_node(h) {
+                shinri_core::TermNode::App {
+                    op: shinri_core::Op::Builtin(shinri_core::BuiltinOp::Not),
+                    ..
+                } => {}
+                other => panic!("{src}: expected (not a), got {other:?}"),
+            }
+        }
+    }
+
+    /// After the pop, a fresh `declare-fun h` is what `h` resolves to — not
+    /// the stale alias.
+    #[test]
+    fn declare_fun_after_pop_is_not_shadowed_by_stale_binding() {
+        for def in ["(assert (! a :named h))", "(define-fun h () Bool a)"] {
+            let src = format!(
+                "(declare-fun a () Bool)(push 1){def}(pop 1)(declare-fun h () Bool)(assert h)"
+            );
+            let (ctx, cmds) = parse_all_ok(&src);
+            let h = *assert_terms(&cmds).last().unwrap();
+            assert_eq!(uf_name(&ctx, h).as_deref(), Some("h"), "{src}");
+        }
+    }
+
+    /// Pop restores the definition a scoped redefinition shadowed; nested
+    /// scopes unwind one level at a time; `push n` / `pop n` count levels.
+    #[test]
+    fn pop_restores_outer_definitions_level_by_level() {
+        let src = "(declare-fun a () Bool)(declare-fun b () Bool)\
+                   (define-fun k () Bool a)\
+                   (push 2)(define-fun m () Bool b)(push 1)(assert (! b :named n))\
+                   (pop 1)(assert m)(pop 1)(assert m)(pop 1)(assert k)";
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        let mut results = Vec::new();
+        while let Some(r) = p.next_command(&mut ctx) {
+            results.push(r);
+        }
+        // `m` survives the first pop (it lives one level out from `n`); the
+        // second pop closes the inner of push 2's two levels, where `m`
+        // lives, so the second `(assert m)` is an error; the third pop
+        // closes the last level and `k` (depth 0) survives everything.
+        let asserts: Vec<_> = results
+            .iter()
+            .filter(|r| matches!(r, Ok(Command::Assert(_)) | Err(_)))
+            .collect();
+        assert_eq!(asserts.len(), 4);
+        assert!(matches!(asserts[0], Ok(Command::Assert(_))), "n's assert");
+        assert!(
+            matches!(asserts[1], Ok(Command::Assert(_))),
+            "m after pop 1"
+        );
+        match asserts[2] {
+            Err(d) => assert!(d.message.contains("undeclared symbol m"), "{d:?}"),
+            other => panic!("m must be gone after the second pop, got {other:?}"),
+        }
+        assert!(matches!(asserts[3], Ok(Command::Assert(_))), "k is global");
+        // Shadowed definition restored.
+        let src = "(declare-fun a () Bool)(define-fun k () Bool a)\
+                   (push 1)(define-fun k () Bool (not a))(pop 1)(assert k)";
+        let (ctx, cmds) = parse_all_ok(src);
+        let k = *assert_terms(&cmds).last().unwrap();
+        assert_eq!(uf_name(&ctx, k).as_deref(), Some("a"));
+    }
+
+    /// A nullary `define-sort` is a definition too: scoped by push/pop.
+    #[test]
+    fn define_sort_alias_is_removed_by_pop() {
+        let src = "(push 1)(define-sort S () Bool)(pop 1)(declare-fun x () S)";
+        let msg = first_error(src).expect("S must be gone after pop");
+        assert!(msg.contains("S"), "{msg}");
+        // ...and may be redefined after the pop.
+        let (_ctx, cmds) =
+            parse_all_ok("(push 1)(define-sort S () Bool)(pop 1)(define-sort S () Int)");
+        assert_eq!(cmds.len(), 2);
+    }
+
+    /// Threat model: over-pop is a silent no-op (as in the solver), and huge
+    /// push/pop counts cost O(1) memory per command, never a panic.
+    #[test]
+    fn hostile_push_pop_counts_are_bounded_and_never_panic() {
+        let src = "(declare-fun a () Bool)(pop 1000000)(push 4294967295)\
+                   (define-fun k () Bool a)(push 4294967295)(assert (! a :named h))\
+                   (pop 4294967295)(assert h)(pop 4294967295)(pop 4294967295)(assert k)";
+        let mut ctx = Context::new();
+        let mut p = Parser::new(src);
+        let mut results = Vec::new();
+        while let Some(r) = p.next_command(&mut ctx) {
+            results.push(r);
+        }
+        let errs: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(errs[0].message.contains("undeclared symbol h"));
+        assert!(errs[1].message.contains("undeclared symbol k"));
+        // A deep chain of single pushes, each with a definition.
+        let mut src = String::from("(declare-fun a () Bool)");
+        for i in 0..10_000 {
+            src.push_str(&format!("(push 1)(define-fun d{i} () Bool a)"));
+        }
+        src.push_str("(pop 10000)(assert d0)");
+        assert!(first_error(&src)
+            .expect("d0 must be gone")
+            .contains("undeclared symbol d0"));
+    }
+
+    /// `:named` inside a `define-fun` body would bind an open term over the
+    /// definition's parameter placeholders.
+    #[test]
+    fn named_inside_define_fun_with_params_is_rejected() {
+        let src = "(define-fun f ((x Bool)) Bool (! x :named h))";
+        let msg = first_error(src).expect("must be rejected");
+        assert!(
+            msg.contains("named term: not allowed inside define-fun"),
+            "{msg}"
+        );
+        // The rejection leaves no binding behind, and the next command parses.
+        let src = "(define-fun f ((x Bool)) Bool (! x :named h))(declare-fun h () Bool)(assert h)";
+        let errs = all_errors(src);
+        assert_eq!(errs.len(), 1, "{errs:?}");
+    }
+
+    /// A `:named` / `define-fun` name may not shadow a builtin operator or a
+    /// solver-reserved symbol: `(! a :named and)` would break every later
+    /// `(and …)`.
+    #[test]
+    fn named_and_define_fun_reject_builtin_and_reserved_names() {
+        for src in [
+            "(declare-fun a () Bool)(assert (! a :named and))",
+            "(declare-fun a () Bool)(assert (! a :named =))",
+            "(declare-fun a () Bool)(assert (! a :named /))",
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(msg.contains("name already in use"), "{src}: {msg}");
+        }
+        for src in [
+            "(declare-fun a () Bool)(define-fun and () Bool a)",
+            "(declare-fun a () Bool)(define-fun + ((x Int)) Int x)",
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(msg.contains("builtin"), "{src}: {msg}");
+        }
+        // `and` still works after the rejected binding.
+        let errs = all_errors("(declare-fun a () Bool)(assert (! a :named and))(assert (and a a))");
+        assert_eq!(errs.len(), 1, "{errs:?}");
+    }
+
+    /// A reserved (solver-internal) name is rejected by `:named` and
+    /// `define-fun` alike.
+    #[test]
+    fn named_and_define_fun_reject_reserved_names() {
+        // `is-nil` is the minted (reserved) tester of `nil`.
+        for src in [
+            "(declare-datatype L ((nil)))(declare-fun a () Bool)(assert (! a :named is-nil))",
+            "(declare-datatype L ((nil)))(declare-fun a () Bool)(define-fun is-nil () Bool a)",
+        ] {
+            let msg = first_error(src).unwrap_or_else(|| panic!("no error for {src}"));
+            assert!(
+                msg.contains("reserved") || msg.contains("name already in use"),
+                "{src}: {msg}"
+            );
+        }
     }
 
     #[test]

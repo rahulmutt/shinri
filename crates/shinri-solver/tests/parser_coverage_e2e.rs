@@ -7,19 +7,25 @@ use shinri_solver::{CommandResponse, SolveOutcome, Solver};
 /// Run an SMT-LIB script; the outcome of its last `check-sat`. Any parse
 /// error fails the test: these scripts must parse completely.
 fn script_outcome(src: &str) -> SolveOutcome {
+    *script_outcomes(src).last().expect("script has a check-sat")
+}
+
+/// Run an SMT-LIB script; the outcome of every `check-sat`, in order. Any
+/// parse error fails the test.
+fn script_outcomes(src: &str) -> Vec<SolveOutcome> {
     let mut solver = Solver::new();
     let mut parser = Parser::new(src);
-    let mut outcome = None;
+    let mut outcomes = Vec::new();
     while let Some(result) = parser.next_command(solver.ctx_mut()) {
         let cmd = result.unwrap_or_else(|e| panic!("parse error: {e:?}"));
         match solver.execute(cmd) {
-            CommandResponse::Sat => outcome = Some(SolveOutcome::Sat),
-            CommandResponse::Unsat => outcome = Some(SolveOutcome::Unsat),
-            CommandResponse::Unknown => outcome = Some(SolveOutcome::Unknown),
+            CommandResponse::Sat => outcomes.push(SolveOutcome::Sat),
+            CommandResponse::Unsat => outcomes.push(SolveOutcome::Unsat),
+            CommandResponse::Unknown => outcomes.push(SolveOutcome::Unknown),
             _ => {}
         }
     }
-    outcome.expect("script has a check-sat")
+    outcomes
 }
 
 /// QF_UFLRA/FFT/smtlib.624882 (`:status unsat`), set-info lines dropped.
@@ -71,4 +77,43 @@ fn slice64_wintersteiger_define_sort() {
         script_outcome(&format!("{base}(assert (not (= (fp.abs x) r)))(check-sat)")),
         SolveOutcome::Unsat
     );
+}
+
+/// Final review (slice 64): a `:named` / `define-fun` binding made inside a
+/// push scope is removed by the matching pop, so the name can be reused in a
+/// later scope. Before the fix the reuse was rejected ("name already in
+/// use"), the assertion dropped, and the second check-sat answered `sat`.
+#[test]
+fn slice64_binding_reused_after_pop_is_unsat() {
+    for (def1, def2) in [
+        ("(assert (! a :named h))", "(assert (! (not a) :named h))"),
+        (
+            "(define-fun h () Bool a)(assert h)",
+            "(define-fun h () Bool (not a))(assert h)",
+        ),
+    ] {
+        let src = format!(
+            "(set-logic QF_UF)(declare-fun a () Bool)\
+             (push 1){def1}(check-sat)(pop 1)\
+             (push 1){def2}(assert a)(check-sat)"
+        );
+        assert_eq!(
+            script_outcomes(&src),
+            vec![SolveOutcome::Sat, SolveOutcome::Unsat],
+            "{src}"
+        );
+    }
+}
+
+/// Final review (slice 64): after the pop, `h` names the fresh declaration,
+/// not the stale alias of `a` (which answered `unsat`).
+#[test]
+fn slice64_declaration_after_pop_is_not_a_stale_alias_sat() {
+    for def in ["(assert (! a :named h))", "(define-fun h () Bool a)"] {
+        let src = format!(
+            "(set-logic QF_UF)(declare-fun a () Bool)(push 1){def}(pop 1)\
+             (declare-fun h () Bool)(assert h)(assert (not a))(check-sat)"
+        );
+        assert_eq!(script_outcome(&src), SolveOutcome::Sat, "{src}");
+    }
 }
