@@ -73,3 +73,24 @@ fn slice64a_min_has_solution_13472() {
         (assert (= (fp.min x y) r))(check-sat)";
     assert_eq!(script_outcome(src), SolveOutcome::Sat);
 }
+
+const FMA_4663: &str = "(set-logic QF_FP)(define-sort FPN () (_ FloatingPoint 11 53))\
+    (declare-fun x () FPN)(declare-fun y () FPN)(declare-fun z () FPN)(declare-fun r () FPN)\
+    (assert (= x (fp #b0 #b00011000011 #b0101001000001100110001010110011011001000000000001111)))\
+    (assert (= y (fp #b1 #b00100010011 #b1100111000110100000010101001001111101110010000110001)))\
+    (assert (= z (fp #b0 #b00000000000 #b0000000000000000000000000000000000000000000000000000)))\
+    (assert (= r (fp #b1 #b00000000000 #b0000000000000000000000000000000000000000000000000000)))";
+
+/// QF_FP/wintersteiger/fma/fma-has-solution-4663 (`:status sat`).
+#[test]
+fn slice64a_fma_has_solution_4663() {
+    let src = format!("{FMA_4663}(assert (= (fp.fma roundTowardZero x y z) r))(check-sat)");
+    assert_eq!(script_outcome(&src), SolveOutcome::Sat);
+}
+
+/// QF_FP/wintersteiger/fma/fma-has-no-other-solution-4663 (`:status unsat`).
+#[test]
+fn slice64a_fma_has_no_other_solution_4663() {
+    let src = format!("{FMA_4663}(assert (not (= (fp.fma roundTowardZero x y z) r)))(check-sat)");
+    assert_eq!(script_outcome(&src), SolveOutcome::Unsat);
+}
