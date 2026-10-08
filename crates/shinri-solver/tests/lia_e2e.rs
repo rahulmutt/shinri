@@ -234,6 +234,28 @@ fn slice63_shared_neg_numeral_stays_pinned() {
     assert_eq!(script_outcome(src), SolveOutcome::Unsat);
 }
 
+/// Guard for the plan's Global Constraint that `is_compound_arith` and
+/// `ensure_shared_var`'s `numeral_value` pin stay numeral-only: a shared
+/// `(- 4)` must remain pinned by the arithmetic side. Only bounds on `y`
+/// reach the pin (EUF alone cannot refute this), so treating `(- 4)` as a
+/// constant in `is_compound_arith` turns this `Unsat` into `Sat`.
+#[test]
+fn slice63_shared_neg_numeral_pinned_via_bounds() {
+    let src = "(set-logic QF_UFLIA)(declare-fun f (Int) Int)(declare-fun y () Int)\
+               (assert (<= y (- 4)))(assert (>= y (- 4)))\
+               (assert (= (f y) 0))(assert (= (f (- 4)) 1))(check-sat)";
+    assert_eq!(script_outcome(src), SolveOutcome::Unsat);
+}
+
+/// Same guard, with the bounds stated through a compound `(+ y 4)`.
+#[test]
+fn slice63_shared_neg_numeral_pinned_via_compound_bounds() {
+    let src = "(set-logic QF_UFLIA)(declare-fun f (Int) Int)(declare-fun y () Int)\
+               (assert (<= (+ y 4) 0))(assert (>= (+ y 4) 0))\
+               (assert (= (f y) 0))(assert (= (f (- 4)) 1))(check-sat)";
+    assert_eq!(script_outcome(src), SolveOutcome::Unsat);
+}
+
 /// A shared compound with a `(- 1)` coefficient is linear and pinned
 /// (slice 50's `define_shared_compound`): (* (- 1) y) = 4 when y = −4.
 #[test]
