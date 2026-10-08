@@ -718,10 +718,10 @@ fn smt2_real(n: i32) -> String {
 
 /// Render `coeff * var_name` as an SMT-LIB 2 Real term, or `None` if coeff == 0.
 /// Uses decimal coefficient literals so everything stays in the Real sort.
-/// Negative coefficients are rendered as `(- (* |c|.0 var))` rather than
-/// `(* (- |c|.0) var)` so the `Mul` node has only one non-constant child
-/// (the variable), which is correctly identified as linear by the solver's
-/// nonlinear-multiplication guard.
+/// Negative coefficients are rendered as `(- (* |c|.0 var))`. Before slice 63
+/// the solver refused `(* (- |c|.0) var)` as nonlinear; the rendering is kept
+/// so this oracle's generated corpus is unchanged. `neg_coeff_oracle.rs`
+/// covers the `(* (- k) var)` shape.
 fn smt2_real_coeff_times_var(coeff: i32, var: &str) -> Option<String> {
     match coeff {
         0 => None,
